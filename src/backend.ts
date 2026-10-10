@@ -18,6 +18,7 @@ interface ChatLike {
 
 type FrontendMessage =
   | { type: 'chat_voice_refresh' }
+  | { type: 'chat_voice_scan'; chatId: string; messageLimit: number }
   | {
       type: 'chat_voice_save'
       chatId: string
@@ -50,15 +51,12 @@ async function loadCharacters(chat: ChatLike, userId?: string): Promise<Characte
 async function buildState(chat: ChatLike, userId?: string) {
   const metadata = chat.metadata ?? {}
   const candidates = await loadCharacters(chat, userId)
-  const initialConfig = readConfig(metadata, candidates.map((character) => character.id))
-  const messages = await spindle.chat.getMessages(chat.id)
-  const detected = detectCharacters(
-    messages,
-    candidates,
-    initialConfig.messageLimit,
-    chat.metadata?.group === true ? null : chat.character_id,
-  )
-  const config = readConfig(metadata, detected.map((character) => character.id))
+  const config = readConfig(metadata, candidates.map((character) => character.id))
+  const candidatesById = new Map(candidates.map((character) => [character.id, character] as const))
+  const detected = config.detectedCharacters.flatMap(({ id, messageCount }) => {
+    const character = candidatesById.get(id)
+    return character ? [{ ...character, messageCount }] : []
+  })
 
   return {
     id: chat.id,
@@ -99,7 +97,7 @@ function sanitizeSaveConfig(
     }
   }
   return {
-    version: 2,
+    version: 3,
     messageLimit: clampMessageLimit(input.messageLimit),
     connectionId: typeof input.connectionId === 'string'
       ? input.connectionId.trim().slice(0, 128)
@@ -108,6 +106,7 @@ function sanitizeSaveConfig(
       ? input.narratorVoice.trim().slice(0, 512)
       : '',
     characterVoices,
+    detectedCharacters: previous.detectedCharacters,
     managedCharacterIds: previous.managedCharacterIds,
   }
 }
@@ -138,11 +137,53 @@ function queueSave(
   return nextTask
 }
 
+function queueScan(
+  payload: Extract<FrontendMessage, { type: 'chat_voice_scan' }>,
+  userId?: string,
+): Promise<void> {
+  const queueKey = `${userId ?? 'user'}:${payload.chatId}`
+  const previousTask = saveQueues.get(queueKey) ?? Promise.resolve()
+  const nextTask = previousTask.catch(() => undefined).then(async () => {
+    const chat = await spindle.chats.get(payload.chatId, userId) as ChatLike | null
+    if (!chat) throw new Error('The chat is no longer available.')
+    const candidates = await loadCharacters(chat, userId)
+    const messageLimit = clampMessageLimit(payload.messageLimit)
+    const messages = await spindle.chat.getMessages(chat.id)
+    const detected = detectCharacters(
+      messages,
+      candidates,
+      messageLimit,
+      chat.metadata?.group === true ? null : chat.character_id,
+    )
+    const config = readConfig(chat.metadata ?? {}, candidates.map((character) => character.id))
+    const nextConfig: ChatVoiceConfig = {
+      ...config,
+      version: 3,
+      messageLimit,
+      detectedCharacters: detected.map(({ id, messageCount }) => ({ id, messageCount })),
+    }
+    const metadata = applyConfigToMetadata(chat.metadata ?? {}, nextConfig)
+    await spindle.chats.update(chat.id, { metadata }, userId)
+
+    const active = await spindle.chats.getActive(userId) as ChatLike | null
+    if (active?.id === chat.id) {
+      await sendState(userId)
+      spindle.sendToFrontend({ type: 'chat_voice_scan_complete', chatId: chat.id }, userId)
+    }
+  }).finally(() => {
+    if (saveQueues.get(queueKey) === nextTask) saveQueues.delete(queueKey)
+  })
+  saveQueues.set(queueKey, nextTask)
+  return nextTask
+}
+
 spindle.onFrontendMessage(async (rawPayload: unknown, userId) => {
   const payload = rawPayload as FrontendMessage
   try {
     if (payload?.type === 'chat_voice_refresh') {
       await sendState(userId)
+    } else if (payload?.type === 'chat_voice_scan') {
+      await queueScan(payload, userId)
     } else if (payload?.type === 'chat_voice_save') {
       await queueSave(payload, userId)
     }
@@ -156,24 +197,8 @@ spindle.onFrontendMessage(async (rawPayload: unknown, userId) => {
   }
 })
 
-const refreshTimers = new Map<string, ReturnType<typeof setTimeout>>()
-
-function scheduleStateRefresh(userId?: string) {
-  const key = userId ?? 'user'
-  const existing = refreshTimers.get(key)
-  if (existing) clearTimeout(existing)
-  refreshTimers.set(key, setTimeout(() => {
-    refreshTimers.delete(key)
-    void sendState(userId)
-  }, 150))
-}
-
 spindle.on('CHAT_SWITCHED', async (_payload, userId) => {
   await sendState(userId)
 })
 
-for (const event of ['MESSAGE_SENT', 'MESSAGE_EDITED', 'MESSAGE_SWIPED', 'MESSAGE_DELETED'] as const) {
-  spindle.on(event, (_payload, userId) => scheduleStateRefresh(userId))
-}
-
-spindle.log.info('Chat Voice 2.0 loaded.')
+spindle.log.info('Chat Voice 2.1 loaded.')

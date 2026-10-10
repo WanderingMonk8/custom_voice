@@ -42,6 +42,11 @@ interface ErrorPayload {
   clientRevision?: number
 }
 
+interface ScanCompletePayload {
+  type: 'chat_voice_scan_complete'
+  chatId: string
+}
+
 const VOICE_ICON = `
   <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
     <path d="M5 10v4M9 7v10M13 4v16M17 8v8M21 10v4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
@@ -110,6 +115,14 @@ export function setup(ctx: SpindleFrontendContext) {
     }
     .chat-voice-context { min-height:18px; }
     .chat-voice-field { display:flex; flex-direction:column; gap:7px; }
+    .chat-voice-scan-row { display:grid; grid-template-columns:minmax(0, 1fr) auto; gap:8px; align-items:center; }
+    .chat-voice-scan-button {
+      min-height:36px; padding:0 14px; border:1px solid var(--lumiverse-border);
+      border-radius:var(--lumiverse-radius); background:var(--lumiverse-accent, #7c6df2);
+      color:#fff; font:inherit; font-size:12px; font-weight:700; cursor:pointer;
+    }
+    .chat-voice-scan-button:hover:not(:disabled) { filter:brightness(1.08); }
+    .chat-voice-scan-button:disabled { cursor:not-allowed; opacity:.5; }
     .chat-voice-label { color:var(--lumiverse-text); font-size:12px; font-weight:600; }
     .chat-voice-section-title {
       margin:2px 0 0; color:var(--lumiverse-text); font-size:13px; font-weight:700;
@@ -161,6 +174,15 @@ export function setup(ctx: SpindleFrontendContext) {
 
   const connectionField = createField('TTS connection')
   const messageLimitField = createField('Messages to scan')
+  const scanRow = document.createElement('div')
+  scanRow.className = 'chat-voice-scan-row'
+  const scanButton = document.createElement('button')
+  scanButton.type = 'button'
+  scanButton.className = 'chat-voice-scan-button'
+  scanButton.textContent = 'Scan'
+  scanButton.disabled = true
+  messageLimitField.field.insertBefore(scanRow, messageLimitField.slot)
+  scanRow.append(messageLimitField.slot, scanButton)
   const narratorField = createField('Narrator voice')
   const routingHint = document.createElement('div')
   routingHint.className = 'chat-voice-hint'
@@ -193,6 +215,7 @@ export function setup(ctx: SpindleFrontendContext) {
   let saveTimer: ReturnType<typeof setTimeout> | null = null
   let editRevision = 0
   let dirty = false
+  let scanning = false
   const inFlight = new Set<number>()
   const characterInputs = new Map<string, SpindleTextInputHandle>()
 
@@ -257,6 +280,22 @@ export function setup(ctx: SpindleFrontendContext) {
     saveTimer = setTimeout(flushSave, delay)
   }
 
+  function scanMessages() {
+    if (!activeChat || scanning) return
+    flushSave()
+    scanning = true
+    scanButton.disabled = true
+    scanButton.textContent = 'Scanning…'
+    setStatus('Scanning recent messages…')
+    ctx.sendToBackend({
+      type: 'chat_voice_scan',
+      chatId: activeChat.id,
+      messageLimit: messageLimitInput.getValue() ?? 20,
+    })
+  }
+
+  scanButton.addEventListener('click', scanMessages)
+
   function connectionOptions(selectedId = '') {
     const options = connections.map((connection) => ({
       value: connection.id,
@@ -276,7 +315,7 @@ export function setup(ctx: SpindleFrontendContext) {
     if (characters.length === 0) {
       const empty = document.createElement('div')
       empty.className = 'chat-voice-empty'
-      empty.textContent = 'No character speakers were found in the selected message window.'
+      empty.textContent = 'No saved characters yet. Click Scan to detect speakers in recent messages.'
       characterList.appendChild(empty)
       return
     }
@@ -318,6 +357,7 @@ export function setup(ctx: SpindleFrontendContext) {
       disabled: !next || connections.length === 0,
     })
     messageLimitInput.update({ value: next?.messageLimit ?? 20, disabled: !next })
+    scanButton.disabled = !next || scanning
     narratorInput.update({ value: next?.narratorVoice ?? '', disabled: !next })
     renderCharacters(next?.characters ?? [])
     applyingState = false
@@ -343,10 +383,21 @@ export function setup(ctx: SpindleFrontendContext) {
   }
 
   const unsubscribeBackend = ctx.onBackendMessage((rawPayload: unknown) => {
-    const payload = rawPayload as StatePayload | ErrorPayload
+    const payload = rawPayload as StatePayload | ErrorPayload | ScanCompletePayload
     if (payload.type === 'chat_voice_error') {
       if (payload.clientRevision !== undefined) inFlight.delete(payload.clientRevision)
+      scanning = false
+      scanButton.textContent = 'Scan'
+      scanButton.disabled = !activeChat
       setStatus(payload.error || 'Could not save chat voice settings.', 'error')
+      return
+    }
+    if (payload.type === 'chat_voice_scan_complete') {
+      if (payload.chatId !== activeChat?.id) return
+      scanning = false
+      scanButton.textContent = 'Scan'
+      scanButton.disabled = false
+      setStatus('Scan complete. Character settings saved.', 'saved')
       return
     }
     if (payload.type !== 'chat_voice_state') return
@@ -357,6 +408,8 @@ export function setup(ctx: SpindleFrontendContext) {
       flushSave()
       dirty = false
       inFlight.clear()
+      scanning = false
+      scanButton.textContent = 'Scan'
       renderState(payload.chat)
       return
     }
@@ -392,6 +445,7 @@ export function setup(ctx: SpindleFrontendContext) {
     connectionPicker.destroy()
     messageLimitInput.destroy()
     narratorInput.destroy()
+    scanButton.removeEventListener('click', scanMessages)
     tab.destroy()
     removeStyle()
   }

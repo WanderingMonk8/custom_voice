@@ -55,11 +55,12 @@ test('migrates existing native voice overrides into extension config', () => {
 
 test('writes native overrides while preserving unrelated character voices', () => {
   const config: ChatVoiceConfig = {
-    version: 2,
+    version: 3,
     messageLimit: 20,
     connectionId: 'shared',
     narratorVoice: 'narrator',
     characterVoices: { alice: 'alice-voice', bob: '' },
+    detectedCharacters: [{ id: 'alice', messageCount: 4 }, { id: 'bob', messageCount: 2 }],
     managedCharacterIds: ['alice', 'bob'],
   }
   const metadata = applyConfigToMetadata({
@@ -79,4 +80,20 @@ test('writes native overrides while preserving unrelated character voices', () =
       alice: { connectionId: 'shared', voice: 'alice-voice' },
     },
   })
+})
+
+test('persists manual scan results for loading without rescanning messages', () => {
+  const metadata = applyConfigToMetadata({}, {
+    version: 3,
+    messageLimit: 35,
+    connectionId: '',
+    narratorVoice: '',
+    characterVoices: { alice: 'voice-a' },
+    detectedCharacters: [{ id: 'alice', messageCount: 7 }],
+    managedCharacterIds: [],
+  })
+  const restored = readConfig(metadata, ['alice'])
+  assert.equal(restored.messageLimit, 35)
+  assert.deepEqual(restored.detectedCharacters, [{ id: 'alice', messageCount: 7 }])
+  assert.equal(restored.characterVoices.alice, 'voice-a')
 })

@@ -14,11 +14,12 @@ export interface VoiceOverrides {
 }
 
 export interface ChatVoiceConfig {
-  version: 2
+  version: 3
   messageLimit: number
   connectionId: string
   narratorVoice: string
   characterVoices: Record<string, string>
+  detectedCharacters: Array<{ id: string; messageCount: number }>
   managedCharacterIds: string[]
 }
 
@@ -60,6 +61,26 @@ function readStringMap(value: unknown): Record<string, string> {
   const result: Record<string, string> = {}
   for (const [key, item] of Object.entries(value)) {
     if (key && typeof item === 'string') result[key] = item.trim().slice(0, 512)
+  }
+  return result
+}
+
+function readDetectedCharacters(
+  value: unknown,
+  fallbackIds: string[],
+): Array<{ id: string; messageCount: number }> {
+  if (!Array.isArray(value)) {
+    return [...new Set(fallbackIds)].map((id) => ({ id, messageCount: 0 }))
+  }
+  const result: Array<{ id: string; messageCount: number }> = []
+  const seen = new Set<string>()
+  for (const item of value) {
+    if (!isRecord(item) || typeof item.id !== 'string' || !item.id || seen.has(item.id)) continue
+    seen.add(item.id)
+    const count = typeof item.messageCount === 'number' && Number.isFinite(item.messageCount)
+      ? Math.max(0, Math.round(item.messageCount))
+      : 0
+    result.push({ id: item.id, messageCount: count })
   }
   return result
 }
@@ -106,8 +127,12 @@ export function readConfig(
       .find((id): id is string => !!id)
     ?? ''
 
+  const legacyDetectedIds = Object.keys(storedVoices).length > 0
+    ? Object.keys(storedVoices)
+    : managedCharacterIds
+
   return {
-    version: 2,
+    version: 3,
     messageLimit: clampMessageLimit(raw.messageLimit),
     connectionId: typeof raw.connectionId === 'string'
       ? raw.connectionId.trim().slice(0, 128)
@@ -116,6 +141,7 @@ export function readConfig(
       ? raw.narratorVoice.trim().slice(0, 512)
       : overrides.narrator?.voice ?? '',
     characterVoices,
+    detectedCharacters: readDetectedCharacters(raw.detectedCharacters, legacyDetectedIds),
     managedCharacterIds: [...new Set(managedCharacterIds)],
   }
 }
