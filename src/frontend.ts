@@ -90,6 +90,26 @@ interface SynthesizedVoiceSegment {
   mime: string
 }
 
+interface SavedAudioAttachment {
+  type?: string
+  image_id?: string
+  swipe_id?: number
+}
+
+interface SavedMessageAudioResult {
+  message?: {
+    id?: string
+    extra?: { attachments?: SavedAudioAttachment[] }
+  }
+  audio?: {
+    id?: string
+    mime_type?: string
+    size_bytes?: number
+  }
+  muxed_with_ffmpeg?: boolean
+  swipe_id?: number
+}
+
 interface PlaybackPreferences {
   speed: number
   volume: number
@@ -226,7 +246,7 @@ async function saveMessageAudio(
   swipeId: number | undefined,
   segments: SynthesizedVoiceSegment[],
   signal: AbortSignal,
-): Promise<void> {
+): Promise<SavedMessageAudioResult> {
   const form = new FormData()
   form.append('chatId', chatId)
   form.append('messageId', messageId)
@@ -241,10 +261,28 @@ async function saveMessageAudio(
     signal,
     body: form,
   })
+  const responseText = await response.text()
   if (!response.ok) {
-    const body = await response.json().catch(() => null) as { error?: string } | null
+    let body: { error?: string } | null = null
+    try { body = JSON.parse(responseText) as { error?: string } } catch { /* non-JSON server error */ }
     throw new Error(body?.error || `Could not save generated audio (${response.status}).`)
   }
+
+  let result: SavedMessageAudioResult
+  try {
+    result = JSON.parse(responseText) as SavedMessageAudioResult
+  } catch {
+    throw new Error('Lumiverse returned an invalid response after saving generated audio.')
+  }
+  const savedAudioId = result.audio?.id
+  const attachments = result.message?.extra?.attachments
+  const attached = Array.isArray(attachments) && attachments.some(attachment => (
+    attachment?.type === 'audio' && attachment.image_id === savedAudioId
+  ))
+  if (result.message?.id !== messageId || !savedAudioId || !attached) {
+    throw new Error('Lumiverse did not confirm the generated audio attachment on the message.')
+  }
+  return result
 }
 
 /** Force the host TTS parser to route only quoted text to character voices. */
@@ -420,9 +458,28 @@ export function setup(ctx: SpindleFrontendContext) {
   let activePlayback: {
     messageId: string
     controller: AbortController
+    synthesisController: AbortController | null
     context: AudioContext
     source: AudioBufferSourceNode | null
+    persistenceState: 'not-started' | 'pending' | 'saved' | 'failed'
+    persistenceError: string | null
+    playbackStopped: boolean
+    playbackFinished: boolean
   } | null = null
+  const backgroundSynthesisControllers = new Set<AbortController>()
+  const sharedSynthesisPacer: SynthesisPacer = { nextStartAt: 0, startQueue: Promise.resolve() }
+  const synthesisSlots: Promise<void>[] = Array.from(
+    { length: PLAYBACK_BUFFER_SEGMENTS },
+    () => Promise.resolve(),
+  )
+  let nextSynthesisSlot = 0
+
+  function runInSynthesisSlot<T>(task: () => Promise<T>): Promise<T> {
+    const slot = nextSynthesisSlot++ % synthesisSlots.length
+    const result = synthesisSlots[slot].then(task)
+    synthesisSlots[slot] = result.then(() => undefined, () => undefined)
+    return result
+  }
   const inFlight = new Set<number>()
   const characterInputs = new Map<string, SpindleTextInputHandle>()
   let lastContextMessageId: string | null = null
@@ -612,14 +669,17 @@ export function setup(ctx: SpindleFrontendContext) {
     })
   }
 
-  function stopPlayback() {
+  function stopPlayback(): boolean {
     const playback = activePlayback
     activePlayback = null
-    if (!playback) return
+    if (!playback) return false
+    playback.playbackStopped = true
     playback.controller.abort()
+    if (playback.persistenceState === 'not-started') playback.synthesisController?.abort()
     try { playback.source?.stop() } catch { /* already stopped */ }
     void playback.context.close().catch(() => undefined)
     updatePlaybackButtons()
+    return playback.persistenceState === 'pending'
   }
 
   async function playDecodedBuffer(
@@ -653,12 +713,59 @@ export function setup(ctx: SpindleFrontendContext) {
     return buffer
   }
 
+  async function encodeCapturedWav(
+    segments: SynthesizedVoiceSegment[],
+    contextClass: typeof AudioContext,
+  ): Promise<ArrayBuffer> {
+    const decodeContext = new contextClass()
+    try {
+      const decoded: AudioBuffer[] = []
+      for (const segment of segments) {
+        decoded.push(await decodeContext.decodeAudioData(segment.data.slice(0)))
+      }
+      return encodeConcatenatedWav(decoded.map(buffer => ({
+        sampleRate: buffer.sampleRate,
+        channels: Array.from(
+          { length: buffer.numberOfChannels },
+          (_, channel) => buffer.getChannelData(channel),
+        ),
+      })))
+    } finally {
+      await decodeContext.close().catch(() => undefined)
+    }
+  }
+
+  async function persistCapturedAudio(
+    chatId: string,
+    messageId: string,
+    swipeId: number | undefined,
+    segments: SynthesizedVoiceSegment[],
+    contextClass: typeof AudioContext,
+    signal: AbortSignal,
+    onWavFallback: () => void,
+  ): Promise<SavedMessageAudioResult> {
+    try {
+      return await saveMessageAudio(chatId, messageId, swipeId, segments, signal)
+    } catch (segmentSaveError) {
+      if ((segmentSaveError as { name?: string })?.name === 'AbortError') throw segmentSaveError
+      onWavFallback()
+      const wav = await encodeCapturedWav(segments, contextClass)
+      return saveMessageAudio(
+        chatId,
+        messageId,
+        swipeId,
+        [{ data: wav, mime: 'audio/wav' }],
+        signal,
+      )
+    }
+  }
+
   async function playMessage(messageId: string): Promise<void> {
     if (activePlayback) {
       const wasSameMessage = activePlayback.messageId === messageId
-      stopPlayback()
+      const finishingSave = stopPlayback()
       if (wasSameMessage) {
-        setStatus('Playback stopped.')
+        setStatus(finishingSave ? 'Playback stopped; finishing saved audio…' : 'Playback stopped.')
         return
       }
     }
@@ -695,14 +802,20 @@ export function setup(ctx: SpindleFrontendContext) {
     const playback = {
       messageId,
       controller: new AbortController(),
+      synthesisController: null as AbortController | null,
       context: audioContext,
       source: null as AudioBufferSourceNode | null,
+      persistenceState: 'not-started' as const as 'not-started' | 'pending' | 'saved' | 'failed',
+      persistenceError: null as string | null,
+      playbackStopped: false,
+      playbackFinished: false,
     }
     activePlayback = playback
     updatePlaybackButtons()
 
     try {
       const message = await requestPlaybackMessage(playbackChat.id, messageId)
+      if (playback.controller.signal.aborted) throw new DOMException('Playback stopped.', 'AbortError')
       if (message.is_user) throw new Error('Custom voice playback is only available for character messages.')
       const explicitId = typeof message.extra?.character_id === 'string' ? message.extra.character_id : ''
       const messageName = normalizeSpeakerName(message.name).toLowerCase()
@@ -727,74 +840,122 @@ export function setup(ctx: SpindleFrontendContext) {
       }))
       if (plan.length === 0) throw new Error('This message has no playable narration or dialogue.')
 
-      const pacer: SynthesisPacer = { nextStartAt: 0, startQueue: Promise.resolve() }
-      type PreparedSegment = { segment: SynthesizedVoiceSegment; error?: never } | { segment?: never; error: unknown }
+      const synthesisController = new AbortController()
+      playback.synthesisController = synthesisController
+      backgroundSynthesisControllers.add(synthesisController)
+      type PreparedSegment =
+        | { ok: true; segment: SynthesizedVoiceSegment }
+        | { ok: false; error: unknown }
       const prepare = async (index: number): Promise<PreparedSegment> => {
         try {
-          const segment = await synthesizeVoiceSegment(
+          const segment = await runInSynthesisSlot(() => synthesizeVoiceSegment(
             connectionId,
             plan[index].text,
             plan[index].voice,
             preferences.speed,
-            playback.controller.signal,
-            pacer,
-            (delayMs, retry) => setStatus(
-              `Rate limited; retry ${retry} in ${Math.max(1, Math.ceil(delayMs / 1_000))}s…`,
-            ),
-          )
-          return { segment }
+            synthesisController.signal,
+            sharedSynthesisPacer,
+            (delayMs, retry) => {
+              if (ctx.getActiveChat().chatId === playbackChat.id && (!activePlayback || activePlayback === playback)) {
+                setStatus(`Rate limited; retry ${retry} in ${Math.max(1, Math.ceil(delayMs / 1_000))}s…`)
+              }
+            },
+          ))
+          return { ok: true, segment }
         } catch (error) {
-          return { error }
+          return { ok: false, error }
         }
       }
 
-      const prepared = new Map<number, Promise<PreparedSegment>>()
-      const schedule = (index: number) => {
-        if (index < plan.length && !prepared.has(index)) prepared.set(index, prepare(index))
+      const preparedResolvers: Array<(value: PreparedSegment) => void> = []
+      const prepared = plan.map(() => new Promise<PreparedSegment>((resolve) => {
+        preparedResolvers.push(resolve)
+      }))
+      let synthesisCursor = 0
+      const runSynthesisWorker = async () => {
+        while (true) {
+          const index = synthesisCursor++
+          if (index >= plan.length) return
+          preparedResolvers[index](await prepare(index))
+        }
       }
+      const workerCount = Math.min(PLAYBACK_BUFFER_SEGMENTS, plan.length)
+      for (let index = 0; index < workerCount; index += 1) void runSynthesisWorker()
+      playback.persistenceState = 'pending'
+
+      void Promise.all(prepared).then(async (results) => {
+        const failed = results.find((result): result is { ok: false; error: unknown } => !result.ok)
+        if (failed) throw failed.error
+        const captured = results.filter(
+          (result): result is { ok: true; segment: SynthesizedVoiceSegment } => result.ok,
+        ).map(result => ({
+          data: result.segment.data.slice(0),
+          mime: result.segment.mime,
+        }))
+        const saved = await persistCapturedAudio(
+          playbackChat.id,
+          messageId,
+          message.swipe_id,
+          captured,
+          contextClass,
+          synthesisController.signal,
+          () => {
+            if (ctx.getActiveChat().chatId === playbackChat.id && (!activePlayback || activePlayback === playback)) {
+              setStatus('Server could not combine the source audio; retrying as WAV…')
+            }
+          },
+        )
+        playback.persistenceState = 'saved'
+        console.info('[Chat Voice] Saved generated message audio.', {
+          messageId,
+          swipeId: saved.swipe_id,
+          audioId: saved.audio?.id,
+          mime: saved.audio?.mime_type,
+          sizeBytes: saved.audio?.size_bytes,
+          muxedWithFfmpeg: saved.muxed_with_ffmpeg,
+        })
+        if (ctx.getActiveChat().chatId === playbackChat.id && (!activePlayback || activePlayback === playback)) {
+          if (playback.playbackStopped) setStatus('Playback stopped; audio saved.', 'saved')
+          else if (playback.playbackFinished) setStatus('Playback complete and audio saved.', 'saved')
+        }
+      }).catch((error) => {
+        playback.persistenceState = 'failed'
+        playback.persistenceError = error instanceof Error ? error.message : 'Unknown save error.'
+        if (
+          (error as { name?: string })?.name !== 'AbortError'
+          && ctx.getActiveChat().chatId === playbackChat.id
+          && (!activePlayback || activePlayback === playback)
+          && (playback.playbackStopped || playback.playbackFinished)
+        ) {
+          setStatus(`Audio could not be saved: ${playback.persistenceError}`, 'error')
+        }
+      }).finally(() => {
+        backgroundSynthesisControllers.delete(synthesisController)
+      })
+
       const initialBufferSize = Math.min(PLAYBACK_BUFFER_SEGMENTS, plan.length)
-      for (let index = 0; index < initialBufferSize; index += 1) schedule(index)
       setStatus(
         `Buffering ${initialBufferSize} voice segment${initialBufferSize === 1 ? '' : 's'} before playback…`,
       )
-      await Promise.all(prepared.values())
+      await Promise.all(prepared.slice(0, initialBufferSize))
 
-      const decoded = new Array<AudioBuffer>(plan.length)
       for (let index = 0; index < plan.length; index += 1) {
-        const current = await prepared.get(index)!
-        prepared.delete(index)
-        if ('error' in current) throw current.error
-        schedule(index + PLAYBACK_BUFFER_SEGMENTS)
+        const current = await prepared[index]
+        if (!current.ok) throw current.error
         setStatus(`Playing ${index + 1} of ${plan.length} voice segment${plan.length === 1 ? '' : 's'}…`)
-        decoded[index] = await playDecodedBuffer(playback, current.segment.data, preferences.volume)
+        await playDecodedBuffer(playback, current.segment.data, preferences.volume)
       }
+      playback.playbackFinished = true
       if (activePlayback === playback) {
         activePlayback = null
         updatePlaybackButtons()
         await playback.context.close().catch(() => undefined)
       }
-      const wav = encodeConcatenatedWav(decoded.map(buffer => ({
-        sampleRate: buffer.sampleRate,
-        channels: Array.from(
-          { length: buffer.numberOfChannels },
-          (_, channel) => buffer.getChannelData(channel),
-        ),
-      })))
-      setStatus('Playback complete. Saving generated audio…')
-      try {
-        await saveMessageAudio(
-          playbackChat.id,
-          messageId,
-          message.swipe_id,
-          [{ data: wav, mime: 'audio/wav' }],
-          playback.controller.signal,
-        )
-        setStatus('Playback complete and audio saved.', 'saved')
-      } catch (error) {
-        if ((error as { name?: string })?.name === 'AbortError') throw error
-        const detail = error instanceof Error ? error.message : 'Unknown save error.'
-        setStatus(`Playback completed, but its audio could not be saved: ${detail}`, 'error')
-      }
+      const persistenceState = playback.persistenceState as 'not-started' | 'pending' | 'saved' | 'failed'
+      if (persistenceState === 'saved') setStatus('Playback complete and audio saved.', 'saved')
+      else if (persistenceState === 'failed') {
+        setStatus(`Playback completed, but its audio could not be saved: ${playback.persistenceError}`, 'error')
+      } else setStatus('Playback complete; finishing saved audio…')
     } catch (error) {
       if ((error as { name?: string })?.name !== 'AbortError') {
         setStatus(error instanceof Error ? error.message : 'Custom voice playback failed.', 'error')
@@ -1168,6 +1329,8 @@ export function setup(ctx: SpindleFrontendContext) {
 
   return () => {
     stopPlayback()
+    for (const controller of backgroundSynthesisControllers) controller.abort()
+    backgroundSynthesisControllers.clear()
     flushSave()
     if (saveTimer) clearTimeout(saveTimer)
     unsubscribeActivate()

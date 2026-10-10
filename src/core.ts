@@ -751,6 +751,115 @@ function inferQuotedSpeaker(
     : { speakerId: defaultSpeakerId, confident: false, source: 'fallback' }
 }
 
+interface PlaybackParagraph {
+  start: number
+  end: number
+  text: string
+}
+
+function playbackParagraphs(content: string): PlaybackParagraph[] {
+  const paragraphs: PlaybackParagraph[] = []
+  let cursor = 0
+  for (const separator of content.matchAll(/\n[^\S\n]*\n/gu)) {
+    if (separator.index === undefined) continue
+    const text = content.slice(cursor, separator.index)
+    if (text.trim()) paragraphs.push({ start: cursor, end: separator.index, text })
+    cursor = separator.index + separator[0].length
+  }
+  const text = content.slice(cursor)
+  if (text.trim()) paragraphs.push({ start: cursor, end: content.length, text })
+  return paragraphs
+}
+
+function paragraphDialogueTurns(
+  content: string,
+  speakers: CharacterLike[],
+  defaultSpeakerId: string | null,
+): Map<number, string> {
+  const turns = new Map<number, string>()
+  const paragraphs = playbackParagraphs(content)
+  let pair: [string, string] | null = null
+  let previousStrongSpeakerId: string | null = null
+  let lastTurnSpeakerId: string | null = null
+
+  for (let paragraphIndex = 0; paragraphIndex < paragraphs.length; paragraphIndex++) {
+    const paragraph = paragraphs[paragraphIndex]
+    const quoteMatches = [...paragraph.text.matchAll(/["“]([\s\S]*?)["”]/gu)]
+    if (quoteMatches.length === 0) {
+      const narration = cleanPlaybackText(paragraph.text)
+      const transparentBeat = narration.length <= 120
+        && !hasSpeakerMentions(mentionedSpeakers(paragraph.text, speakers))
+      if (!transparentBeat) {
+        pair = null
+        previousStrongSpeakerId = null
+        lastTurnSpeakerId = null
+      }
+      continue
+    }
+
+    const explicitSpeakerIds = new Set<string>()
+    const initialHistorySpeakerIds = new Set<string>()
+    for (const match of quoteMatches) {
+      if (match.index === undefined) continue
+      const quoteStart = paragraph.start + match.index
+      const quoteEnd = quoteStart + match[0].length
+      const inference = inferQuotedSpeaker(
+        content.slice(0, quoteStart),
+        content.slice(quoteEnd),
+        match[1] ?? '',
+        speakers,
+        defaultSpeakerId,
+      )
+      if (inference.source === 'explicit' && inference.speakerId) {
+        explicitSpeakerIds.add(inference.speakerId)
+      } else if (
+        !pair
+        && !previousStrongSpeakerId
+        && inference.source === 'history'
+        && inference.confident
+        && inference.speakerId
+      ) {
+        initialHistorySpeakerIds.add(inference.speakerId)
+      }
+    }
+
+    if (explicitSpeakerIds.size > 1) {
+      pair = null
+      previousStrongSpeakerId = null
+      lastTurnSpeakerId = null
+      continue
+    }
+
+    const explicitSpeakerId = explicitSpeakerIds.size === 1 ? [...explicitSpeakerIds][0] : null
+    const initialHistorySpeakerId = initialHistorySpeakerIds.size === 1
+      ? [...initialHistorySpeakerIds][0]
+      : null
+    const localSpeakerId = explicitSpeakerId
+      ?? soleMentionedSpeaker(paragraph.text, speakers)
+      ?? initialHistorySpeakerId
+    if (localSpeakerId) {
+      if (pair && !pair.includes(localSpeakerId)) pair = null
+      if (!pair && previousStrongSpeakerId && previousStrongSpeakerId !== localSpeakerId) {
+        pair = [previousStrongSpeakerId, localSpeakerId]
+      }
+      previousStrongSpeakerId = localSpeakerId
+      lastTurnSpeakerId = localSpeakerId
+      continue
+    }
+
+    if (pair && lastTurnSpeakerId && pair.includes(lastTurnSpeakerId)) {
+      const alternatingSpeakerId: string = pair[0] === lastTurnSpeakerId ? pair[1] : pair[0]
+      turns.set(paragraphIndex, alternatingSpeakerId)
+      lastTurnSpeakerId = alternatingSpeakerId
+    } else {
+      previousStrongSpeakerId = null
+      lastTurnSpeakerId = null
+    }
+  }
+
+  return turns
+}
+
 function canContinueSpeaker(
   bridge: string,
   previousSpeakerId: string,
@@ -775,11 +884,17 @@ export function parseRosterVoiceSegments(
   const playbackContent = stripPlaybackMarkup(content)
   const result: PlaybackSegment[] = []
   const quotePattern = /["“]([\s\S]*?)["”]/g
+  const paragraphs = playbackParagraphs(playbackContent)
+  const dialogueTurns = paragraphDialogueTurns(playbackContent, speakers, defaultSpeakerId)
+  let paragraphIndex = 0
   let cursor = 0
   let lastConfidentSpeakerId: string | null = null
   let lastAssignedSpeakerId: string | null = null
   for (const match of playbackContent.matchAll(quotePattern)) {
     if (match.index === undefined) continue
+    while (paragraphIndex + 1 < paragraphs.length && match.index >= paragraphs[paragraphIndex].end) {
+      paragraphIndex += 1
+    }
     const bridge = playbackContent.slice(cursor, match.index)
     const narration = cleanPlaybackText(bridge)
     if (narration) result.push({ text: narration, speakerId: null })
@@ -799,7 +914,13 @@ export function parseRosterVoiceSegments(
         && canContinueSpeaker(bridge, continuationCandidate, speakers)
         ? continuationCandidate
         : null
-      const speakerId: string | null = continuedSpeakerId ?? inference.speakerId
+      const dialogueTurnSpeakerId = dialogueTurns.get(paragraphIndex) ?? null
+      const inferredTurnSpeakerId = (inference.source === 'history' || inference.source === 'fallback')
+        ? dialogueTurnSpeakerId
+        : null
+      const speakerId: string | null = inferredTurnSpeakerId
+        ?? continuedSpeakerId
+        ?? inference.speakerId
       result.push({
         text: speech,
         speakerId,

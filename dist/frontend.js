@@ -256,6 +256,86 @@ function inferQuotedSpeaker(before, after, quotedText, speakers, defaultSpeakerI
   const paragraphSpeakerId = precedingParagraphSpeaker(before, speakers);
   return paragraphSpeakerId ? { speakerId: paragraphSpeakerId, confident: true, source: "history" } : { speakerId: defaultSpeakerId, confident: false, source: "fallback" };
 }
+function playbackParagraphs(content) {
+  const paragraphs = [];
+  let cursor = 0;
+  for (const separator of content.matchAll(/\n[^\S\n]*\n/gu)) {
+    if (separator.index === void 0) continue;
+    const text2 = content.slice(cursor, separator.index);
+    if (text2.trim()) paragraphs.push({ start: cursor, end: separator.index, text: text2 });
+    cursor = separator.index + separator[0].length;
+  }
+  const text = content.slice(cursor);
+  if (text.trim()) paragraphs.push({ start: cursor, end: content.length, text });
+  return paragraphs;
+}
+function paragraphDialogueTurns(content, speakers, defaultSpeakerId) {
+  const turns = /* @__PURE__ */ new Map();
+  const paragraphs = playbackParagraphs(content);
+  let pair = null;
+  let previousStrongSpeakerId = null;
+  let lastTurnSpeakerId = null;
+  for (let paragraphIndex = 0; paragraphIndex < paragraphs.length; paragraphIndex++) {
+    const paragraph = paragraphs[paragraphIndex];
+    const quoteMatches = [...paragraph.text.matchAll(/["“]([\s\S]*?)["”]/gu)];
+    if (quoteMatches.length === 0) {
+      const narration = cleanPlaybackText(paragraph.text);
+      const transparentBeat = narration.length <= 120 && !hasSpeakerMentions(mentionedSpeakers(paragraph.text, speakers));
+      if (!transparentBeat) {
+        pair = null;
+        previousStrongSpeakerId = null;
+        lastTurnSpeakerId = null;
+      }
+      continue;
+    }
+    const explicitSpeakerIds = /* @__PURE__ */ new Set();
+    const initialHistorySpeakerIds = /* @__PURE__ */ new Set();
+    for (const match of quoteMatches) {
+      if (match.index === void 0) continue;
+      const quoteStart = paragraph.start + match.index;
+      const quoteEnd = quoteStart + match[0].length;
+      const inference = inferQuotedSpeaker(
+        content.slice(0, quoteStart),
+        content.slice(quoteEnd),
+        match[1] ?? "",
+        speakers,
+        defaultSpeakerId
+      );
+      if (inference.source === "explicit" && inference.speakerId) {
+        explicitSpeakerIds.add(inference.speakerId);
+      } else if (!pair && !previousStrongSpeakerId && inference.source === "history" && inference.confident && inference.speakerId) {
+        initialHistorySpeakerIds.add(inference.speakerId);
+      }
+    }
+    if (explicitSpeakerIds.size > 1) {
+      pair = null;
+      previousStrongSpeakerId = null;
+      lastTurnSpeakerId = null;
+      continue;
+    }
+    const explicitSpeakerId = explicitSpeakerIds.size === 1 ? [...explicitSpeakerIds][0] : null;
+    const initialHistorySpeakerId = initialHistorySpeakerIds.size === 1 ? [...initialHistorySpeakerIds][0] : null;
+    const localSpeakerId = explicitSpeakerId ?? soleMentionedSpeaker(paragraph.text, speakers) ?? initialHistorySpeakerId;
+    if (localSpeakerId) {
+      if (pair && !pair.includes(localSpeakerId)) pair = null;
+      if (!pair && previousStrongSpeakerId && previousStrongSpeakerId !== localSpeakerId) {
+        pair = [previousStrongSpeakerId, localSpeakerId];
+      }
+      previousStrongSpeakerId = localSpeakerId;
+      lastTurnSpeakerId = localSpeakerId;
+      continue;
+    }
+    if (pair && lastTurnSpeakerId && pair.includes(lastTurnSpeakerId)) {
+      const alternatingSpeakerId = pair[0] === lastTurnSpeakerId ? pair[1] : pair[0];
+      turns.set(paragraphIndex, alternatingSpeakerId);
+      lastTurnSpeakerId = alternatingSpeakerId;
+    } else {
+      previousStrongSpeakerId = null;
+      lastTurnSpeakerId = null;
+    }
+  }
+  return turns;
+}
 function canContinueSpeaker(bridge, previousSpeakerId, speakers) {
   if (/\n\s*\n/u.test(bridge)) return false;
   for (const speaker of speakers) {
@@ -271,11 +351,17 @@ function parseRosterVoiceSegments(content, defaultSpeakerId, speakers) {
   const playbackContent = stripPlaybackMarkup(content);
   const result = [];
   const quotePattern = /["“]([\s\S]*?)["”]/g;
+  const paragraphs = playbackParagraphs(playbackContent);
+  const dialogueTurns = paragraphDialogueTurns(playbackContent, speakers, defaultSpeakerId);
+  let paragraphIndex = 0;
   let cursor = 0;
   let lastConfidentSpeakerId = null;
   let lastAssignedSpeakerId = null;
   for (const match of playbackContent.matchAll(quotePattern)) {
     if (match.index === void 0) continue;
+    while (paragraphIndex + 1 < paragraphs.length && match.index >= paragraphs[paragraphIndex].end) {
+      paragraphIndex += 1;
+    }
     const bridge = playbackContent.slice(cursor, match.index);
     const narration2 = cleanPlaybackText(bridge);
     if (narration2) result.push({ text: narration2, speakerId: null });
@@ -291,7 +377,9 @@ function parseRosterVoiceSegments(content, defaultSpeakerId, speakers) {
       );
       const continuationCandidate = lastAssignedSpeakerId ?? lastConfidentSpeakerId;
       const continuedSpeakerId = inference.source === "fallback" && continuationCandidate && canContinueSpeaker(bridge, continuationCandidate, speakers) ? continuationCandidate : null;
-      const speakerId = continuedSpeakerId ?? inference.speakerId;
+      const dialogueTurnSpeakerId = dialogueTurns.get(paragraphIndex) ?? null;
+      const inferredTurnSpeakerId = inference.source === "history" || inference.source === "fallback" ? dialogueTurnSpeakerId : null;
+      const speakerId = inferredTurnSpeakerId ?? continuedSpeakerId ?? inference.speakerId;
       result.push({
         text: speech,
         speakerId
@@ -430,10 +518,28 @@ async function saveMessageAudio(chatId, messageId, swipeId, segments, signal) {
     signal,
     body: form
   });
+  const responseText = await response.text();
   if (!response.ok) {
-    const body = await response.json().catch(() => null);
+    let body = null;
+    try {
+      body = JSON.parse(responseText);
+    } catch {
+    }
     throw new Error(body?.error || `Could not save generated audio (${response.status}).`);
   }
+  let result;
+  try {
+    result = JSON.parse(responseText);
+  } catch {
+    throw new Error("Lumiverse returned an invalid response after saving generated audio.");
+  }
+  const savedAudioId = result.audio?.id;
+  const attachments = result.message?.extra?.attachments;
+  const attached = Array.isArray(attachments) && attachments.some((attachment) => attachment?.type === "audio" && attachment.image_id === savedAudioId);
+  if (result.message?.id !== messageId || !savedAudioId || !attached) {
+    throw new Error("Lumiverse did not confirm the generated audio attachment on the message.");
+  }
+  return result;
 }
 async function ensureQuotationRouting() {
   const response = await fetch("/api/v1/settings/voiceSettings", {
@@ -593,6 +699,19 @@ function setup(ctx) {
   let dirty = false;
   let scanning = false;
   let activePlayback = null;
+  const backgroundSynthesisControllers = /* @__PURE__ */ new Set();
+  const sharedSynthesisPacer = { nextStartAt: 0, startQueue: Promise.resolve() };
+  const synthesisSlots = Array.from(
+    { length: PLAYBACK_BUFFER_SEGMENTS },
+    () => Promise.resolve()
+  );
+  let nextSynthesisSlot = 0;
+  function runInSynthesisSlot(task) {
+    const slot = nextSynthesisSlot++ % synthesisSlots.length;
+    const result = synthesisSlots[slot].then(task);
+    synthesisSlots[slot] = result.then(() => void 0, () => void 0);
+    return result;
+  }
   const inFlight = /* @__PURE__ */ new Set();
   const characterInputs = /* @__PURE__ */ new Map();
   let lastContextMessageId = null;
@@ -760,14 +879,17 @@ function setup(ctx) {
   function stopPlayback() {
     const playback = activePlayback;
     activePlayback = null;
-    if (!playback) return;
+    if (!playback) return false;
+    playback.playbackStopped = true;
     playback.controller.abort();
+    if (playback.persistenceState === "not-started") playback.synthesisController?.abort();
     try {
       playback.source?.stop();
     } catch {
     }
     void playback.context.close().catch(() => void 0);
     updatePlaybackButtons();
+    return playback.persistenceState === "pending";
   }
   async function playDecodedBuffer(playback, data, volume) {
     if (playback.controller.signal.aborted) throw new DOMException("Playback stopped.", "AbortError");
@@ -798,12 +920,46 @@ function setup(ctx) {
     });
     return buffer;
   }
+  async function encodeCapturedWav(segments, contextClass) {
+    const decodeContext = new contextClass();
+    try {
+      const decoded = [];
+      for (const segment of segments) {
+        decoded.push(await decodeContext.decodeAudioData(segment.data.slice(0)));
+      }
+      return encodeConcatenatedWav(decoded.map((buffer) => ({
+        sampleRate: buffer.sampleRate,
+        channels: Array.from(
+          { length: buffer.numberOfChannels },
+          (_, channel) => buffer.getChannelData(channel)
+        )
+      })));
+    } finally {
+      await decodeContext.close().catch(() => void 0);
+    }
+  }
+  async function persistCapturedAudio(chatId, messageId, swipeId, segments, contextClass, signal, onWavFallback) {
+    try {
+      return await saveMessageAudio(chatId, messageId, swipeId, segments, signal);
+    } catch (segmentSaveError) {
+      if (segmentSaveError?.name === "AbortError") throw segmentSaveError;
+      onWavFallback();
+      const wav = await encodeCapturedWav(segments, contextClass);
+      return saveMessageAudio(
+        chatId,
+        messageId,
+        swipeId,
+        [{ data: wav, mime: "audio/wav" }],
+        signal
+      );
+    }
+  }
   async function playMessage(messageId) {
     if (activePlayback) {
       const wasSameMessage = activePlayback.messageId === messageId;
-      stopPlayback();
+      const finishingSave = stopPlayback();
       if (wasSameMessage) {
-        setStatus("Playback stopped.");
+        setStatus(finishingSave ? "Playback stopped; finishing saved audio\u2026" : "Playback stopped.");
         return;
       }
     }
@@ -836,13 +992,19 @@ function setup(ctx) {
     const playback = {
       messageId,
       controller: new AbortController(),
+      synthesisController: null,
       context: audioContext,
-      source: null
+      source: null,
+      persistenceState: "not-started",
+      persistenceError: null,
+      playbackStopped: false,
+      playbackFinished: false
     };
     activePlayback = playback;
     updatePlaybackButtons();
     try {
       const message = await requestPlaybackMessage(playbackChat.id, messageId);
+      if (playback.controller.signal.aborted) throw new DOMException("Playback stopped.", "AbortError");
       if (message.is_user) throw new Error("Custom voice playback is only available for character messages.");
       const explicitId = typeof message.extra?.character_id === "string" ? message.extra.character_id : "";
       const messageName = normalizeSpeakerName(message.name).toLowerCase();
@@ -857,71 +1019,110 @@ function setup(ctx) {
         return { text: segment.text, voice };
       }));
       if (plan.length === 0) throw new Error("This message has no playable narration or dialogue.");
-      const pacer = { nextStartAt: 0, startQueue: Promise.resolve() };
+      const synthesisController = new AbortController();
+      playback.synthesisController = synthesisController;
+      backgroundSynthesisControllers.add(synthesisController);
       const prepare = async (index) => {
         try {
-          const segment = await synthesizeVoiceSegment(
+          const segment = await runInSynthesisSlot(() => synthesizeVoiceSegment(
             connectionId,
             plan[index].text,
             plan[index].voice,
             preferences.speed,
-            playback.controller.signal,
-            pacer,
-            (delayMs, retry) => setStatus(
-              `Rate limited; retry ${retry} in ${Math.max(1, Math.ceil(delayMs / 1e3))}s\u2026`
-            )
-          );
-          return { segment };
+            synthesisController.signal,
+            sharedSynthesisPacer,
+            (delayMs, retry) => {
+              if (ctx.getActiveChat().chatId === playbackChat.id && (!activePlayback || activePlayback === playback)) {
+                setStatus(`Rate limited; retry ${retry} in ${Math.max(1, Math.ceil(delayMs / 1e3))}s\u2026`);
+              }
+            }
+          ));
+          return { ok: true, segment };
         } catch (error) {
-          return { error };
+          return { ok: false, error };
         }
       };
-      const prepared = /* @__PURE__ */ new Map();
-      const schedule = (index) => {
-        if (index < plan.length && !prepared.has(index)) prepared.set(index, prepare(index));
+      const preparedResolvers = [];
+      const prepared = plan.map(() => new Promise((resolve) => {
+        preparedResolvers.push(resolve);
+      }));
+      let synthesisCursor = 0;
+      const runSynthesisWorker = async () => {
+        while (true) {
+          const index = synthesisCursor++;
+          if (index >= plan.length) return;
+          preparedResolvers[index](await prepare(index));
+        }
       };
+      const workerCount = Math.min(PLAYBACK_BUFFER_SEGMENTS, plan.length);
+      for (let index = 0; index < workerCount; index += 1) void runSynthesisWorker();
+      playback.persistenceState = "pending";
+      void Promise.all(prepared).then(async (results) => {
+        const failed = results.find((result) => !result.ok);
+        if (failed) throw failed.error;
+        const captured = results.filter(
+          (result) => result.ok
+        ).map((result) => ({
+          data: result.segment.data.slice(0),
+          mime: result.segment.mime
+        }));
+        const saved = await persistCapturedAudio(
+          playbackChat.id,
+          messageId,
+          message.swipe_id,
+          captured,
+          contextClass,
+          synthesisController.signal,
+          () => {
+            if (ctx.getActiveChat().chatId === playbackChat.id && (!activePlayback || activePlayback === playback)) {
+              setStatus("Server could not combine the source audio; retrying as WAV\u2026");
+            }
+          }
+        );
+        playback.persistenceState = "saved";
+        console.info("[Chat Voice] Saved generated message audio.", {
+          messageId,
+          swipeId: saved.swipe_id,
+          audioId: saved.audio?.id,
+          mime: saved.audio?.mime_type,
+          sizeBytes: saved.audio?.size_bytes,
+          muxedWithFfmpeg: saved.muxed_with_ffmpeg
+        });
+        if (ctx.getActiveChat().chatId === playbackChat.id && (!activePlayback || activePlayback === playback)) {
+          if (playback.playbackStopped) setStatus("Playback stopped; audio saved.", "saved");
+          else if (playback.playbackFinished) setStatus("Playback complete and audio saved.", "saved");
+        }
+      }).catch((error) => {
+        playback.persistenceState = "failed";
+        playback.persistenceError = error instanceof Error ? error.message : "Unknown save error.";
+        if (error?.name !== "AbortError" && ctx.getActiveChat().chatId === playbackChat.id && (!activePlayback || activePlayback === playback) && (playback.playbackStopped || playback.playbackFinished)) {
+          setStatus(`Audio could not be saved: ${playback.persistenceError}`, "error");
+        }
+      }).finally(() => {
+        backgroundSynthesisControllers.delete(synthesisController);
+      });
       const initialBufferSize = Math.min(PLAYBACK_BUFFER_SEGMENTS, plan.length);
-      for (let index = 0; index < initialBufferSize; index += 1) schedule(index);
       setStatus(
         `Buffering ${initialBufferSize} voice segment${initialBufferSize === 1 ? "" : "s"} before playback\u2026`
       );
-      await Promise.all(prepared.values());
-      const decoded = new Array(plan.length);
+      await Promise.all(prepared.slice(0, initialBufferSize));
       for (let index = 0; index < plan.length; index += 1) {
-        const current = await prepared.get(index);
-        prepared.delete(index);
-        if ("error" in current) throw current.error;
-        schedule(index + PLAYBACK_BUFFER_SEGMENTS);
+        const current = await prepared[index];
+        if (!current.ok) throw current.error;
         setStatus(`Playing ${index + 1} of ${plan.length} voice segment${plan.length === 1 ? "" : "s"}\u2026`);
-        decoded[index] = await playDecodedBuffer(playback, current.segment.data, preferences.volume);
+        await playDecodedBuffer(playback, current.segment.data, preferences.volume);
       }
+      playback.playbackFinished = true;
       if (activePlayback === playback) {
         activePlayback = null;
         updatePlaybackButtons();
         await playback.context.close().catch(() => void 0);
       }
-      const wav = encodeConcatenatedWav(decoded.map((buffer) => ({
-        sampleRate: buffer.sampleRate,
-        channels: Array.from(
-          { length: buffer.numberOfChannels },
-          (_, channel) => buffer.getChannelData(channel)
-        )
-      })));
-      setStatus("Playback complete. Saving generated audio\u2026");
-      try {
-        await saveMessageAudio(
-          playbackChat.id,
-          messageId,
-          message.swipe_id,
-          [{ data: wav, mime: "audio/wav" }],
-          playback.controller.signal
-        );
-        setStatus("Playback complete and audio saved.", "saved");
-      } catch (error) {
-        if (error?.name === "AbortError") throw error;
-        const detail = error instanceof Error ? error.message : "Unknown save error.";
-        setStatus(`Playback completed, but its audio could not be saved: ${detail}`, "error");
-      }
+      const persistenceState = playback.persistenceState;
+      if (persistenceState === "saved") setStatus("Playback complete and audio saved.", "saved");
+      else if (persistenceState === "failed") {
+        setStatus(`Playback completed, but its audio could not be saved: ${playback.persistenceError}`, "error");
+      } else setStatus("Playback complete; finishing saved audio\u2026");
     } catch (error) {
       if (error?.name !== "AbortError") {
         setStatus(error instanceof Error ? error.message : "Custom voice playback failed.", "error");
@@ -1257,6 +1458,8 @@ function setup(ctx) {
   refreshLocalState();
   return () => {
     stopPlayback();
+    for (const controller of backgroundSynthesisControllers) controller.abort();
+    backgroundSynthesisControllers.clear();
     flushSave();
     if (saveTimer) clearTimeout(saveTimer);
     unsubscribeActivate();

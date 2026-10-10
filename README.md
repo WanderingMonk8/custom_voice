@@ -15,12 +15,14 @@ A [Lumiverse Spindle](https://docs.lumiverse.chat/) extension that detects chara
 - Routes quoted text to the speaking character and text outside quotations to the narrator.
 - Carries a confidently identified speaker across same-paragraph narration for later unattributed quotes, unless another roster character is introduced.
 - Resolves multi-character paragraphs with confidence-scored main-clause subject detection while discounting objects, passive agents, possessives, and subordinate references.
+- Recognizes confidently seeded two-character dialogue chains and alternates otherwise unattributed back-to-back speech turns.
 - Routes Lumiverse's native message TTS button through ordered multi-voice playback.
 - Overrides the matching native context-menu action instead of adding duplicate playback controls.
 - Merges adjacent same-voice passages within each paragraph, splits multi-paragraph passages into smaller requests, and maintains a four-segment rolling playback buffer to avoid gaps and API bursts.
 - Paces request starts and automatically honors `Retry-After` when a TTS provider responds with HTTP 429.
 - Uses Lumiverse's selected TTS connection, falling back to the profile marked as the default, when a chat has no saved connection.
-- Combines successful multi-voice playback into one browser-generated WAV and saves it as a native Lumiverse audio attachment for the active message swipe, without requiring server-side FFmpeg.
+- Saves the exact synthesized custom-voice segments as a native Lumiverse audio attachment for the active message swipe, with a browser-generated WAV fallback when the server cannot mux their source formats.
+- Continues bounded background synthesis and saves the complete recording even when audible playback is stopped early.
 - Removes HTML/escaped tags and Markdown emphasis markers before sending readable text to TTS.
 - Auto-saves every setting to the current chat.
 - Saves the detected cast and reloads it with the correct settings whenever the active chat changes.

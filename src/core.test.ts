@@ -497,6 +497,65 @@ test('does not let a nearby secondary name override the paragraph subject for on
   )
 })
 
+test('alternates unresolved turns in a confidently seeded dialogue chain', () => {
+  const segments = parseRosterVoiceSegments(
+    '"It is working, but hear me first," Alma called down. "Receiving is clean."\n\n"One hop reaches who?" Vahn said.\n\n"The repeater broadcasts what it receives. A reply takes a person on the other end." A pause. "So we can send two sentences before going mute."\n\n"Then I understand."',
+    'card',
+    [{ id: 'alma', name: 'Alma' }, { id: 'vahn', name: 'Vahn' }],
+  )
+  assert.deepEqual(segments.filter(segment => segment.speakerId !== null), [
+    { text: 'It is working, but hear me first,', speakerId: 'alma' },
+    { text: 'Receiving is clean.', speakerId: 'alma' },
+    { text: 'One hop reaches who?', speakerId: 'vahn' },
+    {
+      text: 'The repeater broadcasts what it receives. A reply takes a person on the other end.',
+      speakerId: 'alma',
+    },
+    { text: 'So we can send two sentences before going mute.', speakerId: 'alma' },
+    { text: 'Then I understand.', speakerId: 'vahn' },
+  ])
+})
+
+test('seeds a dialogue chain from a confidently inherited speaker before a named reply', () => {
+  const segments = parseRosterVoiceSegments(
+    '"Do not talk," Alma called down. Not to anyone.\n\nThe yard obeyed. Frost ticked on the tarp ropes. Somewhere behind the pile of roped crates a civilian shifted in his blanket and stopped himself.\n\nThen Alma\'s good hand came down over the rail and made a shape in the lantern light: hold, hold, hold.\n\n"Logistics net, same as before," she said, finally. "But it is not fragments anymore. Somebody up the line is running an open schedule."\n\nVahn came off the pump. "Which posts still talk."\n\n"Seven through 14. We are eleven. So the order is addressed to us." Her voice thinned at the edges. "Nobody accuses me later of sugar."',
+    'card',
+    [{ id: 'alma', name: 'Alma' }, { id: 'vahn', name: 'Vahn' }],
+  )
+  assert.deepEqual(segments.filter(segment => segment.speakerId !== null).slice(-5), [
+    { text: 'Logistics net, same as before,', speakerId: 'alma' },
+    {
+      text: 'But it is not fragments anymore. Somebody up the line is running an open schedule.',
+      speakerId: 'alma',
+    },
+    { text: 'Which posts still talk.', speakerId: 'vahn' },
+    { text: 'Seven through 14. We are eleven. So the order is addressed to us.', speakerId: 'alma' },
+    { text: 'Nobody accuses me later of sugar.', speakerId: 'alma' },
+  ])
+})
+
+test('keeps a dialogue chain across a short unnamed narrative beat', () => {
+  assert.deepEqual(
+    parseRosterVoiceSegments(
+      '"First," Alma said.\n\n"Second," Vahn replied.\n\nA pause.\n\n"Third."',
+      'card',
+      [{ id: 'alma', name: 'Alma' }, { id: 'vahn', name: 'Vahn' }],
+    ).at(-1),
+    { text: 'Third.', speakerId: 'alma' },
+  )
+})
+
+test('breaks dialogue alternation after substantive pure narration', () => {
+  assert.deepEqual(
+    parseRosterVoiceSegments(
+      '"First," Alma said.\n\n"Second," Vahn replied.\n\nThe group crossed the valley in silence while the weather worsened around them and the road disappeared beneath fresh snow for the rest of the afternoon.\n\n"Unattributed."',
+      'card',
+      [{ id: 'alma', name: 'Alma' }, { id: 'vahn', name: 'Vahn' }],
+    ).at(-1),
+    { text: 'Unattributed.', speakerId: 'vahn' },
+  )
+})
+
 test('distinguishes main subjects from objects and passive agents', () => {
   const speakers = [{ id: 'yaniko', name: 'Yaniko' }, { id: 'kansai', name: 'Kansai' }]
   for (const narration of [
