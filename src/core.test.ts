@@ -5,6 +5,7 @@ import {
   clampMessageLimit,
   detectCharacters,
   hashMessageContent,
+  mergeVoicePlan,
   npcSpeakerId,
   parseCardCast,
   parseLlmSegmentation,
@@ -13,6 +14,20 @@ import {
   readConfig,
   type ChatVoiceConfig,
 } from './core'
+
+test('merges adjacent segments that use the same voice', () => {
+  assert.deepEqual(mergeVoicePlan([
+    { text: 'First sentence.', voice: 'narrator' },
+    { text: ' Second sentence. ', voice: 'narrator' },
+    { text: 'Hello.', voice: 'alice' },
+    { text: '', voice: 'alice' },
+    { text: 'Back to narration.', voice: 'narrator' },
+  ]), [
+    { text: 'First sentence. Second sentence.', voice: 'narrator' },
+    { text: 'Hello.', voice: 'alice' },
+    { text: 'Back to narration.', voice: 'narrator' },
+  ])
+})
 
 test('clamps the configurable message window', () => {
   assert.equal(clampMessageLimit(undefined), 20)

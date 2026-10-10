@@ -67,6 +67,27 @@ export interface PlaybackSegment {
   speakerId: string | null
 }
 
+export interface VoicePlanSegment {
+  text: string
+  voice: string
+}
+
+/** Reduce TTS requests without changing playback order or voice boundaries. */
+export function mergeVoicePlan(segments: VoicePlanSegment[]): VoicePlanSegment[] {
+  const result: VoicePlanSegment[] = []
+  for (const segment of segments) {
+    const text = segment.text.trim()
+    if (!text) continue
+    const previous = result.at(-1)
+    if (previous?.voice === segment.voice) {
+      previous.text = `${previous.text} ${text}`
+    } else {
+      result.push({ text, voice: segment.voice })
+    }
+  }
+  return result
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object' && !Array.isArray(value)
 }

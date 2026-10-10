@@ -3,6 +3,7 @@ import type {
   SpindleTextInputHandle,
 } from 'lumiverse-spindle-types'
 import {
+  mergeVoicePlan,
   npcSpeakerId,
   normalizeSpeakerName,
   parseRosterVoiceSegments,
@@ -18,6 +19,13 @@ interface ConnectionPage {
   data?: TtsConnection[]
   total?: number
 }
+
+interface SynthesisPacer {
+  nextStartAt: number
+}
+
+const MIN_SYNTHESIS_START_INTERVAL_MS = 1_100
+const MAX_RATE_LIMIT_RETRIES = 3
 
 interface DetectedCharacterState {
   id: string
@@ -117,30 +125,69 @@ async function loadPlaybackPreferences(): Promise<PlaybackPreferences> {
   }
 }
 
+function abortableDelay(milliseconds: number, signal: AbortSignal): Promise<void> {
+  if (milliseconds <= 0) return Promise.resolve()
+  return new Promise((resolve, reject) => {
+    const timer = window.setTimeout(() => {
+      signal.removeEventListener('abort', abort)
+      resolve()
+    }, milliseconds)
+    const abort = () => {
+      window.clearTimeout(timer)
+      reject(new DOMException('Playback stopped.', 'AbortError'))
+    }
+    signal.addEventListener('abort', abort, { once: true })
+    if (signal.aborted) abort()
+  })
+}
+
+function retryAfterMilliseconds(value: string | null): number | null {
+  if (!value) return null
+  const seconds = Number(value)
+  if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1_000
+  const timestamp = Date.parse(value)
+  return Number.isFinite(timestamp) ? Math.max(0, timestamp - Date.now()) : null
+}
+
+async function waitForSynthesisSlot(pacer: SynthesisPacer, signal: AbortSignal): Promise<void> {
+  await abortableDelay(Math.max(0, pacer.nextStartAt - Date.now()), signal)
+  pacer.nextStartAt = Date.now() + MIN_SYNTHESIS_START_INTERVAL_MS
+}
+
 async function synthesizeVoiceSegment(
   connectionId: string,
   text: string,
   voice: string,
   speed: number,
   signal: AbortSignal,
+  pacer: SynthesisPacer,
+  onRateLimit: (delayMs: number, retry: number) => void,
 ): Promise<ArrayBuffer> {
-  const response = await fetch('/api/v1/tts/synthesize', {
-    method: 'POST',
-    credentials: 'same-origin',
-    signal,
-    headers: { 'Content-Type': 'application/json', Accept: 'audio/*' },
-    body: JSON.stringify({
-      connectionId,
-      text,
-      voice: voice || undefined,
-      parameters: { speed },
-    }),
-  })
-  if (!response.ok) {
+  for (let attempt = 0; ; attempt += 1) {
+    await waitForSynthesisSlot(pacer, signal)
+    const response = await fetch('/api/v1/tts/synthesize', {
+      method: 'POST',
+      credentials: 'same-origin',
+      signal,
+      headers: { 'Content-Type': 'application/json', Accept: 'audio/*' },
+      body: JSON.stringify({
+        connectionId,
+        text,
+        voice: voice || undefined,
+        parameters: { speed },
+      }),
+    })
+    if (response.ok) return response.arrayBuffer()
+    if (response.status === 429 && attempt < MAX_RATE_LIMIT_RETRIES) {
+      const retryDelay = retryAfterMilliseconds(response.headers.get('Retry-After'))
+        ?? Math.min(15_000, 2_000 * (2 ** attempt))
+      pacer.nextStartAt = Math.max(pacer.nextStartAt, Date.now() + retryDelay)
+      onRateLimit(retryDelay, attempt + 1)
+      continue
+    }
     const detail = await response.text().catch(() => '')
     throw new Error(detail || `TTS synthesis failed (${response.status}).`)
   }
-  return response.arrayBuffer()
 }
 
 /** Force the host TTS parser to route only quoted text to character voices. */
@@ -514,7 +561,7 @@ export function setup(ctx: SpindleFrontendContext) {
         activeChat.characters.map((character) => [npcSpeakerId(character.name), character.id] as const),
       )
       const segments = parseRosterVoiceSegments(message.content, defaultSpeakerId, activeChat.characters)
-      const plan = segments.map((segment) => {
+      const plan = mergeVoicePlan(segments.map((segment) => {
         const speakerId = segment.speakerId
           ? aliases.get(segment.speakerId) ?? segment.speakerId
           : null
@@ -522,30 +569,40 @@ export function setup(ctx: SpindleFrontendContext) {
           ? config.characterVoices[speakerId] || (defaultSpeakerId ? config.characterVoices[defaultSpeakerId] : '') || ''
           : config.narratorVoice
         return { text: segment.text, voice }
-      })
+      }))
       if (plan.length === 0) throw new Error('This message has no playable narration or dialogue.')
 
       const preferences = await loadPlaybackPreferences()
-      setStatus(`Generating ${plan.length} voice segment${plan.length === 1 ? '' : 's'}…`)
-      const buffers = new Array<ArrayBuffer>(plan.length)
-      let cursor = 0
-      const worker = async () => {
-        while (true) {
-          const index = cursor++
-          if (index >= plan.length) return
-          buffers[index] = await synthesizeVoiceSegment(
+      const pacer: SynthesisPacer = { nextStartAt: 0 }
+      type PreparedSegment = { buffer: ArrayBuffer; error?: never } | { buffer?: never; error: unknown }
+      const prepare = async (index: number): Promise<PreparedSegment> => {
+        try {
+          const buffer = await synthesizeVoiceSegment(
             config.connectionId,
             plan[index].text,
             plan[index].voice,
             preferences.speed,
             playback.controller.signal,
+            pacer,
+            (delayMs, retry) => setStatus(
+              `Rate limited; retry ${retry} in ${Math.max(1, Math.ceil(delayMs / 1_000))}s…`,
+            ),
           )
+          return { buffer }
+        } catch (error) {
+          return { error }
         }
       }
-      await Promise.all(Array.from({ length: Math.min(3, plan.length) }, () => worker()))
-      setStatus('Playing custom voices…')
-      for (const buffer of buffers) {
-        await playDecodedBuffer(playback, buffer, preferences.volume)
+
+      setStatus(`Preparing 1 of ${plan.length} voice segment${plan.length === 1 ? '' : 's'}…`)
+      let prepared = prepare(0)
+      for (let index = 0; index < plan.length; index += 1) {
+        const current = await prepared
+        if ('error' in current) throw current.error
+        const next = index + 1 < plan.length ? prepare(index + 1) : null
+        setStatus(`Playing ${index + 1} of ${plan.length} voice segment${plan.length === 1 ? '' : 's'}…`)
+        await playDecodedBuffer(playback, current.buffer, preferences.volume)
+        if (next) prepared = next
       }
       setStatus('Playback complete.', 'saved')
     } catch (error) {

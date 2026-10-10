@@ -1,4 +1,18 @@
 // src/core.ts
+function mergeVoicePlan(segments) {
+  const result = [];
+  for (const segment of segments) {
+    const text = segment.text.trim();
+    if (!text) continue;
+    const previous = result.at(-1);
+    if (previous?.voice === segment.voice) {
+      previous.text = `${previous.text} ${text}`;
+    } else {
+      result.push({ text, voice: segment.voice });
+    }
+  }
+  return result;
+}
 function normalizeSpeakerName(value) {
   return value.normalize("NFKC").trim().replace(/\s+/g, " ");
 }
@@ -67,6 +81,8 @@ function parseRosterVoiceSegments(content, defaultSpeakerId, speakers) {
 }
 
 // src/frontend.ts
+var MIN_SYNTHESIS_START_INTERVAL_MS = 1100;
+var MAX_RATE_LIMIT_RETRIES = 3;
 var VOICE_ICON = `
   <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
     <path d="M5 10v4M9 7v10M13 4v16M17 8v8M21 10v4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
@@ -106,24 +122,57 @@ async function loadPlaybackPreferences() {
     volume: Math.min(1, Math.max(0, volume))
   };
 }
-async function synthesizeVoiceSegment(connectionId, text, voice, speed, signal) {
-  const response = await fetch("/api/v1/tts/synthesize", {
-    method: "POST",
-    credentials: "same-origin",
-    signal,
-    headers: { "Content-Type": "application/json", Accept: "audio/*" },
-    body: JSON.stringify({
-      connectionId,
-      text,
-      voice: voice || void 0,
-      parameters: { speed }
-    })
+function abortableDelay(milliseconds, signal) {
+  if (milliseconds <= 0) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const timer = window.setTimeout(() => {
+      signal.removeEventListener("abort", abort);
+      resolve();
+    }, milliseconds);
+    const abort = () => {
+      window.clearTimeout(timer);
+      reject(new DOMException("Playback stopped.", "AbortError"));
+    };
+    signal.addEventListener("abort", abort, { once: true });
+    if (signal.aborted) abort();
   });
-  if (!response.ok) {
+}
+function retryAfterMilliseconds(value) {
+  if (!value) return null;
+  const seconds = Number(value);
+  if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1e3;
+  const timestamp = Date.parse(value);
+  return Number.isFinite(timestamp) ? Math.max(0, timestamp - Date.now()) : null;
+}
+async function waitForSynthesisSlot(pacer, signal) {
+  await abortableDelay(Math.max(0, pacer.nextStartAt - Date.now()), signal);
+  pacer.nextStartAt = Date.now() + MIN_SYNTHESIS_START_INTERVAL_MS;
+}
+async function synthesizeVoiceSegment(connectionId, text, voice, speed, signal, pacer, onRateLimit) {
+  for (let attempt = 0; ; attempt += 1) {
+    await waitForSynthesisSlot(pacer, signal);
+    const response = await fetch("/api/v1/tts/synthesize", {
+      method: "POST",
+      credentials: "same-origin",
+      signal,
+      headers: { "Content-Type": "application/json", Accept: "audio/*" },
+      body: JSON.stringify({
+        connectionId,
+        text,
+        voice: voice || void 0,
+        parameters: { speed }
+      })
+    });
+    if (response.ok) return response.arrayBuffer();
+    if (response.status === 429 && attempt < MAX_RATE_LIMIT_RETRIES) {
+      const retryDelay = retryAfterMilliseconds(response.headers.get("Retry-After")) ?? Math.min(15e3, 2e3 * 2 ** attempt);
+      pacer.nextStartAt = Math.max(pacer.nextStartAt, Date.now() + retryDelay);
+      onRateLimit(retryDelay, attempt + 1);
+      continue;
+    }
     const detail = await response.text().catch(() => "");
     throw new Error(detail || `TTS synthesis failed (${response.status}).`);
   }
-  return response.arrayBuffer();
 }
 async function ensureQuotationRouting() {
   const response = await fetch("/api/v1/settings/voiceSettings", {
@@ -468,33 +517,41 @@ function setup(ctx) {
         activeChat.characters.map((character) => [npcSpeakerId(character.name), character.id])
       );
       const segments = parseRosterVoiceSegments(message.content, defaultSpeakerId, activeChat.characters);
-      const plan = segments.map((segment) => {
+      const plan = mergeVoicePlan(segments.map((segment) => {
         const speakerId = segment.speakerId ? aliases.get(segment.speakerId) ?? segment.speakerId : null;
         const voice = speakerId ? config.characterVoices[speakerId] || (defaultSpeakerId ? config.characterVoices[defaultSpeakerId] : "") || "" : config.narratorVoice;
         return { text: segment.text, voice };
-      });
+      }));
       if (plan.length === 0) throw new Error("This message has no playable narration or dialogue.");
       const preferences = await loadPlaybackPreferences();
-      setStatus(`Generating ${plan.length} voice segment${plan.length === 1 ? "" : "s"}\u2026`);
-      const buffers = new Array(plan.length);
-      let cursor = 0;
-      const worker = async () => {
-        while (true) {
-          const index = cursor++;
-          if (index >= plan.length) return;
-          buffers[index] = await synthesizeVoiceSegment(
+      const pacer = { nextStartAt: 0 };
+      const prepare = async (index) => {
+        try {
+          const buffer = await synthesizeVoiceSegment(
             config.connectionId,
             plan[index].text,
             plan[index].voice,
             preferences.speed,
-            playback.controller.signal
+            playback.controller.signal,
+            pacer,
+            (delayMs, retry) => setStatus(
+              `Rate limited; retry ${retry} in ${Math.max(1, Math.ceil(delayMs / 1e3))}s\u2026`
+            )
           );
+          return { buffer };
+        } catch (error) {
+          return { error };
         }
       };
-      await Promise.all(Array.from({ length: Math.min(3, plan.length) }, () => worker()));
-      setStatus("Playing custom voices\u2026");
-      for (const buffer of buffers) {
-        await playDecodedBuffer(playback, buffer, preferences.volume);
+      setStatus(`Preparing 1 of ${plan.length} voice segment${plan.length === 1 ? "" : "s"}\u2026`);
+      let prepared = prepare(0);
+      for (let index = 0; index < plan.length; index += 1) {
+        const current = await prepared;
+        if ("error" in current) throw current.error;
+        const next = index + 1 < plan.length ? prepare(index + 1) : null;
+        setStatus(`Playing ${index + 1} of ${plan.length} voice segment${plan.length === 1 ? "" : "s"}\u2026`);
+        await playDecodedBuffer(playback, current.buffer, preferences.volume);
+        if (next) prepared = next;
       }
       setStatus("Playback complete.", "saved");
     } catch (error) {
