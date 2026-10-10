@@ -91,10 +91,9 @@ function detectCharacters(messages, candidates, messageLimit, fallbackCharacterI
   const byId = new Map(candidates.map((character) => [character.id, character]));
   const counts = /* @__PURE__ */ new Map();
   const order = [];
-  const window = messages.slice(-clampMessageLimit(messageLimit));
+  const window = messages.filter((message) => !message.is_user).slice(-clampMessageLimit(messageLimit));
   for (let index = window.length - 1; index >= 0; index--) {
     const message = window[index];
-    if (message.is_user) continue;
     const normalizedName = message.name?.trim().toLowerCase() ?? "";
     let character = normalizedName ? byName.get(normalizedName) : void 0;
     if (!character && candidates.length === 1 && fallbackCharacterId) {
@@ -283,4 +282,4 @@ spindle.onFrontendMessage(async (rawPayload, userId) => {
 spindle.on("CHAT_SWITCHED", async (_payload, userId) => {
   await sendState(userId);
 });
-spindle.log.info("Chat Voice 2.1 loaded.");
+spindle.log.info("Chat Voice 2.1.1 loaded.");

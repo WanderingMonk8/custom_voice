@@ -162,11 +162,12 @@ export function detectCharacters(
   const byId = new Map(candidates.map((character) => [character.id, character] as const))
   const counts = new Map<string, number>()
   const order: string[] = []
-  const window = messages.slice(-clampMessageLimit(messageLimit))
+  const window = messages
+    .filter((message) => !message.is_user)
+    .slice(-clampMessageLimit(messageLimit))
 
   for (let index = window.length - 1; index >= 0; index--) {
     const message = window[index]
-    if (message.is_user) continue
     const normalizedName = message.name?.trim().toLowerCase() ?? ''
     let character = normalizedName ? byName.get(normalizedName) : undefined
     if (!character && candidates.length === 1 && fallbackCharacterId) {

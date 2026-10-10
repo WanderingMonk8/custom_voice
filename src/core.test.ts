@@ -19,7 +19,9 @@ test('detects recent assistant speakers and ignores user messages', () => {
   const messages = [
     { is_user: false, name: 'Alice' },
     { is_user: false, name: 'Bob' },
-    { is_user: true, name: 'Alice' },
+    { is_user: true, name: 'User' },
+    { is_user: true, name: 'User' },
+    { is_user: true, name: 'User' },
     { is_user: false, name: 'alice' },
   ]
   const detected = detectCharacters(
@@ -29,7 +31,7 @@ test('detects recent assistant speakers and ignores user messages', () => {
     null,
   )
   assert.deepEqual(detected, [
-    { id: 'alice', name: 'Alice', messageCount: 1 },
+    { id: 'alice', name: 'Alice', messageCount: 2 },
     { id: 'bob', name: 'Bob', messageCount: 1 },
   ])
 })

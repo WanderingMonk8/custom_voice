@@ -4,7 +4,7 @@ A [Lumiverse Spindle](https://docs.lumiverse.chat/) extension that detects the c
 
 ## Features
 
-- Scans a configurable number of recent messages (20 by default, 1–500) only when you click **Scan**.
+- Scans a configurable number of recent character messages (20 by default, 1–500) only when you click **Scan**; user messages do not count toward the limit.
 - Detects participating characters from the active chat's actual message speakers.
 - Uses one shared TTS connection for the entire chat.
 - Assigns a different custom voice name or provider voice ID to every detected character.
