@@ -145,13 +145,19 @@ export function encodeConcatenatedWav(segments: PcmAudioSegment[]): ArrayBuffer 
 export function mergeVoicePlan(segments: VoicePlanSegment[]): VoicePlanSegment[] {
   const result: VoicePlanSegment[] = []
   for (const segment of segments) {
-    const text = segment.text.trim()
-    if (!text) continue
-    const previous = result.at(-1)
-    if (previous?.voice === segment.voice) {
-      previous.text = `${previous.text} ${text}`
-    } else {
-      result.push({ text, voice: segment.voice })
+    const paragraphs = segment.text
+      .trim()
+      .split(/\n\s*\n+/)
+      .map(paragraph => paragraph.replace(/\s*\n\s*/g, ' ').trim())
+      .filter(Boolean)
+    for (let index = 0; index < paragraphs.length; index += 1) {
+      const text = paragraphs[index]
+      const previous = result.at(-1)
+      if (index === 0 && previous?.voice === segment.voice) {
+        previous.text = `${previous.text} ${text}`
+      } else {
+        result.push({ text, voice: segment.voice })
+      }
     }
   }
   return result
@@ -410,6 +416,8 @@ export function extractNamedDialogue(content: string): Array<{ name: string; tex
 
 function stripPlaybackMarkup(value: string): string {
   return value
+    .replace(/&lt;\/?(?:p|div|br)(?:\s[\s\S]*?)?&gt;/gi, '\n\n')
+    .replace(/\\?<\/?(?:p|div|br)(?:\s[^>]*)?>/gi, '\n\n')
     .replace(/&lt;\/?[a-z][\s\S]*?&gt;/gi, ' ')
     .replace(/\\?<\/?[a-z][^>]*>/gi, ' ')
     .replace(/\[\/?(?:font|color|size|style|span|div|p|b|i|u|em|strong)(?:=[^\]]*)?\]/gi, ' ')
@@ -430,7 +438,10 @@ function cleanPlaybackText(value: string): string {
   return decodePlaybackEntities(stripPlaybackMarkup(value))
     .replace(/```[\s\S]*?```/g, ' ')
     .replace(/`[^`\n]*`/g, ' ')
-    .replace(/\s+/g, ' ')
+    .replace(/\r\n?/g, '\n')
+    .replace(/[^\S\n]+/g, ' ')
+    .replace(/ *\n */g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
     .trim()
 }
 
@@ -479,9 +490,22 @@ function escapedPattern(value: string): string {
 function inferQuotedSpeaker(
   before: string,
   after: string,
+  quotedText: string,
   speakers: CharacterLike[],
   defaultSpeakerId: string | null,
 ): string | null {
+  if (/[,]\s*$/u.test(quotedText)) {
+    const actionBeat = after.slice(0, 140).split(/["“\n]/u, 1)[0]
+    let nearest: { id: string; index: number } | null = null
+    for (const speaker of speakers) {
+      const name = escapedPattern(normalizeSpeakerName(speaker.name))
+      if (!name) continue
+      const index = actionBeat.search(new RegExp(`\\b${name}\\b`, 'iu'))
+      if (index >= 0 && (!nearest || index < nearest.index)) nearest = { id: speaker.id, index }
+    }
+    if (nearest) return nearest.id
+  }
+
   let best: { id: string; score: number } | null = null
   for (const speaker of speakers) {
     const name = escapedPattern(normalizeSpeakerName(speaker.name))
@@ -522,6 +546,7 @@ export function parseRosterVoiceSegments(
         speakerId: inferQuotedSpeaker(
           playbackContent.slice(0, match.index),
           playbackContent.slice(quoteEnd),
+          match[1] ?? '',
           speakers,
           defaultSpeakerId,
         ),

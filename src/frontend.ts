@@ -14,6 +14,7 @@ interface TtsConnection {
   id: string
   name: string
   provider?: string
+  is_default?: boolean
 }
 
 interface ConnectionPage {
@@ -28,7 +29,7 @@ interface SynthesisPacer {
 
 const MIN_SYNTHESIS_START_INTERVAL_MS = 1_250
 const MAX_RATE_LIMIT_RETRIES = 3
-const PLAYBACK_BUFFER_SEGMENTS = 2
+const PLAYBACK_BUFFER_SEGMENTS = 4
 
 interface DetectedCharacterState {
   id: string
@@ -89,6 +90,7 @@ interface SynthesizedVoiceSegment {
 interface PlaybackPreferences {
   speed: number
   volume: number
+  connectionId: string
 }
 
 const VOICE_ICON = `
@@ -123,13 +125,16 @@ async function loadPlaybackPreferences(): Promise<PlaybackPreferences> {
     credentials: 'same-origin',
     headers: { Accept: 'application/json' },
   })
-  if (!response.ok) return { speed: 1, volume: 1 }
+  if (!response.ok) return { speed: 1, volume: 1, connectionId: '' }
   const row = await response.json() as { value?: Record<string, unknown> }
   const speed = typeof row.value?.ttsSpeed === 'number' ? row.value.ttsSpeed : 1
   const volume = typeof row.value?.ttsVolume === 'number' ? row.value.ttsVolume : 1
   return {
     speed: Math.min(4, Math.max(0.25, speed)),
     volume: Math.min(1, Math.max(0, volume)),
+    connectionId: typeof row.value?.ttsConnectionId === 'string'
+      ? row.value.ttsConnectionId.trim()
+      : '',
   }
 }
 
@@ -398,6 +403,7 @@ export function setup(ctx: SpindleFrontendContext) {
   let applyingState = false
   let activeChat: ActiveChatState | null = null
   let connections: TtsConnection[] = []
+  let lumiverseConnectionId = ''
   let saveTimer: ReturnType<typeof setTimeout> | null = null
   let editRevision = 0
   let dirty = false
@@ -623,7 +629,12 @@ export function setup(ctx: SpindleFrontendContext) {
     if (!activeChat) return
     const playbackChat = activeChat
     const config = collectConfig()
-    if (!config.connectionId) {
+    const preferences = await loadPlaybackPreferences()
+    const connectionId = config.connectionId
+      || (connections.some(connection => connection.id === preferences.connectionId)
+        ? preferences.connectionId
+        : connections.find(connection => connection.is_default)?.id ?? lumiverseConnectionId)
+    if (!connectionId) {
       setStatus('Choose a TTS connection before playing.', 'error')
       return
     }
@@ -668,13 +679,12 @@ export function setup(ctx: SpindleFrontendContext) {
       }))
       if (plan.length === 0) throw new Error('This message has no playable narration or dialogue.')
 
-      const preferences = await loadPlaybackPreferences()
       const pacer: SynthesisPacer = { nextStartAt: 0, startQueue: Promise.resolve() }
       type PreparedSegment = { segment: SynthesizedVoiceSegment; error?: never } | { segment?: never; error: unknown }
       const prepare = async (index: number): Promise<PreparedSegment> => {
         try {
           const segment = await synthesizeVoiceSegment(
-            config.connectionId,
+            connectionId,
             plan[index].text,
             plan[index].voice,
             preferences.speed,
@@ -710,15 +720,20 @@ export function setup(ctx: SpindleFrontendContext) {
         setStatus(`Playing ${index + 1} of ${plan.length} voice segment${plan.length === 1 ? '' : 's'}…`)
         decoded[index] = await playDecodedBuffer(playback, current.segment.data, preferences.volume)
       }
-      setStatus('Saving generated audio…')
+      if (activePlayback === playback) {
+        activePlayback = null
+        updatePlaybackButtons()
+        await playback.context.close().catch(() => undefined)
+      }
+      const wav = encodeConcatenatedWav(decoded.map(buffer => ({
+        sampleRate: buffer.sampleRate,
+        channels: Array.from(
+          { length: buffer.numberOfChannels },
+          (_, channel) => buffer.getChannelData(channel),
+        ),
+      })))
+      setStatus('Playback complete. Saving generated audio…')
       try {
-        const wav = encodeConcatenatedWav(decoded.map(buffer => ({
-          sampleRate: buffer.sampleRate,
-          channels: Array.from(
-            { length: buffer.numberOfChannels },
-            (_, channel) => buffer.getChannelData(channel),
-          ),
-        })))
         await saveMessageAudio(
           playbackChat.id,
           messageId,
@@ -871,9 +886,10 @@ export function setup(ctx: SpindleFrontendContext) {
     applyingState = true
     activeChat = next
     context.textContent = next ? `Active chat: ${next.name}` : 'Open a chat to configure its voices.'
+    const selectedConnectionId = next?.connectionId || lumiverseConnectionId
     connectionPicker.update({
-      value: next?.connectionId ?? '',
-      options: connectionOptions(next?.connectionId),
+      value: selectedConnectionId,
+      options: connectionOptions(selectedConnectionId),
       placeholder: connections.length ? 'Choose a TTS connection' : 'No TTS connections found',
       disabled: !next || connections.length === 0,
     })
@@ -890,9 +906,18 @@ export function setup(ctx: SpindleFrontendContext) {
 
   async function loadConnections() {
     try {
-      connections = await listAllTtsConnections()
+      const [loadedConnections, preferences] = await Promise.all([
+        listAllTtsConnections(),
+        loadPlaybackPreferences(),
+      ])
+      connections = loadedConnections
+      lumiverseConnectionId = connections.some(connection => connection.id === preferences.connectionId)
+        ? preferences.connectionId
+        : connections.find(connection => connection.is_default)?.id ?? ''
+      const selectedConnectionId = activeChat?.connectionId || lumiverseConnectionId
       connectionPicker.update({
-        options: connectionOptions(activeChat?.connectionId),
+        value: selectedConnectionId,
+        options: connectionOptions(selectedConnectionId),
         placeholder: connections.length ? 'Choose a TTS connection' : 'No TTS connections found',
         disabled: !activeChat || connections.length === 0,
       })

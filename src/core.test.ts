@@ -50,6 +50,16 @@ test('merges adjacent segments that use the same voice', () => {
   ])
 })
 
+test('keeps separate paragraphs as independently generated voice segments', () => {
+  assert.deepEqual(mergeVoicePlan([
+    { text: 'First paragraph.\n\nSecond paragraph.\n\nThird paragraph.', voice: 'narrator' },
+  ]), [
+    { text: 'First paragraph.', voice: 'narrator' },
+    { text: 'Second paragraph.', voice: 'narrator' },
+    { text: 'Third paragraph.', voice: 'narrator' },
+  ])
+})
+
 test('clamps the configurable message window', () => {
   assert.equal(clampMessageLimit(undefined), 20)
   assert.equal(clampMessageLimit(0), 1)
@@ -215,6 +225,25 @@ test('supports speaker attribution after a quote', () => {
     [
       { text: 'We should go,', speakerId: 'alice' },
       { text: 'whispered Alice.', speakerId: null },
+    ],
+  )
+})
+
+test('uses a comma-ended quote action beat to identify its speaker', () => {
+  assert.deepEqual(
+    parseRosterVoiceSegments(
+      '"I am speaking here," Sarah looks unamused, "Please listen to me."',
+      'card',
+      [
+        { id: 'bob', name: 'Bob' },
+        { id: 'sarah', name: 'Sarah' },
+        { id: 'card', name: 'Narrator Card' },
+      ],
+    ),
+    [
+      { text: 'I am speaking here,', speakerId: 'sarah' },
+      { text: 'Sarah looks unamused,', speakerId: null },
+      { text: 'Please listen to me.', speakerId: 'sarah' },
     ],
   )
 })
