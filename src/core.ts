@@ -318,12 +318,28 @@ export function extractNamedDialogue(content: string): Array<{ name: string; tex
   return result
 }
 
-function cleanPlaybackText(value: string): string {
+function stripPlaybackMarkup(value: string): string {
   return value
+    .replace(/&lt;\/?[a-z][\s\S]*?&gt;/gi, ' ')
+    .replace(/\\?<\/?[a-z][^>]*>/gi, ' ')
+    .replace(/\[\/?(?:font|color|size|style|span|div|p|b|i|u|em|strong)(?:=[^\]]*)?\]/gi, ' ')
+    .replace(/[*_~]+/g, ' ')
+}
+
+function decodePlaybackEntities(value: string): string {
+  return value
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&quot;|&#34;|&#x22;/gi, '"')
+    .replace(/&apos;|&#39;|&#x27;/gi, "'")
+    .replace(/&lt;|&#60;|&#x3c;/gi, '<')
+    .replace(/&gt;|&#62;|&#x3e;/gi, '>')
+    .replace(/&amp;|&#38;|&#x26;/gi, '&')
+}
+
+function cleanPlaybackText(value: string): string {
+  return decodePlaybackEntities(stripPlaybackMarkup(value))
     .replace(/```[\s\S]*?```/g, ' ')
     .replace(/`[^`\n]*`/g, ' ')
-    .replace(/<[^>]+>/g, ' ')
-    .replace(/[*_~]+/g, ' ')
     .replace(/\s+/g, ' ')
     .trim()
 }
@@ -400,12 +416,13 @@ export function parseRosterVoiceSegments(
   defaultSpeakerId: string | null,
   speakers: CharacterLike[],
 ): PlaybackSegment[] {
+  const playbackContent = stripPlaybackMarkup(content)
   const result: PlaybackSegment[] = []
   const quotePattern = /["“]([\s\S]*?)["”]/g
   let cursor = 0
-  for (const match of content.matchAll(quotePattern)) {
+  for (const match of playbackContent.matchAll(quotePattern)) {
     if (match.index === undefined) continue
-    const narration = cleanPlaybackText(content.slice(cursor, match.index))
+    const narration = cleanPlaybackText(playbackContent.slice(cursor, match.index))
     if (narration) result.push({ text: narration, speakerId: null })
     const speech = cleanPlaybackText(match[1] ?? '')
     if (speech) {
@@ -413,8 +430,8 @@ export function parseRosterVoiceSegments(
       result.push({
         text: speech,
         speakerId: inferQuotedSpeaker(
-          content.slice(0, match.index),
-          content.slice(quoteEnd),
+          playbackContent.slice(0, match.index),
+          playbackContent.slice(quoteEnd),
           speakers,
           defaultSpeakerId,
         ),
@@ -422,7 +439,7 @@ export function parseRosterVoiceSegments(
     }
     cursor = match.index + match[0].length
   }
-  const narration = cleanPlaybackText(content.slice(cursor))
+  const narration = cleanPlaybackText(playbackContent.slice(cursor))
   if (narration) result.push({ text: narration, speakerId: null })
   return result
 }

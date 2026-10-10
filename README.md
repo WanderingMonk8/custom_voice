@@ -13,6 +13,8 @@ A [Lumiverse Spindle](https://docs.lumiverse.chat/) extension that detects chara
 - Assigns a separate narrator voice.
 - Routes quoted text to the speaking character and text outside quotations to the narrator.
 - Adds a custom music-note action to each message for ordered multi-voice playback.
+- Adds the same custom playback action to the message context menu.
+- Removes HTML/escaped tags and Markdown emphasis markers before sending readable text to TTS.
 - Auto-saves every setting to the current chat.
 - Saves the detected cast and reloads it with the correct settings whenever the active chat changes.
 - Never scans automatically when a chat loads, changes, or receives new messages.

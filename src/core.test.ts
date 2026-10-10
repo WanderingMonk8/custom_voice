@@ -183,6 +183,20 @@ test('supports speaker attribution after a quote', () => {
   )
 })
 
+test('strips HTML tags and emphasis markers before TTS segmentation', () => {
+  assert.deepEqual(
+    parseRosterVoiceSegments('<font color="#4169E1">"One more,"</font> *she whispered.*', 'alice', []),
+    [
+      { text: 'One more,', speakerId: 'alice' },
+      { text: 'she whispered.', speakerId: null },
+    ],
+  )
+  assert.deepEqual(
+    parseRosterVoiceSegments('&lt;font color=&quot;#4169E1&quot;&gt;"Again."&lt;/font&gt;', 'alice', []),
+    [{ text: 'Again.', speakerId: 'alice' }],
+  )
+})
+
 test('detects multiple named NPCs written by one character card', () => {
   const detected = detectCharacters([{
     is_user: false,

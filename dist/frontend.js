@@ -5,8 +5,14 @@ function normalizeSpeakerName(value) {
 function npcSpeakerId(name) {
   return `npc:${normalizeSpeakerName(name).toLowerCase()}`;
 }
+function stripPlaybackMarkup(value) {
+  return value.replace(/&lt;\/?[a-z][\s\S]*?&gt;/gi, " ").replace(/\\?<\/?[a-z][^>]*>/gi, " ").replace(/\[\/?(?:font|color|size|style|span|div|p|b|i|u|em|strong)(?:=[^\]]*)?\]/gi, " ").replace(/[*_~]+/g, " ");
+}
+function decodePlaybackEntities(value) {
+  return value.replace(/&nbsp;/gi, " ").replace(/&quot;|&#34;|&#x22;/gi, '"').replace(/&apos;|&#39;|&#x27;/gi, "'").replace(/&lt;|&#60;|&#x3c;/gi, "<").replace(/&gt;|&#62;|&#x3e;/gi, ">").replace(/&amp;|&#38;|&#x26;/gi, "&");
+}
 function cleanPlaybackText(value) {
-  return value.replace(/```[\s\S]*?```/g, " ").replace(/`[^`\n]*`/g, " ").replace(/<[^>]+>/g, " ").replace(/[*_~]+/g, " ").replace(/\s+/g, " ").trim();
+  return decodePlaybackEntities(stripPlaybackMarkup(value)).replace(/```[\s\S]*?```/g, " ").replace(/`[^`\n]*`/g, " ").replace(/\s+/g, " ").trim();
 }
 var SPEECH_VERBS = "(?:said|says|asked|asks|replied|replies|whispered|whispers|shouted|shouts|yelled|yells|called|calls|murmured|murmurs|answered|answers|added|adds|continued|continues|remarked|remarks|cried|cries|growled|growls|sighed|sighs)";
 function escapedPattern(value) {
@@ -32,12 +38,13 @@ function inferQuotedSpeaker(before, after, speakers, defaultSpeakerId) {
   return best?.id ?? defaultSpeakerId;
 }
 function parseRosterVoiceSegments(content, defaultSpeakerId, speakers) {
+  const playbackContent = stripPlaybackMarkup(content);
   const result = [];
   const quotePattern = /["“]([\s\S]*?)["”]/g;
   let cursor = 0;
-  for (const match of content.matchAll(quotePattern)) {
+  for (const match of playbackContent.matchAll(quotePattern)) {
     if (match.index === void 0) continue;
-    const narration2 = cleanPlaybackText(content.slice(cursor, match.index));
+    const narration2 = cleanPlaybackText(playbackContent.slice(cursor, match.index));
     if (narration2) result.push({ text: narration2, speakerId: null });
     const speech = cleanPlaybackText(match[1] ?? "");
     if (speech) {
@@ -45,8 +52,8 @@ function parseRosterVoiceSegments(content, defaultSpeakerId, speakers) {
       result.push({
         text: speech,
         speakerId: inferQuotedSpeaker(
-          content.slice(0, match.index),
-          content.slice(quoteEnd),
+          playbackContent.slice(0, match.index),
+          playbackContent.slice(quoteEnd),
           speakers,
           defaultSpeakerId
         )
@@ -54,7 +61,7 @@ function parseRosterVoiceSegments(content, defaultSpeakerId, speakers) {
     }
     cursor = match.index + match[0].length;
   }
-  const narration = cleanPlaybackText(content.slice(cursor));
+  const narration = cleanPlaybackText(playbackContent.slice(cursor));
   if (narration) result.push({ text: narration, speakerId: null });
   return result;
 }
@@ -197,6 +204,13 @@ function setup(ctx) {
     }
     .chat-voice-message-play:hover { background:var(--lumiverse-fill-subtle); }
     .chat-voice-message-play[data-playing="true"] { color:var(--lumiverse-accent, #7c6df2); }
+    .chat-voice-context-play {
+      display:flex; align-items:center; gap:10px; width:100%; padding:9px 12px;
+      border:0; border-radius:6px; background:transparent; color:var(--lumiverse-text);
+      font:inherit; font-size:13px; text-align:left; cursor:pointer;
+    }
+    .chat-voice-context-play:hover { background:var(--lumiverse-fill-subtle); }
+    .chat-voice-context-play svg { flex:0 0 auto; }
   `);
   const tab = ctx.ui.registerDrawerTab({
     id: "chat-voice",
@@ -277,6 +291,7 @@ function setup(ctx) {
   const inFlight = /* @__PURE__ */ new Set();
   const characterInputs = /* @__PURE__ */ new Map();
   const playButtons = /* @__PURE__ */ new Map();
+  const contextPlayButtons = /* @__PURE__ */ new Map();
   const pendingMessageRequests = /* @__PURE__ */ new Map();
   let messageRequestSequence = 0;
   const setStatus = (message, state = "normal") => {
@@ -350,6 +365,15 @@ function setup(ctx) {
         button.dataset.playing = String(playing);
         button.innerHTML = playing ? STOP_ACTION_ICON : PLAY_ACTION_ICON;
         button.title = playing ? "Stop custom voice playback" : "Play with custom NPC voices";
+        button.setAttribute("aria-label", button.title);
+      }
+    }
+    for (const [messageId, buttons] of contextPlayButtons) {
+      for (const button of buttons) {
+        const playing = activePlayback?.messageId === messageId;
+        button.dataset.playing = String(playing);
+        button.innerHTML = `${playing ? STOP_ACTION_ICON : PLAY_ACTION_ICON}<span>${playing ? "Stop custom voice playback" : "Play with custom voices"}</span>`;
+        button.title = playing ? "Stop custom voice playback" : "Play with custom voices";
         button.setAttribute("aria-label", button.title);
       }
     }
@@ -655,6 +679,25 @@ function setup(ctx) {
     if (!button) return;
     return bindPlaybackButton(root, button, false);
   }
+  function mountCurrentContextPlayback(root) {
+    root.style.display = "contents";
+    const button = root.querySelector('[data-spindle-decorator-kind="context-action"]');
+    if (!button) return;
+    const messageId = ctx.dom.getMessageId(root);
+    if (!messageId) return;
+    button.classList.add("chat-voice-context-play");
+    const buttons = contextPlayButtons.get(messageId) ?? /* @__PURE__ */ new Set();
+    buttons.add(button);
+    contextPlayButtons.set(messageId, buttons);
+    const onClick = () => void playMessage(messageId);
+    button.addEventListener("click", onClick);
+    updatePlaybackButtons();
+    return () => {
+      button.removeEventListener("click", onClick);
+      buttons.delete(button);
+      if (buttons.size === 0) contextPlayButtons.delete(messageId);
+    };
+  }
   function mountLegacyPlaybackButton(element) {
     const button = document.createElement("button");
     button.type = "button";
@@ -667,6 +710,13 @@ function setup(ctx) {
     kind: "button",
     svg: PLAY_ACTION_ICON,
     render: mountCurrentPlaybackButton
+  }) : null;
+  const destroyContextDecorator = currentDecorator ? currentDecorator({
+    mount: "message_context_menu",
+    kind: "context-action",
+    priority: 30,
+    html: `${PLAY_ACTION_ICON}<span>Play with custom voices</span>`,
+    render: mountCurrentContextPlayback
   }) : null;
   const legacyDecorator = !destroyCurrentDecorator && ctx.registerDomDecorator ? ctx.registerDomDecorator({ target: "message_actions", decorate: mountLegacyPlaybackButton }) : null;
   const legacyMessageAction = !destroyCurrentDecorator && !legacyDecorator && ctx.registerMessageAction ? ctx.registerMessageAction({
@@ -755,6 +805,7 @@ function setup(ctx) {
     addNpcInputSlot.removeEventListener("keydown", onAddNpcKeyDown);
     scanButton.removeEventListener("click", scanMessages);
     destroyCurrentDecorator?.();
+    destroyContextDecorator?.();
     legacyDecorator?.destroy();
     legacyMessageAction?.destroy();
     tab.destroy();
