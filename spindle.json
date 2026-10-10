@@ -1,12 +1,12 @@
 {
-  "version": "1.0.0",
+  "version": "2.0.0",
   "name": "Chat Voice",
   "identifier": "chat_voice",
   "author": "WanderingMonk8",
   "github": "https://github.com/WanderingMonk8/custom_voice",
   "homepage": "https://github.com/WanderingMonk8/custom_voice",
-  "description": "Choose a TTS connection and custom voice name for the active chat.",
-  "permissions": ["chats"],
+  "description": "Automatically detect chat characters and assign per-character and narrator TTS voices.",
+  "permissions": ["chats", "chat_mutation", "characters"],
   "entry_backend": "dist/backend.js",
   "entry_frontend": "dist/frontend.js",
   "minimum_lumiverse_version": "1.2.5"

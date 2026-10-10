@@ -1,14 +1,13 @@
+import {
+  applyConfigToMetadata,
+  clampMessageLimit,
+  detectCharacters,
+  readConfig,
+  type CharacterLike,
+  type ChatVoiceConfig,
+} from './core'
+
 declare const spindle: import('lumiverse-spindle-types').SpindleAPI
-
-interface VoiceRef {
-  connectionId: string
-  voice: string
-}
-
-interface VoiceOverrides {
-  narrator?: VoiceRef
-  characters?: Record<string, VoiceRef>
-}
 
 interface ChatLike {
   id: string
@@ -19,138 +18,162 @@ interface ChatLike {
 
 type FrontendMessage =
   | { type: 'chat_voice_refresh' }
-  | { type: 'chat_voice_save'; connectionId: string; voice: string }
+  | {
+      type: 'chat_voice_save'
+      chatId: string
+      clientRevision: number
+      config: {
+        messageLimit: number
+        connectionId: string
+        narratorVoice: string
+        characterVoices: Record<string, string>
+      }
+    }
 
-function readVoiceRef(value: unknown): VoiceRef | null {
-  if (!value || typeof value !== 'object') return null
-  const candidate = value as Record<string, unknown>
-  if (typeof candidate.connectionId !== 'string' || !candidate.connectionId) return null
-  return {
-    connectionId: candidate.connectionId,
-    voice: typeof candidate.voice === 'string' ? candidate.voice : '',
-  }
-}
-
-function targetCharacterIds(chat: ChatLike): string[] {
+function chatMemberIds(chat: ChatLike): string[] {
   const rawIds = chat.metadata?.character_ids
   if (chat.metadata?.group === true && Array.isArray(rawIds)) {
-    const ids = rawIds.filter((id): id is string => typeof id === 'string' && id.length > 0)
-    if (ids.length > 0) return [...new Set(ids)]
+    return [...new Set(rawIds.filter((id): id is string => typeof id === 'string' && !!id))]
   }
   return chat.character_id ? [chat.character_id] : []
 }
 
-function currentVoice(chat: ChatLike): { connectionId: string; voice: string; mixed: boolean } {
-  const raw = chat.metadata?.voiceOverrides
-  const overrides = raw && typeof raw === 'object' ? raw as VoiceOverrides : {}
-  const refs: VoiceRef[] = []
-  const narrator = readVoiceRef(overrides.narrator)
-  if (narrator) refs.push(narrator)
-
-  for (const characterId of targetCharacterIds(chat)) {
-    const ref = readVoiceRef(overrides.characters?.[characterId])
-    if (ref) refs.push(ref)
-  }
-
-  if (refs.length === 0) return { connectionId: '', voice: '', mixed: false }
-  const first = refs[0]
-  const mixed = refs.some((ref) =>
-    ref.connectionId !== first.connectionId || ref.voice !== first.voice,
+async function loadCharacters(chat: ChatLike, userId?: string): Promise<CharacterLike[]> {
+  const results = await Promise.all(
+    chatMemberIds(chat).map((id) => spindle.characters.get(id, userId)),
   )
-  return { connectionId: first.connectionId, voice: first.voice, mixed }
+  return results
+    .filter((character): character is NonNullable<typeof character> => !!character)
+    .map((character) => ({ id: character.id, name: character.name }))
 }
 
-async function sendState(userId?: string): Promise<void> {
-  const chat = await spindle.chats.getActive(userId) as ChatLike | null
-  if (!chat) {
-    spindle.sendToFrontend({ type: 'chat_voice_state', chat: null }, userId)
-    return
+async function buildState(chat: ChatLike, userId?: string) {
+  const metadata = chat.metadata ?? {}
+  const candidates = await loadCharacters(chat, userId)
+  const initialConfig = readConfig(metadata, candidates.map((character) => character.id))
+  const messages = await spindle.chat.getMessages(chat.id)
+  const detected = detectCharacters(
+    messages,
+    candidates,
+    initialConfig.messageLimit,
+    chat.metadata?.group === true ? null : chat.character_id,
+  )
+  const config = readConfig(metadata, detected.map((character) => character.id))
+
+  return {
+    id: chat.id,
+    name: chat.name,
+    messageLimit: config.messageLimit,
+    connectionId: config.connectionId,
+    narratorVoice: config.narratorVoice,
+    characters: detected.map((character) => ({
+      ...character,
+      voice: config.characterVoices[character.id] ?? '',
+    })),
   }
-
-  spindle.sendToFrontend({
-    type: 'chat_voice_state',
-    chat: {
-      id: chat.id,
-      name: chat.name,
-      ...currentVoice(chat),
-    },
-  }, userId)
 }
 
-async function saveVoice(
-  connectionIdValue: unknown,
-  voiceValue: unknown,
+async function sendState(userId?: string, clientRevision?: number): Promise<void> {
+  try {
+    const chat = await spindle.chats.getActive(userId) as ChatLike | null
+    spindle.sendToFrontend({
+      type: 'chat_voice_state',
+      chat: chat ? await buildState(chat, userId) : null,
+      ...(clientRevision !== undefined ? { clientRevision } : {}),
+    }, userId)
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Could not load chat voice settings.'
+    spindle.sendToFrontend({ type: 'chat_voice_error', error: message }, userId)
+  }
+}
+
+function sanitizeSaveConfig(
+  previous: ChatVoiceConfig,
+  input: Extract<FrontendMessage, { type: 'chat_voice_save' }>['config'],
+): ChatVoiceConfig {
+  const characterVoices = { ...previous.characterVoices }
+  if (input.characterVoices && typeof input.characterVoices === 'object') {
+    for (const [id, voice] of Object.entries(input.characterVoices)) {
+      if (!id || typeof voice !== 'string') continue
+      characterVoices[id] = voice.trim().slice(0, 512)
+    }
+  }
+  return {
+    version: 2,
+    messageLimit: clampMessageLimit(input.messageLimit),
+    connectionId: typeof input.connectionId === 'string'
+      ? input.connectionId.trim().slice(0, 128)
+      : '',
+    narratorVoice: typeof input.narratorVoice === 'string'
+      ? input.narratorVoice.trim().slice(0, 512)
+      : '',
+    characterVoices,
+    managedCharacterIds: previous.managedCharacterIds,
+  }
+}
+
+const saveQueues = new Map<string, Promise<void>>()
+
+function queueSave(
+  payload: Extract<FrontendMessage, { type: 'chat_voice_save' }>,
   userId?: string,
 ): Promise<void> {
-  const connectionId = typeof connectionIdValue === 'string' ? connectionIdValue.trim() : ''
-  const voice = typeof voiceValue === 'string' ? voiceValue.trim() : ''
+  const queueKey = `${userId ?? 'user'}:${payload.chatId}`
+  const previousTask = saveQueues.get(queueKey) ?? Promise.resolve()
+  const nextTask = previousTask.catch(() => undefined).then(async () => {
+    const chat = await spindle.chats.get(payload.chatId, userId) as ChatLike | null
+    if (!chat) throw new Error('The chat is no longer available.')
+    const candidateIds = chatMemberIds(chat)
+    const previousConfig = readConfig(chat.metadata ?? {}, candidateIds)
+    const config = sanitizeSaveConfig(previousConfig, payload.config)
+    const metadata = applyConfigToMetadata(chat.metadata ?? {}, config)
+    await spindle.chats.update(chat.id, { metadata }, userId)
 
-  if (connectionId.length > 128 || voice.length > 512) {
-    throw new Error('The connection or voice name is too long.')
-  }
-
-  const chat = await spindle.chats.getActive(userId) as ChatLike | null
-  if (!chat) throw new Error('Open a chat before choosing a voice.')
-
-  const metadata = { ...(chat.metadata ?? {}) }
-  const rawOverrides = metadata.voiceOverrides
-  const previous = rawOverrides && typeof rawOverrides === 'object'
-    ? rawOverrides as VoiceOverrides
-    : {}
-  const characters = { ...(previous.characters ?? {}) }
-  const characterIds = targetCharacterIds(chat)
-
-  if (connectionId) {
-    const next: VoiceRef = { connectionId, voice }
-    for (const characterId of characterIds) characters[characterId] = next
-    metadata.voiceOverrides = {
-      ...previous,
-      narrator: next,
-      ...(Object.keys(characters).length > 0 ? { characters } : {}),
-    }
-  } else {
-    for (const characterId of characterIds) delete characters[characterId]
-    const nextOverrides: VoiceOverrides = { ...previous }
-    delete nextOverrides.narrator
-    if (Object.keys(characters).length > 0) nextOverrides.characters = characters
-    else delete nextOverrides.characters
-
-    if (nextOverrides.narrator || nextOverrides.characters) {
-      metadata.voiceOverrides = nextOverrides
-    } else {
-      delete metadata.voiceOverrides
-    }
-  }
-
-  await spindle.chats.update(chat.id, { metadata }, userId)
-  spindle.toast.success(
-    connectionId ? 'Chat voice saved.' : 'Chat voice reset to defaults.',
-    { userId },
-  )
-  await sendState(userId)
+    const active = await spindle.chats.getActive(userId) as ChatLike | null
+    if (active?.id === chat.id) await sendState(userId, payload.clientRevision)
+  }).finally(() => {
+    if (saveQueues.get(queueKey) === nextTask) saveQueues.delete(queueKey)
+  })
+  saveQueues.set(queueKey, nextTask)
+  return nextTask
 }
 
 spindle.onFrontendMessage(async (rawPayload: unknown, userId) => {
+  const payload = rawPayload as FrontendMessage
   try {
-    const payload = rawPayload as FrontendMessage
     if (payload?.type === 'chat_voice_refresh') {
       await sendState(userId)
     } else if (payload?.type === 'chat_voice_save') {
-      await saveVoice(payload.connectionId, payload.voice, userId)
+      await queueSave(payload, userId)
     }
   } catch (error) {
-    const message = error instanceof Error ? error.message : 'Could not update the chat voice.'
-    spindle.sendToFrontend({ type: 'chat_voice_error', error: message }, userId)
-    spindle.toast.error(message, { userId })
+    const message = error instanceof Error ? error.message : 'Could not save chat voice settings.'
+    spindle.sendToFrontend({
+      type: 'chat_voice_error',
+      error: message,
+      clientRevision: payload?.type === 'chat_voice_save' ? payload.clientRevision : undefined,
+    }, userId)
   }
 })
+
+const refreshTimers = new Map<string, ReturnType<typeof setTimeout>>()
+
+function scheduleStateRefresh(userId?: string) {
+  const key = userId ?? 'user'
+  const existing = refreshTimers.get(key)
+  if (existing) clearTimeout(existing)
+  refreshTimers.set(key, setTimeout(() => {
+    refreshTimers.delete(key)
+    void sendState(userId)
+  }, 150))
+}
 
 spindle.on('CHAT_SWITCHED', async (_payload, userId) => {
   await sendState(userId)
 })
 
-spindle.on('CHAT_CHANGED', async (_payload, userId) => {
-  await sendState(userId)
-})
+for (const event of ['MESSAGE_SENT', 'MESSAGE_EDITED', 'MESSAGE_SWIPED', 'MESSAGE_DELETED'] as const) {
+  spindle.on(event, (_payload, userId) => scheduleStateRefresh(userId))
+}
 
-spindle.log.info('Chat Voice loaded.')
+spindle.log.info('Chat Voice 2.0 loaded.')
