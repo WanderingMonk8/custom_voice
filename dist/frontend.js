@@ -99,6 +99,32 @@ var SPEECH_VERBS = "(?:said|says|asked|asks|replied|replies|whispered|whispers|s
 function escapedPattern(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
+function soleMentionedSpeaker(text, speakers) {
+  const narrative = text.replace(/["“][\s\S]*?["”]/gu, " ");
+  const mentionedSpeakerIds = /* @__PURE__ */ new Set();
+  for (const speaker of speakers) {
+    for (const alias of speakerAliases(speaker.name)) {
+      if (new RegExp(`\\b${escapedPattern(alias)}\\b`, "iu").test(narrative)) {
+        mentionedSpeakerIds.add(speaker.id);
+        break;
+      }
+    }
+  }
+  return mentionedSpeakerIds.size === 1 ? [...mentionedSpeakerIds][0] : null;
+}
+function currentParagraphSpeaker(before, after, speakers) {
+  let paragraphStart = 0;
+  for (const match of before.matchAll(/\n[^\S\n]*\n/gu)) {
+    if (match.index !== void 0) paragraphStart = match.index + match[0].length;
+  }
+  const nextBreak = /\n[^\S\n]*\n/u.exec(after);
+  const paragraphEnd = nextBreak?.index ?? after.length;
+  return soleMentionedSpeaker(
+    `${before.slice(paragraphStart)}
+${after.slice(0, paragraphEnd)}`,
+    speakers
+  );
+}
 function precedingParagraphSpeaker(before, speakers) {
   let lastBreak = null;
   for (const match of before.matchAll(/\n[^\S\n]*\n/gu)) lastBreak = match;
@@ -110,17 +136,7 @@ function precedingParagraphSpeaker(before, speakers) {
   for (const match of earlierText.matchAll(/\n[^\S\n]*\n/gu)) {
     if (match.index !== void 0) previousBreakEnd = match.index + match[0].length;
   }
-  const previousParagraph = earlierText.slice(previousBreakEnd).replace(/["“][\s\S]*?["”]/gu, " ");
-  const mentionedSpeakerIds = /* @__PURE__ */ new Set();
-  for (const speaker of speakers) {
-    for (const alias of speakerAliases(speaker.name)) {
-      if (new RegExp(`\\b${escapedPattern(alias)}\\b`, "iu").test(previousParagraph)) {
-        mentionedSpeakerIds.add(speaker.id);
-        break;
-      }
-    }
-  }
-  return mentionedSpeakerIds.size === 1 ? [...mentionedSpeakerIds][0] : null;
+  return soleMentionedSpeaker(earlierText.slice(previousBreakEnd), speakers);
 }
 function inferQuotedSpeaker(before, after, quotedText, speakers, defaultSpeakerId) {
   if (/[,]\s*$/u.test(quotedText)) {
@@ -153,6 +169,8 @@ function inferQuotedSpeaker(before, after, quotedText, speakers, defaultSpeakerI
     }
   }
   if (best) return { speakerId: best.id, confident: true };
+  const currentSpeakerId = currentParagraphSpeaker(before, after, speakers);
+  if (currentSpeakerId) return { speakerId: currentSpeakerId, confident: true };
   const paragraphSpeakerId = precedingParagraphSpeaker(before, speakers);
   return paragraphSpeakerId ? { speakerId: paragraphSpeakerId, confident: true } : { speakerId: defaultSpeakerId, confident: false };
 }
