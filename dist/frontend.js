@@ -265,6 +265,8 @@ function setup(ctx) {
     keywords: ["tts", "speech", "narrator", "characters", "custom voice"],
     iconSvg: VOICE_ICON
   });
+  const hostDocument = tab.root.ownerDocument;
+  const hostWindow = hostDocument.defaultView ?? window;
   const panel = document.createElement("div");
   panel.className = "chat-voice-panel";
   const context = document.createElement("div");
@@ -345,11 +347,21 @@ function setup(ctx) {
   function nativeTtsMessageId(button) {
     if (button.closest("[data-spindle-extension-root]")) return null;
     const known = button.dataset.chatVoiceNativeTts === "true";
-    const hasNativeTtsIcon = !!button.querySelector("svg.lucide-volume-2, svg.lucide-square");
-    if (!known && !hasNativeTtsIcon) return null;
+    const label = [
+      button.getAttribute("title"),
+      button.getAttribute("aria-label"),
+      button.textContent
+    ].filter(Boolean).join(" ").toLowerCase();
+    const iconClass = button.querySelector("svg")?.getAttribute("class")?.toLowerCase() ?? "";
+    const hasNativeTtsIcon = iconClass.includes("volume-2") || iconClass.includes("volume2") || iconClass.includes("volume-high");
+    const hasNativeTtsLabel = /\btts\b|text[ -]to[ -]speech|stop playback|regenerate.+audio/.test(label);
+    const bubbleActions = button.closest('[data-component="BubbleActions"]');
+    const bubbleButtons = bubbleActions ? [...bubbleActions.children].filter((child) => child.tagName === "BUTTON") : [];
+    const isBubbleTtsPosition = bubbleButtons.length >= 3 && bubbleButtons[2] === button;
+    if (!known && !hasNativeTtsIcon && !hasNativeTtsLabel && !isBubbleTtsPosition) return null;
     const messageElement = button.closest("[data-message-id]");
     if (messageElement?.dataset.messageId) return messageElement.dataset.messageId;
-    const isPortalMenuAction = button.parentElement?.parentElement === document.body && !!button.querySelector(":scope > span");
+    const isPortalMenuAction = button.parentElement?.parentElement === button.ownerDocument.body && !!button.querySelector(":scope > span");
     return isPortalMenuAction ? lastContextMessageId : null;
   }
   const connectionPicker = ctx.components.mountSelect(connectionField.slot, {
@@ -413,7 +425,7 @@ function setup(ctx) {
     saveTimer = setTimeout(flushSave, delay);
   }
   function updatePlaybackButtons() {
-    for (const button of document.querySelectorAll("button")) {
+    for (const button of hostDocument.querySelectorAll("button")) {
       const messageId = nativeTtsMessageId(button);
       if (!messageId) continue;
       const playing = activePlayback?.messageId === messageId;
@@ -750,12 +762,12 @@ function setup(ctx) {
     }
   }
   const onNativeContextMenu = (event) => {
-    const target = event.target instanceof Element ? event.target : null;
+    const target = event.target && typeof event.target.closest === "function" ? event.target : null;
     lastContextMessageId = target?.closest("[data-message-id]")?.dataset.messageId ?? null;
-    window.requestAnimationFrame(updatePlaybackButtons);
+    hostWindow.requestAnimationFrame(updatePlaybackButtons);
   };
   const onNativeTtsClick = (event) => {
-    const target = event.target instanceof Element ? event.target : null;
+    const target = event.target && typeof event.target.closest === "function" ? event.target : null;
     const button = target?.closest("button");
     if (!button) return;
     const messageId = nativeTtsMessageId(button);
@@ -763,14 +775,14 @@ function setup(ctx) {
     event.preventDefault();
     event.stopPropagation();
     event.stopImmediatePropagation();
-    if (button.parentElement?.parentElement === document.body) {
-      document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    if (button.parentElement?.parentElement === button.ownerDocument.body) {
+      hostDocument.dispatchEvent(new hostWindow.KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
     }
     void playMessage(messageId);
   };
-  document.addEventListener("contextmenu", onNativeContextMenu, true);
-  document.addEventListener("click", onNativeTtsClick, true);
-  window.requestAnimationFrame(updatePlaybackButtons);
+  hostWindow.addEventListener("contextmenu", onNativeContextMenu, true);
+  hostWindow.addEventListener("click", onNativeTtsClick, true);
+  hostWindow.requestAnimationFrame(updatePlaybackButtons);
   const unsubscribeBackend = ctx.onBackendMessage((rawPayload) => {
     const payload = rawPayload;
     if (payload.type === "chat_voice_message") {
@@ -851,8 +863,8 @@ function setup(ctx) {
     addNpcButton.removeEventListener("click", onAddNpc);
     addNpcInputSlot.removeEventListener("keydown", onAddNpcKeyDown);
     scanButton.removeEventListener("click", scanMessages);
-    document.removeEventListener("contextmenu", onNativeContextMenu, true);
-    document.removeEventListener("click", onNativeTtsClick, true);
+    hostWindow.removeEventListener("contextmenu", onNativeContextMenu, true);
+    hostWindow.removeEventListener("click", onNativeTtsClick, true);
     restoreNativePlaybackButtons();
     tab.destroy();
     removeStyle();

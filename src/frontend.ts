@@ -290,6 +290,8 @@ export function setup(ctx: SpindleFrontendContext) {
     keywords: ['tts', 'speech', 'narrator', 'characters', 'custom voice'],
     iconSvg: VOICE_ICON,
   })
+  const hostDocument = tab.root.ownerDocument
+  const hostWindow = hostDocument.defaultView ?? window
 
   const panel = document.createElement('div')
   panel.className = 'chat-voice-panel'
@@ -391,13 +393,27 @@ export function setup(ctx: SpindleFrontendContext) {
   function nativeTtsMessageId(button: HTMLButtonElement): string | null {
     if (button.closest('[data-spindle-extension-root]')) return null
     const known = button.dataset.chatVoiceNativeTts === 'true'
-    const hasNativeTtsIcon = !!button.querySelector('svg.lucide-volume-2, svg.lucide-square')
-    if (!known && !hasNativeTtsIcon) return null
+    const label = [
+      button.getAttribute('title'),
+      button.getAttribute('aria-label'),
+      button.textContent,
+    ].filter(Boolean).join(' ').toLowerCase()
+    const iconClass = button.querySelector('svg')?.getAttribute('class')?.toLowerCase() ?? ''
+    const hasNativeTtsIcon = iconClass.includes('volume-2')
+      || iconClass.includes('volume2')
+      || iconClass.includes('volume-high')
+    const hasNativeTtsLabel = /\btts\b|text[ -]to[ -]speech|stop playback|regenerate.+audio/.test(label)
+    const bubbleActions = button.closest('[data-component="BubbleActions"]')
+    const bubbleButtons = bubbleActions
+      ? [...bubbleActions.children].filter((child): child is HTMLButtonElement => child.tagName === 'BUTTON')
+      : []
+    const isBubbleTtsPosition = bubbleButtons.length >= 3 && bubbleButtons[2] === button
+    if (!known && !hasNativeTtsIcon && !hasNativeTtsLabel && !isBubbleTtsPosition) return null
 
     const messageElement = button.closest<HTMLElement>('[data-message-id]')
     if (messageElement?.dataset.messageId) return messageElement.dataset.messageId
 
-    const isPortalMenuAction = button.parentElement?.parentElement === document.body
+    const isPortalMenuAction = button.parentElement?.parentElement === button.ownerDocument.body
       && !!button.querySelector(':scope > span')
     return isPortalMenuAction ? lastContextMessageId : null
   }
@@ -459,7 +475,7 @@ export function setup(ctx: SpindleFrontendContext) {
   }
 
   function updatePlaybackButtons() {
-    for (const button of document.querySelectorAll<HTMLButtonElement>('button')) {
+    for (const button of hostDocument.querySelectorAll<HTMLButtonElement>('button')) {
       const messageId = nativeTtsMessageId(button)
       if (!messageId) continue
       const playing = activePlayback?.messageId === messageId
@@ -826,13 +842,17 @@ export function setup(ctx: SpindleFrontendContext) {
   }
 
   const onNativeContextMenu = (event: MouseEvent) => {
-    const target = event.target instanceof Element ? event.target : null
+    const target = event.target && typeof (event.target as Element).closest === 'function'
+      ? event.target as Element
+      : null
     lastContextMessageId = target?.closest<HTMLElement>('[data-message-id]')?.dataset.messageId ?? null
-    window.requestAnimationFrame(updatePlaybackButtons)
+    hostWindow.requestAnimationFrame(updatePlaybackButtons)
   }
 
   const onNativeTtsClick = (event: MouseEvent) => {
-    const target = event.target instanceof Element ? event.target : null
+    const target = event.target && typeof (event.target as Element).closest === 'function'
+      ? event.target as Element
+      : null
     const button = target?.closest<HTMLButtonElement>('button')
     if (!button) return
     const messageId = nativeTtsMessageId(button)
@@ -840,15 +860,15 @@ export function setup(ctx: SpindleFrontendContext) {
     event.preventDefault()
     event.stopPropagation()
     event.stopImmediatePropagation()
-    if (button.parentElement?.parentElement === document.body) {
-      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+    if (button.parentElement?.parentElement === button.ownerDocument.body) {
+      hostDocument.dispatchEvent(new hostWindow.KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
     }
     void playMessage(messageId)
   }
 
-  document.addEventListener('contextmenu', onNativeContextMenu, true)
-  document.addEventListener('click', onNativeTtsClick, true)
-  window.requestAnimationFrame(updatePlaybackButtons)
+  hostWindow.addEventListener('contextmenu', onNativeContextMenu, true)
+  hostWindow.addEventListener('click', onNativeTtsClick, true)
+  hostWindow.requestAnimationFrame(updatePlaybackButtons)
 
   const unsubscribeBackend = ctx.onBackendMessage((rawPayload: unknown) => {
     const payload = rawPayload as StatePayload | ErrorPayload | ScanCompletePayload | MessagePayload
@@ -938,8 +958,8 @@ export function setup(ctx: SpindleFrontendContext) {
     addNpcButton.removeEventListener('click', onAddNpc)
     addNpcInputSlot.removeEventListener('keydown', onAddNpcKeyDown)
     scanButton.removeEventListener('click', scanMessages)
-    document.removeEventListener('contextmenu', onNativeContextMenu, true)
-    document.removeEventListener('click', onNativeTtsClick, true)
+    hostWindow.removeEventListener('contextmenu', onNativeContextMenu, true)
+    hostWindow.removeEventListener('click', onNativeTtsClick, true)
     restoreNativePlaybackButtons()
     tab.destroy()
     removeStyle()
