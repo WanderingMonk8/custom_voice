@@ -306,6 +306,39 @@ test('does not continue a speaker across a paragraph break', () => {
   )
 })
 
+test('anchors leading dialogue to the sole character in the preceding paragraph', () => {
+  const content = 'Toggard rode the last hundred yards out ahead without being asked, dropped from the bay at the bank stones, and stood looking at the water a long moment before he came back.\n\n"It\'s up. The crossing is possible, but it is a ford you walk, not a ford you ride." He wiped his wet hands on his breeches. "There\'s flat ground back under the alders."'
+  assert.deepEqual(
+    parseRosterVoiceSegments(content, 'card', [
+      { id: 'toggard', name: 'Toggard' },
+      { id: 'card', name: 'Narrator Card' },
+    ]),
+    [
+      {
+        text: 'Toggard rode the last hundred yards out ahead without being asked, dropped from the bay at the bank stones, and stood looking at the water a long moment before he came back.',
+        speakerId: null,
+      },
+      {
+        text: "It's up. The crossing is possible, but it is a ford you walk, not a ford you ride.",
+        speakerId: 'toggard',
+      },
+      { text: 'He wiped his wet hands on his breeches.', speakerId: null },
+      { text: "There's flat ground back under the alders.", speakerId: 'toggard' },
+    ],
+  )
+})
+
+test('does not guess a leading dialogue speaker when the preceding paragraph names multiple characters', () => {
+  assert.deepEqual(
+    parseRosterVoiceSegments(
+      'Alma watched Bob cross the room.\n\n"Unattributed."',
+      'card',
+      [{ id: 'alma', name: 'Alma' }, { id: 'bob', name: 'Bob' }],
+    ).at(-1),
+    { text: 'Unattributed.', speakerId: 'card' },
+  )
+})
+
 test('does not continue a speaker after another roster character is introduced', () => {
   assert.deepEqual(
     parseRosterVoiceSegments(
