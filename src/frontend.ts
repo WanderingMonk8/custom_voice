@@ -51,12 +51,14 @@ interface StatePayload {
   type: 'chat_voice_state'
   chat: ActiveChatState | null
   clientRevision?: number
+  requestId?: string
 }
 
 interface ErrorPayload {
   type: 'chat_voice_error'
   error: string
   clientRevision?: number
+  requestId?: string
 }
 
 interface ScanCompletePayload {
@@ -428,7 +430,14 @@ export function setup(ctx: SpindleFrontendContext) {
     reject: (error: Error) => void
     timer: ReturnType<typeof setTimeout>
   }>()
+  const pendingStateRequests = new Map<string, {
+    chatId: string | null
+    resolve: (chat: ActiveChatState | null) => void
+    reject: (error: Error) => void
+    timer: ReturnType<typeof setTimeout>
+  }>()
   let messageRequestSequence = 0
+  let stateRequestSequence = 0
 
   const setStatus = (message: string, state: 'normal' | 'saved' | 'error' = 'normal') => {
     status.textContent = message
@@ -576,6 +585,26 @@ export function setup(ctx: SpindleFrontendContext) {
     })
   }
 
+  function refreshLocalState(): void {
+    ctx.sendToBackend({
+      type: 'chat_voice_refresh',
+      chatId: ctx.getActiveChat().chatId,
+    })
+  }
+
+  function requestLocalState(): Promise<ActiveChatState | null> {
+    const chatId = ctx.getActiveChat().chatId
+    const requestId = `state-${Date.now().toString(36)}-${++stateRequestSequence}`
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        pendingStateRequests.delete(requestId)
+        reject(new Error('Timed out while loading the active chat voice settings.'))
+      }, 15_000)
+      pendingStateRequests.set(requestId, { chatId, resolve, reject, timer })
+      ctx.sendToBackend({ type: 'chat_voice_refresh', chatId, requestId })
+    })
+  }
+
   function stopPlayback() {
     const playback = activePlayback
     activePlayback = null
@@ -626,7 +655,17 @@ export function setup(ctx: SpindleFrontendContext) {
         return
       }
     }
-    if (!activeChat) return
+    const localChatId = ctx.getActiveChat().chatId
+    if (activeChat?.id !== localChatId) {
+      setStatus('Loading this chat’s voice settings…')
+      try {
+        await requestLocalState()
+      } catch (error) {
+        setStatus(error instanceof Error ? error.message : 'Could not load this chat’s voice settings.', 'error')
+        return
+      }
+    }
+    if (!activeChat || activeChat.id !== ctx.getActiveChat().chatId) return
     const playbackChat = activeChat
     const config = collectConfig()
     const preferences = await loadPlaybackPreferences()
@@ -970,6 +1009,14 @@ export function setup(ctx: SpindleFrontendContext) {
       return
     }
     if (payload.type === 'chat_voice_error') {
+      if (payload.requestId) {
+        const pending = pendingStateRequests.get(payload.requestId)
+        if (pending) {
+          clearTimeout(pending.timer)
+          pendingStateRequests.delete(payload.requestId)
+          pending.reject(new Error(payload.error || 'Could not load chat voice settings.'))
+        }
+      }
       if (payload.clientRevision !== undefined) inFlight.delete(payload.clientRevision)
       scanning = false
       scanButton.textContent = 'Scan'
@@ -990,6 +1037,16 @@ export function setup(ctx: SpindleFrontendContext) {
     if (payload.type !== 'chat_voice_state') return
 
     const incomingChatId = payload.chat?.id ?? null
+    const localChatId = ctx.getActiveChat().chatId
+    const pendingState = payload.requestId ? pendingStateRequests.get(payload.requestId) : undefined
+    if (pendingState) {
+      clearTimeout(pendingState.timer)
+      pendingStateRequests.delete(payload.requestId!)
+    }
+    if (incomingChatId !== localChatId) {
+      pendingState?.reject(new Error('The active chat changed while its voice settings were loading.'))
+      return
+    }
     const currentChatId = activeChat?.id ?? null
     if (incomingChatId !== currentChatId) {
       for (const pending of pendingMessageRequests.values()) {
@@ -997,12 +1054,14 @@ export function setup(ctx: SpindleFrontendContext) {
         pending.reject(new Error('The active chat changed before playback started.'))
       }
       pendingMessageRequests.clear()
+      stopPlayback()
       flushSave()
       dirty = false
       inFlight.clear()
       scanning = false
       scanButton.textContent = 'Scan'
       renderState(payload.chat)
+      pendingState?.resolve(payload.chat)
       return
     }
 
@@ -1011,28 +1070,41 @@ export function setup(ctx: SpindleFrontendContext) {
       if (payload.clientRevision !== editRevision || dirty) return
       renderState(payload.chat)
       setStatus('Saved.', 'saved')
+      pendingState?.resolve(payload.chat)
       return
     }
 
-    if (dirty || inFlight.size > 0) return
+    if (dirty || inFlight.size > 0) {
+      pendingState?.resolve(payload.chat)
+      return
+    }
     renderState(payload.chat)
+    pendingState?.resolve(payload.chat)
+  })
+
+  const unsubscribeChatSwitched = ctx.events.on('CHAT_SWITCHED', (rawPayload: unknown) => {
+    const switchedChatId = (rawPayload as { chatId?: string | null })?.chatId ?? null
+    hostWindow.requestAnimationFrame(() => {
+      if (ctx.getActiveChat().chatId === switchedChatId) refreshLocalState()
+    })
   })
 
   const unsubscribeActivate = tab.onActivate(() => {
     void loadConnections()
     void ensureQuotationRouting().catch(() => undefined)
-    ctx.sendToBackend({ type: 'chat_voice_refresh' })
+    refreshLocalState()
   })
 
   void loadConnections()
   void ensureQuotationRouting().catch(() => undefined)
-  ctx.sendToBackend({ type: 'chat_voice_refresh' })
+  refreshLocalState()
 
   return () => {
     stopPlayback()
     flushSave()
     if (saveTimer) clearTimeout(saveTimer)
     unsubscribeActivate()
+    unsubscribeChatSwitched()
     unsubscribeBackend()
     for (const input of characterInputs.values()) input.destroy()
     for (const pending of pendingMessageRequests.values()) {
@@ -1040,6 +1112,11 @@ export function setup(ctx: SpindleFrontendContext) {
       pending.reject(new Error('Chat Voice was closed.'))
     }
     pendingMessageRequests.clear()
+    for (const pending of pendingStateRequests.values()) {
+      clearTimeout(pending.timer)
+      pending.reject(new Error('Chat Voice was closed.'))
+    }
+    pendingStateRequests.clear()
     connectionPicker.destroy()
     narratorInput.destroy()
     addNpcInput.destroy()

@@ -21,6 +21,7 @@ A [Lumiverse Spindle](https://docs.lumiverse.chat/) extension that detects chara
 - Removes HTML/escaped tags and Markdown emphasis markers before sending readable text to TTS.
 - Auto-saves every setting to the current chat.
 - Saves the detected cast and reloads it with the correct settings whenever the active chat changes.
+- Keeps active-chat settings and playback requests isolated between multiple open Lumiverse browser tabs.
 - Never scans automatically when a chat loads, changes, or receives new messages.
 - Uses Lumiverse's native themed controls.
 
