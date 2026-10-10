@@ -72,17 +72,92 @@ export interface VoicePlanSegment {
   voice: string
 }
 
+export interface PcmAudioSegment {
+  sampleRate: number
+  channels: Float32Array[]
+}
+
+/** Combine decoded audio into one PCM WAV so the host does not need FFmpeg to save it. */
+export function encodeConcatenatedWav(segments: PcmAudioSegment[]): ArrayBuffer {
+  const usable = segments.filter(segment => (
+    Number.isFinite(segment.sampleRate)
+    && segment.sampleRate > 0
+    && segment.channels.length > 0
+    && segment.channels.some(channel => channel.length > 0)
+  ))
+  if (usable.length === 0) throw new Error('No decoded audio is available to save.')
+
+  const sampleRate = Math.max(...usable.map(segment => Math.round(segment.sampleRate)))
+  const channelCount = Math.max(...usable.map(segment => segment.channels.length))
+  const frameCounts = usable.map(segment => {
+    const sourceFrames = Math.max(...segment.channels.map(channel => channel.length))
+    return Math.max(1, Math.round(sourceFrames * sampleRate / segment.sampleRate))
+  })
+  const totalFrames = frameCounts.reduce((sum, count) => sum + count, 0)
+  const bytesPerSample = 2
+  const dataLength = totalFrames * channelCount * bytesPerSample
+  const output = new ArrayBuffer(44 + dataLength)
+  const view = new DataView(output)
+  const writeText = (offset: number, value: string) => {
+    for (let index = 0; index < value.length; index += 1) {
+      view.setUint8(offset + index, value.charCodeAt(index))
+    }
+  }
+
+  writeText(0, 'RIFF')
+  view.setUint32(4, 36 + dataLength, true)
+  writeText(8, 'WAVE')
+  writeText(12, 'fmt ')
+  view.setUint32(16, 16, true)
+  view.setUint16(20, 1, true)
+  view.setUint16(22, channelCount, true)
+  view.setUint32(24, sampleRate, true)
+  view.setUint32(28, sampleRate * channelCount * bytesPerSample, true)
+  view.setUint16(32, channelCount * bytesPerSample, true)
+  view.setUint16(34, bytesPerSample * 8, true)
+  writeText(36, 'data')
+  view.setUint32(40, dataLength, true)
+
+  let writeOffset = 44
+  usable.forEach((segment, segmentIndex) => {
+    const outputFrames = frameCounts[segmentIndex]
+    const sourceFrames = Math.max(...segment.channels.map(channel => channel.length))
+    for (let frame = 0; frame < outputFrames; frame += 1) {
+      const sourcePosition = outputFrames === 1 ? 0 : frame * (sourceFrames - 1) / (outputFrames - 1)
+      const lower = Math.floor(sourcePosition)
+      const upper = Math.min(sourceFrames - 1, lower + 1)
+      const fraction = sourcePosition - lower
+      for (let channelIndex = 0; channelIndex < channelCount; channelIndex += 1) {
+        const channel = segment.channels[Math.min(channelIndex, segment.channels.length - 1)]
+        const lowerValue = channel[Math.min(lower, channel.length - 1)] ?? 0
+        const upperValue = channel[Math.min(upper, channel.length - 1)] ?? lowerValue
+        const sample = Math.max(-1, Math.min(1, lowerValue + (upperValue - lowerValue) * fraction))
+        view.setInt16(writeOffset, sample < 0 ? sample * 0x8000 : sample * 0x7fff, true)
+        writeOffset += bytesPerSample
+      }
+    }
+  })
+
+  return output
+}
+
 /** Reduce TTS requests without changing playback order or voice boundaries. */
 export function mergeVoicePlan(segments: VoicePlanSegment[]): VoicePlanSegment[] {
   const result: VoicePlanSegment[] = []
   for (const segment of segments) {
-    const text = segment.text.trim()
-    if (!text) continue
-    const previous = result.at(-1)
-    if (previous?.voice === segment.voice) {
-      previous.text = `${previous.text} ${text}`
-    } else {
-      result.push({ text, voice: segment.voice })
+    const paragraphs = segment.text
+      .trim()
+      .split(/\n\s*\n+/)
+      .map(paragraph => paragraph.replace(/\s*\n\s*/g, ' ').trim())
+      .filter(Boolean)
+    for (let index = 0; index < paragraphs.length; index += 1) {
+      const text = paragraphs[index]
+      const previous = result.at(-1)
+      if (index === 0 && previous?.voice === segment.voice) {
+        previous.text = `${previous.text} ${text}`
+      } else {
+        result.push({ text, voice: segment.voice })
+      }
     }
   }
   return result
@@ -341,6 +416,8 @@ export function extractNamedDialogue(content: string): Array<{ name: string; tex
 
 function stripPlaybackMarkup(value: string): string {
   return value
+    .replace(/&lt;\/?(?:p|div|br)(?:\s[\s\S]*?)?&gt;/gi, '\n\n')
+    .replace(/\\?<\/?(?:p|div|br)(?:\s[^>]*)?>/gi, '\n\n')
     .replace(/&lt;\/?[a-z][\s\S]*?&gt;/gi, ' ')
     .replace(/\\?<\/?[a-z][^>]*>/gi, ' ')
     .replace(/\[\/?(?:font|color|size|style|span|div|p|b|i|u|em|strong)(?:=[^\]]*)?\]/gi, ' ')
@@ -361,7 +438,10 @@ function cleanPlaybackText(value: string): string {
   return decodePlaybackEntities(stripPlaybackMarkup(value))
     .replace(/```[\s\S]*?```/g, ' ')
     .replace(/`[^`\n]*`/g, ' ')
-    .replace(/\s+/g, ' ')
+    .replace(/\r\n?/g, '\n')
+    .replace(/[^\S\n]+/g, ' ')
+    .replace(/ *\n */g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
     .trim()
 }
 
@@ -410,9 +490,22 @@ function escapedPattern(value: string): string {
 function inferQuotedSpeaker(
   before: string,
   after: string,
+  quotedText: string,
   speakers: CharacterLike[],
   defaultSpeakerId: string | null,
 ): string | null {
+  if (/[,]\s*$/u.test(quotedText)) {
+    const actionBeat = after.slice(0, 140).split(/["“\n]/u, 1)[0]
+    let nearest: { id: string; index: number } | null = null
+    for (const speaker of speakers) {
+      const name = escapedPattern(normalizeSpeakerName(speaker.name))
+      if (!name) continue
+      const index = actionBeat.search(new RegExp(`\\b${name}\\b`, 'iu'))
+      if (index >= 0 && (!nearest || index < nearest.index)) nearest = { id: speaker.id, index }
+    }
+    if (nearest) return nearest.id
+  }
+
   let best: { id: string; score: number } | null = null
   for (const speaker of speakers) {
     const name = escapedPattern(normalizeSpeakerName(speaker.name))
@@ -453,6 +546,7 @@ export function parseRosterVoiceSegments(
         speakerId: inferQuotedSpeaker(
           playbackContent.slice(0, match.index),
           playbackContent.slice(quoteEnd),
+          match[1] ?? '',
           speakers,
           defaultSpeakerId,
         ),

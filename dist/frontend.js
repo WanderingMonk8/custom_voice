@@ -1,14 +1,69 @@
 // src/core.ts
+function encodeConcatenatedWav(segments) {
+  const usable = segments.filter((segment) => Number.isFinite(segment.sampleRate) && segment.sampleRate > 0 && segment.channels.length > 0 && segment.channels.some((channel) => channel.length > 0));
+  if (usable.length === 0) throw new Error("No decoded audio is available to save.");
+  const sampleRate = Math.max(...usable.map((segment) => Math.round(segment.sampleRate)));
+  const channelCount = Math.max(...usable.map((segment) => segment.channels.length));
+  const frameCounts = usable.map((segment) => {
+    const sourceFrames = Math.max(...segment.channels.map((channel) => channel.length));
+    return Math.max(1, Math.round(sourceFrames * sampleRate / segment.sampleRate));
+  });
+  const totalFrames = frameCounts.reduce((sum, count) => sum + count, 0);
+  const bytesPerSample = 2;
+  const dataLength = totalFrames * channelCount * bytesPerSample;
+  const output = new ArrayBuffer(44 + dataLength);
+  const view = new DataView(output);
+  const writeText = (offset, value) => {
+    for (let index = 0; index < value.length; index += 1) {
+      view.setUint8(offset + index, value.charCodeAt(index));
+    }
+  };
+  writeText(0, "RIFF");
+  view.setUint32(4, 36 + dataLength, true);
+  writeText(8, "WAVE");
+  writeText(12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, channelCount, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * channelCount * bytesPerSample, true);
+  view.setUint16(32, channelCount * bytesPerSample, true);
+  view.setUint16(34, bytesPerSample * 8, true);
+  writeText(36, "data");
+  view.setUint32(40, dataLength, true);
+  let writeOffset = 44;
+  usable.forEach((segment, segmentIndex) => {
+    const outputFrames = frameCounts[segmentIndex];
+    const sourceFrames = Math.max(...segment.channels.map((channel) => channel.length));
+    for (let frame = 0; frame < outputFrames; frame += 1) {
+      const sourcePosition = outputFrames === 1 ? 0 : frame * (sourceFrames - 1) / (outputFrames - 1);
+      const lower = Math.floor(sourcePosition);
+      const upper = Math.min(sourceFrames - 1, lower + 1);
+      const fraction = sourcePosition - lower;
+      for (let channelIndex = 0; channelIndex < channelCount; channelIndex += 1) {
+        const channel = segment.channels[Math.min(channelIndex, segment.channels.length - 1)];
+        const lowerValue = channel[Math.min(lower, channel.length - 1)] ?? 0;
+        const upperValue = channel[Math.min(upper, channel.length - 1)] ?? lowerValue;
+        const sample = Math.max(-1, Math.min(1, lowerValue + (upperValue - lowerValue) * fraction));
+        view.setInt16(writeOffset, sample < 0 ? sample * 32768 : sample * 32767, true);
+        writeOffset += bytesPerSample;
+      }
+    }
+  });
+  return output;
+}
 function mergeVoicePlan(segments) {
   const result = [];
   for (const segment of segments) {
-    const text = segment.text.trim();
-    if (!text) continue;
-    const previous = result.at(-1);
-    if (previous?.voice === segment.voice) {
-      previous.text = `${previous.text} ${text}`;
-    } else {
-      result.push({ text, voice: segment.voice });
+    const paragraphs = segment.text.trim().split(/\n\s*\n+/).map((paragraph) => paragraph.replace(/\s*\n\s*/g, " ").trim()).filter(Boolean);
+    for (let index = 0; index < paragraphs.length; index += 1) {
+      const text = paragraphs[index];
+      const previous = result.at(-1);
+      if (index === 0 && previous?.voice === segment.voice) {
+        previous.text = `${previous.text} ${text}`;
+      } else {
+        result.push({ text, voice: segment.voice });
+      }
     }
   }
   return result;
@@ -20,19 +75,30 @@ function npcSpeakerId(name) {
   return `npc:${normalizeSpeakerName(name).toLowerCase()}`;
 }
 function stripPlaybackMarkup(value) {
-  return value.replace(/&lt;\/?[a-z][\s\S]*?&gt;/gi, " ").replace(/\\?<\/?[a-z][^>]*>/gi, " ").replace(/\[\/?(?:font|color|size|style|span|div|p|b|i|u|em|strong)(?:=[^\]]*)?\]/gi, " ").replace(/[*_~]+/g, " ");
+  return value.replace(/&lt;\/?(?:p|div|br)(?:\s[\s\S]*?)?&gt;/gi, "\n\n").replace(/\\?<\/?(?:p|div|br)(?:\s[^>]*)?>/gi, "\n\n").replace(/&lt;\/?[a-z][\s\S]*?&gt;/gi, " ").replace(/\\?<\/?[a-z][^>]*>/gi, " ").replace(/\[\/?(?:font|color|size|style|span|div|p|b|i|u|em|strong)(?:=[^\]]*)?\]/gi, " ").replace(/[*_~]+/g, " ");
 }
 function decodePlaybackEntities(value) {
   return value.replace(/&nbsp;/gi, " ").replace(/&quot;|&#34;|&#x22;/gi, '"').replace(/&apos;|&#39;|&#x27;/gi, "'").replace(/&lt;|&#60;|&#x3c;/gi, "<").replace(/&gt;|&#62;|&#x3e;/gi, ">").replace(/&amp;|&#38;|&#x26;/gi, "&");
 }
 function cleanPlaybackText(value) {
-  return decodePlaybackEntities(stripPlaybackMarkup(value)).replace(/```[\s\S]*?```/g, " ").replace(/`[^`\n]*`/g, " ").replace(/\s+/g, " ").trim();
+  return decodePlaybackEntities(stripPlaybackMarkup(value)).replace(/```[\s\S]*?```/g, " ").replace(/`[^`\n]*`/g, " ").replace(/\r\n?/g, "\n").replace(/[^\S\n]+/g, " ").replace(/ *\n */g, "\n").replace(/\n{3,}/g, "\n\n").trim();
 }
 var SPEECH_VERBS = "(?:said|says|asked|asks|replied|replies|whispered|whispers|shouted|shouts|yelled|yells|called|calls|murmured|murmurs|answered|answers|added|adds|continued|continues|remarked|remarks|cried|cries|growled|growls|sighed|sighs)";
 function escapedPattern(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
-function inferQuotedSpeaker(before, after, speakers, defaultSpeakerId) {
+function inferQuotedSpeaker(before, after, quotedText, speakers, defaultSpeakerId) {
+  if (/[,]\s*$/u.test(quotedText)) {
+    const actionBeat = after.slice(0, 140).split(/["“\n]/u, 1)[0];
+    let nearest = null;
+    for (const speaker of speakers) {
+      const name = escapedPattern(normalizeSpeakerName(speaker.name));
+      if (!name) continue;
+      const index = actionBeat.search(new RegExp(`\\b${name}\\b`, "iu"));
+      if (index >= 0 && (!nearest || index < nearest.index)) nearest = { id: speaker.id, index };
+    }
+    if (nearest) return nearest.id;
+  }
   let best = null;
   for (const speaker of speakers) {
     const name = escapedPattern(normalizeSpeakerName(speaker.name));
@@ -68,6 +134,7 @@ function parseRosterVoiceSegments(content, defaultSpeakerId, speakers) {
         speakerId: inferQuotedSpeaker(
           playbackContent.slice(0, match.index),
           playbackContent.slice(quoteEnd),
+          match[1] ?? "",
           speakers,
           defaultSpeakerId
         )
@@ -83,7 +150,7 @@ function parseRosterVoiceSegments(content, defaultSpeakerId, speakers) {
 // src/frontend.ts
 var MIN_SYNTHESIS_START_INTERVAL_MS = 1250;
 var MAX_RATE_LIMIT_RETRIES = 3;
-var PLAYBACK_BUFFER_SEGMENTS = 2;
+var PLAYBACK_BUFFER_SEGMENTS = 4;
 var VOICE_ICON = `
   <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
     <path d="M5 10v4M9 7v10M13 4v16M17 8v8M21 10v4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
@@ -113,13 +180,14 @@ async function loadPlaybackPreferences() {
     credentials: "same-origin",
     headers: { Accept: "application/json" }
   });
-  if (!response.ok) return { speed: 1, volume: 1 };
+  if (!response.ok) return { speed: 1, volume: 1, connectionId: "" };
   const row = await response.json();
   const speed = typeof row.value?.ttsSpeed === "number" ? row.value.ttsSpeed : 1;
   const volume = typeof row.value?.ttsVolume === "number" ? row.value.ttsVolume : 1;
   return {
     speed: Math.min(4, Math.max(0.25, speed)),
-    volume: Math.min(1, Math.max(0, volume))
+    volume: Math.min(1, Math.max(0, volume)),
+    connectionId: typeof row.value?.ttsConnectionId === "string" ? row.value.ttsConnectionId.trim() : ""
   };
 }
 function abortableDelay(milliseconds, signal) {
@@ -354,6 +422,7 @@ function setup(ctx) {
   let applyingState = false;
   let activeChat = null;
   let connections = [];
+  let lumiverseConnectionId = "";
   let saveTimer = null;
   let editRevision = 0;
   let dirty = false;
@@ -542,6 +611,7 @@ function setup(ctx) {
       };
       source.start();
     });
+    return buffer;
   }
   async function playMessage(messageId) {
     if (activePlayback) {
@@ -555,7 +625,9 @@ function setup(ctx) {
     if (!activeChat) return;
     const playbackChat = activeChat;
     const config = collectConfig();
-    if (!config.connectionId) {
+    const preferences = await loadPlaybackPreferences();
+    const connectionId = config.connectionId || (connections.some((connection) => connection.id === preferences.connectionId) ? preferences.connectionId : connections.find((connection) => connection.is_default)?.id ?? lumiverseConnectionId);
+    if (!connectionId) {
       setStatus("Choose a TTS connection before playing.", "error");
       return;
     }
@@ -589,12 +661,11 @@ function setup(ctx) {
         return { text: segment.text, voice };
       }));
       if (plan.length === 0) throw new Error("This message has no playable narration or dialogue.");
-      const preferences = await loadPlaybackPreferences();
       const pacer = { nextStartAt: 0, startQueue: Promise.resolve() };
       const prepare = async (index) => {
         try {
           const segment = await synthesizeVoiceSegment(
-            config.connectionId,
+            connectionId,
             plan[index].text,
             plan[index].voice,
             preferences.speed,
@@ -619,25 +690,42 @@ function setup(ctx) {
         `Buffering ${initialBufferSize} voice segment${initialBufferSize === 1 ? "" : "s"} before playback\u2026`
       );
       await Promise.all(prepared.values());
-      const captured = new Array(plan.length);
+      const decoded = new Array(plan.length);
       for (let index = 0; index < plan.length; index += 1) {
         const current = await prepared.get(index);
         prepared.delete(index);
         if ("error" in current) throw current.error;
-        captured[index] = current.segment;
         schedule(index + PLAYBACK_BUFFER_SEGMENTS);
         setStatus(`Playing ${index + 1} of ${plan.length} voice segment${plan.length === 1 ? "" : "s"}\u2026`);
-        await playDecodedBuffer(playback, current.segment.data, preferences.volume);
+        decoded[index] = await playDecodedBuffer(playback, current.segment.data, preferences.volume);
       }
-      setStatus("Saving generated audio\u2026");
-      await saveMessageAudio(
-        playbackChat.id,
-        messageId,
-        message.swipe_id,
-        captured,
-        playback.controller.signal
-      );
-      setStatus("Playback complete and audio saved.", "saved");
+      if (activePlayback === playback) {
+        activePlayback = null;
+        updatePlaybackButtons();
+        await playback.context.close().catch(() => void 0);
+      }
+      const wav = encodeConcatenatedWav(decoded.map((buffer) => ({
+        sampleRate: buffer.sampleRate,
+        channels: Array.from(
+          { length: buffer.numberOfChannels },
+          (_, channel) => buffer.getChannelData(channel)
+        )
+      })));
+      setStatus("Playback complete. Saving generated audio\u2026");
+      try {
+        await saveMessageAudio(
+          playbackChat.id,
+          messageId,
+          message.swipe_id,
+          [{ data: wav, mime: "audio/wav" }],
+          playback.controller.signal
+        );
+        setStatus("Playback complete and audio saved.", "saved");
+      } catch (error) {
+        if (error?.name === "AbortError") throw error;
+        const detail = error instanceof Error ? error.message : "Unknown save error.";
+        setStatus(`Playback completed, but its audio could not be saved: ${detail}`, "error");
+      }
     } catch (error) {
       if (error?.name !== "AbortError") {
         setStatus(error instanceof Error ? error.message : "Custom voice playback failed.", "error");
@@ -766,9 +854,10 @@ function setup(ctx) {
     applyingState = true;
     activeChat = next;
     context.textContent = next ? `Active chat: ${next.name}` : "Open a chat to configure its voices.";
+    const selectedConnectionId = next?.connectionId || lumiverseConnectionId;
     connectionPicker.update({
-      value: next?.connectionId ?? "",
-      options: connectionOptions(next?.connectionId),
+      value: selectedConnectionId,
+      options: connectionOptions(selectedConnectionId),
       placeholder: connections.length ? "Choose a TTS connection" : "No TTS connections found",
       disabled: !next || connections.length === 0
     });
@@ -784,9 +873,16 @@ function setup(ctx) {
   }
   async function loadConnections() {
     try {
-      connections = await listAllTtsConnections();
+      const [loadedConnections, preferences] = await Promise.all([
+        listAllTtsConnections(),
+        loadPlaybackPreferences()
+      ]);
+      connections = loadedConnections;
+      lumiverseConnectionId = connections.some((connection) => connection.id === preferences.connectionId) ? preferences.connectionId : connections.find((connection) => connection.is_default)?.id ?? "";
+      const selectedConnectionId = activeChat?.connectionId || lumiverseConnectionId;
       connectionPicker.update({
-        options: connectionOptions(activeChat?.connectionId),
+        value: selectedConnectionId,
+        options: connectionOptions(selectedConnectionId),
         placeholder: connections.length ? "Choose a TTS connection" : "No TTS connections found",
         disabled: !activeChat || connections.length === 0
       });

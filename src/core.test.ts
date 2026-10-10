@@ -4,6 +4,7 @@ import {
   applyConfigToMetadata,
   clampMessageLimit,
   detectCharacters,
+  encodeConcatenatedWav,
   hashMessageContent,
   mergeVoicePlan,
   npcSpeakerId,
@@ -14,6 +15,26 @@ import {
   readConfig,
   type ChatVoiceConfig,
 } from './core'
+
+test('combines decoded segments into one resampled PCM WAV', () => {
+  const wav = encodeConcatenatedWav([
+    { sampleRate: 8_000, channels: [new Float32Array([0, 0.5, -0.5, 1])] },
+    { sampleRate: 16_000, channels: [new Float32Array([0.25, -0.25, 0.75, -0.75])] },
+  ])
+  const view = new DataView(wav)
+  const text = (offset: number, length: number) => String.fromCharCode(
+    ...new Uint8Array(wav, offset, length),
+  )
+
+  assert.equal(text(0, 4), 'RIFF')
+  assert.equal(text(8, 4), 'WAVE')
+  assert.equal(text(36, 4), 'data')
+  assert.equal(view.getUint16(20, true), 1)
+  assert.equal(view.getUint16(22, true), 1)
+  assert.equal(view.getUint32(24, true), 16_000)
+  assert.equal(view.getUint32(40, true), 24)
+  assert.equal(wav.byteLength, 68)
+})
 
 test('merges adjacent segments that use the same voice', () => {
   assert.deepEqual(mergeVoicePlan([
@@ -26,6 +47,16 @@ test('merges adjacent segments that use the same voice', () => {
     { text: 'First sentence. Second sentence.', voice: 'narrator' },
     { text: 'Hello.', voice: 'alice' },
     { text: 'Back to narration.', voice: 'narrator' },
+  ])
+})
+
+test('keeps separate paragraphs as independently generated voice segments', () => {
+  assert.deepEqual(mergeVoicePlan([
+    { text: 'First paragraph.\n\nSecond paragraph.\n\nThird paragraph.', voice: 'narrator' },
+  ]), [
+    { text: 'First paragraph.', voice: 'narrator' },
+    { text: 'Second paragraph.', voice: 'narrator' },
+    { text: 'Third paragraph.', voice: 'narrator' },
   ])
 })
 
@@ -194,6 +225,25 @@ test('supports speaker attribution after a quote', () => {
     [
       { text: 'We should go,', speakerId: 'alice' },
       { text: 'whispered Alice.', speakerId: null },
+    ],
+  )
+})
+
+test('uses a comma-ended quote action beat to identify its speaker', () => {
+  assert.deepEqual(
+    parseRosterVoiceSegments(
+      '"I am speaking here," Sarah looks unamused, "Please listen to me."',
+      'card',
+      [
+        { id: 'bob', name: 'Bob' },
+        { id: 'sarah', name: 'Sarah' },
+        { id: 'card', name: 'Narrator Card' },
+      ],
+    ),
+    [
+      { text: 'I am speaking here,', speakerId: 'sarah' },
+      { text: 'Sarah looks unamused,', speakerId: null },
+      { text: 'Please listen to me.', speakerId: 'sarah' },
     ],
   )
 })
