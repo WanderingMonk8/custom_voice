@@ -270,6 +270,38 @@ test('uses a comma-ended quote action beat to identify its speaker', () => {
   )
 })
 
+test('assigns every quote to the sole character named in its paragraph', () => {
+  assert.deepEqual(
+    parseRosterVoiceSegments(
+      '"Then take them out on him!" Zuri is already crawling aside, surrendering her place at his left hand. "Talk your talk, captain. I\'ll hold his hand and be the gauge."',
+      'card',
+      [
+        { id: 'zuri', name: 'Zuri' },
+        { id: 'card', name: 'Narrator Card' },
+      ],
+    ),
+    [
+      { text: 'Then take them out on him!', speakerId: 'zuri' },
+      {
+        text: 'Zuri is already crawling aside, surrendering her place at his left hand.',
+        speakerId: null,
+      },
+      { text: "Talk your talk, captain. I'll hold his hand and be the gauge.", speakerId: 'zuri' },
+    ],
+  )
+})
+
+test('does not use the paragraph fallback when narration names multiple characters', () => {
+  assert.deepEqual(
+    parseRosterVoiceSegments(
+      '"Move!" Zuri watches Alma cross the room.',
+      'card',
+      [{ id: 'zuri', name: 'Zuri' }, { id: 'alma', name: 'Alma' }],
+    )[0],
+    { text: 'Move!', speakerId: 'card' },
+  )
+})
+
 test('continues a confidently identified speaker across same-paragraph narration', () => {
   const content = '"The board\'s right here," Alma said. She was already at the kit-roll with her good hand on the coupling block, the splinted arm holding the coil against her ribs. "But the mast is up there and we are down here. Anybody want to volunteer?"'
   assert.deepEqual(
@@ -291,7 +323,7 @@ test('continues a confidently identified speaker across same-paragraph narration
   )
 })
 
-test('does not continue a speaker across a paragraph break', () => {
+test('inherits the nearest confident speaker across an unnamed paragraph break', () => {
   assert.deepEqual(
     parseRosterVoiceSegments(
       '"First," Alma said.\n\nThe scene changes. "Unattributed."',
@@ -301,7 +333,27 @@ test('does not continue a speaker across a paragraph break', () => {
     [
       { text: 'First,', speakerId: 'alma' },
       { text: 'Alma said.\n\nThe scene changes.', speakerId: null },
-      { text: 'Unattributed.', speakerId: 'card' },
+      { text: 'Unattributed.', speakerId: 'alma' },
+    ],
+  )
+})
+
+test('searches upward through unnamed paragraphs for the nearest confident speaker', () => {
+  const segments = parseRosterVoiceSegments(
+    '"Third thing." Hailey settles back and finishes her explanation.\n\n"The fourth thing I cannot say. I have to show it."\n\nHer hands move with calm purpose and she considers the next step.\n\n"I do not know how to do this part without a plan," she says. "So watch me while it happens."',
+    'card',
+    [
+      { id: 'hailey', name: 'Hailey' },
+      { id: 'card', name: 'Narrator Card' },
+    ],
+  )
+  assert.deepEqual(
+    segments.filter(segment => segment.speakerId !== null),
+    [
+      { text: 'Third thing.', speakerId: 'hailey' },
+      { text: 'The fourth thing I cannot say. I have to show it.', speakerId: 'hailey' },
+      { text: 'I do not know how to do this part without a plan,', speakerId: 'hailey' },
+      { text: 'So watch me while it happens.', speakerId: 'hailey' },
     ],
   )
 })
