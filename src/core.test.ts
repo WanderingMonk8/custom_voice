@@ -323,7 +323,7 @@ test('continues a confidently identified speaker across same-paragraph narration
   )
 })
 
-test('does not continue a speaker across a paragraph break', () => {
+test('inherits the nearest confident speaker across an unnamed paragraph break', () => {
   assert.deepEqual(
     parseRosterVoiceSegments(
       '"First," Alma said.\n\nThe scene changes. "Unattributed."',
@@ -333,7 +333,27 @@ test('does not continue a speaker across a paragraph break', () => {
     [
       { text: 'First,', speakerId: 'alma' },
       { text: 'Alma said.\n\nThe scene changes.', speakerId: null },
-      { text: 'Unattributed.', speakerId: 'card' },
+      { text: 'Unattributed.', speakerId: 'alma' },
+    ],
+  )
+})
+
+test('searches upward through unnamed paragraphs for the nearest confident speaker', () => {
+  const segments = parseRosterVoiceSegments(
+    '"Third thing." Hailey settles back and finishes her explanation.\n\n"The fourth thing I cannot say. I have to show it."\n\nHer hands move with calm purpose and she considers the next step.\n\n"I do not know how to do this part without a plan," she says. "So watch me while it happens."',
+    'card',
+    [
+      { id: 'hailey', name: 'Hailey' },
+      { id: 'card', name: 'Narrator Card' },
+    ],
+  )
+  assert.deepEqual(
+    segments.filter(segment => segment.speakerId !== null),
+    [
+      { text: 'Third thing.', speakerId: 'hailey' },
+      { text: 'The fourth thing I cannot say. I have to show it.', speakerId: 'hailey' },
+      { text: 'I do not know how to do this part without a plan,', speakerId: 'hailey' },
+      { text: 'So watch me while it happens.', speakerId: 'hailey' },
     ],
   )
 })

@@ -505,7 +505,7 @@ function escapedPattern(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 }
 
-function soleMentionedSpeaker(text: string, speakers: CharacterLike[]): string | null {
+function mentionedSpeakers(text: string, speakers: CharacterLike[]): Set<string> {
   const narrative = text.replace(/["“][\s\S]*?["”]/gu, ' ')
   const mentionedSpeakerIds = new Set<string>()
   for (const speaker of speakers) {
@@ -516,6 +516,11 @@ function soleMentionedSpeaker(text: string, speakers: CharacterLike[]): string |
       }
     }
   }
+  return mentionedSpeakerIds
+}
+
+function soleMentionedSpeaker(text: string, speakers: CharacterLike[]): string | null {
+  const mentionedSpeakerIds = mentionedSpeakers(text, speakers)
   return mentionedSpeakerIds.size === 1 ? [...mentionedSpeakerIds][0] : null
 }
 
@@ -537,19 +542,14 @@ function currentParagraphSpeaker(
 }
 
 function precedingParagraphSpeaker(before: string, speakers: CharacterLike[]): string | null {
-  let lastBreak: RegExpMatchArray | null = null
-  for (const match of before.matchAll(/\n[^\S\n]*\n/gu)) lastBreak = match
-  if (!lastBreak || lastBreak.index === undefined) return null
-
-  const breakEnd = lastBreak.index + lastBreak[0].length
-  if (cleanPlaybackText(before.slice(breakEnd))) return null
-
-  const earlierText = before.slice(0, lastBreak.index).trimEnd()
-  let previousBreakEnd = 0
-  for (const match of earlierText.matchAll(/\n[^\S\n]*\n/gu)) {
-    if (match.index !== undefined) previousBreakEnd = match.index + match[0].length
+  const paragraphs = before.split(/\n[^\S\n]*\n/gu)
+  if (paragraphs.length < 2) return null
+  for (let index = paragraphs.length - 2; index >= 0; index--) {
+    const mentionedSpeakerIds = mentionedSpeakers(paragraphs[index], speakers)
+    if (mentionedSpeakerIds.size === 1) return [...mentionedSpeakerIds][0]
+    if (mentionedSpeakerIds.size > 1) return null
   }
-  return soleMentionedSpeaker(earlierText.slice(previousBreakEnd), speakers)
+  return null
 }
 
 function inferQuotedSpeaker(

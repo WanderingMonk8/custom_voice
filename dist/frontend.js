@@ -99,7 +99,7 @@ var SPEECH_VERBS = "(?:said|says|asked|asks|replied|replies|whispered|whispers|s
 function escapedPattern(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
-function soleMentionedSpeaker(text, speakers) {
+function mentionedSpeakers(text, speakers) {
   const narrative = text.replace(/["“][\s\S]*?["”]/gu, " ");
   const mentionedSpeakerIds = /* @__PURE__ */ new Set();
   for (const speaker of speakers) {
@@ -110,6 +110,10 @@ function soleMentionedSpeaker(text, speakers) {
       }
     }
   }
+  return mentionedSpeakerIds;
+}
+function soleMentionedSpeaker(text, speakers) {
+  const mentionedSpeakerIds = mentionedSpeakers(text, speakers);
   return mentionedSpeakerIds.size === 1 ? [...mentionedSpeakerIds][0] : null;
 }
 function currentParagraphSpeaker(before, after, speakers) {
@@ -126,17 +130,14 @@ ${after.slice(0, paragraphEnd)}`,
   );
 }
 function precedingParagraphSpeaker(before, speakers) {
-  let lastBreak = null;
-  for (const match of before.matchAll(/\n[^\S\n]*\n/gu)) lastBreak = match;
-  if (!lastBreak || lastBreak.index === void 0) return null;
-  const breakEnd = lastBreak.index + lastBreak[0].length;
-  if (cleanPlaybackText(before.slice(breakEnd))) return null;
-  const earlierText = before.slice(0, lastBreak.index).trimEnd();
-  let previousBreakEnd = 0;
-  for (const match of earlierText.matchAll(/\n[^\S\n]*\n/gu)) {
-    if (match.index !== void 0) previousBreakEnd = match.index + match[0].length;
+  const paragraphs = before.split(/\n[^\S\n]*\n/gu);
+  if (paragraphs.length < 2) return null;
+  for (let index = paragraphs.length - 2; index >= 0; index--) {
+    const mentionedSpeakerIds = mentionedSpeakers(paragraphs[index], speakers);
+    if (mentionedSpeakerIds.size === 1) return [...mentionedSpeakerIds][0];
+    if (mentionedSpeakerIds.size > 1) return null;
   }
-  return soleMentionedSpeaker(earlierText.slice(previousBreakEnd), speakers);
+  return null;
 }
 function inferQuotedSpeaker(before, after, quotedText, speakers, defaultSpeakerId) {
   if (/[,]\s*$/u.test(quotedText)) {
