@@ -1,0 +1,13 @@
+{
+  "version": "1.0.0",
+  "name": "Chat Voice",
+  "identifier": "chat_voice",
+  "author": "WanderingMonk8",
+  "github": "https://github.com/WanderingMonk8/custom_voice",
+  "homepage": "https://github.com/WanderingMonk8/custom_voice",
+  "description": "Choose a TTS connection and custom voice name for the active chat.",
+  "permissions": ["chats"],
+  "entry_backend": "dist/backend.js",
+  "entry_frontend": "dist/frontend.js",
+  "minimum_lumiverse_version": "1.2.5"
+}
