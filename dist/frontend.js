@@ -1,65 +1,62 @@
 // src/core.ts
-function hashMessageContent(content) {
-  let hash = 2166136261;
-  for (let index = 0; index < content.length; index++) {
-    hash ^= content.charCodeAt(index);
-    hash = Math.imul(hash, 16777619);
-  }
-  return `${content.length.toString(36)}-${(hash >>> 0).toString(36)}`;
-}
 function normalizeSpeakerName(value) {
   return value.normalize("NFKC").trim().replace(/\s+/g, " ");
 }
 function npcSpeakerId(name) {
   return `npc:${normalizeSpeakerName(name).toLowerCase()}`;
 }
-var SPEAKER_NAME_RE = /^[\p{L}\p{N}][\p{L}\p{N}\p{M} ._'’\-]{0,63}$/u;
-var NAMED_DIALOGUE_RE = /^(?:\s*(?:[-*]\s*)?)?(?:\*\*)?([^:\n]{1,64}?)(?:\*\*)?\s*:\s*["“]([\s\S]*?)["”]/gm;
-function extractNamedDialogue(content) {
-  const result = [];
-  for (const match of content.matchAll(NAMED_DIALOGUE_RE)) {
-    const name = normalizeSpeakerName(match[1] ?? "");
-    const text = (match[2] ?? "").trim();
-    if (!name || !text || !SPEAKER_NAME_RE.test(name) || match.index === void 0) continue;
-    result.push({ name, text, start: match.index, end: match.index + match[0].length });
-  }
-  return result;
-}
 function cleanPlaybackText(value) {
   return value.replace(/```[\s\S]*?```/g, " ").replace(/`[^`\n]*`/g, " ").replace(/<[^>]+>/g, " ").replace(/[*_~]+/g, " ").replace(/\s+/g, " ").trim();
 }
-function appendGenericSegments(result, text, defaultSpeakerId) {
+var SPEECH_VERBS = "(?:said|says|asked|asks|replied|replies|whispered|whispers|shouted|shouts|yelled|yells|called|calls|murmured|murmurs|answered|answers|added|adds|continued|continues|remarked|remarks|cried|cries|growled|growls|sighed|sighs)";
+function escapedPattern(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+function inferQuotedSpeaker(before, after, speakers, defaultSpeakerId) {
+  let best = null;
+  for (const speaker of speakers) {
+    const name = escapedPattern(normalizeSpeakerName(speaker.name));
+    if (!name) continue;
+    const tests = [
+      [new RegExp(`(?:^|\\n)\\s*(?:[-*]\\s*)?(?:\\*\\*)?${name}(?:\\*\\*)?\\s*:\\s*[^"\u201C\\n]{0,120}$`, "iu"), before.slice(-220), 100],
+      [new RegExp(`\\b${name}\\b[^\\n.!?]{0,60}\\b${SPEECH_VERBS}\\b[^\\n.!?]{0,20}$`, "iu"), before.slice(-180), 90],
+      [new RegExp(`\\b${SPEECH_VERBS}\\b\\s+(?:to\\s+)?${name}\\b[^\\n.!?]{0,20}$`, "iu"), before.slice(-180), 90],
+      [new RegExp(`^\\s*[,;:.!?\u2014-]*\\s*${name}\\b[^\\n.!?]{0,50}\\b${SPEECH_VERBS}\\b`, "iu"), after.slice(0, 180), 85],
+      [new RegExp(`^\\s*[,;:.!?\u2014-]*\\s*${SPEECH_VERBS}\\b\\s+(?:to\\s+)?${name}\\b`, "iu"), after.slice(0, 180), 85],
+      [new RegExp(`\\b${name}\\b[^\\n]{0,70}$`, "iu"), before.slice(-140), 86]
+    ];
+    for (const [pattern, sample, score] of tests) {
+      if (pattern.test(sample) && (!best || score > best.score)) best = { id: speaker.id, score };
+    }
+  }
+  return best?.id ?? defaultSpeakerId;
+}
+function parseRosterVoiceSegments(content, defaultSpeakerId, speakers) {
+  const result = [];
   const quotePattern = /["“]([\s\S]*?)["”]/g;
   let cursor = 0;
-  for (const match of text.matchAll(quotePattern)) {
+  for (const match of content.matchAll(quotePattern)) {
     if (match.index === void 0) continue;
-    const narration2 = cleanPlaybackText(text.slice(cursor, match.index));
+    const narration2 = cleanPlaybackText(content.slice(cursor, match.index));
     if (narration2) result.push({ text: narration2, speakerId: null });
     const speech = cleanPlaybackText(match[1] ?? "");
-    if (speech) result.push({ text: speech, speakerId: defaultSpeakerId });
+    if (speech) {
+      const quoteEnd = match.index + match[0].length;
+      result.push({
+        text: speech,
+        speakerId: inferQuotedSpeaker(
+          content.slice(0, match.index),
+          content.slice(quoteEnd),
+          speakers,
+          defaultSpeakerId
+        )
+      });
+    }
     cursor = match.index + match[0].length;
   }
-  const narration = cleanPlaybackText(text.slice(cursor));
+  const narration = cleanPlaybackText(content.slice(cursor));
   if (narration) result.push({ text: narration, speakerId: null });
-}
-function parseMultiVoiceSegments(content, defaultSpeakerId) {
-  const named = extractNamedDialogue(content);
-  const result = [];
-  let cursor = 0;
-  for (const dialogue of named) {
-    appendGenericSegments(result, content.slice(cursor, dialogue.start), defaultSpeakerId);
-    const speech = cleanPlaybackText(dialogue.text);
-    if (speech) result.push({ text: speech, speakerId: npcSpeakerId(dialogue.name) });
-    cursor = dialogue.end;
-  }
-  appendGenericSegments(result, content.slice(cursor), defaultSpeakerId);
-  const merged = [];
-  for (const segment of result) {
-    const previous = merged[merged.length - 1];
-    if (previous?.speakerId === null && segment.speakerId === null) previous.text += ` ${segment.text}`;
-    else merged.push({ ...segment });
-  }
-  return merged;
+  return result;
 }
 
 // src/frontend.ts
@@ -216,20 +213,19 @@ function setup(ctx) {
     return { field, slot };
   }
   const connectionField = createField("TTS connection");
-  const messageLimitField = createField("Messages to scan");
-  const scanRow = document.createElement("div");
+  const scanField = createField("Character card cast");
+  const scanRow = scanField.slot;
   scanRow.className = "chat-voice-scan-row";
   const scanButton = document.createElement("button");
   scanButton.type = "button";
   scanButton.className = "chat-voice-scan-button";
   scanButton.textContent = "Scan";
   scanButton.disabled = true;
-  messageLimitField.field.insertBefore(scanRow, messageLimitField.slot);
-  scanRow.append(messageLimitField.slot, scanButton);
+  scanRow.append(scanButton);
   const narratorField = createField("Narrator voice");
   const routingHint = document.createElement("div");
   routingHint.className = "chat-voice-hint";
-  routingHint.textContent = 'Use one line per speaker: Name: "Dialogue". The custom music-note action on each message plays named dialogue with that voice and everything else with the narrator voice.';
+  routingHint.textContent = "Scan reads the character card, not chat history. During playback, quoted dialogue is matched to the saved cast using names and dialogue tags; everything outside quotes uses the narrator voice.";
   const characterTitle = document.createElement("div");
   characterTitle.className = "chat-voice-section-title";
   characterTitle.textContent = "Detected voices";
@@ -242,7 +238,7 @@ function setup(ctx) {
   panel.append(
     context,
     connectionField.field,
-    messageLimitField.field,
+    scanField.field,
     narratorField.field,
     routingHint,
     characterTitle,
@@ -277,16 +273,6 @@ function setup(ctx) {
     disabled: true,
     onChange: () => markChanged()
   });
-  const messageLimitInput = ctx.components.mountNumericInput(messageLimitField.slot, {
-    value: 20,
-    min: 1,
-    max: 500,
-    step: 1,
-    integer: true,
-    ariaLabel: "Number of recent messages to scan",
-    disabled: true,
-    onChange: () => markChanged(500)
-  });
   const narratorInput = ctx.components.mountTextInput(narratorField.slot, {
     value: "",
     placeholder: "Enter the narrator voice name or ID",
@@ -296,7 +282,7 @@ function setup(ctx) {
   });
   function collectConfig() {
     return {
-      messageLimit: messageLimitInput.getValue() ?? 20,
+      messageLimit: activeChat?.messageLimit ?? 20,
       connectionId: connectionPicker.getValue(),
       narratorVoice: narratorInput.getValue(),
       characterVoices: Object.fromEntries(
@@ -420,8 +406,7 @@ function setup(ctx) {
       const aliases = new Map(
         activeChat.characters.map((character) => [npcSpeakerId(character.name), character.id])
       );
-      const cached = activeChat.parsedMessages[messageId];
-      const segments = cached?.contentHash === hashMessageContent(message.content) ? cached.segments : parseMultiVoiceSegments(message.content, defaultSpeakerId);
+      const segments = parseRosterVoiceSegments(message.content, defaultSpeakerId, activeChat.characters);
       const plan = segments.map((segment) => {
         const speakerId = segment.speakerId ? aliases.get(segment.speakerId) ?? segment.speakerId : null;
         const voice = speakerId ? config.characterVoices[speakerId] || (defaultSpeakerId ? config.characterVoices[defaultSpeakerId] : "") || "" : config.narratorVoice;
@@ -469,11 +454,11 @@ function setup(ctx) {
     scanning = true;
     scanButton.disabled = true;
     scanButton.textContent = "Scanning\u2026";
-    setStatus("Asking the active language model to identify speakers\u2026");
+    setStatus("Reading the active character card cast\u2026");
     ctx.sendToBackend({
       type: "chat_voice_scan",
       chatId: activeChat.id,
-      messageLimit: messageLimitInput.getValue() ?? 20
+      messageLimit: activeChat.messageLimit
     });
   }
   scanButton.addEventListener("click", scanMessages);
@@ -495,7 +480,7 @@ function setup(ctx) {
     if (characters.length === 0) {
       const empty = document.createElement("div");
       empty.className = "chat-voice-empty";
-      empty.textContent = "No saved characters yet. Click Scan to detect speakers in recent messages.";
+      empty.textContent = "No saved characters yet. Click Scan to read the active character card.";
       characterList.appendChild(empty);
       return;
     }
@@ -509,7 +494,7 @@ function setup(ctx) {
       name.textContent = character.name;
       const count = document.createElement("span");
       count.className = "chat-voice-character-count";
-      count.textContent = `${character.messageCount} occurrence${character.messageCount === 1 ? "" : "s"}`;
+      count.textContent = character.messageCount > 0 ? `${character.messageCount} occurrence${character.messageCount === 1 ? "" : "s"}` : "Card cast";
       const slot = document.createElement("div");
       heading.append(name, count);
       card.append(heading, slot);
@@ -534,7 +519,6 @@ function setup(ctx) {
       placeholder: connections.length ? "Choose a TTS connection" : "No TTS connections found",
       disabled: !next || connections.length === 0
     });
-    messageLimitInput.update({ value: next?.messageLimit ?? 20, disabled: !next });
     scanButton.disabled = !next || scanning;
     narratorInput.update({ value: next?.narratorVoice ?? "", disabled: !next });
     renderCharacters(next?.characters ?? []);
@@ -601,7 +585,7 @@ function setup(ctx) {
       scanning = false;
       scanButton.textContent = "Scan";
       scanButton.disabled = false;
-      setStatus(payload.parserFallbacks ? `Scan complete. ${payload.parserFallbacks} message${payload.parserFallbacks === 1 ? "" : "s"} used deterministic fallback.` : "Scan complete. Speaker map and character settings saved.", "saved");
+      setStatus(payload.cardParserFallback ? "Card parsing was unavailable; the primary card character was saved." : "Scan complete. Character-card cast saved.", "saved");
       return;
     }
     if (payload.type !== "chat_voice_state") return;
@@ -642,7 +626,6 @@ function setup(ctx) {
     unsubscribeBackend();
     for (const input of characterInputs.values()) input.destroy();
     connectionPicker.destroy();
-    messageLimitInput.destroy();
     narratorInput.destroy();
     scanButton.removeEventListener("click", scanMessages);
     destroyCurrentDecorator?.();

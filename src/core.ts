@@ -48,6 +48,11 @@ export interface LlmParsedMessage {
   segments: LlmParsedSegment[]
 }
 
+export interface CardCastMember {
+  cardId: string
+  name: string
+}
+
 export interface CharacterLike {
   id: string
   name: string
@@ -259,6 +264,38 @@ export function parseLlmSegmentation(
   return result
 }
 
+export function parseCardCast(
+  response: unknown,
+  allowedCardIds: ReadonlySet<string>,
+): CardCastMember[] {
+  let text = extractGenerationText(response).trim()
+  if (text.startsWith('```')) {
+    text = text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '')
+  }
+  const start = text.indexOf('{')
+  const end = text.lastIndexOf('}')
+  if (start < 0 || end <= start) return []
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(text.slice(start, end + 1))
+  } catch {
+    return []
+  }
+  if (!isRecord(parsed) || !Array.isArray(parsed.characters)) return []
+  const result: CardCastMember[] = []
+  const seen = new Set<string>()
+  for (const item of parsed.characters.slice(0, 200)) {
+    if (!isRecord(item) || typeof item.cardId !== 'string' || !allowedCardIds.has(item.cardId)) continue
+    if (typeof item.name !== 'string') continue
+    const name = normalizeSpeakerName(item.name).slice(0, 128)
+    const key = `${item.cardId}\u0000${name.toLowerCase()}`
+    if (!name || seen.has(key)) continue
+    seen.add(key)
+    result.push({ cardId: item.cardId, name })
+  }
+  return result
+}
+
 export function normalizeSpeakerName(value: string): string {
   return value.normalize('NFKC').trim().replace(/\s+/g, ' ')
 }
@@ -325,6 +362,69 @@ export function parseMultiVoiceSegments(content: string, defaultSpeakerId: strin
     else merged.push({ ...segment })
   }
   return merged
+}
+
+const SPEECH_VERBS = '(?:said|says|asked|asks|replied|replies|whispered|whispers|shouted|shouts|yelled|yells|called|calls|murmured|murmurs|answered|answers|added|adds|continued|continues|remarked|remarks|cried|cries|growled|growls|sighed|sighs)'
+
+function escapedPattern(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+function inferQuotedSpeaker(
+  before: string,
+  after: string,
+  speakers: CharacterLike[],
+  defaultSpeakerId: string | null,
+): string | null {
+  let best: { id: string; score: number } | null = null
+  for (const speaker of speakers) {
+    const name = escapedPattern(normalizeSpeakerName(speaker.name))
+    if (!name) continue
+    const tests: Array<[RegExp, string, number]> = [
+      [new RegExp(`(?:^|\\n)\\s*(?:[-*]\\s*)?(?:\\*\\*)?${name}(?:\\*\\*)?\\s*:\\s*[^"“\\n]{0,120}$`, 'iu'), before.slice(-220), 100],
+      [new RegExp(`\\b${name}\\b[^\\n.!?]{0,60}\\b${SPEECH_VERBS}\\b[^\\n.!?]{0,20}$`, 'iu'), before.slice(-180), 90],
+      [new RegExp(`\\b${SPEECH_VERBS}\\b\\s+(?:to\\s+)?${name}\\b[^\\n.!?]{0,20}$`, 'iu'), before.slice(-180), 90],
+      [new RegExp(`^\\s*[,;:.!?—-]*\\s*${name}\\b[^\\n.!?]{0,50}\\b${SPEECH_VERBS}\\b`, 'iu'), after.slice(0, 180), 85],
+      [new RegExp(`^\\s*[,;:.!?—-]*\\s*${SPEECH_VERBS}\\b\\s+(?:to\\s+)?${name}\\b`, 'iu'), after.slice(0, 180), 85],
+      [new RegExp(`\\b${name}\\b[^\\n]{0,70}$`, 'iu'), before.slice(-140), 86],
+    ]
+    for (const [pattern, sample, score] of tests) {
+      if (pattern.test(sample) && (!best || score > best.score)) best = { id: speaker.id, score }
+    }
+  }
+  return best?.id ?? defaultSpeakerId
+}
+
+export function parseRosterVoiceSegments(
+  content: string,
+  defaultSpeakerId: string | null,
+  speakers: CharacterLike[],
+): PlaybackSegment[] {
+  const result: PlaybackSegment[] = []
+  const quotePattern = /["“]([\s\S]*?)["”]/g
+  let cursor = 0
+  for (const match of content.matchAll(quotePattern)) {
+    if (match.index === undefined) continue
+    const narration = cleanPlaybackText(content.slice(cursor, match.index))
+    if (narration) result.push({ text: narration, speakerId: null })
+    const speech = cleanPlaybackText(match[1] ?? '')
+    if (speech) {
+      const quoteEnd = match.index + match[0].length
+      result.push({
+        text: speech,
+        speakerId: inferQuotedSpeaker(
+          content.slice(0, match.index),
+          content.slice(quoteEnd),
+          speakers,
+          defaultSpeakerId,
+        ),
+      })
+    }
+    cursor = match.index + match[0].length
+  }
+  const narration = cleanPlaybackText(content.slice(cursor))
+  if (narration) result.push({ text: narration, speakerId: null })
+  return result
 }
 
 export function detectCharacters(

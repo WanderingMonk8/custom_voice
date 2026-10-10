@@ -3,11 +3,9 @@ import type {
   SpindleTextInputHandle,
 } from 'lumiverse-spindle-types'
 import {
-  hashMessageContent,
   npcSpeakerId,
   normalizeSpeakerName,
-  parseMultiVoiceSegments,
-  type CachedMessageParse,
+  parseRosterVoiceSegments,
 } from './core'
 
 interface TtsConnection {
@@ -35,7 +33,6 @@ interface ActiveChatState {
   connectionId: string
   narratorVoice: string
   characters: DetectedCharacterState[]
-  parsedMessages: Record<string, CachedMessageParse>
 }
 
 interface StatePayload {
@@ -53,7 +50,7 @@ interface ErrorPayload {
 interface ScanCompletePayload {
   type: 'chat_voice_scan_complete'
   chatId: string
-  parserFallbacks?: number
+  cardParserFallback?: boolean
 }
 
 interface PlaybackMessage {
@@ -243,20 +240,19 @@ export function setup(ctx: SpindleFrontendContext) {
   }
 
   const connectionField = createField('TTS connection')
-  const messageLimitField = createField('Messages to scan')
-  const scanRow = document.createElement('div')
+  const scanField = createField('Character card cast')
+  const scanRow = scanField.slot
   scanRow.className = 'chat-voice-scan-row'
   const scanButton = document.createElement('button')
   scanButton.type = 'button'
   scanButton.className = 'chat-voice-scan-button'
   scanButton.textContent = 'Scan'
   scanButton.disabled = true
-  messageLimitField.field.insertBefore(scanRow, messageLimitField.slot)
-  scanRow.append(messageLimitField.slot, scanButton)
+  scanRow.append(scanButton)
   const narratorField = createField('Narrator voice')
   const routingHint = document.createElement('div')
   routingHint.className = 'chat-voice-hint'
-  routingHint.textContent = 'Use one line per speaker: Name: "Dialogue". The custom music-note action on each message plays named dialogue with that voice and everything else with the narrator voice.'
+  routingHint.textContent = 'Scan reads the character card, not chat history. During playback, quoted dialogue is matched to the saved cast using names and dialogue tags; everything outside quotes uses the narrator voice.'
   const characterTitle = document.createElement('div')
   characterTitle.className = 'chat-voice-section-title'
   characterTitle.textContent = 'Detected voices'
@@ -270,7 +266,7 @@ export function setup(ctx: SpindleFrontendContext) {
   panel.append(
     context,
     connectionField.field,
-    messageLimitField.field,
+    scanField.field,
     narratorField.field,
     routingHint,
     characterTitle,
@@ -309,12 +305,6 @@ export function setup(ctx: SpindleFrontendContext) {
     onChange: () => markChanged(),
   })
 
-  const messageLimitInput = ctx.components.mountNumericInput(messageLimitField.slot, {
-    value: 20, min: 1, max: 500, step: 1, integer: true,
-    ariaLabel: 'Number of recent messages to scan', disabled: true,
-    onChange: () => markChanged(500),
-  })
-
   const narratorInput = ctx.components.mountTextInput(narratorField.slot, {
     value: '', placeholder: 'Enter the narrator voice name or ID',
     ariaLabel: 'Narrator voice', disabled: true,
@@ -323,7 +313,7 @@ export function setup(ctx: SpindleFrontendContext) {
 
   function collectConfig() {
     return {
-      messageLimit: messageLimitInput.getValue() ?? 20,
+      messageLimit: activeChat?.messageLimit ?? 20,
       connectionId: connectionPicker.getValue(),
       narratorVoice: narratorInput.getValue(),
       characterVoices: Object.fromEntries(
@@ -458,10 +448,7 @@ export function setup(ctx: SpindleFrontendContext) {
       const aliases = new Map(
         activeChat.characters.map((character) => [npcSpeakerId(character.name), character.id] as const),
       )
-      const cached = activeChat.parsedMessages[messageId]
-      const segments = cached?.contentHash === hashMessageContent(message.content)
-        ? cached.segments
-        : parseMultiVoiceSegments(message.content, defaultSpeakerId)
+      const segments = parseRosterVoiceSegments(message.content, defaultSpeakerId, activeChat.characters)
       const plan = segments.map((segment) => {
         const speakerId = segment.speakerId
           ? aliases.get(segment.speakerId) ?? segment.speakerId
@@ -515,11 +502,11 @@ export function setup(ctx: SpindleFrontendContext) {
     scanning = true
     scanButton.disabled = true
     scanButton.textContent = 'Scanning…'
-    setStatus('Asking the active language model to identify speakers…')
+    setStatus('Reading the active character card cast…')
     ctx.sendToBackend({
       type: 'chat_voice_scan',
       chatId: activeChat.id,
-      messageLimit: messageLimitInput.getValue() ?? 20,
+      messageLimit: activeChat.messageLimit,
     })
   }
 
@@ -544,7 +531,7 @@ export function setup(ctx: SpindleFrontendContext) {
     if (characters.length === 0) {
       const empty = document.createElement('div')
       empty.className = 'chat-voice-empty'
-      empty.textContent = 'No saved characters yet. Click Scan to detect speakers in recent messages.'
+      empty.textContent = 'No saved characters yet. Click Scan to read the active character card.'
       characterList.appendChild(empty)
       return
     }
@@ -559,7 +546,9 @@ export function setup(ctx: SpindleFrontendContext) {
       name.textContent = character.name
       const count = document.createElement('span')
       count.className = 'chat-voice-character-count'
-      count.textContent = `${character.messageCount} occurrence${character.messageCount === 1 ? '' : 's'}`
+      count.textContent = character.messageCount > 0
+        ? `${character.messageCount} occurrence${character.messageCount === 1 ? '' : 's'}`
+        : 'Card cast'
       const slot = document.createElement('div')
       heading.append(name, count)
       card.append(heading, slot)
@@ -585,7 +574,6 @@ export function setup(ctx: SpindleFrontendContext) {
       placeholder: connections.length ? 'Choose a TTS connection' : 'No TTS connections found',
       disabled: !next || connections.length === 0,
     })
-    messageLimitInput.update({ value: next?.messageLimit ?? 20, disabled: !next })
     scanButton.disabled = !next || scanning
     narratorInput.update({ value: next?.narratorVoice ?? '', disabled: !next })
     renderCharacters(next?.characters ?? [])
@@ -668,9 +656,9 @@ export function setup(ctx: SpindleFrontendContext) {
       scanning = false
       scanButton.textContent = 'Scan'
       scanButton.disabled = false
-      setStatus(payload.parserFallbacks
-        ? `Scan complete. ${payload.parserFallbacks} message${payload.parserFallbacks === 1 ? '' : 's'} used deterministic fallback.`
-        : 'Scan complete. Speaker map and character settings saved.', 'saved')
+      setStatus(payload.cardParserFallback
+        ? 'Card parsing was unavailable; the primary card character was saved.'
+        : 'Scan complete. Character-card cast saved.', 'saved')
       return
     }
     if (payload.type !== 'chat_voice_state') return
@@ -717,7 +705,6 @@ export function setup(ctx: SpindleFrontendContext) {
     unsubscribeBackend()
     for (const input of characterInputs.values()) input.destroy()
     connectionPicker.destroy()
-    messageLimitInput.destroy()
     narratorInput.destroy()
     scanButton.removeEventListener('click', scanMessages)
     destroyCurrentDecorator?.()

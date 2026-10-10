@@ -6,8 +6,10 @@ import {
   detectCharacters,
   hashMessageContent,
   npcSpeakerId,
+  parseCardCast,
   parseLlmSegmentation,
   parseMultiVoiceSegments,
+  parseRosterVoiceSegments,
   readConfig,
   type ChatVoiceConfig,
 } from './core'
@@ -134,6 +136,51 @@ test('validates fenced LLM segmentation and rejects unknown message IDs', () => 
 test('message content hashes change when playback content changes', () => {
   assert.equal(hashMessageContent('same'), hashMessageContent('same'))
   assert.notEqual(hashMessageContent('same'), hashMessageContent('changed'))
+})
+
+test('validates card-cast extraction and rejects unknown card IDs', () => {
+  const parsed = parseCardCast({
+    content: '{"characters":[{"cardId":"card","name":"Alice"},{"cardId":"card","name":"Bob"},{"cardId":"other","name":"Mallory"}]}',
+  }, new Set(['card']))
+  assert.deepEqual(parsed, [
+    { cardId: 'card', name: 'Alice' },
+    { cardId: 'card', name: 'Bob' },
+  ])
+})
+
+test('assigns quoted output to saved cast members using dialogue tags', () => {
+  const segments = parseRosterVoiceSegments(
+    'Alice said, "Hello." Bob replied, “Welcome.” The room fell quiet.',
+    'card',
+    [
+      { id: npcSpeakerId('Alice'), name: 'Alice' },
+      { id: npcSpeakerId('Bob'), name: 'Bob' },
+    ],
+  )
+  assert.deepEqual(segments, [
+    { text: 'Alice said,', speakerId: null },
+    { text: 'Hello.', speakerId: npcSpeakerId('Alice') },
+    { text: 'Bob replied,', speakerId: null },
+    { text: 'Welcome.', speakerId: npcSpeakerId('Bob') },
+    { text: 'The room fell quiet.', speakerId: null },
+  ])
+})
+
+test('never assigns unquoted output to a character voice', () => {
+  assert.deepEqual(
+    parseRosterVoiceSegments('Alice said hello without quotation marks.', 'card', [{ id: 'alice', name: 'Alice' }]),
+    [{ text: 'Alice said hello without quotation marks.', speakerId: null }],
+  )
+})
+
+test('supports speaker attribution after a quote', () => {
+  assert.deepEqual(
+    parseRosterVoiceSegments('"We should go," whispered Alice.', 'card', [{ id: 'alice', name: 'Alice' }]),
+    [
+      { text: 'We should go,', speakerId: 'alice' },
+      { text: 'whispered Alice.', speakerId: null },
+    ],
+  )
 })
 
 test('detects multiple named NPCs written by one character card', () => {
