@@ -409,6 +409,48 @@ export function speakerAliases(value: string): string[] {
   return aliases
 }
 
+const SPEAKER_TITLES = new Set([
+  'mr', 'mrs', 'ms', 'miss', 'mx', 'dr', 'prof', 'sir', 'lady', 'lord',
+  'capt', 'captain', 'sgt', 'sergeant',
+])
+
+function firstNameAlias(value: string): string | null {
+  const aliases = speakerAliases(value)
+  const words = aliases[0]?.split(/\s+/u) ?? []
+  if (words.length < 2) return null
+  const title = words[0].replace(/\.$/u, '').toLowerCase()
+  const firstName = words[SPEAKER_TITLES.has(title) ? 1 : 0]
+  if (!firstName || aliases.some(alias => alias.toLowerCase() === firstName.toLowerCase())) return null
+  return firstName
+}
+
+export function addScannedFirstNameAliases<T extends CharacterLike>(characters: T[]): T[] {
+  const candidates = new Map<string, string>()
+  const owners = new Map<string, Set<string>>()
+  const addOwner = (alias: string, id: string) => {
+    const key = alias.toLowerCase()
+    const ids = owners.get(key) ?? new Set<string>()
+    ids.add(id)
+    owners.set(key, ids)
+  }
+
+  for (const character of characters) {
+    for (const alias of speakerAliases(character.name)) addOwner(alias, character.id)
+    const candidate = firstNameAlias(character.name)
+    if (candidate) {
+      candidates.set(character.id, candidate)
+      addOwner(candidate, character.id)
+    }
+  }
+
+  return characters.map((character) => {
+    const candidate = candidates.get(character.id)
+    if (!candidate || owners.get(candidate.toLowerCase())?.size !== 1) return character
+    const name = [...speakerAliases(character.name), candidate].join(' / ')
+    return name.length <= 128 ? { ...character, name } : character
+  })
+}
+
 export function npcSpeakerId(name: string): string {
   return `npc:${normalizeSpeakerName(name).toLowerCase()}`
 }
@@ -499,29 +541,137 @@ const SPEECH_VERBS = '(?:said|says|asked|asks|replied|replies|whispered|whispers
 interface SpeakerInference {
   speakerId: string | null
   confident: boolean
+  source: 'explicit' | 'paragraph' | 'history' | 'fallback'
 }
 
 function escapedPattern(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 }
 
-function mentionedSpeakers(text: string, speakers: CharacterLike[]): Set<string> {
-  const narrative = text.replace(/["“][\s\S]*?["”]/gu, ' ')
-  const mentionedSpeakerIds = new Set<string>()
+interface SpeakerMentions {
+  clean: Set<string>
+  possessive: Set<string>
+}
+
+function narrativeOnly(text: string): string {
+  return text.replace(/["“][\s\S]*?["”]/gu, ' ')
+}
+
+function mentionedSpeakers(text: string, speakers: CharacterLike[]): SpeakerMentions {
+  const narrative = narrativeOnly(text)
+  const mentions: SpeakerMentions = { clean: new Set(), possessive: new Set() }
   for (const speaker of speakers) {
     for (const alias of speakerAliases(speaker.name)) {
-      if (new RegExp(`\\b${escapedPattern(alias)}\\b`, 'iu').test(narrative)) {
-        mentionedSpeakerIds.add(speaker.id)
-        break
+      const pattern = new RegExp(`\\b${escapedPattern(alias)}\\b`, 'giu')
+      for (const match of narrative.matchAll(pattern)) {
+        if (match.index === undefined) continue
+        const suffix = narrative.slice(match.index + match[0].length)
+        const collection = /^['’](?:s\b)?/iu.test(suffix) ? mentions.possessive : mentions.clean
+        collection.add(speaker.id)
       }
     }
   }
-  return mentionedSpeakerIds
+  return mentions
+}
+
+interface SpeakerOccurrence {
+  speakerId: string
+  start: number
+  end: number
+}
+
+function discourseSubjectSpeaker(
+  text: string,
+  speakers: CharacterLike[],
+  eligibleSpeakerIds: Set<string>,
+): string | null {
+  const narrative = narrativeOnly(text)
+  const occurrencesByPosition = new Map<string, SpeakerOccurrence>()
+  for (const speaker of speakers) {
+    if (!eligibleSpeakerIds.has(speaker.id)) continue
+    for (const alias of speakerAliases(speaker.name)) {
+      const pattern = new RegExp(`\\b${escapedPattern(alias)}\\b`, 'giu')
+      for (const match of narrative.matchAll(pattern)) {
+        if (match.index === undefined) continue
+        const end = match.index + match[0].length
+        if (/^['’](?:s\b)?/iu.test(narrative.slice(end))) continue
+        const key = `${speaker.id}:${match.index}`
+        const previous = occurrencesByPosition.get(key)
+        if (!previous || end > previous.end) {
+          occurrencesByPosition.set(key, { speakerId: speaker.id, start: match.index, end })
+        }
+      }
+    }
+  }
+  const occurrences = [...occurrencesByPosition.values()].sort((left, right) => (
+    left.start - right.start || right.end - left.end
+  ))
+  if (occurrences.length === 0) return null
+
+  const scores = new Map<string, number>([...eligibleSpeakerIds].map(id => [id, 0]))
+  const firstMentionStart = occurrences[0].start
+  const clauseStart = (index: number) => {
+    const prefix = narrative.slice(0, index)
+    return Math.max(
+      prefix.lastIndexOf('.'), prefix.lastIndexOf('!'), prefix.lastIndexOf('?'),
+      prefix.lastIndexOf(';'), prefix.lastIndexOf('\n'),
+    ) + 1
+  }
+
+  for (const occurrence of occurrences) {
+    const start = clauseStart(occurrence.start)
+    const lead = narrative.slice(start, occurrence.start)
+    const earlierInClause = occurrences.some(other => (
+      other.start >= start && other.start < occurrence.start
+    ))
+    let score = occurrence.start === firstMentionStart ? 2 : 0
+    if (!lead.trim()) score += 10
+    else if (!earlierInClause && /^[^,]{1,48},\s*$/u.test(lead)) score += 8
+
+    if (/\b(?:to|from|for|with|by|at|on|of|beside|behind|under|near|toward|towards)\s*$/iu.test(lead)) {
+      score -= 6
+    }
+    if (/\b(?:that|which|who|whom|whose|because|while|when|if|though|although)\s*$/iu.test(lead)) {
+      score -= 5
+    }
+    if (earlierInClause && /^\s+(?:had|has|have)\b/iu.test(narrative.slice(occurrence.end))) {
+      score -= 5
+    }
+    scores.set(occurrence.speakerId, (scores.get(occurrence.speakerId) ?? 0) + score)
+  }
+
+  for (let index = 1; index < occurrences.length; index++) {
+    const left = occurrences[index - 1]
+    const right = occurrences[index]
+    if (left.speakerId === right.speakerId || clauseStart(left.start) !== clauseStart(right.start)) continue
+    const between = narrative.slice(left.end, right.start)
+    if (/^\s*(?:,\s*)?(?:and|or)\s*$/iu.test(between)) {
+      scores.set(right.speakerId, (scores.get(right.speakerId) ?? 0) + 10)
+    }
+  }
+
+  const ranked = [...scores.entries()].sort((left, right) => right[1] - left[1])
+  const [winnerId, winnerScore] = ranked[0]
+  const runnerUpScore = ranked[1]?.[1] ?? Number.NEGATIVE_INFINITY
+  return winnerScore >= 8 && winnerScore - runnerUpScore >= 4 ? winnerId : null
+}
+
+function preferredMentionedSpeaker(
+  text: string,
+  speakers: CharacterLike[],
+  mentions: SpeakerMentions,
+): string | null {
+  if (mentions.clean.size === 1) return [...mentions.clean][0]
+  if (mentions.clean.size > 1) return discourseSubjectSpeaker(text, speakers, mentions.clean)
+  return mentions.possessive.size === 1 ? [...mentions.possessive][0] : null
+}
+
+function hasSpeakerMentions(mentions: SpeakerMentions): boolean {
+  return mentions.clean.size > 0 || mentions.possessive.size > 0
 }
 
 function soleMentionedSpeaker(text: string, speakers: CharacterLike[]): string | null {
-  const mentionedSpeakerIds = mentionedSpeakers(text, speakers)
-  return mentionedSpeakerIds.size === 1 ? [...mentionedSpeakerIds][0] : null
+  return preferredMentionedSpeaker(text, speakers, mentionedSpeakers(text, speakers))
 }
 
 function currentParagraphSpeaker(
@@ -545,9 +695,11 @@ function precedingParagraphSpeaker(before: string, speakers: CharacterLike[]): s
   const paragraphs = before.split(/\n[^\S\n]*\n/gu)
   if (paragraphs.length < 2) return null
   for (let index = paragraphs.length - 2; index >= 0; index--) {
-    const mentionedSpeakerIds = mentionedSpeakers(paragraphs[index], speakers)
-    if (mentionedSpeakerIds.size === 1) return [...mentionedSpeakerIds][0]
-    if (mentionedSpeakerIds.size > 1) return null
+    const paragraph = paragraphs[index]
+    const mentions = mentionedSpeakers(paragraph, speakers)
+    const speakerId = preferredMentionedSpeaker(paragraph, speakers, mentions)
+    if (speakerId) return speakerId
+    if (hasSpeakerMentions(mentions)) return null
   }
   return null
 }
@@ -569,7 +721,7 @@ function inferQuotedSpeaker(
         if (index >= 0 && (!nearest || index < nearest.index)) nearest = { id: speaker.id, index }
       }
     }
-    if (nearest) return { speakerId: nearest.id, confident: true }
+    if (nearest) return { speakerId: nearest.id, confident: true, source: 'explicit' }
   }
 
   let best: { id: string; score: number } | null = null
@@ -582,20 +734,21 @@ function inferQuotedSpeaker(
         [new RegExp(`\\b${SPEECH_VERBS}\\b\\s+(?:to\\s+)?${name}\\b[^\\n.!?]{0,20}$`, 'iu'), before.slice(-180), 90],
         [new RegExp(`^\\s*[,;:.!?—-]*\\s*${name}\\b[^\\n.!?]{0,50}\\b${SPEECH_VERBS}\\b`, 'iu'), after.slice(0, 180), 85],
         [new RegExp(`^\\s*[,;:.!?—-]*\\s*${SPEECH_VERBS}\\b\\s+(?:to\\s+)?${name}\\b`, 'iu'), after.slice(0, 180), 85],
-        [new RegExp(`\\b${name}\\b[^\\n]{0,70}$`, 'iu'), before.slice(-140), 86],
       ]
       for (const [pattern, sample, score] of tests) {
         if (pattern.test(sample) && (!best || score > best.score)) best = { id: speaker.id, score }
       }
     }
   }
-  if (best) return { speakerId: best.id, confident: true }
+  if (best) return { speakerId: best.id, confident: true, source: 'explicit' }
   const currentSpeakerId = currentParagraphSpeaker(before, after, speakers)
-  if (currentSpeakerId) return { speakerId: currentSpeakerId, confident: true }
+  if (currentSpeakerId) {
+    return { speakerId: currentSpeakerId, confident: true, source: 'paragraph' }
+  }
   const paragraphSpeakerId = precedingParagraphSpeaker(before, speakers)
   return paragraphSpeakerId
-    ? { speakerId: paragraphSpeakerId, confident: true }
-    : { speakerId: defaultSpeakerId, confident: false }
+    ? { speakerId: paragraphSpeakerId, confident: true, source: 'history' }
+    : { speakerId: defaultSpeakerId, confident: false, source: 'fallback' }
 }
 
 function canContinueSpeaker(
@@ -624,6 +777,7 @@ export function parseRosterVoiceSegments(
   const quotePattern = /["“]([\s\S]*?)["”]/g
   let cursor = 0
   let lastConfidentSpeakerId: string | null = null
+  let lastAssignedSpeakerId: string | null = null
   for (const match of playbackContent.matchAll(quotePattern)) {
     if (match.index === undefined) continue
     const bridge = playbackContent.slice(cursor, match.index)
@@ -639,10 +793,11 @@ export function parseRosterVoiceSegments(
         speakers,
         defaultSpeakerId,
       )
-      const continuedSpeakerId: string | null = !inference.confident
-        && lastConfidentSpeakerId
-        && canContinueSpeaker(bridge, lastConfidentSpeakerId, speakers)
-        ? lastConfidentSpeakerId
+      const continuationCandidate: string | null = lastAssignedSpeakerId ?? lastConfidentSpeakerId
+      const continuedSpeakerId: string | null = inference.source === 'fallback'
+        && continuationCandidate
+        && canContinueSpeaker(bridge, continuationCandidate, speakers)
+        ? continuationCandidate
         : null
       const speakerId: string | null = continuedSpeakerId ?? inference.speakerId
       result.push({
@@ -650,6 +805,7 @@ export function parseRosterVoiceSegments(
         speakerId,
       })
       if (inference.confident && speakerId) lastConfidentSpeakerId = speakerId
+      if (speakerId) lastAssignedSpeakerId = speakerId
     }
     cursor = match.index + match[0].length
   }

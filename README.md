@@ -6,6 +6,7 @@ A [Lumiverse Spindle](https://docs.lumiverse.chat/) extension that detects chara
 
 - Reads the active character card only when you click **Scan**; chat history is never sent for cast detection.
 - Uses one short language-model request to identify the primary persona and recurring speaking NPCs represented by the card.
+- Automatically adds an unambiguous first name as an alias when a card scan returns a full character name.
 - Assigns each quoted passage locally during playback using explicit speaker labels, dialogue tags, and the saved card cast.
 - Uses one shared TTS connection for the entire chat.
 - Assigns a different custom voice name or provider voice ID to every detected character.
@@ -13,6 +14,7 @@ A [Lumiverse Spindle](https://docs.lumiverse.chat/) extension that detects chara
 - Assigns a separate narrator voice.
 - Routes quoted text to the speaking character and text outside quotations to the narrator.
 - Carries a confidently identified speaker across same-paragraph narration for later unattributed quotes, unless another roster character is introduced.
+- Resolves multi-character paragraphs with confidence-scored main-clause subject detection while discounting objects, passive agents, possessives, and subordinate references.
 - Routes Lumiverse's native message TTS button through ordered multi-voice playback.
 - Overrides the matching native context-menu action instead of adding duplicate playback controls.
 - Merges adjacent same-voice passages within each paragraph, splits multi-paragraph passages into smaller requests, and maintains a four-segment rolling playback buffer to avoid gaps and API bursts.

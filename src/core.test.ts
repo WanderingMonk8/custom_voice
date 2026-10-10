@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
+  addScannedFirstNameAliases,
   applyConfigToMetadata,
   clampMessageLimit,
   detectCharacters,
@@ -217,6 +218,32 @@ test('normalizes slash-separated speaker aliases without duplicates', () => {
   assert.deepEqual(speakerAliases(' Scott / The sergeant / scott / '), ['Scott', 'The sergeant'])
 })
 
+test('adds unique first-name aliases to scanned full names', () => {
+  assert.deepEqual(addScannedFirstNameAliases([
+    { id: 'al', name: 'Al Neko' },
+    { id: 'sarah', name: 'Dr. Sarah Connor' },
+    { id: 'zuri', name: 'Zuri' },
+  ]), [
+    { id: 'al', name: 'Al Neko / Al' },
+    { id: 'sarah', name: 'Dr. Sarah Connor / Sarah' },
+    { id: 'zuri', name: 'Zuri' },
+  ])
+})
+
+test('does not add ambiguous or already-owned first-name aliases', () => {
+  assert.deepEqual(addScannedFirstNameAliases([
+    { id: 'john-smith', name: 'John Smith' },
+    { id: 'john-doe', name: 'John Doe' },
+    { id: 'al', name: 'Al' },
+    { id: 'al-neko', name: 'Al Neko' },
+  ]), [
+    { id: 'john-smith', name: 'John Smith' },
+    { id: 'john-doe', name: 'John Doe' },
+    { id: 'al', name: 'Al' },
+    { id: 'al-neko', name: 'Al Neko' },
+  ])
+})
+
 test('assigns every slash-separated alias to the same saved NPC voice', () => {
   const speakerId = npcSpeakerId('Scott')
   assert.deepEqual(
@@ -291,14 +318,14 @@ test('assigns every quote to the sole character named in its paragraph', () => {
   )
 })
 
-test('does not use the paragraph fallback when narration names multiple characters', () => {
+test('uses a clear main-clause subject when narration names multiple characters', () => {
   assert.deepEqual(
     parseRosterVoiceSegments(
       '"Move!" Zuri watches Alma cross the room.',
       'card',
       [{ id: 'zuri', name: 'Zuri' }, { id: 'alma', name: 'Alma' }],
     )[0],
-    { text: 'Move!', speakerId: 'card' },
+    { text: 'Move!', speakerId: 'zuri' },
   )
 })
 
@@ -358,6 +385,35 @@ test('searches upward through unnamed paragraphs for the nearest confident speak
   )
 })
 
+test('prefers a clean character name over another character possessive', () => {
+  const segments = parseRosterVoiceSegments(
+    'Kansai watched her go. At the sink, Al Neko\'s hands rested under the running water.\n\n"She will be back at midnight," she said. "For the ramen. Just so you know."',
+    'card',
+    [
+      { id: 'kansai', name: 'Kansai' },
+      { id: 'al-neko', name: 'Al Neko' },
+    ],
+  )
+  assert.deepEqual(
+    segments.filter(segment => segment.speakerId !== null),
+    [
+      { text: 'She will be back at midnight,', speakerId: 'kansai' },
+      { text: 'For the ramen. Just so you know.', speakerId: 'kansai' },
+    ],
+  )
+})
+
+test('uses a sole possessive name when no clean character name is present', () => {
+  assert.deepEqual(
+    parseRosterVoiceSegments(
+      'Al Neko’s hands rested under the running water.\n\n"Ready."',
+      'card',
+      [{ id: 'al-neko', name: 'Al Neko' }],
+    ).at(-1),
+    { text: 'Ready.', speakerId: 'al-neko' },
+  )
+})
+
 test('anchors leading dialogue to the sole character in the preceding paragraph', () => {
   const content = 'Toggard rode the last hundred yards out ahead without being asked, dropped from the bay at the bank stones, and stood looking at the water a long moment before he came back.\n\n"It\'s up. The crossing is possible, but it is a ford you walk, not a ford you ride." He wiped his wet hands on his breeches. "There\'s flat ground back under the alders."'
   assert.deepEqual(
@@ -380,14 +436,82 @@ test('anchors leading dialogue to the sole character in the preceding paragraph'
   )
 })
 
-test('does not guess a leading dialogue speaker when the preceding paragraph names multiple characters', () => {
+test('inherits a clear main-clause subject from a paragraph with multiple characters', () => {
   assert.deepEqual(
     parseRosterVoiceSegments(
       'Alma watched Bob cross the room.\n\n"Unattributed."',
       'card',
       [{ id: 'alma', name: 'Alma' }, { id: 'bob', name: 'Bob' }],
     ).at(-1),
+    { text: 'Unattributed.', speakerId: 'alma' },
+  )
+})
+
+test('keeps coordinated main-clause subjects ambiguous', () => {
+  assert.deepEqual(
+    parseRosterVoiceSegments(
+      'Yaniko and Kansai raise their cups together.\n\n"Unattributed."',
+      'card',
+      [{ id: 'yaniko', name: 'Yaniko' }, { id: 'kansai', name: 'Kansai' }],
+    ).at(-1),
     { text: 'Unattributed.', speakerId: 'card' },
+  )
+})
+
+test('prefers the main subject over a name in a reduced relative clause', () => {
+  const segments = parseRosterVoiceSegments(
+    'Yaniko opened her mouth, closed it, and reached for the paper cup Kansai had given her. She drank and set it down.\n\n"Yaku is coming later," she said. "For the ramen. Just so you know."',
+    'card',
+    [{ id: 'yaniko', name: 'Yaniko' }, { id: 'kansai', name: 'Kansai' }],
+  )
+  assert.deepEqual(segments.filter(segment => segment.speakerId !== null), [
+    { text: 'Yaku is coming later,', speakerId: 'yaniko' },
+    { text: 'For the ramen. Just so you know.', speakerId: 'yaniko' },
+  ])
+})
+
+test('keeps every unattributed quote on the inherited discourse subject', () => {
+  const segments = parseRosterVoiceSegments(
+    'Yaniko opened her mouth. Closed it. Opened it again. She reached for the paper cup Kansai had given her. She drank and set it down.\n\n"Yaku is coming later, nya," she said to no one. "She was feeding someone\'s cat, nya. That\'s why she\'s not here." A pause.\n\n"Hame\'s not coming. Her stream went long. Like I said."',
+    'card',
+    [{ id: 'yaniko', name: 'Yaniko' }, { id: 'kansai', name: 'Kansai' }],
+  )
+  assert.deepEqual(segments.filter(segment => segment.speakerId !== null), [
+    { text: 'Yaku is coming later, nya,', speakerId: 'yaniko' },
+    { text: "She was feeding someone's cat, nya. That's why she's not here.", speakerId: 'yaniko' },
+    { text: "Hame's not coming. Her stream went long. Like I said.", speakerId: 'yaniko' },
+  ])
+})
+
+test('does not let a nearby secondary name override the paragraph subject for one quote', () => {
+  assert.deepEqual(
+    parseRosterVoiceSegments(
+      'Yaniko picked up the cup Kansai had given her. "First." She paused. "Second."',
+      'card',
+      [{ id: 'yaniko', name: 'Yaniko' }, { id: 'kansai', name: 'Kansai' }],
+    ).filter(segment => segment.speakerId !== null),
+    [
+      { text: 'First.', speakerId: 'yaniko' },
+      { text: 'Second.', speakerId: 'yaniko' },
+    ],
+  )
+})
+
+test('distinguishes main subjects from objects and passive agents', () => {
+  const speakers = [{ id: 'yaniko', name: 'Yaniko' }, { id: 'kansai', name: 'Kansai' }]
+  for (const narration of [
+    'Yaniko takes the cup that Kansai had given her.',
+    'Yaniko receives the cup from Kansai.',
+    'Yaniko is handed the cup by Kansai.',
+  ]) {
+    assert.deepEqual(
+      parseRosterVoiceSegments(`${narration}\n\n"Thank you."`, 'card', speakers).at(-1),
+      { text: 'Thank you.', speakerId: 'yaniko' },
+    )
+  }
+  assert.deepEqual(
+    parseRosterVoiceSegments('Kansai gives Yaniko the cup.\n\n"There."', 'card', speakers).at(-1),
+    { text: 'There.', speakerId: 'kansai' },
   )
 })
 

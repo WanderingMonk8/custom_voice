@@ -1,4 +1,5 @@
 import {
+  addScannedFirstNameAliases,
   applyConfigToMetadata,
   clampMessageLimit,
   npcSpeakerId,
@@ -233,7 +234,9 @@ async function scanCardCast(
       reasoning: { source: 'off' },
     })
     const cast = parseCardCast(response, new Set(cards.map((card) => card.id)))
-    if (cast.length === 0) return { detected: base, usedFallback: true }
+    if (cast.length === 0) {
+      return { detected: addScannedFirstNameAliases(base), usedFallback: true }
+    }
     const byName = new Map(cards.map((card) => [normalizeSpeakerName(card.name).toLowerCase(), card] as const))
     const detected = new Map(base.map((character) => [character.id, character] as const))
     for (const member of cast) {
@@ -241,10 +244,10 @@ async function scanCardCast(
       const id = card?.id ?? npcSpeakerId(member.name)
       if (!detected.has(id)) detected.set(id, { id, name: member.name, messageCount: 0 })
     }
-    return { detected: [...detected.values()], usedFallback: false }
+    return { detected: addScannedFirstNameAliases([...detected.values()]), usedFallback: false }
   } catch (error) {
     spindle.log.warn(`Chat Voice card parser failed: ${error instanceof Error ? error.message : String(error)}`)
-    return { detected: base, usedFallback: true }
+    return { detected: addScannedFirstNameAliases(base), usedFallback: true }
   }
 }
 
@@ -370,4 +373,4 @@ spindle.onFrontendMessage(async (rawPayload: unknown, userId, frontendSessionId)
   }
 })
 
-spindle.log.info('Chat Voice 3.10.3 loaded.')
+spindle.log.info('Chat Voice 3.12.1 loaded.')
