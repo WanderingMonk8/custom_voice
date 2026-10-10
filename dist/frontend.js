@@ -101,20 +101,30 @@ function escapedPattern(value) {
 }
 function mentionedSpeakers(text, speakers) {
   const narrative = text.replace(/["“][\s\S]*?["”]/gu, " ");
-  const mentionedSpeakerIds = /* @__PURE__ */ new Set();
+  const mentions = { clean: /* @__PURE__ */ new Set(), possessive: /* @__PURE__ */ new Set() };
   for (const speaker of speakers) {
     for (const alias of speakerAliases(speaker.name)) {
-      if (new RegExp(`\\b${escapedPattern(alias)}\\b`, "iu").test(narrative)) {
-        mentionedSpeakerIds.add(speaker.id);
-        break;
+      const pattern = new RegExp(`\\b${escapedPattern(alias)}\\b`, "giu");
+      for (const match of narrative.matchAll(pattern)) {
+        if (match.index === void 0) continue;
+        const suffix = narrative.slice(match.index + match[0].length);
+        const collection = /^['’](?:s\b)?/iu.test(suffix) ? mentions.possessive : mentions.clean;
+        collection.add(speaker.id);
       }
     }
   }
-  return mentionedSpeakerIds;
+  return mentions;
+}
+function preferredMentionedSpeaker(mentions) {
+  if (mentions.clean.size === 1) return [...mentions.clean][0];
+  if (mentions.clean.size > 1) return null;
+  return mentions.possessive.size === 1 ? [...mentions.possessive][0] : null;
+}
+function hasSpeakerMentions(mentions) {
+  return mentions.clean.size > 0 || mentions.possessive.size > 0;
 }
 function soleMentionedSpeaker(text, speakers) {
-  const mentionedSpeakerIds = mentionedSpeakers(text, speakers);
-  return mentionedSpeakerIds.size === 1 ? [...mentionedSpeakerIds][0] : null;
+  return preferredMentionedSpeaker(mentionedSpeakers(text, speakers));
 }
 function currentParagraphSpeaker(before, after, speakers) {
   let paragraphStart = 0;
@@ -133,9 +143,10 @@ function precedingParagraphSpeaker(before, speakers) {
   const paragraphs = before.split(/\n[^\S\n]*\n/gu);
   if (paragraphs.length < 2) return null;
   for (let index = paragraphs.length - 2; index >= 0; index--) {
-    const mentionedSpeakerIds = mentionedSpeakers(paragraphs[index], speakers);
-    if (mentionedSpeakerIds.size === 1) return [...mentionedSpeakerIds][0];
-    if (mentionedSpeakerIds.size > 1) return null;
+    const mentions = mentionedSpeakers(paragraphs[index], speakers);
+    const speakerId = preferredMentionedSpeaker(mentions);
+    if (speakerId) return speakerId;
+    if (hasSpeakerMentions(mentions)) return null;
   }
   return null;
 }

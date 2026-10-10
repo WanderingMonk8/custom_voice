@@ -358,6 +358,35 @@ test('searches upward through unnamed paragraphs for the nearest confident speak
   )
 })
 
+test('prefers a clean character name over another character possessive', () => {
+  const segments = parseRosterVoiceSegments(
+    'Kansai watched her go. At the sink, Al Neko\'s hands rested under the running water.\n\n"She will be back at midnight," she said. "For the ramen. Just so you know."',
+    'card',
+    [
+      { id: 'kansai', name: 'Kansai' },
+      { id: 'al-neko', name: 'Al Neko' },
+    ],
+  )
+  assert.deepEqual(
+    segments.filter(segment => segment.speakerId !== null),
+    [
+      { text: 'She will be back at midnight,', speakerId: 'kansai' },
+      { text: 'For the ramen. Just so you know.', speakerId: 'kansai' },
+    ],
+  )
+})
+
+test('uses a sole possessive name when no clean character name is present', () => {
+  assert.deepEqual(
+    parseRosterVoiceSegments(
+      'Al Neko’s hands rested under the running water.\n\n"Ready."',
+      'card',
+      [{ id: 'al-neko', name: 'Al Neko' }],
+    ).at(-1),
+    { text: 'Ready.', speakerId: 'al-neko' },
+  )
+})
+
 test('anchors leading dialogue to the sole character in the preceding paragraph', () => {
   const content = 'Toggard rode the last hundred yards out ahead without being asked, dropped from the bay at the bank stones, and stood looking at the water a long moment before he came back.\n\n"It\'s up. The crossing is possible, but it is a ford you walk, not a ford you ride." He wiped his wet hands on his breeches. "There\'s flat ground back under the alders."'
   assert.deepEqual(
