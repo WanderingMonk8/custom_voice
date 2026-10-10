@@ -470,6 +470,33 @@ test('prefers the main subject over a name in a reduced relative clause', () => 
   ])
 })
 
+test('keeps every unattributed quote on the inherited discourse subject', () => {
+  const segments = parseRosterVoiceSegments(
+    'Yaniko opened her mouth. Closed it. Opened it again. She reached for the paper cup Kansai had given her. She drank and set it down.\n\n"Yaku is coming later, nya," she said to no one. "She was feeding someone\'s cat, nya. That\'s why she\'s not here." A pause.\n\n"Hame\'s not coming. Her stream went long. Like I said."',
+    'card',
+    [{ id: 'yaniko', name: 'Yaniko' }, { id: 'kansai', name: 'Kansai' }],
+  )
+  assert.deepEqual(segments.filter(segment => segment.speakerId !== null), [
+    { text: 'Yaku is coming later, nya,', speakerId: 'yaniko' },
+    { text: "She was feeding someone's cat, nya. That's why she's not here.", speakerId: 'yaniko' },
+    { text: "Hame's not coming. Her stream went long. Like I said.", speakerId: 'yaniko' },
+  ])
+})
+
+test('does not let a nearby secondary name override the paragraph subject for one quote', () => {
+  assert.deepEqual(
+    parseRosterVoiceSegments(
+      'Yaniko picked up the cup Kansai had given her. "First." She paused. "Second."',
+      'card',
+      [{ id: 'yaniko', name: 'Yaniko' }, { id: 'kansai', name: 'Kansai' }],
+    ).filter(segment => segment.speakerId !== null),
+    [
+      { text: 'First.', speakerId: 'yaniko' },
+      { text: 'Second.', speakerId: 'yaniko' },
+    ],
+  )
+})
+
 test('distinguishes main subjects from objects and passive agents', () => {
   const speakers = [{ id: 'yaniko', name: 'Yaniko' }, { id: 'kansai', name: 'Kansai' }]
   for (const narration of [

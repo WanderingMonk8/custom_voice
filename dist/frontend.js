@@ -230,7 +230,7 @@ function inferQuotedSpeaker(before, after, quotedText, speakers, defaultSpeakerI
         if (index >= 0 && (!nearest || index < nearest.index)) nearest = { id: speaker.id, index };
       }
     }
-    if (nearest) return { speakerId: nearest.id, confident: true };
+    if (nearest) return { speakerId: nearest.id, confident: true, source: "explicit" };
   }
   let best = null;
   for (const speaker of speakers) {
@@ -241,19 +241,20 @@ function inferQuotedSpeaker(before, after, quotedText, speakers, defaultSpeakerI
         [new RegExp(`\\b${name}\\b[^\\n.!?]{0,60}\\b${SPEECH_VERBS}\\b[^\\n.!?]{0,20}$`, "iu"), before.slice(-180), 90],
         [new RegExp(`\\b${SPEECH_VERBS}\\b\\s+(?:to\\s+)?${name}\\b[^\\n.!?]{0,20}$`, "iu"), before.slice(-180), 90],
         [new RegExp(`^\\s*[,;:.!?\u2014-]*\\s*${name}\\b[^\\n.!?]{0,50}\\b${SPEECH_VERBS}\\b`, "iu"), after.slice(0, 180), 85],
-        [new RegExp(`^\\s*[,;:.!?\u2014-]*\\s*${SPEECH_VERBS}\\b\\s+(?:to\\s+)?${name}\\b`, "iu"), after.slice(0, 180), 85],
-        [new RegExp(`\\b${name}\\b[^\\n]{0,70}$`, "iu"), before.slice(-140), 86]
+        [new RegExp(`^\\s*[,;:.!?\u2014-]*\\s*${SPEECH_VERBS}\\b\\s+(?:to\\s+)?${name}\\b`, "iu"), after.slice(0, 180), 85]
       ];
       for (const [pattern, sample, score] of tests) {
         if (pattern.test(sample) && (!best || score > best.score)) best = { id: speaker.id, score };
       }
     }
   }
-  if (best) return { speakerId: best.id, confident: true };
+  if (best) return { speakerId: best.id, confident: true, source: "explicit" };
   const currentSpeakerId = currentParagraphSpeaker(before, after, speakers);
-  if (currentSpeakerId) return { speakerId: currentSpeakerId, confident: true };
+  if (currentSpeakerId) {
+    return { speakerId: currentSpeakerId, confident: true, source: "paragraph" };
+  }
   const paragraphSpeakerId = precedingParagraphSpeaker(before, speakers);
-  return paragraphSpeakerId ? { speakerId: paragraphSpeakerId, confident: true } : { speakerId: defaultSpeakerId, confident: false };
+  return paragraphSpeakerId ? { speakerId: paragraphSpeakerId, confident: true, source: "history" } : { speakerId: defaultSpeakerId, confident: false, source: "fallback" };
 }
 function canContinueSpeaker(bridge, previousSpeakerId, speakers) {
   if (/\n\s*\n/u.test(bridge)) return false;
@@ -272,6 +273,7 @@ function parseRosterVoiceSegments(content, defaultSpeakerId, speakers) {
   const quotePattern = /["“]([\s\S]*?)["”]/g;
   let cursor = 0;
   let lastConfidentSpeakerId = null;
+  let lastAssignedSpeakerId = null;
   for (const match of playbackContent.matchAll(quotePattern)) {
     if (match.index === void 0) continue;
     const bridge = playbackContent.slice(cursor, match.index);
@@ -287,13 +289,15 @@ function parseRosterVoiceSegments(content, defaultSpeakerId, speakers) {
         speakers,
         defaultSpeakerId
       );
-      const continuedSpeakerId = !inference.confident && lastConfidentSpeakerId && canContinueSpeaker(bridge, lastConfidentSpeakerId, speakers) ? lastConfidentSpeakerId : null;
+      const continuationCandidate = lastAssignedSpeakerId ?? lastConfidentSpeakerId;
+      const continuedSpeakerId = inference.source === "fallback" && continuationCandidate && canContinueSpeaker(bridge, continuationCandidate, speakers) ? continuationCandidate : null;
       const speakerId = continuedSpeakerId ?? inference.speakerId;
       result.push({
         text: speech,
         speakerId
       });
       if (inference.confident && speakerId) lastConfidentSpeakerId = speakerId;
+      if (speakerId) lastAssignedSpeakerId = speakerId;
     }
     cursor = match.index + match[0].length;
   }
