@@ -238,11 +238,27 @@ async function sendState(userId, clientRevision) {
   }
 }
 function sanitizeSaveConfig(previous, input) {
-  const characterVoices = { ...previous.characterVoices };
+  const characterVoices = {};
   if (input.characterVoices && typeof input.characterVoices === "object") {
     for (const [id, voice] of Object.entries(input.characterVoices)) {
       if (!id || typeof voice !== "string") continue;
       characterVoices[id] = voice.trim().slice(0, 512);
+    }
+  }
+  const detectedCharacters = [];
+  const seen = /* @__PURE__ */ new Set();
+  if (Array.isArray(input.characters)) {
+    for (const character of input.characters) {
+      if (!character || typeof character.id !== "string" || typeof character.name !== "string") continue;
+      const id = character.id.trim().slice(0, 256);
+      const name = normalizeSpeakerName(character.name).slice(0, 128);
+      if (!id || !name || seen.has(id)) continue;
+      seen.add(id);
+      detectedCharacters.push({
+        id,
+        name,
+        messageCount: Number.isFinite(character.messageCount) ? Math.max(0, Math.round(character.messageCount)) : 0
+      });
     }
   }
   return {
@@ -251,7 +267,7 @@ function sanitizeSaveConfig(previous, input) {
     connectionId: typeof input.connectionId === "string" ? input.connectionId.trim().slice(0, 128) : "",
     narratorVoice: typeof input.narratorVoice === "string" ? input.narratorVoice.trim().slice(0, 512) : "",
     characterVoices,
-    detectedCharacters: previous.detectedCharacters,
+    detectedCharacters,
     managedCharacterIds: previous.managedCharacterIds,
     parsedMessages: previous.parsedMessages
   };
@@ -337,11 +353,15 @@ function queueScan(payload, userId) {
     const messageLimit = clampMessageLimit(payload.messageLimit);
     const cardResult = await scanCardCast(candidates, userId);
     const config = readConfig(chat.metadata ?? {}, candidates.map((character) => character.id));
+    const detected = new Map(cardResult.detected.map((character) => [character.id, character]));
+    for (const character of config.detectedCharacters) {
+      if (character.id.startsWith("npc:") && !detected.has(character.id)) detected.set(character.id, character);
+    }
     const nextConfig = {
       ...config,
       version: 5,
       messageLimit,
-      detectedCharacters: cardResult.detected,
+      detectedCharacters: [...detected.values()],
       parsedMessages: {}
     };
     const metadata = applyConfigToMetadata(chat.metadata ?? {}, nextConfig);
@@ -366,6 +386,32 @@ spindle.onFrontendMessage(async (rawPayload, userId) => {
   try {
     if (payload?.type === "chat_voice_refresh") {
       await sendState(userId);
+    } else if (payload?.type === "chat_voice_get_message") {
+      try {
+        const messages = await spindle.chat.getMessages(payload.chatId);
+        const message = messages.find((item) => item.id === payload.messageId);
+        spindle.sendToFrontend({
+          type: "chat_voice_message",
+          requestId: payload.requestId,
+          chatId: payload.chatId,
+          message: message ? {
+            id: message.id,
+            is_user: message.is_user,
+            name: message.name,
+            content: message.content ?? "",
+            extra: message.extra ?? {}
+          } : null,
+          ...!message ? { error: "The message is no longer available." } : {}
+        }, userId);
+      } catch (error) {
+        spindle.sendToFrontend({
+          type: "chat_voice_message",
+          requestId: payload.requestId,
+          chatId: payload.chatId,
+          message: null,
+          error: error instanceof Error ? error.message : "Could not load the message."
+        }, userId);
+      }
     } else if (payload?.type === "chat_voice_scan") {
       await queueScan(payload, userId);
     } else if (payload?.type === "chat_voice_save") {
@@ -383,4 +429,4 @@ spindle.onFrontendMessage(async (rawPayload, userId) => {
 spindle.on("CHAT_SWITCHED", async (_payload, userId) => {
   await sendState(userId);
 });
-spindle.log.info("Chat Voice 3.2 loaded.");
+spindle.log.info("Chat Voice 3.3 loaded.");

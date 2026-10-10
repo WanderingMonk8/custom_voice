@@ -9,6 +9,7 @@ A [Lumiverse Spindle](https://docs.lumiverse.chat/) extension that detects chara
 - Assigns each quoted passage locally during playback using explicit speaker labels, dialogue tags, and the saved card cast.
 - Uses one shared TTS connection for the entire chat.
 - Assigns a different custom voice name or provider voice ID to every detected character.
+- Allows unlimited manually added NPCs, each with its own voice and delete control.
 - Assigns a separate narrator voice.
 - Routes quoted text to the speaking character and text outside quotations to the narrator.
 - Adds a custom music-note action to each message for ordered multi-voice playback.
@@ -38,10 +39,10 @@ The compiled frontend and backend bundles are committed under `dist/`, so users 
 2. Select **Voice** in the Lumiverse drawer.
 3. Click **Scan** to read the active character card and save its speaking cast.
 4. Choose one TTS connection for the chat.
-5. Enter the narrator voice and a voice for each detected character.
+5. Enter the narrator voice and a voice for each detected character. Add or delete NPCs manually as needed.
 6. Use the **♫** action on a character message to play it with all configured voices.
 
-The card scan result and all voice settings save automatically for that chat. Switching chats loads the previously saved cast and settings without scanning or calling the language model again. Click **Scan** after changing the card. Clear a voice field to let that speaker fall back to Lumiverse's normal voice resolution; clear the connection to disable every custom voice managed by the extension for that chat.
+The card scan result, manually managed NPC roster, and all voice settings save automatically for that chat. Switching chats loads the previously saved cast and settings without scanning or calling the language model again. Click **Scan** after changing the card. Manual NPCs remain in the roster across later scans until you delete them. Clear a voice field to use the TTS connection's default/fallback voice; clear the connection to disable every custom voice managed by the extension for that chat.
 
 Playback assigns quotes from explicit labels and common dialogue tags. Clear attribution gives the most reliable routing:
 

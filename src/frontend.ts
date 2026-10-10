@@ -53,6 +53,14 @@ interface ScanCompletePayload {
   cardParserFallback?: boolean
 }
 
+interface MessagePayload {
+  type: 'chat_voice_message'
+  requestId: string
+  chatId: string
+  message: PlaybackMessage | null
+  error?: string
+}
+
 interface PlaybackMessage {
   id: string
   is_user: boolean
@@ -71,6 +79,9 @@ const VOICE_ICON = `
     <path d="M5 10v4M9 7v10M13 4v16M17 8v8M21 10v4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
   </svg>
 `
+
+const PLAY_ACTION_ICON = `<svg viewBox="0 0 24 24" width="13" height="13" fill="none" aria-hidden="true"><path d="M9 18V5l10-2v13" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><circle cx="6" cy="18" r="3" stroke="currentColor" stroke-width="2"/><circle cx="16" cy="16" r="3" stroke="currentColor" stroke-width="2"/></svg>`
+const STOP_ACTION_ICON = `<svg viewBox="0 0 24 24" width="13" height="13" fill="currentColor" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="1"/></svg>`
 
 async function listAllTtsConnections(): Promise<TtsConnection[]> {
   const pageSize = 200
@@ -194,19 +205,27 @@ export function setup(ctx: SpindleFrontendContext) {
       background:var(--lumiverse-fill-subtle);
     }
     .chat-voice-character-heading { display:flex; justify-content:space-between; gap:8px; align-items:baseline; }
+    .chat-voice-character-meta { display:flex; align-items:center; gap:6px; }
     .chat-voice-character-name { color:var(--lumiverse-text); font-size:12px; font-weight:600; }
     .chat-voice-character-count { color:var(--lumiverse-text-muted); font-size:11px; white-space:nowrap; }
     .chat-voice-empty {
       padding:12px; text-align:center; color:var(--lumiverse-text-muted); font-size:12px;
       border:1px dashed var(--lumiverse-border); border-radius:var(--lumiverse-radius);
     }
+    .chat-voice-add-row { display:grid; grid-template-columns:minmax(0, 1fr) auto; gap:8px; }
+    .chat-voice-add-button, .chat-voice-delete-button {
+      border:1px solid var(--lumiverse-border); border-radius:6px; background:var(--lumiverse-fill-subtle);
+      color:var(--lumiverse-text); font:inherit; cursor:pointer;
+    }
+    .chat-voice-add-button { min-width:58px; padding:0 12px; font-size:12px; font-weight:600; }
+    .chat-voice-delete-button { width:24px; height:24px; padding:0; font-size:16px; line-height:1; }
+    .chat-voice-add-button:disabled, .chat-voice-delete-button:disabled { opacity:.5; cursor:not-allowed; }
     .chat-voice-status { min-height:18px; }
     .chat-voice-status[data-state="saved"] { color:var(--lumiverse-success, #65b97a); }
     .chat-voice-status[data-state="error"] { color:var(--lumiverse-danger, #ef6464); }
     .chat-voice-message-play {
-      display:inline-flex; align-items:center; justify-content:center; min-width:28px; min-height:28px;
-      padding:0 6px; border:0; border-radius:6px; background:transparent; color:inherit;
-      font:inherit; font-size:15px; cursor:pointer;
+      display:flex; align-items:center; justify-content:center; width:26px; height:26px;
+      padding:0; border:0; border-radius:6px; background:transparent; color:inherit; cursor:pointer;
     }
     .chat-voice-message-play:hover { background:var(--lumiverse-fill-subtle); }
     .chat-voice-message-play[data-playing="true"] { color:var(--lumiverse-accent, #7c6df2); }
@@ -253,6 +272,15 @@ export function setup(ctx: SpindleFrontendContext) {
   const routingHint = document.createElement('div')
   routingHint.className = 'chat-voice-hint'
   routingHint.textContent = 'Scan reads the character card, not chat history. During playback, quoted dialogue is matched to the saved cast using names and dialogue tags; everything outside quotes uses the narrator voice.'
+  const addNpcField = createField('Add NPC manually')
+  addNpcField.slot.className = 'chat-voice-add-row'
+  const addNpcInputSlot = document.createElement('div')
+  const addNpcButton = document.createElement('button')
+  addNpcButton.type = 'button'
+  addNpcButton.className = 'chat-voice-add-button'
+  addNpcButton.textContent = 'Add'
+  addNpcButton.disabled = true
+  addNpcField.slot.append(addNpcInputSlot, addNpcButton)
   const characterTitle = document.createElement('div')
   characterTitle.className = 'chat-voice-section-title'
   characterTitle.textContent = 'Detected voices'
@@ -269,6 +297,7 @@ export function setup(ctx: SpindleFrontendContext) {
     scanField.field,
     narratorField.field,
     routingHint,
+    addNpcField.field,
     characterTitle,
     characterList,
     status,
@@ -291,6 +320,12 @@ export function setup(ctx: SpindleFrontendContext) {
   const inFlight = new Set<number>()
   const characterInputs = new Map<string, SpindleTextInputHandle>()
   const playButtons = new Map<string, Set<HTMLButtonElement>>()
+  const pendingMessageRequests = new Map<string, {
+    resolve: (message: PlaybackMessage) => void
+    reject: (error: Error) => void
+    timer: ReturnType<typeof setTimeout>
+  }>()
+  let messageRequestSequence = 0
 
   const setStatus = (message: string, state: 'normal' | 'saved' | 'error' = 'normal') => {
     status.textContent = message
@@ -311,6 +346,11 @@ export function setup(ctx: SpindleFrontendContext) {
     onChange: () => markChanged(),
   })
 
+  const addNpcInput = ctx.components.mountTextInput(addNpcInputSlot, {
+    value: '', placeholder: 'NPC name', ariaLabel: 'NPC name to add', disabled: true,
+    onChange: () => undefined,
+  })
+
   function collectConfig() {
     return {
       messageLimit: activeChat?.messageLimit ?? 20,
@@ -319,6 +359,7 @@ export function setup(ctx: SpindleFrontendContext) {
       characterVoices: Object.fromEntries(
         [...characterInputs.entries()].map(([id, input]) => [id, input.getValue()]),
       ),
+      characters: activeChat?.characters.map(({ id, name, messageCount }) => ({ id, name, messageCount })) ?? [],
     }
   }
 
@@ -352,11 +393,23 @@ export function setup(ctx: SpindleFrontendContext) {
       for (const button of buttons) {
         const playing = activePlayback?.messageId === messageId
         button.dataset.playing = String(playing)
-        button.textContent = playing ? '■' : '♫'
+        button.innerHTML = playing ? STOP_ACTION_ICON : PLAY_ACTION_ICON
         button.title = playing ? 'Stop custom voice playback' : 'Play with custom NPC voices'
         button.setAttribute('aria-label', button.title)
       }
     }
+  }
+
+  function requestPlaybackMessage(chatId: string, messageId: string): Promise<PlaybackMessage> {
+    const requestId = `${Date.now().toString(36)}-${++messageRequestSequence}`
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        pendingMessageRequests.delete(requestId)
+        reject(new Error('Timed out while loading the message for playback.'))
+      }, 15_000)
+      pendingMessageRequests.set(requestId, { resolve, reject, timer })
+      ctx.sendToBackend({ type: 'chat_voice_get_message', chatId, messageId, requestId })
+    })
   }
 
   function stopPlayback() {
@@ -414,11 +467,6 @@ export function setup(ctx: SpindleFrontendContext) {
       setStatus('Choose a TTS connection before playing.', 'error')
       return
     }
-    if (!ctx.messages.get) {
-      setStatus('This Lumiverse version does not expose message playback data.', 'error')
-      return
-    }
-
     const contextClass = window.AudioContext
       ?? (window as typeof window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext
     if (!contextClass) {
@@ -437,8 +485,8 @@ export function setup(ctx: SpindleFrontendContext) {
     updatePlaybackButtons()
 
     try {
-      const message = await ctx.messages.get(messageId) as PlaybackMessage | null
-      if (!message || message.is_user) throw new Error('Custom voice playback is only available for character messages.')
+      const message = await requestPlaybackMessage(activeChat.id, messageId)
+      if (message.is_user) throw new Error('Custom voice playback is only available for character messages.')
       const explicitId = typeof message.extra?.character_id === 'string' ? message.extra.character_id : ''
       const defaultSpeakerId = explicitId || activeChat.characters.find((character) => (
         !character.id.startsWith('npc:')
@@ -524,6 +572,46 @@ export function setup(ctx: SpindleFrontendContext) {
     return options
   }
 
+  function addManualNpc() {
+    if (!activeChat) return
+    const name = normalizeSpeakerName(addNpcInput.getValue()).slice(0, 128)
+    if (!name) {
+      setStatus('Enter an NPC name first.', 'error')
+      return
+    }
+    const id = npcSpeakerId(name)
+    if (activeChat.characters.some((character) => character.id === id)) {
+      setStatus(`${name} is already in this chat's voice roster.`, 'error')
+      return
+    }
+    activeChat = {
+      ...activeChat,
+      characters: [...activeChat.characters, { id, name, messageCount: 0, voice: '' }],
+    }
+    addNpcInput.update({ value: '' })
+    renderCharacters(activeChat.characters)
+    markChanged(0)
+  }
+
+  function removeNpc(characterId: string) {
+    if (!activeChat || !characterId.startsWith('npc:')) return
+    activeChat = {
+      ...activeChat,
+      characters: activeChat.characters.filter((character) => character.id !== characterId),
+    }
+    renderCharacters(activeChat.characters)
+    markChanged(0)
+  }
+
+  const onAddNpc = () => addManualNpc()
+  const onAddNpcKeyDown = (event: KeyboardEvent) => {
+    if (event.key !== 'Enter') return
+    event.preventDefault()
+    addManualNpc()
+  }
+  addNpcButton.addEventListener('click', onAddNpc)
+  addNpcInputSlot.addEventListener('keydown', onAddNpcKeyDown)
+
   function renderCharacters(characters: DetectedCharacterState[]) {
     for (const input of characterInputs.values()) input.destroy()
     characterInputs.clear()
@@ -549,8 +637,22 @@ export function setup(ctx: SpindleFrontendContext) {
       count.textContent = character.messageCount > 0
         ? `${character.messageCount} occurrence${character.messageCount === 1 ? '' : 's'}`
         : 'Card cast'
+      const meta = document.createElement('span')
+      meta.className = 'chat-voice-character-meta'
+      meta.append(count)
+      if (character.id.startsWith('npc:')) {
+        const remove = document.createElement('button')
+        remove.type = 'button'
+        remove.className = 'chat-voice-delete-button'
+        remove.textContent = '×'
+        remove.title = `Delete ${character.name}`
+        remove.setAttribute('aria-label', remove.title)
+        remove.disabled = !activeChat
+        remove.addEventListener('click', () => removeNpc(character.id))
+        meta.append(remove)
+      }
       const slot = document.createElement('div')
-      heading.append(name, count)
+      heading.append(name, meta)
       card.append(heading, slot)
       characterList.appendChild(card)
       const input = ctx.components.mountTextInput(slot, {
@@ -576,6 +678,8 @@ export function setup(ctx: SpindleFrontendContext) {
     })
     scanButton.disabled = !next || scanning
     narratorInput.update({ value: next?.narratorVoice ?? '', disabled: !next })
+    addNpcInput.update({ value: '', disabled: !next })
+    addNpcButton.disabled = !next
     renderCharacters(next?.characters ?? [])
     applyingState = false
     if (!next) setStatus('Open a chat to edit its voices.')
@@ -599,39 +703,56 @@ export function setup(ctx: SpindleFrontendContext) {
     }
   }
 
-  function mountPlaybackButton(element: Element): (() => void) | void {
-      const messageId = ctx.dom.getMessageId(element)
-      if (!messageId) return
-      const button = document.createElement('button')
-      button.type = 'button'
-      button.className = 'chat-voice-message-play'
-      const buttons = playButtons.get(messageId) ?? new Set<HTMLButtonElement>()
-      buttons.add(button)
-      playButtons.set(messageId, buttons)
-      const onClick = () => void playMessage(messageId)
-      button.addEventListener('click', onClick)
-      element.appendChild(button)
-      updatePlaybackButtons()
-      return () => {
-        button.removeEventListener('click', onClick)
-        button.remove()
-        buttons.delete(button)
-        if (buttons.size === 0) playButtons.delete(messageId)
-      }
+  function bindPlaybackButton(element: Element, button: HTMLButtonElement, removeOnCleanup: boolean): (() => void) | void {
+    const messageId = ctx.dom.getMessageId(element)
+    if (!messageId) return
+    button.classList.add('chat-voice-message-play')
+    const buttons = playButtons.get(messageId) ?? new Set<HTMLButtonElement>()
+    buttons.add(button)
+    playButtons.set(messageId, buttons)
+    const onClick = () => void playMessage(messageId)
+    button.addEventListener('click', onClick)
+    updatePlaybackButtons()
+    return () => {
+      button.removeEventListener('click', onClick)
+      if (removeOnCleanup) button.remove()
+      buttons.delete(button)
+      if (buttons.size === 0) playButtons.delete(messageId)
+    }
+  }
+
+  function mountCurrentPlaybackButton(root: HTMLElement): (() => void) | void {
+    root.style.display = 'contents'
+    const button = root.querySelector<HTMLButtonElement>('[data-spindle-decorator-kind="button"]')
+    if (!button) return
+    return bindPlaybackButton(root, button, false)
+  }
+
+  function mountLegacyPlaybackButton(element: Element): (() => void) | void {
+    const button = document.createElement('button')
+    button.type = 'button'
+    element.appendChild(button)
+    return bindPlaybackButton(element, button, true)
   }
 
   const currentDecorator = (ctx.ui as typeof ctx.ui & {
     registerDomDecorator?: (options: {
       mount: string
       kind?: string
+      svg?: string
       render: (root: HTMLElement) => void | (() => void)
     }) => () => void
   }).registerDomDecorator
   const destroyCurrentDecorator = currentDecorator
-    ? currentDecorator({ mount: 'message_actions', kind: 'button', render: mountPlaybackButton })
+    ? currentDecorator({
+        mount: 'message_actions',
+        kind: 'button',
+        svg: PLAY_ACTION_ICON,
+        render: mountCurrentPlaybackButton,
+      })
     : null
   const legacyDecorator = !destroyCurrentDecorator && ctx.registerDomDecorator
-    ? ctx.registerDomDecorator({ target: 'message_actions', decorate: mountPlaybackButton })
+    ? ctx.registerDomDecorator({ target: 'message_actions', decorate: mountLegacyPlaybackButton })
     : null
   const legacyMessageAction = !destroyCurrentDecorator && !legacyDecorator && ctx.registerMessageAction
     ? ctx.registerMessageAction({
@@ -642,7 +763,16 @@ export function setup(ctx: SpindleFrontendContext) {
     : null
 
   const unsubscribeBackend = ctx.onBackendMessage((rawPayload: unknown) => {
-    const payload = rawPayload as StatePayload | ErrorPayload | ScanCompletePayload
+    const payload = rawPayload as StatePayload | ErrorPayload | ScanCompletePayload | MessagePayload
+    if (payload.type === 'chat_voice_message') {
+      const pending = pendingMessageRequests.get(payload.requestId)
+      if (!pending) return
+      clearTimeout(pending.timer)
+      pendingMessageRequests.delete(payload.requestId)
+      if (payload.error || !payload.message) pending.reject(new Error(payload.error || 'The message is unavailable.'))
+      else pending.resolve(payload.message)
+      return
+    }
     if (payload.type === 'chat_voice_error') {
       if (payload.clientRevision !== undefined) inFlight.delete(payload.clientRevision)
       scanning = false
@@ -666,6 +796,11 @@ export function setup(ctx: SpindleFrontendContext) {
     const incomingChatId = payload.chat?.id ?? null
     const currentChatId = activeChat?.id ?? null
     if (incomingChatId !== currentChatId) {
+      for (const pending of pendingMessageRequests.values()) {
+        clearTimeout(pending.timer)
+        pending.reject(new Error('The active chat changed before playback started.'))
+      }
+      pendingMessageRequests.clear()
       flushSave()
       dirty = false
       inFlight.clear()
@@ -704,8 +839,16 @@ export function setup(ctx: SpindleFrontendContext) {
     unsubscribeActivate()
     unsubscribeBackend()
     for (const input of characterInputs.values()) input.destroy()
+    for (const pending of pendingMessageRequests.values()) {
+      clearTimeout(pending.timer)
+      pending.reject(new Error('Chat Voice was closed.'))
+    }
+    pendingMessageRequests.clear()
     connectionPicker.destroy()
     narratorInput.destroy()
+    addNpcInput.destroy()
+    addNpcButton.removeEventListener('click', onAddNpc)
+    addNpcInputSlot.removeEventListener('keydown', onAddNpcKeyDown)
     scanButton.removeEventListener('click', scanMessages)
     destroyCurrentDecorator?.()
     legacyDecorator?.destroy()
