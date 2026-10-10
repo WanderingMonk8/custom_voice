@@ -47,7 +47,7 @@ The compiled frontend and backend bundles are committed under `dist/`, so users 
 2. Select **Voice** in the Lumiverse drawer.
 3. Click **Scan** to read the active character card and save its speaking cast.
 4. Choose one TTS connection for the chat.
-5. Enter the narrator voice and a voice for each detected character. Add or delete NPCs manually as needed. Separate aliases with `/` (for example, `Scott / The sergeant`) to route every name to the same voice.
+5. Enter the narrator voice and a voice for each detected character. Add, rename, or delete NPCs manually as needed. Separate aliases with `/` (for example, `Scott / The sergeant`) to route every name to the same voice; use the rename button to add aliases later without losing the assigned voice.
 6. Use Lumiverse's normal **Play with TTS** button or context-menu action to play the message with all configured voices.
 
 The card scan result, manually managed NPC roster, and all voice settings save automatically for that chat. Switching chats loads the previously saved cast and settings without scanning or calling the language model again. Click **Scan** after changing the card. Manual NPCs remain in the roster across later scans until you delete them. Clear a voice field to use the TTS connection's default/fallback voice; clear the connection to disable every custom voice managed by the extension for that chat.

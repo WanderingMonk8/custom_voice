@@ -188,6 +188,7 @@ var VOICE_ICON = `
   </svg>
 `;
 var STOP_ACTION_ICON = `<svg viewBox="0 0 24 24" width="13" height="13" fill="currentColor" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="1"/></svg>`;
+var RENAME_ICON = `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" aria-hidden="true"><path d="M4 20h4l11-11-4-4L4 16v4Zm9.5-13.5 4 4" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
 async function listAllTtsConnections() {
   const pageSize = 200;
   const connections = [];
@@ -369,13 +370,18 @@ function setup(ctx) {
       border:1px dashed var(--lumiverse-border); border-radius:var(--lumiverse-radius);
     }
     .chat-voice-add-row { display:grid; grid-template-columns:minmax(0, 1fr) auto; gap:8px; }
-    .chat-voice-add-button, .chat-voice-delete-button {
+    .chat-voice-add-button, .chat-voice-rename-button, .chat-voice-delete-button {
       border:1px solid var(--lumiverse-border); border-radius:6px; background:var(--lumiverse-fill-subtle);
       color:var(--lumiverse-text); font:inherit; cursor:pointer;
     }
     .chat-voice-add-button { min-width:58px; padding:0 12px; font-size:12px; font-weight:600; }
-    .chat-voice-delete-button { width:24px; height:24px; padding:0; font-size:16px; line-height:1; }
-    .chat-voice-add-button:disabled, .chat-voice-delete-button:disabled { opacity:.5; cursor:not-allowed; }
+    .chat-voice-rename-button, .chat-voice-delete-button {
+      display:inline-flex; align-items:center; justify-content:center; width:24px; height:24px; padding:0;
+    }
+    .chat-voice-delete-button { font-size:16px; line-height:1; }
+    .chat-voice-add-button:disabled, .chat-voice-rename-button:disabled, .chat-voice-delete-button:disabled {
+      opacity:.5; cursor:not-allowed;
+    }
     .chat-voice-status { min-height:18px; }
     .chat-voice-status[data-state="saved"] { color:var(--lumiverse-success, #65b97a); }
     .chat-voice-status[data-state="error"] { color:var(--lumiverse-danger, #ef6464); }
@@ -857,6 +863,34 @@ function setup(ctx) {
     renderCharacters(activeChat.characters);
     markChanged(0);
   }
+  function renameNpc(characterId) {
+    if (!activeChat || !characterId.startsWith("npc:")) return null;
+    const character = activeChat.characters.find((item) => item.id === characterId);
+    if (!character) return null;
+    const response = hostWindow.prompt(
+      "Rename this NPC or add aliases separated by \u201C/\u201D.",
+      character.name
+    );
+    if (response === null) return null;
+    const aliases = speakerAliases(response.slice(0, 128));
+    if (aliases.length === 0) {
+      setStatus("Enter an NPC name first.", "error");
+      return null;
+    }
+    const existingAliases = new Set(activeChat.characters.filter((item) => item.id !== characterId).flatMap((item) => speakerAliases(item.name).map((alias) => alias.toLowerCase())));
+    const duplicateAlias = aliases.find((alias) => existingAliases.has(alias.toLowerCase()));
+    if (duplicateAlias) {
+      setStatus(`${duplicateAlias} is already in this chat's voice roster.`, "error");
+      return null;
+    }
+    const name = aliases.join(" / ");
+    activeChat = {
+      ...activeChat,
+      characters: activeChat.characters.map((item) => item.id === characterId ? { ...item, name } : item)
+    };
+    markChanged(0);
+    return name;
+  }
   const onAddNpc = () => addManualNpc();
   const onAddNpcKeyDown = (event) => {
     if (event.key !== "Enter") return;
@@ -891,6 +925,13 @@ function setup(ctx) {
       meta.className = "chat-voice-character-meta";
       meta.append(count);
       if (character.id.startsWith("npc:")) {
+        const rename = document.createElement("button");
+        rename.type = "button";
+        rename.className = "chat-voice-rename-button";
+        rename.innerHTML = RENAME_ICON;
+        rename.title = `Rename ${character.name} or edit aliases`;
+        rename.setAttribute("aria-label", rename.title);
+        rename.disabled = !activeChat;
         const remove = document.createElement("button");
         remove.type = "button";
         remove.className = "chat-voice-delete-button";
@@ -898,8 +939,21 @@ function setup(ctx) {
         remove.title = `Delete ${character.name}`;
         remove.setAttribute("aria-label", remove.title);
         remove.disabled = !activeChat;
+        rename.addEventListener("click", () => {
+          const renamed = renameNpc(character.id);
+          if (!renamed) return;
+          name.textContent = renamed;
+          rename.title = `Rename ${renamed} or edit aliases`;
+          rename.setAttribute("aria-label", rename.title);
+          remove.title = `Delete ${renamed}`;
+          remove.setAttribute("aria-label", remove.title);
+          input.update({
+            placeholder: `Voice name or ID for ${renamed}`,
+            ariaLabel: `Custom voice for ${renamed}`
+          });
+        });
         remove.addEventListener("click", () => removeNpc(character.id));
-        meta.append(remove);
+        meta.append(rename, remove);
       }
       const slot = document.createElement("div");
       heading.append(name, meta);
