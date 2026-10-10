@@ -396,6 +396,19 @@ export function normalizeSpeakerName(value: string): string {
   return value.normalize('NFKC').trim().replace(/\s+/g, ' ')
 }
 
+export function speakerAliases(value: string): string[] {
+  const aliases: string[] = []
+  const seen = new Set<string>()
+  for (const part of value.split('/')) {
+    const alias = normalizeSpeakerName(part)
+    const key = alias.toLowerCase()
+    if (!alias || seen.has(key)) continue
+    seen.add(key)
+    aliases.push(alias)
+  }
+  return aliases
+}
+
 export function npcSpeakerId(name: string): string {
   return `npc:${normalizeSpeakerName(name).toLowerCase()}`
 }
@@ -483,6 +496,11 @@ export function parseMultiVoiceSegments(content: string, defaultSpeakerId: strin
 
 const SPEECH_VERBS = '(?:said|says|asked|asks|replied|replies|whispered|whispers|shouted|shouts|yelled|yells|called|calls|murmured|murmurs|answered|answers|added|adds|continued|continues|remarked|remarks|cried|cries|growled|growls|sighed|sighs)'
 
+interface SpeakerInference {
+  speakerId: string | null
+  confident: boolean
+}
+
 function escapedPattern(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 }
@@ -493,36 +511,56 @@ function inferQuotedSpeaker(
   quotedText: string,
   speakers: CharacterLike[],
   defaultSpeakerId: string | null,
-): string | null {
+): SpeakerInference {
   if (/[,]\s*$/u.test(quotedText)) {
     const actionBeat = after.slice(0, 140).split(/["“\n]/u, 1)[0]
     let nearest: { id: string; index: number } | null = null
     for (const speaker of speakers) {
-      const name = escapedPattern(normalizeSpeakerName(speaker.name))
-      if (!name) continue
-      const index = actionBeat.search(new RegExp(`\\b${name}\\b`, 'iu'))
-      if (index >= 0 && (!nearest || index < nearest.index)) nearest = { id: speaker.id, index }
+      for (const alias of speakerAliases(speaker.name)) {
+        const name = escapedPattern(alias)
+        const index = actionBeat.search(new RegExp(`\\b${name}\\b`, 'iu'))
+        if (index >= 0 && (!nearest || index < nearest.index)) nearest = { id: speaker.id, index }
+      }
     }
-    if (nearest) return nearest.id
+    if (nearest) return { speakerId: nearest.id, confident: true }
   }
 
   let best: { id: string; score: number } | null = null
   for (const speaker of speakers) {
-    const name = escapedPattern(normalizeSpeakerName(speaker.name))
-    if (!name) continue
-    const tests: Array<[RegExp, string, number]> = [
-      [new RegExp(`(?:^|\\n)\\s*(?:[-*]\\s*)?(?:\\*\\*)?${name}(?:\\*\\*)?\\s*:\\s*[^"“\\n]{0,120}$`, 'iu'), before.slice(-220), 100],
-      [new RegExp(`\\b${name}\\b[^\\n.!?]{0,60}\\b${SPEECH_VERBS}\\b[^\\n.!?]{0,20}$`, 'iu'), before.slice(-180), 90],
-      [new RegExp(`\\b${SPEECH_VERBS}\\b\\s+(?:to\\s+)?${name}\\b[^\\n.!?]{0,20}$`, 'iu'), before.slice(-180), 90],
-      [new RegExp(`^\\s*[,;:.!?—-]*\\s*${name}\\b[^\\n.!?]{0,50}\\b${SPEECH_VERBS}\\b`, 'iu'), after.slice(0, 180), 85],
-      [new RegExp(`^\\s*[,;:.!?—-]*\\s*${SPEECH_VERBS}\\b\\s+(?:to\\s+)?${name}\\b`, 'iu'), after.slice(0, 180), 85],
-      [new RegExp(`\\b${name}\\b[^\\n]{0,70}$`, 'iu'), before.slice(-140), 86],
-    ]
-    for (const [pattern, sample, score] of tests) {
-      if (pattern.test(sample) && (!best || score > best.score)) best = { id: speaker.id, score }
+    for (const alias of speakerAliases(speaker.name)) {
+      const name = escapedPattern(alias)
+      const tests: Array<[RegExp, string, number]> = [
+        [new RegExp(`(?:^|\\n)\\s*(?:[-*]\\s*)?(?:\\*\\*)?${name}(?:\\*\\*)?\\s*:\\s*[^"“\\n]{0,120}$`, 'iu'), before.slice(-220), 100],
+        [new RegExp(`\\b${name}\\b[^\\n.!?]{0,60}\\b${SPEECH_VERBS}\\b[^\\n.!?]{0,20}$`, 'iu'), before.slice(-180), 90],
+        [new RegExp(`\\b${SPEECH_VERBS}\\b\\s+(?:to\\s+)?${name}\\b[^\\n.!?]{0,20}$`, 'iu'), before.slice(-180), 90],
+        [new RegExp(`^\\s*[,;:.!?—-]*\\s*${name}\\b[^\\n.!?]{0,50}\\b${SPEECH_VERBS}\\b`, 'iu'), after.slice(0, 180), 85],
+        [new RegExp(`^\\s*[,;:.!?—-]*\\s*${SPEECH_VERBS}\\b\\s+(?:to\\s+)?${name}\\b`, 'iu'), after.slice(0, 180), 85],
+        [new RegExp(`\\b${name}\\b[^\\n]{0,70}$`, 'iu'), before.slice(-140), 86],
+      ]
+      for (const [pattern, sample, score] of tests) {
+        if (pattern.test(sample) && (!best || score > best.score)) best = { id: speaker.id, score }
+      }
     }
   }
-  return best?.id ?? defaultSpeakerId
+  return best
+    ? { speakerId: best.id, confident: true }
+    : { speakerId: defaultSpeakerId, confident: false }
+}
+
+function canContinueSpeaker(
+  bridge: string,
+  previousSpeakerId: string,
+  speakers: CharacterLike[],
+): boolean {
+  if (/\n\s*\n/u.test(bridge)) return false
+  for (const speaker of speakers) {
+    if (speaker.id === previousSpeakerId) continue
+    for (const alias of speakerAliases(speaker.name)) {
+      const name = escapedPattern(alias)
+      if (new RegExp(`\\b${name}\\b`, 'iu').test(bridge)) return false
+    }
+  }
+  return true
 }
 
 export function parseRosterVoiceSegments(
@@ -534,23 +572,33 @@ export function parseRosterVoiceSegments(
   const result: PlaybackSegment[] = []
   const quotePattern = /["“]([\s\S]*?)["”]/g
   let cursor = 0
+  let lastConfidentSpeakerId: string | null = null
   for (const match of playbackContent.matchAll(quotePattern)) {
     if (match.index === undefined) continue
-    const narration = cleanPlaybackText(playbackContent.slice(cursor, match.index))
+    const bridge = playbackContent.slice(cursor, match.index)
+    const narration = cleanPlaybackText(bridge)
     if (narration) result.push({ text: narration, speakerId: null })
     const speech = cleanPlaybackText(match[1] ?? '')
     if (speech) {
       const quoteEnd = match.index + match[0].length
+      const inference = inferQuotedSpeaker(
+        playbackContent.slice(0, match.index),
+        playbackContent.slice(quoteEnd),
+        match[1] ?? '',
+        speakers,
+        defaultSpeakerId,
+      )
+      const continuedSpeakerId: string | null = !inference.confident
+        && lastConfidentSpeakerId
+        && canContinueSpeaker(bridge, lastConfidentSpeakerId, speakers)
+        ? lastConfidentSpeakerId
+        : null
+      const speakerId: string | null = continuedSpeakerId ?? inference.speakerId
       result.push({
         text: speech,
-        speakerId: inferQuotedSpeaker(
-          playbackContent.slice(0, match.index),
-          playbackContent.slice(quoteEnd),
-          match[1] ?? '',
-          speakers,
-          defaultSpeakerId,
-        ),
+        speakerId,
       })
+      if (inference.confident && speakerId) lastConfidentSpeakerId = speakerId
     }
     cursor = match.index + match[0].length
   }
@@ -567,9 +615,9 @@ export function detectCharacters(
 ): DetectedCharacter[] {
   const byName = new Map<string, CharacterLike>()
   for (const character of candidates) {
-    const normalizedName = character.name.trim().toLowerCase()
-    if (normalizedName && !byName.has(normalizedName)) {
-      byName.set(normalizedName, character)
+    for (const alias of speakerAliases(character.name)) {
+      const normalizedName = alias.toLowerCase()
+      if (!byName.has(normalizedName)) byName.set(normalizedName, character)
     }
   }
   const byId = new Map(candidates.map((character) => [character.id, character] as const))

@@ -9,9 +9,10 @@ A [Lumiverse Spindle](https://docs.lumiverse.chat/) extension that detects chara
 - Assigns each quoted passage locally during playback using explicit speaker labels, dialogue tags, and the saved card cast.
 - Uses one shared TTS connection for the entire chat.
 - Assigns a different custom voice name or provider voice ID to every detected character.
-- Allows unlimited manually added NPCs, each with its own voice and delete control.
+- Allows unlimited manually added NPCs, each with its own voice and delete control. Slash-separated aliases share that NPC's voice.
 - Assigns a separate narrator voice.
 - Routes quoted text to the speaking character and text outside quotations to the narrator.
+- Carries a confidently identified speaker across same-paragraph narration for later unattributed quotes, unless another roster character is introduced.
 - Routes Lumiverse's native message TTS button through ordered multi-voice playback.
 - Overrides the matching native context-menu action instead of adding duplicate playback controls.
 - Merges adjacent same-voice passages within each paragraph, splits multi-paragraph passages into smaller requests, and maintains a four-segment rolling playback buffer to avoid gaps and API bursts.
@@ -46,7 +47,7 @@ The compiled frontend and backend bundles are committed under `dist/`, so users 
 2. Select **Voice** in the Lumiverse drawer.
 3. Click **Scan** to read the active character card and save its speaking cast.
 4. Choose one TTS connection for the chat.
-5. Enter the narrator voice and a voice for each detected character. Add or delete NPCs manually as needed.
+5. Enter the narrator voice and a voice for each detected character. Add, rename, or delete NPCs manually as needed. Separate aliases with `/` (for example, `Scott / The sergeant`) to route every name to the same voice; use the rename button to add aliases later without losing the assigned voice.
 6. Use Lumiverse's normal **Play with TTS** button or context-menu action to play the message with all configured voices.
 
 The card scan result, manually managed NPC roster, and all voice settings save automatically for that chat. Switching chats loads the previously saved cast and settings without scanning or calling the language model again. Click **Scan** after changing the card. Manual NPCs remain in the roster across later scans until you delete them. Clear a voice field to use the TTS connection's default/fallback voice; clear the connection to disable every custom voice managed by the extension for that chat.

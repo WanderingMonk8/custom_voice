@@ -13,6 +13,7 @@ import {
   parseMultiVoiceSegments,
   parseRosterVoiceSegments,
   readConfig,
+  speakerAliases,
   type ChatVoiceConfig,
 } from './core'
 
@@ -212,6 +213,27 @@ test('assigns quoted output to saved cast members using dialogue tags', () => {
   ])
 })
 
+test('normalizes slash-separated speaker aliases without duplicates', () => {
+  assert.deepEqual(speakerAliases(' Scott / The sergeant / scott / '), ['Scott', 'The sergeant'])
+})
+
+test('assigns every slash-separated alias to the same saved NPC voice', () => {
+  const speakerId = npcSpeakerId('Scott')
+  assert.deepEqual(
+    parseRosterVoiceSegments(
+      'Scott said, "Ready." The sergeant replied, "Move out."',
+      'card',
+      [{ id: speakerId, name: 'Scott / The sergeant' }],
+    ),
+    [
+      { text: 'Scott said,', speakerId: null },
+      { text: 'Ready.', speakerId },
+      { text: 'The sergeant replied,', speakerId: null },
+      { text: 'Move out.', speakerId },
+    ],
+  )
+})
+
 test('never assigns unquoted output to a character voice', () => {
   assert.deepEqual(
     parseRosterVoiceSegments('Alice said hello without quotation marks.', 'card', [{ id: 'alice', name: 'Alice' }]),
@@ -245,6 +267,57 @@ test('uses a comma-ended quote action beat to identify its speaker', () => {
       { text: 'Sarah looks unamused,', speakerId: null },
       { text: 'Please listen to me.', speakerId: 'sarah' },
     ],
+  )
+})
+
+test('continues a confidently identified speaker across same-paragraph narration', () => {
+  const content = '"The board\'s right here," Alma said. She was already at the kit-roll with her good hand on the coupling block, the splinted arm holding the coil against her ribs. "But the mast is up there and we are down here. Anybody want to volunteer?"'
+  assert.deepEqual(
+    parseRosterVoiceSegments(content, 'card', [
+      { id: 'alma', name: 'Alma' },
+      { id: 'card', name: 'Narrator Card' },
+    ]),
+    [
+      { text: "The board's right here,", speakerId: 'alma' },
+      {
+        text: 'Alma said. She was already at the kit-roll with her good hand on the coupling block, the splinted arm holding the coil against her ribs.',
+        speakerId: null,
+      },
+      {
+        text: 'But the mast is up there and we are down here. Anybody want to volunteer?',
+        speakerId: 'alma',
+      },
+    ],
+  )
+})
+
+test('does not continue a speaker across a paragraph break', () => {
+  assert.deepEqual(
+    parseRosterVoiceSegments(
+      '"First," Alma said.\n\nThe scene changes. "Unattributed."',
+      'card',
+      [{ id: 'alma', name: 'Alma' }, { id: 'card', name: 'Narrator Card' }],
+    ),
+    [
+      { text: 'First,', speakerId: 'alma' },
+      { text: 'Alma said.\n\nThe scene changes.', speakerId: null },
+      { text: 'Unattributed.', speakerId: 'card' },
+    ],
+  )
+})
+
+test('does not continue a speaker after another roster character is introduced', () => {
+  assert.deepEqual(
+    parseRosterVoiceSegments(
+      '"First," Alma said. Bob entered the workshop, checked every latch along the far wall, and silently pointed toward the exit. "Unattributed."',
+      'card',
+      [
+        { id: 'alma', name: 'Alma' },
+        { id: 'bob', name: 'Bob' },
+        { id: 'card', name: 'Narrator Card' },
+      ],
+    ).at(-1),
+    { text: 'Unattributed.', speakerId: 'card' },
   )
 })
 
