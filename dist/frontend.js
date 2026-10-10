@@ -1,4 +1,57 @@
 // src/core.ts
+function encodeConcatenatedWav(segments) {
+  const usable = segments.filter((segment) => Number.isFinite(segment.sampleRate) && segment.sampleRate > 0 && segment.channels.length > 0 && segment.channels.some((channel) => channel.length > 0));
+  if (usable.length === 0) throw new Error("No decoded audio is available to save.");
+  const sampleRate = Math.max(...usable.map((segment) => Math.round(segment.sampleRate)));
+  const channelCount = Math.max(...usable.map((segment) => segment.channels.length));
+  const frameCounts = usable.map((segment) => {
+    const sourceFrames = Math.max(...segment.channels.map((channel) => channel.length));
+    return Math.max(1, Math.round(sourceFrames * sampleRate / segment.sampleRate));
+  });
+  const totalFrames = frameCounts.reduce((sum, count) => sum + count, 0);
+  const bytesPerSample = 2;
+  const dataLength = totalFrames * channelCount * bytesPerSample;
+  const output = new ArrayBuffer(44 + dataLength);
+  const view = new DataView(output);
+  const writeText = (offset, value) => {
+    for (let index = 0; index < value.length; index += 1) {
+      view.setUint8(offset + index, value.charCodeAt(index));
+    }
+  };
+  writeText(0, "RIFF");
+  view.setUint32(4, 36 + dataLength, true);
+  writeText(8, "WAVE");
+  writeText(12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, channelCount, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * channelCount * bytesPerSample, true);
+  view.setUint16(32, channelCount * bytesPerSample, true);
+  view.setUint16(34, bytesPerSample * 8, true);
+  writeText(36, "data");
+  view.setUint32(40, dataLength, true);
+  let writeOffset = 44;
+  usable.forEach((segment, segmentIndex) => {
+    const outputFrames = frameCounts[segmentIndex];
+    const sourceFrames = Math.max(...segment.channels.map((channel) => channel.length));
+    for (let frame = 0; frame < outputFrames; frame += 1) {
+      const sourcePosition = outputFrames === 1 ? 0 : frame * (sourceFrames - 1) / (outputFrames - 1);
+      const lower = Math.floor(sourcePosition);
+      const upper = Math.min(sourceFrames - 1, lower + 1);
+      const fraction = sourcePosition - lower;
+      for (let channelIndex = 0; channelIndex < channelCount; channelIndex += 1) {
+        const channel = segment.channels[Math.min(channelIndex, segment.channels.length - 1)];
+        const lowerValue = channel[Math.min(lower, channel.length - 1)] ?? 0;
+        const upperValue = channel[Math.min(upper, channel.length - 1)] ?? lowerValue;
+        const sample = Math.max(-1, Math.min(1, lowerValue + (upperValue - lowerValue) * fraction));
+        view.setInt16(writeOffset, sample < 0 ? sample * 32768 : sample * 32767, true);
+        writeOffset += bytesPerSample;
+      }
+    }
+  });
+  return output;
+}
 function mergeVoicePlan(segments) {
   const result = [];
   for (const segment of segments) {
@@ -542,6 +595,7 @@ function setup(ctx) {
       };
       source.start();
     });
+    return buffer;
   }
   async function playMessage(messageId) {
     if (activePlayback) {
@@ -619,25 +673,37 @@ function setup(ctx) {
         `Buffering ${initialBufferSize} voice segment${initialBufferSize === 1 ? "" : "s"} before playback\u2026`
       );
       await Promise.all(prepared.values());
-      const captured = new Array(plan.length);
+      const decoded = new Array(plan.length);
       for (let index = 0; index < plan.length; index += 1) {
         const current = await prepared.get(index);
         prepared.delete(index);
         if ("error" in current) throw current.error;
-        captured[index] = current.segment;
         schedule(index + PLAYBACK_BUFFER_SEGMENTS);
         setStatus(`Playing ${index + 1} of ${plan.length} voice segment${plan.length === 1 ? "" : "s"}\u2026`);
-        await playDecodedBuffer(playback, current.segment.data, preferences.volume);
+        decoded[index] = await playDecodedBuffer(playback, current.segment.data, preferences.volume);
       }
       setStatus("Saving generated audio\u2026");
-      await saveMessageAudio(
-        playbackChat.id,
-        messageId,
-        message.swipe_id,
-        captured,
-        playback.controller.signal
-      );
-      setStatus("Playback complete and audio saved.", "saved");
+      try {
+        const wav = encodeConcatenatedWav(decoded.map((buffer) => ({
+          sampleRate: buffer.sampleRate,
+          channels: Array.from(
+            { length: buffer.numberOfChannels },
+            (_, channel) => buffer.getChannelData(channel)
+          )
+        })));
+        await saveMessageAudio(
+          playbackChat.id,
+          messageId,
+          message.swipe_id,
+          [{ data: wav, mime: "audio/wav" }],
+          playback.controller.signal
+        );
+        setStatus("Playback complete and audio saved.", "saved");
+      } catch (error) {
+        if (error?.name === "AbortError") throw error;
+        const detail = error instanceof Error ? error.message : "Unknown save error.";
+        setStatus(`Playback completed, but its audio could not be saved: ${detail}`, "error");
+      }
     } catch (error) {
       if (error?.name !== "AbortError") {
         setStatus(error instanceof Error ? error.message : "Custom voice playback failed.", "error");

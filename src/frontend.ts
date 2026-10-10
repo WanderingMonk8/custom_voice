@@ -3,6 +3,7 @@ import type {
   SpindleTextInputHandle,
 } from 'lumiverse-spindle-types'
 import {
+  encodeConcatenatedWav,
   mergeVoicePlan,
   npcSpeakerId,
   normalizeSpeakerName,
@@ -583,7 +584,7 @@ export function setup(ctx: SpindleFrontendContext) {
     playback: NonNullable<typeof activePlayback>,
     data: ArrayBuffer,
     volume: number,
-  ): Promise<void> {
+  ): Promise<AudioBuffer> {
     if (playback.controller.signal.aborted) throw new DOMException('Playback stopped.', 'AbortError')
     const buffer = await playback.context.decodeAudioData(data.slice(0))
     if (playback.controller.signal.aborted) throw new DOMException('Playback stopped.', 'AbortError')
@@ -607,6 +608,7 @@ export function setup(ctx: SpindleFrontendContext) {
       }
       source.start()
     })
+    return buffer
   }
 
   async function playMessage(messageId: string): Promise<void> {
@@ -699,25 +701,37 @@ export function setup(ctx: SpindleFrontendContext) {
       )
       await Promise.all(prepared.values())
 
-      const captured = new Array<SynthesizedVoiceSegment>(plan.length)
+      const decoded = new Array<AudioBuffer>(plan.length)
       for (let index = 0; index < plan.length; index += 1) {
         const current = await prepared.get(index)!
         prepared.delete(index)
         if ('error' in current) throw current.error
-        captured[index] = current.segment
         schedule(index + PLAYBACK_BUFFER_SEGMENTS)
         setStatus(`Playing ${index + 1} of ${plan.length} voice segment${plan.length === 1 ? '' : 's'}…`)
-        await playDecodedBuffer(playback, current.segment.data, preferences.volume)
+        decoded[index] = await playDecodedBuffer(playback, current.segment.data, preferences.volume)
       }
       setStatus('Saving generated audio…')
-      await saveMessageAudio(
-        playbackChat.id,
-        messageId,
-        message.swipe_id,
-        captured,
-        playback.controller.signal,
-      )
-      setStatus('Playback complete and audio saved.', 'saved')
+      try {
+        const wav = encodeConcatenatedWav(decoded.map(buffer => ({
+          sampleRate: buffer.sampleRate,
+          channels: Array.from(
+            { length: buffer.numberOfChannels },
+            (_, channel) => buffer.getChannelData(channel),
+          ),
+        })))
+        await saveMessageAudio(
+          playbackChat.id,
+          messageId,
+          message.swipe_id,
+          [{ data: wav, mime: 'audio/wav' }],
+          playback.controller.signal,
+        )
+        setStatus('Playback complete and audio saved.', 'saved')
+      } catch (error) {
+        if ((error as { name?: string })?.name === 'AbortError') throw error
+        const detail = error instanceof Error ? error.message : 'Unknown save error.'
+        setStatus(`Playback completed, but its audio could not be saved: ${detail}`, 'error')
+      }
     } catch (error) {
       if ((error as { name?: string })?.name !== 'AbortError') {
         setStatus(error instanceof Error ? error.message : 'Custom voice playback failed.', 'error')

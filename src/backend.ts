@@ -356,4 +356,4 @@ spindle.on('CHAT_SWITCHED', async (_payload, userId) => {
   await sendState(userId)
 })
 
-spindle.log.info('Chat Voice 3.8 loaded.')
+spindle.log.info('Chat Voice 3.8.1 loaded.')
