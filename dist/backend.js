@@ -144,6 +144,67 @@ function parseCardCast(response, allowedCardIds) {
 function normalizeSpeakerName(value) {
   return value.normalize("NFKC").trim().replace(/\s+/g, " ");
 }
+function speakerAliases(value) {
+  const aliases = [];
+  const seen = /* @__PURE__ */ new Set();
+  for (const part of value.split("/")) {
+    const alias = normalizeSpeakerName(part);
+    const key = alias.toLowerCase();
+    if (!alias || seen.has(key)) continue;
+    seen.add(key);
+    aliases.push(alias);
+  }
+  return aliases;
+}
+var SPEAKER_TITLES = /* @__PURE__ */ new Set([
+  "mr",
+  "mrs",
+  "ms",
+  "miss",
+  "mx",
+  "dr",
+  "prof",
+  "sir",
+  "lady",
+  "lord",
+  "capt",
+  "captain",
+  "sgt",
+  "sergeant"
+]);
+function firstNameAlias(value) {
+  const aliases = speakerAliases(value);
+  const words = aliases[0]?.split(/\s+/u) ?? [];
+  if (words.length < 2) return null;
+  const title = words[0].replace(/\.$/u, "").toLowerCase();
+  const firstName = words[SPEAKER_TITLES.has(title) ? 1 : 0];
+  if (!firstName || aliases.some((alias) => alias.toLowerCase() === firstName.toLowerCase())) return null;
+  return firstName;
+}
+function addScannedFirstNameAliases(characters) {
+  const candidates = /* @__PURE__ */ new Map();
+  const owners = /* @__PURE__ */ new Map();
+  const addOwner = (alias, id) => {
+    const key = alias.toLowerCase();
+    const ids = owners.get(key) ?? /* @__PURE__ */ new Set();
+    ids.add(id);
+    owners.set(key, ids);
+  };
+  for (const character of characters) {
+    for (const alias of speakerAliases(character.name)) addOwner(alias, character.id);
+    const candidate = firstNameAlias(character.name);
+    if (candidate) {
+      candidates.set(character.id, candidate);
+      addOwner(candidate, character.id);
+    }
+  }
+  return characters.map((character) => {
+    const candidate = candidates.get(character.id);
+    if (!candidate || owners.get(candidate.toLowerCase())?.size !== 1) return character;
+    const name = [...speakerAliases(character.name), candidate].join(" / ");
+    return name.length <= 128 ? { ...character, name } : character;
+  });
+}
 function npcSpeakerId(name) {
   return `npc:${normalizeSpeakerName(name).toLowerCase()}`;
 }
@@ -317,7 +378,9 @@ async function scanCardCast(cards, userId) {
       reasoning: { source: "off" }
     });
     const cast = parseCardCast(response, new Set(cards.map((card) => card.id)));
-    if (cast.length === 0) return { detected: base, usedFallback: true };
+    if (cast.length === 0) {
+      return { detected: addScannedFirstNameAliases(base), usedFallback: true };
+    }
     const byName = new Map(cards.map((card) => [normalizeSpeakerName(card.name).toLowerCase(), card]));
     const detected = new Map(base.map((character) => [character.id, character]));
     for (const member of cast) {
@@ -325,10 +388,10 @@ async function scanCardCast(cards, userId) {
       const id = card?.id ?? npcSpeakerId(member.name);
       if (!detected.has(id)) detected.set(id, { id, name: member.name, messageCount: 0 });
     }
-    return { detected: [...detected.values()], usedFallback: false };
+    return { detected: addScannedFirstNameAliases([...detected.values()]), usedFallback: false };
   } catch (error) {
     spindle.log.warn(`Chat Voice card parser failed: ${error instanceof Error ? error.message : String(error)}`);
-    return { detected: base, usedFallback: true };
+    return { detected: addScannedFirstNameAliases(base), usedFallback: true };
   }
 }
 var saveQueues = /* @__PURE__ */ new Map();
@@ -432,4 +495,4 @@ spindle.onFrontendMessage(async (rawPayload, userId, frontendSessionId) => {
     }, userId, frontendSessionId);
   }
 });
-spindle.log.info("Chat Voice 3.10.4 loaded.");
+spindle.log.info("Chat Voice 3.11.0 loaded.");

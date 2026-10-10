@@ -6,6 +6,7 @@ A [Lumiverse Spindle](https://docs.lumiverse.chat/) extension that detects chara
 
 - Reads the active character card only when you click **Scan**; chat history is never sent for cast detection.
 - Uses one short language-model request to identify the primary persona and recurring speaking NPCs represented by the card.
+- Automatically adds an unambiguous first name as an alias when a card scan returns a full character name.
 - Assigns each quoted passage locally during playback using explicit speaker labels, dialogue tags, and the saved card cast.
 - Uses one shared TTS connection for the entire chat.
 - Assigns a different custom voice name or provider voice ID to every detected character.

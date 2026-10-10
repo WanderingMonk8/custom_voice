@@ -409,6 +409,48 @@ export function speakerAliases(value: string): string[] {
   return aliases
 }
 
+const SPEAKER_TITLES = new Set([
+  'mr', 'mrs', 'ms', 'miss', 'mx', 'dr', 'prof', 'sir', 'lady', 'lord',
+  'capt', 'captain', 'sgt', 'sergeant',
+])
+
+function firstNameAlias(value: string): string | null {
+  const aliases = speakerAliases(value)
+  const words = aliases[0]?.split(/\s+/u) ?? []
+  if (words.length < 2) return null
+  const title = words[0].replace(/\.$/u, '').toLowerCase()
+  const firstName = words[SPEAKER_TITLES.has(title) ? 1 : 0]
+  if (!firstName || aliases.some(alias => alias.toLowerCase() === firstName.toLowerCase())) return null
+  return firstName
+}
+
+export function addScannedFirstNameAliases<T extends CharacterLike>(characters: T[]): T[] {
+  const candidates = new Map<string, string>()
+  const owners = new Map<string, Set<string>>()
+  const addOwner = (alias: string, id: string) => {
+    const key = alias.toLowerCase()
+    const ids = owners.get(key) ?? new Set<string>()
+    ids.add(id)
+    owners.set(key, ids)
+  }
+
+  for (const character of characters) {
+    for (const alias of speakerAliases(character.name)) addOwner(alias, character.id)
+    const candidate = firstNameAlias(character.name)
+    if (candidate) {
+      candidates.set(character.id, candidate)
+      addOwner(candidate, character.id)
+    }
+  }
+
+  return characters.map((character) => {
+    const candidate = candidates.get(character.id)
+    if (!candidate || owners.get(candidate.toLowerCase())?.size !== 1) return character
+    const name = [...speakerAliases(character.name), candidate].join(' / ')
+    return name.length <= 128 ? { ...character, name } : character
+  })
+}
+
 export function npcSpeakerId(name: string): string {
   return `npc:${normalizeSpeakerName(name).toLowerCase()}`
 }

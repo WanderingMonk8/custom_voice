@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
+  addScannedFirstNameAliases,
   applyConfigToMetadata,
   clampMessageLimit,
   detectCharacters,
@@ -215,6 +216,32 @@ test('assigns quoted output to saved cast members using dialogue tags', () => {
 
 test('normalizes slash-separated speaker aliases without duplicates', () => {
   assert.deepEqual(speakerAliases(' Scott / The sergeant / scott / '), ['Scott', 'The sergeant'])
+})
+
+test('adds unique first-name aliases to scanned full names', () => {
+  assert.deepEqual(addScannedFirstNameAliases([
+    { id: 'al', name: 'Al Neko' },
+    { id: 'sarah', name: 'Dr. Sarah Connor' },
+    { id: 'zuri', name: 'Zuri' },
+  ]), [
+    { id: 'al', name: 'Al Neko / Al' },
+    { id: 'sarah', name: 'Dr. Sarah Connor / Sarah' },
+    { id: 'zuri', name: 'Zuri' },
+  ])
+})
+
+test('does not add ambiguous or already-owned first-name aliases', () => {
+  assert.deepEqual(addScannedFirstNameAliases([
+    { id: 'john-smith', name: 'John Smith' },
+    { id: 'john-doe', name: 'John Doe' },
+    { id: 'al', name: 'Al' },
+    { id: 'al-neko', name: 'Al Neko' },
+  ]), [
+    { id: 'john-smith', name: 'John Smith' },
+    { id: 'john-doe', name: 'John Doe' },
+    { id: 'al', name: 'Al' },
+    { id: 'al-neko', name: 'Al Neko' },
+  ])
 })
 
 test('assigns every slash-separated alias to the same saved NPC voice', () => {
