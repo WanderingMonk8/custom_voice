@@ -1,4 +1,12 @@
 // src/core.ts
+function hashMessageContent(content) {
+  let hash = 2166136261;
+  for (let index = 0; index < content.length; index++) {
+    hash ^= content.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return `${content.length.toString(36)}-${(hash >>> 0).toString(36)}`;
+}
 function normalizeSpeakerName(value) {
   return value.normalize("NFKC").trim().replace(/\s+/g, " ");
 }
@@ -48,7 +56,7 @@ function parseMultiVoiceSegments(content, defaultSpeakerId) {
   const merged = [];
   for (const segment of result) {
     const previous = merged[merged.length - 1];
-    if (previous?.speakerId === segment.speakerId) previous.text += ` ${segment.text}`;
+    if (previous?.speakerId === null && segment.speakerId === null) previous.text += ` ${segment.text}`;
     else merged.push({ ...segment });
   }
   return merged;
@@ -412,7 +420,9 @@ function setup(ctx) {
       const aliases = new Map(
         activeChat.characters.map((character) => [npcSpeakerId(character.name), character.id])
       );
-      const plan = parseMultiVoiceSegments(message.content, defaultSpeakerId).map((segment) => {
+      const cached = activeChat.parsedMessages[messageId];
+      const segments = cached?.contentHash === hashMessageContent(message.content) ? cached.segments : parseMultiVoiceSegments(message.content, defaultSpeakerId);
+      const plan = segments.map((segment) => {
         const speakerId = segment.speakerId ? aliases.get(segment.speakerId) ?? segment.speakerId : null;
         const voice = speakerId ? config.characterVoices[speakerId] || (defaultSpeakerId ? config.characterVoices[defaultSpeakerId] : "") || "" : config.narratorVoice;
         return { text: segment.text, voice };
@@ -459,7 +469,7 @@ function setup(ctx) {
     scanning = true;
     scanButton.disabled = true;
     scanButton.textContent = "Scanning\u2026";
-    setStatus("Scanning recent messages\u2026");
+    setStatus("Asking the active language model to identify speakers\u2026");
     ctx.sendToBackend({
       type: "chat_voice_scan",
       chatId: activeChat.id,
@@ -591,7 +601,7 @@ function setup(ctx) {
       scanning = false;
       scanButton.textContent = "Scan";
       scanButton.disabled = false;
-      setStatus("Scan complete. Character settings saved.", "saved");
+      setStatus(payload.parserFallbacks ? `Scan complete. ${payload.parserFallbacks} message${payload.parserFallbacks === 1 ? "" : "s"} used deterministic fallback.` : "Scan complete. Speaker map and character settings saved.", "saved");
       return;
     }
     if (payload.type !== "chat_voice_state") return;

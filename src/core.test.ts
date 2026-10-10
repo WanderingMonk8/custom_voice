@@ -4,7 +4,9 @@ import {
   applyConfigToMetadata,
   clampMessageLimit,
   detectCharacters,
+  hashMessageContent,
   npcSpeakerId,
+  parseLlmSegmentation,
   parseMultiVoiceSegments,
   readConfig,
   type ChatVoiceConfig,
@@ -59,7 +61,7 @@ test('migrates existing native voice overrides into extension config', () => {
 
 test('writes native overrides while preserving unrelated character voices', () => {
   const config: ChatVoiceConfig = {
-    version: 4,
+    version: 5,
     messageLimit: 20,
     connectionId: 'shared',
     narratorVoice: 'narrator',
@@ -69,6 +71,7 @@ test('writes native overrides while preserving unrelated character voices', () =
       { id: 'bob', name: 'Bob', messageCount: 2 },
     ],
     managedCharacterIds: ['alice', 'bob'],
+    parsedMessages: {},
   }
   const metadata = applyConfigToMetadata({
     untouched: true,
@@ -91,18 +94,46 @@ test('writes native overrides while preserving unrelated character voices', () =
 
 test('persists manual scan results for loading without rescanning messages', () => {
   const metadata = applyConfigToMetadata({}, {
-    version: 4,
+    version: 5,
     messageLimit: 35,
     connectionId: '',
     narratorVoice: '',
     characterVoices: { alice: 'voice-a' },
     detectedCharacters: [{ id: 'alice', name: 'Alice', messageCount: 7 }],
     managedCharacterIds: [],
+    parsedMessages: {
+      message1: {
+        contentHash: hashMessageContent('Alice said, "Hello."'),
+        segments: [
+          { text: 'Alice said,', speakerId: null },
+          { text: 'Hello.', speakerId: npcSpeakerId('Alice') },
+        ],
+      },
+    },
   })
   const restored = readConfig(metadata, ['alice'])
   assert.equal(restored.messageLimit, 35)
   assert.deepEqual(restored.detectedCharacters, [{ id: 'alice', name: 'Alice', messageCount: 7 }])
   assert.equal(restored.characterVoices.alice, 'voice-a')
+  assert.deepEqual(restored.parsedMessages, metadata.chat_voice && (metadata.chat_voice as ChatVoiceConfig).parsedMessages)
+})
+
+test('validates fenced LLM segmentation and rejects unknown message IDs', () => {
+  const parsed = parseLlmSegmentation({
+    content: '```json\n{"messages":[{"id":"known","segments":[{"type":"narration","text":"The door opened.","speaker":null},{"type":"speech","text":"Hello.","speaker":"Alice"}]},{"id":"injected","segments":[{"type":"speech","text":"Nope","speaker":"Mallory"}]}]}\n```',
+  }, new Set(['known']))
+  assert.deepEqual(parsed, [{
+    id: 'known',
+    segments: [
+      { type: 'narration', text: 'The door opened.', speaker: null },
+      { type: 'speech', text: 'Hello.', speaker: 'Alice' },
+    ],
+  }])
+})
+
+test('message content hashes change when playback content changes', () => {
+  assert.equal(hashMessageContent('same'), hashMessageContent('same'))
+  assert.notEqual(hashMessageContent('same'), hashMessageContent('changed'))
 })
 
 test('detects multiple named NPCs written by one character card', () => {

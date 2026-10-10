@@ -14,20 +14,38 @@ export interface VoiceOverrides {
 }
 
 export interface ChatVoiceConfig {
-  version: 4
+  version: 5
   messageLimit: number
   connectionId: string
   narratorVoice: string
   characterVoices: Record<string, string>
   detectedCharacters: Array<{ id: string; name: string; messageCount: number }>
   managedCharacterIds: string[]
+  parsedMessages: Record<string, CachedMessageParse>
 }
 
 export interface MessageLike {
+  id?: string
   is_user: boolean
   name: string
   content?: string
   extra?: Record<string, unknown>
+}
+
+export interface CachedMessageParse {
+  contentHash: string
+  segments: PlaybackSegment[]
+}
+
+export interface LlmParsedSegment {
+  type: 'narration' | 'speech'
+  text: string
+  speaker: string | null
+}
+
+export interface LlmParsedMessage {
+  id: string
+  segments: LlmParsedSegment[]
 }
 
 export interface CharacterLike {
@@ -68,6 +86,30 @@ function readStringMap(value: unknown): Record<string, string> {
   const result: Record<string, string> = {}
   for (const [key, item] of Object.entries(value)) {
     if (key && typeof item === 'string') result[key] = item.trim().slice(0, 512)
+  }
+  return result
+}
+
+function readParsedMessages(value: unknown): Record<string, CachedMessageParse> {
+  if (!isRecord(value)) return {}
+  const result: Record<string, CachedMessageParse> = {}
+  for (const [messageId, item] of Object.entries(value).slice(0, MAX_MESSAGE_LIMIT)) {
+    if (!messageId || !isRecord(item) || typeof item.contentHash !== 'string' || !Array.isArray(item.segments)) continue
+    const segments: PlaybackSegment[] = []
+    for (const segment of item.segments.slice(0, 500)) {
+      if (!isRecord(segment) || typeof segment.text !== 'string') continue
+      const text = segment.text.trim().slice(0, 20_000)
+      const speakerId = segment.speakerId === null || typeof segment.speakerId === 'string'
+        ? segment.speakerId
+        : null
+      if (text) segments.push({ text, speakerId: speakerId?.slice(0, 256) ?? null })
+    }
+    if (segments.length > 0) {
+      result[messageId.slice(0, 256)] = {
+        contentHash: item.contentHash.slice(0, 32),
+        segments,
+      }
+    }
   }
   return result
 }
@@ -143,7 +185,7 @@ export function readConfig(
     : managedCharacterIds
 
   return {
-    version: 4,
+    version: 5,
     messageLimit: clampMessageLimit(raw.messageLimit),
     connectionId: typeof raw.connectionId === 'string'
       ? raw.connectionId.trim().slice(0, 128)
@@ -154,7 +196,67 @@ export function readConfig(
     characterVoices,
     detectedCharacters: readDetectedCharacters(raw.detectedCharacters, legacyDetectedIds),
     managedCharacterIds: [...new Set(managedCharacterIds)],
+    parsedMessages: readParsedMessages(raw.parsedMessages),
   }
+}
+
+export function hashMessageContent(content: string): string {
+  let hash = 0x811c9dc5
+  for (let index = 0; index < content.length; index++) {
+    hash ^= content.charCodeAt(index)
+    hash = Math.imul(hash, 0x01000193)
+  }
+  return `${content.length.toString(36)}-${(hash >>> 0).toString(36)}`
+}
+
+function extractGenerationText(value: unknown): string {
+  if (typeof value === 'string') return value
+  if (!isRecord(value)) return ''
+  if (typeof value.content === 'string') return value.content
+  if (isRecord(value.data) && typeof value.data.content === 'string') return value.data.content
+  return ''
+}
+
+export function parseLlmSegmentation(
+  response: unknown,
+  allowedMessageIds: ReadonlySet<string>,
+): LlmParsedMessage[] {
+  let text = extractGenerationText(response).trim()
+  if (text.startsWith('```')) {
+    text = text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '')
+  }
+  const start = text.indexOf('{')
+  const end = text.lastIndexOf('}')
+  if (start < 0 || end <= start) return []
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(text.slice(start, end + 1))
+  } catch {
+    return []
+  }
+  if (!isRecord(parsed) || !Array.isArray(parsed.messages)) return []
+  const result: LlmParsedMessage[] = []
+  const seen = new Set<string>()
+  for (const item of parsed.messages) {
+    if (!isRecord(item) || typeof item.id !== 'string' || seen.has(item.id) || !allowedMessageIds.has(item.id)) continue
+    if (!Array.isArray(item.segments)) continue
+    const segments: LlmParsedSegment[] = []
+    for (const segment of item.segments.slice(0, 500)) {
+      if (!isRecord(segment) || typeof segment.text !== 'string') continue
+      const text = segment.text.trim().slice(0, 20_000)
+      if (!text) continue
+      const type = segment.type === 'speech' ? 'speech' : segment.type === 'narration' ? 'narration' : null
+      if (!type) continue
+      const speaker = type === 'speech' && typeof segment.speaker === 'string'
+        ? normalizeSpeakerName(segment.speaker).slice(0, 128) || null
+        : null
+      segments.push({ type, text, speaker })
+    }
+    if (segments.length === 0) continue
+    seen.add(item.id)
+    result.push({ id: item.id, segments })
+  }
+  return result
 }
 
 export function normalizeSpeakerName(value: string): string {
@@ -219,7 +321,7 @@ export function parseMultiVoiceSegments(content: string, defaultSpeakerId: strin
   const merged: PlaybackSegment[] = []
   for (const segment of result) {
     const previous = merged[merged.length - 1]
-    if (previous?.speakerId === segment.speakerId) previous.text += ` ${segment.text}`
+    if (previous?.speakerId === null && segment.speakerId === null) previous.text += ` ${segment.text}`
     else merged.push({ ...segment })
   }
   return merged

@@ -2,7 +2,13 @@ import type {
   SpindleFrontendContext,
   SpindleTextInputHandle,
 } from 'lumiverse-spindle-types'
-import { npcSpeakerId, normalizeSpeakerName, parseMultiVoiceSegments } from './core'
+import {
+  hashMessageContent,
+  npcSpeakerId,
+  normalizeSpeakerName,
+  parseMultiVoiceSegments,
+  type CachedMessageParse,
+} from './core'
 
 interface TtsConnection {
   id: string
@@ -29,6 +35,7 @@ interface ActiveChatState {
   connectionId: string
   narratorVoice: string
   characters: DetectedCharacterState[]
+  parsedMessages: Record<string, CachedMessageParse>
 }
 
 interface StatePayload {
@@ -46,6 +53,7 @@ interface ErrorPayload {
 interface ScanCompletePayload {
   type: 'chat_voice_scan_complete'
   chatId: string
+  parserFallbacks?: number
 }
 
 interface PlaybackMessage {
@@ -450,7 +458,11 @@ export function setup(ctx: SpindleFrontendContext) {
       const aliases = new Map(
         activeChat.characters.map((character) => [npcSpeakerId(character.name), character.id] as const),
       )
-      const plan = parseMultiVoiceSegments(message.content, defaultSpeakerId).map((segment) => {
+      const cached = activeChat.parsedMessages[messageId]
+      const segments = cached?.contentHash === hashMessageContent(message.content)
+        ? cached.segments
+        : parseMultiVoiceSegments(message.content, defaultSpeakerId)
+      const plan = segments.map((segment) => {
         const speakerId = segment.speakerId
           ? aliases.get(segment.speakerId) ?? segment.speakerId
           : null
@@ -503,7 +515,7 @@ export function setup(ctx: SpindleFrontendContext) {
     scanning = true
     scanButton.disabled = true
     scanButton.textContent = 'Scanning…'
-    setStatus('Scanning recent messages…')
+    setStatus('Asking the active language model to identify speakers…')
     ctx.sendToBackend({
       type: 'chat_voice_scan',
       chatId: activeChat.id,
@@ -656,7 +668,9 @@ export function setup(ctx: SpindleFrontendContext) {
       scanning = false
       scanButton.textContent = 'Scan'
       scanButton.disabled = false
-      setStatus('Scan complete. Character settings saved.', 'saved')
+      setStatus(payload.parserFallbacks
+        ? `Scan complete. ${payload.parserFallbacks} message${payload.parserFallbacks === 1 ? '' : 's'} used deterministic fallback.`
+        : 'Scan complete. Speaker map and character settings saved.', 'saved')
       return
     }
     if (payload.type !== 'chat_voice_state') return
