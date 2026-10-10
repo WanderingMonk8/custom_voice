@@ -12,8 +12,8 @@ A [Lumiverse Spindle](https://docs.lumiverse.chat/) extension that detects chara
 - Allows unlimited manually added NPCs, each with its own voice and delete control.
 - Assigns a separate narrator voice.
 - Routes quoted text to the speaking character and text outside quotations to the narrator.
-- Adds a custom music-note action to each message for ordered multi-voice playback.
-- Adds the same custom playback action to the message context menu.
+- Routes Lumiverse's native message TTS button through ordered multi-voice playback.
+- Overrides the matching native context-menu action instead of adding duplicate playback controls.
 - Merges adjacent same-voice passages and maintains a two-segment rolling playback buffer to avoid gaps and API bursts.
 - Paces request starts and automatically honors `Retry-After` when a TTS provider responds with HTTP 429.
 - Removes HTML/escaped tags and Markdown emphasis markers before sending readable text to TTS.
@@ -44,7 +44,7 @@ The compiled frontend and backend bundles are committed under `dist/`, so users 
 3. Click **Scan** to read the active character card and save its speaking cast.
 4. Choose one TTS connection for the chat.
 5. Enter the narrator voice and a voice for each detected character. Add or delete NPCs manually as needed.
-6. Use the **♫** action on a character message to play it with all configured voices.
+6. Use Lumiverse's normal **Play with TTS** button or context-menu action to play the message with all configured voices.
 
 The card scan result, manually managed NPC roster, and all voice settings save automatically for that chat. Switching chats loads the previously saved cast and settings without scanning or calling the language model again. Click **Scan** after changing the card. Manual NPCs remain in the roster across later scans until you delete them. Clear a voice field to use the TTS connection's default/fallback voice; clear the connection to disable every custom voice managed by the extension for that chat.
 
@@ -56,7 +56,7 @@ Alice: "I was wondering when you'd arrive."
 Bob: "We should leave before midnight."
 ```
 
-Only text inside straight or curly quotation marks is treated as character speech. Everything outside quotes uses the narrator voice. The extension-owned **♫** action resolves the current output locally and sends narration, Alice, and Bob in order through the shared connection. This supports any number of configured cast voices and does not require another language-model request. Lumiverse's native TTS action still has its native two-voice-per-message behavior, so use **♫** when a message contains multiple same-card NPCs.
+Only text inside straight or curly quotation marks is treated as character speech. Everything outside quotes uses the narrator voice. While the extension is enabled, Lumiverse's native **Play with TTS** button and matching context-menu action resolve the current output locally and send narration, Alice, and Bob in order through the shared connection. This supports any number of configured cast voices and does not require another language-model request.
 
 AI parsing happens only when **Scan** is clicked and only receives card fields such as description, scenario, greeting, and example dialogue. Model output is validated before it is saved; if parsing is unavailable, the primary card character remains available as a fallback.
 

@@ -90,7 +90,6 @@ const VOICE_ICON = `
   </svg>
 `
 
-const PLAY_ACTION_ICON = `<svg viewBox="0 0 24 24" width="13" height="13" fill="none" aria-hidden="true"><path d="M9 18V5l10-2v13" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><circle cx="6" cy="18" r="3" stroke="currentColor" stroke-width="2"/><circle cx="16" cy="16" r="3" stroke="currentColor" stroke-width="2"/></svg>`
 const STOP_ACTION_ICON = `<svg viewBox="0 0 24 24" width="13" height="13" fill="currentColor" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="1"/></svg>`
 
 async function listAllTtsConnections(): Promise<TtsConnection[]> {
@@ -280,19 +279,6 @@ export function setup(ctx: SpindleFrontendContext) {
     .chat-voice-status { min-height:18px; }
     .chat-voice-status[data-state="saved"] { color:var(--lumiverse-success, #65b97a); }
     .chat-voice-status[data-state="error"] { color:var(--lumiverse-danger, #ef6464); }
-    .chat-voice-message-play {
-      display:flex; align-items:center; justify-content:center; width:26px; height:26px;
-      padding:0; border:0; border-radius:6px; background:transparent; color:inherit; cursor:pointer;
-    }
-    .chat-voice-message-play:hover { background:var(--lumiverse-fill-subtle); }
-    .chat-voice-message-play[data-playing="true"] { color:var(--lumiverse-accent, #7c6df2); }
-    .chat-voice-context-play {
-      display:flex; align-items:center; gap:10px; width:100%; padding:9px 12px;
-      border:0; border-radius:6px; background:transparent; color:var(--lumiverse-text);
-      font:inherit; font-size:13px; text-align:left; cursor:pointer;
-    }
-    .chat-voice-context-play:hover { background:var(--lumiverse-fill-subtle); }
-    .chat-voice-context-play svg { flex:0 0 auto; }
   `)
 
   const tab = ctx.ui.registerDrawerTab({
@@ -383,8 +369,13 @@ export function setup(ctx: SpindleFrontendContext) {
   } | null = null
   const inFlight = new Set<number>()
   const characterInputs = new Map<string, SpindleTextInputHandle>()
-  const playButtons = new Map<string, Set<HTMLButtonElement>>()
-  const contextPlayButtons = new Map<string, Set<HTMLButtonElement>>()
+  let lastContextMessageId: string | null = null
+  const nativeButtonStates = new Map<HTMLButtonElement, {
+    html: string
+    title: string | null
+    ariaLabel: string | null
+    ariaPressed: string | null
+  }>()
   const pendingMessageRequests = new Map<string, {
     resolve: (message: PlaybackMessage) => void
     reject: (error: Error) => void
@@ -395,6 +386,20 @@ export function setup(ctx: SpindleFrontendContext) {
   const setStatus = (message: string, state: 'normal' | 'saved' | 'error' = 'normal') => {
     status.textContent = message
     status.dataset.state = state
+  }
+
+  function nativeTtsMessageId(button: HTMLButtonElement): string | null {
+    if (button.closest('[data-spindle-extension-root]')) return null
+    const known = button.dataset.chatVoiceNativeTts === 'true'
+    const hasNativeTtsIcon = !!button.querySelector('svg.lucide-volume-2, svg.lucide-square')
+    if (!known && !hasNativeTtsIcon) return null
+
+    const messageElement = button.closest<HTMLElement>('[data-message-id]')
+    if (messageElement?.dataset.messageId) return messageElement.dataset.messageId
+
+    const isPortalMenuAction = button.parentElement?.parentElement === document.body
+      && !!button.querySelector(':scope > span')
+    return isPortalMenuAction ? lastContextMessageId : null
   }
 
   const connectionPicker = ctx.components.mountSelect(connectionField.slot, {
@@ -454,24 +459,48 @@ export function setup(ctx: SpindleFrontendContext) {
   }
 
   function updatePlaybackButtons() {
-    for (const [messageId, buttons] of playButtons) {
-      for (const button of buttons) {
-        const playing = activePlayback?.messageId === messageId
-        button.dataset.playing = String(playing)
-        button.innerHTML = playing ? STOP_ACTION_ICON : PLAY_ACTION_ICON
-        button.title = playing ? 'Stop custom voice playback' : 'Play with custom NPC voices'
-        button.setAttribute('aria-label', button.title)
+    for (const button of document.querySelectorAll<HTMLButtonElement>('button')) {
+      const messageId = nativeTtsMessageId(button)
+      if (!messageId) continue
+      const playing = activePlayback?.messageId === messageId
+      const idle = nativeButtonStates.get(button)
+      if (!playing) {
+        if (!idle) continue
+        button.innerHTML = idle.html
+        if (idle.title === null) button.removeAttribute('title')
+        else button.setAttribute('title', idle.title)
+        if (idle.ariaLabel === null) button.removeAttribute('aria-label')
+        else button.setAttribute('aria-label', idle.ariaLabel)
+        if (idle.ariaPressed === null) button.removeAttribute('aria-pressed')
+        else button.setAttribute('aria-pressed', idle.ariaPressed)
+        delete button.dataset.chatVoiceNativeTts
+        delete button.dataset.playing
+        nativeButtonStates.delete(button)
+        continue
       }
-    }
-    for (const [messageId, buttons] of contextPlayButtons) {
-      for (const button of buttons) {
-        const playing = activePlayback?.messageId === messageId
-        button.dataset.playing = String(playing)
-        button.innerHTML = `${playing ? STOP_ACTION_ICON : PLAY_ACTION_ICON}<span>${playing ? 'Stop custom voice playback' : 'Play with custom voices'}</span>`
-        button.title = playing ? 'Stop custom voice playback' : 'Play with custom voices'
-        button.setAttribute('aria-label', button.title)
+      if (!idle) {
+        nativeButtonStates.set(button, {
+          html: button.innerHTML,
+          title: button.getAttribute('title'),
+          ariaLabel: button.getAttribute('aria-label'),
+          ariaPressed: button.getAttribute('aria-pressed'),
+        })
       }
+      const label = 'Stop custom voice playback'
+      const hasText = !!button.querySelector(':scope > span')
+      button.dataset.chatVoiceNativeTts = 'true'
+      button.dataset.playing = 'true'
+      button.innerHTML = `${STOP_ACTION_ICON}${hasText ? `<span>${label}</span>` : ''}`
+      button.title = label
+      button.setAttribute('aria-label', label)
+      button.setAttribute('aria-pressed', 'true')
     }
+  }
+
+  function restoreNativePlaybackButtons() {
+    activePlayback = null
+    updatePlaybackButtons()
+    nativeButtonStates.clear()
   }
 
   function requestPlaybackMessage(chatId: string, messageId: string): Promise<PlaybackMessage> {
@@ -796,95 +825,30 @@ export function setup(ctx: SpindleFrontendContext) {
     }
   }
 
-  function bindPlaybackButton(element: Element, button: HTMLButtonElement, removeOnCleanup: boolean): (() => void) | void {
-    const messageId = ctx.dom.getMessageId(element)
-    if (!messageId) return
-    button.classList.add('chat-voice-message-play')
-    const buttons = playButtons.get(messageId) ?? new Set<HTMLButtonElement>()
-    buttons.add(button)
-    playButtons.set(messageId, buttons)
-    const onClick = () => void playMessage(messageId)
-    button.addEventListener('click', onClick)
-    updatePlaybackButtons()
-    return () => {
-      button.removeEventListener('click', onClick)
-      if (removeOnCleanup) button.remove()
-      buttons.delete(button)
-      if (buttons.size === 0) playButtons.delete(messageId)
-    }
+  const onNativeContextMenu = (event: MouseEvent) => {
+    const target = event.target instanceof Element ? event.target : null
+    lastContextMessageId = target?.closest<HTMLElement>('[data-message-id]')?.dataset.messageId ?? null
+    window.requestAnimationFrame(updatePlaybackButtons)
   }
 
-  function mountCurrentPlaybackButton(root: HTMLElement): (() => void) | void {
-    root.style.display = 'contents'
-    const button = root.querySelector<HTMLButtonElement>('[data-spindle-decorator-kind="button"]')
+  const onNativeTtsClick = (event: MouseEvent) => {
+    const target = event.target instanceof Element ? event.target : null
+    const button = target?.closest<HTMLButtonElement>('button')
     if (!button) return
-    return bindPlaybackButton(root, button, false)
-  }
-
-  function mountCurrentContextPlayback(root: HTMLElement): (() => void) | void {
-    root.style.display = 'contents'
-    const button = root.querySelector<HTMLButtonElement>('[data-spindle-decorator-kind="context-action"]')
-    if (!button) return
-    const messageId = ctx.dom.getMessageId(root)
+    const messageId = nativeTtsMessageId(button)
     if (!messageId) return
-    button.classList.add('chat-voice-context-play')
-    const buttons = contextPlayButtons.get(messageId) ?? new Set<HTMLButtonElement>()
-    buttons.add(button)
-    contextPlayButtons.set(messageId, buttons)
-    const onClick = () => void playMessage(messageId)
-    button.addEventListener('click', onClick)
-    updatePlaybackButtons()
-    return () => {
-      button.removeEventListener('click', onClick)
-      buttons.delete(button)
-      if (buttons.size === 0) contextPlayButtons.delete(messageId)
+    event.preventDefault()
+    event.stopPropagation()
+    event.stopImmediatePropagation()
+    if (button.parentElement?.parentElement === document.body) {
+      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
     }
+    void playMessage(messageId)
   }
 
-  function mountLegacyPlaybackButton(element: Element): (() => void) | void {
-    const button = document.createElement('button')
-    button.type = 'button'
-    element.appendChild(button)
-    return bindPlaybackButton(element, button, true)
-  }
-
-  const currentDecorator = (ctx.ui as typeof ctx.ui & {
-    registerDomDecorator?: (options: {
-      mount: string
-      kind?: string
-      svg?: string
-      html?: string
-      priority?: number
-      render: (root: HTMLElement) => void | (() => void)
-    }) => () => void
-  }).registerDomDecorator
-  const destroyCurrentDecorator = currentDecorator
-    ? currentDecorator({
-        mount: 'message_actions',
-        kind: 'button',
-        svg: PLAY_ACTION_ICON,
-        render: mountCurrentPlaybackButton,
-      })
-    : null
-  const destroyContextDecorator = currentDecorator
-    ? currentDecorator({
-        mount: 'message_context_menu',
-        kind: 'context-action',
-        priority: 30,
-        html: `${PLAY_ACTION_ICON}<span>Play with custom voices</span>`,
-        render: mountCurrentContextPlayback,
-      })
-    : null
-  const legacyDecorator = !destroyCurrentDecorator && ctx.registerDomDecorator
-    ? ctx.registerDomDecorator({ target: 'message_actions', decorate: mountLegacyPlaybackButton })
-    : null
-  const legacyMessageAction = !destroyCurrentDecorator && !legacyDecorator && ctx.registerMessageAction
-    ? ctx.registerMessageAction({
-        id: 'play-custom-voices',
-        label: 'Play with custom NPC voices',
-        onClick: (messageId) => void playMessage(messageId),
-      })
-    : null
+  document.addEventListener('contextmenu', onNativeContextMenu, true)
+  document.addEventListener('click', onNativeTtsClick, true)
+  window.requestAnimationFrame(updatePlaybackButtons)
 
   const unsubscribeBackend = ctx.onBackendMessage((rawPayload: unknown) => {
     const payload = rawPayload as StatePayload | ErrorPayload | ScanCompletePayload | MessagePayload
@@ -974,10 +938,9 @@ export function setup(ctx: SpindleFrontendContext) {
     addNpcButton.removeEventListener('click', onAddNpc)
     addNpcInputSlot.removeEventListener('keydown', onAddNpcKeyDown)
     scanButton.removeEventListener('click', scanMessages)
-    destroyCurrentDecorator?.()
-    destroyContextDecorator?.()
-    legacyDecorator?.destroy()
-    legacyMessageAction?.destroy()
+    document.removeEventListener('contextmenu', onNativeContextMenu, true)
+    document.removeEventListener('click', onNativeTtsClick, true)
+    restoreNativePlaybackButtons()
     tab.destroy()
     removeStyle()
   }
