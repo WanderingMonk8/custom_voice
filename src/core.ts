@@ -505,6 +505,34 @@ function escapedPattern(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 }
 
+function precedingParagraphSpeaker(before: string, speakers: CharacterLike[]): string | null {
+  let lastBreak: RegExpMatchArray | null = null
+  for (const match of before.matchAll(/\n[^\S\n]*\n/gu)) lastBreak = match
+  if (!lastBreak || lastBreak.index === undefined) return null
+
+  const breakEnd = lastBreak.index + lastBreak[0].length
+  if (cleanPlaybackText(before.slice(breakEnd))) return null
+
+  const earlierText = before.slice(0, lastBreak.index).trimEnd()
+  let previousBreakEnd = 0
+  for (const match of earlierText.matchAll(/\n[^\S\n]*\n/gu)) {
+    if (match.index !== undefined) previousBreakEnd = match.index + match[0].length
+  }
+  const previousParagraph = earlierText
+    .slice(previousBreakEnd)
+    .replace(/["“][\s\S]*?["”]/gu, ' ')
+  const mentionedSpeakerIds = new Set<string>()
+  for (const speaker of speakers) {
+    for (const alias of speakerAliases(speaker.name)) {
+      if (new RegExp(`\\b${escapedPattern(alias)}\\b`, 'iu').test(previousParagraph)) {
+        mentionedSpeakerIds.add(speaker.id)
+        break
+      }
+    }
+  }
+  return mentionedSpeakerIds.size === 1 ? [...mentionedSpeakerIds][0] : null
+}
+
 function inferQuotedSpeaker(
   before: string,
   after: string,
@@ -542,8 +570,10 @@ function inferQuotedSpeaker(
       }
     }
   }
-  return best
-    ? { speakerId: best.id, confident: true }
+  if (best) return { speakerId: best.id, confident: true }
+  const paragraphSpeakerId = precedingParagraphSpeaker(before, speakers)
+  return paragraphSpeakerId
+    ? { speakerId: paragraphSpeakerId, confident: true }
     : { speakerId: defaultSpeakerId, confident: false }
 }
 
