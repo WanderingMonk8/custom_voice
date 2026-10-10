@@ -497,6 +497,47 @@ test('does not let a nearby secondary name override the paragraph subject for on
   )
 })
 
+test('alternates unresolved turns in a confidently seeded dialogue chain', () => {
+  const segments = parseRosterVoiceSegments(
+    '"It is working, but hear me first," Alma called down. "Receiving is clean."\n\n"One hop reaches who?" Vahn said.\n\n"The repeater broadcasts what it receives. A reply takes a person on the other end." A pause. "So we can send two sentences before going mute."\n\n"Then I understand."',
+    'card',
+    [{ id: 'alma', name: 'Alma' }, { id: 'vahn', name: 'Vahn' }],
+  )
+  assert.deepEqual(segments.filter(segment => segment.speakerId !== null), [
+    { text: 'It is working, but hear me first,', speakerId: 'alma' },
+    { text: 'Receiving is clean.', speakerId: 'alma' },
+    { text: 'One hop reaches who?', speakerId: 'vahn' },
+    {
+      text: 'The repeater broadcasts what it receives. A reply takes a person on the other end.',
+      speakerId: 'alma',
+    },
+    { text: 'So we can send two sentences before going mute.', speakerId: 'alma' },
+    { text: 'Then I understand.', speakerId: 'vahn' },
+  ])
+})
+
+test('keeps a dialogue chain across a short unnamed narrative beat', () => {
+  assert.deepEqual(
+    parseRosterVoiceSegments(
+      '"First," Alma said.\n\n"Second," Vahn replied.\n\nA pause.\n\n"Third."',
+      'card',
+      [{ id: 'alma', name: 'Alma' }, { id: 'vahn', name: 'Vahn' }],
+    ).at(-1),
+    { text: 'Third.', speakerId: 'alma' },
+  )
+})
+
+test('breaks dialogue alternation after substantive pure narration', () => {
+  assert.deepEqual(
+    parseRosterVoiceSegments(
+      '"First," Alma said.\n\n"Second," Vahn replied.\n\nThe group crossed the valley in silence while the weather worsened around them and the road disappeared beneath fresh snow for the rest of the afternoon.\n\n"Unattributed."',
+      'card',
+      [{ id: 'alma', name: 'Alma' }, { id: 'vahn', name: 'Vahn' }],
+    ).at(-1),
+    { text: 'Unattributed.', speakerId: 'vahn' },
+  )
+})
+
 test('distinguishes main subjects from objects and passive agents', () => {
   const speakers = [{ id: 'yaniko', name: 'Yaniko' }, { id: 'kansai', name: 'Kansai' }]
   for (const narration of [
