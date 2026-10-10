@@ -171,7 +171,12 @@ async function synthesizeVoiceSegment(connectionId, text, voice, speed, signal, 
         parameters: { speed }
       })
     });
-    if (response.ok) return response.arrayBuffer();
+    if (response.ok) {
+      return {
+        data: await response.arrayBuffer(),
+        mime: response.headers.get("content-type") || "audio/mpeg"
+      };
+    }
     if (response.status === 429 && attempt < MAX_RATE_LIMIT_RETRIES) {
       const retryDelay = retryAfterMilliseconds(response.headers.get("Retry-After")) ?? Math.min(15e3, 2e3 * 2 ** attempt);
       pacer.nextStartAt = Math.max(pacer.nextStartAt, Date.now() + retryDelay);
@@ -180,6 +185,26 @@ async function synthesizeVoiceSegment(connectionId, text, voice, speed, signal, 
     }
     const detail = await response.text().catch(() => "");
     throw new Error(detail || `TTS synthesis failed (${response.status}).`);
+  }
+}
+async function saveMessageAudio(chatId, messageId, swipeId, segments, signal) {
+  const form = new FormData();
+  form.append("chatId", chatId);
+  form.append("messageId", messageId);
+  if (typeof swipeId === "number") form.append("swipeId", String(swipeId));
+  segments.forEach((segment, index) => {
+    const blob = new Blob([segment.data], { type: segment.mime || "audio/mpeg" });
+    form.append("segment", blob, `seg-${String(index).padStart(4, "0")}`);
+  });
+  const response = await fetch("/api/v1/tts/save-message-audio", {
+    method: "POST",
+    credentials: "same-origin",
+    signal,
+    body: form
+  });
+  if (!response.ok) {
+    const body = await response.json().catch(() => null);
+    throw new Error(body?.error || `Could not save generated audio (${response.status}).`);
   }
 }
 async function ensureQuotationRouting() {
@@ -528,6 +553,7 @@ function setup(ctx) {
       }
     }
     if (!activeChat) return;
+    const playbackChat = activeChat;
     const config = collectConfig();
     if (!config.connectionId) {
       setStatus("Choose a TTS connection before playing.", "error");
@@ -549,14 +575,14 @@ function setup(ctx) {
     activePlayback = playback;
     updatePlaybackButtons();
     try {
-      const message = await requestPlaybackMessage(activeChat.id, messageId);
+      const message = await requestPlaybackMessage(playbackChat.id, messageId);
       if (message.is_user) throw new Error("Custom voice playback is only available for character messages.");
       const explicitId = typeof message.extra?.character_id === "string" ? message.extra.character_id : "";
-      const defaultSpeakerId = explicitId || activeChat.characters.find((character) => !character.id.startsWith("npc:") && normalizeSpeakerName(character.name).toLowerCase() === normalizeSpeakerName(message.name).toLowerCase())?.id || null;
+      const defaultSpeakerId = explicitId || playbackChat.characters.find((character) => !character.id.startsWith("npc:") && normalizeSpeakerName(character.name).toLowerCase() === normalizeSpeakerName(message.name).toLowerCase())?.id || null;
       const aliases = new Map(
-        activeChat.characters.map((character) => [npcSpeakerId(character.name), character.id])
+        playbackChat.characters.map((character) => [npcSpeakerId(character.name), character.id])
       );
-      const segments = parseRosterVoiceSegments(message.content, defaultSpeakerId, activeChat.characters);
+      const segments = parseRosterVoiceSegments(message.content, defaultSpeakerId, playbackChat.characters);
       const plan = mergeVoicePlan(segments.map((segment) => {
         const speakerId = segment.speakerId ? aliases.get(segment.speakerId) ?? segment.speakerId : null;
         const voice = speakerId ? config.characterVoices[speakerId] || (defaultSpeakerId ? config.characterVoices[defaultSpeakerId] : "") || "" : config.narratorVoice;
@@ -567,7 +593,7 @@ function setup(ctx) {
       const pacer = { nextStartAt: 0, startQueue: Promise.resolve() };
       const prepare = async (index) => {
         try {
-          const buffer = await synthesizeVoiceSegment(
+          const segment = await synthesizeVoiceSegment(
             config.connectionId,
             plan[index].text,
             plan[index].voice,
@@ -578,7 +604,7 @@ function setup(ctx) {
               `Rate limited; retry ${retry} in ${Math.max(1, Math.ceil(delayMs / 1e3))}s\u2026`
             )
           );
-          return { buffer };
+          return { segment };
         } catch (error) {
           return { error };
         }
@@ -593,15 +619,25 @@ function setup(ctx) {
         `Buffering ${initialBufferSize} voice segment${initialBufferSize === 1 ? "" : "s"} before playback\u2026`
       );
       await Promise.all(prepared.values());
+      const captured = new Array(plan.length);
       for (let index = 0; index < plan.length; index += 1) {
         const current = await prepared.get(index);
         prepared.delete(index);
         if ("error" in current) throw current.error;
+        captured[index] = current.segment;
         schedule(index + PLAYBACK_BUFFER_SEGMENTS);
         setStatus(`Playing ${index + 1} of ${plan.length} voice segment${plan.length === 1 ? "" : "s"}\u2026`);
-        await playDecodedBuffer(playback, current.buffer, preferences.volume);
+        await playDecodedBuffer(playback, current.segment.data, preferences.volume);
       }
-      setStatus("Playback complete.", "saved");
+      setStatus("Saving generated audio\u2026");
+      await saveMessageAudio(
+        playbackChat.id,
+        messageId,
+        message.swipe_id,
+        captured,
+        playback.controller.signal
+      );
+      setStatus("Playback complete and audio saved.", "saved");
     } catch (error) {
       if (error?.name !== "AbortError") {
         setStatus(error instanceof Error ? error.message : "Custom voice playback failed.", "error");

@@ -310,6 +310,7 @@ spindle.onFrontendMessage(async (rawPayload: unknown, userId) => {
           is_user: boolean
           name: string
           content?: string
+          swipe_id?: number
           extra?: Record<string, unknown>
         }>
         const message = messages.find((item) => item.id === payload.messageId)
@@ -322,6 +323,7 @@ spindle.onFrontendMessage(async (rawPayload: unknown, userId) => {
             is_user: message.is_user,
             name: message.name,
             content: message.content ?? '',
+            swipe_id: message.swipe_id,
             extra: message.extra ?? {},
           } : null,
           ...(!message ? { error: 'The message is no longer available.' } : {}),
@@ -354,4 +356,4 @@ spindle.on('CHAT_SWITCHED', async (_payload, userId) => {
   await sendState(userId)
 })
 
-spindle.log.info('Chat Voice 3.7.1 loaded.')
+spindle.log.info('Chat Voice 3.8 loaded.')

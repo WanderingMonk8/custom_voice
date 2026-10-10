@@ -399,6 +399,7 @@ spindle.onFrontendMessage(async (rawPayload, userId) => {
             is_user: message.is_user,
             name: message.name,
             content: message.content ?? "",
+            swipe_id: message.swipe_id,
             extra: message.extra ?? {}
           } : null,
           ...!message ? { error: "The message is no longer available." } : {}
@@ -429,4 +430,4 @@ spindle.onFrontendMessage(async (rawPayload, userId) => {
 spindle.on("CHAT_SWITCHED", async (_payload, userId) => {
   await sendState(userId);
 });
-spindle.log.info("Chat Voice 3.7.1 loaded.");
+spindle.log.info("Chat Voice 3.8 loaded.");

@@ -16,6 +16,7 @@ A [Lumiverse Spindle](https://docs.lumiverse.chat/) extension that detects chara
 - Overrides the matching native context-menu action instead of adding duplicate playback controls.
 - Merges adjacent same-voice passages and maintains a two-segment rolling playback buffer to avoid gaps and API bursts.
 - Paces request starts and automatically honors `Retry-After` when a TTS provider responds with HTTP 429.
+- Saves successful multi-voice playback as one native Lumiverse audio attachment for the active message swipe.
 - Removes HTML/escaped tags and Markdown emphasis markers before sending readable text to TTS.
 - Auto-saves every setting to the current chat.
 - Saves the detected cast and reloads it with the correct settings whenever the active chat changes.

@@ -76,7 +76,13 @@ interface PlaybackMessage {
   is_user: boolean
   name: string
   content: string
+  swipe_id?: number
   extra?: Record<string, unknown>
+}
+
+interface SynthesizedVoiceSegment {
+  data: ArrayBuffer
+  mime: string
 }
 
 interface PlaybackPreferences {
@@ -171,7 +177,7 @@ async function synthesizeVoiceSegment(
   signal: AbortSignal,
   pacer: SynthesisPacer,
   onRateLimit: (delayMs: number, retry: number) => void,
-): Promise<ArrayBuffer> {
+): Promise<SynthesizedVoiceSegment> {
   for (let attempt = 0; ; attempt += 1) {
     await waitForSynthesisSlot(pacer, signal)
     const response = await fetch('/api/v1/tts/synthesize', {
@@ -186,7 +192,12 @@ async function synthesizeVoiceSegment(
         parameters: { speed },
       }),
     })
-    if (response.ok) return response.arrayBuffer()
+    if (response.ok) {
+      return {
+        data: await response.arrayBuffer(),
+        mime: response.headers.get('content-type') || 'audio/mpeg',
+      }
+    }
     if (response.status === 429 && attempt < MAX_RATE_LIMIT_RETRIES) {
       const retryDelay = retryAfterMilliseconds(response.headers.get('Retry-After'))
         ?? Math.min(15_000, 2_000 * (2 ** attempt))
@@ -196,6 +207,33 @@ async function synthesizeVoiceSegment(
     }
     const detail = await response.text().catch(() => '')
     throw new Error(detail || `TTS synthesis failed (${response.status}).`)
+  }
+}
+
+async function saveMessageAudio(
+  chatId: string,
+  messageId: string,
+  swipeId: number | undefined,
+  segments: SynthesizedVoiceSegment[],
+  signal: AbortSignal,
+): Promise<void> {
+  const form = new FormData()
+  form.append('chatId', chatId)
+  form.append('messageId', messageId)
+  if (typeof swipeId === 'number') form.append('swipeId', String(swipeId))
+  segments.forEach((segment, index) => {
+    const blob = new Blob([segment.data], { type: segment.mime || 'audio/mpeg' })
+    form.append('segment', blob, `seg-${String(index).padStart(4, '0')}`)
+  })
+  const response = await fetch('/api/v1/tts/save-message-audio', {
+    method: 'POST',
+    credentials: 'same-origin',
+    signal,
+    body: form,
+  })
+  if (!response.ok) {
+    const body = await response.json().catch(() => null) as { error?: string } | null
+    throw new Error(body?.error || `Could not save generated audio (${response.status}).`)
   }
 }
 
@@ -581,6 +619,7 @@ export function setup(ctx: SpindleFrontendContext) {
       }
     }
     if (!activeChat) return
+    const playbackChat = activeChat
     const config = collectConfig()
     if (!config.connectionId) {
       setStatus('Choose a TTS connection before playing.', 'error')
@@ -604,18 +643,18 @@ export function setup(ctx: SpindleFrontendContext) {
     updatePlaybackButtons()
 
     try {
-      const message = await requestPlaybackMessage(activeChat.id, messageId)
+      const message = await requestPlaybackMessage(playbackChat.id, messageId)
       if (message.is_user) throw new Error('Custom voice playback is only available for character messages.')
       const explicitId = typeof message.extra?.character_id === 'string' ? message.extra.character_id : ''
-      const defaultSpeakerId = explicitId || activeChat.characters.find((character) => (
+      const defaultSpeakerId = explicitId || playbackChat.characters.find((character) => (
         !character.id.startsWith('npc:')
         && normalizeSpeakerName(character.name).toLowerCase()
           === normalizeSpeakerName(message.name).toLowerCase()
       ))?.id || null
       const aliases = new Map(
-        activeChat.characters.map((character) => [npcSpeakerId(character.name), character.id] as const),
+        playbackChat.characters.map((character) => [npcSpeakerId(character.name), character.id] as const),
       )
-      const segments = parseRosterVoiceSegments(message.content, defaultSpeakerId, activeChat.characters)
+      const segments = parseRosterVoiceSegments(message.content, defaultSpeakerId, playbackChat.characters)
       const plan = mergeVoicePlan(segments.map((segment) => {
         const speakerId = segment.speakerId
           ? aliases.get(segment.speakerId) ?? segment.speakerId
@@ -629,10 +668,10 @@ export function setup(ctx: SpindleFrontendContext) {
 
       const preferences = await loadPlaybackPreferences()
       const pacer: SynthesisPacer = { nextStartAt: 0, startQueue: Promise.resolve() }
-      type PreparedSegment = { buffer: ArrayBuffer; error?: never } | { buffer?: never; error: unknown }
+      type PreparedSegment = { segment: SynthesizedVoiceSegment; error?: never } | { segment?: never; error: unknown }
       const prepare = async (index: number): Promise<PreparedSegment> => {
         try {
-          const buffer = await synthesizeVoiceSegment(
+          const segment = await synthesizeVoiceSegment(
             config.connectionId,
             plan[index].text,
             plan[index].voice,
@@ -643,7 +682,7 @@ export function setup(ctx: SpindleFrontendContext) {
               `Rate limited; retry ${retry} in ${Math.max(1, Math.ceil(delayMs / 1_000))}s…`,
             ),
           )
-          return { buffer }
+          return { segment }
         } catch (error) {
           return { error }
         }
@@ -660,15 +699,25 @@ export function setup(ctx: SpindleFrontendContext) {
       )
       await Promise.all(prepared.values())
 
+      const captured = new Array<SynthesizedVoiceSegment>(plan.length)
       for (let index = 0; index < plan.length; index += 1) {
         const current = await prepared.get(index)!
         prepared.delete(index)
         if ('error' in current) throw current.error
+        captured[index] = current.segment
         schedule(index + PLAYBACK_BUFFER_SEGMENTS)
         setStatus(`Playing ${index + 1} of ${plan.length} voice segment${plan.length === 1 ? '' : 's'}…`)
-        await playDecodedBuffer(playback, current.buffer, preferences.volume)
+        await playDecodedBuffer(playback, current.segment.data, preferences.volume)
       }
-      setStatus('Playback complete.', 'saved')
+      setStatus('Saving generated audio…')
+      await saveMessageAudio(
+        playbackChat.id,
+        messageId,
+        message.swipe_id,
+        captured,
+        playback.controller.signal,
+      )
+      setStatus('Playback complete and audio saved.', 'saved')
     } catch (error) {
       if ((error as { name?: string })?.name !== 'AbortError') {
         setStatus(error instanceof Error ? error.message : 'Custom voice playback failed.', 'error')
