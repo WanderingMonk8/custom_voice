@@ -22,10 +22,12 @@ interface ConnectionPage {
 
 interface SynthesisPacer {
   nextStartAt: number
+  startQueue: Promise<void>
 }
 
-const MIN_SYNTHESIS_START_INTERVAL_MS = 1_100
+const MIN_SYNTHESIS_START_INTERVAL_MS = 1_250
 const MAX_RATE_LIMIT_RETRIES = 3
+const PLAYBACK_BUFFER_SEGMENTS = 2
 
 interface DetectedCharacterState {
   id: string
@@ -150,8 +152,16 @@ function retryAfterMilliseconds(value: string | null): number | null {
 }
 
 async function waitForSynthesisSlot(pacer: SynthesisPacer, signal: AbortSignal): Promise<void> {
-  await abortableDelay(Math.max(0, pacer.nextStartAt - Date.now()), signal)
-  pacer.nextStartAt = Date.now() + MIN_SYNTHESIS_START_INTERVAL_MS
+  const turn = pacer.startQueue.then(async () => {
+    while (true) {
+      await abortableDelay(Math.max(0, pacer.nextStartAt - Date.now()), signal)
+      if (Date.now() < pacer.nextStartAt) continue
+      pacer.nextStartAt = Date.now() + MIN_SYNTHESIS_START_INTERVAL_MS
+      return
+    }
+  })
+  pacer.startQueue = turn.catch(() => undefined)
+  await turn
 }
 
 async function synthesizeVoiceSegment(
@@ -573,7 +583,7 @@ export function setup(ctx: SpindleFrontendContext) {
       if (plan.length === 0) throw new Error('This message has no playable narration or dialogue.')
 
       const preferences = await loadPlaybackPreferences()
-      const pacer: SynthesisPacer = { nextStartAt: 0 }
+      const pacer: SynthesisPacer = { nextStartAt: 0, startQueue: Promise.resolve() }
       type PreparedSegment = { buffer: ArrayBuffer; error?: never } | { buffer?: never; error: unknown }
       const prepare = async (index: number): Promise<PreparedSegment> => {
         try {
@@ -594,15 +604,24 @@ export function setup(ctx: SpindleFrontendContext) {
         }
       }
 
-      setStatus(`Preparing 1 of ${plan.length} voice segment${plan.length === 1 ? '' : 's'}…`)
-      let prepared = prepare(0)
+      const prepared = new Map<number, Promise<PreparedSegment>>()
+      const schedule = (index: number) => {
+        if (index < plan.length && !prepared.has(index)) prepared.set(index, prepare(index))
+      }
+      const initialBufferSize = Math.min(PLAYBACK_BUFFER_SEGMENTS, plan.length)
+      for (let index = 0; index < initialBufferSize; index += 1) schedule(index)
+      setStatus(
+        `Buffering ${initialBufferSize} voice segment${initialBufferSize === 1 ? '' : 's'} before playback…`,
+      )
+      await Promise.all(prepared.values())
+
       for (let index = 0; index < plan.length; index += 1) {
-        const current = await prepared
+        const current = await prepared.get(index)!
+        prepared.delete(index)
         if ('error' in current) throw current.error
-        const next = index + 1 < plan.length ? prepare(index + 1) : null
+        schedule(index + PLAYBACK_BUFFER_SEGMENTS)
         setStatus(`Playing ${index + 1} of ${plan.length} voice segment${plan.length === 1 ? '' : 's'}…`)
         await playDecodedBuffer(playback, current.buffer, preferences.volume)
-        if (next) prepared = next
       }
       setStatus('Playback complete.', 'saved')
     } catch (error) {

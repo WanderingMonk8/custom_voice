@@ -81,8 +81,9 @@ function parseRosterVoiceSegments(content, defaultSpeakerId, speakers) {
 }
 
 // src/frontend.ts
-var MIN_SYNTHESIS_START_INTERVAL_MS = 1100;
+var MIN_SYNTHESIS_START_INTERVAL_MS = 1250;
 var MAX_RATE_LIMIT_RETRIES = 3;
+var PLAYBACK_BUFFER_SEGMENTS = 2;
 var VOICE_ICON = `
   <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
     <path d="M5 10v4M9 7v10M13 4v16M17 8v8M21 10v4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
@@ -145,8 +146,16 @@ function retryAfterMilliseconds(value) {
   return Number.isFinite(timestamp) ? Math.max(0, timestamp - Date.now()) : null;
 }
 async function waitForSynthesisSlot(pacer, signal) {
-  await abortableDelay(Math.max(0, pacer.nextStartAt - Date.now()), signal);
-  pacer.nextStartAt = Date.now() + MIN_SYNTHESIS_START_INTERVAL_MS;
+  const turn = pacer.startQueue.then(async () => {
+    while (true) {
+      await abortableDelay(Math.max(0, pacer.nextStartAt - Date.now()), signal);
+      if (Date.now() < pacer.nextStartAt) continue;
+      pacer.nextStartAt = Date.now() + MIN_SYNTHESIS_START_INTERVAL_MS;
+      return;
+    }
+  });
+  pacer.startQueue = turn.catch(() => void 0);
+  await turn;
 }
 async function synthesizeVoiceSegment(connectionId, text, voice, speed, signal, pacer, onRateLimit) {
   for (let attempt = 0; ; attempt += 1) {
@@ -524,7 +533,7 @@ function setup(ctx) {
       }));
       if (plan.length === 0) throw new Error("This message has no playable narration or dialogue.");
       const preferences = await loadPlaybackPreferences();
-      const pacer = { nextStartAt: 0 };
+      const pacer = { nextStartAt: 0, startQueue: Promise.resolve() };
       const prepare = async (index) => {
         try {
           const buffer = await synthesizeVoiceSegment(
@@ -543,15 +552,23 @@ function setup(ctx) {
           return { error };
         }
       };
-      setStatus(`Preparing 1 of ${plan.length} voice segment${plan.length === 1 ? "" : "s"}\u2026`);
-      let prepared = prepare(0);
+      const prepared = /* @__PURE__ */ new Map();
+      const schedule = (index) => {
+        if (index < plan.length && !prepared.has(index)) prepared.set(index, prepare(index));
+      };
+      const initialBufferSize = Math.min(PLAYBACK_BUFFER_SEGMENTS, plan.length);
+      for (let index = 0; index < initialBufferSize; index += 1) schedule(index);
+      setStatus(
+        `Buffering ${initialBufferSize} voice segment${initialBufferSize === 1 ? "" : "s"} before playback\u2026`
+      );
+      await Promise.all(prepared.values());
       for (let index = 0; index < plan.length; index += 1) {
-        const current = await prepared;
+        const current = await prepared.get(index);
+        prepared.delete(index);
         if ("error" in current) throw current.error;
-        const next = index + 1 < plan.length ? prepare(index + 1) : null;
+        schedule(index + PLAYBACK_BUFFER_SEGMENTS);
         setStatus(`Playing ${index + 1} of ${plan.length} voice segment${plan.length === 1 ? "" : "s"}\u2026`);
         await playDecodedBuffer(playback, current.buffer, preferences.volume);
-        if (next) prepared = next;
       }
       setStatus("Playback complete.", "saved");
     } catch (error) {

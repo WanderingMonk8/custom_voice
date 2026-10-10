@@ -14,7 +14,7 @@ A [Lumiverse Spindle](https://docs.lumiverse.chat/) extension that detects chara
 - Routes quoted text to the speaking character and text outside quotations to the narrator.
 - Adds a custom music-note action to each message for ordered multi-voice playback.
 - Adds the same custom playback action to the message context menu.
-- Merges adjacent same-voice passages and streams synthesis one segment ahead of playback to avoid API bursts.
+- Merges adjacent same-voice passages and maintains a two-segment rolling playback buffer to avoid gaps and API bursts.
 - Paces request starts and automatically honors `Retry-After` when a TTS provider responds with HTTP 429.
 - Removes HTML/escaped tags and Markdown emphasis markers before sending readable text to TTS.
 - Auto-saves every setting to the current chat.
