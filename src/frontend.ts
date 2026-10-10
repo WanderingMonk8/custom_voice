@@ -90,6 +90,26 @@ interface SynthesizedVoiceSegment {
   mime: string
 }
 
+interface SavedAudioAttachment {
+  type?: string
+  image_id?: string
+  swipe_id?: number
+}
+
+interface SavedMessageAudioResult {
+  message?: {
+    id?: string
+    extra?: { attachments?: SavedAudioAttachment[] }
+  }
+  audio?: {
+    id?: string
+    mime_type?: string
+    size_bytes?: number
+  }
+  muxed_with_ffmpeg?: boolean
+  swipe_id?: number
+}
+
 interface PlaybackPreferences {
   speed: number
   volume: number
@@ -226,7 +246,7 @@ async function saveMessageAudio(
   swipeId: number | undefined,
   segments: SynthesizedVoiceSegment[],
   signal: AbortSignal,
-): Promise<void> {
+): Promise<SavedMessageAudioResult> {
   const form = new FormData()
   form.append('chatId', chatId)
   form.append('messageId', messageId)
@@ -241,10 +261,28 @@ async function saveMessageAudio(
     signal,
     body: form,
   })
+  const responseText = await response.text()
   if (!response.ok) {
-    const body = await response.json().catch(() => null) as { error?: string } | null
+    let body: { error?: string } | null = null
+    try { body = JSON.parse(responseText) as { error?: string } } catch { /* non-JSON server error */ }
     throw new Error(body?.error || `Could not save generated audio (${response.status}).`)
   }
+
+  let result: SavedMessageAudioResult
+  try {
+    result = JSON.parse(responseText) as SavedMessageAudioResult
+  } catch {
+    throw new Error('Lumiverse returned an invalid response after saving generated audio.')
+  }
+  const savedAudioId = result.audio?.id
+  const attachments = result.message?.extra?.attachments
+  const attached = Array.isArray(attachments) && attachments.some(attachment => (
+    attachment?.type === 'audio' && attachment.image_id === savedAudioId
+  ))
+  if (result.message?.id !== messageId || !savedAudioId || !attached) {
+    throw new Error('Lumiverse did not confirm the generated audio attachment on the message.')
+  }
+  return result
 }
 
 /** Force the host TTS parser to route only quoted text to character voices. */
@@ -760,10 +798,15 @@ export function setup(ctx: SpindleFrontendContext) {
       await Promise.all(prepared.values())
 
       const decoded = new Array<AudioBuffer>(plan.length)
+      const captured = new Array<SynthesizedVoiceSegment>(plan.length)
       for (let index = 0; index < plan.length; index += 1) {
         const current = await prepared.get(index)!
         prepared.delete(index)
         if ('error' in current) throw current.error
+        captured[index] = {
+          data: current.segment.data.slice(0),
+          mime: current.segment.mime,
+        }
         schedule(index + PLAYBACK_BUFFER_SEGMENTS)
         setStatus(`Playing ${index + 1} of ${plan.length} voice segment${plan.length === 1 ? '' : 's'}…`)
         decoded[index] = await playDecodedBuffer(playback, current.segment.data, preferences.volume)
@@ -773,22 +816,43 @@ export function setup(ctx: SpindleFrontendContext) {
         updatePlaybackButtons()
         await playback.context.close().catch(() => undefined)
       }
-      const wav = encodeConcatenatedWav(decoded.map(buffer => ({
-        sampleRate: buffer.sampleRate,
-        channels: Array.from(
-          { length: buffer.numberOfChannels },
-          (_, channel) => buffer.getChannelData(channel),
-        ),
-      })))
       setStatus('Playback complete. Saving generated audio…')
       try {
-        await saveMessageAudio(
-          playbackChat.id,
+        let saved: SavedMessageAudioResult
+        try {
+          saved = await saveMessageAudio(
+            playbackChat.id,
+            messageId,
+            message.swipe_id,
+            captured,
+            playback.controller.signal,
+          )
+        } catch (segmentSaveError) {
+          if ((segmentSaveError as { name?: string })?.name === 'AbortError') throw segmentSaveError
+          setStatus('Server could not combine the source audio; retrying as WAV…')
+          const wav = encodeConcatenatedWav(decoded.map(buffer => ({
+            sampleRate: buffer.sampleRate,
+            channels: Array.from(
+              { length: buffer.numberOfChannels },
+              (_, channel) => buffer.getChannelData(channel),
+            ),
+          })))
+          saved = await saveMessageAudio(
+            playbackChat.id,
+            messageId,
+            message.swipe_id,
+            [{ data: wav, mime: 'audio/wav' }],
+            playback.controller.signal,
+          )
+        }
+        console.info('[Chat Voice] Saved generated message audio.', {
           messageId,
-          message.swipe_id,
-          [{ data: wav, mime: 'audio/wav' }],
-          playback.controller.signal,
-        )
+          swipeId: saved.swipe_id,
+          audioId: saved.audio?.id,
+          mime: saved.audio?.mime_type,
+          sizeBytes: saved.audio?.size_bytes,
+          muxedWithFfmpeg: saved.muxed_with_ffmpeg,
+        })
         setStatus('Playback complete and audio saved.', 'saved')
       } catch (error) {
         if ((error as { name?: string })?.name === 'AbortError') throw error
