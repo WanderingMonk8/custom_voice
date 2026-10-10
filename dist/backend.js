@@ -495,4 +495,4 @@ spindle.onFrontendMessage(async (rawPayload, userId, frontendSessionId) => {
     }, userId, frontendSessionId);
   }
 });
-spindle.log.info("Chat Voice 3.13.2 loaded.");
+spindle.log.info("Chat Voice 3.14.0 loaded.");
