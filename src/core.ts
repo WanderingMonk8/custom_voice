@@ -396,6 +396,19 @@ export function normalizeSpeakerName(value: string): string {
   return value.normalize('NFKC').trim().replace(/\s+/g, ' ')
 }
 
+export function speakerAliases(value: string): string[] {
+  const aliases: string[] = []
+  const seen = new Set<string>()
+  for (const part of value.split('/')) {
+    const alias = normalizeSpeakerName(part)
+    const key = alias.toLowerCase()
+    if (!alias || seen.has(key)) continue
+    seen.add(key)
+    aliases.push(alias)
+  }
+  return aliases
+}
+
 export function npcSpeakerId(name: string): string {
   return `npc:${normalizeSpeakerName(name).toLowerCase()}`
 }
@@ -503,28 +516,30 @@ function inferQuotedSpeaker(
     const actionBeat = after.slice(0, 140).split(/["“\n]/u, 1)[0]
     let nearest: { id: string; index: number } | null = null
     for (const speaker of speakers) {
-      const name = escapedPattern(normalizeSpeakerName(speaker.name))
-      if (!name) continue
-      const index = actionBeat.search(new RegExp(`\\b${name}\\b`, 'iu'))
-      if (index >= 0 && (!nearest || index < nearest.index)) nearest = { id: speaker.id, index }
+      for (const alias of speakerAliases(speaker.name)) {
+        const name = escapedPattern(alias)
+        const index = actionBeat.search(new RegExp(`\\b${name}\\b`, 'iu'))
+        if (index >= 0 && (!nearest || index < nearest.index)) nearest = { id: speaker.id, index }
+      }
     }
     if (nearest) return { speakerId: nearest.id, confident: true }
   }
 
   let best: { id: string; score: number } | null = null
   for (const speaker of speakers) {
-    const name = escapedPattern(normalizeSpeakerName(speaker.name))
-    if (!name) continue
-    const tests: Array<[RegExp, string, number]> = [
-      [new RegExp(`(?:^|\\n)\\s*(?:[-*]\\s*)?(?:\\*\\*)?${name}(?:\\*\\*)?\\s*:\\s*[^"“\\n]{0,120}$`, 'iu'), before.slice(-220), 100],
-      [new RegExp(`\\b${name}\\b[^\\n.!?]{0,60}\\b${SPEECH_VERBS}\\b[^\\n.!?]{0,20}$`, 'iu'), before.slice(-180), 90],
-      [new RegExp(`\\b${SPEECH_VERBS}\\b\\s+(?:to\\s+)?${name}\\b[^\\n.!?]{0,20}$`, 'iu'), before.slice(-180), 90],
-      [new RegExp(`^\\s*[,;:.!?—-]*\\s*${name}\\b[^\\n.!?]{0,50}\\b${SPEECH_VERBS}\\b`, 'iu'), after.slice(0, 180), 85],
-      [new RegExp(`^\\s*[,;:.!?—-]*\\s*${SPEECH_VERBS}\\b\\s+(?:to\\s+)?${name}\\b`, 'iu'), after.slice(0, 180), 85],
-      [new RegExp(`\\b${name}\\b[^\\n]{0,70}$`, 'iu'), before.slice(-140), 86],
-    ]
-    for (const [pattern, sample, score] of tests) {
-      if (pattern.test(sample) && (!best || score > best.score)) best = { id: speaker.id, score }
+    for (const alias of speakerAliases(speaker.name)) {
+      const name = escapedPattern(alias)
+      const tests: Array<[RegExp, string, number]> = [
+        [new RegExp(`(?:^|\\n)\\s*(?:[-*]\\s*)?(?:\\*\\*)?${name}(?:\\*\\*)?\\s*:\\s*[^"“\\n]{0,120}$`, 'iu'), before.slice(-220), 100],
+        [new RegExp(`\\b${name}\\b[^\\n.!?]{0,60}\\b${SPEECH_VERBS}\\b[^\\n.!?]{0,20}$`, 'iu'), before.slice(-180), 90],
+        [new RegExp(`\\b${SPEECH_VERBS}\\b\\s+(?:to\\s+)?${name}\\b[^\\n.!?]{0,20}$`, 'iu'), before.slice(-180), 90],
+        [new RegExp(`^\\s*[,;:.!?—-]*\\s*${name}\\b[^\\n.!?]{0,50}\\b${SPEECH_VERBS}\\b`, 'iu'), after.slice(0, 180), 85],
+        [new RegExp(`^\\s*[,;:.!?—-]*\\s*${SPEECH_VERBS}\\b\\s+(?:to\\s+)?${name}\\b`, 'iu'), after.slice(0, 180), 85],
+        [new RegExp(`\\b${name}\\b[^\\n]{0,70}$`, 'iu'), before.slice(-140), 86],
+      ]
+      for (const [pattern, sample, score] of tests) {
+        if (pattern.test(sample) && (!best || score > best.score)) best = { id: speaker.id, score }
+      }
     }
   }
   return best
@@ -540,8 +555,10 @@ function canContinueSpeaker(
   if (/\n\s*\n/u.test(bridge)) return false
   for (const speaker of speakers) {
     if (speaker.id === previousSpeakerId) continue
-    const name = escapedPattern(normalizeSpeakerName(speaker.name))
-    if (name && new RegExp(`\\b${name}\\b`, 'iu').test(bridge)) return false
+    for (const alias of speakerAliases(speaker.name)) {
+      const name = escapedPattern(alias)
+      if (new RegExp(`\\b${name}\\b`, 'iu').test(bridge)) return false
+    }
   }
   return true
 }
@@ -598,9 +615,9 @@ export function detectCharacters(
 ): DetectedCharacter[] {
   const byName = new Map<string, CharacterLike>()
   for (const character of candidates) {
-    const normalizedName = character.name.trim().toLowerCase()
-    if (normalizedName && !byName.has(normalizedName)) {
-      byName.set(normalizedName, character)
+    for (const alias of speakerAliases(character.name)) {
+      const normalizedName = alias.toLowerCase()
+      if (!byName.has(normalizedName)) byName.set(normalizedName, character)
     }
   }
   const byId = new Map(candidates.map((character) => [character.id, character] as const))

@@ -8,6 +8,7 @@ import {
   npcSpeakerId,
   normalizeSpeakerName,
   parseRosterVoiceSegments,
+  speakerAliases,
 } from './core'
 
 interface TtsConnection {
@@ -487,7 +488,7 @@ export function setup(ctx: SpindleFrontendContext) {
   })
 
   const addNpcInput = ctx.components.mountTextInput(addNpcInputSlot, {
-    value: '', placeholder: 'NPC name', ariaLabel: 'NPC name to add', disabled: true,
+    value: '', placeholder: 'NPC name / aliases', ariaLabel: 'NPC name and aliases to add', disabled: true,
     onChange: () => undefined,
   })
 
@@ -698,13 +699,15 @@ export function setup(ctx: SpindleFrontendContext) {
       const message = await requestPlaybackMessage(playbackChat.id, messageId)
       if (message.is_user) throw new Error('Custom voice playback is only available for character messages.')
       const explicitId = typeof message.extra?.character_id === 'string' ? message.extra.character_id : ''
+      const messageName = normalizeSpeakerName(message.name).toLowerCase()
       const defaultSpeakerId = explicitId || playbackChat.characters.find((character) => (
         !character.id.startsWith('npc:')
-        && normalizeSpeakerName(character.name).toLowerCase()
-          === normalizeSpeakerName(message.name).toLowerCase()
+        && speakerAliases(character.name).some(alias => alias.toLowerCase() === messageName)
       ))?.id || null
       const aliases = new Map(
-        playbackChat.characters.map((character) => [npcSpeakerId(character.name), character.id] as const),
+        playbackChat.characters.flatMap((character) => (
+          speakerAliases(character.name).map(alias => [npcSpeakerId(alias), character.id] as const)
+        )),
       )
       const segments = parseRosterVoiceSegments(message.content, defaultSpeakerId, playbackChat.characters)
       const plan = mergeVoicePlan(segments.map((segment) => {
@@ -829,16 +832,21 @@ export function setup(ctx: SpindleFrontendContext) {
 
   function addManualNpc() {
     if (!activeChat) return
-    const name = normalizeSpeakerName(addNpcInput.getValue()).slice(0, 128)
-    if (!name) {
+    const aliases = speakerAliases(addNpcInput.getValue().slice(0, 128))
+    if (aliases.length === 0) {
       setStatus('Enter an NPC name first.', 'error')
       return
     }
-    const id = npcSpeakerId(name)
-    if (activeChat.characters.some((character) => character.id === id)) {
-      setStatus(`${name} is already in this chat's voice roster.`, 'error')
+    const existingAliases = new Set(activeChat.characters.flatMap((character) => (
+      speakerAliases(character.name).map(alias => alias.toLowerCase())
+    )))
+    const duplicateAlias = aliases.find(alias => existingAliases.has(alias.toLowerCase()))
+    if (duplicateAlias) {
+      setStatus(`${duplicateAlias} is already in this chat's voice roster.`, 'error')
       return
     }
+    const name = aliases.join(' / ')
+    const id = npcSpeakerId(aliases[0])
     activeChat = {
       ...activeChat,
       characters: [...activeChat.characters, { id, name, messageCount: 0, voice: '' }],

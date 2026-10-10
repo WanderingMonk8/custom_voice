@@ -71,6 +71,18 @@ function mergeVoicePlan(segments) {
 function normalizeSpeakerName(value) {
   return value.normalize("NFKC").trim().replace(/\s+/g, " ");
 }
+function speakerAliases(value) {
+  const aliases = [];
+  const seen = /* @__PURE__ */ new Set();
+  for (const part of value.split("/")) {
+    const alias = normalizeSpeakerName(part);
+    const key = alias.toLowerCase();
+    if (!alias || seen.has(key)) continue;
+    seen.add(key);
+    aliases.push(alias);
+  }
+  return aliases;
+}
 function npcSpeakerId(name) {
   return `npc:${normalizeSpeakerName(name).toLowerCase()}`;
 }
@@ -92,27 +104,29 @@ function inferQuotedSpeaker(before, after, quotedText, speakers, defaultSpeakerI
     const actionBeat = after.slice(0, 140).split(/["“\n]/u, 1)[0];
     let nearest = null;
     for (const speaker of speakers) {
-      const name = escapedPattern(normalizeSpeakerName(speaker.name));
-      if (!name) continue;
-      const index = actionBeat.search(new RegExp(`\\b${name}\\b`, "iu"));
-      if (index >= 0 && (!nearest || index < nearest.index)) nearest = { id: speaker.id, index };
+      for (const alias of speakerAliases(speaker.name)) {
+        const name = escapedPattern(alias);
+        const index = actionBeat.search(new RegExp(`\\b${name}\\b`, "iu"));
+        if (index >= 0 && (!nearest || index < nearest.index)) nearest = { id: speaker.id, index };
+      }
     }
     if (nearest) return { speakerId: nearest.id, confident: true };
   }
   let best = null;
   for (const speaker of speakers) {
-    const name = escapedPattern(normalizeSpeakerName(speaker.name));
-    if (!name) continue;
-    const tests = [
-      [new RegExp(`(?:^|\\n)\\s*(?:[-*]\\s*)?(?:\\*\\*)?${name}(?:\\*\\*)?\\s*:\\s*[^"\u201C\\n]{0,120}$`, "iu"), before.slice(-220), 100],
-      [new RegExp(`\\b${name}\\b[^\\n.!?]{0,60}\\b${SPEECH_VERBS}\\b[^\\n.!?]{0,20}$`, "iu"), before.slice(-180), 90],
-      [new RegExp(`\\b${SPEECH_VERBS}\\b\\s+(?:to\\s+)?${name}\\b[^\\n.!?]{0,20}$`, "iu"), before.slice(-180), 90],
-      [new RegExp(`^\\s*[,;:.!?\u2014-]*\\s*${name}\\b[^\\n.!?]{0,50}\\b${SPEECH_VERBS}\\b`, "iu"), after.slice(0, 180), 85],
-      [new RegExp(`^\\s*[,;:.!?\u2014-]*\\s*${SPEECH_VERBS}\\b\\s+(?:to\\s+)?${name}\\b`, "iu"), after.slice(0, 180), 85],
-      [new RegExp(`\\b${name}\\b[^\\n]{0,70}$`, "iu"), before.slice(-140), 86]
-    ];
-    for (const [pattern, sample, score] of tests) {
-      if (pattern.test(sample) && (!best || score > best.score)) best = { id: speaker.id, score };
+    for (const alias of speakerAliases(speaker.name)) {
+      const name = escapedPattern(alias);
+      const tests = [
+        [new RegExp(`(?:^|\\n)\\s*(?:[-*]\\s*)?(?:\\*\\*)?${name}(?:\\*\\*)?\\s*:\\s*[^"\u201C\\n]{0,120}$`, "iu"), before.slice(-220), 100],
+        [new RegExp(`\\b${name}\\b[^\\n.!?]{0,60}\\b${SPEECH_VERBS}\\b[^\\n.!?]{0,20}$`, "iu"), before.slice(-180), 90],
+        [new RegExp(`\\b${SPEECH_VERBS}\\b\\s+(?:to\\s+)?${name}\\b[^\\n.!?]{0,20}$`, "iu"), before.slice(-180), 90],
+        [new RegExp(`^\\s*[,;:.!?\u2014-]*\\s*${name}\\b[^\\n.!?]{0,50}\\b${SPEECH_VERBS}\\b`, "iu"), after.slice(0, 180), 85],
+        [new RegExp(`^\\s*[,;:.!?\u2014-]*\\s*${SPEECH_VERBS}\\b\\s+(?:to\\s+)?${name}\\b`, "iu"), after.slice(0, 180), 85],
+        [new RegExp(`\\b${name}\\b[^\\n]{0,70}$`, "iu"), before.slice(-140), 86]
+      ];
+      for (const [pattern, sample, score] of tests) {
+        if (pattern.test(sample) && (!best || score > best.score)) best = { id: speaker.id, score };
+      }
     }
   }
   return best ? { speakerId: best.id, confident: true } : { speakerId: defaultSpeakerId, confident: false };
@@ -121,8 +135,10 @@ function canContinueSpeaker(bridge, previousSpeakerId, speakers) {
   if (/\n\s*\n/u.test(bridge)) return false;
   for (const speaker of speakers) {
     if (speaker.id === previousSpeakerId) continue;
-    const name = escapedPattern(normalizeSpeakerName(speaker.name));
-    if (name && new RegExp(`\\b${name}\\b`, "iu").test(bridge)) return false;
+    for (const alias of speakerAliases(speaker.name)) {
+      const name = escapedPattern(alias);
+      if (new RegExp(`\\b${name}\\b`, "iu").test(bridge)) return false;
+    }
   }
   return true;
 }
@@ -496,8 +512,8 @@ function setup(ctx) {
   });
   const addNpcInput = ctx.components.mountTextInput(addNpcInputSlot, {
     value: "",
-    placeholder: "NPC name",
-    ariaLabel: "NPC name to add",
+    placeholder: "NPC name / aliases",
+    ariaLabel: "NPC name and aliases to add",
     disabled: true,
     onChange: () => void 0
   });
@@ -695,9 +711,10 @@ function setup(ctx) {
       const message = await requestPlaybackMessage(playbackChat.id, messageId);
       if (message.is_user) throw new Error("Custom voice playback is only available for character messages.");
       const explicitId = typeof message.extra?.character_id === "string" ? message.extra.character_id : "";
-      const defaultSpeakerId = explicitId || playbackChat.characters.find((character) => !character.id.startsWith("npc:") && normalizeSpeakerName(character.name).toLowerCase() === normalizeSpeakerName(message.name).toLowerCase())?.id || null;
+      const messageName = normalizeSpeakerName(message.name).toLowerCase();
+      const defaultSpeakerId = explicitId || playbackChat.characters.find((character) => !character.id.startsWith("npc:") && speakerAliases(character.name).some((alias) => alias.toLowerCase() === messageName))?.id || null;
       const aliases = new Map(
-        playbackChat.characters.map((character) => [npcSpeakerId(character.name), character.id])
+        playbackChat.characters.flatMap((character) => speakerAliases(character.name).map((alias) => [npcSpeakerId(alias), character.id]))
       );
       const segments = parseRosterVoiceSegments(message.content, defaultSpeakerId, playbackChat.characters);
       const plan = mergeVoicePlan(segments.map((segment) => {
@@ -810,16 +827,19 @@ function setup(ctx) {
   }
   function addManualNpc() {
     if (!activeChat) return;
-    const name = normalizeSpeakerName(addNpcInput.getValue()).slice(0, 128);
-    if (!name) {
+    const aliases = speakerAliases(addNpcInput.getValue().slice(0, 128));
+    if (aliases.length === 0) {
       setStatus("Enter an NPC name first.", "error");
       return;
     }
-    const id = npcSpeakerId(name);
-    if (activeChat.characters.some((character) => character.id === id)) {
-      setStatus(`${name} is already in this chat's voice roster.`, "error");
+    const existingAliases = new Set(activeChat.characters.flatMap((character) => speakerAliases(character.name).map((alias) => alias.toLowerCase())));
+    const duplicateAlias = aliases.find((alias) => existingAliases.has(alias.toLowerCase()));
+    if (duplicateAlias) {
+      setStatus(`${duplicateAlias} is already in this chat's voice roster.`, "error");
       return;
     }
+    const name = aliases.join(" / ");
+    const id = npcSpeakerId(aliases[0]);
     activeChat = {
       ...activeChat,
       characters: [...activeChat.characters, { id, name, messageCount: 0, voice: "" }]

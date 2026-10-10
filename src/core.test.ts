@@ -13,6 +13,7 @@ import {
   parseMultiVoiceSegments,
   parseRosterVoiceSegments,
   readConfig,
+  speakerAliases,
   type ChatVoiceConfig,
 } from './core'
 
@@ -210,6 +211,27 @@ test('assigns quoted output to saved cast members using dialogue tags', () => {
     { text: 'Welcome.', speakerId: npcSpeakerId('Bob') },
     { text: 'The room fell quiet.', speakerId: null },
   ])
+})
+
+test('normalizes slash-separated speaker aliases without duplicates', () => {
+  assert.deepEqual(speakerAliases(' Scott / The sergeant / scott / '), ['Scott', 'The sergeant'])
+})
+
+test('assigns every slash-separated alias to the same saved NPC voice', () => {
+  const speakerId = npcSpeakerId('Scott')
+  assert.deepEqual(
+    parseRosterVoiceSegments(
+      'Scott said, "Ready." The sergeant replied, "Move out."',
+      'card',
+      [{ id: speakerId, name: 'Scott / The sergeant' }],
+    ),
+    [
+      { text: 'Scott said,', speakerId: null },
+      { text: 'Ready.', speakerId },
+      { text: 'The sergeant replied,', speakerId: null },
+      { text: 'Move out.', speakerId },
+    ],
+  )
 })
 
 test('never assigns unquoted output to a character voice', () => {
