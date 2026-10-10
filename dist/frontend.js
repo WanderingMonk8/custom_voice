@@ -99,8 +99,11 @@ var SPEECH_VERBS = "(?:said|says|asked|asks|replied|replies|whispered|whispers|s
 function escapedPattern(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
+function narrativeOnly(text) {
+  return text.replace(/["“][\s\S]*?["”]/gu, " ");
+}
 function mentionedSpeakers(text, speakers) {
-  const narrative = text.replace(/["“][\s\S]*?["”]/gu, " ");
+  const narrative = narrativeOnly(text);
   const mentions = { clean: /* @__PURE__ */ new Set(), possessive: /* @__PURE__ */ new Set() };
   for (const speaker of speakers) {
     for (const alias of speakerAliases(speaker.name)) {
@@ -115,16 +118,81 @@ function mentionedSpeakers(text, speakers) {
   }
   return mentions;
 }
-function preferredMentionedSpeaker(mentions) {
+function discourseSubjectSpeaker(text, speakers, eligibleSpeakerIds) {
+  const narrative = narrativeOnly(text);
+  const occurrencesByPosition = /* @__PURE__ */ new Map();
+  for (const speaker of speakers) {
+    if (!eligibleSpeakerIds.has(speaker.id)) continue;
+    for (const alias of speakerAliases(speaker.name)) {
+      const pattern = new RegExp(`\\b${escapedPattern(alias)}\\b`, "giu");
+      for (const match of narrative.matchAll(pattern)) {
+        if (match.index === void 0) continue;
+        const end = match.index + match[0].length;
+        if (/^['’](?:s\b)?/iu.test(narrative.slice(end))) continue;
+        const key = `${speaker.id}:${match.index}`;
+        const previous = occurrencesByPosition.get(key);
+        if (!previous || end > previous.end) {
+          occurrencesByPosition.set(key, { speakerId: speaker.id, start: match.index, end });
+        }
+      }
+    }
+  }
+  const occurrences = [...occurrencesByPosition.values()].sort((left, right) => left.start - right.start || right.end - left.end);
+  if (occurrences.length === 0) return null;
+  const scores = new Map([...eligibleSpeakerIds].map((id) => [id, 0]));
+  const firstMentionStart = occurrences[0].start;
+  const clauseStart = (index) => {
+    const prefix = narrative.slice(0, index);
+    return Math.max(
+      prefix.lastIndexOf("."),
+      prefix.lastIndexOf("!"),
+      prefix.lastIndexOf("?"),
+      prefix.lastIndexOf(";"),
+      prefix.lastIndexOf("\n")
+    ) + 1;
+  };
+  for (const occurrence of occurrences) {
+    const start = clauseStart(occurrence.start);
+    const lead = narrative.slice(start, occurrence.start);
+    const earlierInClause = occurrences.some((other) => other.start >= start && other.start < occurrence.start);
+    let score = occurrence.start === firstMentionStart ? 2 : 0;
+    if (!lead.trim()) score += 10;
+    else if (!earlierInClause && /^[^,]{1,48},\s*$/u.test(lead)) score += 8;
+    if (/\b(?:to|from|for|with|by|at|on|of|beside|behind|under|near|toward|towards)\s*$/iu.test(lead)) {
+      score -= 6;
+    }
+    if (/\b(?:that|which|who|whom|whose|because|while|when|if|though|although)\s*$/iu.test(lead)) {
+      score -= 5;
+    }
+    if (earlierInClause && /^\s+(?:had|has|have)\b/iu.test(narrative.slice(occurrence.end))) {
+      score -= 5;
+    }
+    scores.set(occurrence.speakerId, (scores.get(occurrence.speakerId) ?? 0) + score);
+  }
+  for (let index = 1; index < occurrences.length; index++) {
+    const left = occurrences[index - 1];
+    const right = occurrences[index];
+    if (left.speakerId === right.speakerId || clauseStart(left.start) !== clauseStart(right.start)) continue;
+    const between = narrative.slice(left.end, right.start);
+    if (/^\s*(?:,\s*)?(?:and|or)\s*$/iu.test(between)) {
+      scores.set(right.speakerId, (scores.get(right.speakerId) ?? 0) + 10);
+    }
+  }
+  const ranked = [...scores.entries()].sort((left, right) => right[1] - left[1]);
+  const [winnerId, winnerScore] = ranked[0];
+  const runnerUpScore = ranked[1]?.[1] ?? Number.NEGATIVE_INFINITY;
+  return winnerScore >= 8 && winnerScore - runnerUpScore >= 4 ? winnerId : null;
+}
+function preferredMentionedSpeaker(text, speakers, mentions) {
   if (mentions.clean.size === 1) return [...mentions.clean][0];
-  if (mentions.clean.size > 1) return null;
+  if (mentions.clean.size > 1) return discourseSubjectSpeaker(text, speakers, mentions.clean);
   return mentions.possessive.size === 1 ? [...mentions.possessive][0] : null;
 }
 function hasSpeakerMentions(mentions) {
   return mentions.clean.size > 0 || mentions.possessive.size > 0;
 }
 function soleMentionedSpeaker(text, speakers) {
-  return preferredMentionedSpeaker(mentionedSpeakers(text, speakers));
+  return preferredMentionedSpeaker(text, speakers, mentionedSpeakers(text, speakers));
 }
 function currentParagraphSpeaker(before, after, speakers) {
   let paragraphStart = 0;
@@ -143,8 +211,9 @@ function precedingParagraphSpeaker(before, speakers) {
   const paragraphs = before.split(/\n[^\S\n]*\n/gu);
   if (paragraphs.length < 2) return null;
   for (let index = paragraphs.length - 2; index >= 0; index--) {
-    const mentions = mentionedSpeakers(paragraphs[index], speakers);
-    const speakerId = preferredMentionedSpeaker(mentions);
+    const paragraph = paragraphs[index];
+    const mentions = mentionedSpeakers(paragraph, speakers);
+    const speakerId = preferredMentionedSpeaker(paragraph, speakers, mentions);
     if (speakerId) return speakerId;
     if (hasSpeakerMentions(mentions)) return null;
   }

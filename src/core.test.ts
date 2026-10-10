@@ -318,14 +318,14 @@ test('assigns every quote to the sole character named in its paragraph', () => {
   )
 })
 
-test('does not use the paragraph fallback when narration names multiple characters', () => {
+test('uses a clear main-clause subject when narration names multiple characters', () => {
   assert.deepEqual(
     parseRosterVoiceSegments(
       '"Move!" Zuri watches Alma cross the room.',
       'card',
       [{ id: 'zuri', name: 'Zuri' }, { id: 'alma', name: 'Alma' }],
     )[0],
-    { text: 'Move!', speakerId: 'card' },
+    { text: 'Move!', speakerId: 'zuri' },
   )
 })
 
@@ -436,14 +436,55 @@ test('anchors leading dialogue to the sole character in the preceding paragraph'
   )
 })
 
-test('does not guess a leading dialogue speaker when the preceding paragraph names multiple characters', () => {
+test('inherits a clear main-clause subject from a paragraph with multiple characters', () => {
   assert.deepEqual(
     parseRosterVoiceSegments(
       'Alma watched Bob cross the room.\n\n"Unattributed."',
       'card',
       [{ id: 'alma', name: 'Alma' }, { id: 'bob', name: 'Bob' }],
     ).at(-1),
+    { text: 'Unattributed.', speakerId: 'alma' },
+  )
+})
+
+test('keeps coordinated main-clause subjects ambiguous', () => {
+  assert.deepEqual(
+    parseRosterVoiceSegments(
+      'Yaniko and Kansai raise their cups together.\n\n"Unattributed."',
+      'card',
+      [{ id: 'yaniko', name: 'Yaniko' }, { id: 'kansai', name: 'Kansai' }],
+    ).at(-1),
     { text: 'Unattributed.', speakerId: 'card' },
+  )
+})
+
+test('prefers the main subject over a name in a reduced relative clause', () => {
+  const segments = parseRosterVoiceSegments(
+    'Yaniko opened her mouth, closed it, and reached for the paper cup Kansai had given her. She drank and set it down.\n\n"Yaku is coming later," she said. "For the ramen. Just so you know."',
+    'card',
+    [{ id: 'yaniko', name: 'Yaniko' }, { id: 'kansai', name: 'Kansai' }],
+  )
+  assert.deepEqual(segments.filter(segment => segment.speakerId !== null), [
+    { text: 'Yaku is coming later,', speakerId: 'yaniko' },
+    { text: 'For the ramen. Just so you know.', speakerId: 'yaniko' },
+  ])
+})
+
+test('distinguishes main subjects from objects and passive agents', () => {
+  const speakers = [{ id: 'yaniko', name: 'Yaniko' }, { id: 'kansai', name: 'Kansai' }]
+  for (const narration of [
+    'Yaniko takes the cup that Kansai had given her.',
+    'Yaniko receives the cup from Kansai.',
+    'Yaniko is handed the cup by Kansai.',
+  ]) {
+    assert.deepEqual(
+      parseRosterVoiceSegments(`${narration}\n\n"Thank you."`, 'card', speakers).at(-1),
+      { text: 'Thank you.', speakerId: 'yaniko' },
+    )
+  }
+  assert.deepEqual(
+    parseRosterVoiceSegments('Kansai gives Yaniko the cup.\n\n"There."', 'card', speakers).at(-1),
+    { text: 'There.', speakerId: 'kansai' },
   )
 })
 
