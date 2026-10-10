@@ -1,3 +1,59 @@
+// src/core.ts
+function normalizeSpeakerName(value) {
+  return value.normalize("NFKC").trim().replace(/\s+/g, " ");
+}
+function npcSpeakerId(name) {
+  return `npc:${normalizeSpeakerName(name).toLowerCase()}`;
+}
+var SPEAKER_NAME_RE = /^[\p{L}\p{N}][\p{L}\p{N}\p{M} ._'’\-]{0,63}$/u;
+var NAMED_DIALOGUE_RE = /^(?:\s*(?:[-*]\s*)?)?(?:\*\*)?([^:\n]{1,64}?)(?:\*\*)?\s*:\s*["“]([\s\S]*?)["”]/gm;
+function extractNamedDialogue(content) {
+  const result = [];
+  for (const match of content.matchAll(NAMED_DIALOGUE_RE)) {
+    const name = normalizeSpeakerName(match[1] ?? "");
+    const text = (match[2] ?? "").trim();
+    if (!name || !text || !SPEAKER_NAME_RE.test(name) || match.index === void 0) continue;
+    result.push({ name, text, start: match.index, end: match.index + match[0].length });
+  }
+  return result;
+}
+function cleanPlaybackText(value) {
+  return value.replace(/```[\s\S]*?```/g, " ").replace(/`[^`\n]*`/g, " ").replace(/<[^>]+>/g, " ").replace(/[*_~]+/g, " ").replace(/\s+/g, " ").trim();
+}
+function appendGenericSegments(result, text, defaultSpeakerId) {
+  const quotePattern = /["“]([\s\S]*?)["”]/g;
+  let cursor = 0;
+  for (const match of text.matchAll(quotePattern)) {
+    if (match.index === void 0) continue;
+    const narration2 = cleanPlaybackText(text.slice(cursor, match.index));
+    if (narration2) result.push({ text: narration2, speakerId: null });
+    const speech = cleanPlaybackText(match[1] ?? "");
+    if (speech) result.push({ text: speech, speakerId: defaultSpeakerId });
+    cursor = match.index + match[0].length;
+  }
+  const narration = cleanPlaybackText(text.slice(cursor));
+  if (narration) result.push({ text: narration, speakerId: null });
+}
+function parseMultiVoiceSegments(content, defaultSpeakerId) {
+  const named = extractNamedDialogue(content);
+  const result = [];
+  let cursor = 0;
+  for (const dialogue of named) {
+    appendGenericSegments(result, content.slice(cursor, dialogue.start), defaultSpeakerId);
+    const speech = cleanPlaybackText(dialogue.text);
+    if (speech) result.push({ text: speech, speakerId: npcSpeakerId(dialogue.name) });
+    cursor = dialogue.end;
+  }
+  appendGenericSegments(result, content.slice(cursor), defaultSpeakerId);
+  const merged = [];
+  for (const segment of result) {
+    const previous = merged[merged.length - 1];
+    if (previous?.speakerId === segment.speakerId) previous.text += ` ${segment.text}`;
+    else merged.push({ ...segment });
+  }
+  return merged;
+}
+
 // src/frontend.ts
 var VOICE_ICON = `
   <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
@@ -21,6 +77,39 @@ async function listAllTtsConnections() {
     if (items.length === 0 || offset >= (page.total ?? items.length)) break;
   }
   return connections;
+}
+async function loadPlaybackPreferences() {
+  const response = await fetch("/api/v1/settings/voiceSettings", {
+    credentials: "same-origin",
+    headers: { Accept: "application/json" }
+  });
+  if (!response.ok) return { speed: 1, volume: 1 };
+  const row = await response.json();
+  const speed = typeof row.value?.ttsSpeed === "number" ? row.value.ttsSpeed : 1;
+  const volume = typeof row.value?.ttsVolume === "number" ? row.value.ttsVolume : 1;
+  return {
+    speed: Math.min(4, Math.max(0.25, speed)),
+    volume: Math.min(1, Math.max(0, volume))
+  };
+}
+async function synthesizeVoiceSegment(connectionId, text, voice, speed, signal) {
+  const response = await fetch("/api/v1/tts/synthesize", {
+    method: "POST",
+    credentials: "same-origin",
+    signal,
+    headers: { "Content-Type": "application/json", Accept: "audio/*" },
+    body: JSON.stringify({
+      connectionId,
+      text,
+      voice: voice || void 0,
+      parameters: { speed }
+    })
+  });
+  if (!response.ok) {
+    const detail = await response.text().catch(() => "");
+    throw new Error(detail || `TTS synthesis failed (${response.status}).`);
+  }
+  return response.arrayBuffer();
 }
 async function ensureQuotationRouting() {
   const response = await fetch("/api/v1/settings/voiceSettings", {
@@ -86,6 +175,13 @@ function setup(ctx) {
     .chat-voice-status { min-height:18px; }
     .chat-voice-status[data-state="saved"] { color:var(--lumiverse-success, #65b97a); }
     .chat-voice-status[data-state="error"] { color:var(--lumiverse-danger, #ef6464); }
+    .chat-voice-message-play {
+      display:inline-flex; align-items:center; justify-content:center; min-width:28px; min-height:28px;
+      padding:0 6px; border:0; border-radius:6px; background:transparent; color:inherit;
+      font:inherit; font-size:15px; cursor:pointer;
+    }
+    .chat-voice-message-play:hover { background:var(--lumiverse-fill-subtle); }
+    .chat-voice-message-play[data-playing="true"] { color:var(--lumiverse-accent, #7c6df2); }
   `);
   const tab = ctx.ui.registerDrawerTab({
     id: "chat-voice",
@@ -125,10 +221,10 @@ function setup(ctx) {
   const narratorField = createField("Narrator voice");
   const routingHint = document.createElement("div");
   routingHint.className = "chat-voice-hint";
-  routingHint.textContent = "Text inside quotation marks uses the speaking character\u2019s voice. Everything outside quotation marks uses the narrator voice.";
+  routingHint.textContent = 'Use one line per speaker: Name: "Dialogue". The custom music-note action on each message plays named dialogue with that voice and everything else with the narrator voice.';
   const characterTitle = document.createElement("div");
   characterTitle.className = "chat-voice-section-title";
-  characterTitle.textContent = "Detected characters";
+  characterTitle.textContent = "Detected voices";
   const characterList = document.createElement("div");
   characterList.className = "chat-voice-character-list";
   const status = document.createElement("div");
@@ -153,8 +249,10 @@ function setup(ctx) {
   let editRevision = 0;
   let dirty = false;
   let scanning = false;
+  let activePlayback = null;
   const inFlight = /* @__PURE__ */ new Set();
   const characterInputs = /* @__PURE__ */ new Map();
+  const playButtons = /* @__PURE__ */ new Map();
   const setStatus = (message, state = "normal") => {
     status.textContent = message;
     status.dataset.state = state;
@@ -221,6 +319,140 @@ function setup(ctx) {
     if (saveTimer) clearTimeout(saveTimer);
     saveTimer = setTimeout(flushSave, delay);
   }
+  function updatePlaybackButtons() {
+    for (const [messageId, buttons] of playButtons) {
+      for (const button of buttons) {
+        const playing = activePlayback?.messageId === messageId;
+        button.dataset.playing = String(playing);
+        button.textContent = playing ? "\u25A0" : "\u266B";
+        button.title = playing ? "Stop custom voice playback" : "Play with custom NPC voices";
+        button.setAttribute("aria-label", button.title);
+      }
+    }
+  }
+  function stopPlayback() {
+    const playback = activePlayback;
+    activePlayback = null;
+    if (!playback) return;
+    playback.controller.abort();
+    try {
+      playback.source?.stop();
+    } catch {
+    }
+    void playback.context.close().catch(() => void 0);
+    updatePlaybackButtons();
+  }
+  async function playDecodedBuffer(playback, data, volume) {
+    if (playback.controller.signal.aborted) throw new DOMException("Playback stopped.", "AbortError");
+    const buffer = await playback.context.decodeAudioData(data.slice(0));
+    if (playback.controller.signal.aborted) throw new DOMException("Playback stopped.", "AbortError");
+    await new Promise((resolve, reject) => {
+      const source = playback.context.createBufferSource();
+      const gain = playback.context.createGain();
+      gain.gain.value = volume;
+      source.buffer = buffer;
+      source.connect(gain);
+      gain.connect(playback.context.destination);
+      playback.source = source;
+      const abort = () => {
+        try {
+          source.stop();
+        } catch {
+        }
+        reject(new DOMException("Playback stopped.", "AbortError"));
+      };
+      playback.controller.signal.addEventListener("abort", abort, { once: true });
+      source.onended = () => {
+        playback.controller.signal.removeEventListener("abort", abort);
+        playback.source = null;
+        resolve();
+      };
+      source.start();
+    });
+  }
+  async function playMessage(messageId) {
+    if (activePlayback) {
+      const wasSameMessage = activePlayback.messageId === messageId;
+      stopPlayback();
+      if (wasSameMessage) {
+        setStatus("Playback stopped.");
+        return;
+      }
+    }
+    if (!activeChat) return;
+    const config = collectConfig();
+    if (!config.connectionId) {
+      setStatus("Choose a TTS connection before playing.", "error");
+      return;
+    }
+    if (!ctx.messages.get) {
+      setStatus("This Lumiverse version does not expose message playback data.", "error");
+      return;
+    }
+    const contextClass = window.AudioContext ?? window.webkitAudioContext;
+    if (!contextClass) {
+      setStatus("Web Audio is unavailable in this browser.", "error");
+      return;
+    }
+    const audioContext = new contextClass();
+    await audioContext.resume();
+    const playback = {
+      messageId,
+      controller: new AbortController(),
+      context: audioContext,
+      source: null
+    };
+    activePlayback = playback;
+    updatePlaybackButtons();
+    try {
+      const message = await ctx.messages.get(messageId);
+      if (!message || message.is_user) throw new Error("Custom voice playback is only available for character messages.");
+      const explicitId = typeof message.extra?.character_id === "string" ? message.extra.character_id : "";
+      const defaultSpeakerId = explicitId || activeChat.characters.find((character) => !character.id.startsWith("npc:") && normalizeSpeakerName(character.name).toLowerCase() === normalizeSpeakerName(message.name).toLowerCase())?.id || null;
+      const aliases = new Map(
+        activeChat.characters.map((character) => [npcSpeakerId(character.name), character.id])
+      );
+      const plan = parseMultiVoiceSegments(message.content, defaultSpeakerId).map((segment) => {
+        const speakerId = segment.speakerId ? aliases.get(segment.speakerId) ?? segment.speakerId : null;
+        const voice = speakerId ? config.characterVoices[speakerId] || (defaultSpeakerId ? config.characterVoices[defaultSpeakerId] : "") || "" : config.narratorVoice;
+        return { text: segment.text, voice };
+      });
+      if (plan.length === 0) throw new Error("This message has no playable narration or dialogue.");
+      const preferences = await loadPlaybackPreferences();
+      setStatus(`Generating ${plan.length} voice segment${plan.length === 1 ? "" : "s"}\u2026`);
+      const buffers = new Array(plan.length);
+      let cursor = 0;
+      const worker = async () => {
+        while (true) {
+          const index = cursor++;
+          if (index >= plan.length) return;
+          buffers[index] = await synthesizeVoiceSegment(
+            config.connectionId,
+            plan[index].text,
+            plan[index].voice,
+            preferences.speed,
+            playback.controller.signal
+          );
+        }
+      };
+      await Promise.all(Array.from({ length: Math.min(3, plan.length) }, () => worker()));
+      setStatus("Playing custom voices\u2026");
+      for (const buffer of buffers) {
+        await playDecodedBuffer(playback, buffer, preferences.volume);
+      }
+      setStatus("Playback complete.", "saved");
+    } catch (error) {
+      if (error?.name !== "AbortError") {
+        setStatus(error instanceof Error ? error.message : "Custom voice playback failed.", "error");
+      }
+    } finally {
+      if (activePlayback === playback) {
+        activePlayback = null;
+        await playback.context.close().catch(() => void 0);
+        updatePlaybackButtons();
+      }
+    }
+  }
   function scanMessages() {
     if (!activeChat || scanning) return;
     flushSave();
@@ -267,7 +499,7 @@ function setup(ctx) {
       name.textContent = character.name;
       const count = document.createElement("span");
       count.className = "chat-voice-character-count";
-      count.textContent = `${character.messageCount} message${character.messageCount === 1 ? "" : "s"}`;
+      count.textContent = `${character.messageCount} occurrence${character.messageCount === 1 ? "" : "s"}`;
       const slot = document.createElement("div");
       heading.append(name, count);
       card.append(heading, slot);
@@ -316,6 +548,34 @@ function setup(ctx) {
       setStatus(message, "error");
     }
   }
+  function mountPlaybackButton(element) {
+    const messageId = ctx.dom.getMessageId(element);
+    if (!messageId) return;
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "chat-voice-message-play";
+    const buttons = playButtons.get(messageId) ?? /* @__PURE__ */ new Set();
+    buttons.add(button);
+    playButtons.set(messageId, buttons);
+    const onClick = () => void playMessage(messageId);
+    button.addEventListener("click", onClick);
+    element.appendChild(button);
+    updatePlaybackButtons();
+    return () => {
+      button.removeEventListener("click", onClick);
+      button.remove();
+      buttons.delete(button);
+      if (buttons.size === 0) playButtons.delete(messageId);
+    };
+  }
+  const currentDecorator = ctx.ui.registerDomDecorator;
+  const destroyCurrentDecorator = currentDecorator ? currentDecorator({ mount: "message_actions", kind: "button", render: mountPlaybackButton }) : null;
+  const legacyDecorator = !destroyCurrentDecorator && ctx.registerDomDecorator ? ctx.registerDomDecorator({ target: "message_actions", decorate: mountPlaybackButton }) : null;
+  const legacyMessageAction = !destroyCurrentDecorator && !legacyDecorator && ctx.registerMessageAction ? ctx.registerMessageAction({
+    id: "play-custom-voices",
+    label: "Play with custom NPC voices",
+    onClick: (messageId) => void playMessage(messageId)
+  }) : null;
   const unsubscribeBackend = ctx.onBackendMessage((rawPayload) => {
     const payload = rawPayload;
     if (payload.type === "chat_voice_error") {
@@ -365,6 +625,7 @@ function setup(ctx) {
   void ensureQuotationRouting().catch(() => void 0);
   ctx.sendToBackend({ type: "chat_voice_refresh" });
   return () => {
+    stopPlayback();
     flushSave();
     if (saveTimer) clearTimeout(saveTimer);
     unsubscribeActivate();
@@ -374,6 +635,9 @@ function setup(ctx) {
     messageLimitInput.destroy();
     narratorInput.destroy();
     scanButton.removeEventListener("click", scanMessages);
+    destroyCurrentDecorator?.();
+    legacyDecorator?.destroy();
+    legacyMessageAction?.destroy();
     tab.destroy();
     removeStyle();
   };

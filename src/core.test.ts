@@ -4,6 +4,8 @@ import {
   applyConfigToMetadata,
   clampMessageLimit,
   detectCharacters,
+  npcSpeakerId,
+  parseMultiVoiceSegments,
   readConfig,
   type ChatVoiceConfig,
 } from './core'
@@ -57,12 +59,15 @@ test('migrates existing native voice overrides into extension config', () => {
 
 test('writes native overrides while preserving unrelated character voices', () => {
   const config: ChatVoiceConfig = {
-    version: 3,
+    version: 4,
     messageLimit: 20,
     connectionId: 'shared',
     narratorVoice: 'narrator',
     characterVoices: { alice: 'alice-voice', bob: '' },
-    detectedCharacters: [{ id: 'alice', messageCount: 4 }, { id: 'bob', messageCount: 2 }],
+    detectedCharacters: [
+      { id: 'alice', name: 'Alice', messageCount: 4 },
+      { id: 'bob', name: 'Bob', messageCount: 2 },
+    ],
     managedCharacterIds: ['alice', 'bob'],
   }
   const metadata = applyConfigToMetadata({
@@ -86,16 +91,55 @@ test('writes native overrides while preserving unrelated character voices', () =
 
 test('persists manual scan results for loading without rescanning messages', () => {
   const metadata = applyConfigToMetadata({}, {
-    version: 3,
+    version: 4,
     messageLimit: 35,
     connectionId: '',
     narratorVoice: '',
     characterVoices: { alice: 'voice-a' },
-    detectedCharacters: [{ id: 'alice', messageCount: 7 }],
+    detectedCharacters: [{ id: 'alice', name: 'Alice', messageCount: 7 }],
     managedCharacterIds: [],
   })
   const restored = readConfig(metadata, ['alice'])
   assert.equal(restored.messageLimit, 35)
-  assert.deepEqual(restored.detectedCharacters, [{ id: 'alice', messageCount: 7 }])
+  assert.deepEqual(restored.detectedCharacters, [{ id: 'alice', name: 'Alice', messageCount: 7 }])
   assert.equal(restored.characterVoices.alice, 'voice-a')
+})
+
+test('detects multiple named NPCs written by one character card', () => {
+  const detected = detectCharacters([{
+    is_user: false,
+    name: 'World Narrator',
+    content: 'Alice: "Hello there."\nBob: “Welcome inside.”',
+  }], [{ id: 'card', name: 'World Narrator' }], 20, 'card')
+
+  assert.deepEqual(detected, [
+    { id: npcSpeakerId('Bob'), name: 'Bob', messageCount: 1 },
+    { id: npcSpeakerId('Alice'), name: 'Alice', messageCount: 1 },
+    { id: 'card', name: 'World Narrator', messageCount: 1 },
+  ])
+})
+
+test('builds ordered narrator and named-NPC playback segments', () => {
+  const segments = parseMultiVoiceSegments(
+    'The door opens.\nAlice: "Hello there."\nBob: “Welcome inside.”\nThe room falls quiet.',
+    'card',
+  )
+  assert.deepEqual(segments, [
+    { text: 'The door opens.', speakerId: null },
+    { text: 'Hello there.', speakerId: npcSpeakerId('Alice') },
+    { text: 'Welcome inside.', speakerId: npcSpeakerId('Bob') },
+    { text: 'The room falls quiet.', speakerId: null },
+  ])
+})
+
+test('uses group message character IDs before ambiguous display names', () => {
+  const detected = detectCharacters([{
+    is_user: false,
+    name: 'Shared Name',
+    extra: { character_id: 'second' },
+  }], [
+    { id: 'first', name: 'Shared Name' },
+    { id: 'second', name: 'Shared Name' },
+  ], 20, null)
+  assert.deepEqual(detected, [{ id: 'second', name: 'Shared Name', messageCount: 1 }])
 })

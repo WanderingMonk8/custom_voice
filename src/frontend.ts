@@ -2,6 +2,7 @@ import type {
   SpindleFrontendContext,
   SpindleTextInputHandle,
 } from 'lumiverse-spindle-types'
+import { npcSpeakerId, normalizeSpeakerName, parseMultiVoiceSegments } from './core'
 
 interface TtsConnection {
   id: string
@@ -47,6 +48,19 @@ interface ScanCompletePayload {
   chatId: string
 }
 
+interface PlaybackMessage {
+  id: string
+  is_user: boolean
+  name: string
+  content: string
+  extra?: Record<string, unknown>
+}
+
+interface PlaybackPreferences {
+  speed: number
+  volume: number
+}
+
 const VOICE_ICON = `
   <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
     <path d="M5 10v4M9 7v10M13 4v16M17 8v8M21 10v4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
@@ -70,6 +84,47 @@ async function listAllTtsConnections(): Promise<TtsConnection[]> {
     if (items.length === 0 || offset >= (page.total ?? items.length)) break
   }
   return connections
+}
+
+async function loadPlaybackPreferences(): Promise<PlaybackPreferences> {
+  const response = await fetch('/api/v1/settings/voiceSettings', {
+    credentials: 'same-origin',
+    headers: { Accept: 'application/json' },
+  })
+  if (!response.ok) return { speed: 1, volume: 1 }
+  const row = await response.json() as { value?: Record<string, unknown> }
+  const speed = typeof row.value?.ttsSpeed === 'number' ? row.value.ttsSpeed : 1
+  const volume = typeof row.value?.ttsVolume === 'number' ? row.value.ttsVolume : 1
+  return {
+    speed: Math.min(4, Math.max(0.25, speed)),
+    volume: Math.min(1, Math.max(0, volume)),
+  }
+}
+
+async function synthesizeVoiceSegment(
+  connectionId: string,
+  text: string,
+  voice: string,
+  speed: number,
+  signal: AbortSignal,
+): Promise<ArrayBuffer> {
+  const response = await fetch('/api/v1/tts/synthesize', {
+    method: 'POST',
+    credentials: 'same-origin',
+    signal,
+    headers: { 'Content-Type': 'application/json', Accept: 'audio/*' },
+    body: JSON.stringify({
+      connectionId,
+      text,
+      voice: voice || undefined,
+      parameters: { speed },
+    }),
+  })
+  if (!response.ok) {
+    const detail = await response.text().catch(() => '')
+    throw new Error(detail || `TTS synthesis failed (${response.status}).`)
+  }
+  return response.arrayBuffer()
 }
 
 /** Force the host TTS parser to route only quoted text to character voices. */
@@ -143,6 +198,13 @@ export function setup(ctx: SpindleFrontendContext) {
     .chat-voice-status { min-height:18px; }
     .chat-voice-status[data-state="saved"] { color:var(--lumiverse-success, #65b97a); }
     .chat-voice-status[data-state="error"] { color:var(--lumiverse-danger, #ef6464); }
+    .chat-voice-message-play {
+      display:inline-flex; align-items:center; justify-content:center; min-width:28px; min-height:28px;
+      padding:0 6px; border:0; border-radius:6px; background:transparent; color:inherit;
+      font:inherit; font-size:15px; cursor:pointer;
+    }
+    .chat-voice-message-play:hover { background:var(--lumiverse-fill-subtle); }
+    .chat-voice-message-play[data-playing="true"] { color:var(--lumiverse-accent, #7c6df2); }
   `)
 
   const tab = ctx.ui.registerDrawerTab({
@@ -186,10 +248,10 @@ export function setup(ctx: SpindleFrontendContext) {
   const narratorField = createField('Narrator voice')
   const routingHint = document.createElement('div')
   routingHint.className = 'chat-voice-hint'
-  routingHint.textContent = 'Text inside quotation marks uses the speaking character’s voice. Everything outside quotation marks uses the narrator voice.'
+  routingHint.textContent = 'Use one line per speaker: Name: "Dialogue". The custom music-note action on each message plays named dialogue with that voice and everything else with the narrator voice.'
   const characterTitle = document.createElement('div')
   characterTitle.className = 'chat-voice-section-title'
-  characterTitle.textContent = 'Detected characters'
+  characterTitle.textContent = 'Detected voices'
   const characterList = document.createElement('div')
   characterList.className = 'chat-voice-character-list'
   const status = document.createElement('div')
@@ -216,8 +278,15 @@ export function setup(ctx: SpindleFrontendContext) {
   let editRevision = 0
   let dirty = false
   let scanning = false
+  let activePlayback: {
+    messageId: string
+    controller: AbortController
+    context: AudioContext
+    source: AudioBufferSourceNode | null
+  } | null = null
   const inFlight = new Set<number>()
   const characterInputs = new Map<string, SpindleTextInputHandle>()
+  const playButtons = new Map<string, Set<HTMLButtonElement>>()
 
   const setStatus = (message: string, state: 'normal' | 'saved' | 'error' = 'normal') => {
     status.textContent = message
@@ -280,6 +349,154 @@ export function setup(ctx: SpindleFrontendContext) {
     saveTimer = setTimeout(flushSave, delay)
   }
 
+  function updatePlaybackButtons() {
+    for (const [messageId, buttons] of playButtons) {
+      for (const button of buttons) {
+        const playing = activePlayback?.messageId === messageId
+        button.dataset.playing = String(playing)
+        button.textContent = playing ? '■' : '♫'
+        button.title = playing ? 'Stop custom voice playback' : 'Play with custom NPC voices'
+        button.setAttribute('aria-label', button.title)
+      }
+    }
+  }
+
+  function stopPlayback() {
+    const playback = activePlayback
+    activePlayback = null
+    if (!playback) return
+    playback.controller.abort()
+    try { playback.source?.stop() } catch { /* already stopped */ }
+    void playback.context.close().catch(() => undefined)
+    updatePlaybackButtons()
+  }
+
+  async function playDecodedBuffer(
+    playback: NonNullable<typeof activePlayback>,
+    data: ArrayBuffer,
+    volume: number,
+  ): Promise<void> {
+    if (playback.controller.signal.aborted) throw new DOMException('Playback stopped.', 'AbortError')
+    const buffer = await playback.context.decodeAudioData(data.slice(0))
+    if (playback.controller.signal.aborted) throw new DOMException('Playback stopped.', 'AbortError')
+    await new Promise<void>((resolve, reject) => {
+      const source = playback.context.createBufferSource()
+      const gain = playback.context.createGain()
+      gain.gain.value = volume
+      source.buffer = buffer
+      source.connect(gain)
+      gain.connect(playback.context.destination)
+      playback.source = source
+      const abort = () => {
+        try { source.stop() } catch { /* already stopped */ }
+        reject(new DOMException('Playback stopped.', 'AbortError'))
+      }
+      playback.controller.signal.addEventListener('abort', abort, { once: true })
+      source.onended = () => {
+        playback.controller.signal.removeEventListener('abort', abort)
+        playback.source = null
+        resolve()
+      }
+      source.start()
+    })
+  }
+
+  async function playMessage(messageId: string): Promise<void> {
+    if (activePlayback) {
+      const wasSameMessage = activePlayback.messageId === messageId
+      stopPlayback()
+      if (wasSameMessage) {
+        setStatus('Playback stopped.')
+        return
+      }
+    }
+    if (!activeChat) return
+    const config = collectConfig()
+    if (!config.connectionId) {
+      setStatus('Choose a TTS connection before playing.', 'error')
+      return
+    }
+    if (!ctx.messages.get) {
+      setStatus('This Lumiverse version does not expose message playback data.', 'error')
+      return
+    }
+
+    const contextClass = window.AudioContext
+      ?? (window as typeof window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext
+    if (!contextClass) {
+      setStatus('Web Audio is unavailable in this browser.', 'error')
+      return
+    }
+    const audioContext = new contextClass()
+    await audioContext.resume()
+    const playback = {
+      messageId,
+      controller: new AbortController(),
+      context: audioContext,
+      source: null as AudioBufferSourceNode | null,
+    }
+    activePlayback = playback
+    updatePlaybackButtons()
+
+    try {
+      const message = await ctx.messages.get(messageId) as PlaybackMessage | null
+      if (!message || message.is_user) throw new Error('Custom voice playback is only available for character messages.')
+      const explicitId = typeof message.extra?.character_id === 'string' ? message.extra.character_id : ''
+      const defaultSpeakerId = explicitId || activeChat.characters.find((character) => (
+        !character.id.startsWith('npc:')
+        && normalizeSpeakerName(character.name).toLowerCase()
+          === normalizeSpeakerName(message.name).toLowerCase()
+      ))?.id || null
+      const aliases = new Map(
+        activeChat.characters.map((character) => [npcSpeakerId(character.name), character.id] as const),
+      )
+      const plan = parseMultiVoiceSegments(message.content, defaultSpeakerId).map((segment) => {
+        const speakerId = segment.speakerId
+          ? aliases.get(segment.speakerId) ?? segment.speakerId
+          : null
+        const voice = speakerId
+          ? config.characterVoices[speakerId] || (defaultSpeakerId ? config.characterVoices[defaultSpeakerId] : '') || ''
+          : config.narratorVoice
+        return { text: segment.text, voice }
+      })
+      if (plan.length === 0) throw new Error('This message has no playable narration or dialogue.')
+
+      const preferences = await loadPlaybackPreferences()
+      setStatus(`Generating ${plan.length} voice segment${plan.length === 1 ? '' : 's'}…`)
+      const buffers = new Array<ArrayBuffer>(plan.length)
+      let cursor = 0
+      const worker = async () => {
+        while (true) {
+          const index = cursor++
+          if (index >= plan.length) return
+          buffers[index] = await synthesizeVoiceSegment(
+            config.connectionId,
+            plan[index].text,
+            plan[index].voice,
+            preferences.speed,
+            playback.controller.signal,
+          )
+        }
+      }
+      await Promise.all(Array.from({ length: Math.min(3, plan.length) }, () => worker()))
+      setStatus('Playing custom voices…')
+      for (const buffer of buffers) {
+        await playDecodedBuffer(playback, buffer, preferences.volume)
+      }
+      setStatus('Playback complete.', 'saved')
+    } catch (error) {
+      if ((error as { name?: string })?.name !== 'AbortError') {
+        setStatus(error instanceof Error ? error.message : 'Custom voice playback failed.', 'error')
+      }
+    } finally {
+      if (activePlayback === playback) {
+        activePlayback = null
+        await playback.context.close().catch(() => undefined)
+        updatePlaybackButtons()
+      }
+    }
+  }
+
   function scanMessages() {
     if (!activeChat || scanning) return
     flushSave()
@@ -330,7 +547,7 @@ export function setup(ctx: SpindleFrontendContext) {
       name.textContent = character.name
       const count = document.createElement('span')
       count.className = 'chat-voice-character-count'
-      count.textContent = `${character.messageCount} message${character.messageCount === 1 ? '' : 's'}`
+      count.textContent = `${character.messageCount} occurrence${character.messageCount === 1 ? '' : 's'}`
       const slot = document.createElement('div')
       heading.append(name, count)
       card.append(heading, slot)
@@ -381,6 +598,48 @@ export function setup(ctx: SpindleFrontendContext) {
       setStatus(message, 'error')
     }
   }
+
+  function mountPlaybackButton(element: Element): (() => void) | void {
+      const messageId = ctx.dom.getMessageId(element)
+      if (!messageId) return
+      const button = document.createElement('button')
+      button.type = 'button'
+      button.className = 'chat-voice-message-play'
+      const buttons = playButtons.get(messageId) ?? new Set<HTMLButtonElement>()
+      buttons.add(button)
+      playButtons.set(messageId, buttons)
+      const onClick = () => void playMessage(messageId)
+      button.addEventListener('click', onClick)
+      element.appendChild(button)
+      updatePlaybackButtons()
+      return () => {
+        button.removeEventListener('click', onClick)
+        button.remove()
+        buttons.delete(button)
+        if (buttons.size === 0) playButtons.delete(messageId)
+      }
+  }
+
+  const currentDecorator = (ctx.ui as typeof ctx.ui & {
+    registerDomDecorator?: (options: {
+      mount: string
+      kind?: string
+      render: (root: HTMLElement) => void | (() => void)
+    }) => () => void
+  }).registerDomDecorator
+  const destroyCurrentDecorator = currentDecorator
+    ? currentDecorator({ mount: 'message_actions', kind: 'button', render: mountPlaybackButton })
+    : null
+  const legacyDecorator = !destroyCurrentDecorator && ctx.registerDomDecorator
+    ? ctx.registerDomDecorator({ target: 'message_actions', decorate: mountPlaybackButton })
+    : null
+  const legacyMessageAction = !destroyCurrentDecorator && !legacyDecorator && ctx.registerMessageAction
+    ? ctx.registerMessageAction({
+        id: 'play-custom-voices',
+        label: 'Play with custom NPC voices',
+        onClick: (messageId) => void playMessage(messageId),
+      })
+    : null
 
   const unsubscribeBackend = ctx.onBackendMessage((rawPayload: unknown) => {
     const payload = rawPayload as StatePayload | ErrorPayload | ScanCompletePayload
@@ -437,6 +696,7 @@ export function setup(ctx: SpindleFrontendContext) {
   ctx.sendToBackend({ type: 'chat_voice_refresh' })
 
   return () => {
+    stopPlayback()
     flushSave()
     if (saveTimer) clearTimeout(saveTimer)
     unsubscribeActivate()
@@ -446,6 +706,9 @@ export function setup(ctx: SpindleFrontendContext) {
     messageLimitInput.destroy()
     narratorInput.destroy()
     scanButton.removeEventListener('click', scanMessages)
+    destroyCurrentDecorator?.()
+    legacyDecorator?.destroy()
+    legacyMessageAction?.destroy()
     tab.destroy()
     removeStyle()
   }

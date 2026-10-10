@@ -53,9 +53,12 @@ async function buildState(chat: ChatLike, userId?: string) {
   const candidates = await loadCharacters(chat, userId)
   const config = readConfig(metadata, candidates.map((character) => character.id))
   const candidatesById = new Map(candidates.map((character) => [character.id, character] as const))
-  const detected = config.detectedCharacters.flatMap(({ id, messageCount }) => {
+  const detected = config.detectedCharacters.flatMap(({ id, name, messageCount }) => {
     const character = candidatesById.get(id)
-    return character ? [{ ...character, messageCount }] : []
+    const savedName = name || (id.startsWith('npc:') ? id.slice(4) : '')
+    return character
+      ? [{ ...character, messageCount }]
+      : savedName ? [{ id, name: savedName, messageCount }] : []
   })
 
   return {
@@ -97,7 +100,7 @@ function sanitizeSaveConfig(
     }
   }
   return {
-    version: 3,
+    version: 4,
     messageLimit: clampMessageLimit(input.messageLimit),
     connectionId: typeof input.connectionId === 'string'
       ? input.connectionId.trim().slice(0, 128)
@@ -158,9 +161,9 @@ function queueScan(
     const config = readConfig(chat.metadata ?? {}, candidates.map((character) => character.id))
     const nextConfig: ChatVoiceConfig = {
       ...config,
-      version: 3,
+      version: 4,
       messageLimit,
-      detectedCharacters: detected.map(({ id, messageCount }) => ({ id, messageCount })),
+      detectedCharacters: detected.map(({ id, name, messageCount }) => ({ id, name, messageCount })),
     }
     const metadata = applyConfigToMetadata(chat.metadata ?? {}, nextConfig)
     await spindle.chats.update(chat.id, { metadata }, userId)
@@ -201,4 +204,4 @@ spindle.on('CHAT_SWITCHED', async (_payload, userId) => {
   await sendState(userId)
 })
 
-spindle.log.info('Chat Voice 2.1.1 loaded.')
+spindle.log.info('Chat Voice 3.0 loaded.')

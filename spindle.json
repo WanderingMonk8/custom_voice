@@ -1,11 +1,11 @@
 {
-  "version": "2.1.1",
+  "version": "3.0.0",
   "name": "Chat Voice",
   "identifier": "chat_voice",
   "author": "WanderingMonk8",
   "github": "https://github.com/WanderingMonk8/custom_voice",
   "homepage": "https://github.com/WanderingMonk8/custom_voice",
-  "description": "Automatically detect chat characters and assign per-character and narrator TTS voices.",
+  "description": "Assign narrator, character-card, and named-NPC voices with custom multi-speaker TTS playback.",
   "permissions": ["chats", "chat_mutation", "characters"],
   "entry_backend": "dist/backend.js",
   "entry_frontend": "dist/frontend.js",

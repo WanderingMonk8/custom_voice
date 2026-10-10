@@ -29,7 +29,7 @@ function readStringMap(value) {
 }
 function readDetectedCharacters(value, fallbackIds) {
   if (!Array.isArray(value)) {
-    return [...new Set(fallbackIds)].map((id) => ({ id, messageCount: 0 }));
+    return [...new Set(fallbackIds)].map((id) => ({ id, name: "", messageCount: 0 }));
   }
   const result = [];
   const seen = /* @__PURE__ */ new Set();
@@ -37,7 +37,11 @@ function readDetectedCharacters(value, fallbackIds) {
     if (!isRecord(item) || typeof item.id !== "string" || !item.id || seen.has(item.id)) continue;
     seen.add(item.id);
     const count = typeof item.messageCount === "number" && Number.isFinite(item.messageCount) ? Math.max(0, Math.round(item.messageCount)) : 0;
-    result.push({ id: item.id, messageCount: count });
+    result.push({
+      id: item.id,
+      name: typeof item.name === "string" ? item.name.trim().slice(0, 128) : "",
+      messageCount: count
+    });
   }
   return result;
 }
@@ -71,7 +75,7 @@ function readConfig(metadata, candidateCharacterIds) {
   const inferredConnection = overrides.narrator?.connectionId ?? candidateCharacterIds.map((id) => overrides.characters?.[id]?.connectionId).find((id) => !!id) ?? "";
   const legacyDetectedIds = Object.keys(storedVoices).length > 0 ? Object.keys(storedVoices) : managedCharacterIds;
   return {
-    version: 3,
+    version: 4,
     messageLimit: clampMessageLimit(raw.messageLimit),
     connectionId: typeof raw.connectionId === "string" ? raw.connectionId.trim().slice(0, 128) : inferredConnection,
     narratorVoice: typeof raw.narratorVoice === "string" ? raw.narratorVoice.trim().slice(0, 512) : overrides.narrator?.voice ?? "",
@@ -79,6 +83,24 @@ function readConfig(metadata, candidateCharacterIds) {
     detectedCharacters: readDetectedCharacters(raw.detectedCharacters, legacyDetectedIds),
     managedCharacterIds: [...new Set(managedCharacterIds)]
   };
+}
+function normalizeSpeakerName(value) {
+  return value.normalize("NFKC").trim().replace(/\s+/g, " ");
+}
+function npcSpeakerId(name) {
+  return `npc:${normalizeSpeakerName(name).toLowerCase()}`;
+}
+var SPEAKER_NAME_RE = /^[\p{L}\p{N}][\p{L}\p{N}\p{M} ._'’\-]{0,63}$/u;
+var NAMED_DIALOGUE_RE = /^(?:\s*(?:[-*]\s*)?)?(?:\*\*)?([^:\n]{1,64}?)(?:\*\*)?\s*:\s*["“]([\s\S]*?)["”]/gm;
+function extractNamedDialogue(content) {
+  const result = [];
+  for (const match of content.matchAll(NAMED_DIALOGUE_RE)) {
+    const name = normalizeSpeakerName(match[1] ?? "");
+    const text = (match[2] ?? "").trim();
+    if (!name || !text || !SPEAKER_NAME_RE.test(name) || match.index === void 0) continue;
+    result.push({ name, text, start: match.index, end: match.index + match[0].length });
+  }
+  return result;
 }
 function detectCharacters(messages, candidates, messageLimit, fallbackCharacterId) {
   const byName = /* @__PURE__ */ new Map();
@@ -91,15 +113,28 @@ function detectCharacters(messages, candidates, messageLimit, fallbackCharacterI
   const byId = new Map(candidates.map((character) => [character.id, character]));
   const counts = /* @__PURE__ */ new Map();
   const order = [];
+  const detectedById = /* @__PURE__ */ new Map();
   const window = messages.filter((message) => !message.is_user).slice(-clampMessageLimit(messageLimit));
   for (let index = window.length - 1; index >= 0; index--) {
     const message = window[index];
+    const namedDialogue = extractNamedDialogue(message.content ?? "");
+    for (let dialogueIndex = namedDialogue.length - 1; dialogueIndex >= 0; dialogueIndex--) {
+      const dialogue = namedDialogue[dialogueIndex];
+      const matchingCard = byName.get(dialogue.name.toLowerCase());
+      const character2 = matchingCard ?? { id: npcSpeakerId(dialogue.name), name: dialogue.name };
+      detectedById.set(character2.id, character2);
+      if (!counts.has(character2.id)) order.push(character2.id);
+      counts.set(character2.id, (counts.get(character2.id) ?? 0) + 1);
+    }
     const normalizedName = message.name?.trim().toLowerCase() ?? "";
-    let character = normalizedName ? byName.get(normalizedName) : void 0;
+    const explicitCharacterId = typeof message.extra?.character_id === "string" ? message.extra.character_id : "";
+    let character = explicitCharacterId ? byId.get(explicitCharacterId) : void 0;
+    if (!character) character = normalizedName ? byName.get(normalizedName) : void 0;
     if (!character && candidates.length === 1 && fallbackCharacterId) {
       character = byId.get(fallbackCharacterId);
     }
     if (!character) continue;
+    detectedById.set(character.id, character);
     if (!counts.has(character.id)) order.push(character.id);
     counts.set(character.id, (counts.get(character.id) ?? 0) + 1);
   }
@@ -108,7 +143,7 @@ function detectCharacters(messages, candidates, messageLimit, fallbackCharacterI
     counts.set(fallbackCharacterId, 0);
   }
   return order.map((id) => ({
-    ...byId.get(id),
+    ...detectedById.get(id) ?? byId.get(id),
     messageCount: counts.get(id) ?? 0
   }));
 }
@@ -121,7 +156,9 @@ function applyConfigToMetadata(metadata, config) {
   }
   if (config.connectionId) {
     for (const [characterId, voice] of Object.entries(config.characterVoices)) {
-      if (voice) characters[characterId] = { connectionId: config.connectionId, voice };
+      if (voice && !characterId.startsWith("npc:")) {
+        characters[characterId] = { connectionId: config.connectionId, voice };
+      }
     }
   }
   const voiceOverrides = {};
@@ -158,9 +195,10 @@ async function buildState(chat, userId) {
   const candidates = await loadCharacters(chat, userId);
   const config = readConfig(metadata, candidates.map((character) => character.id));
   const candidatesById = new Map(candidates.map((character) => [character.id, character]));
-  const detected = config.detectedCharacters.flatMap(({ id, messageCount }) => {
+  const detected = config.detectedCharacters.flatMap(({ id, name, messageCount }) => {
     const character = candidatesById.get(id);
-    return character ? [{ ...character, messageCount }] : [];
+    const savedName = name || (id.startsWith("npc:") ? id.slice(4) : "");
+    return character ? [{ ...character, messageCount }] : savedName ? [{ id, name: savedName, messageCount }] : [];
   });
   return {
     id: chat.id,
@@ -196,7 +234,7 @@ function sanitizeSaveConfig(previous, input) {
     }
   }
   return {
-    version: 3,
+    version: 4,
     messageLimit: clampMessageLimit(input.messageLimit),
     connectionId: typeof input.connectionId === "string" ? input.connectionId.trim().slice(0, 128) : "",
     narratorVoice: typeof input.narratorVoice === "string" ? input.narratorVoice.trim().slice(0, 512) : "",
@@ -243,9 +281,9 @@ function queueScan(payload, userId) {
     const config = readConfig(chat.metadata ?? {}, candidates.map((character) => character.id));
     const nextConfig = {
       ...config,
-      version: 3,
+      version: 4,
       messageLimit,
-      detectedCharacters: detected.map(({ id, messageCount }) => ({ id, messageCount }))
+      detectedCharacters: detected.map(({ id, name, messageCount }) => ({ id, name, messageCount }))
     };
     const metadata = applyConfigToMetadata(chat.metadata ?? {}, nextConfig);
     await spindle.chats.update(chat.id, { metadata }, userId);
@@ -282,4 +320,4 @@ spindle.onFrontendMessage(async (rawPayload, userId) => {
 spindle.on("CHAT_SWITCHED", async (_payload, userId) => {
   await sendState(userId);
 });
-spindle.log.info("Chat Voice 2.1.1 loaded.");
+spindle.log.info("Chat Voice 3.0 loaded.");

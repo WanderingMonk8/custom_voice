@@ -14,18 +14,20 @@ export interface VoiceOverrides {
 }
 
 export interface ChatVoiceConfig {
-  version: 3
+  version: 4
   messageLimit: number
   connectionId: string
   narratorVoice: string
   characterVoices: Record<string, string>
-  detectedCharacters: Array<{ id: string; messageCount: number }>
+  detectedCharacters: Array<{ id: string; name: string; messageCount: number }>
   managedCharacterIds: string[]
 }
 
 export interface MessageLike {
   is_user: boolean
   name: string
+  content?: string
+  extra?: Record<string, unknown>
 }
 
 export interface CharacterLike {
@@ -35,6 +37,11 @@ export interface CharacterLike {
 
 export interface DetectedCharacter extends CharacterLike {
   messageCount: number
+}
+
+export interface PlaybackSegment {
+  text: string
+  speakerId: string | null
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -68,11 +75,11 @@ function readStringMap(value: unknown): Record<string, string> {
 function readDetectedCharacters(
   value: unknown,
   fallbackIds: string[],
-): Array<{ id: string; messageCount: number }> {
+): Array<{ id: string; name: string; messageCount: number }> {
   if (!Array.isArray(value)) {
-    return [...new Set(fallbackIds)].map((id) => ({ id, messageCount: 0 }))
+    return [...new Set(fallbackIds)].map((id) => ({ id, name: '', messageCount: 0 }))
   }
-  const result: Array<{ id: string; messageCount: number }> = []
+  const result: Array<{ id: string; name: string; messageCount: number }> = []
   const seen = new Set<string>()
   for (const item of value) {
     if (!isRecord(item) || typeof item.id !== 'string' || !item.id || seen.has(item.id)) continue
@@ -80,7 +87,11 @@ function readDetectedCharacters(
     const count = typeof item.messageCount === 'number' && Number.isFinite(item.messageCount)
       ? Math.max(0, Math.round(item.messageCount))
       : 0
-    result.push({ id: item.id, messageCount: count })
+    result.push({
+      id: item.id,
+      name: typeof item.name === 'string' ? item.name.trim().slice(0, 128) : '',
+      messageCount: count,
+    })
   }
   return result
 }
@@ -132,7 +143,7 @@ export function readConfig(
     : managedCharacterIds
 
   return {
-    version: 3,
+    version: 4,
     messageLimit: clampMessageLimit(raw.messageLimit),
     connectionId: typeof raw.connectionId === 'string'
       ? raw.connectionId.trim().slice(0, 128)
@@ -144,6 +155,74 @@ export function readConfig(
     detectedCharacters: readDetectedCharacters(raw.detectedCharacters, legacyDetectedIds),
     managedCharacterIds: [...new Set(managedCharacterIds)],
   }
+}
+
+export function normalizeSpeakerName(value: string): string {
+  return value.normalize('NFKC').trim().replace(/\s+/g, ' ')
+}
+
+export function npcSpeakerId(name: string): string {
+  return `npc:${normalizeSpeakerName(name).toLowerCase()}`
+}
+
+const SPEAKER_NAME_RE = /^[\p{L}\p{N}][\p{L}\p{N}\p{M} ._'’\-]{0,63}$/u
+const NAMED_DIALOGUE_RE = /^(?:\s*(?:[-*]\s*)?)?(?:\*\*)?([^:\n]{1,64}?)(?:\*\*)?\s*:\s*["“]([\s\S]*?)["”]/gm
+
+export function extractNamedDialogue(content: string): Array<{ name: string; text: string; start: number; end: number }> {
+  const result: Array<{ name: string; text: string; start: number; end: number }> = []
+  for (const match of content.matchAll(NAMED_DIALOGUE_RE)) {
+    const name = normalizeSpeakerName(match[1] ?? '')
+    const text = (match[2] ?? '').trim()
+    if (!name || !text || !SPEAKER_NAME_RE.test(name) || match.index === undefined) continue
+    result.push({ name, text, start: match.index, end: match.index + match[0].length })
+  }
+  return result
+}
+
+function cleanPlaybackText(value: string): string {
+  return value
+    .replace(/```[\s\S]*?```/g, ' ')
+    .replace(/`[^`\n]*`/g, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/[*_~]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+function appendGenericSegments(result: PlaybackSegment[], text: string, defaultSpeakerId: string | null): void {
+  const quotePattern = /["“]([\s\S]*?)["”]/g
+  let cursor = 0
+  for (const match of text.matchAll(quotePattern)) {
+    if (match.index === undefined) continue
+    const narration = cleanPlaybackText(text.slice(cursor, match.index))
+    if (narration) result.push({ text: narration, speakerId: null })
+    const speech = cleanPlaybackText(match[1] ?? '')
+    if (speech) result.push({ text: speech, speakerId: defaultSpeakerId })
+    cursor = match.index + match[0].length
+  }
+  const narration = cleanPlaybackText(text.slice(cursor))
+  if (narration) result.push({ text: narration, speakerId: null })
+}
+
+export function parseMultiVoiceSegments(content: string, defaultSpeakerId: string | null): PlaybackSegment[] {
+  const named = extractNamedDialogue(content)
+  const result: PlaybackSegment[] = []
+  let cursor = 0
+  for (const dialogue of named) {
+    appendGenericSegments(result, content.slice(cursor, dialogue.start), defaultSpeakerId)
+    const speech = cleanPlaybackText(dialogue.text)
+    if (speech) result.push({ text: speech, speakerId: npcSpeakerId(dialogue.name) })
+    cursor = dialogue.end
+  }
+  appendGenericSegments(result, content.slice(cursor), defaultSpeakerId)
+
+  const merged: PlaybackSegment[] = []
+  for (const segment of result) {
+    const previous = merged[merged.length - 1]
+    if (previous?.speakerId === segment.speakerId) previous.text += ` ${segment.text}`
+    else merged.push({ ...segment })
+  }
+  return merged
 }
 
 export function detectCharacters(
@@ -162,18 +241,33 @@ export function detectCharacters(
   const byId = new Map(candidates.map((character) => [character.id, character] as const))
   const counts = new Map<string, number>()
   const order: string[] = []
+  const detectedById = new Map<string, CharacterLike>()
   const window = messages
     .filter((message) => !message.is_user)
     .slice(-clampMessageLimit(messageLimit))
 
   for (let index = window.length - 1; index >= 0; index--) {
     const message = window[index]
+    const namedDialogue = extractNamedDialogue(message.content ?? '')
+    for (let dialogueIndex = namedDialogue.length - 1; dialogueIndex >= 0; dialogueIndex--) {
+      const dialogue = namedDialogue[dialogueIndex]
+      const matchingCard = byName.get(dialogue.name.toLowerCase())
+      const character = matchingCard ?? { id: npcSpeakerId(dialogue.name), name: dialogue.name }
+      detectedById.set(character.id, character)
+      if (!counts.has(character.id)) order.push(character.id)
+      counts.set(character.id, (counts.get(character.id) ?? 0) + 1)
+    }
     const normalizedName = message.name?.trim().toLowerCase() ?? ''
-    let character = normalizedName ? byName.get(normalizedName) : undefined
+    const explicitCharacterId = typeof message.extra?.character_id === 'string'
+      ? message.extra.character_id
+      : ''
+    let character = explicitCharacterId ? byId.get(explicitCharacterId) : undefined
+    if (!character) character = normalizedName ? byName.get(normalizedName) : undefined
     if (!character && candidates.length === 1 && fallbackCharacterId) {
       character = byId.get(fallbackCharacterId)
     }
     if (!character) continue
+    detectedById.set(character.id, character)
     if (!counts.has(character.id)) order.push(character.id)
     counts.set(character.id, (counts.get(character.id) ?? 0) + 1)
   }
@@ -184,7 +278,7 @@ export function detectCharacters(
   }
 
   return order.map((id) => ({
-    ...byId.get(id)!,
+    ...(detectedById.get(id) ?? byId.get(id)!),
     messageCount: counts.get(id) ?? 0,
   }))
 }
@@ -203,7 +297,9 @@ export function applyConfigToMetadata(
 
   if (config.connectionId) {
     for (const [characterId, voice] of Object.entries(config.characterVoices)) {
-      if (voice) characters[characterId] = { connectionId: config.connectionId, voice }
+      if (voice && !characterId.startsWith('npc:')) {
+        characters[characterId] = { connectionId: config.connectionId, voice }
+      }
     }
   }
 
