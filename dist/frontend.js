@@ -428,15 +428,43 @@ async function loadPlaybackPreferences() {
     credentials: "same-origin",
     headers: { Accept: "application/json" }
   });
-  if (!response.ok) return { speed: 1, volume: 1, connectionId: "" };
+  if (!response.ok) return { speed: 1, volume: 1, connectionId: "", saveGeneratedAudio: false };
   const row = await response.json();
   const speed = typeof row.value?.ttsSpeed === "number" ? row.value.ttsSpeed : 1;
   const volume = typeof row.value?.ttsVolume === "number" ? row.value.ttsVolume : 1;
   return {
     speed: Math.min(4, Math.max(0.25, speed)),
     volume: Math.min(1, Math.max(0, volume)),
-    connectionId: typeof row.value?.ttsConnectionId === "string" ? row.value.ttsConnectionId.trim() : ""
+    connectionId: typeof row.value?.ttsConnectionId === "string" ? row.value.ttsConnectionId.trim() : "",
+    saveGeneratedAudio: row.value?.chatVoiceSaveGeneratedAudio === true
   };
+}
+var voiceSettingsWriteQueue = Promise.resolve();
+function updateVoiceSettings(update) {
+  const task = voiceSettingsWriteQueue.then(async () => {
+    const response = await fetch("/api/v1/settings/voiceSettings", {
+      credentials: "same-origin",
+      headers: { Accept: "application/json" }
+    });
+    if (!response.ok) throw new Error(`Could not load global voice settings (${response.status}).`);
+    const row = await response.json();
+    const current = row.value && typeof row.value === "object" ? row.value : {};
+    const saved = await fetch("/api/v1/settings/voiceSettings", {
+      method: "PUT",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify({ value: update(current) })
+    });
+    if (!saved.ok) throw new Error(`Could not save global voice settings (${saved.status}).`);
+  });
+  voiceSettingsWriteQueue = task.catch(() => void 0);
+  return task;
+}
+function saveGeneratedAudioPreference(enabled) {
+  return updateVoiceSettings((current) => ({
+    ...current,
+    chatVoiceSaveGeneratedAudio: enabled
+  }));
 }
 function abortableDelay(milliseconds, signal) {
   if (milliseconds <= 0) return Promise.resolve();
@@ -542,31 +570,17 @@ async function saveMessageAudio(chatId, messageId, swipeId, segments, signal) {
   return result;
 }
 async function ensureQuotationRouting() {
-  const response = await fetch("/api/v1/settings/voiceSettings", {
-    credentials: "same-origin",
-    headers: { Accept: "application/json" }
-  });
-  if (!response.ok) return;
-  const row = await response.json();
-  const current = row.value && typeof row.value === "object" ? row.value : {};
-  const currentRules = current.speechDetectionRules && typeof current.speechDetectionRules === "object" ? current.speechDetectionRules : {};
-  const alreadyConfigured = currentRules.quoted === "speech" && currentRules.undecorated === "narration" && currentRules.asterisked === "narration";
-  if (alreadyConfigured) return;
-  await fetch("/api/v1/settings/voiceSettings", {
-    method: "PUT",
-    credentials: "same-origin",
-    headers: { "Content-Type": "application/json", Accept: "application/json" },
-    body: JSON.stringify({
-      value: {
-        ...current,
-        speechDetectionRules: {
-          ...currentRules,
-          quoted: "speech",
-          undecorated: "narration",
-          asterisked: "narration"
-        }
+  await updateVoiceSettings((current) => {
+    const currentRules = current.speechDetectionRules && typeof current.speechDetectionRules === "object" ? current.speechDetectionRules : {};
+    return {
+      ...current,
+      speechDetectionRules: {
+        ...currentRules,
+        quoted: "speech",
+        undecorated: "narration",
+        asterisked: "narration"
       }
-    })
+    };
   });
 }
 function setup(ctx) {
@@ -586,6 +600,13 @@ function setup(ctx) {
     .chat-voice-scan-button:hover:not(:disabled) { filter:brightness(1.08); }
     .chat-voice-scan-button:disabled { cursor:not-allowed; opacity:.5; }
     .chat-voice-label { color:var(--lumiverse-text); font-size:12px; font-weight:600; }
+    .chat-voice-toggle {
+      display:flex; align-items:flex-start; gap:9px; color:var(--lumiverse-text); font-size:12px;
+      cursor:pointer;
+    }
+    .chat-voice-toggle input { margin:2px 0 0; accent-color:var(--lumiverse-accent, #7c6df2); }
+    .chat-voice-toggle-copy { display:flex; flex-direction:column; gap:2px; }
+    .chat-voice-toggle-hint { color:var(--lumiverse-text-muted); font-size:11px; line-height:1.4; }
     .chat-voice-section-title {
       margin:2px 0 0; color:var(--lumiverse-text); font-size:13px; font-weight:700;
     }
@@ -647,6 +668,23 @@ function setup(ctx) {
     return { field, slot };
   }
   const connectionField = createField("TTS connection");
+  const saveAudioField = createField("Audio storage");
+  const saveAudioLabel = document.createElement("label");
+  saveAudioLabel.className = "chat-voice-toggle";
+  const saveAudioToggle = document.createElement("input");
+  saveAudioToggle.type = "checkbox";
+  saveAudioToggle.checked = false;
+  saveAudioToggle.setAttribute("aria-label", "Save generated audio to messages");
+  const saveAudioCopy = document.createElement("span");
+  saveAudioCopy.className = "chat-voice-toggle-copy";
+  const saveAudioText = document.createElement("span");
+  saveAudioText.textContent = "Save generated audio";
+  const saveAudioHint = document.createElement("span");
+  saveAudioHint.className = "chat-voice-toggle-hint";
+  saveAudioHint.textContent = "Attach completed recordings to messages. Disabled by default.";
+  saveAudioCopy.append(saveAudioText, saveAudioHint);
+  saveAudioLabel.append(saveAudioToggle, saveAudioCopy);
+  saveAudioField.slot.append(saveAudioLabel);
   const scanField = createField("Character card cast");
   const scanRow = scanField.slot;
   scanRow.className = "chat-voice-scan-row";
@@ -681,6 +719,7 @@ function setup(ctx) {
   panel.append(
     context,
     connectionField.field,
+    saveAudioField.field,
     scanField.field,
     narratorField.field,
     routingHint,
@@ -694,6 +733,8 @@ function setup(ctx) {
   let activeChat = null;
   let connections = [];
   let lumiverseConnectionId = "";
+  let saveGeneratedAudio = false;
+  let savingAudioPreference = false;
   let saveTimer = null;
   let editRevision = 0;
   let dirty = false;
@@ -882,7 +923,9 @@ function setup(ctx) {
     if (!playback) return false;
     playback.playbackStopped = true;
     playback.controller.abort();
-    if (playback.persistenceState === "not-started") playback.synthesisController?.abort();
+    if (playback.persistenceState === "not-started" || playback.persistenceState === "disabled") {
+      playback.synthesisController?.abort();
+    }
     try {
       playback.source?.stop();
     } catch {
@@ -1056,51 +1099,58 @@ function setup(ctx) {
       };
       const workerCount = Math.min(PLAYBACK_BUFFER_SEGMENTS, plan.length);
       for (let index = 0; index < workerCount; index += 1) void runSynthesisWorker();
-      playback.persistenceState = "pending";
-      void Promise.all(prepared).then(async (results) => {
-        const failed = results.find((result) => !result.ok);
-        if (failed) throw failed.error;
-        const captured = results.filter(
-          (result) => result.ok
-        ).map((result) => ({
-          data: result.segment.data.slice(0),
-          mime: result.segment.mime
-        }));
-        const saved = await persistCapturedAudio(
-          playbackChat.id,
-          messageId,
-          message.swipe_id,
-          captured,
-          contextClass,
-          synthesisController.signal,
-          () => {
-            if (ctx.getActiveChat().chatId === playbackChat.id && (!activePlayback || activePlayback === playback)) {
-              setStatus("Server could not combine the source audio; retrying as WAV\u2026");
+      if (preferences.saveGeneratedAudio) {
+        playback.persistenceState = "pending";
+        void Promise.all(prepared).then(async (results) => {
+          const failed = results.find((result) => !result.ok);
+          if (failed) throw failed.error;
+          const captured = results.filter(
+            (result) => result.ok
+          ).map((result) => ({
+            data: result.segment.data.slice(0),
+            mime: result.segment.mime
+          }));
+          const saved = await persistCapturedAudio(
+            playbackChat.id,
+            messageId,
+            message.swipe_id,
+            captured,
+            contextClass,
+            synthesisController.signal,
+            () => {
+              if (ctx.getActiveChat().chatId === playbackChat.id && (!activePlayback || activePlayback === playback)) {
+                setStatus("Server could not combine the source audio; retrying as WAV\u2026");
+              }
             }
+          );
+          playback.persistenceState = "saved";
+          console.info("[Chat Voice] Saved generated message audio.", {
+            messageId,
+            swipeId: saved.swipe_id,
+            audioId: saved.audio?.id,
+            mime: saved.audio?.mime_type,
+            sizeBytes: saved.audio?.size_bytes,
+            muxedWithFfmpeg: saved.muxed_with_ffmpeg
+          });
+          if (ctx.getActiveChat().chatId === playbackChat.id && (!activePlayback || activePlayback === playback)) {
+            if (playback.playbackStopped) setStatus("Playback stopped; audio saved.", "saved");
+            else if (playback.playbackFinished) setStatus("Playback complete and audio saved.", "saved");
           }
-        );
-        playback.persistenceState = "saved";
-        console.info("[Chat Voice] Saved generated message audio.", {
-          messageId,
-          swipeId: saved.swipe_id,
-          audioId: saved.audio?.id,
-          mime: saved.audio?.mime_type,
-          sizeBytes: saved.audio?.size_bytes,
-          muxedWithFfmpeg: saved.muxed_with_ffmpeg
+        }).catch((error) => {
+          playback.persistenceState = "failed";
+          playback.persistenceError = error instanceof Error ? error.message : "Unknown save error.";
+          if (error?.name !== "AbortError" && ctx.getActiveChat().chatId === playbackChat.id && (!activePlayback || activePlayback === playback) && (playback.playbackStopped || playback.playbackFinished)) {
+            setStatus(`Audio could not be saved: ${playback.persistenceError}`, "error");
+          }
+        }).finally(() => {
+          backgroundSynthesisControllers.delete(synthesisController);
         });
-        if (ctx.getActiveChat().chatId === playbackChat.id && (!activePlayback || activePlayback === playback)) {
-          if (playback.playbackStopped) setStatus("Playback stopped; audio saved.", "saved");
-          else if (playback.playbackFinished) setStatus("Playback complete and audio saved.", "saved");
-        }
-      }).catch((error) => {
-        playback.persistenceState = "failed";
-        playback.persistenceError = error instanceof Error ? error.message : "Unknown save error.";
-        if (error?.name !== "AbortError" && ctx.getActiveChat().chatId === playbackChat.id && (!activePlayback || activePlayback === playback) && (playback.playbackStopped || playback.playbackFinished)) {
-          setStatus(`Audio could not be saved: ${playback.persistenceError}`, "error");
-        }
-      }).finally(() => {
-        backgroundSynthesisControllers.delete(synthesisController);
-      });
+      } else {
+        playback.persistenceState = "disabled";
+        void Promise.all(prepared).catch(() => void 0).finally(() => {
+          backgroundSynthesisControllers.delete(synthesisController);
+        });
+      }
       const initialBufferSize = Math.min(PLAYBACK_BUFFER_SEGMENTS, plan.length);
       setStatus(
         `Buffering ${initialBufferSize} voice segment${initialBufferSize === 1 ? "" : "s"} before playback\u2026`
@@ -1122,7 +1172,8 @@ function setup(ctx) {
       if (persistenceState === "saved") setStatus("Playback complete and audio saved.", "saved");
       else if (persistenceState === "failed") {
         setStatus(`Playback completed, but its audio could not be saved: ${playback.persistenceError}`, "error");
-      } else setStatus("Playback complete; finishing saved audio\u2026");
+      } else if (persistenceState === "pending") setStatus("Playback complete; finishing saved audio\u2026");
+      else setStatus("Playback complete.", "saved");
     } catch (error) {
       if (error?.name !== "AbortError") {
         setStatus(error instanceof Error ? error.message : "Custom voice playback failed.", "error");
@@ -1326,6 +1377,10 @@ function setup(ctx) {
         loadPlaybackPreferences()
       ]);
       connections = loadedConnections;
+      if (!savingAudioPreference) {
+        saveGeneratedAudio = preferences.saveGeneratedAudio;
+        saveAudioToggle.checked = saveGeneratedAudio;
+      }
       lumiverseConnectionId = connections.some((connection) => connection.id === preferences.connectionId) ? preferences.connectionId : connections.find((connection) => connection.is_default)?.id ?? "";
       const selectedConnectionId = activeChat?.connectionId || lumiverseConnectionId;
       connectionPicker.update({
@@ -1341,6 +1396,28 @@ function setup(ctx) {
       setStatus(message, "error");
     }
   }
+  const onSaveAudioChanged = async () => {
+    const previous = saveGeneratedAudio;
+    const enabled = saveAudioToggle.checked;
+    saveGeneratedAudio = enabled;
+    savingAudioPreference = true;
+    saveAudioToggle.disabled = true;
+    setStatus("Saving global audio preference\u2026");
+    try {
+      await saveGeneratedAudioPreference(enabled);
+      setStatus(
+        enabled ? "Generated audio will be saved globally." : "Generated audio saving is disabled globally.",
+        "saved"
+      );
+    } catch (error) {
+      saveGeneratedAudio = previous;
+      saveAudioToggle.checked = previous;
+      setStatus(error instanceof Error ? error.message : "Could not save the audio preference.", "error");
+    } finally {
+      savingAudioPreference = false;
+      saveAudioToggle.disabled = false;
+    }
+  };
   const onNativeContextMenu = (event) => {
     const target = event.target && typeof event.target.closest === "function" ? event.target : null;
     lastContextMessageId = target?.closest("[data-message-id]")?.dataset.messageId ?? null;
@@ -1362,6 +1439,7 @@ function setup(ctx) {
   };
   hostWindow.addEventListener("contextmenu", onNativeContextMenu, true);
   hostWindow.addEventListener("click", onNativeTtsClick, true);
+  saveAudioToggle.addEventListener("change", onSaveAudioChanged);
   hostWindow.requestAnimationFrame(updatePlaybackButtons);
   const unsubscribeBackend = ctx.onBackendMessage((rawPayload) => {
     const payload = rawPayload;
@@ -1482,6 +1560,7 @@ function setup(ctx) {
     addNpcButton.removeEventListener("click", onAddNpc);
     addNpcInputSlot.removeEventListener("keydown", onAddNpcKeyDown);
     scanButton.removeEventListener("click", scanMessages);
+    saveAudioToggle.removeEventListener("change", onSaveAudioChanged);
     hostWindow.removeEventListener("contextmenu", onNativeContextMenu, true);
     hostWindow.removeEventListener("click", onNativeTtsClick, true);
     restoreNativePlaybackButtons();
