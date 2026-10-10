@@ -483,6 +483,11 @@ export function parseMultiVoiceSegments(content: string, defaultSpeakerId: strin
 
 const SPEECH_VERBS = '(?:said|says|asked|asks|replied|replies|whispered|whispers|shouted|shouts|yelled|yells|called|calls|murmured|murmurs|answered|answers|added|adds|continued|continues|remarked|remarks|cried|cries|growled|growls|sighed|sighs)'
 
+interface SpeakerInference {
+  speakerId: string | null
+  confident: boolean
+}
+
 function escapedPattern(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 }
@@ -493,7 +498,7 @@ function inferQuotedSpeaker(
   quotedText: string,
   speakers: CharacterLike[],
   defaultSpeakerId: string | null,
-): string | null {
+): SpeakerInference {
   if (/[,]\s*$/u.test(quotedText)) {
     const actionBeat = after.slice(0, 140).split(/["“\n]/u, 1)[0]
     let nearest: { id: string; index: number } | null = null
@@ -503,7 +508,7 @@ function inferQuotedSpeaker(
       const index = actionBeat.search(new RegExp(`\\b${name}\\b`, 'iu'))
       if (index >= 0 && (!nearest || index < nearest.index)) nearest = { id: speaker.id, index }
     }
-    if (nearest) return nearest.id
+    if (nearest) return { speakerId: nearest.id, confident: true }
   }
 
   let best: { id: string; score: number } | null = null
@@ -522,7 +527,23 @@ function inferQuotedSpeaker(
       if (pattern.test(sample) && (!best || score > best.score)) best = { id: speaker.id, score }
     }
   }
-  return best?.id ?? defaultSpeakerId
+  return best
+    ? { speakerId: best.id, confident: true }
+    : { speakerId: defaultSpeakerId, confident: false }
+}
+
+function canContinueSpeaker(
+  bridge: string,
+  previousSpeakerId: string,
+  speakers: CharacterLike[],
+): boolean {
+  if (/\n\s*\n/u.test(bridge)) return false
+  for (const speaker of speakers) {
+    if (speaker.id === previousSpeakerId) continue
+    const name = escapedPattern(normalizeSpeakerName(speaker.name))
+    if (name && new RegExp(`\\b${name}\\b`, 'iu').test(bridge)) return false
+  }
+  return true
 }
 
 export function parseRosterVoiceSegments(
@@ -534,23 +555,33 @@ export function parseRosterVoiceSegments(
   const result: PlaybackSegment[] = []
   const quotePattern = /["“]([\s\S]*?)["”]/g
   let cursor = 0
+  let lastConfidentSpeakerId: string | null = null
   for (const match of playbackContent.matchAll(quotePattern)) {
     if (match.index === undefined) continue
-    const narration = cleanPlaybackText(playbackContent.slice(cursor, match.index))
+    const bridge = playbackContent.slice(cursor, match.index)
+    const narration = cleanPlaybackText(bridge)
     if (narration) result.push({ text: narration, speakerId: null })
     const speech = cleanPlaybackText(match[1] ?? '')
     if (speech) {
       const quoteEnd = match.index + match[0].length
+      const inference = inferQuotedSpeaker(
+        playbackContent.slice(0, match.index),
+        playbackContent.slice(quoteEnd),
+        match[1] ?? '',
+        speakers,
+        defaultSpeakerId,
+      )
+      const continuedSpeakerId: string | null = !inference.confident
+        && lastConfidentSpeakerId
+        && canContinueSpeaker(bridge, lastConfidentSpeakerId, speakers)
+        ? lastConfidentSpeakerId
+        : null
+      const speakerId: string | null = continuedSpeakerId ?? inference.speakerId
       result.push({
         text: speech,
-        speakerId: inferQuotedSpeaker(
-          playbackContent.slice(0, match.index),
-          playbackContent.slice(quoteEnd),
-          match[1] ?? '',
-          speakers,
-          defaultSpeakerId,
-        ),
+        speakerId,
       })
+      if (inference.confident && speakerId) lastConfidentSpeakerId = speakerId
     }
     cursor = match.index + match[0].length
   }

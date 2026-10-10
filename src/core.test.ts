@@ -248,6 +248,57 @@ test('uses a comma-ended quote action beat to identify its speaker', () => {
   )
 })
 
+test('continues a confidently identified speaker across same-paragraph narration', () => {
+  const content = '"The board\'s right here," Alma said. She was already at the kit-roll with her good hand on the coupling block, the splinted arm holding the coil against her ribs. "But the mast is up there and we are down here. Anybody want to volunteer?"'
+  assert.deepEqual(
+    parseRosterVoiceSegments(content, 'card', [
+      { id: 'alma', name: 'Alma' },
+      { id: 'card', name: 'Narrator Card' },
+    ]),
+    [
+      { text: "The board's right here,", speakerId: 'alma' },
+      {
+        text: 'Alma said. She was already at the kit-roll with her good hand on the coupling block, the splinted arm holding the coil against her ribs.',
+        speakerId: null,
+      },
+      {
+        text: 'But the mast is up there and we are down here. Anybody want to volunteer?',
+        speakerId: 'alma',
+      },
+    ],
+  )
+})
+
+test('does not continue a speaker across a paragraph break', () => {
+  assert.deepEqual(
+    parseRosterVoiceSegments(
+      '"First," Alma said.\n\nThe scene changes. "Unattributed."',
+      'card',
+      [{ id: 'alma', name: 'Alma' }, { id: 'card', name: 'Narrator Card' }],
+    ),
+    [
+      { text: 'First,', speakerId: 'alma' },
+      { text: 'Alma said.\n\nThe scene changes.', speakerId: null },
+      { text: 'Unattributed.', speakerId: 'card' },
+    ],
+  )
+})
+
+test('does not continue a speaker after another roster character is introduced', () => {
+  assert.deepEqual(
+    parseRosterVoiceSegments(
+      '"First," Alma said. Bob entered the workshop, checked every latch along the far wall, and silently pointed toward the exit. "Unattributed."',
+      'card',
+      [
+        { id: 'alma', name: 'Alma' },
+        { id: 'bob', name: 'Bob' },
+        { id: 'card', name: 'Narrator Card' },
+      ],
+    ).at(-1),
+    { text: 'Unattributed.', speakerId: 'card' },
+  )
+})
+
 test('strips HTML tags and emphasis markers before TTS segmentation', () => {
   assert.deepEqual(
     parseRosterVoiceSegments('<font color="#4169E1">"One more,"</font> *she whispered.*', 'alice', []),

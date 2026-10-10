@@ -97,7 +97,7 @@ function inferQuotedSpeaker(before, after, quotedText, speakers, defaultSpeakerI
       const index = actionBeat.search(new RegExp(`\\b${name}\\b`, "iu"));
       if (index >= 0 && (!nearest || index < nearest.index)) nearest = { id: speaker.id, index };
     }
-    if (nearest) return nearest.id;
+    if (nearest) return { speakerId: nearest.id, confident: true };
   }
   let best = null;
   for (const speaker of speakers) {
@@ -115,30 +115,45 @@ function inferQuotedSpeaker(before, after, quotedText, speakers, defaultSpeakerI
       if (pattern.test(sample) && (!best || score > best.score)) best = { id: speaker.id, score };
     }
   }
-  return best?.id ?? defaultSpeakerId;
+  return best ? { speakerId: best.id, confident: true } : { speakerId: defaultSpeakerId, confident: false };
+}
+function canContinueSpeaker(bridge, previousSpeakerId, speakers) {
+  if (/\n\s*\n/u.test(bridge)) return false;
+  for (const speaker of speakers) {
+    if (speaker.id === previousSpeakerId) continue;
+    const name = escapedPattern(normalizeSpeakerName(speaker.name));
+    if (name && new RegExp(`\\b${name}\\b`, "iu").test(bridge)) return false;
+  }
+  return true;
 }
 function parseRosterVoiceSegments(content, defaultSpeakerId, speakers) {
   const playbackContent = stripPlaybackMarkup(content);
   const result = [];
   const quotePattern = /["“]([\s\S]*?)["”]/g;
   let cursor = 0;
+  let lastConfidentSpeakerId = null;
   for (const match of playbackContent.matchAll(quotePattern)) {
     if (match.index === void 0) continue;
-    const narration2 = cleanPlaybackText(playbackContent.slice(cursor, match.index));
+    const bridge = playbackContent.slice(cursor, match.index);
+    const narration2 = cleanPlaybackText(bridge);
     if (narration2) result.push({ text: narration2, speakerId: null });
     const speech = cleanPlaybackText(match[1] ?? "");
     if (speech) {
       const quoteEnd = match.index + match[0].length;
+      const inference = inferQuotedSpeaker(
+        playbackContent.slice(0, match.index),
+        playbackContent.slice(quoteEnd),
+        match[1] ?? "",
+        speakers,
+        defaultSpeakerId
+      );
+      const continuedSpeakerId = !inference.confident && lastConfidentSpeakerId && canContinueSpeaker(bridge, lastConfidentSpeakerId, speakers) ? lastConfidentSpeakerId : null;
+      const speakerId = continuedSpeakerId ?? inference.speakerId;
       result.push({
         text: speech,
-        speakerId: inferQuotedSpeaker(
-          playbackContent.slice(0, match.index),
-          playbackContent.slice(quoteEnd),
-          match[1] ?? "",
-          speakers,
-          defaultSpeakerId
-        )
+        speakerId
       });
+      if (inference.confident && speakerId) lastConfidentSpeakerId = speakerId;
     }
     cursor = match.index + match[0].length;
   }

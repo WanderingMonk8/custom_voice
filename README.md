@@ -12,6 +12,7 @@ A [Lumiverse Spindle](https://docs.lumiverse.chat/) extension that detects chara
 - Allows unlimited manually added NPCs, each with its own voice and delete control.
 - Assigns a separate narrator voice.
 - Routes quoted text to the speaking character and text outside quotations to the narrator.
+- Carries a confidently identified speaker across same-paragraph narration for later unattributed quotes, unless another roster character is introduced.
 - Routes Lumiverse's native message TTS button through ordered multi-voice playback.
 - Overrides the matching native context-menu action instead of adding duplicate playback controls.
 - Merges adjacent same-voice passages within each paragraph, splits multi-paragraph passages into smaller requests, and maintains a four-segment rolling playback buffer to avoid gaps and API bursts.
