@@ -1,0 +1,252 @@
+import assert from 'node:assert/strict'
+import test from 'node:test'
+import {
+  applyConfigToMetadata,
+  clampMessageLimit,
+  detectCharacters,
+  hashMessageContent,
+  mergeVoicePlan,
+  npcSpeakerId,
+  parseCardCast,
+  parseLlmSegmentation,
+  parseMultiVoiceSegments,
+  parseRosterVoiceSegments,
+  readConfig,
+  type ChatVoiceConfig,
+} from './core'
+
+test('merges adjacent segments that use the same voice', () => {
+  assert.deepEqual(mergeVoicePlan([
+    { text: 'First sentence.', voice: 'narrator' },
+    { text: ' Second sentence. ', voice: 'narrator' },
+    { text: 'Hello.', voice: 'alice' },
+    { text: '', voice: 'alice' },
+    { text: 'Back to narration.', voice: 'narrator' },
+  ]), [
+    { text: 'First sentence. Second sentence.', voice: 'narrator' },
+    { text: 'Hello.', voice: 'alice' },
+    { text: 'Back to narration.', voice: 'narrator' },
+  ])
+})
+
+test('clamps the configurable message window', () => {
+  assert.equal(clampMessageLimit(undefined), 20)
+  assert.equal(clampMessageLimit(0), 1)
+  assert.equal(clampMessageLimit(20.4), 20)
+  assert.equal(clampMessageLimit(999), 500)
+})
+
+test('detects recent assistant speakers and ignores user messages', () => {
+  const messages = [
+    { is_user: false, name: 'Alice' },
+    { is_user: false, name: 'Bob' },
+    { is_user: true, name: 'User' },
+    { is_user: true, name: 'User' },
+    { is_user: true, name: 'User' },
+    { is_user: false, name: 'alice' },
+  ]
+  const detected = detectCharacters(
+    messages,
+    [{ id: 'alice', name: 'Alice' }, { id: 'bob', name: 'Bob' }],
+    3,
+    null,
+  )
+  assert.deepEqual(detected, [
+    { id: 'alice', name: 'Alice', messageCount: 2 },
+    { id: 'bob', name: 'Bob', messageCount: 1 },
+  ])
+})
+
+test('keeps a solo-chat character available before it has spoken', () => {
+  assert.deepEqual(
+    detectCharacters([], [{ id: 'alice', name: 'Alice' }], 20, 'alice'),
+    [{ id: 'alice', name: 'Alice', messageCount: 0 }],
+  )
+})
+
+test('migrates existing native voice overrides into extension config', () => {
+  const config = readConfig({
+    voiceOverrides: {
+      narrator: { connectionId: 'tts', voice: 'narrator' },
+      characters: { alice: { connectionId: 'tts', voice: 'alice-voice' } },
+    },
+  }, ['alice'])
+  assert.equal(config.connectionId, 'tts')
+  assert.equal(config.narratorVoice, 'narrator')
+  assert.equal(config.characterVoices.alice, 'alice-voice')
+})
+
+test('writes native overrides while preserving unrelated character voices', () => {
+  const config: ChatVoiceConfig = {
+    version: 5,
+    messageLimit: 20,
+    connectionId: 'shared',
+    narratorVoice: 'narrator',
+    characterVoices: { alice: 'alice-voice', bob: '' },
+    detectedCharacters: [
+      { id: 'alice', name: 'Alice', messageCount: 4 },
+      { id: 'bob', name: 'Bob', messageCount: 2 },
+    ],
+    managedCharacterIds: ['alice', 'bob'],
+    parsedMessages: {},
+  }
+  const metadata = applyConfigToMetadata({
+    untouched: true,
+    voiceOverrides: {
+      characters: {
+        outsider: { connectionId: 'other', voice: 'other-voice' },
+        bob: { connectionId: 'old', voice: 'old-bob' },
+      },
+    },
+  }, config)
+  assert.equal(metadata.untouched, true)
+  assert.deepEqual(metadata.voiceOverrides, {
+    narrator: { connectionId: 'shared', voice: 'narrator' },
+    characters: {
+      outsider: { connectionId: 'other', voice: 'other-voice' },
+      alice: { connectionId: 'shared', voice: 'alice-voice' },
+    },
+  })
+})
+
+test('persists manual scan results for loading without rescanning messages', () => {
+  const metadata = applyConfigToMetadata({}, {
+    version: 5,
+    messageLimit: 35,
+    connectionId: '',
+    narratorVoice: '',
+    characterVoices: { alice: 'voice-a' },
+    detectedCharacters: [{ id: 'alice', name: 'Alice', messageCount: 7 }],
+    managedCharacterIds: [],
+    parsedMessages: {
+      message1: {
+        contentHash: hashMessageContent('Alice said, "Hello."'),
+        segments: [
+          { text: 'Alice said,', speakerId: null },
+          { text: 'Hello.', speakerId: npcSpeakerId('Alice') },
+        ],
+      },
+    },
+  })
+  const restored = readConfig(metadata, ['alice'])
+  assert.equal(restored.messageLimit, 35)
+  assert.deepEqual(restored.detectedCharacters, [{ id: 'alice', name: 'Alice', messageCount: 7 }])
+  assert.equal(restored.characterVoices.alice, 'voice-a')
+  assert.deepEqual(restored.parsedMessages, metadata.chat_voice && (metadata.chat_voice as ChatVoiceConfig).parsedMessages)
+})
+
+test('validates fenced LLM segmentation and rejects unknown message IDs', () => {
+  const parsed = parseLlmSegmentation({
+    content: '```json\n{"messages":[{"id":"known","segments":[{"type":"narration","text":"The door opened.","speaker":null},{"type":"speech","text":"Hello.","speaker":"Alice"}]},{"id":"injected","segments":[{"type":"speech","text":"Nope","speaker":"Mallory"}]}]}\n```',
+  }, new Set(['known']))
+  assert.deepEqual(parsed, [{
+    id: 'known',
+    segments: [
+      { type: 'narration', text: 'The door opened.', speaker: null },
+      { type: 'speech', text: 'Hello.', speaker: 'Alice' },
+    ],
+  }])
+})
+
+test('message content hashes change when playback content changes', () => {
+  assert.equal(hashMessageContent('same'), hashMessageContent('same'))
+  assert.notEqual(hashMessageContent('same'), hashMessageContent('changed'))
+})
+
+test('validates card-cast extraction and rejects unknown card IDs', () => {
+  const parsed = parseCardCast({
+    content: '{"characters":[{"cardId":"card","name":"Alice"},{"cardId":"card","name":"Bob"},{"cardId":"other","name":"Mallory"}]}',
+  }, new Set(['card']))
+  assert.deepEqual(parsed, [
+    { cardId: 'card', name: 'Alice' },
+    { cardId: 'card', name: 'Bob' },
+  ])
+})
+
+test('assigns quoted output to saved cast members using dialogue tags', () => {
+  const segments = parseRosterVoiceSegments(
+    'Alice said, "Hello." Bob replied, “Welcome.” The room fell quiet.',
+    'card',
+    [
+      { id: npcSpeakerId('Alice'), name: 'Alice' },
+      { id: npcSpeakerId('Bob'), name: 'Bob' },
+    ],
+  )
+  assert.deepEqual(segments, [
+    { text: 'Alice said,', speakerId: null },
+    { text: 'Hello.', speakerId: npcSpeakerId('Alice') },
+    { text: 'Bob replied,', speakerId: null },
+    { text: 'Welcome.', speakerId: npcSpeakerId('Bob') },
+    { text: 'The room fell quiet.', speakerId: null },
+  ])
+})
+
+test('never assigns unquoted output to a character voice', () => {
+  assert.deepEqual(
+    parseRosterVoiceSegments('Alice said hello without quotation marks.', 'card', [{ id: 'alice', name: 'Alice' }]),
+    [{ text: 'Alice said hello without quotation marks.', speakerId: null }],
+  )
+})
+
+test('supports speaker attribution after a quote', () => {
+  assert.deepEqual(
+    parseRosterVoiceSegments('"We should go," whispered Alice.', 'card', [{ id: 'alice', name: 'Alice' }]),
+    [
+      { text: 'We should go,', speakerId: 'alice' },
+      { text: 'whispered Alice.', speakerId: null },
+    ],
+  )
+})
+
+test('strips HTML tags and emphasis markers before TTS segmentation', () => {
+  assert.deepEqual(
+    parseRosterVoiceSegments('<font color="#4169E1">"One more,"</font> *she whispered.*', 'alice', []),
+    [
+      { text: 'One more,', speakerId: 'alice' },
+      { text: 'she whispered.', speakerId: null },
+    ],
+  )
+  assert.deepEqual(
+    parseRosterVoiceSegments('&lt;font color=&quot;#4169E1&quot;&gt;"Again."&lt;/font&gt;', 'alice', []),
+    [{ text: 'Again.', speakerId: 'alice' }],
+  )
+})
+
+test('detects multiple named NPCs written by one character card', () => {
+  const detected = detectCharacters([{
+    is_user: false,
+    name: 'World Narrator',
+    content: 'Alice: "Hello there."\nBob: “Welcome inside.”',
+  }], [{ id: 'card', name: 'World Narrator' }], 20, 'card')
+
+  assert.deepEqual(detected, [
+    { id: npcSpeakerId('Bob'), name: 'Bob', messageCount: 1 },
+    { id: npcSpeakerId('Alice'), name: 'Alice', messageCount: 1 },
+    { id: 'card', name: 'World Narrator', messageCount: 1 },
+  ])
+})
+
+test('builds ordered narrator and named-NPC playback segments', () => {
+  const segments = parseMultiVoiceSegments(
+    'The door opens.\nAlice: "Hello there."\nBob: “Welcome inside.”\nThe room falls quiet.',
+    'card',
+  )
+  assert.deepEqual(segments, [
+    { text: 'The door opens.', speakerId: null },
+    { text: 'Hello there.', speakerId: npcSpeakerId('Alice') },
+    { text: 'Welcome inside.', speakerId: npcSpeakerId('Bob') },
+    { text: 'The room falls quiet.', speakerId: null },
+  ])
+})
+
+test('uses group message character IDs before ambiguous display names', () => {
+  const detected = detectCharacters([{
+    is_user: false,
+    name: 'Shared Name',
+    extra: { character_id: 'second' },
+  }], [
+    { id: 'first', name: 'Shared Name' },
+    { id: 'second', name: 'Shared Name' },
+  ], 20, null)
+  assert.deepEqual(detected, [{ id: 'second', name: 'Shared Name', messageCount: 1 }])
+})
