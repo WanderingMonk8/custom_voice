@@ -433,7 +433,9 @@ function setup(ctx) {
   let lastContextMessageId = null;
   const nativeButtonStates = /* @__PURE__ */ new Map();
   const pendingMessageRequests = /* @__PURE__ */ new Map();
+  const pendingStateRequests = /* @__PURE__ */ new Map();
   let messageRequestSequence = 0;
+  let stateRequestSequence = 0;
   const setStatus = (message, state = "normal") => {
     status.textContent = message;
     status.dataset.state = state;
@@ -572,6 +574,24 @@ function setup(ctx) {
       ctx.sendToBackend({ type: "chat_voice_get_message", chatId, messageId, requestId });
     });
   }
+  function refreshLocalState() {
+    ctx.sendToBackend({
+      type: "chat_voice_refresh",
+      chatId: ctx.getActiveChat().chatId
+    });
+  }
+  function requestLocalState() {
+    const chatId = ctx.getActiveChat().chatId;
+    const requestId = `state-${Date.now().toString(36)}-${++stateRequestSequence}`;
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        pendingStateRequests.delete(requestId);
+        reject(new Error("Timed out while loading the active chat voice settings."));
+      }, 15e3);
+      pendingStateRequests.set(requestId, { chatId, resolve, reject, timer });
+      ctx.sendToBackend({ type: "chat_voice_refresh", chatId, requestId });
+    });
+  }
   function stopPlayback() {
     const playback = activePlayback;
     activePlayback = null;
@@ -622,7 +642,17 @@ function setup(ctx) {
         return;
       }
     }
-    if (!activeChat) return;
+    const localChatId = ctx.getActiveChat().chatId;
+    if (activeChat?.id !== localChatId) {
+      setStatus("Loading this chat\u2019s voice settings\u2026");
+      try {
+        await requestLocalState();
+      } catch (error) {
+        setStatus(error instanceof Error ? error.message : "Could not load this chat\u2019s voice settings.", "error");
+        return;
+      }
+    }
+    if (!activeChat || activeChat.id !== ctx.getActiveChat().chatId) return;
     const playbackChat = activeChat;
     const config = collectConfig();
     const preferences = await loadPlaybackPreferences();
@@ -927,6 +957,14 @@ function setup(ctx) {
       return;
     }
     if (payload.type === "chat_voice_error") {
+      if (payload.requestId) {
+        const pending = pendingStateRequests.get(payload.requestId);
+        if (pending) {
+          clearTimeout(pending.timer);
+          pendingStateRequests.delete(payload.requestId);
+          pending.reject(new Error(payload.error || "Could not load chat voice settings."));
+        }
+      }
       if (payload.clientRevision !== void 0) inFlight.delete(payload.clientRevision);
       scanning = false;
       scanButton.textContent = "Scan";
@@ -944,6 +982,16 @@ function setup(ctx) {
     }
     if (payload.type !== "chat_voice_state") return;
     const incomingChatId = payload.chat?.id ?? null;
+    const localChatId = ctx.getActiveChat().chatId;
+    const pendingState = payload.requestId ? pendingStateRequests.get(payload.requestId) : void 0;
+    if (pendingState) {
+      clearTimeout(pendingState.timer);
+      pendingStateRequests.delete(payload.requestId);
+    }
+    if (incomingChatId !== localChatId) {
+      pendingState?.reject(new Error("The active chat changed while its voice settings were loading."));
+      return;
+    }
     const currentChatId = activeChat?.id ?? null;
     if (incomingChatId !== currentChatId) {
       for (const pending of pendingMessageRequests.values()) {
@@ -951,12 +999,14 @@ function setup(ctx) {
         pending.reject(new Error("The active chat changed before playback started."));
       }
       pendingMessageRequests.clear();
+      stopPlayback();
       flushSave();
       dirty = false;
       inFlight.clear();
       scanning = false;
       scanButton.textContent = "Scan";
       renderState(payload.chat);
+      pendingState?.resolve(payload.chat);
       return;
     }
     if (payload.clientRevision !== void 0) {
@@ -964,24 +1014,36 @@ function setup(ctx) {
       if (payload.clientRevision !== editRevision || dirty) return;
       renderState(payload.chat);
       setStatus("Saved.", "saved");
+      pendingState?.resolve(payload.chat);
       return;
     }
-    if (dirty || inFlight.size > 0) return;
+    if (dirty || inFlight.size > 0) {
+      pendingState?.resolve(payload.chat);
+      return;
+    }
     renderState(payload.chat);
+    pendingState?.resolve(payload.chat);
+  });
+  const unsubscribeChatSwitched = ctx.events.on("CHAT_SWITCHED", (rawPayload) => {
+    const switchedChatId = rawPayload?.chatId ?? null;
+    hostWindow.requestAnimationFrame(() => {
+      if (ctx.getActiveChat().chatId === switchedChatId) refreshLocalState();
+    });
   });
   const unsubscribeActivate = tab.onActivate(() => {
     void loadConnections();
     void ensureQuotationRouting().catch(() => void 0);
-    ctx.sendToBackend({ type: "chat_voice_refresh" });
+    refreshLocalState();
   });
   void loadConnections();
   void ensureQuotationRouting().catch(() => void 0);
-  ctx.sendToBackend({ type: "chat_voice_refresh" });
+  refreshLocalState();
   return () => {
     stopPlayback();
     flushSave();
     if (saveTimer) clearTimeout(saveTimer);
     unsubscribeActivate();
+    unsubscribeChatSwitched();
     unsubscribeBackend();
     for (const input of characterInputs.values()) input.destroy();
     for (const pending of pendingMessageRequests.values()) {
@@ -989,6 +1051,11 @@ function setup(ctx) {
       pending.reject(new Error("Chat Voice was closed."));
     }
     pendingMessageRequests.clear();
+    for (const pending of pendingStateRequests.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(new Error("Chat Voice was closed."));
+    }
+    pendingStateRequests.clear();
     connectionPicker.destroy();
     narratorInput.destroy();
     addNpcInput.destroy();

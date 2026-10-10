@@ -42,7 +42,7 @@ interface CardPromptData {
 }
 
 type FrontendMessage =
-  | { type: 'chat_voice_refresh' }
+  | { type: 'chat_voice_refresh'; chatId?: string | null; requestId?: string }
   | { type: 'chat_voice_scan'; chatId: string; messageLimit: number }
   | { type: 'chat_voice_get_message'; chatId: string; messageId: string; requestId: string }
   | {
@@ -113,17 +113,36 @@ async function buildState(chat: ChatLike, userId?: string) {
   }
 }
 
-async function sendState(userId?: string, clientRevision?: number): Promise<void> {
+function sendFrontend(payload: unknown, userId?: string, frontendSessionId?: string): void {
+  spindle.sendToFrontend(
+    payload,
+    userId,
+    frontendSessionId ? { frontendSessionId } : undefined,
+  )
+}
+
+async function sendState(
+  userId?: string,
+  clientRevision?: number,
+  chatId?: string | null,
+  frontendSessionId?: string,
+  requestId?: string,
+): Promise<void> {
   try {
-    const chat = await spindle.chats.getActive(userId) as ChatLike | null
-    spindle.sendToFrontend({
+    const chat = chatId === null
+      ? null
+      : chatId
+        ? await spindle.chats.get(chatId, userId) as ChatLike | null
+        : await spindle.chats.getActive(userId) as ChatLike | null
+    sendFrontend({
       type: 'chat_voice_state',
       chat: chat ? await buildState(chat, userId) : null,
       ...(clientRevision !== undefined ? { clientRevision } : {}),
-    }, userId)
+      ...(requestId ? { requestId } : {}),
+    }, userId, frontendSessionId)
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Could not load chat voice settings.'
-    spindle.sendToFrontend({ type: 'chat_voice_error', error: message }, userId)
+    sendFrontend({ type: 'chat_voice_error', error: message, ...(requestId ? { requestId } : {}) }, userId, frontendSessionId)
   }
 }
 
@@ -234,6 +253,7 @@ const saveQueues = new Map<string, Promise<void>>()
 function queueSave(
   payload: Extract<FrontendMessage, { type: 'chat_voice_save' }>,
   userId?: string,
+  frontendSessionId?: string,
 ): Promise<void> {
   const queueKey = `${userId ?? 'user'}:${payload.chatId}`
   const previousTask = saveQueues.get(queueKey) ?? Promise.resolve()
@@ -246,8 +266,7 @@ function queueSave(
     const metadata = applyConfigToMetadata(chat.metadata ?? {}, config)
     await spindle.chats.update(chat.id, { metadata }, userId)
 
-    const active = await spindle.chats.getActive(userId) as ChatLike | null
-    if (active?.id === chat.id) await sendState(userId, payload.clientRevision)
+    await sendState(userId, payload.clientRevision, chat.id, frontendSessionId)
   }).finally(() => {
     if (saveQueues.get(queueKey) === nextTask) saveQueues.delete(queueKey)
   })
@@ -258,6 +277,7 @@ function queueSave(
 function queueScan(
   payload: Extract<FrontendMessage, { type: 'chat_voice_scan' }>,
   userId?: string,
+  frontendSessionId?: string,
 ): Promise<void> {
   const queueKey = `${userId ?? 'user'}:${payload.chatId}`
   const previousTask = saveQueues.get(queueKey) ?? Promise.resolve()
@@ -282,15 +302,12 @@ function queueScan(
     const metadata = applyConfigToMetadata(chat.metadata ?? {}, nextConfig)
     await spindle.chats.update(chat.id, { metadata }, userId)
 
-    const active = await spindle.chats.getActive(userId) as ChatLike | null
-    if (active?.id === chat.id) {
-      await sendState(userId)
-      spindle.sendToFrontend({
-        type: 'chat_voice_scan_complete',
-        chatId: chat.id,
-        cardParserFallback: cardResult.usedFallback,
-      }, userId)
-    }
+    await sendState(userId, undefined, chat.id, frontendSessionId)
+    sendFrontend({
+      type: 'chat_voice_scan_complete',
+      chatId: chat.id,
+      cardParserFallback: cardResult.usedFallback,
+    }, userId, frontendSessionId)
   }).finally(() => {
     if (saveQueues.get(queueKey) === nextTask) saveQueues.delete(queueKey)
   })
@@ -298,11 +315,11 @@ function queueScan(
   return nextTask
 }
 
-spindle.onFrontendMessage(async (rawPayload: unknown, userId) => {
+spindle.onFrontendMessage(async (rawPayload: unknown, userId, frontendSessionId) => {
   const payload = rawPayload as FrontendMessage
   try {
     if (payload?.type === 'chat_voice_refresh') {
-      await sendState(userId)
+      await sendState(userId, undefined, payload.chatId, frontendSessionId, payload.requestId)
     } else if (payload?.type === 'chat_voice_get_message') {
       try {
         const messages = await spindle.chat.getMessages(payload.chatId) as Array<{
@@ -314,7 +331,7 @@ spindle.onFrontendMessage(async (rawPayload: unknown, userId) => {
           extra?: Record<string, unknown>
         }>
         const message = messages.find((item) => item.id === payload.messageId)
-        spindle.sendToFrontend({
+        sendFrontend({
           type: 'chat_voice_message',
           requestId: payload.requestId,
           chatId: payload.chatId,
@@ -327,33 +344,30 @@ spindle.onFrontendMessage(async (rawPayload: unknown, userId) => {
             extra: message.extra ?? {},
           } : null,
           ...(!message ? { error: 'The message is no longer available.' } : {}),
-        }, userId)
+        }, userId, frontendSessionId)
       } catch (error) {
-        spindle.sendToFrontend({
+        sendFrontend({
           type: 'chat_voice_message',
           requestId: payload.requestId,
           chatId: payload.chatId,
           message: null,
           error: error instanceof Error ? error.message : 'Could not load the message.',
-        }, userId)
+        }, userId, frontendSessionId)
       }
     } else if (payload?.type === 'chat_voice_scan') {
-      await queueScan(payload, userId)
+      await queueScan(payload, userId, frontendSessionId)
     } else if (payload?.type === 'chat_voice_save') {
-      await queueSave(payload, userId)
+      await queueSave(payload, userId, frontendSessionId)
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Could not save chat voice settings.'
-    spindle.sendToFrontend({
+    sendFrontend({
       type: 'chat_voice_error',
       error: message,
       clientRevision: payload?.type === 'chat_voice_save' ? payload.clientRevision : undefined,
-    }, userId)
+      requestId: payload?.type === 'chat_voice_refresh' ? payload.requestId : undefined,
+    }, userId, frontendSessionId)
   }
 })
 
-spindle.on('CHAT_SWITCHED', async (_payload, userId) => {
-  await sendState(userId)
-})
-
-spindle.log.info('Chat Voice 3.9 loaded.')
+spindle.log.info('Chat Voice 3.9.1 loaded.')
