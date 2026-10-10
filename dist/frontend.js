@@ -289,6 +289,7 @@ function paragraphDialogueTurns(content, speakers, defaultSpeakerId) {
       continue;
     }
     const explicitSpeakerIds = /* @__PURE__ */ new Set();
+    const initialHistorySpeakerIds = /* @__PURE__ */ new Set();
     for (const match of quoteMatches) {
       if (match.index === void 0) continue;
       const quoteStart = paragraph.start + match.index;
@@ -302,6 +303,8 @@ function paragraphDialogueTurns(content, speakers, defaultSpeakerId) {
       );
       if (inference.source === "explicit" && inference.speakerId) {
         explicitSpeakerIds.add(inference.speakerId);
+      } else if (!pair && !previousStrongSpeakerId && inference.source === "history" && inference.confident && inference.speakerId) {
+        initialHistorySpeakerIds.add(inference.speakerId);
       }
     }
     if (explicitSpeakerIds.size > 1) {
@@ -311,7 +314,8 @@ function paragraphDialogueTurns(content, speakers, defaultSpeakerId) {
       continue;
     }
     const explicitSpeakerId = explicitSpeakerIds.size === 1 ? [...explicitSpeakerIds][0] : null;
-    const localSpeakerId = explicitSpeakerId ?? soleMentionedSpeaker(paragraph.text, speakers);
+    const initialHistorySpeakerId = initialHistorySpeakerIds.size === 1 ? [...initialHistorySpeakerIds][0] : null;
+    const localSpeakerId = explicitSpeakerId ?? soleMentionedSpeaker(paragraph.text, speakers) ?? initialHistorySpeakerId;
     if (localSpeakerId) {
       if (pair && !pair.includes(localSpeakerId)) pair = null;
       if (!pair && previousStrongSpeakerId && previousStrongSpeakerId !== localSpeakerId) {

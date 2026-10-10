@@ -516,6 +516,24 @@ test('alternates unresolved turns in a confidently seeded dialogue chain', () =>
   ])
 })
 
+test('seeds a dialogue chain from a confidently inherited speaker before a named reply', () => {
+  const segments = parseRosterVoiceSegments(
+    '"Do not talk," Alma called down. Not to anyone.\n\nThe yard obeyed. Frost ticked on the tarp ropes. Somewhere behind the pile of roped crates a civilian shifted in his blanket and stopped himself.\n\nThen Alma\'s good hand came down over the rail and made a shape in the lantern light: hold, hold, hold.\n\n"Logistics net, same as before," she said, finally. "But it is not fragments anymore. Somebody up the line is running an open schedule."\n\nVahn came off the pump. "Which posts still talk."\n\n"Seven through 14. We are eleven. So the order is addressed to us." Her voice thinned at the edges. "Nobody accuses me later of sugar."',
+    'card',
+    [{ id: 'alma', name: 'Alma' }, { id: 'vahn', name: 'Vahn' }],
+  )
+  assert.deepEqual(segments.filter(segment => segment.speakerId !== null).slice(-5), [
+    { text: 'Logistics net, same as before,', speakerId: 'alma' },
+    {
+      text: 'But it is not fragments anymore. Somebody up the line is running an open schedule.',
+      speakerId: 'alma',
+    },
+    { text: 'Which posts still talk.', speakerId: 'vahn' },
+    { text: 'Seven through 14. We are eleven. So the order is addressed to us.', speakerId: 'alma' },
+    { text: 'Nobody accuses me later of sugar.', speakerId: 'alma' },
+  ])
+})
+
 test('keeps a dialogue chain across a short unnamed narrative beat', () => {
   assert.deepEqual(
     parseRosterVoiceSegments(

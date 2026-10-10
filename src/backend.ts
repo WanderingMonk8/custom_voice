@@ -373,4 +373,4 @@ spindle.onFrontendMessage(async (rawPayload: unknown, userId, frontendSessionId)
   }
 })
 
-spindle.log.info('Chat Voice 3.13.0 loaded.')
+spindle.log.info('Chat Voice 3.13.1 loaded.')

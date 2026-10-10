@@ -798,6 +798,7 @@ function paragraphDialogueTurns(
     }
 
     const explicitSpeakerIds = new Set<string>()
+    const initialHistorySpeakerIds = new Set<string>()
     for (const match of quoteMatches) {
       if (match.index === undefined) continue
       const quoteStart = paragraph.start + match.index
@@ -811,6 +812,14 @@ function paragraphDialogueTurns(
       )
       if (inference.source === 'explicit' && inference.speakerId) {
         explicitSpeakerIds.add(inference.speakerId)
+      } else if (
+        !pair
+        && !previousStrongSpeakerId
+        && inference.source === 'history'
+        && inference.confident
+        && inference.speakerId
+      ) {
+        initialHistorySpeakerIds.add(inference.speakerId)
       }
     }
 
@@ -822,7 +831,12 @@ function paragraphDialogueTurns(
     }
 
     const explicitSpeakerId = explicitSpeakerIds.size === 1 ? [...explicitSpeakerIds][0] : null
-    const localSpeakerId = explicitSpeakerId ?? soleMentionedSpeaker(paragraph.text, speakers)
+    const initialHistorySpeakerId = initialHistorySpeakerIds.size === 1
+      ? [...initialHistorySpeakerIds][0]
+      : null
+    const localSpeakerId = explicitSpeakerId
+      ?? soleMentionedSpeaker(paragraph.text, speakers)
+      ?? initialHistorySpeakerId
     if (localSpeakerId) {
       if (pair && !pair.includes(localSpeakerId)) pair = null
       if (!pair && previousStrongSpeakerId && previousStrongSpeakerId !== localSpeakerId) {
