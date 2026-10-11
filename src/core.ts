@@ -674,6 +674,13 @@ function soleMentionedSpeaker(text: string, speakers: CharacterLike[]): string |
   return preferredMentionedSpeaker(text, speakers, mentionedSpeakers(text, speakers))
 }
 
+function unambiguousNarrativeSpeaker(text: string, speakers: CharacterLike[]): string | null {
+  const mentions = mentionedSpeakers(text, speakers)
+  if (mentions.clean.size === 1) return [...mentions.clean][0]
+  if (mentions.clean.size === 0 && mentions.possessive.size === 1) return [...mentions.possessive][0]
+  return null
+}
+
 function currentParagraphSpeaker(
   before: string,
   after: string,
@@ -702,6 +709,28 @@ function precedingParagraphSpeaker(before: string, speakers: CharacterLike[]): s
     if (hasSpeakerMentions(mentions)) return null
   }
   return null
+}
+
+function precedingActionBeatSpeaker(before: string, speakers: CharacterLike[]): string | null {
+  const previousQuoteEnd = Math.max(before.lastIndexOf('"'), before.lastIndexOf('”'))
+  const previousParagraphEnd = [...before.matchAll(/\n[^\S\n]*\n/gu)].at(-1)
+  const paragraphBoundary = previousParagraphEnd?.index === undefined
+    ? -1
+    : previousParagraphEnd.index + previousParagraphEnd[0].length - 1
+  const localNarration = before.slice(Math.max(previousQuoteEnd, paragraphBoundary) + 1).trimStart()
+  if (!localNarration) return null
+
+  const matches = new Set<string>()
+  for (const speaker of speakers) {
+    for (const alias of speakerAliases(speaker.name)) {
+      const pattern = new RegExp(
+        `^${escapedPattern(alias)}\\b(?!['’](?:s\\b)?)\\s*(?:,|—|-)`,
+        'iu',
+      )
+      if (pattern.test(localNarration)) matches.add(speaker.id)
+    }
+  }
+  return matches.size === 1 ? [...matches][0] : null
 }
 
 function inferQuotedSpeaker(
@@ -741,6 +770,10 @@ function inferQuotedSpeaker(
     }
   }
   if (best) return { speakerId: best.id, confident: true, source: 'explicit' }
+  const actionBeatSpeakerId = precedingActionBeatSpeaker(before, speakers)
+  if (actionBeatSpeakerId) {
+    return { speakerId: actionBeatSpeakerId, confident: true, source: 'explicit' }
+  }
   const currentSpeakerId = currentParagraphSpeaker(before, after, speakers)
   if (currentSpeakerId) {
     return { speakerId: currentSpeakerId, confident: true, source: 'paragraph' }
@@ -769,6 +802,21 @@ function playbackParagraphs(content: string): PlaybackParagraph[] {
   const text = content.slice(cursor)
   if (text.trim()) paragraphs.push({ start: cursor, end: content.length, text })
   return paragraphs
+}
+
+function hasSustainedUnnamedNarration(
+  paragraphs: PlaybackParagraph[],
+  startIndex: number,
+  speakers: CharacterLike[],
+): boolean {
+  let narrationLength = 0
+  for (let index = startIndex; index < paragraphs.length; index++) {
+    const paragraph = paragraphs[index]
+    if (hasSpeakerMentions(mentionedSpeakers(paragraph.text, speakers))) break
+    narrationLength += cleanPlaybackText(narrativeOnly(paragraph.text)).length
+    if (narrationLength >= 160) return true
+  }
+  return false
 }
 
 function paragraphDialogueTurns(
@@ -847,7 +895,16 @@ function paragraphDialogueTurns(
       continue
     }
 
-    if (pair && lastTurnSpeakerId && pair.includes(lastTurnSpeakerId)) {
+    if (
+      pair
+      && lastTurnSpeakerId
+      && pair.includes(lastTurnSpeakerId)
+      && hasSustainedUnnamedNarration(paragraphs, paragraphIndex, speakers)
+    ) {
+      turns.set(paragraphIndex, lastTurnSpeakerId)
+      pair = null
+      previousStrongSpeakerId = lastTurnSpeakerId
+    } else if (pair && lastTurnSpeakerId && pair.includes(lastTurnSpeakerId)) {
       const alternatingSpeakerId: string = pair[0] === lastTurnSpeakerId ? pair[1] : pair[0]
       turns.set(paragraphIndex, alternatingSpeakerId)
       lastTurnSpeakerId = alternatingSpeakerId
@@ -886,6 +943,9 @@ export function parseRosterVoiceSegments(
   const quotePattern = /["“]([\s\S]*?)["”]/g
   const paragraphs = playbackParagraphs(playbackContent)
   const dialogueTurns = paragraphDialogueTurns(playbackContent, speakers, defaultSpeakerId)
+  const paragraphSpeakers = paragraphs.map(paragraph => (
+    unambiguousNarrativeSpeaker(paragraph.text, speakers)
+  ))
   let paragraphIndex = 0
   let cursor = 0
   let lastConfidentSpeakerId: string | null = null
@@ -918,7 +978,8 @@ export function parseRosterVoiceSegments(
       const inferredTurnSpeakerId = (inference.source === 'history' || inference.source === 'fallback')
         ? dialogueTurnSpeakerId
         : null
-      const speakerId: string | null = inferredTurnSpeakerId
+      const speakerId: string | null = paragraphSpeakers[paragraphIndex]
+        ?? inferredTurnSpeakerId
         ?? continuedSpeakerId
         ?? inference.speakerId
       result.push({

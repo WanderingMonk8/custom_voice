@@ -194,6 +194,12 @@ function hasSpeakerMentions(mentions) {
 function soleMentionedSpeaker(text, speakers) {
   return preferredMentionedSpeaker(text, speakers, mentionedSpeakers(text, speakers));
 }
+function unambiguousNarrativeSpeaker(text, speakers) {
+  const mentions = mentionedSpeakers(text, speakers);
+  if (mentions.clean.size === 1) return [...mentions.clean][0];
+  if (mentions.clean.size === 0 && mentions.possessive.size === 1) return [...mentions.possessive][0];
+  return null;
+}
 function currentParagraphSpeaker(before, after, speakers) {
   let paragraphStart = 0;
   for (const match of before.matchAll(/\n[^\S\n]*\n/gu)) {
@@ -218,6 +224,24 @@ function precedingParagraphSpeaker(before, speakers) {
     if (hasSpeakerMentions(mentions)) return null;
   }
   return null;
+}
+function precedingActionBeatSpeaker(before, speakers) {
+  const previousQuoteEnd = Math.max(before.lastIndexOf('"'), before.lastIndexOf("\u201D"));
+  const previousParagraphEnd = [...before.matchAll(/\n[^\S\n]*\n/gu)].at(-1);
+  const paragraphBoundary = previousParagraphEnd?.index === void 0 ? -1 : previousParagraphEnd.index + previousParagraphEnd[0].length - 1;
+  const localNarration = before.slice(Math.max(previousQuoteEnd, paragraphBoundary) + 1).trimStart();
+  if (!localNarration) return null;
+  const matches = /* @__PURE__ */ new Set();
+  for (const speaker of speakers) {
+    for (const alias of speakerAliases(speaker.name)) {
+      const pattern = new RegExp(
+        `^${escapedPattern(alias)}\\b(?!['\u2019](?:s\\b)?)\\s*(?:,|\u2014|-)`,
+        "iu"
+      );
+      if (pattern.test(localNarration)) matches.add(speaker.id);
+    }
+  }
+  return matches.size === 1 ? [...matches][0] : null;
 }
 function inferQuotedSpeaker(before, after, quotedText, speakers, defaultSpeakerId) {
   if (/[,]\s*$/u.test(quotedText)) {
@@ -249,6 +273,10 @@ function inferQuotedSpeaker(before, after, quotedText, speakers, defaultSpeakerI
     }
   }
   if (best) return { speakerId: best.id, confident: true, source: "explicit" };
+  const actionBeatSpeakerId = precedingActionBeatSpeaker(before, speakers);
+  if (actionBeatSpeakerId) {
+    return { speakerId: actionBeatSpeakerId, confident: true, source: "explicit" };
+  }
   const currentSpeakerId = currentParagraphSpeaker(before, after, speakers);
   if (currentSpeakerId) {
     return { speakerId: currentSpeakerId, confident: true, source: "paragraph" };
@@ -268,6 +296,16 @@ function playbackParagraphs(content) {
   const text = content.slice(cursor);
   if (text.trim()) paragraphs.push({ start: cursor, end: content.length, text });
   return paragraphs;
+}
+function hasSustainedUnnamedNarration(paragraphs, startIndex, speakers) {
+  let narrationLength = 0;
+  for (let index = startIndex; index < paragraphs.length; index++) {
+    const paragraph = paragraphs[index];
+    if (hasSpeakerMentions(mentionedSpeakers(paragraph.text, speakers))) break;
+    narrationLength += cleanPlaybackText(narrativeOnly(paragraph.text)).length;
+    if (narrationLength >= 160) return true;
+  }
+  return false;
 }
 function paragraphDialogueTurns(content, speakers, defaultSpeakerId) {
   const turns = /* @__PURE__ */ new Map();
@@ -325,7 +363,11 @@ function paragraphDialogueTurns(content, speakers, defaultSpeakerId) {
       lastTurnSpeakerId = localSpeakerId;
       continue;
     }
-    if (pair && lastTurnSpeakerId && pair.includes(lastTurnSpeakerId)) {
+    if (pair && lastTurnSpeakerId && pair.includes(lastTurnSpeakerId) && hasSustainedUnnamedNarration(paragraphs, paragraphIndex, speakers)) {
+      turns.set(paragraphIndex, lastTurnSpeakerId);
+      pair = null;
+      previousStrongSpeakerId = lastTurnSpeakerId;
+    } else if (pair && lastTurnSpeakerId && pair.includes(lastTurnSpeakerId)) {
       const alternatingSpeakerId = pair[0] === lastTurnSpeakerId ? pair[1] : pair[0];
       turns.set(paragraphIndex, alternatingSpeakerId);
       lastTurnSpeakerId = alternatingSpeakerId;
@@ -353,6 +395,7 @@ function parseRosterVoiceSegments(content, defaultSpeakerId, speakers) {
   const quotePattern = /["“]([\s\S]*?)["”]/g;
   const paragraphs = playbackParagraphs(playbackContent);
   const dialogueTurns = paragraphDialogueTurns(playbackContent, speakers, defaultSpeakerId);
+  const paragraphSpeakers = paragraphs.map((paragraph) => unambiguousNarrativeSpeaker(paragraph.text, speakers));
   let paragraphIndex = 0;
   let cursor = 0;
   let lastConfidentSpeakerId = null;
@@ -379,7 +422,7 @@ function parseRosterVoiceSegments(content, defaultSpeakerId, speakers) {
       const continuedSpeakerId = inference.source === "fallback" && continuationCandidate && canContinueSpeaker(bridge, continuationCandidate, speakers) ? continuationCandidate : null;
       const dialogueTurnSpeakerId = dialogueTurns.get(paragraphIndex) ?? null;
       const inferredTurnSpeakerId = inference.source === "history" || inference.source === "fallback" ? dialogueTurnSpeakerId : null;
-      const speakerId = inferredTurnSpeakerId ?? continuedSpeakerId ?? inference.speakerId;
+      const speakerId = paragraphSpeakers[paragraphIndex] ?? inferredTurnSpeakerId ?? continuedSpeakerId ?? inference.speakerId;
       result.push({
         text: speech,
         speakerId
@@ -395,6 +438,70 @@ function parseRosterVoiceSegments(content, defaultSpeakerId, speakers) {
 }
 
 // src/frontend.ts
+var ConnectionVoiceGate = class {
+  activeVoice = null;
+  activeCount = 0;
+  queue = [];
+  acquire(voice, signal) {
+    if (signal.aborted) return Promise.reject(new DOMException("Playback stopped.", "AbortError"));
+    const voiceKey = voice.trim();
+    return new Promise((resolve, reject) => {
+      const waiter = {
+        voice: voiceKey,
+        signal,
+        resolve,
+        reject,
+        abort: () => {
+          const index = this.queue.indexOf(waiter);
+          if (index >= 0) this.queue.splice(index, 1);
+          reject(new DOMException("Playback stopped.", "AbortError"));
+          this.drain();
+        }
+      };
+      if (this.activeCount === 0 && this.queue.length === 0) {
+        this.activate(waiter);
+      } else if (this.activeVoice === voiceKey && this.queue.length === 0) {
+        this.activate(waiter);
+      } else {
+        this.queue.push(waiter);
+        signal.addEventListener("abort", waiter.abort, { once: true });
+      }
+    });
+  }
+  activate(waiter) {
+    waiter.signal.removeEventListener("abort", waiter.abort);
+    if (waiter.signal.aborted) {
+      waiter.reject(new DOMException("Playback stopped.", "AbortError"));
+      this.drain();
+      return;
+    }
+    this.activeVoice = waiter.voice;
+    this.activeCount += 1;
+    let released = false;
+    waiter.resolve(() => {
+      if (released) return;
+      released = true;
+      this.activeCount -= 1;
+      if (this.activeCount === 0) {
+        this.activeVoice = null;
+        this.drain();
+      }
+    });
+  }
+  drain() {
+    if (this.activeCount !== 0) return;
+    while (this.queue[0]?.signal.aborted) {
+      const waiter = this.queue.shift();
+      waiter.signal.removeEventListener("abort", waiter.abort);
+      waiter.reject(new DOMException("Playback stopped.", "AbortError"));
+    }
+    const nextVoice = this.queue[0]?.voice;
+    if (nextVoice === void 0) return;
+    const batch = [];
+    while (this.queue[0]?.voice === nextVoice) batch.push(this.queue.shift());
+    for (const waiter of batch) this.activate(waiter);
+  }
+};
 var MIN_SYNTHESIS_START_INTERVAL_MS = 1250;
 var MAX_RATE_LIMIT_RETRIES = 3;
 var PLAYBACK_BUFFER_SEGMENTS = 4;
@@ -500,21 +607,27 @@ async function waitForSynthesisSlot(pacer, signal) {
   pacer.startQueue = turn.catch(() => void 0);
   await turn;
 }
-async function synthesizeVoiceSegment(connectionId, text, voice, speed, signal, pacer, onRateLimit) {
+async function synthesizeVoiceSegment(connectionId, text, voice, speed, signal, pacer, voiceGate, onRateLimit) {
   for (let attempt = 0; ; attempt += 1) {
-    await waitForSynthesisSlot(pacer, signal);
-    const response = await fetch("/api/v1/tts/synthesize", {
-      method: "POST",
-      credentials: "same-origin",
-      signal,
-      headers: { "Content-Type": "application/json", Accept: "audio/*" },
-      body: JSON.stringify({
-        connectionId,
-        text,
-        voice: voice || void 0,
-        parameters: { speed }
-      })
-    });
+    const releaseVoice = await voiceGate.acquire(voice, signal);
+    let response;
+    try {
+      await waitForSynthesisSlot(pacer, signal);
+      response = await fetch("/api/v1/tts/synthesize", {
+        method: "POST",
+        credentials: "same-origin",
+        signal,
+        headers: { "Content-Type": "application/json", Accept: "audio/*" },
+        body: JSON.stringify({
+          connectionId,
+          text,
+          voice: voice || void 0,
+          parameters: { speed }
+        })
+      });
+    } finally {
+      releaseVoice();
+    }
     if (response.ok) {
       return {
         data: await response.arrayBuffer(),
@@ -742,6 +855,7 @@ function setup(ctx) {
   let activePlayback = null;
   const backgroundSynthesisControllers = /* @__PURE__ */ new Set();
   const sharedSynthesisPacer = { nextStartAt: 0, startQueue: Promise.resolve() };
+  const connectionVoiceGates = /* @__PURE__ */ new Map();
   const synthesisSlots = Array.from(
     { length: PLAYBACK_BUFFER_SEGMENTS },
     () => Promise.resolve()
@@ -1058,7 +1172,7 @@ function setup(ctx) {
       const segments = parseRosterVoiceSegments(message.content, defaultSpeakerId, playbackChat.characters);
       const plan = mergeVoicePlan(segments.map((segment) => {
         const speakerId = segment.speakerId ? aliases.get(segment.speakerId) ?? segment.speakerId : null;
-        const voice = speakerId ? config.characterVoices[speakerId] || (defaultSpeakerId ? config.characterVoices[defaultSpeakerId] : "") || "" : config.narratorVoice;
+        const voice = speakerId ? config.characterVoices[speakerId] || "" : config.narratorVoice;
         return { text: segment.text, voice };
       }));
       if (plan.length === 0) throw new Error("This message has no playable narration or dialogue.");
@@ -1074,6 +1188,11 @@ function setup(ctx) {
             preferences.speed,
             synthesisController.signal,
             sharedSynthesisPacer,
+            connectionVoiceGates.get(connectionId) ?? (() => {
+              const gate = new ConnectionVoiceGate();
+              connectionVoiceGates.set(connectionId, gate);
+              return gate;
+            })(),
             (delayMs, retry) => {
               if (ctx.getActiveChat().chatId === playbackChat.id && (!activePlayback || activePlayback === playback)) {
                 setStatus(`Rate limited; retry ${retry} in ${Math.max(1, Math.ceil(delayMs / 1e3))}s\u2026`);

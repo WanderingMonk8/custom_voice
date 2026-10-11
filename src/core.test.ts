@@ -497,6 +497,48 @@ test('does not let a nearby secondary name override the paragraph subject for on
   )
 })
 
+test('does not treat a name addressed inside dialogue as the speaker', () => {
+  const segments = parseRosterVoiceSegments(
+    '"He said my name." Zuri\'s whisper arrives from the pillow, small and stunned, her grip on his hand slackening by a fraction. "He\'s holding it for me. He\'s— Hailey, I don\'t need it, I don\'t, he can give it to you, I just—"\n\n"Stop offering yourself away." Grace, dry from the headboard, one green eye open. "You did it with your turn. You\'re doing it again. Take the gift, Zuri."',
+    'card',
+    [
+      { id: 'zuri', name: 'Zuri' },
+      { id: 'grace', name: 'Grace' },
+      { id: 'hailey', name: 'Hailey' },
+    ],
+  )
+  assert.deepEqual(segments.filter(segment => segment.speakerId !== null), [
+    { text: 'He said my name.', speakerId: 'zuri' },
+    {
+      text: "He's holding it for me. He's— Hailey, I don't need it, I don't, he can give it to you, I just—",
+      speakerId: 'zuri',
+    },
+    { text: 'Stop offering yourself away.', speakerId: 'grace' },
+    { text: "You did it with your turn. You're doing it again. Take the gift, Zuri.", speakerId: 'grace' },
+  ])
+})
+
+test('keeps an appositive speaker across stored rich-text variants', () => {
+  const speakers = [
+    { id: 'zuri', name: 'Zuri' },
+    { id: 'grace', name: 'Grace' },
+    { id: 'hailey', name: 'Hailey' },
+  ]
+  const variants = [
+    '"First." Zuri\'s hand relaxes. "Still Zuri."\n"Stop." Grace, dry from the headboard. "Take the gift, Zuri."',
+    '"First." Zuri\'s hand relaxes. "Still Zuri."\n\n"Stop." {Grace, dry from the headboard. "Take the gift, Zuri."',
+    '<font color="#f0f">"First."</font> Zuri\'s hand relaxes. <font color="#f0f">"Still Zuri."</font><br><br><font color="#0f0">"Stop."</font> Grace, dry from the headboard. <font color="#0f0">"Take the gift, Zuri."</font>',
+    '&lt;font color=&quot;#f0f&quot;&gt;"First."&lt;/font&gt; Zuri\'s hand relaxes. "Still Zuri."&lt;br&gt;&lt;br&gt;"Stop." Grace, dry from the headboard. "Take the gift, Zuri."',
+    '“First.” Zuri’s hand relaxes. “Still Zuri.”\n\n“Stop.” Grace, dry from the headboard. “Take the gift, Zuri.”',
+  ]
+  for (const content of variants) {
+    assert.deepEqual(
+      parseRosterVoiceSegments(content, 'zuri', speakers).filter(segment => segment.speakerId !== null).at(-1),
+      { text: 'Take the gift, Zuri.', speakerId: 'grace' },
+    )
+  }
+})
+
 test('alternates unresolved turns in a confidently seeded dialogue chain', () => {
   const segments = parseRosterVoiceSegments(
     '"It is working, but hear me first," Alma called down. "Receiving is clean."\n\n"One hop reaches who?" Vahn said.\n\n"The repeater broadcasts what it receives. A reply takes a person on the other end." A pause. "So we can send two sentences before going mute."\n\n"Then I understand."',
@@ -543,6 +585,50 @@ test('keeps a dialogue chain across a short unnamed narrative beat', () => {
     ).at(-1),
     { text: 'Third.', speakerId: 'alma' },
   )
+})
+
+test('keeps the last clear speaker across a downstream narrative-heavy ambiguous run', () => {
+  const segments = parseRosterVoiceSegments(
+    '"Kid is right." Grace watches Hailey. "You made the confession."\n\n"It is not a slide—" Hailey stops. Her hands go still on him, both of them resting against him while she considers what to say next.\n\n"Fine. No steps." Her forehead presses against his shoulder, the position she chose holding her up while a wall holds up a person who has stopped bracing. "The fourth thing, I learned watching the footage is that when you came on their faces, you looked at each of them. All four. Before you let go." Her thumb traces the vein beneath her fist, slow, once. "Nobody in my life has ever looked at me before letting go."\n\nHer mouth finds the place where his shoulder meets his chest—not the crown, not the shaft, the wrong place entirely for worship and the exact right place for what she is actually doing—and she presses her lips there and holds, breathing through the contact.\n\n"So that is the fourth item." The words arrive against his skin. "You look at me when you are close, and I will know I am not the girl someone leaves in a room afterward."',
+    'card',
+    [{ id: 'grace', name: 'Grace' }, { id: 'hailey', name: 'Hailey' }],
+  )
+  assert.deepEqual(
+    segments.filter(segment => segment.speakerId !== null).slice(3),
+    [
+      { text: 'Fine. No steps.', speakerId: 'hailey' },
+      {
+        text: 'The fourth thing, I learned watching the footage is that when you came on their faces, you looked at each of them. All four. Before you let go.',
+        speakerId: 'hailey',
+      },
+      { text: 'Nobody in my life has ever looked at me before letting go.', speakerId: 'hailey' },
+      { text: 'So that is the fourth item.', speakerId: 'hailey' },
+      {
+        text: 'You look at me when you are close, and I will know I am not the girl someone leaves in a room afterward.',
+        speakerId: 'hailey',
+      },
+    ],
+  )
+})
+
+test('explicitly attributed dialogue overrides surrounding Hailey and Grace context', () => {
+  const segments = parseRosterVoiceSegments(
+    'Hailey\'s breath fractures when his hands close over her breasts, and she has not once acknowledged them.\n\n"You are supposed to be losing control at my pace," she manages. "Not while I am trying to demonstrate the fourth item."\n\n"She is stalling," Zuri whispers into the pillow, her eyes enormous, his hand still white-knuckled in hers. "The fourth item is not a sequence. It is the thing she is afraid of."\n\n"Kid is right." Grace, against the headboard, her green eyes open now, tracking the flush climbing Hailey\'s collarbone. "Captain, you have been counting steps."',
+    'hailey',
+    [
+      { id: 'hailey', name: 'Hailey' },
+      { id: 'zuri', name: 'Zuri' },
+      { id: 'grace', name: 'Grace' },
+    ],
+  )
+  assert.deepEqual(segments.filter(segment => segment.speakerId !== null), [
+    { text: 'You are supposed to be losing control at my pace,', speakerId: 'hailey' },
+    { text: 'Not while I am trying to demonstrate the fourth item.', speakerId: 'hailey' },
+    { text: 'She is stalling,', speakerId: 'zuri' },
+    { text: 'The fourth item is not a sequence. It is the thing she is afraid of.', speakerId: 'zuri' },
+    { text: 'Kid is right.', speakerId: 'grace' },
+    { text: 'Captain, you have been counting steps.', speakerId: 'grace' },
+  ])
 })
 
 test('breaks dialogue alternation after substantive pure narration', () => {
