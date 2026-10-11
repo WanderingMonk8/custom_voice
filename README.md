@@ -10,7 +10,7 @@ A [Lumiverse Spindle](https://docs.lumiverse.chat/) extension that detects chara
 - Assigns each quoted passage locally during playback using explicit speaker labels, dialogue tags, and the saved card cast.
 - Uses one shared TTS connection for the entire chat.
 - Assigns a different custom voice name or provider voice ID to every detected character.
-- Allows unlimited manually added NPCs, each with its own voice and delete control. Slash-separated aliases share that NPC's voice.
+- Allows every detected or manually added character to be renamed or deleted. Slash-separated aliases share that character's voice.
 - Assigns a separate narrator voice.
 - Routes quoted text to the speaking character and text outside quotations to the narrator.
 - Carries a confidently identified speaker across same-paragraph narration for later unattributed quotes, unless another roster character is introduced.
@@ -52,7 +52,7 @@ The compiled frontend and backend bundles are committed under `dist/`, so users 
 2. Select **Voice** in the Lumiverse drawer.
 3. Click **Scan** to read the active character card and save its speaking cast.
 4. Choose one TTS connection for the chat.
-5. Enter the narrator voice and a voice for each detected character. Add, rename, or delete NPCs manually as needed. Separate aliases with `/` (for example, `Scott / The sergeant`) to route every name to the same voice; use the rename button to add aliases later without losing the assigned voice.
+5. Enter the narrator voice and a voice for each detected character. Add characters manually, or rename and delete any roster entry as needed. Separate aliases with `/` (for example, `Scott / The sergeant`) to route every name to the same voice; use the rename button to add aliases later without losing the assigned voice.
 6. Optionally enable **Save generated audio** to attach completed recordings to messages across every chat. This global setting is off by default.
 7. Use Lumiverse's normal **Play with TTS** button or context-menu action to play the message with all configured voices.
 

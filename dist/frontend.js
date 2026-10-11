@@ -1353,8 +1353,8 @@ function setup(ctx) {
     renderCharacters(activeChat.characters);
     markChanged(0);
   }
-  function removeNpc(characterId) {
-    if (!activeChat || !characterId.startsWith("npc:")) return;
+  function removeCharacter(characterId) {
+    if (!activeChat) return;
     activeChat = {
       ...activeChat,
       characters: activeChat.characters.filter((character) => character.id !== characterId)
@@ -1362,12 +1362,12 @@ function setup(ctx) {
     renderCharacters(activeChat.characters);
     markChanged(0);
   }
-  function renameNpc(characterId) {
-    if (!activeChat || !characterId.startsWith("npc:")) return null;
+  function renameCharacter(characterId) {
+    if (!activeChat) return null;
     const character = activeChat.characters.find((item) => item.id === characterId);
     if (!character) return null;
     const response = hostWindow.prompt(
-      "Rename this NPC or add aliases separated by \u201C/\u201D.",
+      "Rename this character or add aliases separated by \u201C/\u201D.",
       character.name
     );
     if (response === null) return null;
@@ -1423,7 +1423,7 @@ function setup(ctx) {
       const meta = document.createElement("span");
       meta.className = "chat-voice-character-meta";
       meta.append(count);
-      if (character.id.startsWith("npc:")) {
+      {
         const rename = document.createElement("button");
         rename.type = "button";
         rename.className = "chat-voice-rename-button";
@@ -1439,7 +1439,7 @@ function setup(ctx) {
         remove.setAttribute("aria-label", remove.title);
         remove.disabled = !activeChat;
         rename.addEventListener("click", () => {
-          const renamed = renameNpc(character.id);
+          const renamed = renameCharacter(character.id);
           if (!renamed) return;
           name.textContent = renamed;
           rename.title = `Rename ${renamed} or edit aliases`;
@@ -1451,7 +1451,7 @@ function setup(ctx) {
             ariaLabel: `Custom voice for ${renamed}`
           });
         });
-        remove.addEventListener("click", () => removeNpc(character.id));
+        remove.addEventListener("click", () => removeCharacter(character.id));
         meta.append(rename, remove);
       }
       const slot = document.createElement("div");
