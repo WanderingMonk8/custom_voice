@@ -219,6 +219,24 @@ function precedingParagraphSpeaker(before, speakers) {
   }
   return null;
 }
+function precedingActionBeatSpeaker(before, speakers) {
+  const previousQuoteEnd = Math.max(before.lastIndexOf('"'), before.lastIndexOf("\u201D"));
+  const previousParagraphEnd = [...before.matchAll(/\n[^\S\n]*\n/gu)].at(-1);
+  const paragraphBoundary = previousParagraphEnd?.index === void 0 ? -1 : previousParagraphEnd.index + previousParagraphEnd[0].length - 1;
+  const localNarration = before.slice(Math.max(previousQuoteEnd, paragraphBoundary) + 1).trimStart();
+  if (!localNarration) return null;
+  const matches = /* @__PURE__ */ new Set();
+  for (const speaker of speakers) {
+    for (const alias of speakerAliases(speaker.name)) {
+      const pattern = new RegExp(
+        `^${escapedPattern(alias)}\\b(?!['\u2019](?:s\\b)?)\\s*(?:,|\u2014|-)`,
+        "iu"
+      );
+      if (pattern.test(localNarration)) matches.add(speaker.id);
+    }
+  }
+  return matches.size === 1 ? [...matches][0] : null;
+}
 function inferQuotedSpeaker(before, after, quotedText, speakers, defaultSpeakerId) {
   if (/[,]\s*$/u.test(quotedText)) {
     const actionBeat = after.slice(0, 140).split(/["“\n]/u, 1)[0];
@@ -249,6 +267,10 @@ function inferQuotedSpeaker(before, after, quotedText, speakers, defaultSpeakerI
     }
   }
   if (best) return { speakerId: best.id, confident: true, source: "explicit" };
+  const actionBeatSpeakerId = precedingActionBeatSpeaker(before, speakers);
+  if (actionBeatSpeakerId) {
+    return { speakerId: actionBeatSpeakerId, confident: true, source: "explicit" };
+  }
   const currentSpeakerId = currentParagraphSpeaker(before, after, speakers);
   if (currentSpeakerId) {
     return { speakerId: currentSpeakerId, confident: true, source: "paragraph" };
@@ -1058,7 +1080,7 @@ function setup(ctx) {
       const segments = parseRosterVoiceSegments(message.content, defaultSpeakerId, playbackChat.characters);
       const plan = mergeVoicePlan(segments.map((segment) => {
         const speakerId = segment.speakerId ? aliases.get(segment.speakerId) ?? segment.speakerId : null;
-        const voice = speakerId ? config.characterVoices[speakerId] || (defaultSpeakerId ? config.characterVoices[defaultSpeakerId] : "") || "" : config.narratorVoice;
+        const voice = speakerId ? config.characterVoices[speakerId] || "" : config.narratorVoice;
         return { text: segment.text, voice };
       }));
       if (plan.length === 0) throw new Error("This message has no playable narration or dialogue.");

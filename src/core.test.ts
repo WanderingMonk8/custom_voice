@@ -497,6 +497,27 @@ test('does not let a nearby secondary name override the paragraph subject for on
   )
 })
 
+test('does not treat a name addressed inside dialogue as the speaker', () => {
+  const segments = parseRosterVoiceSegments(
+    '"He said my name." Zuri\'s whisper arrives from the pillow, small and stunned, her grip on his hand slackening by a fraction. "He\'s holding it for me. He\'s— Hailey, I don\'t need it, I don\'t, he can give it to you, I just—"\n\n"Stop offering yourself away." Grace, dry from the headboard, one green eye open. "You did it with your turn. You\'re doing it again. Take the gift, Zuri."',
+    'card',
+    [
+      { id: 'zuri', name: 'Zuri' },
+      { id: 'grace', name: 'Grace' },
+      { id: 'hailey', name: 'Hailey' },
+    ],
+  )
+  assert.deepEqual(segments.filter(segment => segment.speakerId !== null), [
+    { text: 'He said my name.', speakerId: 'zuri' },
+    {
+      text: "He's holding it for me. He's— Hailey, I don't need it, I don't, he can give it to you, I just—",
+      speakerId: 'zuri',
+    },
+    { text: 'Stop offering yourself away.', speakerId: 'grace' },
+    { text: "You did it with your turn. You're doing it again. Take the gift, Zuri.", speakerId: 'grace' },
+  ])
+})
+
 test('alternates unresolved turns in a confidently seeded dialogue chain', () => {
   const segments = parseRosterVoiceSegments(
     '"It is working, but hear me first," Alma called down. "Receiving is clean."\n\n"One hop reaches who?" Vahn said.\n\n"The repeater broadcasts what it receives. A reply takes a person on the other end." A pause. "So we can send two sentences before going mute."\n\n"Then I understand."',

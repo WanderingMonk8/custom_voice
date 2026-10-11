@@ -704,6 +704,28 @@ function precedingParagraphSpeaker(before: string, speakers: CharacterLike[]): s
   return null
 }
 
+function precedingActionBeatSpeaker(before: string, speakers: CharacterLike[]): string | null {
+  const previousQuoteEnd = Math.max(before.lastIndexOf('"'), before.lastIndexOf('”'))
+  const previousParagraphEnd = [...before.matchAll(/\n[^\S\n]*\n/gu)].at(-1)
+  const paragraphBoundary = previousParagraphEnd?.index === undefined
+    ? -1
+    : previousParagraphEnd.index + previousParagraphEnd[0].length - 1
+  const localNarration = before.slice(Math.max(previousQuoteEnd, paragraphBoundary) + 1).trimStart()
+  if (!localNarration) return null
+
+  const matches = new Set<string>()
+  for (const speaker of speakers) {
+    for (const alias of speakerAliases(speaker.name)) {
+      const pattern = new RegExp(
+        `^${escapedPattern(alias)}\\b(?!['’](?:s\\b)?)\\s*(?:,|—|-)`,
+        'iu',
+      )
+      if (pattern.test(localNarration)) matches.add(speaker.id)
+    }
+  }
+  return matches.size === 1 ? [...matches][0] : null
+}
+
 function inferQuotedSpeaker(
   before: string,
   after: string,
@@ -741,6 +763,10 @@ function inferQuotedSpeaker(
     }
   }
   if (best) return { speakerId: best.id, confident: true, source: 'explicit' }
+  const actionBeatSpeakerId = precedingActionBeatSpeaker(before, speakers)
+  if (actionBeatSpeakerId) {
+    return { speakerId: actionBeatSpeakerId, confident: true, source: 'explicit' }
+  }
   const currentSpeakerId = currentParagraphSpeaker(before, after, speakers)
   if (currentSpeakerId) {
     return { speakerId: currentSpeakerId, confident: true, source: 'paragraph' }

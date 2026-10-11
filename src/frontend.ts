@@ -880,7 +880,7 @@ export function setup(ctx: SpindleFrontendContext) {
           ? aliases.get(segment.speakerId) ?? segment.speakerId
           : null
         const voice = speakerId
-          ? config.characterVoices[speakerId] || (defaultSpeakerId ? config.characterVoices[defaultSpeakerId] : '') || ''
+          ? config.characterVoices[speakerId] || ''
           : config.narratorVoice
         return { text: segment.text, voice }
       }))
