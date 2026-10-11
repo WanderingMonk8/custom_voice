@@ -587,6 +587,30 @@ test('keeps a dialogue chain across a short unnamed narrative beat', () => {
   )
 })
 
+test('keeps the last clear speaker across a downstream narrative-heavy ambiguous run', () => {
+  const segments = parseRosterVoiceSegments(
+    '"Kid is right." Grace watches Hailey. "You made the confession."\n\n"It is not a slide—" Hailey stops. Her hands go still on him, both of them resting against him while she considers what to say next.\n\n"Fine. No steps." Her forehead presses against his shoulder, the position she chose holding her up while a wall holds up a person who has stopped bracing. "The fourth thing, I learned watching the footage is that when you came on their faces, you looked at each of them. All four. Before you let go." Her thumb traces the vein beneath her fist, slow, once. "Nobody in my life has ever looked at me before letting go."\n\nHer mouth finds the place where his shoulder meets his chest—not the crown, not the shaft, the wrong place entirely for worship and the exact right place for what she is actually doing—and she presses her lips there and holds, breathing through the contact.\n\n"So that is the fourth item." The words arrive against his skin. "You look at me when you are close, and I will know I am not the girl someone leaves in a room afterward."',
+    'card',
+    [{ id: 'grace', name: 'Grace' }, { id: 'hailey', name: 'Hailey' }],
+  )
+  assert.deepEqual(
+    segments.filter(segment => segment.speakerId !== null).slice(3),
+    [
+      { text: 'Fine. No steps.', speakerId: 'hailey' },
+      {
+        text: 'The fourth thing, I learned watching the footage is that when you came on their faces, you looked at each of them. All four. Before you let go.',
+        speakerId: 'hailey',
+      },
+      { text: 'Nobody in my life has ever looked at me before letting go.', speakerId: 'hailey' },
+      { text: 'So that is the fourth item.', speakerId: 'hailey' },
+      {
+        text: 'You look at me when you are close, and I will know I am not the girl someone leaves in a room afterward.',
+        speakerId: 'hailey',
+      },
+    ],
+  )
+})
+
 test('breaks dialogue alternation after substantive pure narration', () => {
   assert.deepEqual(
     parseRosterVoiceSegments(

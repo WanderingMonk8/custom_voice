@@ -804,6 +804,21 @@ function playbackParagraphs(content: string): PlaybackParagraph[] {
   return paragraphs
 }
 
+function hasSustainedUnnamedNarration(
+  paragraphs: PlaybackParagraph[],
+  startIndex: number,
+  speakers: CharacterLike[],
+): boolean {
+  let narrationLength = 0
+  for (let index = startIndex; index < paragraphs.length; index++) {
+    const paragraph = paragraphs[index]
+    if (hasSpeakerMentions(mentionedSpeakers(paragraph.text, speakers))) break
+    narrationLength += cleanPlaybackText(narrativeOnly(paragraph.text)).length
+    if (narrationLength >= 160) return true
+  }
+  return false
+}
+
 function paragraphDialogueTurns(
   content: string,
   speakers: CharacterLike[],
@@ -880,7 +895,16 @@ function paragraphDialogueTurns(
       continue
     }
 
-    if (pair && lastTurnSpeakerId && pair.includes(lastTurnSpeakerId)) {
+    if (
+      pair
+      && lastTurnSpeakerId
+      && pair.includes(lastTurnSpeakerId)
+      && hasSustainedUnnamedNarration(paragraphs, paragraphIndex, speakers)
+    ) {
+      turns.set(paragraphIndex, lastTurnSpeakerId)
+      pair = null
+      previousStrongSpeakerId = lastTurnSpeakerId
+    } else if (pair && lastTurnSpeakerId && pair.includes(lastTurnSpeakerId)) {
       const alternatingSpeakerId: string = pair[0] === lastTurnSpeakerId ? pair[1] : pair[0]
       turns.set(paragraphIndex, alternatingSpeakerId)
       lastTurnSpeakerId = alternatingSpeakerId

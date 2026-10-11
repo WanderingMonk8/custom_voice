@@ -297,6 +297,16 @@ function playbackParagraphs(content) {
   if (text.trim()) paragraphs.push({ start: cursor, end: content.length, text });
   return paragraphs;
 }
+function hasSustainedUnnamedNarration(paragraphs, startIndex, speakers) {
+  let narrationLength = 0;
+  for (let index = startIndex; index < paragraphs.length; index++) {
+    const paragraph = paragraphs[index];
+    if (hasSpeakerMentions(mentionedSpeakers(paragraph.text, speakers))) break;
+    narrationLength += cleanPlaybackText(narrativeOnly(paragraph.text)).length;
+    if (narrationLength >= 160) return true;
+  }
+  return false;
+}
 function paragraphDialogueTurns(content, speakers, defaultSpeakerId) {
   const turns = /* @__PURE__ */ new Map();
   const paragraphs = playbackParagraphs(content);
@@ -353,7 +363,11 @@ function paragraphDialogueTurns(content, speakers, defaultSpeakerId) {
       lastTurnSpeakerId = localSpeakerId;
       continue;
     }
-    if (pair && lastTurnSpeakerId && pair.includes(lastTurnSpeakerId)) {
+    if (pair && lastTurnSpeakerId && pair.includes(lastTurnSpeakerId) && hasSustainedUnnamedNarration(paragraphs, paragraphIndex, speakers)) {
+      turns.set(paragraphIndex, lastTurnSpeakerId);
+      pair = null;
+      previousStrongSpeakerId = lastTurnSpeakerId;
+    } else if (pair && lastTurnSpeakerId && pair.includes(lastTurnSpeakerId)) {
       const alternatingSpeakerId = pair[0] === lastTurnSpeakerId ? pair[1] : pair[0];
       turns.set(paragraphIndex, alternatingSpeakerId);
       lastTurnSpeakerId = alternatingSpeakerId;
