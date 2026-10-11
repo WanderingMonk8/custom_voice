@@ -438,6 +438,70 @@ function parseRosterVoiceSegments(content, defaultSpeakerId, speakers) {
 }
 
 // src/frontend.ts
+var ConnectionVoiceGate = class {
+  activeVoice = null;
+  activeCount = 0;
+  queue = [];
+  acquire(voice, signal) {
+    if (signal.aborted) return Promise.reject(new DOMException("Playback stopped.", "AbortError"));
+    const voiceKey = voice.trim();
+    return new Promise((resolve, reject) => {
+      const waiter = {
+        voice: voiceKey,
+        signal,
+        resolve,
+        reject,
+        abort: () => {
+          const index = this.queue.indexOf(waiter);
+          if (index >= 0) this.queue.splice(index, 1);
+          reject(new DOMException("Playback stopped.", "AbortError"));
+          this.drain();
+        }
+      };
+      if (this.activeCount === 0 && this.queue.length === 0) {
+        this.activate(waiter);
+      } else if (this.activeVoice === voiceKey && this.queue.length === 0) {
+        this.activate(waiter);
+      } else {
+        this.queue.push(waiter);
+        signal.addEventListener("abort", waiter.abort, { once: true });
+      }
+    });
+  }
+  activate(waiter) {
+    waiter.signal.removeEventListener("abort", waiter.abort);
+    if (waiter.signal.aborted) {
+      waiter.reject(new DOMException("Playback stopped.", "AbortError"));
+      this.drain();
+      return;
+    }
+    this.activeVoice = waiter.voice;
+    this.activeCount += 1;
+    let released = false;
+    waiter.resolve(() => {
+      if (released) return;
+      released = true;
+      this.activeCount -= 1;
+      if (this.activeCount === 0) {
+        this.activeVoice = null;
+        this.drain();
+      }
+    });
+  }
+  drain() {
+    if (this.activeCount !== 0) return;
+    while (this.queue[0]?.signal.aborted) {
+      const waiter = this.queue.shift();
+      waiter.signal.removeEventListener("abort", waiter.abort);
+      waiter.reject(new DOMException("Playback stopped.", "AbortError"));
+    }
+    const nextVoice = this.queue[0]?.voice;
+    if (nextVoice === void 0) return;
+    const batch = [];
+    while (this.queue[0]?.voice === nextVoice) batch.push(this.queue.shift());
+    for (const waiter of batch) this.activate(waiter);
+  }
+};
 var MIN_SYNTHESIS_START_INTERVAL_MS = 1250;
 var MAX_RATE_LIMIT_RETRIES = 3;
 var PLAYBACK_BUFFER_SEGMENTS = 4;
@@ -543,21 +607,27 @@ async function waitForSynthesisSlot(pacer, signal) {
   pacer.startQueue = turn.catch(() => void 0);
   await turn;
 }
-async function synthesizeVoiceSegment(connectionId, text, voice, speed, signal, pacer, onRateLimit) {
+async function synthesizeVoiceSegment(connectionId, text, voice, speed, signal, pacer, voiceGate, onRateLimit) {
   for (let attempt = 0; ; attempt += 1) {
-    await waitForSynthesisSlot(pacer, signal);
-    const response = await fetch("/api/v1/tts/synthesize", {
-      method: "POST",
-      credentials: "same-origin",
-      signal,
-      headers: { "Content-Type": "application/json", Accept: "audio/*" },
-      body: JSON.stringify({
-        connectionId,
-        text,
-        voice: voice || void 0,
-        parameters: { speed }
-      })
-    });
+    const releaseVoice = await voiceGate.acquire(voice, signal);
+    let response;
+    try {
+      await waitForSynthesisSlot(pacer, signal);
+      response = await fetch("/api/v1/tts/synthesize", {
+        method: "POST",
+        credentials: "same-origin",
+        signal,
+        headers: { "Content-Type": "application/json", Accept: "audio/*" },
+        body: JSON.stringify({
+          connectionId,
+          text,
+          voice: voice || void 0,
+          parameters: { speed }
+        })
+      });
+    } finally {
+      releaseVoice();
+    }
     if (response.ok) {
       return {
         data: await response.arrayBuffer(),
@@ -785,6 +855,7 @@ function setup(ctx) {
   let activePlayback = null;
   const backgroundSynthesisControllers = /* @__PURE__ */ new Set();
   const sharedSynthesisPacer = { nextStartAt: 0, startQueue: Promise.resolve() };
+  const connectionVoiceGates = /* @__PURE__ */ new Map();
   const synthesisSlots = Array.from(
     { length: PLAYBACK_BUFFER_SEGMENTS },
     () => Promise.resolve()
@@ -1117,6 +1188,11 @@ function setup(ctx) {
             preferences.speed,
             synthesisController.signal,
             sharedSynthesisPacer,
+            connectionVoiceGates.get(connectionId) ?? (() => {
+              const gate = new ConnectionVoiceGate();
+              connectionVoiceGates.set(connectionId, gate);
+              return gate;
+            })(),
             (delayMs, retry) => {
               if (ctx.getActiveChat().chatId === playbackChat.id && (!activePlayback || activePlayback === playback)) {
                 setStatus(`Rate limited; retry ${retry} in ${Math.max(1, Math.ceil(delayMs / 1e3))}s\u2026`);

@@ -611,6 +611,26 @@ test('keeps the last clear speaker across a downstream narrative-heavy ambiguous
   )
 })
 
+test('explicitly attributed dialogue overrides surrounding Hailey and Grace context', () => {
+  const segments = parseRosterVoiceSegments(
+    'Hailey\'s breath fractures when his hands close over her breasts, and she has not once acknowledged them.\n\n"You are supposed to be losing control at my pace," she manages. "Not while I am trying to demonstrate the fourth item."\n\n"She is stalling," Zuri whispers into the pillow, her eyes enormous, his hand still white-knuckled in hers. "The fourth item is not a sequence. It is the thing she is afraid of."\n\n"Kid is right." Grace, against the headboard, her green eyes open now, tracking the flush climbing Hailey\'s collarbone. "Captain, you have been counting steps."',
+    'hailey',
+    [
+      { id: 'hailey', name: 'Hailey' },
+      { id: 'zuri', name: 'Zuri' },
+      { id: 'grace', name: 'Grace' },
+    ],
+  )
+  assert.deepEqual(segments.filter(segment => segment.speakerId !== null), [
+    { text: 'You are supposed to be losing control at my pace,', speakerId: 'hailey' },
+    { text: 'Not while I am trying to demonstrate the fourth item.', speakerId: 'hailey' },
+    { text: 'She is stalling,', speakerId: 'zuri' },
+    { text: 'The fourth item is not a sequence. It is the thing she is afraid of.', speakerId: 'zuri' },
+    { text: 'Kid is right.', speakerId: 'grace' },
+    { text: 'Captain, you have been counting steps.', speakerId: 'grace' },
+  ])
+})
+
 test('breaks dialogue alternation after substantive pure narration', () => {
   assert.deepEqual(
     parseRosterVoiceSegments(

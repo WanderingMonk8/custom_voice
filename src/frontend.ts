@@ -28,6 +28,87 @@ interface SynthesisPacer {
   startQueue: Promise<void>
 }
 
+interface VoiceGateWaiter {
+  voice: string
+  signal: AbortSignal
+  resolve: (release: () => void) => void
+  reject: (error: DOMException) => void
+  abort: () => void
+}
+
+/**
+ * Some TTS providers apply a request's voice through mutable connection state.
+ * Keep different voices from overlapping on one connection while still allowing
+ * the configured concurrency for adjacent segments that use the same voice.
+ */
+class ConnectionVoiceGate {
+  private activeVoice: string | null = null
+  private activeCount = 0
+  private readonly queue: VoiceGateWaiter[] = []
+
+  acquire(voice: string, signal: AbortSignal): Promise<() => void> {
+    if (signal.aborted) return Promise.reject(new DOMException('Playback stopped.', 'AbortError'))
+    const voiceKey = voice.trim()
+    return new Promise((resolve, reject) => {
+      const waiter: VoiceGateWaiter = {
+        voice: voiceKey,
+        signal,
+        resolve,
+        reject,
+        abort: () => {
+          const index = this.queue.indexOf(waiter)
+          if (index >= 0) this.queue.splice(index, 1)
+          reject(new DOMException('Playback stopped.', 'AbortError'))
+          this.drain()
+        },
+      }
+      if (this.activeCount === 0 && this.queue.length === 0) {
+        this.activate(waiter)
+      } else if (this.activeVoice === voiceKey && this.queue.length === 0) {
+        this.activate(waiter)
+      } else {
+        this.queue.push(waiter)
+        signal.addEventListener('abort', waiter.abort, { once: true })
+      }
+    })
+  }
+
+  private activate(waiter: VoiceGateWaiter): void {
+    waiter.signal.removeEventListener('abort', waiter.abort)
+    if (waiter.signal.aborted) {
+      waiter.reject(new DOMException('Playback stopped.', 'AbortError'))
+      this.drain()
+      return
+    }
+    this.activeVoice = waiter.voice
+    this.activeCount += 1
+    let released = false
+    waiter.resolve(() => {
+      if (released) return
+      released = true
+      this.activeCount -= 1
+      if (this.activeCount === 0) {
+        this.activeVoice = null
+        this.drain()
+      }
+    })
+  }
+
+  private drain(): void {
+    if (this.activeCount !== 0) return
+    while (this.queue[0]?.signal.aborted) {
+      const waiter = this.queue.shift()!
+      waiter.signal.removeEventListener('abort', waiter.abort)
+      waiter.reject(new DOMException('Playback stopped.', 'AbortError'))
+    }
+    const nextVoice = this.queue[0]?.voice
+    if (nextVoice === undefined) return
+    const batch: VoiceGateWaiter[] = []
+    while (this.queue[0]?.voice === nextVoice) batch.push(this.queue.shift()!)
+    for (const waiter of batch) this.activate(waiter)
+  }
+}
+
 const MIN_SYNTHESIS_START_INTERVAL_MS = 1_250
 const MAX_RATE_LIMIT_RETRIES = 3
 const PLAYBACK_BUFFER_SEGMENTS = 4
@@ -240,22 +321,29 @@ async function synthesizeVoiceSegment(
   speed: number,
   signal: AbortSignal,
   pacer: SynthesisPacer,
+  voiceGate: ConnectionVoiceGate,
   onRateLimit: (delayMs: number, retry: number) => void,
 ): Promise<SynthesizedVoiceSegment> {
   for (let attempt = 0; ; attempt += 1) {
-    await waitForSynthesisSlot(pacer, signal)
-    const response = await fetch('/api/v1/tts/synthesize', {
-      method: 'POST',
-      credentials: 'same-origin',
-      signal,
-      headers: { 'Content-Type': 'application/json', Accept: 'audio/*' },
-      body: JSON.stringify({
-        connectionId,
-        text,
-        voice: voice || undefined,
-        parameters: { speed },
-      }),
-    })
+    const releaseVoice = await voiceGate.acquire(voice, signal)
+    let response: Response
+    try {
+      await waitForSynthesisSlot(pacer, signal)
+      response = await fetch('/api/v1/tts/synthesize', {
+        method: 'POST',
+        credentials: 'same-origin',
+        signal,
+        headers: { 'Content-Type': 'application/json', Accept: 'audio/*' },
+        body: JSON.stringify({
+          connectionId,
+          text,
+          voice: voice || undefined,
+          parameters: { speed },
+        }),
+      })
+    } finally {
+      releaseVoice()
+    }
     if (response.ok) {
       return {
         data: await response.arrayBuffer(),
@@ -512,6 +600,7 @@ export function setup(ctx: SpindleFrontendContext) {
   } | null = null
   const backgroundSynthesisControllers = new Set<AbortController>()
   const sharedSynthesisPacer: SynthesisPacer = { nextStartAt: 0, startQueue: Promise.resolve() }
+  const connectionVoiceGates = new Map<string, ConnectionVoiceGate>()
   const synthesisSlots: Promise<void>[] = Array.from(
     { length: PLAYBACK_BUFFER_SEGMENTS },
     () => Promise.resolve(),
@@ -901,6 +990,11 @@ export function setup(ctx: SpindleFrontendContext) {
             preferences.speed,
             synthesisController.signal,
             sharedSynthesisPacer,
+            connectionVoiceGates.get(connectionId) ?? (() => {
+              const gate = new ConnectionVoiceGate()
+              connectionVoiceGates.set(connectionId, gate)
+              return gate
+            })(),
             (delayMs, retry) => {
               if (ctx.getActiveChat().chatId === playbackChat.id && (!activePlayback || activePlayback === playback)) {
                 setStatus(`Rate limited; retry ${retry} in ${Math.max(1, Math.ceil(delayMs / 1_000))}s…`)
