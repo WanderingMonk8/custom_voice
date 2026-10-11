@@ -2,10 +2,11 @@ import {
   addScannedFirstNameAliases,
   applyConfigToMetadata,
   clampMessageLimit,
-  npcSpeakerId,
   normalizeSpeakerName,
   parseCardCast,
+  mergeScannedCardCast,
   readConfig,
+  speakerAliases,
   type CharacterLike,
   type ChatVoiceConfig,
 } from './core'
@@ -97,7 +98,7 @@ async function buildState(chat: ChatLike, userId?: string) {
     const character = candidatesById.get(id)
     const savedName = name || (id.startsWith('npc:') ? id.slice(4) : '')
     return character
-      ? [{ ...character, messageCount }]
+      ? [{ ...character, name: savedName || character.name, messageCount }]
       : savedName ? [{ id, name: savedName, messageCount }] : []
   })
 
@@ -237,14 +238,10 @@ async function scanCardCast(
     if (cast.length === 0) {
       return { detected: addScannedFirstNameAliases(base), usedFallback: true }
     }
-    const byName = new Map(cards.map((card) => [normalizeSpeakerName(card.name).toLowerCase(), card] as const))
-    const detected = new Map(base.map((character) => [character.id, character] as const))
-    for (const member of cast) {
-      const card = byName.get(normalizeSpeakerName(member.name).toLowerCase())
-      const id = card?.id ?? npcSpeakerId(member.name)
-      if (!detected.has(id)) detected.set(id, { id, name: member.name, messageCount: 0 })
+    return {
+      detected: mergeScannedCardCast(base, cast).map(character => ({ ...character, messageCount: 0 })),
+      usedFallback: false,
     }
-    return { detected: addScannedFirstNameAliases([...detected.values()]), usedFallback: false }
   } catch (error) {
     spindle.log.warn(`Chat Voice card parser failed: ${error instanceof Error ? error.message : String(error)}`)
     return { detected: addScannedFirstNameAliases(base), usedFallback: true }
@@ -292,13 +289,31 @@ function queueScan(
     const cardResult = await scanCardCast(candidates, userId)
     const config = readConfig(chat.metadata ?? {}, candidates.map((character) => character.id))
     const detected = new Map(cardResult.detected.map((character) => [character.id, character] as const))
+    const detectedByAlias = new Map<string, string>()
+    for (const character of detected.values()) {
+      for (const alias of speakerAliases(character.name)) detectedByAlias.set(alias.toLowerCase(), character.id)
+    }
+    const characterVoices = { ...config.characterVoices }
     for (const character of config.detectedCharacters) {
-      if (character.id.startsWith('npc:') && !detected.has(character.id)) detected.set(character.id, character)
+      if (!character.id.startsWith('npc:') || detected.has(character.id)) continue
+      const replacementId = speakerAliases(character.name)
+        .map(alias => detectedByAlias.get(alias.toLowerCase()))
+        .find((id): id is string => !!id)
+      if (replacementId) {
+        if (!characterVoices[replacementId] && characterVoices[character.id]) {
+          characterVoices[replacementId] = characterVoices[character.id]
+        }
+        delete characterVoices[character.id]
+      } else {
+        detected.set(character.id, character)
+        for (const alias of speakerAliases(character.name)) detectedByAlias.set(alias.toLowerCase(), character.id)
+      }
     }
     const nextConfig: ChatVoiceConfig = {
       ...config,
       version: 5,
       messageLimit,
+      characterVoices,
       detectedCharacters: [...detected.values()],
       parsedMessages: {},
     }

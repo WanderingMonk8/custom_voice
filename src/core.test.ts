@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
   addScannedFirstNameAliases,
+  mergeScannedCardCast,
   applyConfigToMetadata,
   clampMessageLimit,
   detectCharacters,
@@ -241,6 +242,28 @@ test('does not add ambiguous or already-owned first-name aliases', () => {
     { id: 'john-doe', name: 'John Doe' },
     { id: 'al', name: 'Al' },
     { id: 'al-neko', name: 'Al Neko' },
+  ])
+})
+
+test('merges a full scanned name into a first-name card identity', () => {
+  assert.deepEqual(mergeScannedCardCast(
+    [{ id: 'hailey-card', name: 'Hailey' }],
+    [
+      { cardId: 'hailey-card', name: 'Hailey Mercer' },
+      { cardId: 'hailey-card', name: 'Zuri Vale' },
+    ],
+  ), [
+    { id: 'hailey-card', name: 'Hailey Mercer / Hailey' },
+    { id: npcSpeakerId('Zuri Vale'), name: 'Zuri Vale / Zuri' },
+  ])
+})
+
+test('merges a first scanned name into a full-name card identity', () => {
+  assert.deepEqual(mergeScannedCardCast(
+    [{ id: 'hailey-card', name: 'Hailey Mercer' }],
+    [{ cardId: 'hailey-card', name: 'Hailey' }],
+  ), [
+    { id: 'hailey-card', name: 'Hailey Mercer / Hailey' },
   ])
 })
 
