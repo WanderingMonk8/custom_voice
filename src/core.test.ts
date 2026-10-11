@@ -518,6 +518,27 @@ test('does not treat a name addressed inside dialogue as the speaker', () => {
   ])
 })
 
+test('keeps an appositive speaker across stored rich-text variants', () => {
+  const speakers = [
+    { id: 'zuri', name: 'Zuri' },
+    { id: 'grace', name: 'Grace' },
+    { id: 'hailey', name: 'Hailey' },
+  ]
+  const variants = [
+    '"First." Zuri\'s hand relaxes. "Still Zuri."\n"Stop." Grace, dry from the headboard. "Take the gift, Zuri."',
+    '"First." Zuri\'s hand relaxes. "Still Zuri."\n\n"Stop." {Grace, dry from the headboard. "Take the gift, Zuri."',
+    '<font color="#f0f">"First."</font> Zuri\'s hand relaxes. <font color="#f0f">"Still Zuri."</font><br><br><font color="#0f0">"Stop."</font> Grace, dry from the headboard. <font color="#0f0">"Take the gift, Zuri."</font>',
+    '&lt;font color=&quot;#f0f&quot;&gt;"First."&lt;/font&gt; Zuri\'s hand relaxes. "Still Zuri."&lt;br&gt;&lt;br&gt;"Stop." Grace, dry from the headboard. "Take the gift, Zuri."',
+    '“First.” Zuri’s hand relaxes. “Still Zuri.”\n\n“Stop.” Grace, dry from the headboard. “Take the gift, Zuri.”',
+  ]
+  for (const content of variants) {
+    assert.deepEqual(
+      parseRosterVoiceSegments(content, 'zuri', speakers).filter(segment => segment.speakerId !== null).at(-1),
+      { text: 'Take the gift, Zuri.', speakerId: 'grace' },
+    )
+  }
+})
+
 test('alternates unresolved turns in a confidently seeded dialogue chain', () => {
   const segments = parseRosterVoiceSegments(
     '"It is working, but hear me first," Alma called down. "Receiving is clean."\n\n"One hop reaches who?" Vahn said.\n\n"The repeater broadcasts what it receives. A reply takes a person on the other end." A pause. "So we can send two sentences before going mute."\n\n"Then I understand."',

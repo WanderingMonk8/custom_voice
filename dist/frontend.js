@@ -194,6 +194,12 @@ function hasSpeakerMentions(mentions) {
 function soleMentionedSpeaker(text, speakers) {
   return preferredMentionedSpeaker(text, speakers, mentionedSpeakers(text, speakers));
 }
+function unambiguousNarrativeSpeaker(text, speakers) {
+  const mentions = mentionedSpeakers(text, speakers);
+  if (mentions.clean.size === 1) return [...mentions.clean][0];
+  if (mentions.clean.size === 0 && mentions.possessive.size === 1) return [...mentions.possessive][0];
+  return null;
+}
 function currentParagraphSpeaker(before, after, speakers) {
   let paragraphStart = 0;
   for (const match of before.matchAll(/\n[^\S\n]*\n/gu)) {
@@ -375,6 +381,7 @@ function parseRosterVoiceSegments(content, defaultSpeakerId, speakers) {
   const quotePattern = /["“]([\s\S]*?)["”]/g;
   const paragraphs = playbackParagraphs(playbackContent);
   const dialogueTurns = paragraphDialogueTurns(playbackContent, speakers, defaultSpeakerId);
+  const paragraphSpeakers = paragraphs.map((paragraph) => unambiguousNarrativeSpeaker(paragraph.text, speakers));
   let paragraphIndex = 0;
   let cursor = 0;
   let lastConfidentSpeakerId = null;
@@ -401,7 +408,7 @@ function parseRosterVoiceSegments(content, defaultSpeakerId, speakers) {
       const continuedSpeakerId = inference.source === "fallback" && continuationCandidate && canContinueSpeaker(bridge, continuationCandidate, speakers) ? continuationCandidate : null;
       const dialogueTurnSpeakerId = dialogueTurns.get(paragraphIndex) ?? null;
       const inferredTurnSpeakerId = inference.source === "history" || inference.source === "fallback" ? dialogueTurnSpeakerId : null;
-      const speakerId = inferredTurnSpeakerId ?? continuedSpeakerId ?? inference.speakerId;
+      const speakerId = paragraphSpeakers[paragraphIndex] ?? inferredTurnSpeakerId ?? continuedSpeakerId ?? inference.speakerId;
       result.push({
         text: speech,
         speakerId
