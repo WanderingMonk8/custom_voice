@@ -763,14 +763,14 @@ async function loadPlaybackPreferences() {
     saveGeneratedAudio: false,
     savedAudioLimit: DEFAULT_SAVED_AUDIO_LIMIT,
     skippedTrackerTags: "",
-    speakerParsingMode: "off",
+    speakerParsingMode: "ambiguous",
     llmConnectionId: "",
     llmModel: ""
   };
   const row = await response.json();
   const speed = typeof row.value?.ttsSpeed === "number" ? row.value.ttsSpeed : 1;
   const volume = typeof row.value?.ttsVolume === "number" ? row.value.ttsVolume : 1;
-  const speakerParsingMode = row.value?.chatVoiceSpeakerParsingMode === "ambiguous" || row.value?.chatVoiceSpeakerParsingMode === "always" ? row.value.chatVoiceSpeakerParsingMode : "off";
+  const speakerParsingMode = row.value?.chatVoiceSpeakerParsingMode === "off" || row.value?.chatVoiceSpeakerParsingMode === "always" ? row.value.chatVoiceSpeakerParsingMode : "ambiguous";
   return {
     speed: Math.min(4, Math.max(0.25, speed)),
     volume: Math.min(1, Math.max(0, volume)),
@@ -1174,7 +1174,7 @@ function setup(ctx) {
   let skippedTrackerTagsDirty = false;
   let savingSkippedTrackerTags = false;
   let skippedTrackerTagsSaveTimer = null;
-  let speakerParsingMode = "off";
+  let speakerParsingMode = "ambiguous";
   let llmConnections = [];
   let llmConnectionId = "";
   let llmModel = "";
@@ -1282,7 +1282,7 @@ function setup(ctx) {
     onChange: () => scheduleSkippedTrackerTagsSave()
   });
   const speakerParsingPicker = ctx.components.mountSelect(speakerParsingField.slot, {
-    value: "off",
+    value: "ambiguous",
     options: [
       { value: "off", label: "Off", sublabel: "Use the local parser only" },
       { value: "ambiguous", label: "Ambiguous only", sublabel: "Ask the LLM only when attribution is uncertain" },

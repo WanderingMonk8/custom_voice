@@ -56,7 +56,7 @@ The compiled frontend and backend bundles are committed under `dist/`, so users 
 2. Select **Voice** in the Lumiverse drawer.
 3. Click **Scan** to read the active character card and save its speaking cast.
 4. Optionally enter comma-separated paired tags under **Skipped tracker tags**, such as `<tracker></tracker>, <status></status>`. These global exclusions remove both the tags and everything enclosed by them before TTS generation.
-5. Optionally enable global **AI speaker review** for ambiguous dialogue or all dialogue. Choose an existing Lumiverse LLM connection and, if desired, enter a custom model name; both controls remain disabled while review is off.
+5. Global **AI speaker review** defaults to **Ambiguous only**. Choose an existing Lumiverse LLM connection and, if desired, enter a custom model name; both controls remain disabled if review is switched off.
 6. Choose one TTS connection for the chat.
 7. Enter the narrator voice and a voice for each detected character. Add characters manually, or rename and delete any roster entry as needed. Separate aliases with `/` (for example, `Scott / The sergeant`) to route every name to the same voice; use the rename button to add aliases later without losing the assigned voice.
 8. Optionally enable **Save generated audio** to attach completed recordings to messages across every chat. This global setting is off by default. Set **Maximum saved recordings** to control global retention (default: 50); the oldest extension-created attachments are removed first.

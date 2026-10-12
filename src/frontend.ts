@@ -275,17 +275,17 @@ async function loadPlaybackPreferences(): Promise<PlaybackPreferences> {
     saveGeneratedAudio: false,
     savedAudioLimit: DEFAULT_SAVED_AUDIO_LIMIT,
     skippedTrackerTags: '',
-    speakerParsingMode: 'off',
+    speakerParsingMode: 'ambiguous',
     llmConnectionId: '',
     llmModel: '',
   }
   const row = await response.json() as { value?: Record<string, unknown> }
   const speed = typeof row.value?.ttsSpeed === 'number' ? row.value.ttsSpeed : 1
   const volume = typeof row.value?.ttsVolume === 'number' ? row.value.ttsVolume : 1
-  const speakerParsingMode = row.value?.chatVoiceSpeakerParsingMode === 'ambiguous'
+  const speakerParsingMode = row.value?.chatVoiceSpeakerParsingMode === 'off'
     || row.value?.chatVoiceSpeakerParsingMode === 'always'
     ? row.value.chatVoiceSpeakerParsingMode
-    : 'off'
+    : 'ambiguous'
   return {
     speed: Math.min(4, Math.max(0.25, speed)),
     volume: Math.min(1, Math.max(0, volume)),
@@ -747,7 +747,7 @@ export function setup(ctx: SpindleFrontendContext) {
   let skippedTrackerTagsDirty = false
   let savingSkippedTrackerTags = false
   let skippedTrackerTagsSaveTimer: ReturnType<typeof setTimeout> | null = null
-  let speakerParsingMode: 'off' | 'ambiguous' | 'always' = 'off'
+  let speakerParsingMode: 'off' | 'ambiguous' | 'always' = 'ambiguous'
   let llmConnections: LlmConnection[] = []
   let llmConnectionId = ''
   let llmModel = ''
@@ -899,7 +899,7 @@ export function setup(ctx: SpindleFrontendContext) {
   })
 
   const speakerParsingPicker = ctx.components.mountSelect(speakerParsingField.slot, {
-    value: 'off',
+    value: 'ambiguous',
     options: [
       { value: 'off', label: 'Off', sublabel: 'Use the local parser only' },
       { value: 'ambiguous', label: 'Ambiguous only', sublabel: 'Ask the LLM only when attribution is uncertain' },
