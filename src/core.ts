@@ -990,6 +990,68 @@ function initialDialogueBackfill(
   return null
 }
 
+function confidentDialogueParagraphSpeaker(
+  content: string,
+  paragraph: PlaybackParagraph,
+  speakers: CharacterLike[],
+  defaultSpeakerId: string | null,
+): string | null {
+  const speakerIds = new Set<string>()
+  for (const match of paragraph.text.matchAll(/["“]([\s\S]*?)["”]/gu)) {
+    if (match.index === undefined) continue
+    const quoteStart = paragraph.start + match.index
+    const quoteEnd = quoteStart + match[0].length
+    const inference = inferQuotedSpeaker(
+      content.slice(0, quoteStart),
+      content.slice(quoteEnd),
+      match[1] ?? '',
+      speakers,
+      defaultSpeakerId,
+    )
+    if (inference.confident && inference.speakerId) speakerIds.add(inference.speakerId)
+  }
+  return speakerIds.size === 1 ? [...speakerIds][0] : null
+}
+
+/**
+ * Resolve an unattributed reply using strong evidence on both sides. The next
+ * paragraph must be narration-only and begin with a different, clear subject;
+ * a paragraph containing dialogue represents a new turn and cannot backfill.
+ */
+function downstreamNarrativeReplySpeakers(
+  content: string,
+  paragraphs: PlaybackParagraph[],
+  speakers: CharacterLike[],
+  defaultSpeakerId: string | null,
+): Map<number, string> {
+  const replies = new Map<number, string>()
+  for (let index = 1; index + 1 < paragraphs.length; index++) {
+    const previous = paragraphs[index - 1]
+    const current = paragraphs[index]
+    const next = paragraphs[index + 1]
+    if (!/["“][\s\S]*?["”]/u.test(previous.text)) continue
+    if (!/["“][\s\S]*?["”]/u.test(current.text)) continue
+    if (/["“][\s\S]*?["”]/u.test(next.text)) continue
+    if (cleanPlaybackText(narrativeOnly(current.text))) continue
+    if (hasSpeakerMentions(mentionedSpeakers(current.text, speakers))) continue
+
+    const previousSpeakerId = confidentDialogueParagraphSpeaker(
+      content,
+      previous,
+      speakers,
+      defaultSpeakerId,
+    )
+    if (!previousSpeakerId) continue
+
+    const nextMentions = mentionedSpeakers(next.text, speakers)
+    if (nextMentions.clean.size === 0) continue
+    const nextSpeakerId = discourseSubjectSpeaker(next.text, speakers, nextMentions.clean)
+    if (!nextSpeakerId || nextSpeakerId === previousSpeakerId) continue
+    replies.set(index, nextSpeakerId)
+  }
+  return replies
+}
+
 function hasSustainedUnnamedNarration(
   paragraphs: PlaybackParagraph[],
   startIndex: number,
@@ -1130,6 +1192,12 @@ export function parseRosterVoiceSegments(
   const paragraphs = playbackParagraphs(playbackContent)
   const openingBackfill = initialDialogueBackfill(paragraphs, speakers)
   const dialogueTurns = paragraphDialogueTurns(playbackContent, speakers, defaultSpeakerId)
+  const downstreamReplies = downstreamNarrativeReplySpeakers(
+    playbackContent,
+    paragraphs,
+    speakers,
+    defaultSpeakerId,
+  )
   const paragraphSpeakers = paragraphs.map(paragraph => (
     unambiguousNarrativeSpeaker(paragraph.text, speakers)
   ))
@@ -1170,6 +1238,7 @@ export function parseRosterVoiceSegments(
         ? openingBackfill.speakerId
         : null
       const speakerId: string | null = paragraphSpeakers[paragraphIndex]
+        ?? downstreamReplies.get(paragraphIndex)
         ?? inferredTurnSpeakerId
         ?? continuedSpeakerId
         ?? openingSpeakerId

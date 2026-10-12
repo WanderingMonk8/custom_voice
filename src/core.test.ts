@@ -491,6 +491,19 @@ test('does not use downstream backfill after a preceding character is establishe
   })
 })
 
+test('uses a downstream narrative subject for an ambiguous reply in a dialogue chain', () => {
+  const content = 'Tess glances toward the porch, then back to Ken. Her thumb hovers over the screen.\n\n"The badge is a standard guest selection, Sheriff." She pitches her voice to carry the ten yards. "Guest wants it, guest gets it. That is the arrangement."\n\n"Did not say he could not."\n\nColton closes the watch with a click and stands. Taller sitting than standing.'
+  const segments = parseRosterVoiceSegments(content, 'card', [
+    { id: 'tess', name: 'Tess' },
+    { id: 'ken', name: 'Ken' },
+    { id: 'colton', name: 'Colton' },
+    { id: 'card', name: 'Narrator Card' },
+  ])
+  assert.deepEqual(segments.find(segment => segment.text === 'Did not say he could not.'), {
+    text: 'Did not say he could not.', speakerId: 'colton',
+  })
+})
+
 test('anchors leading dialogue to the sole character in the preceding paragraph', () => {
   const content = 'Toggard rode the last hundred yards out ahead without being asked, dropped from the bay at the bank stones, and stood looking at the water a long moment before he came back.\n\n"It\'s up. The crossing is possible, but it is a ford you walk, not a ford you ride." He wiped his wet hands on his breeches. "There\'s flat ground back under the alders."'
   assert.deepEqual(

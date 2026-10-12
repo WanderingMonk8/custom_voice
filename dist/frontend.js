@@ -394,6 +394,49 @@ function initialDialogueBackfill(paragraphs, speakers) {
   }
   return null;
 }
+function confidentDialogueParagraphSpeaker(content, paragraph, speakers, defaultSpeakerId) {
+  const speakerIds = /* @__PURE__ */ new Set();
+  for (const match of paragraph.text.matchAll(/["“]([\s\S]*?)["”]/gu)) {
+    if (match.index === void 0) continue;
+    const quoteStart = paragraph.start + match.index;
+    const quoteEnd = quoteStart + match[0].length;
+    const inference = inferQuotedSpeaker(
+      content.slice(0, quoteStart),
+      content.slice(quoteEnd),
+      match[1] ?? "",
+      speakers,
+      defaultSpeakerId
+    );
+    if (inference.confident && inference.speakerId) speakerIds.add(inference.speakerId);
+  }
+  return speakerIds.size === 1 ? [...speakerIds][0] : null;
+}
+function downstreamNarrativeReplySpeakers(content, paragraphs, speakers, defaultSpeakerId) {
+  const replies = /* @__PURE__ */ new Map();
+  for (let index = 1; index + 1 < paragraphs.length; index++) {
+    const previous = paragraphs[index - 1];
+    const current = paragraphs[index];
+    const next = paragraphs[index + 1];
+    if (!/["“][\s\S]*?["”]/u.test(previous.text)) continue;
+    if (!/["“][\s\S]*?["”]/u.test(current.text)) continue;
+    if (/["“][\s\S]*?["”]/u.test(next.text)) continue;
+    if (cleanPlaybackText(narrativeOnly(current.text))) continue;
+    if (hasSpeakerMentions(mentionedSpeakers(current.text, speakers))) continue;
+    const previousSpeakerId = confidentDialogueParagraphSpeaker(
+      content,
+      previous,
+      speakers,
+      defaultSpeakerId
+    );
+    if (!previousSpeakerId) continue;
+    const nextMentions = mentionedSpeakers(next.text, speakers);
+    if (nextMentions.clean.size === 0) continue;
+    const nextSpeakerId = discourseSubjectSpeaker(next.text, speakers, nextMentions.clean);
+    if (!nextSpeakerId || nextSpeakerId === previousSpeakerId) continue;
+    replies.set(index, nextSpeakerId);
+  }
+  return replies;
+}
 function hasSustainedUnnamedNarration(paragraphs, startIndex, speakers) {
   let narrationLength = 0;
   for (let index = startIndex; index < paragraphs.length; index++) {
@@ -493,6 +536,12 @@ function parseRosterVoiceSegments(content, defaultSpeakerId, speakers) {
   const paragraphs = playbackParagraphs(playbackContent);
   const openingBackfill = initialDialogueBackfill(paragraphs, speakers);
   const dialogueTurns = paragraphDialogueTurns(playbackContent, speakers, defaultSpeakerId);
+  const downstreamReplies = downstreamNarrativeReplySpeakers(
+    playbackContent,
+    paragraphs,
+    speakers,
+    defaultSpeakerId
+  );
   const paragraphSpeakers = paragraphs.map((paragraph) => unambiguousNarrativeSpeaker(paragraph.text, speakers));
   let paragraphIndex = 0;
   let cursor = 0;
@@ -521,7 +570,7 @@ function parseRosterVoiceSegments(content, defaultSpeakerId, speakers) {
       const dialogueTurnSpeakerId = dialogueTurns.get(paragraphIndex) ?? null;
       const inferredTurnSpeakerId = inference.source === "history" || inference.source === "fallback" ? dialogueTurnSpeakerId : null;
       const openingSpeakerId = inference.source === "fallback" && openingBackfill?.paragraphIndexes.has(paragraphIndex) ? openingBackfill.speakerId : null;
-      const speakerId = paragraphSpeakers[paragraphIndex] ?? inferredTurnSpeakerId ?? continuedSpeakerId ?? openingSpeakerId ?? inference.speakerId;
+      const speakerId = paragraphSpeakers[paragraphIndex] ?? downstreamReplies.get(paragraphIndex) ?? inferredTurnSpeakerId ?? continuedSpeakerId ?? openingSpeakerId ?? inference.speakerId;
       result.push({
         text: speech,
         speakerId
