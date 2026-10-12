@@ -2,6 +2,16 @@ export const CONFIG_KEY = 'chat_voice'
 export const DEFAULT_MESSAGE_LIMIT = 20
 export const MIN_MESSAGE_LIMIT = 1
 export const MAX_MESSAGE_LIMIT = 500
+export const DEFAULT_SAVED_AUDIO_LIMIT = 50
+export const MAX_SAVED_AUDIO_LIMIT = 10_000
+
+export interface SavedAudioRecord {
+  chatId: string
+  messageId: string
+  audioId: string
+  swipeId: number
+  savedAt: number
+}
 
 export interface VoiceRef {
   connectionId: string
@@ -171,6 +181,56 @@ export function clampMessageLimit(value: unknown): number {
   const numeric = typeof value === 'number' ? value : Number(value)
   if (!Number.isFinite(numeric)) return DEFAULT_MESSAGE_LIMIT
   return Math.min(MAX_MESSAGE_LIMIT, Math.max(MIN_MESSAGE_LIMIT, Math.round(numeric)))
+}
+
+export function clampSavedAudioLimit(value: unknown): number {
+  const numeric = typeof value === 'number' ? value : Number(value)
+  if (!Number.isFinite(numeric)) return DEFAULT_SAVED_AUDIO_LIMIT
+  return Math.min(MAX_SAVED_AUDIO_LIMIT, Math.max(1, Math.round(numeric)))
+}
+
+export function readSavedAudioHistory(value: unknown): SavedAudioRecord[] {
+  if (!Array.isArray(value)) return []
+  const records: SavedAudioRecord[] = []
+  const seenAudioIds = new Set<string>()
+  for (const item of value.slice(-MAX_SAVED_AUDIO_LIMIT)) {
+    if (!isRecord(item)) continue
+    const chatId = typeof item.chatId === 'string' ? item.chatId : ''
+    const messageId = typeof item.messageId === 'string' ? item.messageId : ''
+    const audioId = typeof item.audioId === 'string' ? item.audioId : ''
+    const swipeId = typeof item.swipeId === 'number' ? Math.max(0, Math.round(item.swipeId)) : NaN
+    const savedAt = typeof item.savedAt === 'number' ? item.savedAt : NaN
+    if (!chatId || !messageId || !audioId || !Number.isFinite(swipeId) || !Number.isFinite(savedAt)) continue
+    if (seenAudioIds.has(audioId)) continue
+    seenAudioIds.add(audioId)
+    records.push({ chatId, messageId, audioId, swipeId, savedAt })
+  }
+  return records
+}
+
+export function upsertSavedAudioRecord(
+  records: SavedAudioRecord[],
+  next: SavedAudioRecord,
+): SavedAudioRecord[] {
+  return [
+    ...records.filter(record => (
+      record.audioId !== next.audioId
+      && !(record.chatId === next.chatId
+        && record.messageId === next.messageId
+        && record.swipeId === next.swipeId)
+    )),
+    next,
+  ]
+}
+
+export function expiredSavedAudioRecords(
+  records: SavedAudioRecord[],
+  limit: number,
+): SavedAudioRecord[] {
+  const overflow = Math.max(0, records.length - clampSavedAudioLimit(limit))
+  return [...records]
+    .sort((left, right) => left.savedAt - right.savedAt)
+    .slice(0, overflow)
 }
 
 export function readVoiceRef(value: unknown): VoiceRef | null {

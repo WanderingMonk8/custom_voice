@@ -5,8 +5,10 @@ import {
   mergeScannedCardCast,
   applyConfigToMetadata,
   clampMessageLimit,
+  clampSavedAudioLimit,
   detectCharacters,
   encodeConcatenatedWav,
+  expiredSavedAudioRecords,
   hashMessageContent,
   mergeVoicePlan,
   npcSpeakerId,
@@ -15,7 +17,9 @@ import {
   parseMultiVoiceSegments,
   parseRosterVoiceSegments,
   readConfig,
+  readSavedAudioHistory,
   speakerAliases,
+  upsertSavedAudioRecord,
   type ChatVoiceConfig,
 } from './core'
 
@@ -68,6 +72,25 @@ test('clamps the configurable message window', () => {
   assert.equal(clampMessageLimit(0), 1)
   assert.equal(clampMessageLimit(20.4), 20)
   assert.equal(clampMessageLimit(999), 500)
+})
+
+test('defaults and clamps the global saved audio limit', () => {
+  assert.equal(clampSavedAudioLimit(undefined), 50)
+  assert.equal(clampSavedAudioLimit(0), 1)
+  assert.equal(clampSavedAudioLimit('75'), 75)
+  assert.equal(clampSavedAudioLimit(50_000), 10_000)
+})
+
+test('replaces a saved swipe record and expires the oldest recordings', () => {
+  const original = readSavedAudioHistory([
+    { chatId: 'chat', messageId: 'one', audioId: 'old-one', swipeId: 0, savedAt: 10 },
+    { chatId: 'chat', messageId: 'two', audioId: 'two', swipeId: 0, savedAt: 20 },
+  ])
+  const history = upsertSavedAudioRecord(original, {
+    chatId: 'chat', messageId: 'one', audioId: 'new-one', swipeId: 0, savedAt: 30,
+  })
+  assert.deepEqual(history.map(record => record.audioId), ['two', 'new-one'])
+  assert.deepEqual(expiredSavedAudioRecords(history, 1).map(record => record.audioId), ['two'])
 })
 
 test('detects recent assistant speakers and ignores user messages', () => {

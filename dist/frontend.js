@@ -1,4 +1,6 @@
 // src/core.ts
+var DEFAULT_SAVED_AUDIO_LIMIT = 50;
+var MAX_SAVED_AUDIO_LIMIT = 1e4;
 function encodeConcatenatedWav(segments) {
   const usable = segments.filter((segment) => Number.isFinite(segment.sampleRate) && segment.sampleRate > 0 && segment.channels.length > 0 && segment.channels.some((channel) => channel.length > 0));
   if (usable.length === 0) throw new Error("No decoded audio is available to save.");
@@ -67,6 +69,42 @@ function mergeVoicePlan(segments) {
     }
   }
   return result;
+}
+function isRecord(value) {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
+function clampSavedAudioLimit(value) {
+  const numeric = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(numeric)) return DEFAULT_SAVED_AUDIO_LIMIT;
+  return Math.min(MAX_SAVED_AUDIO_LIMIT, Math.max(1, Math.round(numeric)));
+}
+function readSavedAudioHistory(value) {
+  if (!Array.isArray(value)) return [];
+  const records = [];
+  const seenAudioIds = /* @__PURE__ */ new Set();
+  for (const item of value.slice(-MAX_SAVED_AUDIO_LIMIT)) {
+    if (!isRecord(item)) continue;
+    const chatId = typeof item.chatId === "string" ? item.chatId : "";
+    const messageId = typeof item.messageId === "string" ? item.messageId : "";
+    const audioId = typeof item.audioId === "string" ? item.audioId : "";
+    const swipeId = typeof item.swipeId === "number" ? Math.max(0, Math.round(item.swipeId)) : NaN;
+    const savedAt = typeof item.savedAt === "number" ? item.savedAt : NaN;
+    if (!chatId || !messageId || !audioId || !Number.isFinite(swipeId) || !Number.isFinite(savedAt)) continue;
+    if (seenAudioIds.has(audioId)) continue;
+    seenAudioIds.add(audioId);
+    records.push({ chatId, messageId, audioId, swipeId, savedAt });
+  }
+  return records;
+}
+function upsertSavedAudioRecord(records, next) {
+  return [
+    ...records.filter((record) => record.audioId !== next.audioId && !(record.chatId === next.chatId && record.messageId === next.messageId && record.swipeId === next.swipeId)),
+    next
+  ];
+}
+function expiredSavedAudioRecords(records, limit) {
+  const overflow = Math.max(0, records.length - clampSavedAudioLimit(limit));
+  return [...records].sort((left, right) => left.savedAt - right.savedAt).slice(0, overflow);
 }
 function normalizeSpeakerName(value) {
   return value.normalize("NFKC").trim().replace(/\s+/g, " ");
@@ -535,7 +573,13 @@ async function loadPlaybackPreferences() {
     credentials: "same-origin",
     headers: { Accept: "application/json" }
   });
-  if (!response.ok) return { speed: 1, volume: 1, connectionId: "", saveGeneratedAudio: false };
+  if (!response.ok) return {
+    speed: 1,
+    volume: 1,
+    connectionId: "",
+    saveGeneratedAudio: false,
+    savedAudioLimit: DEFAULT_SAVED_AUDIO_LIMIT
+  };
   const row = await response.json();
   const speed = typeof row.value?.ttsSpeed === "number" ? row.value.ttsSpeed : 1;
   const volume = typeof row.value?.ttsVolume === "number" ? row.value.ttsVolume : 1;
@@ -543,7 +587,8 @@ async function loadPlaybackPreferences() {
     speed: Math.min(4, Math.max(0.25, speed)),
     volume: Math.min(1, Math.max(0, volume)),
     connectionId: typeof row.value?.ttsConnectionId === "string" ? row.value.ttsConnectionId.trim() : "",
-    saveGeneratedAudio: row.value?.chatVoiceSaveGeneratedAudio === true
+    saveGeneratedAudio: row.value?.chatVoiceSaveGeneratedAudio === true,
+    savedAudioLimit: clampSavedAudioLimit(row.value?.chatVoiceSavedAudioLimit)
   };
 }
 var voiceSettingsWriteQueue = Promise.resolve();
@@ -572,6 +617,44 @@ function saveGeneratedAudioPreference(enabled) {
     ...current,
     chatVoiceSaveGeneratedAudio: enabled
   }));
+}
+function saveGeneratedAudioLimit(limit) {
+  return updateVoiceSettings((current) => ({
+    ...current,
+    chatVoiceSavedAudioLimit: clampSavedAudioLimit(limit)
+  }));
+}
+async function deleteSavedAudioRecord(record) {
+  const response = await fetch(
+    `/api/v1/chats/${encodeURIComponent(record.chatId)}/messages/${encodeURIComponent(record.messageId)}/attachments/${encodeURIComponent(record.audioId)}`,
+    { method: "DELETE", credentials: "same-origin", headers: { Accept: "application/json" } }
+  );
+  return response.ok || response.status === 404;
+}
+async function enforceSavedAudioRetention(nextRecord) {
+  let expired = [];
+  await updateVoiceSettings((current) => {
+    const limit = clampSavedAudioLimit(current.chatVoiceSavedAudioLimit);
+    const history = nextRecord ? upsertSavedAudioRecord(readSavedAudioHistory(current.chatVoiceSavedAudioHistory), nextRecord) : readSavedAudioHistory(current.chatVoiceSavedAudioHistory);
+    expired = expiredSavedAudioRecords(history, limit);
+    return { ...current, chatVoiceSavedAudioHistory: history };
+  });
+  if (expired.length === 0) return 0;
+  const deletedAudioIds = [];
+  for (const record of expired) {
+    if (await deleteSavedAudioRecord(record)) deletedAudioIds.push(record.audioId);
+  }
+  if (deletedAudioIds.length > 0) {
+    const deleted = new Set(deletedAudioIds);
+    await updateVoiceSettings((current) => ({
+      ...current,
+      chatVoiceSavedAudioHistory: readSavedAudioHistory(current.chatVoiceSavedAudioHistory).filter((record) => !deleted.has(record.audioId))
+    }));
+  }
+  if (deletedAudioIds.length !== expired.length) {
+    throw new Error("Some older recordings could not be removed; cleanup will retry after the next save.");
+  }
+  return deletedAudioIds.length;
 }
 function abortableDelay(milliseconds, signal) {
   if (milliseconds <= 0) return Promise.resolve();
@@ -720,6 +803,14 @@ function setup(ctx) {
     .chat-voice-toggle input { margin:2px 0 0; accent-color:var(--lumiverse-accent, #7c6df2); }
     .chat-voice-toggle-copy { display:flex; flex-direction:column; gap:2px; }
     .chat-voice-toggle-hint { color:var(--lumiverse-text-muted); font-size:11px; line-height:1.4; }
+    .chat-voice-storage { display:flex; flex-direction:column; gap:9px; }
+    .chat-voice-retention { display:flex; align-items:center; justify-content:space-between; gap:12px; }
+    .chat-voice-retention-copy { color:var(--lumiverse-text-muted); font-size:11px; line-height:1.4; }
+    .chat-voice-retention-input {
+      width:82px; min-height:34px; box-sizing:border-box; padding:6px 9px;
+      border:1px solid var(--lumiverse-border); border-radius:var(--lumiverse-radius);
+      background:var(--lumiverse-fill-subtle); color:var(--lumiverse-text); font:inherit;
+    }
     .chat-voice-section-title {
       margin:2px 0 0; color:var(--lumiverse-text); font-size:13px; font-weight:700;
     }
@@ -782,6 +873,7 @@ function setup(ctx) {
   }
   const connectionField = createField("TTS connection");
   const saveAudioField = createField("Audio storage");
+  saveAudioField.slot.className = "chat-voice-storage";
   const saveAudioLabel = document.createElement("label");
   saveAudioLabel.className = "chat-voice-toggle";
   const saveAudioToggle = document.createElement("input");
@@ -797,7 +889,21 @@ function setup(ctx) {
   saveAudioHint.textContent = "Attach completed recordings to messages. Disabled by default.";
   saveAudioCopy.append(saveAudioText, saveAudioHint);
   saveAudioLabel.append(saveAudioToggle, saveAudioCopy);
-  saveAudioField.slot.append(saveAudioLabel);
+  const saveAudioRetention = document.createElement("label");
+  saveAudioRetention.className = "chat-voice-retention";
+  const saveAudioRetentionCopy = document.createElement("span");
+  saveAudioRetentionCopy.className = "chat-voice-retention-copy";
+  saveAudioRetentionCopy.textContent = "Maximum saved recordings";
+  const saveAudioLimitInput = document.createElement("input");
+  saveAudioLimitInput.className = "chat-voice-retention-input";
+  saveAudioLimitInput.type = "number";
+  saveAudioLimitInput.min = "1";
+  saveAudioLimitInput.max = "10000";
+  saveAudioLimitInput.step = "1";
+  saveAudioLimitInput.value = String(DEFAULT_SAVED_AUDIO_LIMIT);
+  saveAudioLimitInput.setAttribute("aria-label", "Maximum saved recordings");
+  saveAudioRetention.append(saveAudioRetentionCopy, saveAudioLimitInput);
+  saveAudioField.slot.append(saveAudioLabel, saveAudioRetention);
   const scanField = createField("Character card cast");
   const scanRow = scanField.slot;
   scanRow.className = "chat-voice-scan-row";
@@ -847,7 +953,9 @@ function setup(ctx) {
   let connections = [];
   let lumiverseConnectionId = "";
   let saveGeneratedAudio = false;
+  let savedAudioLimit = DEFAULT_SAVED_AUDIO_LIMIT;
   let savingAudioPreference = false;
+  let savingAudioLimit = false;
   let saveTimer = null;
   let editRevision = 0;
   let dirty = false;
@@ -1242,6 +1350,20 @@ function setup(ctx) {
               }
             }
           );
+          const savedAudioId = saved.audio?.id;
+          if (savedAudioId) {
+            try {
+              await enforceSavedAudioRetention({
+                chatId: playbackChat.id,
+                messageId,
+                audioId: savedAudioId,
+                swipeId: saved.swipe_id ?? message.swipe_id ?? 0,
+                savedAt: Date.now()
+              });
+            } catch (error) {
+              console.warn("[Chat Voice] Saved audio retention cleanup failed.", error);
+            }
+          }
           playback.persistenceState = "saved";
           console.info("[Chat Voice] Saved generated message audio.", {
             messageId,
@@ -1500,6 +1622,10 @@ function setup(ctx) {
         saveGeneratedAudio = preferences.saveGeneratedAudio;
         saveAudioToggle.checked = saveGeneratedAudio;
       }
+      if (!savingAudioLimit) {
+        savedAudioLimit = preferences.savedAudioLimit;
+        saveAudioLimitInput.value = String(savedAudioLimit);
+      }
       lumiverseConnectionId = connections.some((connection) => connection.id === preferences.connectionId) ? preferences.connectionId : connections.find((connection) => connection.is_default)?.id ?? "";
       const selectedConnectionId = activeChat?.connectionId || lumiverseConnectionId;
       connectionPicker.update({
@@ -1537,6 +1663,40 @@ function setup(ctx) {
       saveAudioToggle.disabled = false;
     }
   };
+  const onSaveAudioLimitChanged = async () => {
+    const previous = savedAudioLimit;
+    const limit = clampSavedAudioLimit(saveAudioLimitInput.value);
+    savedAudioLimit = limit;
+    saveAudioLimitInput.value = String(limit);
+    savingAudioLimit = true;
+    saveAudioLimitInput.disabled = true;
+    setStatus("Saving global recording limit\u2026");
+    try {
+      await saveGeneratedAudioLimit(limit);
+    } catch (error) {
+      savedAudioLimit = previous;
+      saveAudioLimitInput.value = String(previous);
+      setStatus(error instanceof Error ? error.message : "Could not update the recording limit.", "error");
+      savingAudioLimit = false;
+      saveAudioLimitInput.disabled = false;
+      return;
+    }
+    try {
+      const deleted = await enforceSavedAudioRetention();
+      setStatus(
+        deleted > 0 ? `Saved recording limit updated; removed ${deleted} old recording${deleted === 1 ? "" : "s"}.` : "Saved recording limit updated.",
+        "saved"
+      );
+    } catch (error) {
+      setStatus(
+        `Recording limit saved, but cleanup failed: ${error instanceof Error ? error.message : "Unknown error."}`,
+        "error"
+      );
+    } finally {
+      savingAudioLimit = false;
+      saveAudioLimitInput.disabled = false;
+    }
+  };
   const onNativeContextMenu = (event) => {
     const target = event.target && typeof event.target.closest === "function" ? event.target : null;
     lastContextMessageId = target?.closest("[data-message-id]")?.dataset.messageId ?? null;
@@ -1559,6 +1719,7 @@ function setup(ctx) {
   hostWindow.addEventListener("contextmenu", onNativeContextMenu, true);
   hostWindow.addEventListener("click", onNativeTtsClick, true);
   saveAudioToggle.addEventListener("change", onSaveAudioChanged);
+  saveAudioLimitInput.addEventListener("change", onSaveAudioLimitChanged);
   hostWindow.requestAnimationFrame(updatePlaybackButtons);
   const unsubscribeBackend = ctx.onBackendMessage((rawPayload) => {
     const payload = rawPayload;
@@ -1680,6 +1841,7 @@ function setup(ctx) {
     addNpcInputSlot.removeEventListener("keydown", onAddNpcKeyDown);
     scanButton.removeEventListener("click", scanMessages);
     saveAudioToggle.removeEventListener("change", onSaveAudioChanged);
+    saveAudioLimitInput.removeEventListener("change", onSaveAudioLimitChanged);
     hostWindow.removeEventListener("contextmenu", onNativeContextMenu, true);
     hostWindow.removeEventListener("click", onNativeTtsClick, true);
     restoreNativePlaybackButtons();
