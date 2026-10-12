@@ -504,17 +504,20 @@ test('uses a downstream narrative subject for an ambiguous reply in a dialogue c
   })
 })
 
-test('lets a clear downstream subject win across ambiguous intervening narration', () => {
-  const content = 'Tess studies the screen.\n\n"The outfit is real. Long duster, wool shirt, leather vest, boots, hat. All weathered. The star is hand-pinned tin—it looks old because it is." She taps the screen twice. "The coat and the star are with the Sheriff. He keeps the spares in the office."\n\nFrom the general store across the way, a shopkeeper in a leather apron comes out carrying a gun belt coiled over one forearm and a wooden case. He crosses the street without a word and sets both at Ken\'s feet, then touches the brim of his hat and walks back.\n\n"Coat is in the office. Been worn before—but it will fit."\n\nColton stands in the open doorway now, one hand on the frame, waiting.'
-  const segments = parseRosterVoiceSegments(content, 'card', [
+test('keeps dialogue with a configured role named in the preceding paragraph', () => {
+  const content = 'Tess studies the screen.\n\n"The coat and the star are with the Sheriff."\n\nFrom the general store across the way, a shopkeeper in a leather apron comes out carrying a wooden case. He crosses the street and sets it at Ken\'s feet, then walks back.\n\n"Coat is in the office. Been worn before—but it will fit."\n\nColton stands in the open doorway now, waiting.\n\n"Well? You coming or not?"'
+  const segments = parseRosterVoiceSegments(content, 'tess', [
     { id: 'tess', name: 'Tess' },
     { id: 'ken', name: 'Ken' },
+    { id: 'shopkeeper', name: 'Shopkeeper' },
     { id: 'colton', name: 'Colton' },
-    { id: 'card', name: 'Narrator Card' },
   ])
   assert.deepEqual(
-    segments.find(segment => segment.text === 'Coat is in the office. Been worn before—but it will fit.'),
-    { text: 'Coat is in the office. Been worn before—but it will fit.', speakerId: 'colton' },
+    segments.filter(segment => segment.speakerId !== null).slice(-2),
+    [
+      { text: 'Coat is in the office. Been worn before—but it will fit.', speakerId: 'shopkeeper' },
+      { text: 'Well? You coming or not?', speakerId: 'colton' },
+    ],
   )
 })
 
