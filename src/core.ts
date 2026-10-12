@@ -1013,6 +1013,29 @@ function confidentDialogueParagraphSpeaker(
   return speakerIds.size === 1 ? [...speakerIds][0] : null
 }
 
+function upstreamDialogueSpeakerAcrossAmbiguousNarration(
+  content: string,
+  paragraphs: PlaybackParagraph[],
+  startIndex: number,
+  speakers: CharacterLike[],
+  defaultSpeakerId: string | null,
+): string | null {
+  for (let index = startIndex; index >= 0; index--) {
+    const paragraph = paragraphs[index]
+    if (/["“][\s\S]*?["”]/u.test(paragraph.text)) {
+      return confidentDialogueParagraphSpeaker(content, paragraph, speakers, defaultSpeakerId)
+    }
+    const mentions = mentionedSpeakers(paragraph.text, speakers)
+    if (
+      mentions.clean.size > 0
+      && discourseSubjectSpeaker(paragraph.text, speakers, mentions.clean)
+    ) {
+      return null
+    }
+  }
+  return null
+}
+
 /**
  * Resolve an unattributed reply using strong evidence on both sides. The next
  * paragraph must be narration-only and begin with a different, clear subject;
@@ -1026,18 +1049,17 @@ function downstreamNarrativeReplySpeakers(
 ): Map<number, string> {
   const replies = new Map<number, string>()
   for (let index = 1; index + 1 < paragraphs.length; index++) {
-    const previous = paragraphs[index - 1]
     const current = paragraphs[index]
     const next = paragraphs[index + 1]
-    if (!/["“][\s\S]*?["”]/u.test(previous.text)) continue
     if (!/["“][\s\S]*?["”]/u.test(current.text)) continue
     if (/["“][\s\S]*?["”]/u.test(next.text)) continue
     if (cleanPlaybackText(narrativeOnly(current.text))) continue
     if (hasSpeakerMentions(mentionedSpeakers(current.text, speakers))) continue
 
-    const previousSpeakerId = confidentDialogueParagraphSpeaker(
+    const previousSpeakerId = upstreamDialogueSpeakerAcrossAmbiguousNarration(
       content,
-      previous,
+      paragraphs,
+      index - 1,
       speakers,
       defaultSpeakerId,
     )
