@@ -746,14 +746,18 @@ export function setup(ctx: SpindleFrontendContext) {
     status.dataset.state = state
   }
 
-  function nativeTtsMessageId(button: HTMLButtonElement): string | null {
-    if (button.closest('[data-spindle-extension-root]')) return null
-    const known = button.dataset.chatVoiceNativeTts === 'true'
-    const label = [
+  function nativeTtsButtonLabel(button: HTMLButtonElement): string {
+    return [
       button.getAttribute('title'),
       button.getAttribute('aria-label'),
       button.textContent,
     ].filter(Boolean).join(' ').toLowerCase()
+  }
+
+  function nativeTtsMessageId(button: HTMLButtonElement): string | null {
+    if (button.closest('[data-spindle-extension-root]')) return null
+    const known = button.dataset.chatVoiceNativeTts === 'true'
+    const label = nativeTtsButtonLabel(button)
     const iconClass = button.querySelector('svg')?.getAttribute('class')?.toLowerCase() ?? ''
     const hasNativeTtsIcon = iconClass.includes('volume-2')
       || iconClass.includes('volume2')
@@ -1015,7 +1019,7 @@ export function setup(ctx: SpindleFrontendContext) {
     })
   }
 
-  async function playMessage(messageId: string): Promise<void> {
+  async function playMessage(messageId: string, nativeRegenerationAction = false): Promise<void> {
     if (activePlayback?.messageId === messageId) {
       const finishingSave = stopPlayback()
       setStatus(finishingSave ? 'Playback stopped; finishing saved audio…' : 'Playback stopped.')
@@ -1036,7 +1040,7 @@ export function setup(ctx: SpindleFrontendContext) {
     }
     if (ctx.getActiveChat().chatId !== requestedChatId) return
 
-    const regeneratingSavedAudio = hasSavedAudioForCurrentSwipe(message)
+    const regeneratingSavedAudio = nativeRegenerationAction || hasSavedAudioForCurrentSwipe(message)
     if (regeneratingSavedAudio) {
       const { confirmed } = await ctx.ui.showConfirm({
         title: 'Regenerate TTS audio?',
@@ -1609,7 +1613,8 @@ export function setup(ctx: SpindleFrontendContext) {
     if (button.parentElement?.parentElement === button.ownerDocument.body) {
       hostDocument.dispatchEvent(new hostWindow.KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
     }
-    void playMessage(messageId)
+    const nativeRegenerationAction = /regenerate.+audio/.test(nativeTtsButtonLabel(button))
+    void playMessage(messageId, nativeRegenerationAction)
   }
 
   hostWindow.addEventListener('contextmenu', onNativeContextMenu, true)

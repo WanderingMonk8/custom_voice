@@ -1065,14 +1065,17 @@ function setup(ctx) {
     status.textContent = message;
     status.dataset.state = state;
   };
-  function nativeTtsMessageId(button) {
-    if (button.closest("[data-spindle-extension-root]")) return null;
-    const known = button.dataset.chatVoiceNativeTts === "true";
-    const label = [
+  function nativeTtsButtonLabel(button) {
+    return [
       button.getAttribute("title"),
       button.getAttribute("aria-label"),
       button.textContent
     ].filter(Boolean).join(" ").toLowerCase();
+  }
+  function nativeTtsMessageId(button) {
+    if (button.closest("[data-spindle-extension-root]")) return null;
+    const known = button.dataset.chatVoiceNativeTts === "true";
+    const label = nativeTtsButtonLabel(button);
     const iconClass = button.querySelector("svg")?.getAttribute("class")?.toLowerCase() ?? "";
     const hasNativeTtsIcon = iconClass.includes("volume-2") || iconClass.includes("volume2") || iconClass.includes("volume-high");
     const hasNativeTtsLabel = /\btts\b|text[ -]to[ -]speech|stop playback|regenerate.+audio/.test(label);
@@ -1309,7 +1312,7 @@ function setup(ctx) {
       return attachment.type === "audio" && (attachment.swipe_id === void 0 || attachment.swipe_id === message.swipe_id);
     });
   }
-  async function playMessage(messageId) {
+  async function playMessage(messageId, nativeRegenerationAction = false) {
     if (activePlayback?.messageId === messageId) {
       const finishingSave = stopPlayback();
       setStatus(finishingSave ? "Playback stopped; finishing saved audio\u2026" : "Playback stopped.");
@@ -1328,7 +1331,7 @@ function setup(ctx) {
       return;
     }
     if (ctx.getActiveChat().chatId !== requestedChatId) return;
-    const regeneratingSavedAudio = hasSavedAudioForCurrentSwipe(message);
+    const regeneratingSavedAudio = nativeRegenerationAction || hasSavedAudioForCurrentSwipe(message);
     if (regeneratingSavedAudio) {
       const { confirmed } = await ctx.ui.showConfirm({
         title: "Regenerate TTS audio?",
@@ -1841,7 +1844,8 @@ function setup(ctx) {
     if (button.parentElement?.parentElement === button.ownerDocument.body) {
       hostDocument.dispatchEvent(new hostWindow.KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
     }
-    void playMessage(messageId);
+    const nativeRegenerationAction = /regenerate.+audio/.test(nativeTtsButtonLabel(button));
+    void playMessage(messageId, nativeRegenerationAction);
   };
   hostWindow.addEventListener("contextmenu", onNativeContextMenu, true);
   hostWindow.addEventListener("click", onNativeTtsClick, true);
