@@ -43,6 +43,12 @@ interface SynthesisPacer {
   startQueue: Promise<void>
 }
 
+interface RateLimitBudget {
+  blockedUntil: number
+  cumulativeWaitMs: number
+  consecutiveResponses: number
+}
+
 interface VoiceGateWaiter {
   voice: string
   signal: AbortSignal
@@ -125,7 +131,7 @@ class ConnectionVoiceGate {
 }
 
 const MIN_SYNTHESIS_START_INTERVAL_MS = 1_250
-const MAX_RATE_LIMIT_RETRIES = 3
+const MAX_CUMULATIVE_RATE_LIMIT_WAIT_MS = 60_000
 const DEFAULT_PLAYBACK_BUFFER_SEGMENTS = 2
 const DEFAULT_CONCURRENT_GENERATIONS = 2
 const MAX_PLAYBACK_BUFFER_SEGMENTS = 20
@@ -487,10 +493,11 @@ async function synthesizeVoiceSegment(
   speed: number,
   signal: AbortSignal,
   pacer: SynthesisPacer,
+  rateLimitBudget: RateLimitBudget,
   voiceGate: ConnectionVoiceGate,
-  onRateLimit: (delayMs: number, retry: number) => void,
+  onRateLimit: (delayMs: number, cumulativeWaitMs: number) => void,
 ): Promise<SynthesizedVoiceSegment> {
-  for (let attempt = 0; ; attempt += 1) {
+  while (true) {
     const releaseVoice = await voiceGate.acquire(voice, signal)
     let response: Response
     try {
@@ -511,16 +518,30 @@ async function synthesizeVoiceSegment(
       releaseVoice()
     }
     if (response.ok) {
+      rateLimitBudget.consecutiveResponses = 0
       return {
         data: await response.arrayBuffer(),
         mime: response.headers.get('content-type') || 'audio/mpeg',
       }
     }
-    if (response.status === 429 && attempt < MAX_RATE_LIMIT_RETRIES) {
-      const retryDelay = retryAfterMilliseconds(response.headers.get('Retry-After'))
-        ?? Math.min(15_000, 2_000 * (2 ** attempt))
-      pacer.nextStartAt = Math.max(pacer.nextStartAt, Date.now() + retryDelay)
-      onRateLimit(retryDelay, attempt + 1)
+    if (response.status === 429) {
+      const now = Date.now()
+      const requestedDelay = retryAfterMilliseconds(response.headers.get('Retry-After'))
+        ?? Math.min(15_000, 2_000 * (2 ** rateLimitBudget.consecutiveResponses))
+      rateLimitBudget.consecutiveResponses += 1
+      const currentBlockEnd = Math.max(now, rateLimitBudget.blockedUntil)
+      const desiredBlockEnd = now + requestedDelay
+      const requestedExtension = Math.max(0, desiredBlockEnd - currentBlockEnd)
+      const remainingBudget = MAX_CUMULATIVE_RATE_LIMIT_WAIT_MS - rateLimitBudget.cumulativeWaitMs
+      if (remainingBudget <= 0 && requestedExtension > 0) {
+        throw new Error('TTS rate limiting continued for one minute. Try playback again in a moment.')
+      }
+      const addedWait = Math.min(requestedExtension, Math.max(0, remainingBudget))
+      rateLimitBudget.cumulativeWaitMs += addedWait
+      rateLimitBudget.blockedUntil = currentBlockEnd + addedWait
+      const retryDelay = Math.max(0, rateLimitBudget.blockedUntil - now)
+      pacer.nextStartAt = Math.max(pacer.nextStartAt, rateLimitBudget.blockedUntil)
+      onRateLimit(retryDelay, rateLimitBudget.cumulativeWaitMs)
       continue
     }
     const detail = await response.text().catch(() => '')
@@ -1447,6 +1468,11 @@ export function setup(ctx: SpindleFrontendContext) {
       if (plan.length === 0) throw new Error('This message has no playable narration or dialogue.')
 
       const synthesisController = new AbortController()
+      const rateLimitBudget: RateLimitBudget = {
+        blockedUntil: 0,
+        cumulativeWaitMs: 0,
+        consecutiveResponses: 0,
+      }
       playback.synthesisController = synthesisController
       backgroundSynthesisControllers.add(synthesisController)
       type PreparedSegment =
@@ -1461,14 +1487,18 @@ export function setup(ctx: SpindleFrontendContext) {
             preferences.speed,
             synthesisController.signal,
             sharedSynthesisPacer,
+            rateLimitBudget,
             connectionVoiceGates.get(connectionId) ?? (() => {
               const gate = new ConnectionVoiceGate()
               connectionVoiceGates.set(connectionId, gate)
               return gate
             })(),
-            (delayMs, retry) => {
+            (delayMs, cumulativeWaitMs) => {
               if (ctx.getActiveChat().chatId === playbackChat.id && (!activePlayback || activePlayback === playback)) {
-                setStatus(`Rate limited; retry ${retry} in ${Math.max(1, Math.ceil(delayMs / 1_000))}s…`)
+                setStatus(
+                  `Rate limited; resuming in ${Math.max(1, Math.ceil(delayMs / 1_000))}s… `
+                  + `(${Math.ceil(cumulativeWaitMs / 1_000)}s of 60s wait budget)`,
+                )
               }
             },
           ), activePlayback === playback && !playback.playbackStopped)

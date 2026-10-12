@@ -724,7 +724,7 @@ var ConnectionVoiceGate = class {
   }
 };
 var MIN_SYNTHESIS_START_INTERVAL_MS = 1250;
-var MAX_RATE_LIMIT_RETRIES = 3;
+var MAX_CUMULATIVE_RATE_LIMIT_WAIT_MS = 6e4;
 var DEFAULT_PLAYBACK_BUFFER_SEGMENTS = 2;
 var DEFAULT_CONCURRENT_GENERATIONS = 2;
 var MAX_PLAYBACK_BUFFER_SEGMENTS = 20;
@@ -931,8 +931,8 @@ async function waitForSynthesisSlot(pacer, signal) {
   pacer.startQueue = turn.catch(() => void 0);
   await turn;
 }
-async function synthesizeVoiceSegment(connectionId, text, voice, speed, signal, pacer, voiceGate, onRateLimit) {
-  for (let attempt = 0; ; attempt += 1) {
+async function synthesizeVoiceSegment(connectionId, text, voice, speed, signal, pacer, rateLimitBudget, voiceGate, onRateLimit) {
+  while (true) {
     const releaseVoice = await voiceGate.acquire(voice, signal);
     let response;
     try {
@@ -953,15 +953,29 @@ async function synthesizeVoiceSegment(connectionId, text, voice, speed, signal, 
       releaseVoice();
     }
     if (response.ok) {
+      rateLimitBudget.consecutiveResponses = 0;
       return {
         data: await response.arrayBuffer(),
         mime: response.headers.get("content-type") || "audio/mpeg"
       };
     }
-    if (response.status === 429 && attempt < MAX_RATE_LIMIT_RETRIES) {
-      const retryDelay = retryAfterMilliseconds(response.headers.get("Retry-After")) ?? Math.min(15e3, 2e3 * 2 ** attempt);
-      pacer.nextStartAt = Math.max(pacer.nextStartAt, Date.now() + retryDelay);
-      onRateLimit(retryDelay, attempt + 1);
+    if (response.status === 429) {
+      const now = Date.now();
+      const requestedDelay = retryAfterMilliseconds(response.headers.get("Retry-After")) ?? Math.min(15e3, 2e3 * 2 ** rateLimitBudget.consecutiveResponses);
+      rateLimitBudget.consecutiveResponses += 1;
+      const currentBlockEnd = Math.max(now, rateLimitBudget.blockedUntil);
+      const desiredBlockEnd = now + requestedDelay;
+      const requestedExtension = Math.max(0, desiredBlockEnd - currentBlockEnd);
+      const remainingBudget = MAX_CUMULATIVE_RATE_LIMIT_WAIT_MS - rateLimitBudget.cumulativeWaitMs;
+      if (remainingBudget <= 0 && requestedExtension > 0) {
+        throw new Error("TTS rate limiting continued for one minute. Try playback again in a moment.");
+      }
+      const addedWait = Math.min(requestedExtension, Math.max(0, remainingBudget));
+      rateLimitBudget.cumulativeWaitMs += addedWait;
+      rateLimitBudget.blockedUntil = currentBlockEnd + addedWait;
+      const retryDelay = Math.max(0, rateLimitBudget.blockedUntil - now);
+      pacer.nextStartAt = Math.max(pacer.nextStartAt, rateLimitBudget.blockedUntil);
+      onRateLimit(retryDelay, rateLimitBudget.cumulativeWaitMs);
       continue;
     }
     const detail = await response.text().catch(() => "");
@@ -1774,6 +1788,11 @@ function setup(ctx) {
       }));
       if (plan.length === 0) throw new Error("This message has no playable narration or dialogue.");
       const synthesisController = new AbortController();
+      const rateLimitBudget = {
+        blockedUntil: 0,
+        cumulativeWaitMs: 0,
+        consecutiveResponses: 0
+      };
       playback.synthesisController = synthesisController;
       backgroundSynthesisControllers.add(synthesisController);
       const prepare = async (index) => {
@@ -1785,14 +1804,17 @@ function setup(ctx) {
             preferences.speed,
             synthesisController.signal,
             sharedSynthesisPacer,
+            rateLimitBudget,
             connectionVoiceGates.get(connectionId) ?? (() => {
               const gate = new ConnectionVoiceGate();
               connectionVoiceGates.set(connectionId, gate);
               return gate;
             })(),
-            (delayMs, retry) => {
+            (delayMs, cumulativeWaitMs) => {
               if (ctx.getActiveChat().chatId === playbackChat.id && (!activePlayback || activePlayback === playback)) {
-                setStatus(`Rate limited; retry ${retry} in ${Math.max(1, Math.ceil(delayMs / 1e3))}s\u2026`);
+                setStatus(
+                  `Rate limited; resuming in ${Math.max(1, Math.ceil(delayMs / 1e3))}s\u2026 (${Math.ceil(cumulativeWaitMs / 1e3)}s of 60s wait budget)`
+                );
               }
             }
           ), activePlayback === playback && !playback.playbackStopped);

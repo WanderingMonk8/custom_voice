@@ -19,7 +19,7 @@ A [Lumiverse Spindle](https://docs.lumiverse.chat/) extension that detects chara
 - Routes Lumiverse's native message TTS button through ordered multi-voice playback.
 - Overrides the matching native context-menu action instead of adding duplicate playback controls.
 - Merges adjacent same-voice passages within each paragraph, splits multi-paragraph passages into smaller requests, and uses globally configurable playback buffering and generation concurrency to avoid gaps and API bursts.
-- Paces request starts and automatically honors `Retry-After` when a TTS provider responds with HTTP 429.
+- Paces request starts and automatically pauses and resumes unfinished generation when a TTS provider responds with HTTP 429. It honors `Retry-After`, keeps completed segments, and allows up to one minute of cumulative rate-limit waiting per playback.
 - Uses Lumiverse's selected TTS connection, falling back to the profile marked as the default, when a chat has no saved connection.
 - Provides a global, opt-in **Save generated audio** setting. It is disabled by default to avoid consuming storage, and retains at most 50 extension recordings by default (user configurable).
 - When enabled, saves the exact synthesized custom-voice segments as a native Lumiverse audio attachment for the active message swipe, with a browser-generated WAV fallback when the server cannot mux their source formats.
