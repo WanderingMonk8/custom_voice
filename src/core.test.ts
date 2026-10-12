@@ -98,6 +98,30 @@ test('removes escaped and nested configured tracker blocks', () => {
   )
 })
 
+test('automatically removes raw and escaped HTML comments before playback', () => {
+  const content = [
+    'Spoken before.',
+    '<!-- VEIL: Ruby on the balcony | Ken cannot see her -->',
+    '&lt;!-- multiline hidden state:\nRuby remembers the reset --&gt;',
+    'Spoken after.',
+  ].join('\n')
+  assert.equal(
+    stripSkippedTrackerBlocks(content, ''),
+    'Spoken before.\n \n \nSpoken after.',
+  )
+  assert.deepEqual(
+    parseRosterVoiceSegments(content, 'ruby', [{ id: 'ruby', name: 'Ruby' }]),
+    [{ text: 'Spoken before.\n\nSpoken after.', speakerId: null }],
+  )
+})
+
+test('leaves an unclosed HTML comment intact', () => {
+  assert.equal(
+    stripSkippedTrackerBlocks('Before <!-- incomplete tracker After', ''),
+    'Before <!-- incomplete tracker After',
+  )
+})
+
 test('clamps the configurable message window', () => {
   assert.equal(clampMessageLimit(undefined), 20)
   assert.equal(clampMessageLimit(0), 1)
