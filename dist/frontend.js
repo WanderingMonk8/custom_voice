@@ -175,7 +175,7 @@ function stripPairedTagBlocks(value, tag) {
   return result;
 }
 function stripSkippedTrackerBlocks(content, tagPairs) {
-  let result = content.replace(/&lt;|&#60;|&#x3c;/gi, "<").replace(/&gt;|&#62;|&#x3e;/gi, ">");
+  let result = content.replace(/&lt;|&#60;|&#x3c;/gi, "<").replace(/&gt;|&#62;|&#x3e;/gi, ">").replace(/<!--[\s\S]*?-->/g, " ");
   for (const tag of parseSkippedTrackerTags(tagPairs)) {
     result = stripPairedTagBlocks(result, tag);
   }

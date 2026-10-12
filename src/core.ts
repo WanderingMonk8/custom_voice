@@ -650,6 +650,7 @@ export function stripSkippedTrackerBlocks(content: string, tagPairs: string): st
   let result = content
     .replace(/&lt;|&#60;|&#x3c;/gi, '<')
     .replace(/&gt;|&#62;|&#x3e;/gi, '>')
+    .replace(/<!--[\s\S]*?-->/g, ' ')
   for (const tag of parseSkippedTrackerTags(tagPairs)) {
     result = stripPairedTagBlocks(result, tag)
   }
