@@ -600,6 +600,62 @@ function decodePlaybackEntities(value: string): string {
     .replace(/&amp;|&#38;|&#x26;/gi, '&')
 }
 
+export function parseSkippedTrackerTags(value: string): string[] {
+  const decoded = decodePlaybackEntities(value)
+  const tags: string[] = []
+  const seen = new Set<string>()
+  const pairPattern = /\\?<\s*([a-z][a-z0-9:._-]*)\b[^>]*>[\s\S]*?\\?<\s*\/\s*\1\s*>/giu
+  for (const match of decoded.matchAll(pairPattern)) {
+    const tag = (match[1] ?? '').toLowerCase()
+    if (!tag || seen.has(tag)) continue
+    seen.add(tag)
+    tags.push(tag)
+    if (tags.length >= 100) break
+  }
+  return tags
+}
+
+function stripPairedTagBlocks(value: string, tag: string): string {
+  const escapedTag = tag.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const tokenPattern = new RegExp(
+    `\\\\?<\\s*(/?)\\s*${escapedTag}(?=\\s|>)[^>]*>`,
+    'giu',
+  )
+  const ranges: Array<{ start: number; end: number }> = []
+  let depth = 0
+  let blockStart = -1
+  for (const match of value.matchAll(tokenPattern)) {
+    if (match.index === undefined) continue
+    const closing = match[1] === '/'
+    if (!closing && !/\/\s*>$/u.test(match[0])) {
+      if (depth === 0) blockStart = match.index
+      depth += 1
+    } else if (closing && depth > 0) {
+      depth -= 1
+      if (depth === 0 && blockStart >= 0) {
+        ranges.push({ start: blockStart, end: match.index + match[0].length })
+        blockStart = -1
+      }
+    }
+  }
+  if (ranges.length === 0) return value
+  let result = value
+  for (let index = ranges.length - 1; index >= 0; index--) {
+    result = `${result.slice(0, ranges[index].start)} ${result.slice(ranges[index].end)}`
+  }
+  return result
+}
+
+export function stripSkippedTrackerBlocks(content: string, tagPairs: string): string {
+  let result = content
+    .replace(/&lt;|&#60;|&#x3c;/gi, '<')
+    .replace(/&gt;|&#62;|&#x3e;/gi, '>')
+  for (const tag of parseSkippedTrackerTags(tagPairs)) {
+    result = stripPairedTagBlocks(result, tag)
+  }
+  return result
+}
+
 function cleanPlaybackText(value: string): string {
   return decodePlaybackEntities(stripPlaybackMarkup(value))
     .replace(/```[\s\S]*?```/g, ' ')
@@ -1185,8 +1241,9 @@ export function parseRosterVoiceSegments(
   content: string,
   defaultSpeakerId: string | null,
   speakers: CharacterLike[],
+  skippedTrackerTagPairs = '',
 ): PlaybackSegment[] {
-  const playbackContent = stripPlaybackMarkup(content)
+  const playbackContent = stripPlaybackMarkup(stripSkippedTrackerBlocks(content, skippedTrackerTagPairs))
   const result: PlaybackSegment[] = []
   const quotePattern = /["“]([\s\S]*?)["”]/g
   const paragraphs = playbackParagraphs(playbackContent)
