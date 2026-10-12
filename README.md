@@ -62,7 +62,7 @@ The compiled frontend and backend bundles are committed under `dist/`, so users 
 8. Optionally enable **Save generated audio** to attach completed recordings to messages across every chat. This global setting is off by default. Set **Maximum saved recordings** to control global retention (default: 50); the oldest extension-created attachments are removed first.
 9. Use Lumiverse's normal **Play with TTS** button or context-menu action to play the message with all configured voices.
 
-The collapsed **Advanced settings** section at the bottom of the drawer controls how many synthesized segments are buffered before playback starts (default: 4) and how many segment generations may run concurrently (default: 4). Higher values can reduce pauses but increase startup delay or API rate-limit pressure.
+The collapsed **Advanced settings** section at the bottom of the drawer controls how many synthesized segments are buffered before playback starts (default: 2) and how many segment generations may run concurrently (default: 2). Higher values can reduce pauses but increase startup delay or API rate-limit pressure.
 
 The card scan result, manually managed NPC roster, and all voice settings save automatically for that chat. Switching chats loads the previously saved cast and settings without scanning or calling the language model again. Click **Scan** after changing the card. Manual NPCs remain in the roster across later scans until you delete them. Clear a voice field to use the TTS connection's default/fallback voice; clear the connection to disable every custom voice managed by the extension for that chat.
 
