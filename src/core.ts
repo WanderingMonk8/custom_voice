@@ -767,11 +767,40 @@ function discourseSubjectSpeaker(
   return winnerScore >= 8 && winnerScore - runnerUpScore >= 4 ? winnerId : null
 }
 
+const SPEECH_BEARING_NOUNS = '(?:voice|words?|reply|answer|question|whisper|shout|yell|call|murmur|remark|response)'
+
+/** Resolve possessive metonymy such as "Colton's voice" when it heads the main clause. */
+function mainClauseSpeechPossessor(text: string, speakers: CharacterLike[]): string | null {
+  const narrative = narrativeOnly(text)
+  const matches = new Set<string>()
+  for (const speaker of speakers) {
+    for (const alias of speakerAliases(speaker.name)) {
+      const pattern = new RegExp(
+        `\\b${escapedPattern(alias)}\\b['’](?:s)?\\s+(?:[\\p{L}\\p{M}'’-]+\\s+){0,3}${SPEECH_BEARING_NOUNS}\\b`,
+        'giu',
+      )
+      for (const match of narrative.matchAll(pattern)) {
+        if (match.index === undefined) continue
+        const prefix = narrative.slice(0, match.index)
+        const sentenceStart = Math.max(
+          prefix.lastIndexOf('.'), prefix.lastIndexOf('!'), prefix.lastIndexOf('?'),
+          prefix.lastIndexOf(';'), prefix.lastIndexOf('\n'),
+        ) + 1
+        const lead = prefix.slice(sentenceStart)
+        if (!lead.trim() || /^[^,]{1,80},\s*$/u.test(lead)) matches.add(speaker.id)
+      }
+    }
+  }
+  return matches.size === 1 ? [...matches][0] : null
+}
+
 function preferredMentionedSpeaker(
   text: string,
   speakers: CharacterLike[],
   mentions: SpeakerMentions,
 ): string | null {
+  const speechPossessor = mainClauseSpeechPossessor(text, speakers)
+  if (speechPossessor) return speechPossessor
   if (mentions.clean.size === 1) return [...mentions.clean][0]
   if (mentions.clean.size > 1) return discourseSubjectSpeaker(text, speakers, mentions.clean)
   return mentions.possessive.size === 1 ? [...mentions.possessive][0] : null
@@ -915,6 +944,52 @@ function playbackParagraphs(content: string): PlaybackParagraph[] {
   return paragraphs
 }
 
+interface InitialDialogueBackfill {
+  speakerId: string
+  paragraphIndexes: Set<number>
+}
+
+/**
+ * Seed only a message-opening ambiguous dialogue run from later narration.
+ * Once any preceding character is established, downstream evidence is ignored.
+ */
+function initialDialogueBackfill(
+  paragraphs: PlaybackParagraph[],
+  speakers: CharacterLike[],
+): InitialDialogueBackfill | null {
+  const paragraphIndexes: number[] = []
+  let dialogueStarted = false
+  for (let index = 0; index < paragraphs.length; index++) {
+    const paragraph = paragraphs[index]
+    const hasDialogue = /["“][\s\S]*?["”]/u.test(paragraph.text)
+    const mentions = mentionedSpeakers(paragraph.text, speakers)
+    const localSpeakerId = preferredMentionedSpeaker(paragraph.text, speakers, mentions)
+
+    if (!dialogueStarted) {
+      if (!hasDialogue) {
+        if (localSpeakerId || hasSpeakerMentions(mentions)) return null
+        continue
+      }
+      dialogueStarted = true
+    }
+
+    if (hasDialogue) {
+      if (localSpeakerId || hasSpeakerMentions(mentions)) return null
+      paragraphIndexes.push(index)
+      continue
+    }
+
+    if (localSpeakerId) {
+      return {
+        speakerId: localSpeakerId,
+        paragraphIndexes: new Set(paragraphIndexes),
+      }
+    }
+    if (hasSpeakerMentions(mentions)) return null
+  }
+  return null
+}
+
 function hasSustainedUnnamedNarration(
   paragraphs: PlaybackParagraph[],
   startIndex: number,
@@ -1053,6 +1128,7 @@ export function parseRosterVoiceSegments(
   const result: PlaybackSegment[] = []
   const quotePattern = /["“]([\s\S]*?)["”]/g
   const paragraphs = playbackParagraphs(playbackContent)
+  const openingBackfill = initialDialogueBackfill(paragraphs, speakers)
   const dialogueTurns = paragraphDialogueTurns(playbackContent, speakers, defaultSpeakerId)
   const paragraphSpeakers = paragraphs.map(paragraph => (
     unambiguousNarrativeSpeaker(paragraph.text, speakers)
@@ -1089,15 +1165,20 @@ export function parseRosterVoiceSegments(
       const inferredTurnSpeakerId = (inference.source === 'history' || inference.source === 'fallback')
         ? dialogueTurnSpeakerId
         : null
+      const openingSpeakerId = inference.source === 'fallback'
+        && openingBackfill?.paragraphIndexes.has(paragraphIndex)
+        ? openingBackfill.speakerId
+        : null
       const speakerId: string | null = paragraphSpeakers[paragraphIndex]
         ?? inferredTurnSpeakerId
         ?? continuedSpeakerId
+        ?? openingSpeakerId
         ?? inference.speakerId
       result.push({
         text: speech,
         speakerId,
       })
-      if (inference.confident && speakerId) lastConfidentSpeakerId = speakerId
+      if ((inference.confident || openingSpeakerId) && speakerId) lastConfidentSpeakerId = speakerId
       if (speakerId) lastAssignedSpeakerId = speakerId
     }
     cursor = match.index + match[0].length

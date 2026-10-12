@@ -460,6 +460,37 @@ test('uses a sole possessive name when no clean character name is present', () =
   )
 })
 
+test('backfills opening dialogue from a main-clause speech possessor', () => {
+  const content = '"And there is one star in Sweetwater."\n\n"That is how it has been. That is how it is."\n\nColton\'s voice comes off the porch before Tess can tap the tablet. He sits with the pocket watch still open in his palm and looks at Ken across the width of the street.\n\nTess glances toward the porch, then back to Ken.\n\n"The badge is a standard guest selection, Sheriff." She pitches her voice to carry the ten yards.'
+  const segments = parseRosterVoiceSegments(content, 'card', [
+    { id: 'colton', name: 'Colton' },
+    { id: 'tess', name: 'Tess' },
+    { id: 'ken', name: 'Ken' },
+    { id: 'card', name: 'Narrator Card' },
+  ])
+  assert.deepEqual(segments.filter(segment => segment.speakerId !== null), [
+    { text: 'And there is one star in Sweetwater.', speakerId: 'colton' },
+    { text: 'That is how it has been. That is how it is.', speakerId: 'colton' },
+    { text: 'The badge is a standard guest selection, Sheriff.', speakerId: 'tess' },
+  ])
+})
+
+test('does not use downstream backfill after a preceding character is established', () => {
+  const segments = parseRosterVoiceSegments(
+    'Alma checks the road.\n\n"Opening speech."\n\nColton\'s voice comes from the porch before Tess can answer.',
+    'card',
+    [
+      { id: 'alma', name: 'Alma' },
+      { id: 'colton', name: 'Colton' },
+      { id: 'tess', name: 'Tess' },
+      { id: 'card', name: 'Narrator Card' },
+    ],
+  )
+  assert.deepEqual(segments.find(segment => segment.text === 'Opening speech.'), {
+    text: 'Opening speech.', speakerId: 'alma',
+  })
+})
+
 test('anchors leading dialogue to the sole character in the preceding paragraph', () => {
   const content = 'Toggard rode the last hundred yards out ahead without being asked, dropped from the bay at the bank stones, and stood looking at the water a long moment before he came back.\n\n"It\'s up. The crossing is possible, but it is a ford you walk, not a ford you ride." He wiped his wet hands on his breeches. "There\'s flat ground back under the alders."'
   assert.deepEqual(
