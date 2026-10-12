@@ -498,6 +498,10 @@ function hasSustainedUnnamedNarration(paragraphs, startIndex, speakers) {
   }
   return false;
 }
+function hasPronounSpeechAttribution(text) {
+  const narration = cleanPlaybackText(narrativeOnly(text));
+  return new RegExp(`\\b(?:he|she|they)\\b[^.!?\\n]{0,40}\\b${SPEECH_VERBS}\\b`, "iu").test(narration);
+}
 function paragraphDialogueTurns(content, speakers, defaultSpeakerId) {
   const turns = /* @__PURE__ */ new Map();
   const paragraphs = playbackParagraphs(content);
@@ -519,6 +523,7 @@ function paragraphDialogueTurns(content, speakers, defaultSpeakerId) {
     }
     const explicitSpeakerIds = /* @__PURE__ */ new Set();
     const initialHistorySpeakerIds = /* @__PURE__ */ new Set();
+    const continuationHistorySpeakerIds = /* @__PURE__ */ new Set();
     for (const match of quoteMatches) {
       if (match.index === void 0) continue;
       const quoteStart = paragraph.start + match.index;
@@ -532,6 +537,8 @@ function paragraphDialogueTurns(content, speakers, defaultSpeakerId) {
       );
       if (inference.source === "explicit" && inference.speakerId) {
         explicitSpeakerIds.add(inference.speakerId);
+      } else if (!pair && previousStrongSpeakerId && inference.source === "history" && inference.confident && inference.speakerId === previousStrongSpeakerId) {
+        continuationHistorySpeakerIds.add(inference.speakerId);
       } else if (!pair && !previousStrongSpeakerId && inference.source === "history" && inference.confident && inference.speakerId) {
         initialHistorySpeakerIds.add(inference.speakerId);
       }
@@ -544,7 +551,8 @@ function paragraphDialogueTurns(content, speakers, defaultSpeakerId) {
     }
     const explicitSpeakerId = explicitSpeakerIds.size === 1 ? [...explicitSpeakerIds][0] : null;
     const initialHistorySpeakerId = initialHistorySpeakerIds.size === 1 ? [...initialHistorySpeakerIds][0] : null;
-    const localSpeakerId = explicitSpeakerId ?? soleMentionedSpeaker(paragraph.text, speakers) ?? initialHistorySpeakerId;
+    const continuationHistorySpeakerId = continuationHistorySpeakerIds.size === 1 && hasPronounSpeechAttribution(paragraph.text) ? [...continuationHistorySpeakerIds][0] : null;
+    const localSpeakerId = explicitSpeakerId ?? soleMentionedSpeaker(paragraph.text, speakers) ?? continuationHistorySpeakerId ?? initialHistorySpeakerId;
     if (localSpeakerId) {
       if (pair && !pair.includes(localSpeakerId)) pair = null;
       if (!pair && previousStrongSpeakerId && previousStrongSpeakerId !== localSpeakerId) {

@@ -27,6 +27,7 @@ A [Lumiverse Spindle](https://docs.lumiverse.chat/) extension that detects chara
 - Removes HTML/escaped tags and Markdown emphasis markers before sending readable text to TTS.
 - Provides a global, autosaved list of paired tracker tags whose tags and enclosed contents are removed before playback generation.
 - Automatically excludes well-formed HTML comments (`<!-- ... -->`) from playback and speaker detection.
+- Alternates short unattributed dialogue turns after two speakers have been confidently established, including chains preceded by same-speaker continuation paragraphs.
 - Auto-saves every setting to the current chat.
 - Saves the detected cast and reloads it with the correct settings whenever the active chat changes.
 - Keeps active-chat settings and playback requests isolated between multiple open Lumiverse browser tabs.

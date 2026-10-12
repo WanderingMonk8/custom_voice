@@ -720,6 +720,32 @@ test('alternates unresolved turns in a confidently seeded dialogue chain', () =>
   ])
 })
 
+test('preserves a dialogue seed across a history-attributed continuation before alternating', () => {
+  const segments = parseRosterVoiceSegments(
+    `"Rugged, honest, and made for the work," Grace repeats from the other side of the glass. "You just described a pen and accidentally described yourself."
+
+"I say that with authority," she adds, quieter. "I have bought instruments. The pretty ones hang on the wall."
+
+"Then that is the one." Katie unfolds from the wall and arrives at the case. "Household lists, the treaty, the cursive. It all goes through that pen."
+
+"I would never."
+
+"You were three sentences from it."`,
+    'card',
+    [{ id: 'grace', name: 'Grace' }, { id: 'katie', name: 'Katie' }],
+  )
+  assert.deepEqual(segments.filter(segment => segment.speakerId !== null), [
+    { text: 'Rugged, honest, and made for the work,', speakerId: 'grace' },
+    { text: 'You just described a pen and accidentally described yourself.', speakerId: 'grace' },
+    { text: 'I say that with authority,', speakerId: 'grace' },
+    { text: 'I have bought instruments. The pretty ones hang on the wall.', speakerId: 'grace' },
+    { text: 'Then that is the one.', speakerId: 'katie' },
+    { text: 'Household lists, the treaty, the cursive. It all goes through that pen.', speakerId: 'katie' },
+    { text: 'I would never.', speakerId: 'grace' },
+    { text: 'You were three sentences from it.', speakerId: 'katie' },
+  ])
+})
+
 test('seeds a dialogue chain from a confidently inherited speaker before a named reply', () => {
   const segments = parseRosterVoiceSegments(
     '"Do not talk," Alma called down. Not to anyone.\n\nThe yard obeyed. Frost ticked on the tarp ropes. Somewhere behind the pile of roped crates a civilian shifted in his blanket and stopped himself.\n\nThen Alma\'s good hand came down over the rail and made a shape in the lantern light: hold, hold, hold.\n\n"Logistics net, same as before," she said, finally. "But it is not fragments anymore. Somebody up the line is running an open schedule."\n\nVahn came off the pump. "Which posts still talk."\n\n"Seven through 14. We are eleven. So the order is addressed to us." Her voice thinned at the edges. "Nobody accuses me later of sugar."',
