@@ -126,7 +126,10 @@ class ConnectionVoiceGate {
 
 const MIN_SYNTHESIS_START_INTERVAL_MS = 1_250
 const MAX_RATE_LIMIT_RETRIES = 3
-const PLAYBACK_BUFFER_SEGMENTS = 4
+const DEFAULT_PLAYBACK_BUFFER_SEGMENTS = 4
+const DEFAULT_CONCURRENT_GENERATIONS = 4
+const MAX_PLAYBACK_BUFFER_SEGMENTS = 20
+const MAX_CONCURRENT_GENERATIONS = 10
 
 interface DetectedCharacterState {
   id: string
@@ -233,6 +236,14 @@ interface PlaybackPreferences {
   speakerParsingMode: 'off' | 'ambiguous' | 'always'
   llmConnectionId: string
   llmModel: string
+  playbackBufferSegments: number
+  concurrentGenerations: number
+}
+
+function clampIntegerSetting(value: unknown, fallback: number, maximum: number): number {
+  const numeric = typeof value === 'number' ? value : Number(value)
+  if (!Number.isFinite(numeric)) return fallback
+  return Math.min(maximum, Math.max(1, Math.round(numeric)))
 }
 
 const VOICE_ICON = `
@@ -278,6 +289,8 @@ async function loadPlaybackPreferences(): Promise<PlaybackPreferences> {
     speakerParsingMode: 'ambiguous',
     llmConnectionId: '',
     llmModel: '',
+    playbackBufferSegments: DEFAULT_PLAYBACK_BUFFER_SEGMENTS,
+    concurrentGenerations: DEFAULT_CONCURRENT_GENERATIONS,
   }
   const row = await response.json() as { value?: Record<string, unknown> }
   const speed = typeof row.value?.ttsSpeed === 'number' ? row.value.ttsSpeed : 1
@@ -304,6 +317,16 @@ async function loadPlaybackPreferences(): Promise<PlaybackPreferences> {
     llmModel: typeof row.value?.chatVoiceLlmModel === 'string'
       ? row.value.chatVoiceLlmModel.trim().slice(0, 256)
       : '',
+    playbackBufferSegments: clampIntegerSetting(
+      row.value?.chatVoicePlaybackBufferSegments,
+      DEFAULT_PLAYBACK_BUFFER_SEGMENTS,
+      MAX_PLAYBACK_BUFFER_SEGMENTS,
+    ),
+    concurrentGenerations: clampIntegerSetting(
+      row.value?.chatVoiceConcurrentGenerations,
+      DEFAULT_CONCURRENT_GENERATIONS,
+      MAX_CONCURRENT_GENERATIONS,
+    ),
   }
 }
 
@@ -363,6 +386,22 @@ function saveLlmParsingPreferences(
     chatVoiceSpeakerParsingMode: mode,
     chatVoiceLlmConnectionId: connectionId.trim().slice(0, 128),
     chatVoiceLlmModel: model.trim().slice(0, 256),
+  }))
+}
+
+function saveAdvancedPlaybackPreferences(bufferSegments: number, concurrentGenerations: number): Promise<void> {
+  return updateVoiceSettings(current => ({
+    ...current,
+    chatVoicePlaybackBufferSegments: clampIntegerSetting(
+      bufferSegments,
+      DEFAULT_PLAYBACK_BUFFER_SEGMENTS,
+      MAX_PLAYBACK_BUFFER_SEGMENTS,
+    ),
+    chatVoiceConcurrentGenerations: clampIntegerSetting(
+      concurrentGenerations,
+      DEFAULT_CONCURRENT_GENERATIONS,
+      MAX_CONCURRENT_GENERATIONS,
+    ),
   }))
 }
 
@@ -617,6 +656,7 @@ export function setup(ctx: SpindleFrontendContext) {
     .chat-voice-status { min-height:18px; }
     .chat-voice-status[data-state="saved"] { color:var(--lumiverse-success, #65b97a); }
     .chat-voice-status[data-state="error"] { color:var(--lumiverse-danger, #ef6464); }
+    .chat-voice-advanced { display:flex; flex-direction:column; gap:12px; padding-top:8px; }
   `)
 
   const tab = ctx.ui.registerDrawerTab({
@@ -716,6 +756,7 @@ export function setup(ctx: SpindleFrontendContext) {
   status.className = 'chat-voice-status'
   status.setAttribute('role', 'status')
   status.setAttribute('aria-live', 'polite')
+  const advancedHost = document.createElement('div')
 
   panel.append(
     context,
@@ -732,8 +773,25 @@ export function setup(ctx: SpindleFrontendContext) {
     characterTitle,
     characterList,
     status,
+    advancedHost,
   )
   tab.root.appendChild(panel)
+
+  const advancedSection = ctx.components.mountCollapsibleSection(advancedHost, {
+    title: 'Advanced settings',
+    defaultExpanded: false,
+  })
+  advancedSection.body.classList.add('chat-voice-advanced')
+  const playbackBufferField = createField('Playback buffer segments')
+  const concurrentGenerationField = createField('Concurrent generations')
+  const advancedHint = document.createElement('div')
+  advancedHint.className = 'chat-voice-hint'
+  advancedHint.textContent = 'Larger buffers can reduce pauses but delay playback. Higher concurrency is faster but increases API load and rate-limit risk.'
+  advancedSection.body.append(
+    playbackBufferField.field,
+    concurrentGenerationField.field,
+    advancedHint,
+  )
 
   let applyingState = false
   let activeChat: ActiveChatState | null = null
@@ -753,6 +811,10 @@ export function setup(ctx: SpindleFrontendContext) {
   let llmModel = ''
   let llmSettingsSaveTimer: ReturnType<typeof setTimeout> | null = null
   let savingLlmSettings = false
+  let playbackBufferSegments = DEFAULT_PLAYBACK_BUFFER_SEGMENTS
+  let concurrentGenerationLimit = DEFAULT_CONCURRENT_GENERATIONS
+  let advancedSettingsSaveTimer: ReturnType<typeof setTimeout> | null = null
+  let savingAdvancedSettings = false
   let saveTimer: ReturnType<typeof setTimeout> | null = null
   let editRevision = 0
   let dirty = false
@@ -779,7 +841,7 @@ export function setup(ctx: SpindleFrontendContext) {
   let activeSynthesisTasks = 0
 
   function drainSynthesisQueue(): void {
-    while (activeSynthesisTasks < PLAYBACK_BUFFER_SEGMENTS) {
+    while (activeSynthesisTasks < concurrentGenerationLimit) {
       const next = foregroundSynthesisQueue.shift() ?? backgroundSynthesisQueue.shift()
       if (!next) return
       activeSynthesisTasks += 1
@@ -929,6 +991,24 @@ export function setup(ctx: SpindleFrontendContext) {
     browseHint: 'Leave blank to use the selected connection’s configured model.',
     disabled: true,
     onChange: value => onLlmModelChanged(value),
+  })
+
+  const playbackBufferInput = ctx.components.mountNumberStepper(playbackBufferField.slot, {
+    value: DEFAULT_PLAYBACK_BUFFER_SEGMENTS,
+    min: 1,
+    max: MAX_PLAYBACK_BUFFER_SEGMENTS,
+    step: 1,
+    integer: true,
+    onChange: value => onPlaybackBufferChanged(value),
+  })
+
+  const concurrentGenerationInput = ctx.components.mountNumberStepper(concurrentGenerationField.slot, {
+    value: DEFAULT_CONCURRENT_GENERATIONS,
+    min: 1,
+    max: MAX_CONCURRENT_GENERATIONS,
+    step: 1,
+    integer: true,
+    onChange: value => onConcurrentGenerationsChanged(value),
   })
 
   const addNpcInput = ctx.components.mountTextInput(addNpcInputSlot, {
@@ -1250,6 +1330,13 @@ export function setup(ctx: SpindleFrontendContext) {
       preferences.llmConnectionId = llmConnectionId
       preferences.llmModel = llmModel
     }
+    if (advancedSettingsSaveTimer || savingAdvancedSettings) {
+      preferences.playbackBufferSegments = playbackBufferSegments
+      preferences.concurrentGenerations = concurrentGenerationLimit
+    } else {
+      playbackBufferSegments = preferences.playbackBufferSegments
+      concurrentGenerationLimit = preferences.concurrentGenerations
+    }
     const connectionId = config.connectionId
       || (connections.some(connection => connection.id === preferences.connectionId)
         ? preferences.connectionId
@@ -1376,7 +1463,7 @@ export function setup(ctx: SpindleFrontendContext) {
           preparedResolvers[index](await prepare(index))
         }
       }
-      const workerCount = Math.min(PLAYBACK_BUFFER_SEGMENTS, plan.length)
+      const workerCount = Math.min(preferences.concurrentGenerations, plan.length)
       for (let index = 0; index < workerCount; index += 1) void runSynthesisWorker()
       if (preferences.saveGeneratedAudio || regeneratingSavedAudio) {
         playback.persistenceState = 'pending'
@@ -1453,7 +1540,7 @@ export function setup(ctx: SpindleFrontendContext) {
           })
       }
 
-      const initialBufferSize = Math.min(PLAYBACK_BUFFER_SEGMENTS, plan.length)
+      const initialBufferSize = Math.min(preferences.playbackBufferSegments, plan.length)
       setStatus(
         `Buffering ${initialBufferSize} voice segment${initialBufferSize === 1 ? '' : 's'} before playback…`,
       )
@@ -1725,6 +1812,12 @@ export function setup(ctx: SpindleFrontendContext) {
         speakerParsingPicker.update({ value: speakerParsingMode })
         updateLlmControlState()
       }
+      if (!savingAdvancedSettings && !advancedSettingsSaveTimer) {
+        playbackBufferSegments = preferences.playbackBufferSegments
+        concurrentGenerationLimit = preferences.concurrentGenerations
+        playbackBufferInput.update({ value: playbackBufferSegments })
+        concurrentGenerationInput.update({ value: concurrentGenerationLimit })
+      }
       lumiverseConnectionId = connections.some(connection => connection.id === preferences.connectionId)
         ? preferences.connectionId
         : connections.find(connection => connection.is_default)?.id ?? ''
@@ -1809,6 +1902,48 @@ export function setup(ctx: SpindleFrontendContext) {
       setStatus(error instanceof Error ? error.message : 'Could not save AI speaker-review settings.', 'error')
     } finally {
       savingLlmSettings = false
+    }
+  }
+
+  function scheduleAdvancedSettingsSave(): void {
+    if (advancedSettingsSaveTimer) clearTimeout(advancedSettingsSaveTimer)
+    advancedSettingsSaveTimer = setTimeout(() => {
+      advancedSettingsSaveTimer = null
+      void persistAdvancedSettings()
+    }, 400)
+  }
+
+  function onPlaybackBufferChanged(value: number | null): void {
+    playbackBufferSegments = clampIntegerSetting(
+      value,
+      DEFAULT_PLAYBACK_BUFFER_SEGMENTS,
+      MAX_PLAYBACK_BUFFER_SEGMENTS,
+    )
+    playbackBufferInput.update({ value: playbackBufferSegments })
+    scheduleAdvancedSettingsSave()
+  }
+
+  function onConcurrentGenerationsChanged(value: number | null): void {
+    concurrentGenerationLimit = clampIntegerSetting(
+      value,
+      DEFAULT_CONCURRENT_GENERATIONS,
+      MAX_CONCURRENT_GENERATIONS,
+    )
+    concurrentGenerationInput.update({ value: concurrentGenerationLimit })
+    drainSynthesisQueue()
+    scheduleAdvancedSettingsSave()
+  }
+
+  async function persistAdvancedSettings(): Promise<void> {
+    savingAdvancedSettings = true
+    setStatus('Saving global advanced playback settings…')
+    try {
+      await saveAdvancedPlaybackPreferences(playbackBufferSegments, concurrentGenerationLimit)
+      setStatus('Advanced playback settings saved globally.', 'saved')
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : 'Could not save advanced playback settings.', 'error')
+    } finally {
+      savingAdvancedSettings = false
     }
   }
 
@@ -2096,10 +2231,17 @@ export function setup(ctx: SpindleFrontendContext) {
       clearTimeout(llmSettingsSaveTimer)
       void saveLlmParsingPreferences(speakerParsingMode, llmConnectionId, llmModel)
     }
+    if (advancedSettingsSaveTimer) {
+      clearTimeout(advancedSettingsSaveTimer)
+      void saveAdvancedPlaybackPreferences(playbackBufferSegments, concurrentGenerationLimit)
+    }
     skippedTrackerTagsInput.destroy()
     speakerParsingPicker.destroy()
     llmConnectionPicker.destroy()
     llmModelInput.destroy()
+    playbackBufferInput.destroy()
+    concurrentGenerationInput.destroy()
+    advancedSection.destroy()
     addNpcInput.destroy()
     addNpcButton.removeEventListener('click', onAddNpc)
     addNpcInputSlot.removeEventListener('keydown', onAddNpcKeyDown)

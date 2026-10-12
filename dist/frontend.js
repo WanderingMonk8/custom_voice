@@ -725,7 +725,15 @@ var ConnectionVoiceGate = class {
 };
 var MIN_SYNTHESIS_START_INTERVAL_MS = 1250;
 var MAX_RATE_LIMIT_RETRIES = 3;
-var PLAYBACK_BUFFER_SEGMENTS = 4;
+var DEFAULT_PLAYBACK_BUFFER_SEGMENTS = 4;
+var DEFAULT_CONCURRENT_GENERATIONS = 4;
+var MAX_PLAYBACK_BUFFER_SEGMENTS = 20;
+var MAX_CONCURRENT_GENERATIONS = 10;
+function clampIntegerSetting(value, fallback, maximum) {
+  const numeric = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(numeric)) return fallback;
+  return Math.min(maximum, Math.max(1, Math.round(numeric)));
+}
 var VOICE_ICON = `
   <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
     <path d="M5 10v4M9 7v10M13 4v16M17 8v8M21 10v4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
@@ -765,7 +773,9 @@ async function loadPlaybackPreferences() {
     skippedTrackerTags: "",
     speakerParsingMode: "ambiguous",
     llmConnectionId: "",
-    llmModel: ""
+    llmModel: "",
+    playbackBufferSegments: DEFAULT_PLAYBACK_BUFFER_SEGMENTS,
+    concurrentGenerations: DEFAULT_CONCURRENT_GENERATIONS
   };
   const row = await response.json();
   const speed = typeof row.value?.ttsSpeed === "number" ? row.value.ttsSpeed : 1;
@@ -780,7 +790,17 @@ async function loadPlaybackPreferences() {
     skippedTrackerTags: typeof row.value?.chatVoiceSkippedTrackerTags === "string" ? row.value.chatVoiceSkippedTrackerTags.slice(0, 4e3) : "",
     speakerParsingMode,
     llmConnectionId: typeof row.value?.chatVoiceLlmConnectionId === "string" ? row.value.chatVoiceLlmConnectionId.trim().slice(0, 128) : "",
-    llmModel: typeof row.value?.chatVoiceLlmModel === "string" ? row.value.chatVoiceLlmModel.trim().slice(0, 256) : ""
+    llmModel: typeof row.value?.chatVoiceLlmModel === "string" ? row.value.chatVoiceLlmModel.trim().slice(0, 256) : "",
+    playbackBufferSegments: clampIntegerSetting(
+      row.value?.chatVoicePlaybackBufferSegments,
+      DEFAULT_PLAYBACK_BUFFER_SEGMENTS,
+      MAX_PLAYBACK_BUFFER_SEGMENTS
+    ),
+    concurrentGenerations: clampIntegerSetting(
+      row.value?.chatVoiceConcurrentGenerations,
+      DEFAULT_CONCURRENT_GENERATIONS,
+      MAX_CONCURRENT_GENERATIONS
+    )
   };
 }
 var voiceSettingsWriteQueue = Promise.resolve();
@@ -828,6 +848,21 @@ function saveLlmParsingPreferences(mode, connectionId, model) {
     chatVoiceSpeakerParsingMode: mode,
     chatVoiceLlmConnectionId: connectionId.trim().slice(0, 128),
     chatVoiceLlmModel: model.trim().slice(0, 256)
+  }));
+}
+function saveAdvancedPlaybackPreferences(bufferSegments, concurrentGenerations) {
+  return updateVoiceSettings((current) => ({
+    ...current,
+    chatVoicePlaybackBufferSegments: clampIntegerSetting(
+      bufferSegments,
+      DEFAULT_PLAYBACK_BUFFER_SEGMENTS,
+      MAX_PLAYBACK_BUFFER_SEGMENTS
+    ),
+    chatVoiceConcurrentGenerations: clampIntegerSetting(
+      concurrentGenerations,
+      DEFAULT_CONCURRENT_GENERATIONS,
+      MAX_CONCURRENT_GENERATIONS
+    )
   }));
 }
 async function deleteSavedAudioRecord(record) {
@@ -1050,6 +1085,7 @@ function setup(ctx) {
     .chat-voice-status { min-height:18px; }
     .chat-voice-status[data-state="saved"] { color:var(--lumiverse-success, #65b97a); }
     .chat-voice-status[data-state="error"] { color:var(--lumiverse-danger, #ef6464); }
+    .chat-voice-advanced { display:flex; flex-direction:column; gap:12px; padding-top:8px; }
   `);
   const tab = ctx.ui.registerDrawerTab({
     id: "chat-voice",
@@ -1145,6 +1181,7 @@ function setup(ctx) {
   status.className = "chat-voice-status";
   status.setAttribute("role", "status");
   status.setAttribute("aria-live", "polite");
+  const advancedHost = document.createElement("div");
   panel.append(
     context,
     connectionField.field,
@@ -1159,9 +1196,25 @@ function setup(ctx) {
     addNpcField.field,
     characterTitle,
     characterList,
-    status
+    status,
+    advancedHost
   );
   tab.root.appendChild(panel);
+  const advancedSection = ctx.components.mountCollapsibleSection(advancedHost, {
+    title: "Advanced settings",
+    defaultExpanded: false
+  });
+  advancedSection.body.classList.add("chat-voice-advanced");
+  const playbackBufferField = createField("Playback buffer segments");
+  const concurrentGenerationField = createField("Concurrent generations");
+  const advancedHint = document.createElement("div");
+  advancedHint.className = "chat-voice-hint";
+  advancedHint.textContent = "Larger buffers can reduce pauses but delay playback. Higher concurrency is faster but increases API load and rate-limit risk.";
+  advancedSection.body.append(
+    playbackBufferField.field,
+    concurrentGenerationField.field,
+    advancedHint
+  );
   let applyingState = false;
   let activeChat = null;
   let connections = [];
@@ -1180,6 +1233,10 @@ function setup(ctx) {
   let llmModel = "";
   let llmSettingsSaveTimer = null;
   let savingLlmSettings = false;
+  let playbackBufferSegments = DEFAULT_PLAYBACK_BUFFER_SEGMENTS;
+  let concurrentGenerationLimit = DEFAULT_CONCURRENT_GENERATIONS;
+  let advancedSettingsSaveTimer = null;
+  let savingAdvancedSettings = false;
   let saveTimer = null;
   let editRevision = 0;
   let dirty = false;
@@ -1192,7 +1249,7 @@ function setup(ctx) {
   const backgroundSynthesisQueue = [];
   let activeSynthesisTasks = 0;
   function drainSynthesisQueue() {
-    while (activeSynthesisTasks < PLAYBACK_BUFFER_SEGMENTS) {
+    while (activeSynthesisTasks < concurrentGenerationLimit) {
       const next = foregroundSynthesisQueue.shift() ?? backgroundSynthesisQueue.shift();
       if (!next) return;
       activeSynthesisTasks += 1;
@@ -1310,6 +1367,22 @@ function setup(ctx) {
     browseHint: "Leave blank to use the selected connection\u2019s configured model.",
     disabled: true,
     onChange: (value) => onLlmModelChanged(value)
+  });
+  const playbackBufferInput = ctx.components.mountNumberStepper(playbackBufferField.slot, {
+    value: DEFAULT_PLAYBACK_BUFFER_SEGMENTS,
+    min: 1,
+    max: MAX_PLAYBACK_BUFFER_SEGMENTS,
+    step: 1,
+    integer: true,
+    onChange: (value) => onPlaybackBufferChanged(value)
+  });
+  const concurrentGenerationInput = ctx.components.mountNumberStepper(concurrentGenerationField.slot, {
+    value: DEFAULT_CONCURRENT_GENERATIONS,
+    min: 1,
+    max: MAX_CONCURRENT_GENERATIONS,
+    step: 1,
+    integer: true,
+    onChange: (value) => onConcurrentGenerationsChanged(value)
   });
   const addNpcInput = ctx.components.mountTextInput(addNpcInputSlot, {
     value: "",
@@ -1599,6 +1672,13 @@ function setup(ctx) {
       preferences.llmConnectionId = llmConnectionId;
       preferences.llmModel = llmModel;
     }
+    if (advancedSettingsSaveTimer || savingAdvancedSettings) {
+      preferences.playbackBufferSegments = playbackBufferSegments;
+      preferences.concurrentGenerations = concurrentGenerationLimit;
+    } else {
+      playbackBufferSegments = preferences.playbackBufferSegments;
+      concurrentGenerationLimit = preferences.concurrentGenerations;
+    }
     const connectionId = config.connectionId || (connections.some((connection) => connection.id === preferences.connectionId) ? preferences.connectionId : connections.find((connection) => connection.is_default)?.id ?? lumiverseConnectionId);
     if (!connectionId) {
       setStatus("Choose a TTS connection before playing.", "error");
@@ -1706,7 +1786,7 @@ function setup(ctx) {
           preparedResolvers[index](await prepare(index));
         }
       };
-      const workerCount = Math.min(PLAYBACK_BUFFER_SEGMENTS, plan.length);
+      const workerCount = Math.min(preferences.concurrentGenerations, plan.length);
       for (let index = 0; index < workerCount; index += 1) void runSynthesisWorker();
       if (preferences.saveGeneratedAudio || regeneratingSavedAudio) {
         playback.persistenceState = "pending";
@@ -1775,7 +1855,7 @@ function setup(ctx) {
           backgroundSynthesisControllers.delete(synthesisController);
         });
       }
-      const initialBufferSize = Math.min(PLAYBACK_BUFFER_SEGMENTS, plan.length);
+      const initialBufferSize = Math.min(preferences.playbackBufferSegments, plan.length);
       setStatus(
         `Buffering ${initialBufferSize} voice segment${initialBufferSize === 1 ? "" : "s"} before playback\u2026`
       );
@@ -2027,6 +2107,12 @@ function setup(ctx) {
         speakerParsingPicker.update({ value: speakerParsingMode });
         updateLlmControlState();
       }
+      if (!savingAdvancedSettings && !advancedSettingsSaveTimer) {
+        playbackBufferSegments = preferences.playbackBufferSegments;
+        concurrentGenerationLimit = preferences.concurrentGenerations;
+        playbackBufferInput.update({ value: playbackBufferSegments });
+        concurrentGenerationInput.update({ value: concurrentGenerationLimit });
+      }
       lumiverseConnectionId = connections.some((connection) => connection.id === preferences.connectionId) ? preferences.connectionId : connections.find((connection) => connection.is_default)?.id ?? "";
       const selectedConnectionId = activeChat?.connectionId || lumiverseConnectionId;
       connectionPicker.update({
@@ -2098,6 +2184,44 @@ function setup(ctx) {
       setStatus(error instanceof Error ? error.message : "Could not save AI speaker-review settings.", "error");
     } finally {
       savingLlmSettings = false;
+    }
+  }
+  function scheduleAdvancedSettingsSave() {
+    if (advancedSettingsSaveTimer) clearTimeout(advancedSettingsSaveTimer);
+    advancedSettingsSaveTimer = setTimeout(() => {
+      advancedSettingsSaveTimer = null;
+      void persistAdvancedSettings();
+    }, 400);
+  }
+  function onPlaybackBufferChanged(value) {
+    playbackBufferSegments = clampIntegerSetting(
+      value,
+      DEFAULT_PLAYBACK_BUFFER_SEGMENTS,
+      MAX_PLAYBACK_BUFFER_SEGMENTS
+    );
+    playbackBufferInput.update({ value: playbackBufferSegments });
+    scheduleAdvancedSettingsSave();
+  }
+  function onConcurrentGenerationsChanged(value) {
+    concurrentGenerationLimit = clampIntegerSetting(
+      value,
+      DEFAULT_CONCURRENT_GENERATIONS,
+      MAX_CONCURRENT_GENERATIONS
+    );
+    concurrentGenerationInput.update({ value: concurrentGenerationLimit });
+    drainSynthesisQueue();
+    scheduleAdvancedSettingsSave();
+  }
+  async function persistAdvancedSettings() {
+    savingAdvancedSettings = true;
+    setStatus("Saving global advanced playback settings\u2026");
+    try {
+      await saveAdvancedPlaybackPreferences(playbackBufferSegments, concurrentGenerationLimit);
+      setStatus("Advanced playback settings saved globally.", "saved");
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : "Could not save advanced playback settings.", "error");
+    } finally {
+      savingAdvancedSettings = false;
     }
   }
   const onSaveAudioChanged = async () => {
@@ -2362,10 +2486,17 @@ function setup(ctx) {
       clearTimeout(llmSettingsSaveTimer);
       void saveLlmParsingPreferences(speakerParsingMode, llmConnectionId, llmModel);
     }
+    if (advancedSettingsSaveTimer) {
+      clearTimeout(advancedSettingsSaveTimer);
+      void saveAdvancedPlaybackPreferences(playbackBufferSegments, concurrentGenerationLimit);
+    }
     skippedTrackerTagsInput.destroy();
     speakerParsingPicker.destroy();
     llmConnectionPicker.destroy();
     llmModelInput.destroy();
+    playbackBufferInput.destroy();
+    concurrentGenerationInput.destroy();
+    advancedSection.destroy();
     addNpcInput.destroy();
     addNpcButton.removeEventListener("click", onAddNpc);
     addNpcInputSlot.removeEventListener("keydown", onAddNpcKeyDown);

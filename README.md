@@ -18,7 +18,7 @@ A [Lumiverse Spindle](https://docs.lumiverse.chat/) extension that detects chara
 - Recognizes confidently seeded two-character dialogue chains and alternates otherwise unattributed back-to-back speech turns.
 - Routes Lumiverse's native message TTS button through ordered multi-voice playback.
 - Overrides the matching native context-menu action instead of adding duplicate playback controls.
-- Merges adjacent same-voice passages within each paragraph, splits multi-paragraph passages into smaller requests, and maintains a four-segment rolling playback buffer to avoid gaps and API bursts.
+- Merges adjacent same-voice passages within each paragraph, splits multi-paragraph passages into smaller requests, and uses globally configurable playback buffering and generation concurrency to avoid gaps and API bursts.
 - Paces request starts and automatically honors `Retry-After` when a TTS provider responds with HTTP 429.
 - Uses Lumiverse's selected TTS connection, falling back to the profile marked as the default, when a chat has no saved connection.
 - Provides a global, opt-in **Save generated audio** setting. It is disabled by default to avoid consuming storage, and retains at most 50 extension recordings by default (user configurable).
@@ -61,6 +61,8 @@ The compiled frontend and backend bundles are committed under `dist/`, so users 
 7. Enter the narrator voice and a voice for each detected character. Add characters manually, or rename and delete any roster entry as needed. Separate aliases with `/` (for example, `Scott / The sergeant`) to route every name to the same voice; use the rename button to add aliases later without losing the assigned voice.
 8. Optionally enable **Save generated audio** to attach completed recordings to messages across every chat. This global setting is off by default. Set **Maximum saved recordings** to control global retention (default: 50); the oldest extension-created attachments are removed first.
 9. Use Lumiverse's normal **Play with TTS** button or context-menu action to play the message with all configured voices.
+
+The collapsed **Advanced settings** section at the bottom of the drawer controls how many synthesized segments are buffered before playback starts (default: 4) and how many segment generations may run concurrently (default: 4). Higher values can reduce pauses but increase startup delay or API rate-limit pressure.
 
 The card scan result, manually managed NPC roster, and all voice settings save automatically for that chat. Switching chats loads the previously saved cast and settings without scanning or calling the language model again. Click **Scan** after changing the card. Manual NPCs remain in the roster across later scans until you delete them. Clear a voice field to use the TTS connection's default/fallback voice; clear the connection to disable every custom voice managed by the extension for that chat.
 
