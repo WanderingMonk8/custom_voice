@@ -681,21 +681,42 @@ export function setup(ctx: SpindleFrontendContext) {
     persistenceError: string | null
     playbackStopped: boolean
     playbackFinished: boolean
+    audibleDone: Promise<void>
+    finishAudible: () => void
   } | null = null
   const backgroundSynthesisControllers = new Set<AbortController>()
   const sharedSynthesisPacer: SynthesisPacer = { nextStartAt: 0, startQueue: Promise.resolve() }
   const connectionVoiceGates = new Map<string, ConnectionVoiceGate>()
-  const synthesisSlots: Promise<void>[] = Array.from(
-    { length: PLAYBACK_BUFFER_SEGMENTS },
-    () => Promise.resolve(),
-  )
-  let nextSynthesisSlot = 0
+  type SynthesisTask = () => Promise<void>
+  const foregroundSynthesisQueue: SynthesisTask[] = []
+  const backgroundSynthesisQueue: SynthesisTask[] = []
+  let activeSynthesisTasks = 0
 
-  function runInSynthesisSlot<T>(task: () => Promise<T>): Promise<T> {
-    const slot = nextSynthesisSlot++ % synthesisSlots.length
-    const result = synthesisSlots[slot].then(task)
-    synthesisSlots[slot] = result.then(() => undefined, () => undefined)
-    return result
+  function drainSynthesisQueue(): void {
+    while (activeSynthesisTasks < PLAYBACK_BUFFER_SEGMENTS) {
+      const next = foregroundSynthesisQueue.shift() ?? backgroundSynthesisQueue.shift()
+      if (!next) return
+      activeSynthesisTasks += 1
+      void next().finally(() => {
+        activeSynthesisTasks -= 1
+        drainSynthesisQueue()
+      })
+    }
+  }
+
+  function runSynthesisTask<T>(task: () => Promise<T>, foreground: boolean): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      const queued = async () => {
+        try {
+          resolve(await task())
+        } catch (error) {
+          reject(error)
+        }
+      }
+      const queue = foreground ? foregroundSynthesisQueue : backgroundSynthesisQueue
+      queue.push(queued)
+      drainSynthesisQueue()
+    })
   }
   const inFlight = new Set<number>()
   const characterInputs = new Map<string, SpindleTextInputHandle>()
@@ -891,6 +912,7 @@ export function setup(ctx: SpindleFrontendContext) {
     activePlayback = null
     if (!playback) return false
     playback.playbackStopped = true
+    playback.finishAudible()
     playback.controller.abort()
     if (playback.persistenceState === 'not-started' || playback.persistenceState === 'disabled') {
       playback.synthesisController?.abort()
@@ -961,12 +983,15 @@ export function setup(ctx: SpindleFrontendContext) {
     segments: SynthesizedVoiceSegment[],
     contextClass: typeof AudioContext,
     signal: AbortSignal,
+    waitForSafeFallback: () => Promise<void>,
     onWavFallback: () => void,
   ): Promise<SavedMessageAudioResult> {
     try {
       return await saveMessageAudio(chatId, messageId, swipeId, segments, signal)
     } catch (segmentSaveError) {
       if ((segmentSaveError as { name?: string })?.name === 'AbortError') throw segmentSaveError
+      await waitForSafeFallback()
+      if (signal.aborted) throw new DOMException('Audio saving stopped.', 'AbortError')
       onWavFallback()
       const wav = await encodeCapturedWav(segments, contextClass)
       return saveMessageAudio(
@@ -979,14 +1004,52 @@ export function setup(ctx: SpindleFrontendContext) {
     }
   }
 
+  function hasSavedAudioForCurrentSwipe(message: PlaybackMessage): boolean {
+    const attachments = message.extra?.attachments
+    if (!Array.isArray(attachments)) return false
+    return attachments.some((candidate) => {
+      if (!candidate || typeof candidate !== 'object') return false
+      const attachment = candidate as SavedAudioAttachment
+      return attachment.type === 'audio'
+        && (attachment.swipe_id === undefined || attachment.swipe_id === message.swipe_id)
+    })
+  }
+
   async function playMessage(messageId: string): Promise<void> {
-    if (activePlayback) {
-      const wasSameMessage = activePlayback.messageId === messageId
+    if (activePlayback?.messageId === messageId) {
       const finishingSave = stopPlayback()
-      if (wasSameMessage) {
-        setStatus(finishingSave ? 'Playback stopped; finishing saved audio…' : 'Playback stopped.')
-        return
-      }
+      setStatus(finishingSave ? 'Playback stopped; finishing saved audio…' : 'Playback stopped.')
+      return
+    }
+
+    const requestedChatId = ctx.getActiveChat().chatId
+    if (!requestedChatId) {
+      setStatus('Open a chat before starting voice playback.', 'error')
+      return
+    }
+    let message: PlaybackMessage
+    try {
+      message = await requestPlaybackMessage(requestedChatId, messageId)
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : 'Could not load this message.', 'error')
+      return
+    }
+    if (ctx.getActiveChat().chatId !== requestedChatId) return
+
+    const regeneratingSavedAudio = hasSavedAudioForCurrentSwipe(message)
+    if (regeneratingSavedAudio) {
+      const { confirmed } = await ctx.ui.showConfirm({
+        title: 'Regenerate TTS audio?',
+        message: 'This will replace the saved audio attached to this message with a new TTS synthesis. The current recording will be deleted.',
+        confirmLabel: 'Regenerate',
+        cancelLabel: 'Keep current',
+        variant: 'warning',
+      })
+      if (!confirmed || ctx.getActiveChat().chatId !== requestedChatId) return
+    }
+
+    if (activePlayback) {
+      stopPlayback()
     }
     const localChatId = ctx.getActiveChat().chatId
     if (activeChat?.id !== localChatId) {
@@ -1018,6 +1081,11 @@ export function setup(ctx: SpindleFrontendContext) {
     }
     const audioContext = new contextClass()
     await audioContext.resume()
+    let audibleFinished = false
+    let resolveAudibleDone: (() => void) | null = null
+    const audibleDone = new Promise<void>((resolve) => {
+      resolveAudibleDone = resolve
+    })
     const playback = {
       messageId,
       controller: new AbortController(),
@@ -1028,12 +1096,17 @@ export function setup(ctx: SpindleFrontendContext) {
       persistenceError: null as string | null,
       playbackStopped: false,
       playbackFinished: false,
+      audibleDone,
+      finishAudible: () => {
+        if (audibleFinished) return
+        audibleFinished = true
+        resolveAudibleDone?.()
+      },
     }
     activePlayback = playback
     updatePlaybackButtons()
 
     try {
-      const message = await requestPlaybackMessage(playbackChat.id, messageId)
       if (playback.controller.signal.aborted) throw new DOMException('Playback stopped.', 'AbortError')
       if (message.is_user) throw new Error('Custom voice playback is only available for character messages.')
       const explicitId = typeof message.extra?.character_id === 'string' ? message.extra.character_id : ''
@@ -1067,7 +1140,7 @@ export function setup(ctx: SpindleFrontendContext) {
         | { ok: false; error: unknown }
       const prepare = async (index: number): Promise<PreparedSegment> => {
         try {
-          const segment = await runInSynthesisSlot(() => synthesizeVoiceSegment(
+          const segment = await runSynthesisTask(() => synthesizeVoiceSegment(
             connectionId,
             plan[index].text,
             plan[index].voice,
@@ -1084,7 +1157,7 @@ export function setup(ctx: SpindleFrontendContext) {
                 setStatus(`Rate limited; retry ${retry} in ${Math.max(1, Math.ceil(delayMs / 1_000))}s…`)
               }
             },
-          ))
+          ), activePlayback === playback && !playback.playbackStopped)
           return { ok: true, segment }
         } catch (error) {
           return { ok: false, error }
@@ -1105,7 +1178,7 @@ export function setup(ctx: SpindleFrontendContext) {
       }
       const workerCount = Math.min(PLAYBACK_BUFFER_SEGMENTS, plan.length)
       for (let index = 0; index < workerCount; index += 1) void runSynthesisWorker()
-      if (preferences.saveGeneratedAudio) {
+      if (preferences.saveGeneratedAudio || regeneratingSavedAudio) {
         playback.persistenceState = 'pending'
         void Promise.all(prepared).then(async (results) => {
           const failed = results.find((result): result is { ok: false; error: unknown } => !result.ok)
@@ -1123,6 +1196,7 @@ export function setup(ctx: SpindleFrontendContext) {
             captured,
             contextClass,
             synthesisController.signal,
+            () => playback.audibleDone,
             () => {
               if (ctx.getActiveChat().chatId === playbackChat.id && (!activePlayback || activePlayback === playback)) {
                 setStatus('Server could not combine the source audio; retrying as WAV…')
@@ -1192,6 +1266,7 @@ export function setup(ctx: SpindleFrontendContext) {
         await playDecodedBuffer(playback, current.segment.data, preferences.volume)
       }
       playback.playbackFinished = true
+      playback.finishAudible()
       if (activePlayback === playback) {
         activePlayback = null
         updatePlaybackButtons()
@@ -1208,6 +1283,7 @@ export function setup(ctx: SpindleFrontendContext) {
         setStatus(error instanceof Error ? error.message : 'Custom voice playback failed.', 'error')
       }
     } finally {
+      playback.finishAudible()
       if (activePlayback === playback) {
         activePlayback = null
         await playback.context.close().catch(() => undefined)

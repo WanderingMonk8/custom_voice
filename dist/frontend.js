@@ -1025,16 +1025,33 @@ function setup(ctx) {
   const backgroundSynthesisControllers = /* @__PURE__ */ new Set();
   const sharedSynthesisPacer = { nextStartAt: 0, startQueue: Promise.resolve() };
   const connectionVoiceGates = /* @__PURE__ */ new Map();
-  const synthesisSlots = Array.from(
-    { length: PLAYBACK_BUFFER_SEGMENTS },
-    () => Promise.resolve()
-  );
-  let nextSynthesisSlot = 0;
-  function runInSynthesisSlot(task) {
-    const slot = nextSynthesisSlot++ % synthesisSlots.length;
-    const result = synthesisSlots[slot].then(task);
-    synthesisSlots[slot] = result.then(() => void 0, () => void 0);
-    return result;
+  const foregroundSynthesisQueue = [];
+  const backgroundSynthesisQueue = [];
+  let activeSynthesisTasks = 0;
+  function drainSynthesisQueue() {
+    while (activeSynthesisTasks < PLAYBACK_BUFFER_SEGMENTS) {
+      const next = foregroundSynthesisQueue.shift() ?? backgroundSynthesisQueue.shift();
+      if (!next) return;
+      activeSynthesisTasks += 1;
+      void next().finally(() => {
+        activeSynthesisTasks -= 1;
+        drainSynthesisQueue();
+      });
+    }
+  }
+  function runSynthesisTask(task, foreground) {
+    return new Promise((resolve, reject) => {
+      const queued = async () => {
+        try {
+          resolve(await task());
+        } catch (error) {
+          reject(error);
+        }
+      };
+      const queue = foreground ? foregroundSynthesisQueue : backgroundSynthesisQueue;
+      queue.push(queued);
+      drainSynthesisQueue();
+    });
   }
   const inFlight = /* @__PURE__ */ new Set();
   const characterInputs = /* @__PURE__ */ new Map();
@@ -1205,6 +1222,7 @@ function setup(ctx) {
     activePlayback = null;
     if (!playback) return false;
     playback.playbackStopped = true;
+    playback.finishAudible();
     playback.controller.abort();
     if (playback.persistenceState === "not-started" || playback.persistenceState === "disabled") {
       playback.synthesisController?.abort();
@@ -1264,11 +1282,13 @@ function setup(ctx) {
       await decodeContext.close().catch(() => void 0);
     }
   }
-  async function persistCapturedAudio(chatId, messageId, swipeId, segments, contextClass, signal, onWavFallback) {
+  async function persistCapturedAudio(chatId, messageId, swipeId, segments, contextClass, signal, waitForSafeFallback, onWavFallback) {
     try {
       return await saveMessageAudio(chatId, messageId, swipeId, segments, signal);
     } catch (segmentSaveError) {
       if (segmentSaveError?.name === "AbortError") throw segmentSaveError;
+      await waitForSafeFallback();
+      if (signal.aborted) throw new DOMException("Audio saving stopped.", "AbortError");
       onWavFallback();
       const wav = await encodeCapturedWav(segments, contextClass);
       return saveMessageAudio(
@@ -1280,14 +1300,47 @@ function setup(ctx) {
       );
     }
   }
+  function hasSavedAudioForCurrentSwipe(message) {
+    const attachments = message.extra?.attachments;
+    if (!Array.isArray(attachments)) return false;
+    return attachments.some((candidate) => {
+      if (!candidate || typeof candidate !== "object") return false;
+      const attachment = candidate;
+      return attachment.type === "audio" && (attachment.swipe_id === void 0 || attachment.swipe_id === message.swipe_id);
+    });
+  }
   async function playMessage(messageId) {
-    if (activePlayback) {
-      const wasSameMessage = activePlayback.messageId === messageId;
+    if (activePlayback?.messageId === messageId) {
       const finishingSave = stopPlayback();
-      if (wasSameMessage) {
-        setStatus(finishingSave ? "Playback stopped; finishing saved audio\u2026" : "Playback stopped.");
-        return;
-      }
+      setStatus(finishingSave ? "Playback stopped; finishing saved audio\u2026" : "Playback stopped.");
+      return;
+    }
+    const requestedChatId = ctx.getActiveChat().chatId;
+    if (!requestedChatId) {
+      setStatus("Open a chat before starting voice playback.", "error");
+      return;
+    }
+    let message;
+    try {
+      message = await requestPlaybackMessage(requestedChatId, messageId);
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : "Could not load this message.", "error");
+      return;
+    }
+    if (ctx.getActiveChat().chatId !== requestedChatId) return;
+    const regeneratingSavedAudio = hasSavedAudioForCurrentSwipe(message);
+    if (regeneratingSavedAudio) {
+      const { confirmed } = await ctx.ui.showConfirm({
+        title: "Regenerate TTS audio?",
+        message: "This will replace the saved audio attached to this message with a new TTS synthesis. The current recording will be deleted.",
+        confirmLabel: "Regenerate",
+        cancelLabel: "Keep current",
+        variant: "warning"
+      });
+      if (!confirmed || ctx.getActiveChat().chatId !== requestedChatId) return;
+    }
+    if (activePlayback) {
+      stopPlayback();
     }
     const localChatId = ctx.getActiveChat().chatId;
     if (activeChat?.id !== localChatId) {
@@ -1315,6 +1368,11 @@ function setup(ctx) {
     }
     const audioContext = new contextClass();
     await audioContext.resume();
+    let audibleFinished = false;
+    let resolveAudibleDone = null;
+    const audibleDone = new Promise((resolve) => {
+      resolveAudibleDone = resolve;
+    });
     const playback = {
       messageId,
       controller: new AbortController(),
@@ -1324,12 +1382,17 @@ function setup(ctx) {
       persistenceState: "not-started",
       persistenceError: null,
       playbackStopped: false,
-      playbackFinished: false
+      playbackFinished: false,
+      audibleDone,
+      finishAudible: () => {
+        if (audibleFinished) return;
+        audibleFinished = true;
+        resolveAudibleDone?.();
+      }
     };
     activePlayback = playback;
     updatePlaybackButtons();
     try {
-      const message = await requestPlaybackMessage(playbackChat.id, messageId);
       if (playback.controller.signal.aborted) throw new DOMException("Playback stopped.", "AbortError");
       if (message.is_user) throw new Error("Custom voice playback is only available for character messages.");
       const explicitId = typeof message.extra?.character_id === "string" ? message.extra.character_id : "";
@@ -1350,7 +1413,7 @@ function setup(ctx) {
       backgroundSynthesisControllers.add(synthesisController);
       const prepare = async (index) => {
         try {
-          const segment = await runInSynthesisSlot(() => synthesizeVoiceSegment(
+          const segment = await runSynthesisTask(() => synthesizeVoiceSegment(
             connectionId,
             plan[index].text,
             plan[index].voice,
@@ -1367,7 +1430,7 @@ function setup(ctx) {
                 setStatus(`Rate limited; retry ${retry} in ${Math.max(1, Math.ceil(delayMs / 1e3))}s\u2026`);
               }
             }
-          ));
+          ), activePlayback === playback && !playback.playbackStopped);
           return { ok: true, segment };
         } catch (error) {
           return { ok: false, error };
@@ -1387,7 +1450,7 @@ function setup(ctx) {
       };
       const workerCount = Math.min(PLAYBACK_BUFFER_SEGMENTS, plan.length);
       for (let index = 0; index < workerCount; index += 1) void runSynthesisWorker();
-      if (preferences.saveGeneratedAudio) {
+      if (preferences.saveGeneratedAudio || regeneratingSavedAudio) {
         playback.persistenceState = "pending";
         void Promise.all(prepared).then(async (results) => {
           const failed = results.find((result) => !result.ok);
@@ -1405,6 +1468,7 @@ function setup(ctx) {
             captured,
             contextClass,
             synthesisController.signal,
+            () => playback.audibleDone,
             () => {
               if (ctx.getActiveChat().chatId === playbackChat.id && (!activePlayback || activePlayback === playback)) {
                 setStatus("Server could not combine the source audio; retrying as WAV\u2026");
@@ -1465,6 +1529,7 @@ function setup(ctx) {
         await playDecodedBuffer(playback, current.segment.data, preferences.volume);
       }
       playback.playbackFinished = true;
+      playback.finishAudible();
       if (activePlayback === playback) {
         activePlayback = null;
         updatePlaybackButtons();
@@ -1481,6 +1546,7 @@ function setup(ctx) {
         setStatus(error instanceof Error ? error.message : "Custom voice playback failed.", "error");
       }
     } finally {
+      playback.finishAudible();
       if (activePlayback === playback) {
         activePlayback = null;
         await playback.context.close().catch(() => void 0);
