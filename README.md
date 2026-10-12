@@ -18,7 +18,7 @@ A [Lumiverse Spindle](https://docs.lumiverse.chat/) extension that detects chara
 - Recognizes confidently seeded two-character dialogue chains and alternates otherwise unattributed back-to-back speech turns.
 - Routes Lumiverse's native message TTS button through ordered multi-voice playback.
 - Overrides the matching native context-menu action instead of adding duplicate playback controls.
-- Merges adjacent same-voice passages within each paragraph, splits multi-paragraph passages into smaller requests, and maintains a four-segment rolling playback buffer to avoid gaps and API bursts.
+- Merges adjacent same-voice passages within each paragraph, splits multi-paragraph passages into smaller requests, and uses globally configurable playback buffering and generation concurrency to avoid gaps and API bursts.
 - Paces request starts and automatically honors `Retry-After` when a TTS provider responds with HTTP 429.
 - Uses Lumiverse's selected TTS connection, falling back to the profile marked as the default, when a chat has no saved connection.
 - Provides a global, opt-in **Save generated audio** setting. It is disabled by default to avoid consuming storage, and retains at most 50 extension recordings by default (user configurable).
@@ -27,6 +27,8 @@ A [Lumiverse Spindle](https://docs.lumiverse.chat/) extension that detects chara
 - Removes HTML/escaped tags and Markdown emphasis markers before sending readable text to TTS.
 - Provides a global, autosaved list of paired tracker tags whose tags and enclosed contents are removed before playback generation.
 - Automatically excludes well-formed HTML comments (`<!-- ... -->`) from playback and speaker detection.
+- Alternates short unattributed dialogue turns after two speakers have been confidently established, including chains preceded by same-speaker continuation paragraphs.
+- Optionally reviews ambiguous—or all—dialogue with an LLM, using a selectable Lumiverse connection and optional custom model override. Results are cached per message and safely fall back to local parsing.
 - Auto-saves every setting to the current chat.
 - Saves the detected cast and reloads it with the correct settings whenever the active chat changes.
 - Keeps active-chat settings and playback requests isolated between multiple open Lumiverse browser tabs.
@@ -54,10 +56,13 @@ The compiled frontend and backend bundles are committed under `dist/`, so users 
 2. Select **Voice** in the Lumiverse drawer.
 3. Click **Scan** to read the active character card and save its speaking cast.
 4. Optionally enter comma-separated paired tags under **Skipped tracker tags**, such as `<tracker></tracker>, <status></status>`. These global exclusions remove both the tags and everything enclosed by them before TTS generation.
-5. Choose one TTS connection for the chat.
-6. Enter the narrator voice and a voice for each detected character. Add characters manually, or rename and delete any roster entry as needed. Separate aliases with `/` (for example, `Scott / The sergeant`) to route every name to the same voice; use the rename button to add aliases later without losing the assigned voice.
-7. Optionally enable **Save generated audio** to attach completed recordings to messages across every chat. This global setting is off by default. Set **Maximum saved recordings** to control global retention (default: 50); the oldest extension-created attachments are removed first.
-8. Use Lumiverse's normal **Play with TTS** button or context-menu action to play the message with all configured voices.
+5. Global **AI speaker review** defaults to **Ambiguous only**. Choose an existing Lumiverse LLM connection and, if desired, enter a custom model name; both controls remain disabled if review is switched off.
+6. Choose one TTS connection for the chat.
+7. Enter the narrator voice and a voice for each detected character. Add characters manually, or rename and delete any roster entry as needed. Separate aliases with `/` (for example, `Scott / The sergeant`) to route every name to the same voice; use the rename button to add aliases later without losing the assigned voice.
+8. Optionally enable **Save generated audio** to attach completed recordings to messages across every chat. This global setting is off by default. Set **Maximum saved recordings** to control global retention (default: 50); the oldest extension-created attachments are removed first.
+9. Use Lumiverse's normal **Play with TTS** button or context-menu action to play the message with all configured voices.
+
+The collapsed **Advanced settings** section at the bottom of the drawer controls how many synthesized segments are buffered before playback starts (default: 2) and how many segment generations may run concurrently (default: 2). Higher values can reduce pauses but increase startup delay or API rate-limit pressure.
 
 The card scan result, manually managed NPC roster, and all voice settings save automatically for that chat. Switching chats loads the previously saved cast and settings without scanning or calling the language model again. Click **Scan** after changing the card. Manual NPCs remain in the roster across later scans until you delete them. Clear a voice field to use the TTS connection's default/fallback voice; clear the connection to disable every custom voice managed by the extension for that chat.
 
@@ -69,9 +74,9 @@ Alice: "I was wondering when you'd arrive."
 Bob: "We should leave before midnight."
 ```
 
-Only text inside straight or curly quotation marks is treated as character speech. Everything outside quotes uses the narrator voice. While the extension is enabled, Lumiverse's native **Play with TTS** button and matching context-menu action resolve the current output locally and send narration, Alice, and Bob in order through the shared connection. This supports any number of configured cast voices and does not require another language-model request.
+Only text inside straight or curly quotation marks is treated as character speech. Everything outside quotes uses the narrator voice. While the extension is enabled, Lumiverse's native **Play with TTS** button and matching context-menu action send narration, Alice, and Bob in order through the shared connection. This supports any number of configured cast voices. With AI speaker review off, attribution is entirely local; the optional review modes make a cached language-model request before synthesis when required.
 
-AI parsing happens only when **Scan** is clicked and only receives card fields such as description, scenario, greeting, and example dialogue. Model output is validated before it is saved; if parsing is unavailable, the primary card character remains available as a fallback.
+Card-cast AI parsing happens only when **Scan** is clicked and receives card fields such as description, scenario, greeting, and example dialogue. Optional playback speaker review receives the cleaned current message, its numbered quotations, and the saved roster. Model output is validated against known speaker IDs; failures fall back to deterministic parsing.
 
 Chat Voice configures Lumiverse's speech detection so quoted text is classified as character speech and both asterisked and undecorated text are classified as narration. Other Voice & Speech preferences are preserved.
 

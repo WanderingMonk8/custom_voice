@@ -12,10 +12,13 @@ import {
   hashMessageContent,
   mergeVoicePlan,
   npcSpeakerId,
+  needsLlmSpeakerReview,
   parseCardCast,
   parseLlmSegmentation,
+  parseLlmSpeakerAssignments,
   parseMultiVoiceSegments,
   parseRosterVoiceSegments,
+  parseRosterVoiceSegmentsWithAssignments,
   parseSkippedTrackerTags,
   readConfig,
   readSavedAudioHistory,
@@ -258,6 +261,34 @@ test('validates fenced LLM segmentation and rejects unknown message IDs', () => 
       { type: 'speech', text: 'Hello.', speaker: 'Alice' },
     ],
   }])
+})
+
+test('validates LLM quote assignments and applies only known speaker IDs', () => {
+  const assignments = parseLlmSpeakerAssignments({
+    content: '```json\n{"assignments":[{"quote":0,"speakerId":"grace"},{"quote":1,"speakerId":"katie"},{"quote":2,"speakerId":"unknown"}]}\n```',
+  }, new Set(['grace', 'katie']), 3)
+  assert.deepEqual(assignments, [
+    { quote: 0, speakerId: 'grace' },
+    { quote: 1, speakerId: 'katie' },
+  ])
+  assert.deepEqual(
+    parseRosterVoiceSegmentsWithAssignments(
+      '"First."\n\n"Second."',
+      'grace',
+      [{ id: 'grace', name: 'Grace' }, { id: 'katie', name: 'Katie' }],
+      assignments,
+    ).filter(segment => segment.speakerId !== null),
+    [
+      { text: 'First.', speakerId: 'grace' },
+      { text: 'Second.', speakerId: 'katie' },
+    ],
+  )
+})
+
+test('requests LLM review only for dialogue requiring historical or fallback attribution', () => {
+  const speakers = [{ id: 'grace', name: 'Grace' }, { id: 'katie', name: 'Katie' }]
+  assert.equal(needsLlmSpeakerReview('Grace said, "Clearly attributed."', 'grace', speakers), false)
+  assert.equal(needsLlmSpeakerReview('Grace watched the door.\n\n"Who is there?"', 'grace', speakers), true)
 })
 
 test('message content hashes change when playback content changes', () => {
@@ -717,6 +748,32 @@ test('alternates unresolved turns in a confidently seeded dialogue chain', () =>
     },
     { text: 'So we can send two sentences before going mute.', speakerId: 'alma' },
     { text: 'Then I understand.', speakerId: 'vahn' },
+  ])
+})
+
+test('preserves a dialogue seed across a history-attributed continuation before alternating', () => {
+  const segments = parseRosterVoiceSegments(
+    `"Rugged, honest, and made for the work," Grace repeats from the other side of the glass. "You just described a pen and accidentally described yourself."
+
+"I say that with authority," she adds, quieter. "I have bought instruments. The pretty ones hang on the wall."
+
+"Then that is the one." Katie unfolds from the wall and arrives at the case. "Household lists, the treaty, the cursive. It all goes through that pen."
+
+"I would never."
+
+"You were three sentences from it."`,
+    'card',
+    [{ id: 'grace', name: 'Grace' }, { id: 'katie', name: 'Katie' }],
+  )
+  assert.deepEqual(segments.filter(segment => segment.speakerId !== null), [
+    { text: 'Rugged, honest, and made for the work,', speakerId: 'grace' },
+    { text: 'You just described a pen and accidentally described yourself.', speakerId: 'grace' },
+    { text: 'I say that with authority,', speakerId: 'grace' },
+    { text: 'I have bought instruments. The pretty ones hang on the wall.', speakerId: 'grace' },
+    { text: 'Then that is the one.', speakerId: 'katie' },
+    { text: 'Household lists, the treaty, the cursive. It all goes through that pen.', speakerId: 'katie' },
+    { text: 'I would never.', speakerId: 'grace' },
+    { text: 'You were three sentences from it.', speakerId: 'katie' },
   ])
 })
 

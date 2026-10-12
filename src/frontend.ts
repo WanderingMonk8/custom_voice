@@ -14,6 +14,7 @@ import {
   readSavedAudioHistory,
   speakerAliases,
   upsertSavedAudioRecord,
+  type PlaybackSegment,
   type SavedAudioRecord,
 } from './core'
 
@@ -27,6 +28,14 @@ interface TtsConnection {
 interface ConnectionPage {
   data?: TtsConnection[]
   total?: number
+}
+
+interface LlmConnection {
+  id: string
+  name: string
+  provider: string
+  model: string
+  is_default: boolean
 }
 
 interface SynthesisPacer {
@@ -117,7 +126,10 @@ class ConnectionVoiceGate {
 
 const MIN_SYNTHESIS_START_INTERVAL_MS = 1_250
 const MAX_RATE_LIMIT_RETRIES = 3
-const PLAYBACK_BUFFER_SEGMENTS = 4
+const DEFAULT_PLAYBACK_BUFFER_SEGMENTS = 2
+const DEFAULT_CONCURRENT_GENERATIONS = 2
+const MAX_PLAYBACK_BUFFER_SEGMENTS = 20
+const MAX_CONCURRENT_GENERATIONS = 10
 
 interface DetectedCharacterState {
   id: string
@@ -163,6 +175,23 @@ interface MessagePayload {
   error?: string
 }
 
+interface ParsedMessagePayload {
+  type: 'chat_voice_parsed_message'
+  requestId: string
+  chatId: string
+  messageId: string
+  segments?: PlaybackSegment[]
+  usedLlm?: boolean
+  error?: string
+}
+
+interface LlmConnectionsPayload {
+  type: 'chat_voice_llm_connections'
+  requestId: string
+  connections: LlmConnection[]
+  error?: string
+}
+
 interface PlaybackMessage {
   id: string
   is_user: boolean
@@ -204,6 +233,17 @@ interface PlaybackPreferences {
   saveGeneratedAudio: boolean
   savedAudioLimit: number
   skippedTrackerTags: string
+  speakerParsingMode: 'off' | 'ambiguous' | 'always'
+  llmConnectionId: string
+  llmModel: string
+  playbackBufferSegments: number
+  concurrentGenerations: number
+}
+
+function clampIntegerSetting(value: unknown, fallback: number, maximum: number): number {
+  const numeric = typeof value === 'number' ? value : Number(value)
+  if (!Number.isFinite(numeric)) return fallback
+  return Math.min(maximum, Math.max(1, Math.round(numeric)))
 }
 
 const VOICE_ICON = `
@@ -246,10 +286,19 @@ async function loadPlaybackPreferences(): Promise<PlaybackPreferences> {
     saveGeneratedAudio: false,
     savedAudioLimit: DEFAULT_SAVED_AUDIO_LIMIT,
     skippedTrackerTags: '',
+    speakerParsingMode: 'ambiguous',
+    llmConnectionId: '',
+    llmModel: '',
+    playbackBufferSegments: DEFAULT_PLAYBACK_BUFFER_SEGMENTS,
+    concurrentGenerations: DEFAULT_CONCURRENT_GENERATIONS,
   }
   const row = await response.json() as { value?: Record<string, unknown> }
   const speed = typeof row.value?.ttsSpeed === 'number' ? row.value.ttsSpeed : 1
   const volume = typeof row.value?.ttsVolume === 'number' ? row.value.ttsVolume : 1
+  const speakerParsingMode = row.value?.chatVoiceSpeakerParsingMode === 'off'
+    || row.value?.chatVoiceSpeakerParsingMode === 'always'
+    ? row.value.chatVoiceSpeakerParsingMode
+    : 'ambiguous'
   return {
     speed: Math.min(4, Math.max(0.25, speed)),
     volume: Math.min(1, Math.max(0, volume)),
@@ -261,6 +310,23 @@ async function loadPlaybackPreferences(): Promise<PlaybackPreferences> {
     skippedTrackerTags: typeof row.value?.chatVoiceSkippedTrackerTags === 'string'
       ? row.value.chatVoiceSkippedTrackerTags.slice(0, 4_000)
       : '',
+    speakerParsingMode,
+    llmConnectionId: typeof row.value?.chatVoiceLlmConnectionId === 'string'
+      ? row.value.chatVoiceLlmConnectionId.trim().slice(0, 128)
+      : '',
+    llmModel: typeof row.value?.chatVoiceLlmModel === 'string'
+      ? row.value.chatVoiceLlmModel.trim().slice(0, 256)
+      : '',
+    playbackBufferSegments: clampIntegerSetting(
+      row.value?.chatVoicePlaybackBufferSegments,
+      DEFAULT_PLAYBACK_BUFFER_SEGMENTS,
+      MAX_PLAYBACK_BUFFER_SEGMENTS,
+    ),
+    concurrentGenerations: clampIntegerSetting(
+      row.value?.chatVoiceConcurrentGenerations,
+      DEFAULT_CONCURRENT_GENERATIONS,
+      MAX_CONCURRENT_GENERATIONS,
+    ),
   }
 }
 
@@ -307,6 +373,35 @@ function saveSkippedTrackerTagsPreference(value: string): Promise<void> {
   return updateVoiceSettings(current => ({
     ...current,
     chatVoiceSkippedTrackerTags: value.slice(0, 4_000),
+  }))
+}
+
+function saveLlmParsingPreferences(
+  mode: 'off' | 'ambiguous' | 'always',
+  connectionId: string,
+  model: string,
+): Promise<void> {
+  return updateVoiceSettings(current => ({
+    ...current,
+    chatVoiceSpeakerParsingMode: mode,
+    chatVoiceLlmConnectionId: connectionId.trim().slice(0, 128),
+    chatVoiceLlmModel: model.trim().slice(0, 256),
+  }))
+}
+
+function saveAdvancedPlaybackPreferences(bufferSegments: number, concurrentGenerations: number): Promise<void> {
+  return updateVoiceSettings(current => ({
+    ...current,
+    chatVoicePlaybackBufferSegments: clampIntegerSetting(
+      bufferSegments,
+      DEFAULT_PLAYBACK_BUFFER_SEGMENTS,
+      MAX_PLAYBACK_BUFFER_SEGMENTS,
+    ),
+    chatVoiceConcurrentGenerations: clampIntegerSetting(
+      concurrentGenerations,
+      DEFAULT_CONCURRENT_GENERATIONS,
+      MAX_CONCURRENT_GENERATIONS,
+    ),
   }))
 }
 
@@ -561,6 +656,20 @@ export function setup(ctx: SpindleFrontendContext) {
     .chat-voice-status { min-height:18px; }
     .chat-voice-status[data-state="saved"] { color:var(--lumiverse-success, #65b97a); }
     .chat-voice-status[data-state="error"] { color:var(--lumiverse-danger, #ef6464); }
+    .chat-voice-advanced-section { border-top:1px solid var(--lumiverse-border); padding-top:12px; }
+    .chat-voice-advanced-summary {
+      display:flex; align-items:center; justify-content:space-between; cursor:pointer;
+      font-weight:700; list-style:none; user-select:none;
+    }
+    .chat-voice-advanced-summary::-webkit-details-marker { display:none; }
+    .chat-voice-advanced-summary::after { content:'›'; color:var(--lumiverse-text-muted); transform:rotate(90deg); }
+    .chat-voice-advanced-section[open] .chat-voice-advanced-summary::after { transform:rotate(-90deg); }
+    .chat-voice-advanced { display:flex; flex-direction:column; gap:12px; padding-top:16px; }
+    .chat-voice-number-input {
+      box-sizing:border-box; width:100%; min-height:36px; padding:7px 10px;
+      border:1px solid var(--lumiverse-border); border-radius:var(--lumiverse-radius);
+      background:var(--lumiverse-bg-secondary, transparent); color:var(--lumiverse-text-primary); font:inherit;
+    }
   `)
 
   const tab = ctx.ui.registerDrawerTab({
@@ -635,6 +744,9 @@ export function setup(ctx: SpindleFrontendContext) {
   scanButton.disabled = true
   scanRow.append(scanButton)
   const skippedTagsField = createField('Skipped tracker tags (global)')
+  const speakerParsingField = createField('AI speaker review (global)')
+  const llmConnectionField = createField('Speaker-review LLM connection')
+  const llmModelField = createField('Custom LLM model (optional)')
   const narratorField = createField('Narrator voice')
   const routingHint = document.createElement('div')
   routingHint.className = 'chat-voice-hint'
@@ -657,6 +769,14 @@ export function setup(ctx: SpindleFrontendContext) {
   status.className = 'chat-voice-status'
   status.setAttribute('role', 'status')
   status.setAttribute('aria-live', 'polite')
+  const advancedSection = document.createElement('details')
+  advancedSection.className = 'chat-voice-advanced-section'
+  const advancedSummary = document.createElement('summary')
+  advancedSummary.className = 'chat-voice-advanced-summary'
+  advancedSummary.textContent = 'Advanced settings'
+  const advancedBody = document.createElement('div')
+  advancedBody.className = 'chat-voice-advanced'
+  advancedSection.append(advancedSummary, advancedBody)
 
   panel.append(
     context,
@@ -664,14 +784,29 @@ export function setup(ctx: SpindleFrontendContext) {
     saveAudioField.field,
     scanField.field,
     skippedTagsField.field,
+    speakerParsingField.field,
+    llmConnectionField.field,
+    llmModelField.field,
     narratorField.field,
     routingHint,
     addNpcField.field,
     characterTitle,
     characterList,
     status,
+    advancedSection,
   )
   tab.root.appendChild(panel)
+
+  const playbackBufferField = createField('Playback buffer segments')
+  const concurrentGenerationField = createField('Concurrent generations')
+  const advancedHint = document.createElement('div')
+  advancedHint.className = 'chat-voice-hint'
+  advancedHint.textContent = 'Larger buffers can reduce pauses but delay playback. Higher concurrency is faster but increases API load and rate-limit risk.'
+  advancedBody.append(
+    playbackBufferField.field,
+    concurrentGenerationField.field,
+    advancedHint,
+  )
 
   let applyingState = false
   let activeChat: ActiveChatState | null = null
@@ -685,6 +820,16 @@ export function setup(ctx: SpindleFrontendContext) {
   let skippedTrackerTagsDirty = false
   let savingSkippedTrackerTags = false
   let skippedTrackerTagsSaveTimer: ReturnType<typeof setTimeout> | null = null
+  let speakerParsingMode: 'off' | 'ambiguous' | 'always' = 'ambiguous'
+  let llmConnections: LlmConnection[] = []
+  let llmConnectionId = ''
+  let llmModel = ''
+  let llmSettingsSaveTimer: ReturnType<typeof setTimeout> | null = null
+  let savingLlmSettings = false
+  let playbackBufferSegments = DEFAULT_PLAYBACK_BUFFER_SEGMENTS
+  let concurrentGenerationLimit = DEFAULT_CONCURRENT_GENERATIONS
+  let advancedSettingsSaveTimer: ReturnType<typeof setTimeout> | null = null
+  let savingAdvancedSettings = false
   let saveTimer: ReturnType<typeof setTimeout> | null = null
   let editRevision = 0
   let dirty = false
@@ -711,7 +856,7 @@ export function setup(ctx: SpindleFrontendContext) {
   let activeSynthesisTasks = 0
 
   function drainSynthesisQueue(): void {
-    while (activeSynthesisTasks < PLAYBACK_BUFFER_SEGMENTS) {
+    while (activeSynthesisTasks < concurrentGenerationLimit) {
       const next = foregroundSynthesisQueue.shift() ?? backgroundSynthesisQueue.shift()
       if (!next) return
       activeSynthesisTasks += 1
@@ -756,8 +901,20 @@ export function setup(ctx: SpindleFrontendContext) {
     reject: (error: Error) => void
     timer: ReturnType<typeof setTimeout>
   }>()
+  const pendingSpeakerParseRequests = new Map<string, {
+    resolve: (segments: PlaybackSegment[]) => void
+    reject: (error: Error) => void
+    timer: ReturnType<typeof setTimeout>
+  }>()
+  const pendingLlmConnectionRequests = new Map<string, {
+    resolve: (connections: LlmConnection[]) => void
+    reject: (error: Error) => void
+    timer: ReturnType<typeof setTimeout>
+  }>()
   let messageRequestSequence = 0
   let stateRequestSequence = 0
+  let speakerParseRequestSequence = 0
+  let llmConnectionRequestSequence = 0
 
   const setStatus = (message: string, state: 'normal' | 'saved' | 'error' = 'normal') => {
     status.textContent = message
@@ -817,6 +974,69 @@ export function setup(ctx: SpindleFrontendContext) {
     ariaLabel: 'Tracker tag pairs to skip globally',
     onChange: () => scheduleSkippedTrackerTagsSave(),
   })
+
+  const speakerParsingPicker = ctx.components.mountSelect(speakerParsingField.slot, {
+    value: 'ambiguous',
+    options: [
+      { value: 'off', label: 'Off', sublabel: 'Use the local parser only' },
+      { value: 'ambiguous', label: 'Ambiguous only', sublabel: 'Ask the LLM only when attribution is uncertain' },
+      { value: 'always', label: 'All dialogue', sublabel: 'Review every message containing dialogue' },
+    ],
+    ariaLabel: 'AI speaker review mode',
+    onChange: value => onSpeakerParsingModeChanged(value),
+  })
+
+  const llmConnectionPicker = ctx.components.mountSelect(llmConnectionField.slot, {
+    value: '',
+    options: [],
+    placeholder: 'Use the default LLM connection',
+    searchPlaceholder: 'Search LLM connections…',
+    emptyMessage: 'No LLM connections found.',
+    clearable: true,
+    clearLabel: 'Use default LLM connection',
+    ariaLabel: 'Speaker-review LLM connection',
+    disabled: true,
+    onChange: value => onLlmConnectionChanged(value),
+  })
+
+  const llmModelInput = ctx.components.mountModelCombobox(llmModelField.slot, {
+    value: '',
+    connection: { kind: 'llm' },
+    placeholder: 'Use the connection model or enter a model name',
+    browseHint: 'Leave blank to use the selected connection’s configured model.',
+    disabled: true,
+    onChange: value => onLlmModelChanged(value),
+  })
+
+  function createNumberInput(value: number, maximum: number, ariaLabel: string): HTMLInputElement {
+    const input = document.createElement('input')
+    input.className = 'chat-voice-number-input'
+    input.type = 'number'
+    input.value = String(value)
+    input.min = '1'
+    input.max = String(maximum)
+    input.step = '1'
+    input.inputMode = 'numeric'
+    input.setAttribute('aria-label', ariaLabel)
+    return input
+  }
+
+  const playbackBufferInput = createNumberInput(
+    DEFAULT_PLAYBACK_BUFFER_SEGMENTS,
+    MAX_PLAYBACK_BUFFER_SEGMENTS,
+    'Playback buffer segments',
+  )
+  const concurrentGenerationInput = createNumberInput(
+    DEFAULT_CONCURRENT_GENERATIONS,
+    MAX_CONCURRENT_GENERATIONS,
+    'Concurrent generations',
+  )
+  playbackBufferField.slot.appendChild(playbackBufferInput)
+  concurrentGenerationField.slot.appendChild(concurrentGenerationInput)
+  const onPlaybackBufferInput = () => onPlaybackBufferChanged(playbackBufferInput.valueAsNumber)
+  const onConcurrentGenerationInput = () => onConcurrentGenerationsChanged(concurrentGenerationInput.valueAsNumber)
+  playbackBufferInput.addEventListener('change', onPlaybackBufferInput)
+  concurrentGenerationInput.addEventListener('change', onConcurrentGenerationInput)
 
   const addNpcInput = ctx.components.mountTextInput(addNpcInputSlot, {
     value: '', placeholder: 'NPC name / aliases', ariaLabel: 'NPC name and aliases to add', disabled: true,
@@ -914,6 +1134,43 @@ export function setup(ctx: SpindleFrontendContext) {
       }, 15_000)
       pendingMessageRequests.set(requestId, { resolve, reject, timer })
       ctx.sendToBackend({ type: 'chat_voice_get_message', chatId, messageId, requestId })
+    })
+  }
+
+  function requestSpeakerReviewedSegments(
+    chatId: string,
+    messageId: string,
+    preferences: PlaybackPreferences,
+  ): Promise<PlaybackSegment[]> {
+    const requestId = `parse-${Date.now().toString(36)}-${++speakerParseRequestSequence}`
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        pendingSpeakerParseRequests.delete(requestId)
+        reject(new Error('AI speaker review timed out.'))
+      }, 45_000)
+      pendingSpeakerParseRequests.set(requestId, { resolve, reject, timer })
+      ctx.sendToBackend({
+        type: 'chat_voice_parse_message',
+        chatId,
+        messageId,
+        requestId,
+        mode: preferences.speakerParsingMode === 'always' ? 'always' : 'ambiguous',
+        connectionId: preferences.llmConnectionId,
+        model: preferences.llmModel,
+        skippedTrackerTags: preferences.skippedTrackerTags,
+      })
+    })
+  }
+
+  function requestLlmConnections(): Promise<LlmConnection[]> {
+    const requestId = `connections-${Date.now().toString(36)}-${++llmConnectionRequestSequence}`
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        pendingLlmConnectionRequests.delete(requestId)
+        reject(new Error('Timed out while loading main LLM connections.'))
+      }, 15_000)
+      pendingLlmConnectionRequests.set(requestId, { resolve, reject, timer })
+      ctx.sendToBackend({ type: 'chat_voice_list_llm_connections', requestId })
     })
   }
 
@@ -1095,6 +1352,18 @@ export function setup(ctx: SpindleFrontendContext) {
     const playbackChat = activeChat
     const config = collectConfig()
     const preferences = await loadPlaybackPreferences()
+    if (llmSettingsSaveTimer || savingLlmSettings) {
+      preferences.speakerParsingMode = speakerParsingMode
+      preferences.llmConnectionId = llmConnectionId
+      preferences.llmModel = llmModel
+    }
+    if (advancedSettingsSaveTimer || savingAdvancedSettings) {
+      preferences.playbackBufferSegments = playbackBufferSegments
+      preferences.concurrentGenerations = concurrentGenerationLimit
+    } else {
+      playbackBufferSegments = preferences.playbackBufferSegments
+      concurrentGenerationLimit = preferences.concurrentGenerations
+    }
     const connectionId = config.connectionId
       || (connections.some(connection => connection.id === preferences.connectionId)
         ? preferences.connectionId
@@ -1150,12 +1419,22 @@ export function setup(ctx: SpindleFrontendContext) {
           speakerAliases(character.name).map(alias => [npcSpeakerId(alias), character.id] as const)
         )),
       )
-      const segments = parseRosterVoiceSegments(
+      let segments = parseRosterVoiceSegments(
         message.content,
         defaultSpeakerId,
         playbackChat.characters,
         preferences.skippedTrackerTags,
       )
+      if (preferences.speakerParsingMode !== 'off') {
+        setStatus('Reviewing dialogue speakers…')
+        try {
+          segments = await requestSpeakerReviewedSegments(playbackChat.id, messageId, preferences)
+        } catch (error) {
+          console.warn('[Chat Voice] AI speaker review failed; using the local parser.', error)
+          if (playback.controller.signal.aborted) throw new DOMException('Playback stopped.', 'AbortError')
+          setStatus('AI speaker review unavailable; using the local parser.')
+        }
+      }
       const plan = mergeVoicePlan(segments.map((segment) => {
         const speakerId = segment.speakerId
           ? aliases.get(segment.speakerId) ?? segment.speakerId
@@ -1211,7 +1490,7 @@ export function setup(ctx: SpindleFrontendContext) {
           preparedResolvers[index](await prepare(index))
         }
       }
-      const workerCount = Math.min(PLAYBACK_BUFFER_SEGMENTS, plan.length)
+      const workerCount = Math.min(preferences.concurrentGenerations, plan.length)
       for (let index = 0; index < workerCount; index += 1) void runSynthesisWorker()
       if (preferences.saveGeneratedAudio || regeneratingSavedAudio) {
         playback.persistenceState = 'pending'
@@ -1288,7 +1567,7 @@ export function setup(ctx: SpindleFrontendContext) {
           })
       }
 
-      const initialBufferSize = Math.min(PLAYBACK_BUFFER_SEGMENTS, plan.length)
+      const initialBufferSize = Math.min(preferences.playbackBufferSegments, plan.length)
       setStatus(
         `Buffering ${initialBufferSize} voice segment${initialBufferSize === 1 ? '' : 's'} before playback…`,
       )
@@ -1531,11 +1810,16 @@ export function setup(ctx: SpindleFrontendContext) {
 
   async function loadConnections() {
     try {
-      const [loadedConnections, preferences] = await Promise.all([
+      const [loadedConnections, loadedLlmConnections, preferences] = await Promise.all([
         listAllTtsConnections(),
+        requestLlmConnections().catch((error) => {
+          console.warn('[Chat Voice] Could not load main LLM connections.', error)
+          return []
+        }),
         loadPlaybackPreferences(),
       ])
       connections = loadedConnections
+      llmConnections = loadedLlmConnections
       if (!savingAudioPreference) {
         saveGeneratedAudio = preferences.saveGeneratedAudio
         saveAudioToggle.checked = saveGeneratedAudio
@@ -1547,6 +1831,19 @@ export function setup(ctx: SpindleFrontendContext) {
       if (!savingSkippedTrackerTags && !skippedTrackerTagsDirty) {
         skippedTrackerTags = preferences.skippedTrackerTags
         skippedTrackerTagsInput.update({ value: skippedTrackerTags })
+      }
+      if (!savingLlmSettings && !llmSettingsSaveTimer) {
+        speakerParsingMode = preferences.speakerParsingMode
+        llmConnectionId = preferences.llmConnectionId
+        llmModel = preferences.llmModel
+        speakerParsingPicker.update({ value: speakerParsingMode })
+        updateLlmControlState()
+      }
+      if (!savingAdvancedSettings && !advancedSettingsSaveTimer) {
+        playbackBufferSegments = preferences.playbackBufferSegments
+        concurrentGenerationLimit = preferences.concurrentGenerations
+        playbackBufferInput.value = String(playbackBufferSegments)
+        concurrentGenerationInput.value = String(concurrentGenerationLimit)
       }
       lumiverseConnectionId = connections.some(connection => connection.id === preferences.connectionId)
         ? preferences.connectionId
@@ -1563,6 +1860,117 @@ export function setup(ctx: SpindleFrontendContext) {
       const message = error instanceof Error ? error.message : 'Could not load TTS connections.'
       connectionPicker.update({ placeholder: 'Connections unavailable', disabled: true })
       setStatus(message, 'error')
+    }
+  }
+
+  function llmConnectionOptions(selectedId = '') {
+    const options = llmConnections.map(connection => ({
+      value: connection.id,
+      label: connection.name,
+      sublabel: `${connection.provider}${connection.model ? ` · ${connection.model}` : ''}`,
+    }))
+    if (selectedId && !llmConnections.some(connection => connection.id === selectedId)) {
+      options.unshift({ value: selectedId, label: 'Missing connection', sublabel: selectedId })
+    }
+    return options
+  }
+
+  function updateLlmControlState(): void {
+    const enabled = speakerParsingMode !== 'off'
+    llmConnectionPicker.update({
+      value: llmConnectionId,
+      options: llmConnectionOptions(llmConnectionId),
+      disabled: !enabled,
+      placeholder: llmConnections.length
+        ? 'Use the default LLM connection'
+        : 'No LLM connections found; default will be used',
+    })
+    llmModelInput.update({
+      value: llmModel,
+      connection: llmConnectionId
+        ? { kind: 'llm', id: llmConnectionId }
+        : { kind: 'llm' },
+      disabled: !enabled,
+    })
+  }
+
+  function scheduleLlmSettingsSave(): void {
+    if (llmSettingsSaveTimer) clearTimeout(llmSettingsSaveTimer)
+    llmSettingsSaveTimer = setTimeout(() => {
+      llmSettingsSaveTimer = null
+      void persistLlmSettings()
+    }, 400)
+  }
+
+  function onSpeakerParsingModeChanged(value: string): void {
+    speakerParsingMode = value === 'ambiguous' || value === 'always' ? value : 'off'
+    updateLlmControlState()
+    scheduleLlmSettingsSave()
+  }
+
+  function onLlmConnectionChanged(value: string): void {
+    llmConnectionId = value.trim().slice(0, 128)
+    updateLlmControlState()
+    scheduleLlmSettingsSave()
+  }
+
+  function onLlmModelChanged(value: string): void {
+    llmModel = value.trim().slice(0, 256)
+    scheduleLlmSettingsSave()
+  }
+
+  async function persistLlmSettings(): Promise<void> {
+    savingLlmSettings = true
+    setStatus('Saving global AI speaker-review settings…')
+    try {
+      await saveLlmParsingPreferences(speakerParsingMode, llmConnectionId, llmModel)
+      setStatus('AI speaker-review settings saved globally.', 'saved')
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : 'Could not save AI speaker-review settings.', 'error')
+    } finally {
+      savingLlmSettings = false
+    }
+  }
+
+  function scheduleAdvancedSettingsSave(): void {
+    if (advancedSettingsSaveTimer) clearTimeout(advancedSettingsSaveTimer)
+    advancedSettingsSaveTimer = setTimeout(() => {
+      advancedSettingsSaveTimer = null
+      void persistAdvancedSettings()
+    }, 400)
+  }
+
+  function onPlaybackBufferChanged(value: number | null): void {
+    playbackBufferSegments = clampIntegerSetting(
+      value,
+      DEFAULT_PLAYBACK_BUFFER_SEGMENTS,
+      MAX_PLAYBACK_BUFFER_SEGMENTS,
+    )
+    playbackBufferInput.value = String(playbackBufferSegments)
+    scheduleAdvancedSettingsSave()
+  }
+
+  function onConcurrentGenerationsChanged(value: number | null): void {
+    concurrentGenerationLimit = clampIntegerSetting(
+      value,
+      DEFAULT_CONCURRENT_GENERATIONS,
+      MAX_CONCURRENT_GENERATIONS,
+    )
+    concurrentGenerationInput.value = String(concurrentGenerationLimit)
+    drainSynthesisQueue()
+    scheduleAdvancedSettingsSave()
+  }
+
+  async function persistAdvancedSettings(): Promise<void> {
+    savingAdvancedSettings = true
+    setStatus('Saving global advanced playback settings…')
+    try {
+      await saveAdvancedPlaybackPreferences(playbackBufferSegments, concurrentGenerationLimit)
+      setStatus('Advanced playback settings saved globally.', 'saved')
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : 'Could not save advanced playback settings.', 'error')
+    } finally {
+      savingAdvancedSettings = false
     }
   }
 
@@ -1683,7 +2091,7 @@ export function setup(ctx: SpindleFrontendContext) {
   hostWindow.requestAnimationFrame(updatePlaybackButtons)
 
   const unsubscribeBackend = ctx.onBackendMessage((rawPayload: unknown) => {
-    const payload = rawPayload as StatePayload | ErrorPayload | ScanCompletePayload | MessagePayload
+    const payload = rawPayload as StatePayload | ErrorPayload | ScanCompletePayload | MessagePayload | ParsedMessagePayload | LlmConnectionsPayload
     if (payload.type === 'chat_voice_message') {
       const pending = pendingMessageRequests.get(payload.requestId)
       if (!pending) return
@@ -1691,6 +2099,27 @@ export function setup(ctx: SpindleFrontendContext) {
       pendingMessageRequests.delete(payload.requestId)
       if (payload.error || !payload.message) pending.reject(new Error(payload.error || 'The message is unavailable.'))
       else pending.resolve(payload.message)
+      return
+    }
+    if (payload.type === 'chat_voice_parsed_message') {
+      const pending = pendingSpeakerParseRequests.get(payload.requestId)
+      if (!pending) return
+      clearTimeout(pending.timer)
+      pendingSpeakerParseRequests.delete(payload.requestId)
+      if (payload.error || !payload.segments) {
+        pending.reject(new Error(payload.error || 'The message could not be reviewed.'))
+      } else {
+        pending.resolve(payload.segments)
+      }
+      return
+    }
+    if (payload.type === 'chat_voice_llm_connections') {
+      const pending = pendingLlmConnectionRequests.get(payload.requestId)
+      if (!pending) return
+      clearTimeout(pending.timer)
+      pendingLlmConnectionRequests.delete(payload.requestId)
+      if (payload.error) pending.reject(new Error(payload.error))
+      else pending.resolve(payload.connections)
       return
     }
     if (payload.type === 'chat_voice_error') {
@@ -1739,6 +2168,11 @@ export function setup(ctx: SpindleFrontendContext) {
         pending.reject(new Error('The active chat changed before playback started.'))
       }
       pendingMessageRequests.clear()
+      for (const pending of pendingSpeakerParseRequests.values()) {
+        clearTimeout(pending.timer)
+        pending.reject(new Error('The active chat changed before speaker review completed.'))
+      }
+      pendingSpeakerParseRequests.clear()
       stopPlayback()
       flushSave()
       dirty = false
@@ -1799,6 +2233,16 @@ export function setup(ctx: SpindleFrontendContext) {
       pending.reject(new Error('Chat Voice was closed.'))
     }
     pendingMessageRequests.clear()
+    for (const pending of pendingSpeakerParseRequests.values()) {
+      clearTimeout(pending.timer)
+      pending.reject(new Error('Chat Voice was closed.'))
+    }
+    pendingSpeakerParseRequests.clear()
+    for (const pending of pendingLlmConnectionRequests.values()) {
+      clearTimeout(pending.timer)
+      pending.reject(new Error('Chat Voice was closed.'))
+    }
+    pendingLlmConnectionRequests.clear()
     for (const pending of pendingStateRequests.values()) {
       clearTimeout(pending.timer)
       pending.reject(new Error('Chat Voice was closed.'))
@@ -1810,7 +2254,20 @@ export function setup(ctx: SpindleFrontendContext) {
       clearTimeout(skippedTrackerTagsSaveTimer)
       void saveSkippedTrackerTagsPreference(skippedTrackerTags)
     }
+    if (llmSettingsSaveTimer) {
+      clearTimeout(llmSettingsSaveTimer)
+      void saveLlmParsingPreferences(speakerParsingMode, llmConnectionId, llmModel)
+    }
+    if (advancedSettingsSaveTimer) {
+      clearTimeout(advancedSettingsSaveTimer)
+      void saveAdvancedPlaybackPreferences(playbackBufferSegments, concurrentGenerationLimit)
+    }
     skippedTrackerTagsInput.destroy()
+    speakerParsingPicker.destroy()
+    llmConnectionPicker.destroy()
+    llmModelInput.destroy()
+    playbackBufferInput.removeEventListener('change', onPlaybackBufferInput)
+    concurrentGenerationInput.removeEventListener('change', onConcurrentGenerationInput)
     addNpcInput.destroy()
     addNpcButton.removeEventListener('click', onAddNpc)
     addNpcInputSlot.removeEventListener('keydown', onAddNpcKeyDown)
