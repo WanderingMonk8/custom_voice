@@ -5,8 +5,10 @@ import {
   mergeScannedCardCast,
   applyConfigToMetadata,
   clampMessageLimit,
+  clampSavedAudioLimit,
   detectCharacters,
   encodeConcatenatedWav,
+  expiredSavedAudioRecords,
   hashMessageContent,
   mergeVoicePlan,
   npcSpeakerId,
@@ -15,7 +17,9 @@ import {
   parseMultiVoiceSegments,
   parseRosterVoiceSegments,
   readConfig,
+  readSavedAudioHistory,
   speakerAliases,
+  upsertSavedAudioRecord,
   type ChatVoiceConfig,
 } from './core'
 
@@ -68,6 +72,25 @@ test('clamps the configurable message window', () => {
   assert.equal(clampMessageLimit(0), 1)
   assert.equal(clampMessageLimit(20.4), 20)
   assert.equal(clampMessageLimit(999), 500)
+})
+
+test('defaults and clamps the global saved audio limit', () => {
+  assert.equal(clampSavedAudioLimit(undefined), 50)
+  assert.equal(clampSavedAudioLimit(0), 1)
+  assert.equal(clampSavedAudioLimit('75'), 75)
+  assert.equal(clampSavedAudioLimit(50_000), 10_000)
+})
+
+test('replaces a saved swipe record and expires the oldest recordings', () => {
+  const original = readSavedAudioHistory([
+    { chatId: 'chat', messageId: 'one', audioId: 'old-one', swipeId: 0, savedAt: 10 },
+    { chatId: 'chat', messageId: 'two', audioId: 'two', swipeId: 0, savedAt: 20 },
+  ])
+  const history = upsertSavedAudioRecord(original, {
+    chatId: 'chat', messageId: 'one', audioId: 'new-one', swipeId: 0, savedAt: 30,
+  })
+  assert.deepEqual(history.map(record => record.audioId), ['two', 'new-one'])
+  assert.deepEqual(expiredSavedAudioRecords(history, 1).map(record => record.audioId), ['two'])
 })
 
 test('detects recent assistant speakers and ignores user messages', () => {
@@ -434,6 +457,67 @@ test('uses a sole possessive name when no clean character name is present', () =
       [{ id: 'al-neko', name: 'Al Neko' }],
     ).at(-1),
     { text: 'Ready.', speakerId: 'al-neko' },
+  )
+})
+
+test('backfills opening dialogue from a main-clause speech possessor', () => {
+  const content = '"And there is one star in Sweetwater."\n\n"That is how it has been. That is how it is."\n\nColton\'s voice comes off the porch before Tess can tap the tablet. He sits with the pocket watch still open in his palm and looks at Ken across the width of the street.\n\nTess glances toward the porch, then back to Ken.\n\n"The badge is a standard guest selection, Sheriff." She pitches her voice to carry the ten yards.'
+  const segments = parseRosterVoiceSegments(content, 'card', [
+    { id: 'colton', name: 'Colton' },
+    { id: 'tess', name: 'Tess' },
+    { id: 'ken', name: 'Ken' },
+    { id: 'card', name: 'Narrator Card' },
+  ])
+  assert.deepEqual(segments.filter(segment => segment.speakerId !== null), [
+    { text: 'And there is one star in Sweetwater.', speakerId: 'colton' },
+    { text: 'That is how it has been. That is how it is.', speakerId: 'colton' },
+    { text: 'The badge is a standard guest selection, Sheriff.', speakerId: 'tess' },
+  ])
+})
+
+test('does not use downstream backfill after a preceding character is established', () => {
+  const segments = parseRosterVoiceSegments(
+    'Alma checks the road.\n\n"Opening speech."\n\nColton\'s voice comes from the porch before Tess can answer.',
+    'card',
+    [
+      { id: 'alma', name: 'Alma' },
+      { id: 'colton', name: 'Colton' },
+      { id: 'tess', name: 'Tess' },
+      { id: 'card', name: 'Narrator Card' },
+    ],
+  )
+  assert.deepEqual(segments.find(segment => segment.text === 'Opening speech.'), {
+    text: 'Opening speech.', speakerId: 'alma',
+  })
+})
+
+test('uses a downstream narrative subject for an ambiguous reply in a dialogue chain', () => {
+  const content = 'Tess glances toward the porch, then back to Ken. Her thumb hovers over the screen.\n\n"The badge is a standard guest selection, Sheriff." She pitches her voice to carry the ten yards. "Guest wants it, guest gets it. That is the arrangement."\n\n"Did not say he could not."\n\nColton closes the watch with a click and stands. Taller sitting than standing.'
+  const segments = parseRosterVoiceSegments(content, 'card', [
+    { id: 'tess', name: 'Tess' },
+    { id: 'ken', name: 'Ken' },
+    { id: 'colton', name: 'Colton' },
+    { id: 'card', name: 'Narrator Card' },
+  ])
+  assert.deepEqual(segments.find(segment => segment.text === 'Did not say he could not.'), {
+    text: 'Did not say he could not.', speakerId: 'colton',
+  })
+})
+
+test('keeps dialogue with a configured role named in the preceding paragraph', () => {
+  const content = 'Tess studies the screen.\n\n"The coat and the star are with the Sheriff."\n\nFrom the general store across the way, a shopkeeper in a leather apron comes out carrying a wooden case. He crosses the street and sets it at Ken\'s feet, then walks back.\n\n"Coat is in the office. Been worn before—but it will fit."\n\nColton stands in the open doorway now, waiting.\n\n"Well? You coming or not?"'
+  const segments = parseRosterVoiceSegments(content, 'tess', [
+    { id: 'tess', name: 'Tess' },
+    { id: 'ken', name: 'Ken' },
+    { id: 'shopkeeper', name: 'Shopkeeper' },
+    { id: 'colton', name: 'Colton' },
+  ])
+  assert.deepEqual(
+    segments.filter(segment => segment.speakerId !== null).slice(-2),
+    [
+      { text: 'Coat is in the office. Been worn before—but it will fit.', speakerId: 'shopkeeper' },
+      { text: 'Well? You coming or not?', speakerId: 'colton' },
+    ],
   )
 })
 

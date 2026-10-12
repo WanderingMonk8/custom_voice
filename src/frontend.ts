@@ -3,12 +3,18 @@ import type {
   SpindleTextInputHandle,
 } from 'lumiverse-spindle-types'
 import {
+  clampSavedAudioLimit,
+  DEFAULT_SAVED_AUDIO_LIMIT,
   encodeConcatenatedWav,
+  expiredSavedAudioRecords,
   mergeVoicePlan,
   npcSpeakerId,
   normalizeSpeakerName,
   parseRosterVoiceSegments,
+  readSavedAudioHistory,
   speakerAliases,
+  upsertSavedAudioRecord,
+  type SavedAudioRecord,
 } from './core'
 
 interface TtsConnection {
@@ -196,6 +202,7 @@ interface PlaybackPreferences {
   volume: number
   connectionId: string
   saveGeneratedAudio: boolean
+  savedAudioLimit: number
 }
 
 const VOICE_ICON = `
@@ -231,7 +238,13 @@ async function loadPlaybackPreferences(): Promise<PlaybackPreferences> {
     credentials: 'same-origin',
     headers: { Accept: 'application/json' },
   })
-  if (!response.ok) return { speed: 1, volume: 1, connectionId: '', saveGeneratedAudio: false }
+  if (!response.ok) return {
+    speed: 1,
+    volume: 1,
+    connectionId: '',
+    saveGeneratedAudio: false,
+    savedAudioLimit: DEFAULT_SAVED_AUDIO_LIMIT,
+  }
   const row = await response.json() as { value?: Record<string, unknown> }
   const speed = typeof row.value?.ttsSpeed === 'number' ? row.value.ttsSpeed : 1
   const volume = typeof row.value?.ttsVolume === 'number' ? row.value.ttsVolume : 1
@@ -242,6 +255,7 @@ async function loadPlaybackPreferences(): Promise<PlaybackPreferences> {
       ? row.value.ttsConnectionId.trim()
       : '',
     saveGeneratedAudio: row.value?.chatVoiceSaveGeneratedAudio === true,
+    savedAudioLimit: clampSavedAudioLimit(row.value?.chatVoiceSavedAudioLimit),
   }
 }
 
@@ -275,6 +289,51 @@ function saveGeneratedAudioPreference(enabled: boolean): Promise<void> {
     ...current,
     chatVoiceSaveGeneratedAudio: enabled,
   }))
+}
+
+function saveGeneratedAudioLimit(limit: number): Promise<void> {
+  return updateVoiceSettings(current => ({
+    ...current,
+    chatVoiceSavedAudioLimit: clampSavedAudioLimit(limit),
+  }))
+}
+
+async function deleteSavedAudioRecord(record: SavedAudioRecord): Promise<boolean> {
+  const response = await fetch(
+    `/api/v1/chats/${encodeURIComponent(record.chatId)}/messages/${encodeURIComponent(record.messageId)}/attachments/${encodeURIComponent(record.audioId)}`,
+    { method: 'DELETE', credentials: 'same-origin', headers: { Accept: 'application/json' } },
+  )
+  return response.ok || response.status === 404
+}
+
+async function enforceSavedAudioRetention(nextRecord?: SavedAudioRecord): Promise<number> {
+  let expired: SavedAudioRecord[] = []
+  await updateVoiceSettings(current => {
+    const limit = clampSavedAudioLimit(current.chatVoiceSavedAudioLimit)
+    const history = nextRecord
+      ? upsertSavedAudioRecord(readSavedAudioHistory(current.chatVoiceSavedAudioHistory), nextRecord)
+      : readSavedAudioHistory(current.chatVoiceSavedAudioHistory)
+    expired = expiredSavedAudioRecords(history, limit)
+    return { ...current, chatVoiceSavedAudioHistory: history }
+  })
+  if (expired.length === 0) return 0
+
+  const deletedAudioIds: string[] = []
+  for (const record of expired) {
+    if (await deleteSavedAudioRecord(record)) deletedAudioIds.push(record.audioId)
+  }
+  if (deletedAudioIds.length > 0) {
+    const deleted = new Set(deletedAudioIds)
+    await updateVoiceSettings(current => ({
+      ...current,
+      chatVoiceSavedAudioHistory: readSavedAudioHistory(current.chatVoiceSavedAudioHistory)
+        .filter(record => !deleted.has(record.audioId)),
+    }))
+  }
+  if (deletedAudioIds.length !== expired.length) {
+    throw new Error('Some older recordings could not be removed; cleanup will retry after the next save.')
+  }
+  return deletedAudioIds.length
 }
 
 function abortableDelay(milliseconds: number, signal: AbortSignal): Promise<void> {
@@ -449,6 +508,14 @@ export function setup(ctx: SpindleFrontendContext) {
     .chat-voice-toggle input { margin:2px 0 0; accent-color:var(--lumiverse-accent, #7c6df2); }
     .chat-voice-toggle-copy { display:flex; flex-direction:column; gap:2px; }
     .chat-voice-toggle-hint { color:var(--lumiverse-text-muted); font-size:11px; line-height:1.4; }
+    .chat-voice-storage { display:flex; flex-direction:column; gap:9px; }
+    .chat-voice-retention { display:flex; align-items:center; justify-content:space-between; gap:12px; }
+    .chat-voice-retention-copy { color:var(--lumiverse-text-muted); font-size:11px; line-height:1.4; }
+    .chat-voice-retention-input {
+      width:82px; min-height:34px; box-sizing:border-box; padding:6px 9px;
+      border:1px solid var(--lumiverse-border); border-radius:var(--lumiverse-radius);
+      background:var(--lumiverse-fill-subtle); color:var(--lumiverse-text); font:inherit;
+    }
     .chat-voice-section-title {
       margin:2px 0 0; color:var(--lumiverse-text); font-size:13px; font-weight:700;
     }
@@ -515,6 +582,7 @@ export function setup(ctx: SpindleFrontendContext) {
 
   const connectionField = createField('TTS connection')
   const saveAudioField = createField('Audio storage')
+  saveAudioField.slot.className = 'chat-voice-storage'
   const saveAudioLabel = document.createElement('label')
   saveAudioLabel.className = 'chat-voice-toggle'
   const saveAudioToggle = document.createElement('input')
@@ -530,7 +598,21 @@ export function setup(ctx: SpindleFrontendContext) {
   saveAudioHint.textContent = 'Attach completed recordings to messages. Disabled by default.'
   saveAudioCopy.append(saveAudioText, saveAudioHint)
   saveAudioLabel.append(saveAudioToggle, saveAudioCopy)
-  saveAudioField.slot.append(saveAudioLabel)
+  const saveAudioRetention = document.createElement('label')
+  saveAudioRetention.className = 'chat-voice-retention'
+  const saveAudioRetentionCopy = document.createElement('span')
+  saveAudioRetentionCopy.className = 'chat-voice-retention-copy'
+  saveAudioRetentionCopy.textContent = 'Maximum saved recordings'
+  const saveAudioLimitInput = document.createElement('input')
+  saveAudioLimitInput.className = 'chat-voice-retention-input'
+  saveAudioLimitInput.type = 'number'
+  saveAudioLimitInput.min = '1'
+  saveAudioLimitInput.max = '10000'
+  saveAudioLimitInput.step = '1'
+  saveAudioLimitInput.value = String(DEFAULT_SAVED_AUDIO_LIMIT)
+  saveAudioLimitInput.setAttribute('aria-label', 'Maximum saved recordings')
+  saveAudioRetention.append(saveAudioRetentionCopy, saveAudioLimitInput)
+  saveAudioField.slot.append(saveAudioLabel, saveAudioRetention)
   const scanField = createField('Character card cast')
   const scanRow = scanField.slot
   scanRow.className = 'chat-voice-scan-row'
@@ -582,7 +664,9 @@ export function setup(ctx: SpindleFrontendContext) {
   let connections: TtsConnection[] = []
   let lumiverseConnectionId = ''
   let saveGeneratedAudio = false
+  let savedAudioLimit = DEFAULT_SAVED_AUDIO_LIMIT
   let savingAudioPreference = false
+  let savingAudioLimit = false
   let saveTimer: ReturnType<typeof setTimeout> | null = null
   let editRevision = 0
   let dirty = false
@@ -597,21 +681,42 @@ export function setup(ctx: SpindleFrontendContext) {
     persistenceError: string | null
     playbackStopped: boolean
     playbackFinished: boolean
+    audibleDone: Promise<void>
+    finishAudible: () => void
   } | null = null
   const backgroundSynthesisControllers = new Set<AbortController>()
   const sharedSynthesisPacer: SynthesisPacer = { nextStartAt: 0, startQueue: Promise.resolve() }
   const connectionVoiceGates = new Map<string, ConnectionVoiceGate>()
-  const synthesisSlots: Promise<void>[] = Array.from(
-    { length: PLAYBACK_BUFFER_SEGMENTS },
-    () => Promise.resolve(),
-  )
-  let nextSynthesisSlot = 0
+  type SynthesisTask = () => Promise<void>
+  const foregroundSynthesisQueue: SynthesisTask[] = []
+  const backgroundSynthesisQueue: SynthesisTask[] = []
+  let activeSynthesisTasks = 0
 
-  function runInSynthesisSlot<T>(task: () => Promise<T>): Promise<T> {
-    const slot = nextSynthesisSlot++ % synthesisSlots.length
-    const result = synthesisSlots[slot].then(task)
-    synthesisSlots[slot] = result.then(() => undefined, () => undefined)
-    return result
+  function drainSynthesisQueue(): void {
+    while (activeSynthesisTasks < PLAYBACK_BUFFER_SEGMENTS) {
+      const next = foregroundSynthesisQueue.shift() ?? backgroundSynthesisQueue.shift()
+      if (!next) return
+      activeSynthesisTasks += 1
+      void next().finally(() => {
+        activeSynthesisTasks -= 1
+        drainSynthesisQueue()
+      })
+    }
+  }
+
+  function runSynthesisTask<T>(task: () => Promise<T>, foreground: boolean): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      const queued = async () => {
+        try {
+          resolve(await task())
+        } catch (error) {
+          reject(error)
+        }
+      }
+      const queue = foreground ? foregroundSynthesisQueue : backgroundSynthesisQueue
+      queue.push(queued)
+      drainSynthesisQueue()
+    })
   }
   const inFlight = new Set<number>()
   const characterInputs = new Map<string, SpindleTextInputHandle>()
@@ -641,14 +746,18 @@ export function setup(ctx: SpindleFrontendContext) {
     status.dataset.state = state
   }
 
-  function nativeTtsMessageId(button: HTMLButtonElement): string | null {
-    if (button.closest('[data-spindle-extension-root]')) return null
-    const known = button.dataset.chatVoiceNativeTts === 'true'
-    const label = [
+  function nativeTtsButtonLabel(button: HTMLButtonElement): string {
+    return [
       button.getAttribute('title'),
       button.getAttribute('aria-label'),
       button.textContent,
     ].filter(Boolean).join(' ').toLowerCase()
+  }
+
+  function nativeTtsMessageId(button: HTMLButtonElement): string | null {
+    if (button.closest('[data-spindle-extension-root]')) return null
+    const known = button.dataset.chatVoiceNativeTts === 'true'
+    const label = nativeTtsButtonLabel(button)
     const iconClass = button.querySelector('svg')?.getAttribute('class')?.toLowerCase() ?? ''
     const hasNativeTtsIcon = iconClass.includes('volume-2')
       || iconClass.includes('volume2')
@@ -807,6 +916,7 @@ export function setup(ctx: SpindleFrontendContext) {
     activePlayback = null
     if (!playback) return false
     playback.playbackStopped = true
+    playback.finishAudible()
     playback.controller.abort()
     if (playback.persistenceState === 'not-started' || playback.persistenceState === 'disabled') {
       playback.synthesisController?.abort()
@@ -877,12 +987,15 @@ export function setup(ctx: SpindleFrontendContext) {
     segments: SynthesizedVoiceSegment[],
     contextClass: typeof AudioContext,
     signal: AbortSignal,
+    waitForSafeFallback: () => Promise<void>,
     onWavFallback: () => void,
   ): Promise<SavedMessageAudioResult> {
     try {
       return await saveMessageAudio(chatId, messageId, swipeId, segments, signal)
     } catch (segmentSaveError) {
       if ((segmentSaveError as { name?: string })?.name === 'AbortError') throw segmentSaveError
+      await waitForSafeFallback()
+      if (signal.aborted) throw new DOMException('Audio saving stopped.', 'AbortError')
       onWavFallback()
       const wav = await encodeCapturedWav(segments, contextClass)
       return saveMessageAudio(
@@ -895,14 +1008,52 @@ export function setup(ctx: SpindleFrontendContext) {
     }
   }
 
-  async function playMessage(messageId: string): Promise<void> {
-    if (activePlayback) {
-      const wasSameMessage = activePlayback.messageId === messageId
+  function hasSavedAudioForCurrentSwipe(message: PlaybackMessage): boolean {
+    const attachments = message.extra?.attachments
+    if (!Array.isArray(attachments)) return false
+    return attachments.some((candidate) => {
+      if (!candidate || typeof candidate !== 'object') return false
+      const attachment = candidate as SavedAudioAttachment
+      return attachment.type === 'audio'
+        && (attachment.swipe_id === undefined || attachment.swipe_id === message.swipe_id)
+    })
+  }
+
+  async function playMessage(messageId: string, nativeRegenerationAction = false): Promise<void> {
+    if (activePlayback?.messageId === messageId) {
       const finishingSave = stopPlayback()
-      if (wasSameMessage) {
-        setStatus(finishingSave ? 'Playback stopped; finishing saved audio…' : 'Playback stopped.')
-        return
-      }
+      setStatus(finishingSave ? 'Playback stopped; finishing saved audio…' : 'Playback stopped.')
+      return
+    }
+
+    const requestedChatId = ctx.getActiveChat().chatId
+    if (!requestedChatId) {
+      setStatus('Open a chat before starting voice playback.', 'error')
+      return
+    }
+    let message: PlaybackMessage
+    try {
+      message = await requestPlaybackMessage(requestedChatId, messageId)
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : 'Could not load this message.', 'error')
+      return
+    }
+    if (ctx.getActiveChat().chatId !== requestedChatId) return
+
+    const regeneratingSavedAudio = nativeRegenerationAction || hasSavedAudioForCurrentSwipe(message)
+    if (regeneratingSavedAudio) {
+      const { confirmed } = await ctx.ui.showConfirm({
+        title: 'Regenerate TTS audio?',
+        message: 'This will replace the saved audio attached to this message with a new TTS synthesis. The current recording will be deleted.',
+        confirmLabel: 'Regenerate',
+        cancelLabel: 'Keep current',
+        variant: 'warning',
+      })
+      if (!confirmed || ctx.getActiveChat().chatId !== requestedChatId) return
+    }
+
+    if (activePlayback) {
+      stopPlayback()
     }
     const localChatId = ctx.getActiveChat().chatId
     if (activeChat?.id !== localChatId) {
@@ -934,6 +1085,11 @@ export function setup(ctx: SpindleFrontendContext) {
     }
     const audioContext = new contextClass()
     await audioContext.resume()
+    let audibleFinished = false
+    let resolveAudibleDone: (() => void) | null = null
+    const audibleDone = new Promise<void>((resolve) => {
+      resolveAudibleDone = resolve
+    })
     const playback = {
       messageId,
       controller: new AbortController(),
@@ -944,12 +1100,17 @@ export function setup(ctx: SpindleFrontendContext) {
       persistenceError: null as string | null,
       playbackStopped: false,
       playbackFinished: false,
+      audibleDone,
+      finishAudible: () => {
+        if (audibleFinished) return
+        audibleFinished = true
+        resolveAudibleDone?.()
+      },
     }
     activePlayback = playback
     updatePlaybackButtons()
 
     try {
-      const message = await requestPlaybackMessage(playbackChat.id, messageId)
       if (playback.controller.signal.aborted) throw new DOMException('Playback stopped.', 'AbortError')
       if (message.is_user) throw new Error('Custom voice playback is only available for character messages.')
       const explicitId = typeof message.extra?.character_id === 'string' ? message.extra.character_id : ''
@@ -983,7 +1144,7 @@ export function setup(ctx: SpindleFrontendContext) {
         | { ok: false; error: unknown }
       const prepare = async (index: number): Promise<PreparedSegment> => {
         try {
-          const segment = await runInSynthesisSlot(() => synthesizeVoiceSegment(
+          const segment = await runSynthesisTask(() => synthesizeVoiceSegment(
             connectionId,
             plan[index].text,
             plan[index].voice,
@@ -1000,7 +1161,7 @@ export function setup(ctx: SpindleFrontendContext) {
                 setStatus(`Rate limited; retry ${retry} in ${Math.max(1, Math.ceil(delayMs / 1_000))}s…`)
               }
             },
-          ))
+          ), activePlayback === playback && !playback.playbackStopped)
           return { ok: true, segment }
         } catch (error) {
           return { ok: false, error }
@@ -1021,7 +1182,7 @@ export function setup(ctx: SpindleFrontendContext) {
       }
       const workerCount = Math.min(PLAYBACK_BUFFER_SEGMENTS, plan.length)
       for (let index = 0; index < workerCount; index += 1) void runSynthesisWorker()
-      if (preferences.saveGeneratedAudio) {
+      if (preferences.saveGeneratedAudio || regeneratingSavedAudio) {
         playback.persistenceState = 'pending'
         void Promise.all(prepared).then(async (results) => {
           const failed = results.find((result): result is { ok: false; error: unknown } => !result.ok)
@@ -1039,12 +1200,27 @@ export function setup(ctx: SpindleFrontendContext) {
             captured,
             contextClass,
             synthesisController.signal,
+            () => playback.audibleDone,
             () => {
               if (ctx.getActiveChat().chatId === playbackChat.id && (!activePlayback || activePlayback === playback)) {
                 setStatus('Server could not combine the source audio; retrying as WAV…')
               }
             },
           )
+          const savedAudioId = saved.audio?.id
+          if (savedAudioId) {
+            try {
+              await enforceSavedAudioRetention({
+                chatId: playbackChat.id,
+                messageId,
+                audioId: savedAudioId,
+                swipeId: saved.swipe_id ?? message.swipe_id ?? 0,
+                savedAt: Date.now(),
+              })
+            } catch (error) {
+              console.warn('[Chat Voice] Saved audio retention cleanup failed.', error)
+            }
+          }
           playback.persistenceState = 'saved'
           console.info('[Chat Voice] Saved generated message audio.', {
             messageId,
@@ -1094,6 +1270,7 @@ export function setup(ctx: SpindleFrontendContext) {
         await playDecodedBuffer(playback, current.segment.data, preferences.volume)
       }
       playback.playbackFinished = true
+      playback.finishAudible()
       if (activePlayback === playback) {
         activePlayback = null
         updatePlaybackButtons()
@@ -1110,6 +1287,7 @@ export function setup(ctx: SpindleFrontendContext) {
         setStatus(error instanceof Error ? error.message : 'Custom voice playback failed.', 'error')
       }
     } finally {
+      playback.finishAudible()
       if (activePlayback === playback) {
         activePlayback = null
         await playback.context.close().catch(() => undefined)
@@ -1331,6 +1509,10 @@ export function setup(ctx: SpindleFrontendContext) {
         saveGeneratedAudio = preferences.saveGeneratedAudio
         saveAudioToggle.checked = saveGeneratedAudio
       }
+      if (!savingAudioLimit) {
+        savedAudioLimit = preferences.savedAudioLimit
+        saveAudioLimitInput.value = String(savedAudioLimit)
+      }
       lumiverseConnectionId = connections.some(connection => connection.id === preferences.connectionId)
         ? preferences.connectionId
         : connections.find(connection => connection.is_default)?.id ?? ''
@@ -1372,6 +1554,43 @@ export function setup(ctx: SpindleFrontendContext) {
     }
   }
 
+  const onSaveAudioLimitChanged = async () => {
+    const previous = savedAudioLimit
+    const limit = clampSavedAudioLimit(saveAudioLimitInput.value)
+    savedAudioLimit = limit
+    saveAudioLimitInput.value = String(limit)
+    savingAudioLimit = true
+    saveAudioLimitInput.disabled = true
+    setStatus('Saving global recording limit…')
+    try {
+      await saveGeneratedAudioLimit(limit)
+    } catch (error) {
+      savedAudioLimit = previous
+      saveAudioLimitInput.value = String(previous)
+      setStatus(error instanceof Error ? error.message : 'Could not update the recording limit.', 'error')
+      savingAudioLimit = false
+      saveAudioLimitInput.disabled = false
+      return
+    }
+    try {
+      const deleted = await enforceSavedAudioRetention()
+      setStatus(
+        deleted > 0
+          ? `Saved recording limit updated; removed ${deleted} old recording${deleted === 1 ? '' : 's'}.`
+          : 'Saved recording limit updated.',
+        'saved',
+      )
+    } catch (error) {
+      setStatus(
+        `Recording limit saved, but cleanup failed: ${error instanceof Error ? error.message : 'Unknown error.'}`,
+        'error',
+      )
+    } finally {
+      savingAudioLimit = false
+      saveAudioLimitInput.disabled = false
+    }
+  }
+
   const onNativeContextMenu = (event: MouseEvent) => {
     const target = event.target && typeof (event.target as Element).closest === 'function'
       ? event.target as Element
@@ -1394,12 +1613,14 @@ export function setup(ctx: SpindleFrontendContext) {
     if (button.parentElement?.parentElement === button.ownerDocument.body) {
       hostDocument.dispatchEvent(new hostWindow.KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
     }
-    void playMessage(messageId)
+    const nativeRegenerationAction = /regenerate.+audio/.test(nativeTtsButtonLabel(button))
+    void playMessage(messageId, nativeRegenerationAction)
   }
 
   hostWindow.addEventListener('contextmenu', onNativeContextMenu, true)
   hostWindow.addEventListener('click', onNativeTtsClick, true)
   saveAudioToggle.addEventListener('change', onSaveAudioChanged)
+  saveAudioLimitInput.addEventListener('change', onSaveAudioLimitChanged)
   hostWindow.requestAnimationFrame(updatePlaybackButtons)
 
   const unsubscribeBackend = ctx.onBackendMessage((rawPayload: unknown) => {
@@ -1531,6 +1752,7 @@ export function setup(ctx: SpindleFrontendContext) {
     addNpcInputSlot.removeEventListener('keydown', onAddNpcKeyDown)
     scanButton.removeEventListener('click', scanMessages)
     saveAudioToggle.removeEventListener('change', onSaveAudioChanged)
+    saveAudioLimitInput.removeEventListener('change', onSaveAudioLimitChanged)
     hostWindow.removeEventListener('contextmenu', onNativeContextMenu, true)
     hostWindow.removeEventListener('click', onNativeTtsClick, true)
     restoreNativePlaybackButtons()

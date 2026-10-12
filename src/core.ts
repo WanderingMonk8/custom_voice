@@ -2,6 +2,16 @@ export const CONFIG_KEY = 'chat_voice'
 export const DEFAULT_MESSAGE_LIMIT = 20
 export const MIN_MESSAGE_LIMIT = 1
 export const MAX_MESSAGE_LIMIT = 500
+export const DEFAULT_SAVED_AUDIO_LIMIT = 50
+export const MAX_SAVED_AUDIO_LIMIT = 10_000
+
+export interface SavedAudioRecord {
+  chatId: string
+  messageId: string
+  audioId: string
+  swipeId: number
+  savedAt: number
+}
 
 export interface VoiceRef {
   connectionId: string
@@ -171,6 +181,56 @@ export function clampMessageLimit(value: unknown): number {
   const numeric = typeof value === 'number' ? value : Number(value)
   if (!Number.isFinite(numeric)) return DEFAULT_MESSAGE_LIMIT
   return Math.min(MAX_MESSAGE_LIMIT, Math.max(MIN_MESSAGE_LIMIT, Math.round(numeric)))
+}
+
+export function clampSavedAudioLimit(value: unknown): number {
+  const numeric = typeof value === 'number' ? value : Number(value)
+  if (!Number.isFinite(numeric)) return DEFAULT_SAVED_AUDIO_LIMIT
+  return Math.min(MAX_SAVED_AUDIO_LIMIT, Math.max(1, Math.round(numeric)))
+}
+
+export function readSavedAudioHistory(value: unknown): SavedAudioRecord[] {
+  if (!Array.isArray(value)) return []
+  const records: SavedAudioRecord[] = []
+  const seenAudioIds = new Set<string>()
+  for (const item of value.slice(-MAX_SAVED_AUDIO_LIMIT)) {
+    if (!isRecord(item)) continue
+    const chatId = typeof item.chatId === 'string' ? item.chatId : ''
+    const messageId = typeof item.messageId === 'string' ? item.messageId : ''
+    const audioId = typeof item.audioId === 'string' ? item.audioId : ''
+    const swipeId = typeof item.swipeId === 'number' ? Math.max(0, Math.round(item.swipeId)) : NaN
+    const savedAt = typeof item.savedAt === 'number' ? item.savedAt : NaN
+    if (!chatId || !messageId || !audioId || !Number.isFinite(swipeId) || !Number.isFinite(savedAt)) continue
+    if (seenAudioIds.has(audioId)) continue
+    seenAudioIds.add(audioId)
+    records.push({ chatId, messageId, audioId, swipeId, savedAt })
+  }
+  return records
+}
+
+export function upsertSavedAudioRecord(
+  records: SavedAudioRecord[],
+  next: SavedAudioRecord,
+): SavedAudioRecord[] {
+  return [
+    ...records.filter(record => (
+      record.audioId !== next.audioId
+      && !(record.chatId === next.chatId
+        && record.messageId === next.messageId
+        && record.swipeId === next.swipeId)
+    )),
+    next,
+  ]
+}
+
+export function expiredSavedAudioRecords(
+  records: SavedAudioRecord[],
+  limit: number,
+): SavedAudioRecord[] {
+  const overflow = Math.max(0, records.length - clampSavedAudioLimit(limit))
+  return [...records]
+    .sort((left, right) => left.savedAt - right.savedAt)
+    .slice(0, overflow)
 }
 
 export function readVoiceRef(value: unknown): VoiceRef | null {
@@ -707,11 +767,40 @@ function discourseSubjectSpeaker(
   return winnerScore >= 8 && winnerScore - runnerUpScore >= 4 ? winnerId : null
 }
 
+const SPEECH_BEARING_NOUNS = '(?:voice|words?|reply|answer|question|whisper|shout|yell|call|murmur|remark|response)'
+
+/** Resolve possessive metonymy such as "Colton's voice" when it heads the main clause. */
+function mainClauseSpeechPossessor(text: string, speakers: CharacterLike[]): string | null {
+  const narrative = narrativeOnly(text)
+  const matches = new Set<string>()
+  for (const speaker of speakers) {
+    for (const alias of speakerAliases(speaker.name)) {
+      const pattern = new RegExp(
+        `\\b${escapedPattern(alias)}\\b['’](?:s)?\\s+(?:[\\p{L}\\p{M}'’-]+\\s+){0,3}${SPEECH_BEARING_NOUNS}\\b`,
+        'giu',
+      )
+      for (const match of narrative.matchAll(pattern)) {
+        if (match.index === undefined) continue
+        const prefix = narrative.slice(0, match.index)
+        const sentenceStart = Math.max(
+          prefix.lastIndexOf('.'), prefix.lastIndexOf('!'), prefix.lastIndexOf('?'),
+          prefix.lastIndexOf(';'), prefix.lastIndexOf('\n'),
+        ) + 1
+        const lead = prefix.slice(sentenceStart)
+        if (!lead.trim() || /^[^,]{1,80},\s*$/u.test(lead)) matches.add(speaker.id)
+      }
+    }
+  }
+  return matches.size === 1 ? [...matches][0] : null
+}
+
 function preferredMentionedSpeaker(
   text: string,
   speakers: CharacterLike[],
   mentions: SpeakerMentions,
 ): string | null {
+  const speechPossessor = mainClauseSpeechPossessor(text, speakers)
+  if (speechPossessor) return speechPossessor
   if (mentions.clean.size === 1) return [...mentions.clean][0]
   if (mentions.clean.size > 1) return discourseSubjectSpeaker(text, speakers, mentions.clean)
   return mentions.possessive.size === 1 ? [...mentions.possessive][0] : null
@@ -855,6 +944,114 @@ function playbackParagraphs(content: string): PlaybackParagraph[] {
   return paragraphs
 }
 
+interface InitialDialogueBackfill {
+  speakerId: string
+  paragraphIndexes: Set<number>
+}
+
+/**
+ * Seed only a message-opening ambiguous dialogue run from later narration.
+ * Once any preceding character is established, downstream evidence is ignored.
+ */
+function initialDialogueBackfill(
+  paragraphs: PlaybackParagraph[],
+  speakers: CharacterLike[],
+): InitialDialogueBackfill | null {
+  const paragraphIndexes: number[] = []
+  let dialogueStarted = false
+  for (let index = 0; index < paragraphs.length; index++) {
+    const paragraph = paragraphs[index]
+    const hasDialogue = /["“][\s\S]*?["”]/u.test(paragraph.text)
+    const mentions = mentionedSpeakers(paragraph.text, speakers)
+    const localSpeakerId = preferredMentionedSpeaker(paragraph.text, speakers, mentions)
+
+    if (!dialogueStarted) {
+      if (!hasDialogue) {
+        if (localSpeakerId || hasSpeakerMentions(mentions)) return null
+        continue
+      }
+      dialogueStarted = true
+    }
+
+    if (hasDialogue) {
+      if (localSpeakerId || hasSpeakerMentions(mentions)) return null
+      paragraphIndexes.push(index)
+      continue
+    }
+
+    if (localSpeakerId) {
+      return {
+        speakerId: localSpeakerId,
+        paragraphIndexes: new Set(paragraphIndexes),
+      }
+    }
+    if (hasSpeakerMentions(mentions)) return null
+  }
+  return null
+}
+
+function confidentDialogueParagraphSpeaker(
+  content: string,
+  paragraph: PlaybackParagraph,
+  speakers: CharacterLike[],
+  defaultSpeakerId: string | null,
+): string | null {
+  const speakerIds = new Set<string>()
+  for (const match of paragraph.text.matchAll(/["“]([\s\S]*?)["”]/gu)) {
+    if (match.index === undefined) continue
+    const quoteStart = paragraph.start + match.index
+    const quoteEnd = quoteStart + match[0].length
+    const inference = inferQuotedSpeaker(
+      content.slice(0, quoteStart),
+      content.slice(quoteEnd),
+      match[1] ?? '',
+      speakers,
+      defaultSpeakerId,
+    )
+    if (inference.confident && inference.speakerId) speakerIds.add(inference.speakerId)
+  }
+  return speakerIds.size === 1 ? [...speakerIds][0] : null
+}
+
+/**
+ * Resolve an unattributed reply using strong evidence on both sides. The next
+ * paragraph must be narration-only and begin with a different, clear subject;
+ * a paragraph containing dialogue represents a new turn and cannot backfill.
+ */
+function downstreamNarrativeReplySpeakers(
+  content: string,
+  paragraphs: PlaybackParagraph[],
+  speakers: CharacterLike[],
+  defaultSpeakerId: string | null,
+): Map<number, string> {
+  const replies = new Map<number, string>()
+  for (let index = 1; index + 1 < paragraphs.length; index++) {
+    const previous = paragraphs[index - 1]
+    const current = paragraphs[index]
+    const next = paragraphs[index + 1]
+    if (!/["“][\s\S]*?["”]/u.test(previous.text)) continue
+    if (!/["“][\s\S]*?["”]/u.test(current.text)) continue
+    if (/["“][\s\S]*?["”]/u.test(next.text)) continue
+    if (cleanPlaybackText(narrativeOnly(current.text))) continue
+    if (hasSpeakerMentions(mentionedSpeakers(current.text, speakers))) continue
+
+    const previousSpeakerId = confidentDialogueParagraphSpeaker(
+      content,
+      previous,
+      speakers,
+      defaultSpeakerId,
+    )
+    if (!previousSpeakerId) continue
+
+    const nextMentions = mentionedSpeakers(next.text, speakers)
+    if (nextMentions.clean.size === 0) continue
+    const nextSpeakerId = discourseSubjectSpeaker(next.text, speakers, nextMentions.clean)
+    if (!nextSpeakerId || nextSpeakerId === previousSpeakerId) continue
+    replies.set(index, nextSpeakerId)
+  }
+  return replies
+}
+
 function hasSustainedUnnamedNarration(
   paragraphs: PlaybackParagraph[],
   startIndex: number,
@@ -993,7 +1190,14 @@ export function parseRosterVoiceSegments(
   const result: PlaybackSegment[] = []
   const quotePattern = /["“]([\s\S]*?)["”]/g
   const paragraphs = playbackParagraphs(playbackContent)
+  const openingBackfill = initialDialogueBackfill(paragraphs, speakers)
   const dialogueTurns = paragraphDialogueTurns(playbackContent, speakers, defaultSpeakerId)
+  const downstreamReplies = downstreamNarrativeReplySpeakers(
+    playbackContent,
+    paragraphs,
+    speakers,
+    defaultSpeakerId,
+  )
   const paragraphSpeakers = paragraphs.map(paragraph => (
     unambiguousNarrativeSpeaker(paragraph.text, speakers)
   ))
@@ -1029,15 +1233,21 @@ export function parseRosterVoiceSegments(
       const inferredTurnSpeakerId = (inference.source === 'history' || inference.source === 'fallback')
         ? dialogueTurnSpeakerId
         : null
+      const openingSpeakerId = inference.source === 'fallback'
+        && openingBackfill?.paragraphIndexes.has(paragraphIndex)
+        ? openingBackfill.speakerId
+        : null
       const speakerId: string | null = paragraphSpeakers[paragraphIndex]
+        ?? downstreamReplies.get(paragraphIndex)
         ?? inferredTurnSpeakerId
         ?? continuedSpeakerId
+        ?? openingSpeakerId
         ?? inference.speakerId
       result.push({
         text: speech,
         speakerId,
       })
-      if (inference.confident && speakerId) lastConfidentSpeakerId = speakerId
+      if ((inference.confident || openingSpeakerId) && speakerId) lastConfidentSpeakerId = speakerId
       if (speakerId) lastAssignedSpeakerId = speakerId
     }
     cursor = match.index + match[0].length
