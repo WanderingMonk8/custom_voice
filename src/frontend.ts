@@ -1,4 +1,5 @@
 import type {
+  ConnectionProfileDTO,
   SpindleFrontendContext,
   SpindleTextInputHandle,
 } from 'lumiverse-spindle-types'
@@ -14,6 +15,7 @@ import {
   readSavedAudioHistory,
   speakerAliases,
   upsertSavedAudioRecord,
+  type PlaybackSegment,
   type SavedAudioRecord,
 } from './core'
 
@@ -163,6 +165,16 @@ interface MessagePayload {
   error?: string
 }
 
+interface ParsedMessagePayload {
+  type: 'chat_voice_parsed_message'
+  requestId: string
+  chatId: string
+  messageId: string
+  segments?: PlaybackSegment[]
+  usedLlm?: boolean
+  error?: string
+}
+
 interface PlaybackMessage {
   id: string
   is_user: boolean
@@ -204,6 +216,9 @@ interface PlaybackPreferences {
   saveGeneratedAudio: boolean
   savedAudioLimit: number
   skippedTrackerTags: string
+  speakerParsingMode: 'off' | 'ambiguous' | 'always'
+  llmConnectionId: string
+  llmModel: string
 }
 
 const VOICE_ICON = `
@@ -246,10 +261,17 @@ async function loadPlaybackPreferences(): Promise<PlaybackPreferences> {
     saveGeneratedAudio: false,
     savedAudioLimit: DEFAULT_SAVED_AUDIO_LIMIT,
     skippedTrackerTags: '',
+    speakerParsingMode: 'off',
+    llmConnectionId: '',
+    llmModel: '',
   }
   const row = await response.json() as { value?: Record<string, unknown> }
   const speed = typeof row.value?.ttsSpeed === 'number' ? row.value.ttsSpeed : 1
   const volume = typeof row.value?.ttsVolume === 'number' ? row.value.ttsVolume : 1
+  const speakerParsingMode = row.value?.chatVoiceSpeakerParsingMode === 'ambiguous'
+    || row.value?.chatVoiceSpeakerParsingMode === 'always'
+    ? row.value.chatVoiceSpeakerParsingMode
+    : 'off'
   return {
     speed: Math.min(4, Math.max(0.25, speed)),
     volume: Math.min(1, Math.max(0, volume)),
@@ -260,6 +282,13 @@ async function loadPlaybackPreferences(): Promise<PlaybackPreferences> {
     savedAudioLimit: clampSavedAudioLimit(row.value?.chatVoiceSavedAudioLimit),
     skippedTrackerTags: typeof row.value?.chatVoiceSkippedTrackerTags === 'string'
       ? row.value.chatVoiceSkippedTrackerTags.slice(0, 4_000)
+      : '',
+    speakerParsingMode,
+    llmConnectionId: typeof row.value?.chatVoiceLlmConnectionId === 'string'
+      ? row.value.chatVoiceLlmConnectionId.trim().slice(0, 128)
+      : '',
+    llmModel: typeof row.value?.chatVoiceLlmModel === 'string'
+      ? row.value.chatVoiceLlmModel.trim().slice(0, 256)
       : '',
   }
 }
@@ -307,6 +336,19 @@ function saveSkippedTrackerTagsPreference(value: string): Promise<void> {
   return updateVoiceSettings(current => ({
     ...current,
     chatVoiceSkippedTrackerTags: value.slice(0, 4_000),
+  }))
+}
+
+function saveLlmParsingPreferences(
+  mode: 'off' | 'ambiguous' | 'always',
+  connectionId: string,
+  model: string,
+): Promise<void> {
+  return updateVoiceSettings(current => ({
+    ...current,
+    chatVoiceSpeakerParsingMode: mode,
+    chatVoiceLlmConnectionId: connectionId.trim().slice(0, 128),
+    chatVoiceLlmModel: model.trim().slice(0, 256),
   }))
 }
 
@@ -635,6 +677,9 @@ export function setup(ctx: SpindleFrontendContext) {
   scanButton.disabled = true
   scanRow.append(scanButton)
   const skippedTagsField = createField('Skipped tracker tags (global)')
+  const speakerParsingField = createField('AI speaker review (global)')
+  const llmConnectionField = createField('Speaker-review LLM connection')
+  const llmModelField = createField('Custom LLM model (optional)')
   const narratorField = createField('Narrator voice')
   const routingHint = document.createElement('div')
   routingHint.className = 'chat-voice-hint'
@@ -664,6 +709,9 @@ export function setup(ctx: SpindleFrontendContext) {
     saveAudioField.field,
     scanField.field,
     skippedTagsField.field,
+    speakerParsingField.field,
+    llmConnectionField.field,
+    llmModelField.field,
     narratorField.field,
     routingHint,
     addNpcField.field,
@@ -685,6 +733,12 @@ export function setup(ctx: SpindleFrontendContext) {
   let skippedTrackerTagsDirty = false
   let savingSkippedTrackerTags = false
   let skippedTrackerTagsSaveTimer: ReturnType<typeof setTimeout> | null = null
+  let speakerParsingMode: 'off' | 'ambiguous' | 'always' = 'off'
+  let llmConnections: ConnectionProfileDTO[] = []
+  let llmConnectionId = ''
+  let llmModel = ''
+  let llmSettingsSaveTimer: ReturnType<typeof setTimeout> | null = null
+  let savingLlmSettings = false
   let saveTimer: ReturnType<typeof setTimeout> | null = null
   let editRevision = 0
   let dirty = false
@@ -756,8 +810,14 @@ export function setup(ctx: SpindleFrontendContext) {
     reject: (error: Error) => void
     timer: ReturnType<typeof setTimeout>
   }>()
+  const pendingSpeakerParseRequests = new Map<string, {
+    resolve: (segments: PlaybackSegment[]) => void
+    reject: (error: Error) => void
+    timer: ReturnType<typeof setTimeout>
+  }>()
   let messageRequestSequence = 0
   let stateRequestSequence = 0
+  let speakerParseRequestSequence = 0
 
   const setStatus = (message: string, state: 'normal' | 'saved' | 'error' = 'normal') => {
     status.textContent = message
@@ -816,6 +876,39 @@ export function setup(ctx: SpindleFrontendContext) {
     rows: 3,
     ariaLabel: 'Tracker tag pairs to skip globally',
     onChange: () => scheduleSkippedTrackerTagsSave(),
+  })
+
+  const speakerParsingPicker = ctx.components.mountSelect(speakerParsingField.slot, {
+    value: 'off',
+    options: [
+      { value: 'off', label: 'Off', sublabel: 'Use the local parser only' },
+      { value: 'ambiguous', label: 'Ambiguous only', sublabel: 'Ask the LLM only when attribution is uncertain' },
+      { value: 'always', label: 'All dialogue', sublabel: 'Review every message containing dialogue' },
+    ],
+    ariaLabel: 'AI speaker review mode',
+    onChange: value => onSpeakerParsingModeChanged(value),
+  })
+
+  const llmConnectionPicker = ctx.components.mountSelect(llmConnectionField.slot, {
+    value: '',
+    options: [],
+    placeholder: 'Use the default LLM connection',
+    searchPlaceholder: 'Search LLM connections…',
+    emptyMessage: 'No LLM connections found.',
+    clearable: true,
+    clearLabel: 'Use default LLM connection',
+    ariaLabel: 'Speaker-review LLM connection',
+    disabled: true,
+    onChange: value => onLlmConnectionChanged(value),
+  })
+
+  const llmModelInput = ctx.components.mountModelCombobox(llmModelField.slot, {
+    value: '',
+    connection: { kind: 'llm' },
+    placeholder: 'Use the connection model or enter a model name',
+    browseHint: 'Leave blank to use the selected connection’s configured model.',
+    disabled: true,
+    onChange: value => onLlmModelChanged(value),
   })
 
   const addNpcInput = ctx.components.mountTextInput(addNpcInputSlot, {
@@ -914,6 +1007,31 @@ export function setup(ctx: SpindleFrontendContext) {
       }, 15_000)
       pendingMessageRequests.set(requestId, { resolve, reject, timer })
       ctx.sendToBackend({ type: 'chat_voice_get_message', chatId, messageId, requestId })
+    })
+  }
+
+  function requestSpeakerReviewedSegments(
+    chatId: string,
+    messageId: string,
+    preferences: PlaybackPreferences,
+  ): Promise<PlaybackSegment[]> {
+    const requestId = `parse-${Date.now().toString(36)}-${++speakerParseRequestSequence}`
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        pendingSpeakerParseRequests.delete(requestId)
+        reject(new Error('AI speaker review timed out.'))
+      }, 45_000)
+      pendingSpeakerParseRequests.set(requestId, { resolve, reject, timer })
+      ctx.sendToBackend({
+        type: 'chat_voice_parse_message',
+        chatId,
+        messageId,
+        requestId,
+        mode: preferences.speakerParsingMode === 'always' ? 'always' : 'ambiguous',
+        connectionId: preferences.llmConnectionId,
+        model: preferences.llmModel,
+        skippedTrackerTags: preferences.skippedTrackerTags,
+      })
     })
   }
 
@@ -1095,6 +1213,11 @@ export function setup(ctx: SpindleFrontendContext) {
     const playbackChat = activeChat
     const config = collectConfig()
     const preferences = await loadPlaybackPreferences()
+    if (llmSettingsSaveTimer || savingLlmSettings) {
+      preferences.speakerParsingMode = speakerParsingMode
+      preferences.llmConnectionId = llmConnectionId
+      preferences.llmModel = llmModel
+    }
     const connectionId = config.connectionId
       || (connections.some(connection => connection.id === preferences.connectionId)
         ? preferences.connectionId
@@ -1150,12 +1273,22 @@ export function setup(ctx: SpindleFrontendContext) {
           speakerAliases(character.name).map(alias => [npcSpeakerId(alias), character.id] as const)
         )),
       )
-      const segments = parseRosterVoiceSegments(
+      let segments = parseRosterVoiceSegments(
         message.content,
         defaultSpeakerId,
         playbackChat.characters,
         preferences.skippedTrackerTags,
       )
+      if (preferences.speakerParsingMode !== 'off') {
+        setStatus('Reviewing dialogue speakers…')
+        try {
+          segments = await requestSpeakerReviewedSegments(playbackChat.id, messageId, preferences)
+        } catch (error) {
+          console.warn('[Chat Voice] AI speaker review failed; using the local parser.', error)
+          if (playback.controller.signal.aborted) throw new DOMException('Playback stopped.', 'AbortError')
+          setStatus('AI speaker review unavailable; using the local parser.')
+        }
+      }
       const plan = mergeVoicePlan(segments.map((segment) => {
         const speakerId = segment.speakerId
           ? aliases.get(segment.speakerId) ?? segment.speakerId
@@ -1531,11 +1664,13 @@ export function setup(ctx: SpindleFrontendContext) {
 
   async function loadConnections() {
     try {
-      const [loadedConnections, preferences] = await Promise.all([
+      const [loadedConnections, loadedLlmConnections, preferences] = await Promise.all([
         listAllTtsConnections(),
+        ctx.connections?.list().catch(() => []) ?? Promise.resolve([]),
         loadPlaybackPreferences(),
       ])
       connections = loadedConnections
+      llmConnections = loadedLlmConnections
       if (!savingAudioPreference) {
         saveGeneratedAudio = preferences.saveGeneratedAudio
         saveAudioToggle.checked = saveGeneratedAudio
@@ -1547,6 +1682,13 @@ export function setup(ctx: SpindleFrontendContext) {
       if (!savingSkippedTrackerTags && !skippedTrackerTagsDirty) {
         skippedTrackerTags = preferences.skippedTrackerTags
         skippedTrackerTagsInput.update({ value: skippedTrackerTags })
+      }
+      if (!savingLlmSettings && !llmSettingsSaveTimer) {
+        speakerParsingMode = preferences.speakerParsingMode
+        llmConnectionId = preferences.llmConnectionId
+        llmModel = preferences.llmModel
+        speakerParsingPicker.update({ value: speakerParsingMode })
+        updateLlmControlState()
       }
       lumiverseConnectionId = connections.some(connection => connection.id === preferences.connectionId)
         ? preferences.connectionId
@@ -1563,6 +1705,75 @@ export function setup(ctx: SpindleFrontendContext) {
       const message = error instanceof Error ? error.message : 'Could not load TTS connections.'
       connectionPicker.update({ placeholder: 'Connections unavailable', disabled: true })
       setStatus(message, 'error')
+    }
+  }
+
+  function llmConnectionOptions(selectedId = '') {
+    const options = llmConnections.map(connection => ({
+      value: connection.id,
+      label: connection.name,
+      sublabel: `${connection.provider}${connection.model ? ` · ${connection.model}` : ''}`,
+    }))
+    if (selectedId && !llmConnections.some(connection => connection.id === selectedId)) {
+      options.unshift({ value: selectedId, label: 'Missing connection', sublabel: selectedId })
+    }
+    return options
+  }
+
+  function updateLlmControlState(): void {
+    const enabled = speakerParsingMode !== 'off'
+    llmConnectionPicker.update({
+      value: llmConnectionId,
+      options: llmConnectionOptions(llmConnectionId),
+      disabled: !enabled,
+      placeholder: llmConnections.length
+        ? 'Use the default LLM connection'
+        : 'No LLM connections found; default will be used',
+    })
+    llmModelInput.update({
+      value: llmModel,
+      connection: llmConnectionId
+        ? { kind: 'llm', id: llmConnectionId }
+        : { kind: 'llm' },
+      disabled: !enabled,
+    })
+  }
+
+  function scheduleLlmSettingsSave(): void {
+    if (llmSettingsSaveTimer) clearTimeout(llmSettingsSaveTimer)
+    llmSettingsSaveTimer = setTimeout(() => {
+      llmSettingsSaveTimer = null
+      void persistLlmSettings()
+    }, 400)
+  }
+
+  function onSpeakerParsingModeChanged(value: string): void {
+    speakerParsingMode = value === 'ambiguous' || value === 'always' ? value : 'off'
+    updateLlmControlState()
+    scheduleLlmSettingsSave()
+  }
+
+  function onLlmConnectionChanged(value: string): void {
+    llmConnectionId = value.trim().slice(0, 128)
+    updateLlmControlState()
+    scheduleLlmSettingsSave()
+  }
+
+  function onLlmModelChanged(value: string): void {
+    llmModel = value.trim().slice(0, 256)
+    scheduleLlmSettingsSave()
+  }
+
+  async function persistLlmSettings(): Promise<void> {
+    savingLlmSettings = true
+    setStatus('Saving global AI speaker-review settings…')
+    try {
+      await saveLlmParsingPreferences(speakerParsingMode, llmConnectionId, llmModel)
+      setStatus('AI speaker-review settings saved globally.', 'saved')
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : 'Could not save AI speaker-review settings.', 'error')
+    } finally {
+      savingLlmSettings = false
     }
   }
 
@@ -1683,7 +1894,7 @@ export function setup(ctx: SpindleFrontendContext) {
   hostWindow.requestAnimationFrame(updatePlaybackButtons)
 
   const unsubscribeBackend = ctx.onBackendMessage((rawPayload: unknown) => {
-    const payload = rawPayload as StatePayload | ErrorPayload | ScanCompletePayload | MessagePayload
+    const payload = rawPayload as StatePayload | ErrorPayload | ScanCompletePayload | MessagePayload | ParsedMessagePayload
     if (payload.type === 'chat_voice_message') {
       const pending = pendingMessageRequests.get(payload.requestId)
       if (!pending) return
@@ -1691,6 +1902,18 @@ export function setup(ctx: SpindleFrontendContext) {
       pendingMessageRequests.delete(payload.requestId)
       if (payload.error || !payload.message) pending.reject(new Error(payload.error || 'The message is unavailable.'))
       else pending.resolve(payload.message)
+      return
+    }
+    if (payload.type === 'chat_voice_parsed_message') {
+      const pending = pendingSpeakerParseRequests.get(payload.requestId)
+      if (!pending) return
+      clearTimeout(pending.timer)
+      pendingSpeakerParseRequests.delete(payload.requestId)
+      if (payload.error || !payload.segments) {
+        pending.reject(new Error(payload.error || 'The message could not be reviewed.'))
+      } else {
+        pending.resolve(payload.segments)
+      }
       return
     }
     if (payload.type === 'chat_voice_error') {
@@ -1739,6 +1962,11 @@ export function setup(ctx: SpindleFrontendContext) {
         pending.reject(new Error('The active chat changed before playback started.'))
       }
       pendingMessageRequests.clear()
+      for (const pending of pendingSpeakerParseRequests.values()) {
+        clearTimeout(pending.timer)
+        pending.reject(new Error('The active chat changed before speaker review completed.'))
+      }
+      pendingSpeakerParseRequests.clear()
       stopPlayback()
       flushSave()
       dirty = false
@@ -1799,6 +2027,11 @@ export function setup(ctx: SpindleFrontendContext) {
       pending.reject(new Error('Chat Voice was closed.'))
     }
     pendingMessageRequests.clear()
+    for (const pending of pendingSpeakerParseRequests.values()) {
+      clearTimeout(pending.timer)
+      pending.reject(new Error('Chat Voice was closed.'))
+    }
+    pendingSpeakerParseRequests.clear()
     for (const pending of pendingStateRequests.values()) {
       clearTimeout(pending.timer)
       pending.reject(new Error('Chat Voice was closed.'))
@@ -1810,7 +2043,14 @@ export function setup(ctx: SpindleFrontendContext) {
       clearTimeout(skippedTrackerTagsSaveTimer)
       void saveSkippedTrackerTagsPreference(skippedTrackerTags)
     }
+    if (llmSettingsSaveTimer) {
+      clearTimeout(llmSettingsSaveTimer)
+      void saveLlmParsingPreferences(speakerParsingMode, llmConnectionId, llmModel)
+    }
     skippedTrackerTagsInput.destroy()
+    speakerParsingPicker.destroy()
+    llmConnectionPicker.destroy()
+    llmModelInput.destroy()
     addNpcInput.destroy()
     addNpcButton.removeEventListener('click', onAddNpc)
     addNpcInputSlot.removeEventListener('keydown', onAddNpcKeyDown)

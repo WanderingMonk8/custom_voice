@@ -181,6 +181,9 @@ function stripSkippedTrackerBlocks(content, tagPairs) {
   }
   return result;
 }
+function preparePlaybackContent(content, skippedTrackerTagPairs = "") {
+  return stripPlaybackMarkup(stripSkippedTrackerBlocks(content, skippedTrackerTagPairs));
+}
 function cleanPlaybackText(value) {
   return decodePlaybackEntities(stripPlaybackMarkup(value)).replace(/```[\s\S]*?```/g, " ").replace(/`[^`\n]*`/g, " ").replace(/\r\n?/g, "\n").replace(/[^\S\n]+/g, " ").replace(/ *\n */g, "\n").replace(/\n{3,}/g, "\n\n").trim();
 }
@@ -588,8 +591,8 @@ function canContinueSpeaker(bridge, previousSpeakerId, speakers) {
   }
   return true;
 }
-function parseRosterVoiceSegments(content, defaultSpeakerId, speakers, skippedTrackerTagPairs = "") {
-  const playbackContent = stripPlaybackMarkup(stripSkippedTrackerBlocks(content, skippedTrackerTagPairs));
+function parseRosterVoiceSegmentsInternal(content, defaultSpeakerId, speakers, skippedTrackerTagPairs = "", quoteSpeakerOverrides) {
+  const playbackContent = preparePlaybackContent(content, skippedTrackerTagPairs);
   const result = [];
   const quotePattern = /["“]([\s\S]*?)["”]/g;
   const paragraphs = playbackParagraphs(playbackContent);
@@ -606,8 +609,11 @@ function parseRosterVoiceSegments(content, defaultSpeakerId, speakers, skippedTr
   let cursor = 0;
   let lastConfidentSpeakerId = null;
   let lastAssignedSpeakerId = null;
+  let quoteIndex = 0;
   for (const match of playbackContent.matchAll(quotePattern)) {
     if (match.index === void 0) continue;
+    const currentQuoteIndex = quoteIndex;
+    quoteIndex += 1;
     while (paragraphIndex + 1 < paragraphs.length && match.index >= paragraphs[paragraphIndex].end) {
       paragraphIndex += 1;
     }
@@ -629,7 +635,7 @@ function parseRosterVoiceSegments(content, defaultSpeakerId, speakers, skippedTr
       const dialogueTurnSpeakerId = dialogueTurns.get(paragraphIndex) ?? null;
       const inferredTurnSpeakerId = inference.source === "history" || inference.source === "fallback" ? dialogueTurnSpeakerId : null;
       const openingSpeakerId = inference.source === "fallback" && openingBackfill?.paragraphIndexes.has(paragraphIndex) ? openingBackfill.speakerId : null;
-      const speakerId = paragraphSpeakers[paragraphIndex] ?? downstreamReplies.get(paragraphIndex) ?? inferredTurnSpeakerId ?? continuedSpeakerId ?? openingSpeakerId ?? inference.speakerId;
+      const speakerId = quoteSpeakerOverrides?.has(currentQuoteIndex) ? quoteSpeakerOverrides.get(currentQuoteIndex) ?? null : paragraphSpeakers[paragraphIndex] ?? downstreamReplies.get(paragraphIndex) ?? inferredTurnSpeakerId ?? continuedSpeakerId ?? openingSpeakerId ?? inference.speakerId;
       result.push({
         text: speech,
         speakerId
@@ -642,6 +648,14 @@ function parseRosterVoiceSegments(content, defaultSpeakerId, speakers, skippedTr
   const narration = cleanPlaybackText(playbackContent.slice(cursor));
   if (narration) result.push({ text: narration, speakerId: null });
   return result;
+}
+function parseRosterVoiceSegments(content, defaultSpeakerId, speakers, skippedTrackerTagPairs = "") {
+  return parseRosterVoiceSegmentsInternal(
+    content,
+    defaultSpeakerId,
+    speakers,
+    skippedTrackerTagPairs
+  );
 }
 
 // src/frontend.ts
@@ -748,18 +762,25 @@ async function loadPlaybackPreferences() {
     connectionId: "",
     saveGeneratedAudio: false,
     savedAudioLimit: DEFAULT_SAVED_AUDIO_LIMIT,
-    skippedTrackerTags: ""
+    skippedTrackerTags: "",
+    speakerParsingMode: "off",
+    llmConnectionId: "",
+    llmModel: ""
   };
   const row = await response.json();
   const speed = typeof row.value?.ttsSpeed === "number" ? row.value.ttsSpeed : 1;
   const volume = typeof row.value?.ttsVolume === "number" ? row.value.ttsVolume : 1;
+  const speakerParsingMode = row.value?.chatVoiceSpeakerParsingMode === "ambiguous" || row.value?.chatVoiceSpeakerParsingMode === "always" ? row.value.chatVoiceSpeakerParsingMode : "off";
   return {
     speed: Math.min(4, Math.max(0.25, speed)),
     volume: Math.min(1, Math.max(0, volume)),
     connectionId: typeof row.value?.ttsConnectionId === "string" ? row.value.ttsConnectionId.trim() : "",
     saveGeneratedAudio: row.value?.chatVoiceSaveGeneratedAudio === true,
     savedAudioLimit: clampSavedAudioLimit(row.value?.chatVoiceSavedAudioLimit),
-    skippedTrackerTags: typeof row.value?.chatVoiceSkippedTrackerTags === "string" ? row.value.chatVoiceSkippedTrackerTags.slice(0, 4e3) : ""
+    skippedTrackerTags: typeof row.value?.chatVoiceSkippedTrackerTags === "string" ? row.value.chatVoiceSkippedTrackerTags.slice(0, 4e3) : "",
+    speakerParsingMode,
+    llmConnectionId: typeof row.value?.chatVoiceLlmConnectionId === "string" ? row.value.chatVoiceLlmConnectionId.trim().slice(0, 128) : "",
+    llmModel: typeof row.value?.chatVoiceLlmModel === "string" ? row.value.chatVoiceLlmModel.trim().slice(0, 256) : ""
   };
 }
 var voiceSettingsWriteQueue = Promise.resolve();
@@ -799,6 +820,14 @@ function saveSkippedTrackerTagsPreference(value) {
   return updateVoiceSettings((current) => ({
     ...current,
     chatVoiceSkippedTrackerTags: value.slice(0, 4e3)
+  }));
+}
+function saveLlmParsingPreferences(mode, connectionId, model) {
+  return updateVoiceSettings((current) => ({
+    ...current,
+    chatVoiceSpeakerParsingMode: mode,
+    chatVoiceLlmConnectionId: connectionId.trim().slice(0, 128),
+    chatVoiceLlmModel: model.trim().slice(0, 256)
   }));
 }
 async function deleteSavedAudioRecord(record) {
@@ -1091,6 +1120,9 @@ function setup(ctx) {
   scanButton.disabled = true;
   scanRow.append(scanButton);
   const skippedTagsField = createField("Skipped tracker tags (global)");
+  const speakerParsingField = createField("AI speaker review (global)");
+  const llmConnectionField = createField("Speaker-review LLM connection");
+  const llmModelField = createField("Custom LLM model (optional)");
   const narratorField = createField("Narrator voice");
   const routingHint = document.createElement("div");
   routingHint.className = "chat-voice-hint";
@@ -1119,6 +1151,9 @@ function setup(ctx) {
     saveAudioField.field,
     scanField.field,
     skippedTagsField.field,
+    speakerParsingField.field,
+    llmConnectionField.field,
+    llmModelField.field,
     narratorField.field,
     routingHint,
     addNpcField.field,
@@ -1139,6 +1174,12 @@ function setup(ctx) {
   let skippedTrackerTagsDirty = false;
   let savingSkippedTrackerTags = false;
   let skippedTrackerTagsSaveTimer = null;
+  let speakerParsingMode = "off";
+  let llmConnections = [];
+  let llmConnectionId = "";
+  let llmModel = "";
+  let llmSettingsSaveTimer = null;
+  let savingLlmSettings = false;
   let saveTimer = null;
   let editRevision = 0;
   let dirty = false;
@@ -1181,8 +1222,10 @@ function setup(ctx) {
   const nativeButtonStates = /* @__PURE__ */ new Map();
   const pendingMessageRequests = /* @__PURE__ */ new Map();
   const pendingStateRequests = /* @__PURE__ */ new Map();
+  const pendingSpeakerParseRequests = /* @__PURE__ */ new Map();
   let messageRequestSequence = 0;
   let stateRequestSequence = 0;
+  let speakerParseRequestSequence = 0;
   const setStatus = (message, state = "normal") => {
     status.textContent = message;
     status.dataset.state = state;
@@ -1235,6 +1278,36 @@ function setup(ctx) {
     rows: 3,
     ariaLabel: "Tracker tag pairs to skip globally",
     onChange: () => scheduleSkippedTrackerTagsSave()
+  });
+  const speakerParsingPicker = ctx.components.mountSelect(speakerParsingField.slot, {
+    value: "off",
+    options: [
+      { value: "off", label: "Off", sublabel: "Use the local parser only" },
+      { value: "ambiguous", label: "Ambiguous only", sublabel: "Ask the LLM only when attribution is uncertain" },
+      { value: "always", label: "All dialogue", sublabel: "Review every message containing dialogue" }
+    ],
+    ariaLabel: "AI speaker review mode",
+    onChange: (value) => onSpeakerParsingModeChanged(value)
+  });
+  const llmConnectionPicker = ctx.components.mountSelect(llmConnectionField.slot, {
+    value: "",
+    options: [],
+    placeholder: "Use the default LLM connection",
+    searchPlaceholder: "Search LLM connections\u2026",
+    emptyMessage: "No LLM connections found.",
+    clearable: true,
+    clearLabel: "Use default LLM connection",
+    ariaLabel: "Speaker-review LLM connection",
+    disabled: true,
+    onChange: (value) => onLlmConnectionChanged(value)
+  });
+  const llmModelInput = ctx.components.mountModelCombobox(llmModelField.slot, {
+    value: "",
+    connection: { kind: "llm" },
+    placeholder: "Use the connection model or enter a model name",
+    browseHint: "Leave blank to use the selected connection\u2019s configured model.",
+    disabled: true,
+    onChange: (value) => onLlmModelChanged(value)
   });
   const addNpcInput = ctx.components.mountTextInput(addNpcInputSlot, {
     value: "",
@@ -1329,6 +1402,26 @@ function setup(ctx) {
       }, 15e3);
       pendingMessageRequests.set(requestId, { resolve, reject, timer });
       ctx.sendToBackend({ type: "chat_voice_get_message", chatId, messageId, requestId });
+    });
+  }
+  function requestSpeakerReviewedSegments(chatId, messageId, preferences) {
+    const requestId = `parse-${Date.now().toString(36)}-${++speakerParseRequestSequence}`;
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        pendingSpeakerParseRequests.delete(requestId);
+        reject(new Error("AI speaker review timed out."));
+      }, 45e3);
+      pendingSpeakerParseRequests.set(requestId, { resolve, reject, timer });
+      ctx.sendToBackend({
+        type: "chat_voice_parse_message",
+        chatId,
+        messageId,
+        requestId,
+        mode: preferences.speakerParsingMode === "always" ? "always" : "ambiguous",
+        connectionId: preferences.llmConnectionId,
+        model: preferences.llmModel,
+        skippedTrackerTags: preferences.skippedTrackerTags
+      });
     });
   }
   function refreshLocalState() {
@@ -1488,6 +1581,11 @@ function setup(ctx) {
     const playbackChat = activeChat;
     const config = collectConfig();
     const preferences = await loadPlaybackPreferences();
+    if (llmSettingsSaveTimer || savingLlmSettings) {
+      preferences.speakerParsingMode = speakerParsingMode;
+      preferences.llmConnectionId = llmConnectionId;
+      preferences.llmModel = llmModel;
+    }
     const connectionId = config.connectionId || (connections.some((connection) => connection.id === preferences.connectionId) ? preferences.connectionId : connections.find((connection) => connection.is_default)?.id ?? lumiverseConnectionId);
     if (!connectionId) {
       setStatus("Choose a TTS connection before playing.", "error");
@@ -1533,12 +1631,22 @@ function setup(ctx) {
       const aliases = new Map(
         playbackChat.characters.flatMap((character) => speakerAliases(character.name).map((alias) => [npcSpeakerId(alias), character.id]))
       );
-      const segments = parseRosterVoiceSegments(
+      let segments = parseRosterVoiceSegments(
         message.content,
         defaultSpeakerId,
         playbackChat.characters,
         preferences.skippedTrackerTags
       );
+      if (preferences.speakerParsingMode !== "off") {
+        setStatus("Reviewing dialogue speakers\u2026");
+        try {
+          segments = await requestSpeakerReviewedSegments(playbackChat.id, messageId, preferences);
+        } catch (error) {
+          console.warn("[Chat Voice] AI speaker review failed; using the local parser.", error);
+          if (playback.controller.signal.aborted) throw new DOMException("Playback stopped.", "AbortError");
+          setStatus("AI speaker review unavailable; using the local parser.");
+        }
+      }
       const plan = mergeVoicePlan(segments.map((segment) => {
         const speakerId = segment.speakerId ? aliases.get(segment.speakerId) ?? segment.speakerId : null;
         const voice = speakerId ? config.characterVoices[speakerId] || "" : config.narratorVoice;
@@ -1877,11 +1985,13 @@ function setup(ctx) {
   }
   async function loadConnections() {
     try {
-      const [loadedConnections, preferences] = await Promise.all([
+      const [loadedConnections, loadedLlmConnections, preferences] = await Promise.all([
         listAllTtsConnections(),
+        ctx.connections?.list().catch(() => []) ?? Promise.resolve([]),
         loadPlaybackPreferences()
       ]);
       connections = loadedConnections;
+      llmConnections = loadedLlmConnections;
       if (!savingAudioPreference) {
         saveGeneratedAudio = preferences.saveGeneratedAudio;
         saveAudioToggle.checked = saveGeneratedAudio;
@@ -1893,6 +2003,13 @@ function setup(ctx) {
       if (!savingSkippedTrackerTags && !skippedTrackerTagsDirty) {
         skippedTrackerTags = preferences.skippedTrackerTags;
         skippedTrackerTagsInput.update({ value: skippedTrackerTags });
+      }
+      if (!savingLlmSettings && !llmSettingsSaveTimer) {
+        speakerParsingMode = preferences.speakerParsingMode;
+        llmConnectionId = preferences.llmConnectionId;
+        llmModel = preferences.llmModel;
+        speakerParsingPicker.update({ value: speakerParsingMode });
+        updateLlmControlState();
       }
       lumiverseConnectionId = connections.some((connection) => connection.id === preferences.connectionId) ? preferences.connectionId : connections.find((connection) => connection.is_default)?.id ?? "";
       const selectedConnectionId = activeChat?.connectionId || lumiverseConnectionId;
@@ -1907,6 +2024,64 @@ function setup(ctx) {
       const message = error instanceof Error ? error.message : "Could not load TTS connections.";
       connectionPicker.update({ placeholder: "Connections unavailable", disabled: true });
       setStatus(message, "error");
+    }
+  }
+  function llmConnectionOptions(selectedId = "") {
+    const options = llmConnections.map((connection) => ({
+      value: connection.id,
+      label: connection.name,
+      sublabel: `${connection.provider}${connection.model ? ` \xB7 ${connection.model}` : ""}`
+    }));
+    if (selectedId && !llmConnections.some((connection) => connection.id === selectedId)) {
+      options.unshift({ value: selectedId, label: "Missing connection", sublabel: selectedId });
+    }
+    return options;
+  }
+  function updateLlmControlState() {
+    const enabled = speakerParsingMode !== "off";
+    llmConnectionPicker.update({
+      value: llmConnectionId,
+      options: llmConnectionOptions(llmConnectionId),
+      disabled: !enabled,
+      placeholder: llmConnections.length ? "Use the default LLM connection" : "No LLM connections found; default will be used"
+    });
+    llmModelInput.update({
+      value: llmModel,
+      connection: llmConnectionId ? { kind: "llm", id: llmConnectionId } : { kind: "llm" },
+      disabled: !enabled
+    });
+  }
+  function scheduleLlmSettingsSave() {
+    if (llmSettingsSaveTimer) clearTimeout(llmSettingsSaveTimer);
+    llmSettingsSaveTimer = setTimeout(() => {
+      llmSettingsSaveTimer = null;
+      void persistLlmSettings();
+    }, 400);
+  }
+  function onSpeakerParsingModeChanged(value) {
+    speakerParsingMode = value === "ambiguous" || value === "always" ? value : "off";
+    updateLlmControlState();
+    scheduleLlmSettingsSave();
+  }
+  function onLlmConnectionChanged(value) {
+    llmConnectionId = value.trim().slice(0, 128);
+    updateLlmControlState();
+    scheduleLlmSettingsSave();
+  }
+  function onLlmModelChanged(value) {
+    llmModel = value.trim().slice(0, 256);
+    scheduleLlmSettingsSave();
+  }
+  async function persistLlmSettings() {
+    savingLlmSettings = true;
+    setStatus("Saving global AI speaker-review settings\u2026");
+    try {
+      await saveLlmParsingPreferences(speakerParsingMode, llmConnectionId, llmModel);
+      setStatus("AI speaker-review settings saved globally.", "saved");
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : "Could not save AI speaker-review settings.", "error");
+    } finally {
+      savingLlmSettings = false;
     }
   }
   const onSaveAudioChanged = async () => {
@@ -2023,6 +2198,18 @@ function setup(ctx) {
       else pending.resolve(payload.message);
       return;
     }
+    if (payload.type === "chat_voice_parsed_message") {
+      const pending = pendingSpeakerParseRequests.get(payload.requestId);
+      if (!pending) return;
+      clearTimeout(pending.timer);
+      pendingSpeakerParseRequests.delete(payload.requestId);
+      if (payload.error || !payload.segments) {
+        pending.reject(new Error(payload.error || "The message could not be reviewed."));
+      } else {
+        pending.resolve(payload.segments);
+      }
+      return;
+    }
     if (payload.type === "chat_voice_error") {
       if (payload.requestId) {
         const pending = pendingStateRequests.get(payload.requestId);
@@ -2066,6 +2253,11 @@ function setup(ctx) {
         pending.reject(new Error("The active chat changed before playback started."));
       }
       pendingMessageRequests.clear();
+      for (const pending of pendingSpeakerParseRequests.values()) {
+        clearTimeout(pending.timer);
+        pending.reject(new Error("The active chat changed before speaker review completed."));
+      }
+      pendingSpeakerParseRequests.clear();
       stopPlayback();
       flushSave();
       dirty = false;
@@ -2120,6 +2312,11 @@ function setup(ctx) {
       pending.reject(new Error("Chat Voice was closed."));
     }
     pendingMessageRequests.clear();
+    for (const pending of pendingSpeakerParseRequests.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(new Error("Chat Voice was closed."));
+    }
+    pendingSpeakerParseRequests.clear();
     for (const pending of pendingStateRequests.values()) {
       clearTimeout(pending.timer);
       pending.reject(new Error("Chat Voice was closed."));
@@ -2131,7 +2328,14 @@ function setup(ctx) {
       clearTimeout(skippedTrackerTagsSaveTimer);
       void saveSkippedTrackerTagsPreference(skippedTrackerTags);
     }
+    if (llmSettingsSaveTimer) {
+      clearTimeout(llmSettingsSaveTimer);
+      void saveLlmParsingPreferences(speakerParsingMode, llmConnectionId, llmModel);
+    }
     skippedTrackerTagsInput.destroy();
+    speakerParsingPicker.destroy();
+    llmConnectionPicker.destroy();
+    llmModelInput.destroy();
     addNpcInput.destroy();
     addNpcButton.removeEventListener("click", onAddNpc);
     addNpcInputSlot.removeEventListener("keydown", onAddNpcKeyDown);

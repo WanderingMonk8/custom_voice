@@ -58,6 +58,11 @@ export interface LlmParsedMessage {
   segments: LlmParsedSegment[]
 }
 
+export interface LlmSpeakerAssignment {
+  quote: number
+  speakerId: string | null
+}
+
 export interface CardCastMember {
   cardId: string
   name: string
@@ -420,6 +425,43 @@ export function parseLlmSegmentation(
   return result
 }
 
+export function parseLlmSpeakerAssignments(
+  response: unknown,
+  allowedSpeakerIds: ReadonlySet<string>,
+  quoteCount: number,
+): LlmSpeakerAssignment[] {
+  let text = extractGenerationText(response).trim()
+  if (text.startsWith('```')) {
+    text = text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '')
+  }
+  const start = text.indexOf('{')
+  const end = text.lastIndexOf('}')
+  if (start < 0 || end <= start) return []
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(text.slice(start, end + 1))
+  } catch {
+    return []
+  }
+  if (!isRecord(parsed) || !Array.isArray(parsed.assignments)) return []
+  const result: LlmSpeakerAssignment[] = []
+  const seen = new Set<number>()
+  for (const item of parsed.assignments.slice(0, 500)) {
+    if (!isRecord(item) || !Number.isInteger(item.quote)) continue
+    const quote = item.quote as number
+    if (quote < 0 || quote >= quoteCount || seen.has(quote)) continue
+    const speakerId = item.speakerId === null
+      ? null
+      : typeof item.speakerId === 'string' && allowedSpeakerIds.has(item.speakerId)
+        ? item.speakerId
+        : undefined
+    if (speakerId === undefined) continue
+    seen.add(quote)
+    result.push({ quote, speakerId })
+  }
+  return result.sort((left, right) => left.quote - right.quote)
+}
+
 export function parseCardCast(
   response: unknown,
   allowedCardIds: ReadonlySet<string>,
@@ -655,6 +697,10 @@ export function stripSkippedTrackerBlocks(content: string, tagPairs: string): st
     result = stripPairedTagBlocks(result, tag)
   }
   return result
+}
+
+export function preparePlaybackContent(content: string, skippedTrackerTagPairs = ''): string {
+  return stripPlaybackMarkup(stripSkippedTrackerBlocks(content, skippedTrackerTagPairs))
 }
 
 function cleanPlaybackText(value: string): string {
@@ -1257,13 +1303,42 @@ function canContinueSpeaker(
   return true
 }
 
-export function parseRosterVoiceSegments(
+export function speakerReviewQuotes(content: string, skippedTrackerTagPairs = ''): string[] {
+  const playbackContent = preparePlaybackContent(content, skippedTrackerTagPairs)
+  return [...playbackContent.matchAll(/["“]([\s\S]*?)["”]/gu)]
+    .map(match => cleanPlaybackText(match[1] ?? ''))
+}
+
+export function needsLlmSpeakerReview(
   content: string,
   defaultSpeakerId: string | null,
   speakers: CharacterLike[],
   skippedTrackerTagPairs = '',
+): boolean {
+  const playbackContent = preparePlaybackContent(content, skippedTrackerTagPairs)
+  for (const match of playbackContent.matchAll(/["“]([\s\S]*?)["”]/gu)) {
+    if (match.index === undefined || !cleanPlaybackText(match[1] ?? '')) continue
+    const quoteEnd = match.index + match[0].length
+    const inference = inferQuotedSpeaker(
+      playbackContent.slice(0, match.index),
+      playbackContent.slice(quoteEnd),
+      match[1] ?? '',
+      speakers,
+      defaultSpeakerId,
+    )
+    if (inference.source === 'history' || inference.source === 'fallback') return true
+  }
+  return false
+}
+
+function parseRosterVoiceSegmentsInternal(
+  content: string,
+  defaultSpeakerId: string | null,
+  speakers: CharacterLike[],
+  skippedTrackerTagPairs = '',
+  quoteSpeakerOverrides?: ReadonlyMap<number, string | null>,
 ): PlaybackSegment[] {
-  const playbackContent = stripPlaybackMarkup(stripSkippedTrackerBlocks(content, skippedTrackerTagPairs))
+  const playbackContent = preparePlaybackContent(content, skippedTrackerTagPairs)
   const result: PlaybackSegment[] = []
   const quotePattern = /["“]([\s\S]*?)["”]/g
   const paragraphs = playbackParagraphs(playbackContent)
@@ -1282,8 +1357,11 @@ export function parseRosterVoiceSegments(
   let cursor = 0
   let lastConfidentSpeakerId: string | null = null
   let lastAssignedSpeakerId: string | null = null
+  let quoteIndex = 0
   for (const match of playbackContent.matchAll(quotePattern)) {
     if (match.index === undefined) continue
+    const currentQuoteIndex = quoteIndex
+    quoteIndex += 1
     while (paragraphIndex + 1 < paragraphs.length && match.index >= paragraphs[paragraphIndex].end) {
       paragraphIndex += 1
     }
@@ -1314,12 +1392,14 @@ export function parseRosterVoiceSegments(
         && openingBackfill?.paragraphIndexes.has(paragraphIndex)
         ? openingBackfill.speakerId
         : null
-      const speakerId: string | null = paragraphSpeakers[paragraphIndex]
-        ?? downstreamReplies.get(paragraphIndex)
-        ?? inferredTurnSpeakerId
-        ?? continuedSpeakerId
-        ?? openingSpeakerId
-        ?? inference.speakerId
+      const speakerId: string | null = quoteSpeakerOverrides?.has(currentQuoteIndex)
+        ? quoteSpeakerOverrides.get(currentQuoteIndex) ?? null
+        : paragraphSpeakers[paragraphIndex]
+          ?? downstreamReplies.get(paragraphIndex)
+          ?? inferredTurnSpeakerId
+          ?? continuedSpeakerId
+          ?? openingSpeakerId
+          ?? inference.speakerId
       result.push({
         text: speech,
         speakerId,
@@ -1332,6 +1412,36 @@ export function parseRosterVoiceSegments(
   const narration = cleanPlaybackText(playbackContent.slice(cursor))
   if (narration) result.push({ text: narration, speakerId: null })
   return result
+}
+
+export function parseRosterVoiceSegments(
+  content: string,
+  defaultSpeakerId: string | null,
+  speakers: CharacterLike[],
+  skippedTrackerTagPairs = '',
+): PlaybackSegment[] {
+  return parseRosterVoiceSegmentsInternal(
+    content,
+    defaultSpeakerId,
+    speakers,
+    skippedTrackerTagPairs,
+  )
+}
+
+export function parseRosterVoiceSegmentsWithAssignments(
+  content: string,
+  defaultSpeakerId: string | null,
+  speakers: CharacterLike[],
+  assignments: LlmSpeakerAssignment[],
+  skippedTrackerTagPairs = '',
+): PlaybackSegment[] {
+  return parseRosterVoiceSegmentsInternal(
+    content,
+    defaultSpeakerId,
+    speakers,
+    skippedTrackerTagPairs,
+    new Map(assignments.map(assignment => [assignment.quote, assignment.speakerId])),
+  )
 }
 
 export function detectCharacters(

@@ -12,10 +12,13 @@ import {
   hashMessageContent,
   mergeVoicePlan,
   npcSpeakerId,
+  needsLlmSpeakerReview,
   parseCardCast,
   parseLlmSegmentation,
+  parseLlmSpeakerAssignments,
   parseMultiVoiceSegments,
   parseRosterVoiceSegments,
+  parseRosterVoiceSegmentsWithAssignments,
   parseSkippedTrackerTags,
   readConfig,
   readSavedAudioHistory,
@@ -258,6 +261,34 @@ test('validates fenced LLM segmentation and rejects unknown message IDs', () => 
       { type: 'speech', text: 'Hello.', speaker: 'Alice' },
     ],
   }])
+})
+
+test('validates LLM quote assignments and applies only known speaker IDs', () => {
+  const assignments = parseLlmSpeakerAssignments({
+    content: '```json\n{"assignments":[{"quote":0,"speakerId":"grace"},{"quote":1,"speakerId":"katie"},{"quote":2,"speakerId":"unknown"}]}\n```',
+  }, new Set(['grace', 'katie']), 3)
+  assert.deepEqual(assignments, [
+    { quote: 0, speakerId: 'grace' },
+    { quote: 1, speakerId: 'katie' },
+  ])
+  assert.deepEqual(
+    parseRosterVoiceSegmentsWithAssignments(
+      '"First."\n\n"Second."',
+      'grace',
+      [{ id: 'grace', name: 'Grace' }, { id: 'katie', name: 'Katie' }],
+      assignments,
+    ).filter(segment => segment.speakerId !== null),
+    [
+      { text: 'First.', speakerId: 'grace' },
+      { text: 'Second.', speakerId: 'katie' },
+    ],
+  )
+})
+
+test('requests LLM review only for dialogue requiring historical or fallback attribution', () => {
+  const speakers = [{ id: 'grace', name: 'Grace' }, { id: 'katie', name: 'Katie' }]
+  assert.equal(needsLlmSpeakerReview('Grace said, "Clearly attributed."', 'grace', speakers), false)
+  assert.equal(needsLlmSpeakerReview('Grace watched the door.\n\n"Who is there?"', 'grace', speakers), true)
 })
 
 test('message content hashes change when playback content changes', () => {
