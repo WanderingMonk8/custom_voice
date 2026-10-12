@@ -451,6 +451,57 @@ export function addScannedFirstNameAliases<T extends CharacterLike>(characters: 
   })
 }
 
+function namesDescribeSameCardCharacter(cardName: string, scannedName: string): boolean {
+  const cardAliases = speakerAliases(cardName)
+  const scannedAliases = speakerAliases(scannedName)
+  const cardKeys = new Set(cardAliases.map(alias => alias.toLowerCase()))
+  const scannedKeys = new Set(scannedAliases.map(alias => alias.toLowerCase()))
+  if (cardAliases.some(alias => scannedKeys.has(alias.toLowerCase()))) return true
+  const cardFirst = firstNameAlias(cardName)?.toLowerCase()
+  const scannedFirst = firstNameAlias(scannedName)?.toLowerCase()
+  return !!(
+    (cardFirst && scannedKeys.has(cardFirst))
+    || (scannedFirst && cardKeys.has(scannedFirst))
+  )
+}
+
+function combineSpeakerNames(left: string, right: string): string {
+  const aliases = [...speakerAliases(left), ...speakerAliases(right)]
+  const unique = aliases.filter((alias, index) => (
+    aliases.findIndex(candidate => candidate.toLowerCase() === alias.toLowerCase()) === index
+  ))
+  unique.sort((a, b) => b.split(/\s+/u).length - a.split(/\s+/u).length)
+  const combined = unique.join(' / ')
+  return combined.length <= 128 ? combined : left
+}
+
+/** Consolidate a card's first-name and full-name variants into its stable card ID. */
+export function mergeScannedCardCast(
+  cards: CharacterLike[],
+  cast: CardCastMember[],
+): CharacterLike[] {
+  const cardsById = new Map(cards.map(card => [card.id, card] as const))
+  const cardsByName = new Map<string, CharacterLike>()
+  for (const card of cards) {
+    for (const alias of speakerAliases(card.name)) cardsByName.set(alias.toLowerCase(), card)
+  }
+  const detected = new Map(cards.map(card => [card.id, { ...card }] as const))
+  for (const member of cast) {
+    const exactCard = cardsByName.get(normalizeSpeakerName(member.name).toLowerCase())
+    const sourceCard = cardsById.get(member.cardId)
+    const matchingCard = exactCard
+      ?? (sourceCard && namesDescribeSameCardCharacter(sourceCard.name, member.name) ? sourceCard : null)
+    const id = matchingCard?.id ?? npcSpeakerId(member.name)
+    const existing = detected.get(id)
+    if (!existing) {
+      detected.set(id, { id, name: member.name })
+    } else if (matchingCard) {
+      detected.set(id, { ...existing, name: combineSpeakerNames(existing.name, member.name) })
+    }
+  }
+  return addScannedFirstNameAliases([...detected.values()])
+}
+
 export function npcSpeakerId(name: string): string {
   return `npc:${normalizeSpeakerName(name).toLowerCase()}`
 }

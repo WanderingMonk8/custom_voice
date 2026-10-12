@@ -205,6 +205,44 @@ function addScannedFirstNameAliases(characters) {
     return name.length <= 128 ? { ...character, name } : character;
   });
 }
+function namesDescribeSameCardCharacter(cardName, scannedName) {
+  const cardAliases = speakerAliases(cardName);
+  const scannedAliases = speakerAliases(scannedName);
+  const cardKeys = new Set(cardAliases.map((alias) => alias.toLowerCase()));
+  const scannedKeys = new Set(scannedAliases.map((alias) => alias.toLowerCase()));
+  if (cardAliases.some((alias) => scannedKeys.has(alias.toLowerCase()))) return true;
+  const cardFirst = firstNameAlias(cardName)?.toLowerCase();
+  const scannedFirst = firstNameAlias(scannedName)?.toLowerCase();
+  return !!(cardFirst && scannedKeys.has(cardFirst) || scannedFirst && cardKeys.has(scannedFirst));
+}
+function combineSpeakerNames(left, right) {
+  const aliases = [...speakerAliases(left), ...speakerAliases(right)];
+  const unique = aliases.filter((alias, index) => aliases.findIndex((candidate) => candidate.toLowerCase() === alias.toLowerCase()) === index);
+  unique.sort((a, b) => b.split(/\s+/u).length - a.split(/\s+/u).length);
+  const combined = unique.join(" / ");
+  return combined.length <= 128 ? combined : left;
+}
+function mergeScannedCardCast(cards, cast) {
+  const cardsById = new Map(cards.map((card) => [card.id, card]));
+  const cardsByName = /* @__PURE__ */ new Map();
+  for (const card of cards) {
+    for (const alias of speakerAliases(card.name)) cardsByName.set(alias.toLowerCase(), card);
+  }
+  const detected = new Map(cards.map((card) => [card.id, { ...card }]));
+  for (const member of cast) {
+    const exactCard = cardsByName.get(normalizeSpeakerName(member.name).toLowerCase());
+    const sourceCard = cardsById.get(member.cardId);
+    const matchingCard = exactCard ?? (sourceCard && namesDescribeSameCardCharacter(sourceCard.name, member.name) ? sourceCard : null);
+    const id = matchingCard?.id ?? npcSpeakerId(member.name);
+    const existing = detected.get(id);
+    if (!existing) {
+      detected.set(id, { id, name: member.name });
+    } else if (matchingCard) {
+      detected.set(id, { ...existing, name: combineSpeakerNames(existing.name, member.name) });
+    }
+  }
+  return addScannedFirstNameAliases([...detected.values()]);
+}
 function npcSpeakerId(name) {
   return `npc:${normalizeSpeakerName(name).toLowerCase()}`;
 }
@@ -271,7 +309,7 @@ async function buildState(chat, userId) {
   const detected = config.detectedCharacters.flatMap(({ id, name, messageCount }) => {
     const character = candidatesById.get(id);
     const savedName = name || (id.startsWith("npc:") ? id.slice(4) : "");
-    return character ? [{ ...character, messageCount }] : savedName ? [{ id, name: savedName, messageCount }] : [];
+    return character ? [{ ...character, name: savedName || character.name, messageCount }] : savedName ? [{ id, name: savedName, messageCount }] : [];
   });
   return {
     id: chat.id,
@@ -381,14 +419,10 @@ async function scanCardCast(cards, userId) {
     if (cast.length === 0) {
       return { detected: addScannedFirstNameAliases(base), usedFallback: true };
     }
-    const byName = new Map(cards.map((card) => [normalizeSpeakerName(card.name).toLowerCase(), card]));
-    const detected = new Map(base.map((character) => [character.id, character]));
-    for (const member of cast) {
-      const card = byName.get(normalizeSpeakerName(member.name).toLowerCase());
-      const id = card?.id ?? npcSpeakerId(member.name);
-      if (!detected.has(id)) detected.set(id, { id, name: member.name, messageCount: 0 });
-    }
-    return { detected: addScannedFirstNameAliases([...detected.values()]), usedFallback: false };
+    return {
+      detected: mergeScannedCardCast(base, cast).map((character) => ({ ...character, messageCount: 0 })),
+      usedFallback: false
+    };
   } catch (error) {
     spindle.log.warn(`Chat Voice card parser failed: ${error instanceof Error ? error.message : String(error)}`);
     return { detected: addScannedFirstNameAliases(base), usedFallback: true };
@@ -424,13 +458,29 @@ function queueScan(payload, userId, frontendSessionId) {
     const cardResult = await scanCardCast(candidates, userId);
     const config = readConfig(chat.metadata ?? {}, candidates.map((character) => character.id));
     const detected = new Map(cardResult.detected.map((character) => [character.id, character]));
+    const detectedByAlias = /* @__PURE__ */ new Map();
+    for (const character of detected.values()) {
+      for (const alias of speakerAliases(character.name)) detectedByAlias.set(alias.toLowerCase(), character.id);
+    }
+    const characterVoices = { ...config.characterVoices };
     for (const character of config.detectedCharacters) {
-      if (character.id.startsWith("npc:") && !detected.has(character.id)) detected.set(character.id, character);
+      if (!character.id.startsWith("npc:") || detected.has(character.id)) continue;
+      const replacementId = speakerAliases(character.name).map((alias) => detectedByAlias.get(alias.toLowerCase())).find((id) => !!id);
+      if (replacementId) {
+        if (!characterVoices[replacementId] && characterVoices[character.id]) {
+          characterVoices[replacementId] = characterVoices[character.id];
+        }
+        delete characterVoices[character.id];
+      } else {
+        detected.set(character.id, character);
+        for (const alias of speakerAliases(character.name)) detectedByAlias.set(alias.toLowerCase(), character.id);
+      }
     }
     const nextConfig = {
       ...config,
       version: 5,
       messageLimit,
+      characterVoices,
       detectedCharacters: [...detected.values()],
       parsedMessages: {}
     };
