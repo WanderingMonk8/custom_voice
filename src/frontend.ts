@@ -810,9 +810,10 @@ export function setup(ctx: SpindleFrontendContext) {
     onChange: () => markChanged(),
   })
 
-  const skippedTrackerTagsInput = ctx.components.mountTextInput(skippedTagsField.slot, {
+  const skippedTrackerTagsInput = ctx.components.mountTextArea(skippedTagsField.slot, {
     value: '',
     placeholder: '<tracker></tracker>, <status></status>',
+    rows: 3,
     ariaLabel: 'Tracker tag pairs to skip globally',
     onChange: () => scheduleSkippedTrackerTagsSave(),
   })
