@@ -656,7 +656,20 @@ export function setup(ctx: SpindleFrontendContext) {
     .chat-voice-status { min-height:18px; }
     .chat-voice-status[data-state="saved"] { color:var(--lumiverse-success, #65b97a); }
     .chat-voice-status[data-state="error"] { color:var(--lumiverse-danger, #ef6464); }
-    .chat-voice-advanced { display:flex; flex-direction:column; gap:12px; padding-top:8px; }
+    .chat-voice-advanced-section { border-top:1px solid var(--lumiverse-border); padding-top:12px; }
+    .chat-voice-advanced-summary {
+      display:flex; align-items:center; justify-content:space-between; cursor:pointer;
+      font-weight:700; list-style:none; user-select:none;
+    }
+    .chat-voice-advanced-summary::-webkit-details-marker { display:none; }
+    .chat-voice-advanced-summary::after { content:'›'; color:var(--lumiverse-text-muted); transform:rotate(90deg); }
+    .chat-voice-advanced-section[open] .chat-voice-advanced-summary::after { transform:rotate(-90deg); }
+    .chat-voice-advanced { display:flex; flex-direction:column; gap:12px; padding-top:16px; }
+    .chat-voice-number-input {
+      box-sizing:border-box; width:100%; min-height:36px; padding:7px 10px;
+      border:1px solid var(--lumiverse-border); border-radius:var(--lumiverse-radius);
+      background:var(--lumiverse-bg-secondary, transparent); color:var(--lumiverse-text-primary); font:inherit;
+    }
   `)
 
   const tab = ctx.ui.registerDrawerTab({
@@ -756,7 +769,14 @@ export function setup(ctx: SpindleFrontendContext) {
   status.className = 'chat-voice-status'
   status.setAttribute('role', 'status')
   status.setAttribute('aria-live', 'polite')
-  const advancedHost = document.createElement('div')
+  const advancedSection = document.createElement('details')
+  advancedSection.className = 'chat-voice-advanced-section'
+  const advancedSummary = document.createElement('summary')
+  advancedSummary.className = 'chat-voice-advanced-summary'
+  advancedSummary.textContent = 'Advanced settings'
+  const advancedBody = document.createElement('div')
+  advancedBody.className = 'chat-voice-advanced'
+  advancedSection.append(advancedSummary, advancedBody)
 
   panel.append(
     context,
@@ -773,21 +793,16 @@ export function setup(ctx: SpindleFrontendContext) {
     characterTitle,
     characterList,
     status,
-    advancedHost,
+    advancedSection,
   )
   tab.root.appendChild(panel)
 
-  const advancedSection = ctx.components.mountCollapsibleSection(advancedHost, {
-    title: 'Advanced settings',
-    defaultExpanded: false,
-  })
-  advancedSection.body.classList.add('chat-voice-advanced')
   const playbackBufferField = createField('Playback buffer segments')
   const concurrentGenerationField = createField('Concurrent generations')
   const advancedHint = document.createElement('div')
   advancedHint.className = 'chat-voice-hint'
   advancedHint.textContent = 'Larger buffers can reduce pauses but delay playback. Higher concurrency is faster but increases API load and rate-limit risk.'
-  advancedSection.body.append(
+  advancedBody.append(
     playbackBufferField.field,
     concurrentGenerationField.field,
     advancedHint,
@@ -993,23 +1008,35 @@ export function setup(ctx: SpindleFrontendContext) {
     onChange: value => onLlmModelChanged(value),
   })
 
-  const playbackBufferInput = ctx.components.mountNumberStepper(playbackBufferField.slot, {
-    value: DEFAULT_PLAYBACK_BUFFER_SEGMENTS,
-    min: 1,
-    max: MAX_PLAYBACK_BUFFER_SEGMENTS,
-    step: 1,
-    integer: true,
-    onChange: value => onPlaybackBufferChanged(value),
-  })
+  function createNumberInput(value: number, maximum: number, ariaLabel: string): HTMLInputElement {
+    const input = document.createElement('input')
+    input.className = 'chat-voice-number-input'
+    input.type = 'number'
+    input.value = String(value)
+    input.min = '1'
+    input.max = String(maximum)
+    input.step = '1'
+    input.inputMode = 'numeric'
+    input.setAttribute('aria-label', ariaLabel)
+    return input
+  }
 
-  const concurrentGenerationInput = ctx.components.mountNumberStepper(concurrentGenerationField.slot, {
-    value: DEFAULT_CONCURRENT_GENERATIONS,
-    min: 1,
-    max: MAX_CONCURRENT_GENERATIONS,
-    step: 1,
-    integer: true,
-    onChange: value => onConcurrentGenerationsChanged(value),
-  })
+  const playbackBufferInput = createNumberInput(
+    DEFAULT_PLAYBACK_BUFFER_SEGMENTS,
+    MAX_PLAYBACK_BUFFER_SEGMENTS,
+    'Playback buffer segments',
+  )
+  const concurrentGenerationInput = createNumberInput(
+    DEFAULT_CONCURRENT_GENERATIONS,
+    MAX_CONCURRENT_GENERATIONS,
+    'Concurrent generations',
+  )
+  playbackBufferField.slot.appendChild(playbackBufferInput)
+  concurrentGenerationField.slot.appendChild(concurrentGenerationInput)
+  const onPlaybackBufferInput = () => onPlaybackBufferChanged(playbackBufferInput.valueAsNumber)
+  const onConcurrentGenerationInput = () => onConcurrentGenerationsChanged(concurrentGenerationInput.valueAsNumber)
+  playbackBufferInput.addEventListener('change', onPlaybackBufferInput)
+  concurrentGenerationInput.addEventListener('change', onConcurrentGenerationInput)
 
   const addNpcInput = ctx.components.mountTextInput(addNpcInputSlot, {
     value: '', placeholder: 'NPC name / aliases', ariaLabel: 'NPC name and aliases to add', disabled: true,
@@ -1815,8 +1842,8 @@ export function setup(ctx: SpindleFrontendContext) {
       if (!savingAdvancedSettings && !advancedSettingsSaveTimer) {
         playbackBufferSegments = preferences.playbackBufferSegments
         concurrentGenerationLimit = preferences.concurrentGenerations
-        playbackBufferInput.update({ value: playbackBufferSegments })
-        concurrentGenerationInput.update({ value: concurrentGenerationLimit })
+        playbackBufferInput.value = String(playbackBufferSegments)
+        concurrentGenerationInput.value = String(concurrentGenerationLimit)
       }
       lumiverseConnectionId = connections.some(connection => connection.id === preferences.connectionId)
         ? preferences.connectionId
@@ -1919,7 +1946,7 @@ export function setup(ctx: SpindleFrontendContext) {
       DEFAULT_PLAYBACK_BUFFER_SEGMENTS,
       MAX_PLAYBACK_BUFFER_SEGMENTS,
     )
-    playbackBufferInput.update({ value: playbackBufferSegments })
+    playbackBufferInput.value = String(playbackBufferSegments)
     scheduleAdvancedSettingsSave()
   }
 
@@ -1929,7 +1956,7 @@ export function setup(ctx: SpindleFrontendContext) {
       DEFAULT_CONCURRENT_GENERATIONS,
       MAX_CONCURRENT_GENERATIONS,
     )
-    concurrentGenerationInput.update({ value: concurrentGenerationLimit })
+    concurrentGenerationInput.value = String(concurrentGenerationLimit)
     drainSynthesisQueue()
     scheduleAdvancedSettingsSave()
   }
@@ -2239,9 +2266,8 @@ export function setup(ctx: SpindleFrontendContext) {
     speakerParsingPicker.destroy()
     llmConnectionPicker.destroy()
     llmModelInput.destroy()
-    playbackBufferInput.destroy()
-    concurrentGenerationInput.destroy()
-    advancedSection.destroy()
+    playbackBufferInput.removeEventListener('change', onPlaybackBufferInput)
+    concurrentGenerationInput.removeEventListener('change', onConcurrentGenerationInput)
     addNpcInput.destroy()
     addNpcButton.removeEventListener('click', onAddNpc)
     addNpcInputSlot.removeEventListener('keydown', onAddNpcKeyDown)

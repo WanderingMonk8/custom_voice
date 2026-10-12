@@ -1085,7 +1085,20 @@ function setup(ctx) {
     .chat-voice-status { min-height:18px; }
     .chat-voice-status[data-state="saved"] { color:var(--lumiverse-success, #65b97a); }
     .chat-voice-status[data-state="error"] { color:var(--lumiverse-danger, #ef6464); }
-    .chat-voice-advanced { display:flex; flex-direction:column; gap:12px; padding-top:8px; }
+    .chat-voice-advanced-section { border-top:1px solid var(--lumiverse-border); padding-top:12px; }
+    .chat-voice-advanced-summary {
+      display:flex; align-items:center; justify-content:space-between; cursor:pointer;
+      font-weight:700; list-style:none; user-select:none;
+    }
+    .chat-voice-advanced-summary::-webkit-details-marker { display:none; }
+    .chat-voice-advanced-summary::after { content:'\u203A'; color:var(--lumiverse-text-muted); transform:rotate(90deg); }
+    .chat-voice-advanced-section[open] .chat-voice-advanced-summary::after { transform:rotate(-90deg); }
+    .chat-voice-advanced { display:flex; flex-direction:column; gap:12px; padding-top:16px; }
+    .chat-voice-number-input {
+      box-sizing:border-box; width:100%; min-height:36px; padding:7px 10px;
+      border:1px solid var(--lumiverse-border); border-radius:var(--lumiverse-radius);
+      background:var(--lumiverse-bg-secondary, transparent); color:var(--lumiverse-text-primary); font:inherit;
+    }
   `);
   const tab = ctx.ui.registerDrawerTab({
     id: "chat-voice",
@@ -1181,7 +1194,14 @@ function setup(ctx) {
   status.className = "chat-voice-status";
   status.setAttribute("role", "status");
   status.setAttribute("aria-live", "polite");
-  const advancedHost = document.createElement("div");
+  const advancedSection = document.createElement("details");
+  advancedSection.className = "chat-voice-advanced-section";
+  const advancedSummary = document.createElement("summary");
+  advancedSummary.className = "chat-voice-advanced-summary";
+  advancedSummary.textContent = "Advanced settings";
+  const advancedBody = document.createElement("div");
+  advancedBody.className = "chat-voice-advanced";
+  advancedSection.append(advancedSummary, advancedBody);
   panel.append(
     context,
     connectionField.field,
@@ -1197,20 +1217,15 @@ function setup(ctx) {
     characterTitle,
     characterList,
     status,
-    advancedHost
+    advancedSection
   );
   tab.root.appendChild(panel);
-  const advancedSection = ctx.components.mountCollapsibleSection(advancedHost, {
-    title: "Advanced settings",
-    defaultExpanded: false
-  });
-  advancedSection.body.classList.add("chat-voice-advanced");
   const playbackBufferField = createField("Playback buffer segments");
   const concurrentGenerationField = createField("Concurrent generations");
   const advancedHint = document.createElement("div");
   advancedHint.className = "chat-voice-hint";
   advancedHint.textContent = "Larger buffers can reduce pauses but delay playback. Higher concurrency is faster but increases API load and rate-limit risk.";
-  advancedSection.body.append(
+  advancedBody.append(
     playbackBufferField.field,
     concurrentGenerationField.field,
     advancedHint
@@ -1368,22 +1383,34 @@ function setup(ctx) {
     disabled: true,
     onChange: (value) => onLlmModelChanged(value)
   });
-  const playbackBufferInput = ctx.components.mountNumberStepper(playbackBufferField.slot, {
-    value: DEFAULT_PLAYBACK_BUFFER_SEGMENTS,
-    min: 1,
-    max: MAX_PLAYBACK_BUFFER_SEGMENTS,
-    step: 1,
-    integer: true,
-    onChange: (value) => onPlaybackBufferChanged(value)
-  });
-  const concurrentGenerationInput = ctx.components.mountNumberStepper(concurrentGenerationField.slot, {
-    value: DEFAULT_CONCURRENT_GENERATIONS,
-    min: 1,
-    max: MAX_CONCURRENT_GENERATIONS,
-    step: 1,
-    integer: true,
-    onChange: (value) => onConcurrentGenerationsChanged(value)
-  });
+  function createNumberInput(value, maximum, ariaLabel) {
+    const input = document.createElement("input");
+    input.className = "chat-voice-number-input";
+    input.type = "number";
+    input.value = String(value);
+    input.min = "1";
+    input.max = String(maximum);
+    input.step = "1";
+    input.inputMode = "numeric";
+    input.setAttribute("aria-label", ariaLabel);
+    return input;
+  }
+  const playbackBufferInput = createNumberInput(
+    DEFAULT_PLAYBACK_BUFFER_SEGMENTS,
+    MAX_PLAYBACK_BUFFER_SEGMENTS,
+    "Playback buffer segments"
+  );
+  const concurrentGenerationInput = createNumberInput(
+    DEFAULT_CONCURRENT_GENERATIONS,
+    MAX_CONCURRENT_GENERATIONS,
+    "Concurrent generations"
+  );
+  playbackBufferField.slot.appendChild(playbackBufferInput);
+  concurrentGenerationField.slot.appendChild(concurrentGenerationInput);
+  const onPlaybackBufferInput = () => onPlaybackBufferChanged(playbackBufferInput.valueAsNumber);
+  const onConcurrentGenerationInput = () => onConcurrentGenerationsChanged(concurrentGenerationInput.valueAsNumber);
+  playbackBufferInput.addEventListener("change", onPlaybackBufferInput);
+  concurrentGenerationInput.addEventListener("change", onConcurrentGenerationInput);
   const addNpcInput = ctx.components.mountTextInput(addNpcInputSlot, {
     value: "",
     placeholder: "NPC name / aliases",
@@ -2110,8 +2137,8 @@ function setup(ctx) {
       if (!savingAdvancedSettings && !advancedSettingsSaveTimer) {
         playbackBufferSegments = preferences.playbackBufferSegments;
         concurrentGenerationLimit = preferences.concurrentGenerations;
-        playbackBufferInput.update({ value: playbackBufferSegments });
-        concurrentGenerationInput.update({ value: concurrentGenerationLimit });
+        playbackBufferInput.value = String(playbackBufferSegments);
+        concurrentGenerationInput.value = String(concurrentGenerationLimit);
       }
       lumiverseConnectionId = connections.some((connection) => connection.id === preferences.connectionId) ? preferences.connectionId : connections.find((connection) => connection.is_default)?.id ?? "";
       const selectedConnectionId = activeChat?.connectionId || lumiverseConnectionId;
@@ -2199,7 +2226,7 @@ function setup(ctx) {
       DEFAULT_PLAYBACK_BUFFER_SEGMENTS,
       MAX_PLAYBACK_BUFFER_SEGMENTS
     );
-    playbackBufferInput.update({ value: playbackBufferSegments });
+    playbackBufferInput.value = String(playbackBufferSegments);
     scheduleAdvancedSettingsSave();
   }
   function onConcurrentGenerationsChanged(value) {
@@ -2208,7 +2235,7 @@ function setup(ctx) {
       DEFAULT_CONCURRENT_GENERATIONS,
       MAX_CONCURRENT_GENERATIONS
     );
-    concurrentGenerationInput.update({ value: concurrentGenerationLimit });
+    concurrentGenerationInput.value = String(concurrentGenerationLimit);
     drainSynthesisQueue();
     scheduleAdvancedSettingsSave();
   }
@@ -2494,9 +2521,8 @@ function setup(ctx) {
     speakerParsingPicker.destroy();
     llmConnectionPicker.destroy();
     llmModelInput.destroy();
-    playbackBufferInput.destroy();
-    concurrentGenerationInput.destroy();
-    advancedSection.destroy();
+    playbackBufferInput.removeEventListener("change", onPlaybackBufferInput);
+    concurrentGenerationInput.removeEventListener("change", onConcurrentGenerationInput);
     addNpcInput.destroy();
     addNpcButton.removeEventListener("click", onAddNpc);
     addNpcInputSlot.removeEventListener("keydown", onAddNpcKeyDown);
