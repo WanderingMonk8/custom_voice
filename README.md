@@ -19,7 +19,7 @@ A [Lumiverse Spindle](https://docs.lumiverse.chat/) extension that detects chara
 - Routes Lumiverse's native message TTS button through ordered multi-voice playback.
 - Overrides the matching native context-menu action instead of adding duplicate playback controls.
 - Merges adjacent same-voice passages within each paragraph, splits multi-paragraph passages into smaller requests, and uses globally configurable playback buffering and generation concurrency to avoid gaps and API bursts.
-- Paces request starts and automatically pauses and resumes unfinished generation when a TTS provider responds with HTTP 429. It honors `Retry-After`, keeps completed segments, and allows up to one minute of cumulative rate-limit waiting per playback.
+- Paces request starts and automatically pauses and resumes unfinished generation when a TTS provider responds with HTTP 429. It honors `Retry-After`, keeps completed segments, and uses a configurable cumulative rate-limit wait budget.
 - Uses Lumiverse's selected TTS connection, falling back to the profile marked as the default, when a chat has no saved connection.
 - Provides a global, opt-in **Save generated audio** setting. It is disabled by default to avoid consuming storage, and retains at most 50 extension recordings by default (user configurable).
 - When enabled, saves the exact synthesized custom-voice segments as a native Lumiverse audio attachment for the active message swipe, with a browser-generated WAV fallback when the server cannot mux their source formats.
@@ -62,7 +62,7 @@ The compiled frontend and backend bundles are committed under `dist/`, so users 
 8. Optionally enable **Save generated audio** to attach completed recordings to messages across every chat. This global setting is off by default. Set **Maximum saved recordings** to control global retention (default: 50); the oldest extension-created attachments are removed first.
 9. Use Lumiverse's normal **Play with TTS** button or context-menu action to play the message with all configured voices.
 
-The collapsed **Advanced settings** section at the bottom of the drawer controls how many synthesized segments are buffered before playback starts (default: 2) and how many segment generations may run concurrently (default: 2). Higher values can reduce pauses but increase startup delay or API rate-limit pressure.
+The collapsed **Advanced settings** section at the bottom of the drawer controls how many synthesized segments are buffered before playback starts (default: 2), how many segment generations may run concurrently (default: 2), and the cumulative rate-limit wait budget in seconds (default: 60, maximum: 3600). Higher buffer and concurrency values can reduce pauses but increase startup delay or API rate-limit pressure; a longer wait budget lets interrupted generation keep retrying for longer.
 
 The card scan result, manually managed NPC roster, and all voice settings save automatically for that chat. Switching chats loads the previously saved cast and settings without scanning or calling the language model again. Click **Scan** after changing the card. Manual NPCs remain in the roster across later scans until you delete them. Clear a voice field to use the TTS connection's default/fallback voice; clear the connection to disable every custom voice managed by the extension for that chat.
 

@@ -724,11 +724,12 @@ var ConnectionVoiceGate = class {
   }
 };
 var MIN_SYNTHESIS_START_INTERVAL_MS = 1250;
-var MAX_CUMULATIVE_RATE_LIMIT_WAIT_MS = 6e4;
 var DEFAULT_PLAYBACK_BUFFER_SEGMENTS = 2;
 var DEFAULT_CONCURRENT_GENERATIONS = 2;
+var DEFAULT_RATE_LIMIT_WAIT_SECONDS = 60;
 var MAX_PLAYBACK_BUFFER_SEGMENTS = 20;
 var MAX_CONCURRENT_GENERATIONS = 10;
+var MAX_RATE_LIMIT_WAIT_SECONDS = 3600;
 function clampIntegerSetting(value, fallback, maximum) {
   const numeric = typeof value === "number" ? value : Number(value);
   if (!Number.isFinite(numeric)) return fallback;
@@ -775,7 +776,8 @@ async function loadPlaybackPreferences() {
     llmConnectionId: "",
     llmModel: "",
     playbackBufferSegments: DEFAULT_PLAYBACK_BUFFER_SEGMENTS,
-    concurrentGenerations: DEFAULT_CONCURRENT_GENERATIONS
+    concurrentGenerations: DEFAULT_CONCURRENT_GENERATIONS,
+    rateLimitWaitSeconds: DEFAULT_RATE_LIMIT_WAIT_SECONDS
   };
   const row = await response.json();
   const speed = typeof row.value?.ttsSpeed === "number" ? row.value.ttsSpeed : 1;
@@ -800,6 +802,11 @@ async function loadPlaybackPreferences() {
       row.value?.chatVoiceConcurrentGenerations,
       DEFAULT_CONCURRENT_GENERATIONS,
       MAX_CONCURRENT_GENERATIONS
+    ),
+    rateLimitWaitSeconds: clampIntegerSetting(
+      row.value?.chatVoiceRateLimitWaitSeconds,
+      DEFAULT_RATE_LIMIT_WAIT_SECONDS,
+      MAX_RATE_LIMIT_WAIT_SECONDS
     )
   };
 }
@@ -850,7 +857,7 @@ function saveLlmParsingPreferences(mode, connectionId, model) {
     chatVoiceLlmModel: model.trim().slice(0, 256)
   }));
 }
-function saveAdvancedPlaybackPreferences(bufferSegments, concurrentGenerations) {
+function saveAdvancedPlaybackPreferences(bufferSegments, concurrentGenerations, rateLimitWaitSeconds) {
   return updateVoiceSettings((current) => ({
     ...current,
     chatVoicePlaybackBufferSegments: clampIntegerSetting(
@@ -862,6 +869,11 @@ function saveAdvancedPlaybackPreferences(bufferSegments, concurrentGenerations) 
       concurrentGenerations,
       DEFAULT_CONCURRENT_GENERATIONS,
       MAX_CONCURRENT_GENERATIONS
+    ),
+    chatVoiceRateLimitWaitSeconds: clampIntegerSetting(
+      rateLimitWaitSeconds,
+      DEFAULT_RATE_LIMIT_WAIT_SECONDS,
+      MAX_RATE_LIMIT_WAIT_SECONDS
     )
   }));
 }
@@ -966,9 +978,9 @@ async function synthesizeVoiceSegment(connectionId, text, voice, speed, signal, 
       const currentBlockEnd = Math.max(now, rateLimitBudget.blockedUntil);
       const desiredBlockEnd = now + requestedDelay;
       const requestedExtension = Math.max(0, desiredBlockEnd - currentBlockEnd);
-      const remainingBudget = MAX_CUMULATIVE_RATE_LIMIT_WAIT_MS - rateLimitBudget.cumulativeWaitMs;
+      const remainingBudget = rateLimitBudget.maximumWaitMs - rateLimitBudget.cumulativeWaitMs;
       if (remainingBudget <= 0 && requestedExtension > 0) {
-        throw new Error("TTS rate limiting continued for one minute. Try playback again in a moment.");
+        throw new Error("TTS rate limiting reached the configured wait limit. Try playback again in a moment.");
       }
       const addedWait = Math.min(requestedExtension, Math.max(0, remainingBudget));
       rateLimitBudget.cumulativeWaitMs += addedWait;
@@ -1236,12 +1248,14 @@ function setup(ctx) {
   tab.root.appendChild(panel);
   const playbackBufferField = createField("Playback buffer segments");
   const concurrentGenerationField = createField("Concurrent generations");
+  const rateLimitWaitField = createField("Rate-limit wait budget (seconds)");
   const advancedHint = document.createElement("div");
   advancedHint.className = "chat-voice-hint";
-  advancedHint.textContent = "Larger buffers can reduce pauses but delay playback. Higher concurrency is faster but increases API load and rate-limit risk.";
+  advancedHint.textContent = "Larger buffers can reduce pauses but delay playback. Higher concurrency increases API load. The wait budget controls how long a playback may cumulatively pause and retry after rate limits.";
   advancedBody.append(
     playbackBufferField.field,
     concurrentGenerationField.field,
+    rateLimitWaitField.field,
     advancedHint
   );
   let applyingState = false;
@@ -1264,6 +1278,7 @@ function setup(ctx) {
   let savingLlmSettings = false;
   let playbackBufferSegments = DEFAULT_PLAYBACK_BUFFER_SEGMENTS;
   let concurrentGenerationLimit = DEFAULT_CONCURRENT_GENERATIONS;
+  let rateLimitWaitSeconds = DEFAULT_RATE_LIMIT_WAIT_SECONDS;
   let advancedSettingsSaveTimer = null;
   let savingAdvancedSettings = false;
   let saveTimer = null;
@@ -1419,12 +1434,20 @@ function setup(ctx) {
     MAX_CONCURRENT_GENERATIONS,
     "Concurrent generations"
   );
+  const rateLimitWaitInput = createNumberInput(
+    DEFAULT_RATE_LIMIT_WAIT_SECONDS,
+    MAX_RATE_LIMIT_WAIT_SECONDS,
+    "Rate-limit wait budget in seconds"
+  );
   playbackBufferField.slot.appendChild(playbackBufferInput);
   concurrentGenerationField.slot.appendChild(concurrentGenerationInput);
+  rateLimitWaitField.slot.appendChild(rateLimitWaitInput);
   const onPlaybackBufferInput = () => onPlaybackBufferChanged(playbackBufferInput.valueAsNumber);
   const onConcurrentGenerationInput = () => onConcurrentGenerationsChanged(concurrentGenerationInput.valueAsNumber);
+  const onRateLimitWaitInput = () => onRateLimitWaitChanged(rateLimitWaitInput.valueAsNumber);
   playbackBufferInput.addEventListener("change", onPlaybackBufferInput);
   concurrentGenerationInput.addEventListener("change", onConcurrentGenerationInput);
+  rateLimitWaitInput.addEventListener("change", onRateLimitWaitInput);
   const addNpcInput = ctx.components.mountTextInput(addNpcInputSlot, {
     value: "",
     placeholder: "NPC name / aliases",
@@ -1716,9 +1739,11 @@ function setup(ctx) {
     if (advancedSettingsSaveTimer || savingAdvancedSettings) {
       preferences.playbackBufferSegments = playbackBufferSegments;
       preferences.concurrentGenerations = concurrentGenerationLimit;
+      preferences.rateLimitWaitSeconds = rateLimitWaitSeconds;
     } else {
       playbackBufferSegments = preferences.playbackBufferSegments;
       concurrentGenerationLimit = preferences.concurrentGenerations;
+      rateLimitWaitSeconds = preferences.rateLimitWaitSeconds;
     }
     const connectionId = config.connectionId || (connections.some((connection) => connection.id === preferences.connectionId) ? preferences.connectionId : connections.find((connection) => connection.is_default)?.id ?? lumiverseConnectionId);
     if (!connectionId) {
@@ -1791,7 +1816,8 @@ function setup(ctx) {
       const rateLimitBudget = {
         blockedUntil: 0,
         cumulativeWaitMs: 0,
-        consecutiveResponses: 0
+        consecutiveResponses: 0,
+        maximumWaitMs: preferences.rateLimitWaitSeconds * 1e3
       };
       playback.synthesisController = synthesisController;
       backgroundSynthesisControllers.add(synthesisController);
@@ -1813,7 +1839,7 @@ function setup(ctx) {
             (delayMs, cumulativeWaitMs) => {
               if (ctx.getActiveChat().chatId === playbackChat.id && (!activePlayback || activePlayback === playback)) {
                 setStatus(
-                  `Rate limited; resuming in ${Math.max(1, Math.ceil(delayMs / 1e3))}s\u2026 (${Math.ceil(cumulativeWaitMs / 1e3)}s of 60s wait budget)`
+                  `Rate limited; resuming in ${Math.max(1, Math.ceil(delayMs / 1e3))}s\u2026 (${Math.ceil(cumulativeWaitMs / 1e3)}s of ${preferences.rateLimitWaitSeconds}s wait budget)`
                 );
               }
             }
@@ -2159,8 +2185,10 @@ function setup(ctx) {
       if (!savingAdvancedSettings && !advancedSettingsSaveTimer) {
         playbackBufferSegments = preferences.playbackBufferSegments;
         concurrentGenerationLimit = preferences.concurrentGenerations;
+        rateLimitWaitSeconds = preferences.rateLimitWaitSeconds;
         playbackBufferInput.value = String(playbackBufferSegments);
         concurrentGenerationInput.value = String(concurrentGenerationLimit);
+        rateLimitWaitInput.value = String(rateLimitWaitSeconds);
       }
       lumiverseConnectionId = connections.some((connection) => connection.id === preferences.connectionId) ? preferences.connectionId : connections.find((connection) => connection.is_default)?.id ?? "";
       const selectedConnectionId = activeChat?.connectionId || lumiverseConnectionId;
@@ -2261,11 +2289,24 @@ function setup(ctx) {
     drainSynthesisQueue();
     scheduleAdvancedSettingsSave();
   }
+  function onRateLimitWaitChanged(value) {
+    rateLimitWaitSeconds = clampIntegerSetting(
+      value,
+      DEFAULT_RATE_LIMIT_WAIT_SECONDS,
+      MAX_RATE_LIMIT_WAIT_SECONDS
+    );
+    rateLimitWaitInput.value = String(rateLimitWaitSeconds);
+    scheduleAdvancedSettingsSave();
+  }
   async function persistAdvancedSettings() {
     savingAdvancedSettings = true;
     setStatus("Saving global advanced playback settings\u2026");
     try {
-      await saveAdvancedPlaybackPreferences(playbackBufferSegments, concurrentGenerationLimit);
+      await saveAdvancedPlaybackPreferences(
+        playbackBufferSegments,
+        concurrentGenerationLimit,
+        rateLimitWaitSeconds
+      );
       setStatus("Advanced playback settings saved globally.", "saved");
     } catch (error) {
       setStatus(error instanceof Error ? error.message : "Could not save advanced playback settings.", "error");
@@ -2537,7 +2578,11 @@ function setup(ctx) {
     }
     if (advancedSettingsSaveTimer) {
       clearTimeout(advancedSettingsSaveTimer);
-      void saveAdvancedPlaybackPreferences(playbackBufferSegments, concurrentGenerationLimit);
+      void saveAdvancedPlaybackPreferences(
+        playbackBufferSegments,
+        concurrentGenerationLimit,
+        rateLimitWaitSeconds
+      );
     }
     skippedTrackerTagsInput.destroy();
     speakerParsingPicker.destroy();
@@ -2545,6 +2590,7 @@ function setup(ctx) {
     llmModelInput.destroy();
     playbackBufferInput.removeEventListener("change", onPlaybackBufferInput);
     concurrentGenerationInput.removeEventListener("change", onConcurrentGenerationInput);
+    rateLimitWaitInput.removeEventListener("change", onRateLimitWaitInput);
     addNpcInput.destroy();
     addNpcButton.removeEventListener("click", onAddNpc);
     addNpcInputSlot.removeEventListener("keydown", onAddNpcKeyDown);

@@ -47,6 +47,7 @@ interface RateLimitBudget {
   blockedUntil: number
   cumulativeWaitMs: number
   consecutiveResponses: number
+  maximumWaitMs: number
 }
 
 interface VoiceGateWaiter {
@@ -131,11 +132,12 @@ class ConnectionVoiceGate {
 }
 
 const MIN_SYNTHESIS_START_INTERVAL_MS = 1_250
-const MAX_CUMULATIVE_RATE_LIMIT_WAIT_MS = 60_000
 const DEFAULT_PLAYBACK_BUFFER_SEGMENTS = 2
 const DEFAULT_CONCURRENT_GENERATIONS = 2
+const DEFAULT_RATE_LIMIT_WAIT_SECONDS = 60
 const MAX_PLAYBACK_BUFFER_SEGMENTS = 20
 const MAX_CONCURRENT_GENERATIONS = 10
+const MAX_RATE_LIMIT_WAIT_SECONDS = 3_600
 
 interface DetectedCharacterState {
   id: string
@@ -244,6 +246,7 @@ interface PlaybackPreferences {
   llmModel: string
   playbackBufferSegments: number
   concurrentGenerations: number
+  rateLimitWaitSeconds: number
 }
 
 function clampIntegerSetting(value: unknown, fallback: number, maximum: number): number {
@@ -297,6 +300,7 @@ async function loadPlaybackPreferences(): Promise<PlaybackPreferences> {
     llmModel: '',
     playbackBufferSegments: DEFAULT_PLAYBACK_BUFFER_SEGMENTS,
     concurrentGenerations: DEFAULT_CONCURRENT_GENERATIONS,
+    rateLimitWaitSeconds: DEFAULT_RATE_LIMIT_WAIT_SECONDS,
   }
   const row = await response.json() as { value?: Record<string, unknown> }
   const speed = typeof row.value?.ttsSpeed === 'number' ? row.value.ttsSpeed : 1
@@ -332,6 +336,11 @@ async function loadPlaybackPreferences(): Promise<PlaybackPreferences> {
       row.value?.chatVoiceConcurrentGenerations,
       DEFAULT_CONCURRENT_GENERATIONS,
       MAX_CONCURRENT_GENERATIONS,
+    ),
+    rateLimitWaitSeconds: clampIntegerSetting(
+      row.value?.chatVoiceRateLimitWaitSeconds,
+      DEFAULT_RATE_LIMIT_WAIT_SECONDS,
+      MAX_RATE_LIMIT_WAIT_SECONDS,
     ),
   }
 }
@@ -395,7 +404,11 @@ function saveLlmParsingPreferences(
   }))
 }
 
-function saveAdvancedPlaybackPreferences(bufferSegments: number, concurrentGenerations: number): Promise<void> {
+function saveAdvancedPlaybackPreferences(
+  bufferSegments: number,
+  concurrentGenerations: number,
+  rateLimitWaitSeconds: number,
+): Promise<void> {
   return updateVoiceSettings(current => ({
     ...current,
     chatVoicePlaybackBufferSegments: clampIntegerSetting(
@@ -407,6 +420,11 @@ function saveAdvancedPlaybackPreferences(bufferSegments: number, concurrentGener
       concurrentGenerations,
       DEFAULT_CONCURRENT_GENERATIONS,
       MAX_CONCURRENT_GENERATIONS,
+    ),
+    chatVoiceRateLimitWaitSeconds: clampIntegerSetting(
+      rateLimitWaitSeconds,
+      DEFAULT_RATE_LIMIT_WAIT_SECONDS,
+      MAX_RATE_LIMIT_WAIT_SECONDS,
     ),
   }))
 }
@@ -532,9 +550,9 @@ async function synthesizeVoiceSegment(
       const currentBlockEnd = Math.max(now, rateLimitBudget.blockedUntil)
       const desiredBlockEnd = now + requestedDelay
       const requestedExtension = Math.max(0, desiredBlockEnd - currentBlockEnd)
-      const remainingBudget = MAX_CUMULATIVE_RATE_LIMIT_WAIT_MS - rateLimitBudget.cumulativeWaitMs
+      const remainingBudget = rateLimitBudget.maximumWaitMs - rateLimitBudget.cumulativeWaitMs
       if (remainingBudget <= 0 && requestedExtension > 0) {
-        throw new Error('TTS rate limiting continued for one minute. Try playback again in a moment.')
+        throw new Error('TTS rate limiting reached the configured wait limit. Try playback again in a moment.')
       }
       const addedWait = Math.min(requestedExtension, Math.max(0, remainingBudget))
       rateLimitBudget.cumulativeWaitMs += addedWait
@@ -820,12 +838,14 @@ export function setup(ctx: SpindleFrontendContext) {
 
   const playbackBufferField = createField('Playback buffer segments')
   const concurrentGenerationField = createField('Concurrent generations')
+  const rateLimitWaitField = createField('Rate-limit wait budget (seconds)')
   const advancedHint = document.createElement('div')
   advancedHint.className = 'chat-voice-hint'
-  advancedHint.textContent = 'Larger buffers can reduce pauses but delay playback. Higher concurrency is faster but increases API load and rate-limit risk.'
+  advancedHint.textContent = 'Larger buffers can reduce pauses but delay playback. Higher concurrency increases API load. The wait budget controls how long a playback may cumulatively pause and retry after rate limits.'
   advancedBody.append(
     playbackBufferField.field,
     concurrentGenerationField.field,
+    rateLimitWaitField.field,
     advancedHint,
   )
 
@@ -849,6 +869,7 @@ export function setup(ctx: SpindleFrontendContext) {
   let savingLlmSettings = false
   let playbackBufferSegments = DEFAULT_PLAYBACK_BUFFER_SEGMENTS
   let concurrentGenerationLimit = DEFAULT_CONCURRENT_GENERATIONS
+  let rateLimitWaitSeconds = DEFAULT_RATE_LIMIT_WAIT_SECONDS
   let advancedSettingsSaveTimer: ReturnType<typeof setTimeout> | null = null
   let savingAdvancedSettings = false
   let saveTimer: ReturnType<typeof setTimeout> | null = null
@@ -1052,12 +1073,20 @@ export function setup(ctx: SpindleFrontendContext) {
     MAX_CONCURRENT_GENERATIONS,
     'Concurrent generations',
   )
+  const rateLimitWaitInput = createNumberInput(
+    DEFAULT_RATE_LIMIT_WAIT_SECONDS,
+    MAX_RATE_LIMIT_WAIT_SECONDS,
+    'Rate-limit wait budget in seconds',
+  )
   playbackBufferField.slot.appendChild(playbackBufferInput)
   concurrentGenerationField.slot.appendChild(concurrentGenerationInput)
+  rateLimitWaitField.slot.appendChild(rateLimitWaitInput)
   const onPlaybackBufferInput = () => onPlaybackBufferChanged(playbackBufferInput.valueAsNumber)
   const onConcurrentGenerationInput = () => onConcurrentGenerationsChanged(concurrentGenerationInput.valueAsNumber)
+  const onRateLimitWaitInput = () => onRateLimitWaitChanged(rateLimitWaitInput.valueAsNumber)
   playbackBufferInput.addEventListener('change', onPlaybackBufferInput)
   concurrentGenerationInput.addEventListener('change', onConcurrentGenerationInput)
+  rateLimitWaitInput.addEventListener('change', onRateLimitWaitInput)
 
   const addNpcInput = ctx.components.mountTextInput(addNpcInputSlot, {
     value: '', placeholder: 'NPC name / aliases', ariaLabel: 'NPC name and aliases to add', disabled: true,
@@ -1381,9 +1410,11 @@ export function setup(ctx: SpindleFrontendContext) {
     if (advancedSettingsSaveTimer || savingAdvancedSettings) {
       preferences.playbackBufferSegments = playbackBufferSegments
       preferences.concurrentGenerations = concurrentGenerationLimit
+      preferences.rateLimitWaitSeconds = rateLimitWaitSeconds
     } else {
       playbackBufferSegments = preferences.playbackBufferSegments
       concurrentGenerationLimit = preferences.concurrentGenerations
+      rateLimitWaitSeconds = preferences.rateLimitWaitSeconds
     }
     const connectionId = config.connectionId
       || (connections.some(connection => connection.id === preferences.connectionId)
@@ -1472,6 +1503,7 @@ export function setup(ctx: SpindleFrontendContext) {
         blockedUntil: 0,
         cumulativeWaitMs: 0,
         consecutiveResponses: 0,
+        maximumWaitMs: preferences.rateLimitWaitSeconds * 1_000,
       }
       playback.synthesisController = synthesisController
       backgroundSynthesisControllers.add(synthesisController)
@@ -1497,7 +1529,7 @@ export function setup(ctx: SpindleFrontendContext) {
               if (ctx.getActiveChat().chatId === playbackChat.id && (!activePlayback || activePlayback === playback)) {
                 setStatus(
                   `Rate limited; resuming in ${Math.max(1, Math.ceil(delayMs / 1_000))}s… `
-                  + `(${Math.ceil(cumulativeWaitMs / 1_000)}s of 60s wait budget)`,
+                  + `(${Math.ceil(cumulativeWaitMs / 1_000)}s of ${preferences.rateLimitWaitSeconds}s wait budget)`,
                 )
               }
             },
@@ -1872,8 +1904,10 @@ export function setup(ctx: SpindleFrontendContext) {
       if (!savingAdvancedSettings && !advancedSettingsSaveTimer) {
         playbackBufferSegments = preferences.playbackBufferSegments
         concurrentGenerationLimit = preferences.concurrentGenerations
+        rateLimitWaitSeconds = preferences.rateLimitWaitSeconds
         playbackBufferInput.value = String(playbackBufferSegments)
         concurrentGenerationInput.value = String(concurrentGenerationLimit)
+        rateLimitWaitInput.value = String(rateLimitWaitSeconds)
       }
       lumiverseConnectionId = connections.some(connection => connection.id === preferences.connectionId)
         ? preferences.connectionId
@@ -1991,11 +2025,25 @@ export function setup(ctx: SpindleFrontendContext) {
     scheduleAdvancedSettingsSave()
   }
 
+  function onRateLimitWaitChanged(value: number | null): void {
+    rateLimitWaitSeconds = clampIntegerSetting(
+      value,
+      DEFAULT_RATE_LIMIT_WAIT_SECONDS,
+      MAX_RATE_LIMIT_WAIT_SECONDS,
+    )
+    rateLimitWaitInput.value = String(rateLimitWaitSeconds)
+    scheduleAdvancedSettingsSave()
+  }
+
   async function persistAdvancedSettings(): Promise<void> {
     savingAdvancedSettings = true
     setStatus('Saving global advanced playback settings…')
     try {
-      await saveAdvancedPlaybackPreferences(playbackBufferSegments, concurrentGenerationLimit)
+      await saveAdvancedPlaybackPreferences(
+        playbackBufferSegments,
+        concurrentGenerationLimit,
+        rateLimitWaitSeconds,
+      )
       setStatus('Advanced playback settings saved globally.', 'saved')
     } catch (error) {
       setStatus(error instanceof Error ? error.message : 'Could not save advanced playback settings.', 'error')
@@ -2290,7 +2338,11 @@ export function setup(ctx: SpindleFrontendContext) {
     }
     if (advancedSettingsSaveTimer) {
       clearTimeout(advancedSettingsSaveTimer)
-      void saveAdvancedPlaybackPreferences(playbackBufferSegments, concurrentGenerationLimit)
+      void saveAdvancedPlaybackPreferences(
+        playbackBufferSegments,
+        concurrentGenerationLimit,
+        rateLimitWaitSeconds,
+      )
     }
     skippedTrackerTagsInput.destroy()
     speakerParsingPicker.destroy()
@@ -2298,6 +2350,7 @@ export function setup(ctx: SpindleFrontendContext) {
     llmModelInput.destroy()
     playbackBufferInput.removeEventListener('change', onPlaybackBufferInput)
     concurrentGenerationInput.removeEventListener('change', onConcurrentGenerationInput)
+    rateLimitWaitInput.removeEventListener('change', onRateLimitWaitInput)
     addNpcInput.destroy()
     addNpcButton.removeEventListener('click', onAddNpc)
     addNpcInputSlot.removeEventListener('keydown', onAddNpcKeyDown)
