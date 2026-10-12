@@ -52,6 +52,7 @@ interface CardPromptData {
 
 type FrontendMessage =
   | { type: 'chat_voice_refresh'; chatId?: string | null; requestId?: string }
+  | { type: 'chat_voice_list_llm_connections'; requestId: string }
   | { type: 'chat_voice_scan'; chatId: string; messageLimit: number }
   | { type: 'chat_voice_get_message'; chatId: string; messageId: string; requestId: string }
   | {
@@ -541,6 +542,28 @@ spindle.onFrontendMessage(async (rawPayload: unknown, userId, frontendSessionId)
   try {
     if (payload?.type === 'chat_voice_refresh') {
       await sendState(userId, undefined, payload.chatId, frontendSessionId, payload.requestId)
+    } else if (payload?.type === 'chat_voice_list_llm_connections') {
+      try {
+        const connections = await spindle.connections.list(userId)
+        sendFrontend({
+          type: 'chat_voice_llm_connections',
+          requestId: payload.requestId,
+          connections: connections.map(connection => ({
+            id: connection.id,
+            name: connection.name,
+            provider: connection.provider,
+            model: connection.model,
+            is_default: connection.is_default,
+          })),
+        }, userId, frontendSessionId)
+      } catch (error) {
+        sendFrontend({
+          type: 'chat_voice_llm_connections',
+          requestId: payload.requestId,
+          connections: [],
+          error: error instanceof Error ? error.message : 'Could not load LLM connections.',
+        }, userId, frontendSessionId)
+      }
     } else if (payload?.type === 'chat_voice_parse_message') {
       await queueSpeakerParse(payload, userId, frontendSessionId)
     } else if (payload?.type === 'chat_voice_get_message') {

@@ -1223,9 +1223,11 @@ function setup(ctx) {
   const pendingMessageRequests = /* @__PURE__ */ new Map();
   const pendingStateRequests = /* @__PURE__ */ new Map();
   const pendingSpeakerParseRequests = /* @__PURE__ */ new Map();
+  const pendingLlmConnectionRequests = /* @__PURE__ */ new Map();
   let messageRequestSequence = 0;
   let stateRequestSequence = 0;
   let speakerParseRequestSequence = 0;
+  let llmConnectionRequestSequence = 0;
   const setStatus = (message, state = "normal") => {
     status.textContent = message;
     status.dataset.state = state;
@@ -1422,6 +1424,17 @@ function setup(ctx) {
         model: preferences.llmModel,
         skippedTrackerTags: preferences.skippedTrackerTags
       });
+    });
+  }
+  function requestLlmConnections() {
+    const requestId = `connections-${Date.now().toString(36)}-${++llmConnectionRequestSequence}`;
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        pendingLlmConnectionRequests.delete(requestId);
+        reject(new Error("Timed out while loading main LLM connections."));
+      }, 15e3);
+      pendingLlmConnectionRequests.set(requestId, { resolve, reject, timer });
+      ctx.sendToBackend({ type: "chat_voice_list_llm_connections", requestId });
     });
   }
   function refreshLocalState() {
@@ -1987,7 +2000,10 @@ function setup(ctx) {
     try {
       const [loadedConnections, loadedLlmConnections, preferences] = await Promise.all([
         listAllTtsConnections(),
-        ctx.connections?.list().catch(() => []) ?? Promise.resolve([]),
+        requestLlmConnections().catch((error) => {
+          console.warn("[Chat Voice] Could not load main LLM connections.", error);
+          return [];
+        }),
         loadPlaybackPreferences()
       ]);
       connections = loadedConnections;
@@ -2210,6 +2226,15 @@ function setup(ctx) {
       }
       return;
     }
+    if (payload.type === "chat_voice_llm_connections") {
+      const pending = pendingLlmConnectionRequests.get(payload.requestId);
+      if (!pending) return;
+      clearTimeout(pending.timer);
+      pendingLlmConnectionRequests.delete(payload.requestId);
+      if (payload.error) pending.reject(new Error(payload.error));
+      else pending.resolve(payload.connections);
+      return;
+    }
     if (payload.type === "chat_voice_error") {
       if (payload.requestId) {
         const pending = pendingStateRequests.get(payload.requestId);
@@ -2317,6 +2342,11 @@ function setup(ctx) {
       pending.reject(new Error("Chat Voice was closed."));
     }
     pendingSpeakerParseRequests.clear();
+    for (const pending of pendingLlmConnectionRequests.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(new Error("Chat Voice was closed."));
+    }
+    pendingLlmConnectionRequests.clear();
     for (const pending of pendingStateRequests.values()) {
       clearTimeout(pending.timer);
       pending.reject(new Error("Chat Voice was closed."));

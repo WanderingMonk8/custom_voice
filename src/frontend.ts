@@ -1,5 +1,4 @@
 import type {
-  ConnectionProfileDTO,
   SpindleFrontendContext,
   SpindleTextInputHandle,
 } from 'lumiverse-spindle-types'
@@ -29,6 +28,14 @@ interface TtsConnection {
 interface ConnectionPage {
   data?: TtsConnection[]
   total?: number
+}
+
+interface LlmConnection {
+  id: string
+  name: string
+  provider: string
+  model: string
+  is_default: boolean
 }
 
 interface SynthesisPacer {
@@ -172,6 +179,13 @@ interface ParsedMessagePayload {
   messageId: string
   segments?: PlaybackSegment[]
   usedLlm?: boolean
+  error?: string
+}
+
+interface LlmConnectionsPayload {
+  type: 'chat_voice_llm_connections'
+  requestId: string
+  connections: LlmConnection[]
   error?: string
 }
 
@@ -734,7 +748,7 @@ export function setup(ctx: SpindleFrontendContext) {
   let savingSkippedTrackerTags = false
   let skippedTrackerTagsSaveTimer: ReturnType<typeof setTimeout> | null = null
   let speakerParsingMode: 'off' | 'ambiguous' | 'always' = 'off'
-  let llmConnections: ConnectionProfileDTO[] = []
+  let llmConnections: LlmConnection[] = []
   let llmConnectionId = ''
   let llmModel = ''
   let llmSettingsSaveTimer: ReturnType<typeof setTimeout> | null = null
@@ -815,9 +829,15 @@ export function setup(ctx: SpindleFrontendContext) {
     reject: (error: Error) => void
     timer: ReturnType<typeof setTimeout>
   }>()
+  const pendingLlmConnectionRequests = new Map<string, {
+    resolve: (connections: LlmConnection[]) => void
+    reject: (error: Error) => void
+    timer: ReturnType<typeof setTimeout>
+  }>()
   let messageRequestSequence = 0
   let stateRequestSequence = 0
   let speakerParseRequestSequence = 0
+  let llmConnectionRequestSequence = 0
 
   const setStatus = (message: string, state: 'normal' | 'saved' | 'error' = 'normal') => {
     status.textContent = message
@@ -1032,6 +1052,18 @@ export function setup(ctx: SpindleFrontendContext) {
         model: preferences.llmModel,
         skippedTrackerTags: preferences.skippedTrackerTags,
       })
+    })
+  }
+
+  function requestLlmConnections(): Promise<LlmConnection[]> {
+    const requestId = `connections-${Date.now().toString(36)}-${++llmConnectionRequestSequence}`
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        pendingLlmConnectionRequests.delete(requestId)
+        reject(new Error('Timed out while loading main LLM connections.'))
+      }, 15_000)
+      pendingLlmConnectionRequests.set(requestId, { resolve, reject, timer })
+      ctx.sendToBackend({ type: 'chat_voice_list_llm_connections', requestId })
     })
   }
 
@@ -1666,7 +1698,10 @@ export function setup(ctx: SpindleFrontendContext) {
     try {
       const [loadedConnections, loadedLlmConnections, preferences] = await Promise.all([
         listAllTtsConnections(),
-        ctx.connections?.list().catch(() => []) ?? Promise.resolve([]),
+        requestLlmConnections().catch((error) => {
+          console.warn('[Chat Voice] Could not load main LLM connections.', error)
+          return []
+        }),
         loadPlaybackPreferences(),
       ])
       connections = loadedConnections
@@ -1894,7 +1929,7 @@ export function setup(ctx: SpindleFrontendContext) {
   hostWindow.requestAnimationFrame(updatePlaybackButtons)
 
   const unsubscribeBackend = ctx.onBackendMessage((rawPayload: unknown) => {
-    const payload = rawPayload as StatePayload | ErrorPayload | ScanCompletePayload | MessagePayload | ParsedMessagePayload
+    const payload = rawPayload as StatePayload | ErrorPayload | ScanCompletePayload | MessagePayload | ParsedMessagePayload | LlmConnectionsPayload
     if (payload.type === 'chat_voice_message') {
       const pending = pendingMessageRequests.get(payload.requestId)
       if (!pending) return
@@ -1914,6 +1949,15 @@ export function setup(ctx: SpindleFrontendContext) {
       } else {
         pending.resolve(payload.segments)
       }
+      return
+    }
+    if (payload.type === 'chat_voice_llm_connections') {
+      const pending = pendingLlmConnectionRequests.get(payload.requestId)
+      if (!pending) return
+      clearTimeout(pending.timer)
+      pendingLlmConnectionRequests.delete(payload.requestId)
+      if (payload.error) pending.reject(new Error(payload.error))
+      else pending.resolve(payload.connections)
       return
     }
     if (payload.type === 'chat_voice_error') {
@@ -2032,6 +2076,11 @@ export function setup(ctx: SpindleFrontendContext) {
       pending.reject(new Error('Chat Voice was closed.'))
     }
     pendingSpeakerParseRequests.clear()
+    for (const pending of pendingLlmConnectionRequests.values()) {
+      clearTimeout(pending.timer)
+      pending.reject(new Error('Chat Voice was closed.'))
+    }
+    pendingLlmConnectionRequests.clear()
     for (const pending of pendingStateRequests.values()) {
       clearTimeout(pending.timer)
       pending.reject(new Error('Chat Voice was closed.'))
