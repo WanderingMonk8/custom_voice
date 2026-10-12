@@ -16,9 +16,11 @@ import {
   parseLlmSegmentation,
   parseMultiVoiceSegments,
   parseRosterVoiceSegments,
+  parseSkippedTrackerTags,
   readConfig,
   readSavedAudioHistory,
   speakerAliases,
+  stripSkippedTrackerBlocks,
   upsertSavedAudioRecord,
   type ChatVoiceConfig,
 } from './core'
@@ -65,6 +67,35 @@ test('keeps separate paragraphs as independently generated voice segments', () =
     { text: 'Second paragraph.', voice: 'narrator' },
     { text: 'Third paragraph.', voice: 'narrator' },
   ])
+})
+
+test('parses comma-separated tracker tag pairs and removes their contents before playback', () => {
+  const tagPairs = '<tracker></tracker>, <status>example</status>, <tracker>duplicate</tracker>'
+  assert.deepEqual(parseSkippedTrackerTags(tagPairs), ['tracker', 'status'])
+  const content = 'Spoken before. <tracker> Date: 1/2/2026 <status>Hidden state</status> </tracker> Spoken after.'
+  assert.equal(stripSkippedTrackerBlocks(content, tagPairs), 'Spoken before.   Spoken after.')
+  assert.deepEqual(
+    parseRosterVoiceSegments(
+      '"Keep this." <tracker>"Do not synthesize this."</tracker> Narration remains.',
+      'alice',
+      [{ id: 'alice', name: 'Alice' }],
+      '<tracker></tracker>',
+    ),
+    [
+      { text: 'Keep this.', speakerId: 'alice' },
+      { text: 'Narration remains.', speakerId: null },
+    ],
+  )
+})
+
+test('removes escaped and nested configured tracker blocks', () => {
+  assert.equal(
+    stripSkippedTrackerBlocks(
+      'Before &lt;tracker&gt;outer <tracker>inner</tracker> tail&lt;/tracker&gt; After',
+      '&lt;tracker&gt;&lt;/tracker&gt;',
+    ),
+    'Before   After',
+  )
 })
 
 test('clamps the configurable message window', () => {

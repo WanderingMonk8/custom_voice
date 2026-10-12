@@ -130,6 +130,57 @@ function stripPlaybackMarkup(value) {
 function decodePlaybackEntities(value) {
   return value.replace(/&nbsp;/gi, " ").replace(/&quot;|&#34;|&#x22;/gi, '"').replace(/&apos;|&#39;|&#x27;/gi, "'").replace(/&lt;|&#60;|&#x3c;/gi, "<").replace(/&gt;|&#62;|&#x3e;/gi, ">").replace(/&amp;|&#38;|&#x26;/gi, "&");
 }
+function parseSkippedTrackerTags(value) {
+  const decoded = decodePlaybackEntities(value);
+  const tags = [];
+  const seen = /* @__PURE__ */ new Set();
+  const pairPattern = /\\?<\s*([a-z][a-z0-9:._-]*)\b[^>]*>[\s\S]*?\\?<\s*\/\s*\1\s*>/giu;
+  for (const match of decoded.matchAll(pairPattern)) {
+    const tag = (match[1] ?? "").toLowerCase();
+    if (!tag || seen.has(tag)) continue;
+    seen.add(tag);
+    tags.push(tag);
+    if (tags.length >= 100) break;
+  }
+  return tags;
+}
+function stripPairedTagBlocks(value, tag) {
+  const escapedTag = tag.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const tokenPattern = new RegExp(
+    `\\\\?<\\s*(/?)\\s*${escapedTag}(?=\\s|>)[^>]*>`,
+    "giu"
+  );
+  const ranges = [];
+  let depth = 0;
+  let blockStart = -1;
+  for (const match of value.matchAll(tokenPattern)) {
+    if (match.index === void 0) continue;
+    const closing = match[1] === "/";
+    if (!closing && !/\/\s*>$/u.test(match[0])) {
+      if (depth === 0) blockStart = match.index;
+      depth += 1;
+    } else if (closing && depth > 0) {
+      depth -= 1;
+      if (depth === 0 && blockStart >= 0) {
+        ranges.push({ start: blockStart, end: match.index + match[0].length });
+        blockStart = -1;
+      }
+    }
+  }
+  if (ranges.length === 0) return value;
+  let result = value;
+  for (let index = ranges.length - 1; index >= 0; index--) {
+    result = `${result.slice(0, ranges[index].start)} ${result.slice(ranges[index].end)}`;
+  }
+  return result;
+}
+function stripSkippedTrackerBlocks(content, tagPairs) {
+  let result = content.replace(/&lt;|&#60;|&#x3c;/gi, "<").replace(/&gt;|&#62;|&#x3e;/gi, ">");
+  for (const tag of parseSkippedTrackerTags(tagPairs)) {
+    result = stripPairedTagBlocks(result, tag);
+  }
+  return result;
+}
 function cleanPlaybackText(value) {
   return decodePlaybackEntities(stripPlaybackMarkup(value)).replace(/```[\s\S]*?```/g, " ").replace(/`[^`\n]*`/g, " ").replace(/\r\n?/g, "\n").replace(/[^\S\n]+/g, " ").replace(/ *\n */g, "\n").replace(/\n{3,}/g, "\n\n").trim();
 }
@@ -529,8 +580,8 @@ function canContinueSpeaker(bridge, previousSpeakerId, speakers) {
   }
   return true;
 }
-function parseRosterVoiceSegments(content, defaultSpeakerId, speakers) {
-  const playbackContent = stripPlaybackMarkup(content);
+function parseRosterVoiceSegments(content, defaultSpeakerId, speakers, skippedTrackerTagPairs = "") {
+  const playbackContent = stripPlaybackMarkup(stripSkippedTrackerBlocks(content, skippedTrackerTagPairs));
   const result = [];
   const quotePattern = /["“]([\s\S]*?)["”]/g;
   const paragraphs = playbackParagraphs(playbackContent);
@@ -688,7 +739,8 @@ async function loadPlaybackPreferences() {
     volume: 1,
     connectionId: "",
     saveGeneratedAudio: false,
-    savedAudioLimit: DEFAULT_SAVED_AUDIO_LIMIT
+    savedAudioLimit: DEFAULT_SAVED_AUDIO_LIMIT,
+    skippedTrackerTags: ""
   };
   const row = await response.json();
   const speed = typeof row.value?.ttsSpeed === "number" ? row.value.ttsSpeed : 1;
@@ -698,7 +750,8 @@ async function loadPlaybackPreferences() {
     volume: Math.min(1, Math.max(0, volume)),
     connectionId: typeof row.value?.ttsConnectionId === "string" ? row.value.ttsConnectionId.trim() : "",
     saveGeneratedAudio: row.value?.chatVoiceSaveGeneratedAudio === true,
-    savedAudioLimit: clampSavedAudioLimit(row.value?.chatVoiceSavedAudioLimit)
+    savedAudioLimit: clampSavedAudioLimit(row.value?.chatVoiceSavedAudioLimit),
+    skippedTrackerTags: typeof row.value?.chatVoiceSkippedTrackerTags === "string" ? row.value.chatVoiceSkippedTrackerTags.slice(0, 4e3) : ""
   };
 }
 var voiceSettingsWriteQueue = Promise.resolve();
@@ -732,6 +785,12 @@ function saveGeneratedAudioLimit(limit) {
   return updateVoiceSettings((current) => ({
     ...current,
     chatVoiceSavedAudioLimit: clampSavedAudioLimit(limit)
+  }));
+}
+function saveSkippedTrackerTagsPreference(value) {
+  return updateVoiceSettings((current) => ({
+    ...current,
+    chatVoiceSkippedTrackerTags: value.slice(0, 4e3)
   }));
 }
 async function deleteSavedAudioRecord(record) {
@@ -1023,6 +1082,7 @@ function setup(ctx) {
   scanButton.textContent = "Scan";
   scanButton.disabled = true;
   scanRow.append(scanButton);
+  const skippedTagsField = createField("Skipped tracker tags (global)");
   const narratorField = createField("Narrator voice");
   const routingHint = document.createElement("div");
   routingHint.className = "chat-voice-hint";
@@ -1050,6 +1110,7 @@ function setup(ctx) {
     connectionField.field,
     saveAudioField.field,
     scanField.field,
+    skippedTagsField.field,
     narratorField.field,
     routingHint,
     addNpcField.field,
@@ -1066,6 +1127,10 @@ function setup(ctx) {
   let savedAudioLimit = DEFAULT_SAVED_AUDIO_LIMIT;
   let savingAudioPreference = false;
   let savingAudioLimit = false;
+  let skippedTrackerTags = "";
+  let skippedTrackerTagsDirty = false;
+  let savingSkippedTrackerTags = false;
+  let skippedTrackerTagsSaveTimer = null;
   let saveTimer = null;
   let editRevision = 0;
   let dirty = false;
@@ -1155,6 +1220,13 @@ function setup(ctx) {
     ariaLabel: "Narrator voice",
     disabled: true,
     onChange: () => markChanged()
+  });
+  const skippedTrackerTagsInput = ctx.components.mountTextArea(skippedTagsField.slot, {
+    value: "",
+    placeholder: "<tracker></tracker>, <status></status>",
+    rows: 3,
+    ariaLabel: "Tracker tag pairs to skip globally",
+    onChange: () => scheduleSkippedTrackerTagsSave()
   });
   const addNpcInput = ctx.components.mountTextInput(addNpcInputSlot, {
     value: "",
@@ -1453,7 +1525,12 @@ function setup(ctx) {
       const aliases = new Map(
         playbackChat.characters.flatMap((character) => speakerAliases(character.name).map((alias) => [npcSpeakerId(alias), character.id]))
       );
-      const segments = parseRosterVoiceSegments(message.content, defaultSpeakerId, playbackChat.characters);
+      const segments = parseRosterVoiceSegments(
+        message.content,
+        defaultSpeakerId,
+        playbackChat.characters,
+        preferences.skippedTrackerTags
+      );
       const plan = mergeVoicePlan(segments.map((segment) => {
         const speakerId = segment.speakerId ? aliases.get(segment.speakerId) ?? segment.speakerId : null;
         const voice = speakerId ? config.characterVoices[speakerId] || "" : config.narratorVoice;
@@ -1805,6 +1882,10 @@ function setup(ctx) {
         savedAudioLimit = preferences.savedAudioLimit;
         saveAudioLimitInput.value = String(savedAudioLimit);
       }
+      if (!savingSkippedTrackerTags && !skippedTrackerTagsDirty) {
+        skippedTrackerTags = preferences.skippedTrackerTags;
+        skippedTrackerTagsInput.update({ value: skippedTrackerTags });
+      }
       lumiverseConnectionId = connections.some((connection) => connection.id === preferences.connectionId) ? preferences.connectionId : connections.find((connection) => connection.is_default)?.id ?? "";
       const selectedConnectionId = activeChat?.connectionId || lumiverseConnectionId;
       connectionPicker.update({
@@ -1876,6 +1957,28 @@ function setup(ctx) {
       saveAudioLimitInput.disabled = false;
     }
   };
+  function scheduleSkippedTrackerTagsSave() {
+    skippedTrackerTags = skippedTrackerTagsInput.getValue().slice(0, 4e3);
+    skippedTrackerTagsDirty = true;
+    if (skippedTrackerTagsSaveTimer) clearTimeout(skippedTrackerTagsSaveTimer);
+    skippedTrackerTagsSaveTimer = setTimeout(() => {
+      skippedTrackerTagsSaveTimer = null;
+      void persistSkippedTrackerTags(skippedTrackerTags);
+    }, 500);
+  }
+  async function persistSkippedTrackerTags(value) {
+    savingSkippedTrackerTags = true;
+    setStatus("Saving global tracker exclusions\u2026");
+    try {
+      await saveSkippedTrackerTagsPreference(value);
+      if (skippedTrackerTags === value) skippedTrackerTagsDirty = false;
+      setStatus("Global tracker exclusions saved.", "saved");
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : "Could not save tracker exclusions.", "error");
+    } finally {
+      savingSkippedTrackerTags = false;
+    }
+  }
   const onNativeContextMenu = (event) => {
     const target = event.target && typeof event.target.closest === "function" ? event.target : null;
     lastContextMessageId = target?.closest("[data-message-id]")?.dataset.messageId ?? null;
@@ -2016,6 +2119,11 @@ function setup(ctx) {
     pendingStateRequests.clear();
     connectionPicker.destroy();
     narratorInput.destroy();
+    if (skippedTrackerTagsSaveTimer) {
+      clearTimeout(skippedTrackerTagsSaveTimer);
+      void saveSkippedTrackerTagsPreference(skippedTrackerTags);
+    }
+    skippedTrackerTagsInput.destroy();
     addNpcInput.destroy();
     addNpcButton.removeEventListener("click", onAddNpc);
     addNpcInputSlot.removeEventListener("keydown", onAddNpcKeyDown);

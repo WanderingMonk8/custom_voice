@@ -203,6 +203,7 @@ interface PlaybackPreferences {
   connectionId: string
   saveGeneratedAudio: boolean
   savedAudioLimit: number
+  skippedTrackerTags: string
 }
 
 const VOICE_ICON = `
@@ -244,6 +245,7 @@ async function loadPlaybackPreferences(): Promise<PlaybackPreferences> {
     connectionId: '',
     saveGeneratedAudio: false,
     savedAudioLimit: DEFAULT_SAVED_AUDIO_LIMIT,
+    skippedTrackerTags: '',
   }
   const row = await response.json() as { value?: Record<string, unknown> }
   const speed = typeof row.value?.ttsSpeed === 'number' ? row.value.ttsSpeed : 1
@@ -256,6 +258,9 @@ async function loadPlaybackPreferences(): Promise<PlaybackPreferences> {
       : '',
     saveGeneratedAudio: row.value?.chatVoiceSaveGeneratedAudio === true,
     savedAudioLimit: clampSavedAudioLimit(row.value?.chatVoiceSavedAudioLimit),
+    skippedTrackerTags: typeof row.value?.chatVoiceSkippedTrackerTags === 'string'
+      ? row.value.chatVoiceSkippedTrackerTags.slice(0, 4_000)
+      : '',
   }
 }
 
@@ -295,6 +300,13 @@ function saveGeneratedAudioLimit(limit: number): Promise<void> {
   return updateVoiceSettings(current => ({
     ...current,
     chatVoiceSavedAudioLimit: clampSavedAudioLimit(limit),
+  }))
+}
+
+function saveSkippedTrackerTagsPreference(value: string): Promise<void> {
+  return updateVoiceSettings(current => ({
+    ...current,
+    chatVoiceSkippedTrackerTags: value.slice(0, 4_000),
   }))
 }
 
@@ -622,6 +634,7 @@ export function setup(ctx: SpindleFrontendContext) {
   scanButton.textContent = 'Scan'
   scanButton.disabled = true
   scanRow.append(scanButton)
+  const skippedTagsField = createField('Skipped tracker tags (global)')
   const narratorField = createField('Narrator voice')
   const routingHint = document.createElement('div')
   routingHint.className = 'chat-voice-hint'
@@ -650,6 +663,7 @@ export function setup(ctx: SpindleFrontendContext) {
     connectionField.field,
     saveAudioField.field,
     scanField.field,
+    skippedTagsField.field,
     narratorField.field,
     routingHint,
     addNpcField.field,
@@ -667,6 +681,10 @@ export function setup(ctx: SpindleFrontendContext) {
   let savedAudioLimit = DEFAULT_SAVED_AUDIO_LIMIT
   let savingAudioPreference = false
   let savingAudioLimit = false
+  let skippedTrackerTags = ''
+  let skippedTrackerTagsDirty = false
+  let savingSkippedTrackerTags = false
+  let skippedTrackerTagsSaveTimer: ReturnType<typeof setTimeout> | null = null
   let saveTimer: ReturnType<typeof setTimeout> | null = null
   let editRevision = 0
   let dirty = false
@@ -790,6 +808,14 @@ export function setup(ctx: SpindleFrontendContext) {
     value: '', placeholder: 'Enter the narrator voice name or ID',
     ariaLabel: 'Narrator voice', disabled: true,
     onChange: () => markChanged(),
+  })
+
+  const skippedTrackerTagsInput = ctx.components.mountTextArea(skippedTagsField.slot, {
+    value: '',
+    placeholder: '<tracker></tracker>, <status></status>',
+    rows: 3,
+    ariaLabel: 'Tracker tag pairs to skip globally',
+    onChange: () => scheduleSkippedTrackerTagsSave(),
   })
 
   const addNpcInput = ctx.components.mountTextInput(addNpcInputSlot, {
@@ -1124,7 +1150,12 @@ export function setup(ctx: SpindleFrontendContext) {
           speakerAliases(character.name).map(alias => [npcSpeakerId(alias), character.id] as const)
         )),
       )
-      const segments = parseRosterVoiceSegments(message.content, defaultSpeakerId, playbackChat.characters)
+      const segments = parseRosterVoiceSegments(
+        message.content,
+        defaultSpeakerId,
+        playbackChat.characters,
+        preferences.skippedTrackerTags,
+      )
       const plan = mergeVoicePlan(segments.map((segment) => {
         const speakerId = segment.speakerId
           ? aliases.get(segment.speakerId) ?? segment.speakerId
@@ -1513,6 +1544,10 @@ export function setup(ctx: SpindleFrontendContext) {
         savedAudioLimit = preferences.savedAudioLimit
         saveAudioLimitInput.value = String(savedAudioLimit)
       }
+      if (!savingSkippedTrackerTags && !skippedTrackerTagsDirty) {
+        skippedTrackerTags = preferences.skippedTrackerTags
+        skippedTrackerTagsInput.update({ value: skippedTrackerTags })
+      }
       lumiverseConnectionId = connections.some(connection => connection.id === preferences.connectionId)
         ? preferences.connectionId
         : connections.find(connection => connection.is_default)?.id ?? ''
@@ -1588,6 +1623,30 @@ export function setup(ctx: SpindleFrontendContext) {
     } finally {
       savingAudioLimit = false
       saveAudioLimitInput.disabled = false
+    }
+  }
+
+  function scheduleSkippedTrackerTagsSave(): void {
+    skippedTrackerTags = skippedTrackerTagsInput.getValue().slice(0, 4_000)
+    skippedTrackerTagsDirty = true
+    if (skippedTrackerTagsSaveTimer) clearTimeout(skippedTrackerTagsSaveTimer)
+    skippedTrackerTagsSaveTimer = setTimeout(() => {
+      skippedTrackerTagsSaveTimer = null
+      void persistSkippedTrackerTags(skippedTrackerTags)
+    }, 500)
+  }
+
+  async function persistSkippedTrackerTags(value: string): Promise<void> {
+    savingSkippedTrackerTags = true
+    setStatus('Saving global tracker exclusions…')
+    try {
+      await saveSkippedTrackerTagsPreference(value)
+      if (skippedTrackerTags === value) skippedTrackerTagsDirty = false
+      setStatus('Global tracker exclusions saved.', 'saved')
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : 'Could not save tracker exclusions.', 'error')
+    } finally {
+      savingSkippedTrackerTags = false
     }
   }
 
@@ -1747,6 +1806,11 @@ export function setup(ctx: SpindleFrontendContext) {
     pendingStateRequests.clear()
     connectionPicker.destroy()
     narratorInput.destroy()
+    if (skippedTrackerTagsSaveTimer) {
+      clearTimeout(skippedTrackerTagsSaveTimer)
+      void saveSkippedTrackerTagsPreference(skippedTrackerTags)
+    }
+    skippedTrackerTagsInput.destroy()
     addNpcInput.destroy()
     addNpcButton.removeEventListener('click', onAddNpc)
     addNpcInputSlot.removeEventListener('keydown', onAddNpcKeyDown)
