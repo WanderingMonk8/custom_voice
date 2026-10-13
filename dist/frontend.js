@@ -1331,7 +1331,7 @@ function setup(ctx) {
   const rateLimitWaitField = createField("Rate-limit wait budget (seconds)");
   const advancedHint = document.createElement("div");
   advancedHint.className = "chat-voice-hint";
-  advancedHint.textContent = "Concurrency adapts up to the selected maximum. Dense short-segment runs force one request at a time, while sustained long runs increase gradually. Larger buffers reduce pauses but delay playback. The wait budget controls cumulative rate-limit cooldowns.";
+  advancedHint.textContent = "Concurrency starts at one and adapts up to the selected maximum. Dense short-segment runs stay at one request at a time, while sustained long runs increase gradually. Larger buffers reduce pauses but delay playback. The wait budget controls cumulative rate-limit cooldowns.";
   advancedBody.append(
     playbackBufferField.field,
     concurrentGenerationField.field,
@@ -1919,7 +1919,7 @@ function setup(ctx) {
       playback.synthesisController = synthesisController;
       backgroundSynthesisControllers.add(synthesisController);
       const adaptiveLimitToken = Symbol("playback-concurrency");
-      let adaptiveConcurrency = preferences.concurrentGenerations;
+      let adaptiveConcurrency = 1;
       let shortConcurrencyCooldown = 0;
       let longWindowStreak = 0;
       let rateLimitedForRemainder = false;
