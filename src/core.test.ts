@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
+  adaptiveGenerationConcurrency,
   addScannedFirstNameAliases,
   mergeScannedCardCast,
   applyConfigToMetadata,
@@ -58,6 +59,39 @@ test('applies per-segment gain while assembling PCM WAV audio', () => {
   assert.equal(view.getInt16(46, true), -8192)
 })
 
+test('forces fragmented generation windows to one despite long outliers', () => {
+  assert.deepEqual(
+    adaptiveGenerationConcurrency(3, 3, [80, 90, 500, 100, 450, 110]),
+    { concurrency: 1, shortCooldown: 6, longWindowStreak: 0 },
+  )
+})
+
+test('requires sustained long windows before raising concurrency to its configured ceiling', () => {
+  const first = adaptiveGenerationConcurrency(1, 3, [400, 500, 600], 0, 0)
+  assert.deepEqual(first, { concurrency: 1, shortCooldown: 0, longWindowStreak: 1 })
+  assert.deepEqual(
+    adaptiveGenerationConcurrency(
+      first.concurrency,
+      3,
+      [420, 520, 620],
+      first.shortCooldown,
+      first.longWindowStreak,
+    ),
+    { concurrency: 2, shortCooldown: 0, longWindowStreak: 0 },
+  )
+  assert.deepEqual(
+    adaptiveGenerationConcurrency(1, 1, [400, 500, 600], 0, 1),
+    { concurrency: 1, shortCooldown: 0, longWindowStreak: 0 },
+  )
+})
+
+test('holds concurrency at one during the short-segment cooldown', () => {
+  assert.deepEqual(
+    adaptiveGenerationConcurrency(1, 4, [250, 260, 270], 6, 0),
+    { concurrency: 1, shortCooldown: 5, longWindowStreak: 0 },
+  )
+})
+
 test('merges adjacent segments that use the same voice', () => {
   assert.deepEqual(mergeVoicePlan([
     { text: 'First sentence.', voice: 'narrator' },
@@ -82,22 +116,29 @@ test('keeps separate paragraphs as independently generated voice segments', () =
   ])
 })
 
-test('parses comma-separated tracker tag pairs and removes their contents before playback', () => {
-  const tagPairs = '<tracker></tracker>, <status>example</status>, <tracker>duplicate</tracker>'
-  assert.deepEqual(parseSkippedTrackerTags(tagPairs), ['tracker', 'status'])
+test('parses comma-separated tracker tag names and removes their contents before playback', () => {
+  const tagNames = 'tracker, status, tracker, o_scene'
+  assert.deepEqual(parseSkippedTrackerTags(tagNames), ['tracker', 'status', 'o_scene'])
   const content = 'Spoken before. <tracker> Date: 1/2/2026 <status>Hidden state</status> </tracker> Spoken after.'
-  assert.equal(stripSkippedTrackerBlocks(content, tagPairs), 'Spoken before.   Spoken after.')
+  assert.equal(stripSkippedTrackerBlocks(content, tagNames), 'Spoken before.   Spoken after.')
   assert.deepEqual(
     parseRosterVoiceSegments(
       '"Keep this." <tracker>"Do not synthesize this."</tracker> Narration remains.',
       'alice',
       [{ id: 'alice', name: 'Alice' }],
-      '<tracker></tracker>',
+      'tracker',
     ),
     [
       { text: 'Keep this.', speakerId: 'alice' },
       { text: 'Narration remains.', speakerId: null },
     ],
+  )
+})
+
+test('continues to accept previously saved paired tracker tags', () => {
+  assert.deepEqual(
+    parseSkippedTrackerTags('<tracker></tracker>, <status>example</status>'),
+    ['tracker', 'status'],
   )
 })
 

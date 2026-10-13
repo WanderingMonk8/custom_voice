@@ -93,6 +93,56 @@ export interface PcmAudioSegment {
   gain?: number
 }
 
+export interface AdaptiveGenerationState {
+  concurrency: number
+  shortCooldown: number
+  longWindowStreak: number
+}
+
+/** Adjust TTS concurrency from fragmentation density while resisting rapid oscillation. */
+export function adaptiveGenerationConcurrency(
+  current: number,
+  configuredMaximum: number,
+  segmentLengths: number[],
+  shortCooldown = 0,
+  longWindowStreak = 0,
+  maximum = 10,
+): AdaptiveGenerationState {
+  const safeMaximum = Math.max(1, Math.round(maximum))
+  const safeConfiguredMaximum = Math.min(safeMaximum, Math.max(1, Math.round(configuredMaximum)))
+  const safeCurrent = Math.min(safeConfiguredMaximum, Math.max(1, Math.round(current)))
+  const safeCooldown = Math.max(0, Math.round(shortCooldown))
+  const safeLongStreak = Math.max(0, Math.round(longWindowStreak))
+  const lengths = segmentLengths.filter(length => Number.isFinite(length) && length >= 0)
+  if (lengths.length === 0) {
+    return { concurrency: safeCurrent, shortCooldown: safeCooldown, longWindowStreak: safeLongStreak }
+  }
+  const sorted = [...lengths].sort((left, right) => left - right)
+  const middle = Math.floor(sorted.length / 2)
+  const medianLength = sorted.length % 2 === 0
+    ? ((sorted[middle - 1] ?? 0) + (sorted[middle] ?? 0)) / 2
+    : sorted[middle] ?? 0
+  const shortCount = lengths.filter(length => length < 160).length
+  if (shortCount >= 3 || medianLength < 200) {
+    return { concurrency: 1, shortCooldown: 6, longWindowStreak: 0 }
+  }
+  if (safeCooldown > 0) {
+    return { concurrency: 1, shortCooldown: safeCooldown - 1, longWindowStreak: 0 }
+  }
+  if (shortCount === 0 && medianLength > 320) {
+    const nextStreak = safeLongStreak + 1
+    if (nextStreak >= 2) {
+      return {
+        concurrency: Math.min(safeConfiguredMaximum, safeCurrent + 1),
+        shortCooldown: 0,
+        longWindowStreak: 0,
+      }
+    }
+    return { concurrency: safeCurrent, shortCooldown: 0, longWindowStreak: nextStreak }
+  }
+  return { concurrency: safeCurrent, shortCooldown: 0, longWindowStreak: 0 }
+}
+
 /** Combine decoded audio into one PCM WAV so the host does not need FFmpeg to save it. */
 export function encodeConcatenatedWav(segments: PcmAudioSegment[]): ArrayBuffer {
   const usable = segments.filter(segment => (
@@ -648,12 +698,20 @@ export function parseSkippedTrackerTags(value: string): string[] {
   const decoded = decodePlaybackEntities(value)
   const tags: string[] = []
   const seen = new Set<string>()
-  const pairPattern = /\\?<\s*([a-z][a-z0-9:._-]*)\b[^>]*>[\s\S]*?\\?<\s*\/\s*\1\s*>/giu
-  for (const match of decoded.matchAll(pairPattern)) {
-    const tag = (match[1] ?? '').toLowerCase()
-    if (!tag || seen.has(tag)) continue
+  const addTag = (value: string) => {
+    const tag = value.toLowerCase()
+    if (!tag || seen.has(tag) || !/^[a-z][a-z0-9:._-]*$/u.test(tag)) return
     seen.add(tag)
     tags.push(tag)
+  }
+  for (const entry of decoded.split(',')) {
+    addTag(entry.trim())
+    if (tags.length >= 100) return tags
+  }
+  // Keep previously saved paired-tag settings working after the simpler name-only format is introduced.
+  const pairPattern = /\\?<\s*([a-z][a-z0-9:._-]*)\b[^>]*>[\s\S]*?\\?<\s*\/\s*\1\s*>/giu
+  for (const match of decoded.matchAll(pairPattern)) {
+    addTag(match[1] ?? '')
     if (tags.length >= 100) break
   }
   return tags

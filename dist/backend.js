@@ -292,12 +292,19 @@ function parseSkippedTrackerTags(value) {
   const decoded = decodePlaybackEntities(value);
   const tags = [];
   const seen = /* @__PURE__ */ new Set();
-  const pairPattern = /\\?<\s*([a-z][a-z0-9:._-]*)\b[^>]*>[\s\S]*?\\?<\s*\/\s*\1\s*>/giu;
-  for (const match of decoded.matchAll(pairPattern)) {
-    const tag = (match[1] ?? "").toLowerCase();
-    if (!tag || seen.has(tag)) continue;
+  const addTag = (value2) => {
+    const tag = value2.toLowerCase();
+    if (!tag || seen.has(tag) || !/^[a-z][a-z0-9:._-]*$/u.test(tag)) return;
     seen.add(tag);
     tags.push(tag);
+  };
+  for (const entry of decoded.split(",")) {
+    addTag(entry.trim());
+    if (tags.length >= 100) return tags;
+  }
+  const pairPattern = /\\?<\s*([a-z][a-z0-9:._-]*)\b[^>]*>[\s\S]*?\\?<\s*\/\s*\1\s*>/giu;
+  for (const match of decoded.matchAll(pairPattern)) {
+    addTag(match[1] ?? "");
     if (tags.length >= 100) break;
   }
   return tags;

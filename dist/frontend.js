@@ -1,6 +1,39 @@
 // src/core.ts
 var DEFAULT_SAVED_AUDIO_LIMIT = 50;
 var MAX_SAVED_AUDIO_LIMIT = 1e4;
+function adaptiveGenerationConcurrency(current, configuredMaximum, segmentLengths, shortCooldown = 0, longWindowStreak = 0, maximum = 10) {
+  const safeMaximum = Math.max(1, Math.round(maximum));
+  const safeConfiguredMaximum = Math.min(safeMaximum, Math.max(1, Math.round(configuredMaximum)));
+  const safeCurrent = Math.min(safeConfiguredMaximum, Math.max(1, Math.round(current)));
+  const safeCooldown = Math.max(0, Math.round(shortCooldown));
+  const safeLongStreak = Math.max(0, Math.round(longWindowStreak));
+  const lengths = segmentLengths.filter((length) => Number.isFinite(length) && length >= 0);
+  if (lengths.length === 0) {
+    return { concurrency: safeCurrent, shortCooldown: safeCooldown, longWindowStreak: safeLongStreak };
+  }
+  const sorted = [...lengths].sort((left, right) => left - right);
+  const middle = Math.floor(sorted.length / 2);
+  const medianLength = sorted.length % 2 === 0 ? ((sorted[middle - 1] ?? 0) + (sorted[middle] ?? 0)) / 2 : sorted[middle] ?? 0;
+  const shortCount = lengths.filter((length) => length < 160).length;
+  if (shortCount >= 3 || medianLength < 200) {
+    return { concurrency: 1, shortCooldown: 6, longWindowStreak: 0 };
+  }
+  if (safeCooldown > 0) {
+    return { concurrency: 1, shortCooldown: safeCooldown - 1, longWindowStreak: 0 };
+  }
+  if (shortCount === 0 && medianLength > 320) {
+    const nextStreak = safeLongStreak + 1;
+    if (nextStreak >= 2) {
+      return {
+        concurrency: Math.min(safeConfiguredMaximum, safeCurrent + 1),
+        shortCooldown: 0,
+        longWindowStreak: 0
+      };
+    }
+    return { concurrency: safeCurrent, shortCooldown: 0, longWindowStreak: nextStreak };
+  }
+  return { concurrency: safeCurrent, shortCooldown: 0, longWindowStreak: 0 };
+}
 function encodeConcatenatedWav(segments) {
   const usable = segments.filter((segment) => Number.isFinite(segment.sampleRate) && segment.sampleRate > 0 && segment.channels.length > 0 && segment.channels.some((channel) => channel.length > 0));
   if (usable.length === 0) throw new Error("No decoded audio is available to save.");
@@ -135,12 +168,19 @@ function parseSkippedTrackerTags(value) {
   const decoded = decodePlaybackEntities(value);
   const tags = [];
   const seen = /* @__PURE__ */ new Set();
-  const pairPattern = /\\?<\s*([a-z][a-z0-9:._-]*)\b[^>]*>[\s\S]*?\\?<\s*\/\s*\1\s*>/giu;
-  for (const match of decoded.matchAll(pairPattern)) {
-    const tag = (match[1] ?? "").toLowerCase();
-    if (!tag || seen.has(tag)) continue;
+  const addTag = (value2) => {
+    const tag = value2.toLowerCase();
+    if (!tag || seen.has(tag) || !/^[a-z][a-z0-9:._-]*$/u.test(tag)) return;
     seen.add(tag);
     tags.push(tag);
+  };
+  for (const entry of decoded.split(",")) {
+    addTag(entry.trim());
+    if (tags.length >= 100) return tags;
+  }
+  const pairPattern = /\\?<\s*([a-z][a-z0-9:._-]*)\b[^>]*>[\s\S]*?\\?<\s*\/\s*\1\s*>/giu;
+  for (const match of decoded.matchAll(pairPattern)) {
+    addTag(match[1] ?? "");
     if (tags.length >= 100) break;
   }
   return tags;
@@ -726,7 +766,7 @@ var ConnectionVoiceGate = class {
 };
 var MIN_SYNTHESIS_START_INTERVAL_MS = 1250;
 var DEFAULT_PLAYBACK_BUFFER_SEGMENTS = 2;
-var DEFAULT_CONCURRENT_GENERATIONS = 1;
+var DEFAULT_CONCURRENT_GENERATIONS = 4;
 var DEFAULT_RATE_LIMIT_WAIT_SECONDS = 60;
 var MAX_PLAYBACK_BUFFER_SEGMENTS = 20;
 var MAX_CONCURRENT_GENERATIONS = 10;
@@ -1294,11 +1334,11 @@ function setup(ctx) {
   );
   tab.root.appendChild(panel);
   const playbackBufferField = createField("Playback buffer segments");
-  const concurrentGenerationField = createField("Concurrent generations");
+  const concurrentGenerationField = createField("Maximum concurrent generations");
   const rateLimitWaitField = createField("Rate-limit wait budget (seconds)");
   const advancedHint = document.createElement("div");
   advancedHint.className = "chat-voice-hint";
-  advancedHint.textContent = "Larger buffers can reduce pauses but delay playback. Higher concurrency increases API load. The wait budget controls how long a playback may cumulatively pause and retry after rate limits.";
+  advancedHint.textContent = "Concurrency starts at one and adapts up to the selected maximum. Dense short-segment runs stay at one request at a time, while sustained long runs increase gradually. Larger buffers reduce pauses but delay playback. The wait budget controls cumulative rate-limit cooldowns.";
   advancedBody.append(
     playbackBufferField.field,
     concurrentGenerationField.field,
@@ -1338,9 +1378,13 @@ function setup(ctx) {
   const connectionVoiceGates = /* @__PURE__ */ new Map();
   const foregroundSynthesisQueue = [];
   const backgroundSynthesisQueue = [];
+  const adaptiveSynthesisLimits = /* @__PURE__ */ new Map();
   let activeSynthesisTasks = 0;
+  function effectiveSynthesisLimit() {
+    return adaptiveSynthesisLimits.size > 0 ? Math.max(...adaptiveSynthesisLimits.values()) : concurrentGenerationLimit;
+  }
   function drainSynthesisQueue() {
-    while (activeSynthesisTasks < concurrentGenerationLimit) {
+    while (activeSynthesisTasks < effectiveSynthesisLimit()) {
       const next = foregroundSynthesisQueue.shift() ?? backgroundSynthesisQueue.shift();
       if (!next) return;
       activeSynthesisTasks += 1;
@@ -1424,9 +1468,9 @@ function setup(ctx) {
   });
   const skippedTrackerTagsInput = ctx.components.mountTextArea(skippedTagsField.slot, {
     value: "",
-    placeholder: "<tracker></tracker>, <status></status>",
+    placeholder: "tracker, status, o_scene",
     rows: 3,
-    ariaLabel: "Tracker tag pairs to skip globally",
+    ariaLabel: "Tracker tag names to skip globally",
     onChange: () => scheduleSkippedTrackerTagsSave()
   });
   const speakerParsingPicker = ctx.components.mountSelect(speakerParsingField.slot, {
@@ -1479,7 +1523,7 @@ function setup(ctx) {
   const concurrentGenerationInput = createNumberInput(
     DEFAULT_CONCURRENT_GENERATIONS,
     MAX_CONCURRENT_GENERATIONS,
-    "Concurrent generations"
+    "Maximum concurrent generations"
   );
   const rateLimitWaitInput = createNumberInput(
     DEFAULT_RATE_LIMIT_WAIT_SECONDS,
@@ -1881,6 +1925,11 @@ function setup(ctx) {
       };
       playback.synthesisController = synthesisController;
       backgroundSynthesisControllers.add(synthesisController);
+      const adaptiveLimitToken = Symbol("playback-concurrency");
+      let adaptiveConcurrency = 1;
+      let shortConcurrencyCooldown = 0;
+      let longWindowStreak = 0;
+      let rateLimitedForRemainder = false;
       const prepare = async (index) => {
         try {
           const segment = await runSynthesisTask(() => synthesizeVoiceSegment(
@@ -1897,6 +1946,12 @@ function setup(ctx) {
               return gate;
             })(),
             (delayMs, cumulativeWaitMs) => {
+              rateLimitedForRemainder = true;
+              adaptiveConcurrency = 1;
+              shortConcurrencyCooldown = 0;
+              longWindowStreak = 0;
+              adaptiveSynthesisLimits.set(adaptiveLimitToken, 1);
+              drainSynthesisQueue();
               if (ctx.getActiveChat().chatId === playbackChat.id && (!activePlayback || activePlayback === playback)) {
                 setStatus(
                   `Rate limited; resuming in ${Math.max(1, Math.ceil(delayMs / 1e3))}s\u2026 (${Math.ceil(cumulativeWaitMs / 1e3)}s of ${preferences.rateLimitWaitSeconds}s wait budget)`
@@ -1914,15 +1969,51 @@ function setup(ctx) {
         preparedResolvers.push(resolve);
       }));
       let synthesisCursor = 0;
-      const runSynthesisWorker = async () => {
-        while (true) {
+      let localSynthesisTasks = 0;
+      const initialAdaptiveState = adaptiveGenerationConcurrency(
+        adaptiveConcurrency,
+        preferences.concurrentGenerations,
+        plan.slice(0, 6).map((segment) => segment.text.length),
+        shortConcurrencyCooldown,
+        longWindowStreak,
+        MAX_CONCURRENT_GENERATIONS
+      );
+      adaptiveConcurrency = initialAdaptiveState.concurrency;
+      shortConcurrencyCooldown = initialAdaptiveState.shortCooldown;
+      longWindowStreak = initialAdaptiveState.longWindowStreak;
+      adaptiveSynthesisLimits.set(adaptiveLimitToken, adaptiveConcurrency);
+      const scheduleSynthesis = () => {
+        while (localSynthesisTasks < adaptiveConcurrency && synthesisCursor < plan.length) {
           const index = synthesisCursor++;
-          if (index >= plan.length) return;
-          preparedResolvers[index](await prepare(index));
+          localSynthesisTasks += 1;
+          void prepare(index).then((result) => {
+            preparedResolvers[index](result);
+          }).finally(() => {
+            localSynthesisTasks -= 1;
+            if (!rateLimitedForRemainder) {
+              const nextState = adaptiveGenerationConcurrency(
+                adaptiveConcurrency,
+                preferences.concurrentGenerations,
+                plan.slice(index + 1, Math.min(plan.length, index + 7)).map((segment) => segment.text.length),
+                shortConcurrencyCooldown,
+                longWindowStreak,
+                MAX_CONCURRENT_GENERATIONS
+              );
+              adaptiveConcurrency = nextState.concurrency;
+              shortConcurrencyCooldown = nextState.shortCooldown;
+              longWindowStreak = nextState.longWindowStreak;
+              adaptiveSynthesisLimits.set(adaptiveLimitToken, adaptiveConcurrency);
+              drainSynthesisQueue();
+            }
+            scheduleSynthesis();
+          });
         }
       };
-      const workerCount = Math.min(preferences.concurrentGenerations, plan.length);
-      for (let index = 0; index < workerCount; index += 1) void runSynthesisWorker();
+      scheduleSynthesis();
+      void Promise.all(prepared).finally(() => {
+        adaptiveSynthesisLimits.delete(adaptiveLimitToken);
+        drainSynthesisQueue();
+      });
       const normalizationContext = new contextClass();
       const voiceLoudnessProfiles = /* @__PURE__ */ new Map();
       let normalizationChain = Promise.resolve();
