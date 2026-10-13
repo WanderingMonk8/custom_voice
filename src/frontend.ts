@@ -134,7 +134,7 @@ class ConnectionVoiceGate {
 
 const MIN_SYNTHESIS_START_INTERVAL_MS = 1_250
 const DEFAULT_PLAYBACK_BUFFER_SEGMENTS = 2
-const DEFAULT_CONCURRENT_GENERATIONS = 1
+const DEFAULT_CONCURRENT_GENERATIONS = 4
 const DEFAULT_RATE_LIMIT_WAIT_SECONDS = 60
 const MAX_PLAYBACK_BUFFER_SEGMENTS = 20
 const MAX_CONCURRENT_GENERATIONS = 10
@@ -1080,9 +1080,9 @@ export function setup(ctx: SpindleFrontendContext) {
 
   const skippedTrackerTagsInput = ctx.components.mountTextArea(skippedTagsField.slot, {
     value: '',
-    placeholder: '<tracker></tracker>, <status></status>',
+    placeholder: 'tracker, status, o_scene',
     rows: 3,
-    ariaLabel: 'Tracker tag pairs to skip globally',
+    ariaLabel: 'Tracker tag names to skip globally',
     onChange: () => scheduleSkippedTrackerTagsSave(),
   })
 

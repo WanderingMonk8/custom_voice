@@ -26,7 +26,7 @@ A [Lumiverse Spindle](https://docs.lumiverse.chat/) extension that detects chara
 - When enabled, saves the exact synthesized custom-voice segments as a native Lumiverse audio attachment for the active message swipe, with a browser-generated WAV fallback when the server cannot mux their source formats.
 - When saving is enabled, continues bounded background synthesis and saves the complete recording even when audible playback is stopped early.
 - Removes HTML/escaped tags and Markdown emphasis markers before sending readable text to TTS.
-- Provides a global, autosaved list of paired tracker tags whose tags and enclosed contents are removed before playback generation.
+- Provides a global, autosaved list of tracker tag names whose tags and enclosed contents are removed before playback generation.
 - Automatically excludes well-formed HTML comments (`<!-- ... -->`) from playback and speaker detection.
 - Alternates short unattributed dialogue turns after two speakers have been confidently established, including chains preceded by same-speaker continuation paragraphs.
 - Optionally reviews ambiguous—or all—dialogue with an LLM, using a selectable Lumiverse connection and optional custom model override. Results are cached per message and safely fall back to local parsing.
@@ -56,14 +56,14 @@ The compiled frontend and backend bundles are committed under `dist/`, so users 
 1. Open a chat.
 2. Select **Voice** in the Lumiverse drawer.
 3. Click **Scan** to read the active character card and save its speaking cast.
-4. Optionally enter comma-separated paired tags under **Skipped tracker tags**, such as `<tracker></tracker>, <status></status>`. These global exclusions remove both the tags and everything enclosed by them before TTS generation.
+4. Optionally enter comma-separated tag names under **Skipped tracker tags**, such as `tracker, status, o_scene`. These global exclusions remove both the opening/closing tags and everything enclosed by them before TTS generation. Previously saved paired-tag entries remain compatible.
 5. Global **AI speaker review** defaults to **Ambiguous only**. Choose an existing Lumiverse LLM connection and, if desired, enter a custom model name; both controls remain disabled if review is switched off.
 6. Choose one TTS connection for the chat.
 7. Enter the narrator voice and a voice for each detected character. Add characters manually, or rename and delete any roster entry as needed. Separate aliases with `/` (for example, `Scott / The sergeant`) to route every name to the same voice; use the rename button to add aliases later without losing the assigned voice.
 8. Optionally enable **Save generated audio** to attach completed recordings to messages across every chat. This global setting is off by default. Set **Maximum saved recordings** to control global retention (default: 50); the oldest extension-created attachments are removed first.
 9. Use Lumiverse's normal **Play with TTS** button or context-menu action to play the message with all configured voices.
 
-The collapsed **Advanced settings** section at the bottom of the drawer controls how many synthesized segments are buffered before playback starts (default: 2), the maximum generation concurrency (default: 1), and the cumulative rate-limit wait budget in seconds (default: 60, maximum: 3600). Every message starts at concurrency 1. A six-segment window keeps concurrency at 1 when it contains at least three short segments or has a short median, and only increases toward the configured maximum after two consecutive all-long windows. Any HTTP 429 keeps the rest of that message at concurrency 1. A longer wait budget lets interrupted generation keep retrying for longer. Voice-volume normalization is always active. Normalized saved recordings use assembled PCM WAV audio and may consume more storage.
+The collapsed **Advanced settings** section at the bottom of the drawer controls how many synthesized segments are buffered before playback starts (default: 2), the maximum generation concurrency (default: 4), and the cumulative rate-limit wait budget in seconds (default: 60, maximum: 3600). Every message starts at concurrency 1. A six-segment window keeps concurrency at 1 when it contains at least three short segments or has a short median, and only increases toward the configured maximum after two consecutive all-long windows. Any HTTP 429 keeps the rest of that message at concurrency 1. A longer wait budget lets interrupted generation keep retrying for longer. Voice-volume normalization is always active. Normalized saved recordings use assembled PCM WAV audio and may consume more storage.
 
 The card scan result, manually managed NPC roster, and all voice settings save automatically for that chat. Switching chats loads the previously saved cast and settings without scanning or calling the language model again. Click **Scan** after changing the card. Manual NPCs remain in the roster across later scans until you delete them. Clear a voice field to use the TTS connection's default/fallback voice; clear the connection to disable every custom voice managed by the extension for that chat.
 

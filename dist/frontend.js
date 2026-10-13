@@ -168,12 +168,19 @@ function parseSkippedTrackerTags(value) {
   const decoded = decodePlaybackEntities(value);
   const tags = [];
   const seen = /* @__PURE__ */ new Set();
-  const pairPattern = /\\?<\s*([a-z][a-z0-9:._-]*)\b[^>]*>[\s\S]*?\\?<\s*\/\s*\1\s*>/giu;
-  for (const match of decoded.matchAll(pairPattern)) {
-    const tag = (match[1] ?? "").toLowerCase();
-    if (!tag || seen.has(tag)) continue;
+  const addTag = (value2) => {
+    const tag = value2.toLowerCase();
+    if (!tag || seen.has(tag) || !/^[a-z][a-z0-9:._-]*$/u.test(tag)) return;
     seen.add(tag);
     tags.push(tag);
+  };
+  for (const entry of decoded.split(",")) {
+    addTag(entry.trim());
+    if (tags.length >= 100) return tags;
+  }
+  const pairPattern = /\\?<\s*([a-z][a-z0-9:._-]*)\b[^>]*>[\s\S]*?\\?<\s*\/\s*\1\s*>/giu;
+  for (const match of decoded.matchAll(pairPattern)) {
+    addTag(match[1] ?? "");
     if (tags.length >= 100) break;
   }
   return tags;
@@ -759,7 +766,7 @@ var ConnectionVoiceGate = class {
 };
 var MIN_SYNTHESIS_START_INTERVAL_MS = 1250;
 var DEFAULT_PLAYBACK_BUFFER_SEGMENTS = 2;
-var DEFAULT_CONCURRENT_GENERATIONS = 1;
+var DEFAULT_CONCURRENT_GENERATIONS = 4;
 var DEFAULT_RATE_LIMIT_WAIT_SECONDS = 60;
 var MAX_PLAYBACK_BUFFER_SEGMENTS = 20;
 var MAX_CONCURRENT_GENERATIONS = 10;
@@ -1461,9 +1468,9 @@ function setup(ctx) {
   });
   const skippedTrackerTagsInput = ctx.components.mountTextArea(skippedTagsField.slot, {
     value: "",
-    placeholder: "<tracker></tracker>, <status></status>",
+    placeholder: "tracker, status, o_scene",
     rows: 3,
-    ariaLabel: "Tracker tag pairs to skip globally",
+    ariaLabel: "Tracker tag names to skip globally",
     onChange: () => scheduleSkippedTrackerTagsSave()
   });
   const speakerParsingPicker = ctx.components.mountSelect(speakerParsingField.slot, {
