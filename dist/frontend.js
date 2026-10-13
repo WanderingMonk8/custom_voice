@@ -786,8 +786,7 @@ async function loadPlaybackPreferences() {
     llmModel: "",
     playbackBufferSegments: DEFAULT_PLAYBACK_BUFFER_SEGMENTS,
     concurrentGenerations: DEFAULT_CONCURRENT_GENERATIONS,
-    rateLimitWaitSeconds: DEFAULT_RATE_LIMIT_WAIT_SECONDS,
-    normalizeVoiceVolumes: false
+    rateLimitWaitSeconds: DEFAULT_RATE_LIMIT_WAIT_SECONDS
   };
   const row = await response.json();
   const speed = typeof row.value?.ttsSpeed === "number" ? row.value.ttsSpeed : 1;
@@ -817,8 +816,7 @@ async function loadPlaybackPreferences() {
       row.value?.chatVoiceRateLimitWaitSeconds,
       DEFAULT_RATE_LIMIT_WAIT_SECONDS,
       MAX_RATE_LIMIT_WAIT_SECONDS
-    ),
-    normalizeVoiceVolumes: row.value?.chatVoiceNormalizeVoiceVolumes === true
+    )
   };
 }
 var voiceSettingsWriteQueue = Promise.resolve();
@@ -868,7 +866,7 @@ function saveLlmParsingPreferences(mode, connectionId, model) {
     chatVoiceLlmModel: model.trim().slice(0, 256)
   }));
 }
-function saveAdvancedPlaybackPreferences(bufferSegments, concurrentGenerations, rateLimitWaitSeconds, normalizeVoiceVolumes) {
+function saveAdvancedPlaybackPreferences(bufferSegments, concurrentGenerations, rateLimitWaitSeconds) {
   return updateVoiceSettings((current) => ({
     ...current,
     chatVoicePlaybackBufferSegments: clampIntegerSetting(
@@ -885,8 +883,7 @@ function saveAdvancedPlaybackPreferences(bufferSegments, concurrentGenerations, 
       rateLimitWaitSeconds,
       DEFAULT_RATE_LIMIT_WAIT_SECONDS,
       MAX_RATE_LIMIT_WAIT_SECONDS
-    ),
-    chatVoiceNormalizeVoiceVolumes: normalizeVoiceVolumes
+    )
   }));
 }
 async function deleteSavedAudioRecord(record) {
@@ -1299,21 +1296,6 @@ function setup(ctx) {
   const playbackBufferField = createField("Playback buffer segments");
   const concurrentGenerationField = createField("Concurrent generations");
   const rateLimitWaitField = createField("Rate-limit wait budget (seconds)");
-  const normalizeVolumesLabel = document.createElement("label");
-  normalizeVolumesLabel.className = "chat-voice-toggle";
-  const normalizeVolumesToggle = document.createElement("input");
-  normalizeVolumesToggle.type = "checkbox";
-  normalizeVolumesToggle.checked = false;
-  normalizeVolumesToggle.setAttribute("aria-label", "Normalize voice volumes");
-  const normalizeVolumesCopy = document.createElement("span");
-  normalizeVolumesCopy.className = "chat-voice-toggle-copy";
-  const normalizeVolumesText = document.createElement("span");
-  normalizeVolumesText.textContent = "Normalize voice volumes";
-  const normalizeVolumesHint = document.createElement("span");
-  normalizeVolumesHint.className = "chat-voice-toggle-hint";
-  normalizeVolumesHint.textContent = "Balance perceived speech volume with a rolling per-voice profile. Disabled by default.";
-  normalizeVolumesCopy.append(normalizeVolumesText, normalizeVolumesHint);
-  normalizeVolumesLabel.append(normalizeVolumesToggle, normalizeVolumesCopy);
   const advancedHint = document.createElement("div");
   advancedHint.className = "chat-voice-hint";
   advancedHint.textContent = "Larger buffers can reduce pauses but delay playback. Higher concurrency increases API load. The wait budget controls how long a playback may cumulatively pause and retry after rate limits.";
@@ -1321,7 +1303,6 @@ function setup(ctx) {
     playbackBufferField.field,
     concurrentGenerationField.field,
     rateLimitWaitField.field,
-    normalizeVolumesLabel,
     advancedHint
   );
   let applyingState = false;
@@ -1345,7 +1326,6 @@ function setup(ctx) {
   let playbackBufferSegments = DEFAULT_PLAYBACK_BUFFER_SEGMENTS;
   let concurrentGenerationLimit = DEFAULT_CONCURRENT_GENERATIONS;
   let rateLimitWaitSeconds = DEFAULT_RATE_LIMIT_WAIT_SECONDS;
-  let normalizeVoiceVolumes = false;
   let advancedSettingsSaveTimer = null;
   let savingAdvancedSettings = false;
   let saveTimer = null;
@@ -1512,14 +1492,9 @@ function setup(ctx) {
   const onPlaybackBufferInput = () => onPlaybackBufferChanged(playbackBufferInput.valueAsNumber);
   const onConcurrentGenerationInput = () => onConcurrentGenerationsChanged(concurrentGenerationInput.valueAsNumber);
   const onRateLimitWaitInput = () => onRateLimitWaitChanged(rateLimitWaitInput.valueAsNumber);
-  const onNormalizeVolumesInput = () => {
-    normalizeVoiceVolumes = normalizeVolumesToggle.checked;
-    scheduleAdvancedSettingsSave();
-  };
   playbackBufferInput.addEventListener("change", onPlaybackBufferInput);
   concurrentGenerationInput.addEventListener("change", onConcurrentGenerationInput);
   rateLimitWaitInput.addEventListener("change", onRateLimitWaitInput);
-  normalizeVolumesToggle.addEventListener("change", onNormalizeVolumesInput);
   const addNpcInput = ctx.components.mountTextInput(addNpcInputSlot, {
     value: "",
     placeholder: "NPC name / aliases",
@@ -1825,12 +1800,10 @@ function setup(ctx) {
       preferences.playbackBufferSegments = playbackBufferSegments;
       preferences.concurrentGenerations = concurrentGenerationLimit;
       preferences.rateLimitWaitSeconds = rateLimitWaitSeconds;
-      preferences.normalizeVoiceVolumes = normalizeVoiceVolumes;
     } else {
       playbackBufferSegments = preferences.playbackBufferSegments;
       concurrentGenerationLimit = preferences.concurrentGenerations;
       rateLimitWaitSeconds = preferences.rateLimitWaitSeconds;
-      normalizeVoiceVolumes = preferences.normalizeVoiceVolumes;
     }
     const connectionId = config.connectionId || (connections.some((connection) => connection.id === preferences.connectionId) ? preferences.connectionId : connections.find((connection) => connection.is_default)?.id ?? lumiverseConnectionId);
     if (!connectionId) {
@@ -1950,13 +1923,13 @@ function setup(ctx) {
       };
       const workerCount = Math.min(preferences.concurrentGenerations, plan.length);
       for (let index = 0; index < workerCount; index += 1) void runSynthesisWorker();
-      const normalizationContext = preferences.normalizeVoiceVolumes ? new contextClass() : null;
+      const normalizationContext = new contextClass();
       const voiceLoudnessProfiles = /* @__PURE__ */ new Map();
       let normalizationChain = Promise.resolve();
       const processed = prepared.map((pending, index) => {
         const processing = normalizationChain.then(async () => {
           const result = await pending;
-          if (!result.ok || !normalizationContext) return result;
+          if (!result.ok) return result;
           const decodedBuffer = await normalizationContext.decodeAudioData(result.segment.data.slice(0));
           const voiceKey = plan[index].voice.trim().toLowerCase() || "__connection-default__";
           const normalizationGain = normalizedVoiceGain(decodedBuffer, voiceKey, voiceLoudnessProfiles);
@@ -1968,9 +1941,7 @@ function setup(ctx) {
         normalizationChain = processing.then(() => void 0, () => void 0);
         return processing;
       });
-      if (normalizationContext) {
-        void Promise.all(processed).finally(() => normalizationContext.close().catch(() => void 0)).catch(() => void 0);
-      }
+      void Promise.all(processed).finally(() => normalizationContext.close().catch(() => void 0)).catch(() => void 0);
       if (preferences.saveGeneratedAudio || regeneratingSavedAudio) {
         playback.persistenceState = "pending";
         void Promise.all(processed).then(async (results) => {
@@ -2296,11 +2267,9 @@ function setup(ctx) {
         playbackBufferSegments = preferences.playbackBufferSegments;
         concurrentGenerationLimit = preferences.concurrentGenerations;
         rateLimitWaitSeconds = preferences.rateLimitWaitSeconds;
-        normalizeVoiceVolumes = preferences.normalizeVoiceVolumes;
         playbackBufferInput.value = String(playbackBufferSegments);
         concurrentGenerationInput.value = String(concurrentGenerationLimit);
         rateLimitWaitInput.value = String(rateLimitWaitSeconds);
-        normalizeVolumesToggle.checked = normalizeVoiceVolumes;
       }
       lumiverseConnectionId = connections.some((connection) => connection.id === preferences.connectionId) ? preferences.connectionId : connections.find((connection) => connection.is_default)?.id ?? "";
       const selectedConnectionId = activeChat?.connectionId || lumiverseConnectionId;
@@ -2417,8 +2386,7 @@ function setup(ctx) {
       await saveAdvancedPlaybackPreferences(
         playbackBufferSegments,
         concurrentGenerationLimit,
-        rateLimitWaitSeconds,
-        normalizeVoiceVolumes
+        rateLimitWaitSeconds
       );
       setStatus("Advanced playback settings saved globally.", "saved");
     } catch (error) {
@@ -2694,8 +2662,7 @@ function setup(ctx) {
       void saveAdvancedPlaybackPreferences(
         playbackBufferSegments,
         concurrentGenerationLimit,
-        rateLimitWaitSeconds,
-        normalizeVoiceVolumes
+        rateLimitWaitSeconds
       );
     }
     skippedTrackerTagsInput.destroy();
@@ -2705,7 +2672,6 @@ function setup(ctx) {
     playbackBufferInput.removeEventListener("change", onPlaybackBufferInput);
     concurrentGenerationInput.removeEventListener("change", onConcurrentGenerationInput);
     rateLimitWaitInput.removeEventListener("change", onRateLimitWaitInput);
-    normalizeVolumesToggle.removeEventListener("change", onNormalizeVolumesInput);
     addNpcInput.destroy();
     addNpcButton.removeEventListener("click", onAddNpc);
     addNpcInputSlot.removeEventListener("keydown", onAddNpcKeyDown);

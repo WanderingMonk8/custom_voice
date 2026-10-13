@@ -257,7 +257,6 @@ interface PlaybackPreferences {
   playbackBufferSegments: number
   concurrentGenerations: number
   rateLimitWaitSeconds: number
-  normalizeVoiceVolumes: boolean
 }
 
 function clampIntegerSetting(value: unknown, fallback: number, maximum: number): number {
@@ -312,7 +311,6 @@ async function loadPlaybackPreferences(): Promise<PlaybackPreferences> {
     playbackBufferSegments: DEFAULT_PLAYBACK_BUFFER_SEGMENTS,
     concurrentGenerations: DEFAULT_CONCURRENT_GENERATIONS,
     rateLimitWaitSeconds: DEFAULT_RATE_LIMIT_WAIT_SECONDS,
-    normalizeVoiceVolumes: false,
   }
   const row = await response.json() as { value?: Record<string, unknown> }
   const speed = typeof row.value?.ttsSpeed === 'number' ? row.value.ttsSpeed : 1
@@ -354,7 +352,6 @@ async function loadPlaybackPreferences(): Promise<PlaybackPreferences> {
       DEFAULT_RATE_LIMIT_WAIT_SECONDS,
       MAX_RATE_LIMIT_WAIT_SECONDS,
     ),
-    normalizeVoiceVolumes: row.value?.chatVoiceNormalizeVoiceVolumes === true,
   }
 }
 
@@ -421,7 +418,6 @@ function saveAdvancedPlaybackPreferences(
   bufferSegments: number,
   concurrentGenerations: number,
   rateLimitWaitSeconds: number,
-  normalizeVoiceVolumes: boolean,
 ): Promise<void> {
   return updateVoiceSettings(current => ({
     ...current,
@@ -440,7 +436,6 @@ function saveAdvancedPlaybackPreferences(
       DEFAULT_RATE_LIMIT_WAIT_SECONDS,
       MAX_RATE_LIMIT_WAIT_SECONDS,
     ),
-    chatVoiceNormalizeVoiceVolumes: normalizeVoiceVolumes,
   }))
 }
 
@@ -905,21 +900,6 @@ export function setup(ctx: SpindleFrontendContext) {
   const playbackBufferField = createField('Playback buffer segments')
   const concurrentGenerationField = createField('Concurrent generations')
   const rateLimitWaitField = createField('Rate-limit wait budget (seconds)')
-  const normalizeVolumesLabel = document.createElement('label')
-  normalizeVolumesLabel.className = 'chat-voice-toggle'
-  const normalizeVolumesToggle = document.createElement('input')
-  normalizeVolumesToggle.type = 'checkbox'
-  normalizeVolumesToggle.checked = false
-  normalizeVolumesToggle.setAttribute('aria-label', 'Normalize voice volumes')
-  const normalizeVolumesCopy = document.createElement('span')
-  normalizeVolumesCopy.className = 'chat-voice-toggle-copy'
-  const normalizeVolumesText = document.createElement('span')
-  normalizeVolumesText.textContent = 'Normalize voice volumes'
-  const normalizeVolumesHint = document.createElement('span')
-  normalizeVolumesHint.className = 'chat-voice-toggle-hint'
-  normalizeVolumesHint.textContent = 'Balance perceived speech volume with a rolling per-voice profile. Disabled by default.'
-  normalizeVolumesCopy.append(normalizeVolumesText, normalizeVolumesHint)
-  normalizeVolumesLabel.append(normalizeVolumesToggle, normalizeVolumesCopy)
   const advancedHint = document.createElement('div')
   advancedHint.className = 'chat-voice-hint'
   advancedHint.textContent = 'Larger buffers can reduce pauses but delay playback. Higher concurrency increases API load. The wait budget controls how long a playback may cumulatively pause and retry after rate limits.'
@@ -927,7 +907,6 @@ export function setup(ctx: SpindleFrontendContext) {
     playbackBufferField.field,
     concurrentGenerationField.field,
     rateLimitWaitField.field,
-    normalizeVolumesLabel,
     advancedHint,
   )
 
@@ -952,7 +931,6 @@ export function setup(ctx: SpindleFrontendContext) {
   let playbackBufferSegments = DEFAULT_PLAYBACK_BUFFER_SEGMENTS
   let concurrentGenerationLimit = DEFAULT_CONCURRENT_GENERATIONS
   let rateLimitWaitSeconds = DEFAULT_RATE_LIMIT_WAIT_SECONDS
-  let normalizeVoiceVolumes = false
   let advancedSettingsSaveTimer: ReturnType<typeof setTimeout> | null = null
   let savingAdvancedSettings = false
   let saveTimer: ReturnType<typeof setTimeout> | null = null
@@ -1167,14 +1145,9 @@ export function setup(ctx: SpindleFrontendContext) {
   const onPlaybackBufferInput = () => onPlaybackBufferChanged(playbackBufferInput.valueAsNumber)
   const onConcurrentGenerationInput = () => onConcurrentGenerationsChanged(concurrentGenerationInput.valueAsNumber)
   const onRateLimitWaitInput = () => onRateLimitWaitChanged(rateLimitWaitInput.valueAsNumber)
-  const onNormalizeVolumesInput = () => {
-    normalizeVoiceVolumes = normalizeVolumesToggle.checked
-    scheduleAdvancedSettingsSave()
-  }
   playbackBufferInput.addEventListener('change', onPlaybackBufferInput)
   concurrentGenerationInput.addEventListener('change', onConcurrentGenerationInput)
   rateLimitWaitInput.addEventListener('change', onRateLimitWaitInput)
-  normalizeVolumesToggle.addEventListener('change', onNormalizeVolumesInput)
 
   const addNpcInput = ctx.components.mountTextInput(addNpcInputSlot, {
     value: '', placeholder: 'NPC name / aliases', ariaLabel: 'NPC name and aliases to add', disabled: true,
@@ -1513,12 +1486,10 @@ export function setup(ctx: SpindleFrontendContext) {
       preferences.playbackBufferSegments = playbackBufferSegments
       preferences.concurrentGenerations = concurrentGenerationLimit
       preferences.rateLimitWaitSeconds = rateLimitWaitSeconds
-      preferences.normalizeVoiceVolumes = normalizeVoiceVolumes
     } else {
       playbackBufferSegments = preferences.playbackBufferSegments
       concurrentGenerationLimit = preferences.concurrentGenerations
       rateLimitWaitSeconds = preferences.rateLimitWaitSeconds
-      normalizeVoiceVolumes = preferences.normalizeVoiceVolumes
     }
     const connectionId = config.connectionId
       || (connections.some(connection => connection.id === preferences.connectionId)
@@ -1658,13 +1629,13 @@ export function setup(ctx: SpindleFrontendContext) {
       }
       const workerCount = Math.min(preferences.concurrentGenerations, plan.length)
       for (let index = 0; index < workerCount; index += 1) void runSynthesisWorker()
-      const normalizationContext = preferences.normalizeVoiceVolumes ? new contextClass() : null
+      const normalizationContext = new contextClass()
       const voiceLoudnessProfiles = new Map<string, number>()
       let normalizationChain: Promise<void> = Promise.resolve()
       const processed = prepared.map((pending, index) => {
         const processing = normalizationChain.then(async (): Promise<PreparedSegment> => {
           const result = await pending
-          if (!result.ok || !normalizationContext) return result
+          if (!result.ok) return result
           const decodedBuffer = await normalizationContext.decodeAudioData(result.segment.data.slice(0))
           const voiceKey = plan[index].voice.trim().toLowerCase() || '__connection-default__'
           const normalizationGain = normalizedVoiceGain(decodedBuffer, voiceKey, voiceLoudnessProfiles)
@@ -1676,11 +1647,9 @@ export function setup(ctx: SpindleFrontendContext) {
         normalizationChain = processing.then(() => undefined, () => undefined)
         return processing
       })
-      if (normalizationContext) {
-        void Promise.all(processed)
-          .finally(() => normalizationContext.close().catch(() => undefined))
-          .catch(() => undefined)
-      }
+      void Promise.all(processed)
+        .finally(() => normalizationContext.close().catch(() => undefined))
+        .catch(() => undefined)
       if (preferences.saveGeneratedAudio || regeneratingSavedAudio) {
         playback.persistenceState = 'pending'
         void Promise.all(processed).then(async (results) => {
@@ -2036,11 +2005,9 @@ export function setup(ctx: SpindleFrontendContext) {
         playbackBufferSegments = preferences.playbackBufferSegments
         concurrentGenerationLimit = preferences.concurrentGenerations
         rateLimitWaitSeconds = preferences.rateLimitWaitSeconds
-        normalizeVoiceVolumes = preferences.normalizeVoiceVolumes
         playbackBufferInput.value = String(playbackBufferSegments)
         concurrentGenerationInput.value = String(concurrentGenerationLimit)
         rateLimitWaitInput.value = String(rateLimitWaitSeconds)
-        normalizeVolumesToggle.checked = normalizeVoiceVolumes
       }
       lumiverseConnectionId = connections.some(connection => connection.id === preferences.connectionId)
         ? preferences.connectionId
@@ -2176,7 +2143,6 @@ export function setup(ctx: SpindleFrontendContext) {
         playbackBufferSegments,
         concurrentGenerationLimit,
         rateLimitWaitSeconds,
-        normalizeVoiceVolumes,
       )
       setStatus('Advanced playback settings saved globally.', 'saved')
     } catch (error) {
@@ -2476,7 +2442,6 @@ export function setup(ctx: SpindleFrontendContext) {
         playbackBufferSegments,
         concurrentGenerationLimit,
         rateLimitWaitSeconds,
-        normalizeVoiceVolumes,
       )
     }
     skippedTrackerTagsInput.destroy()
@@ -2486,7 +2451,6 @@ export function setup(ctx: SpindleFrontendContext) {
     playbackBufferInput.removeEventListener('change', onPlaybackBufferInput)
     concurrentGenerationInput.removeEventListener('change', onConcurrentGenerationInput)
     rateLimitWaitInput.removeEventListener('change', onRateLimitWaitInput)
-    normalizeVolumesToggle.removeEventListener('change', onNormalizeVolumesInput)
     addNpcInput.destroy()
     addNpcButton.removeEventListener('click', onAddNpc)
     addNpcInputSlot.removeEventListener('keydown', onAddNpcKeyDown)
