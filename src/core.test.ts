@@ -59,12 +59,37 @@ test('applies per-segment gain while assembling PCM WAV audio', () => {
   assert.equal(view.getInt16(46, true), -8192)
 })
 
-test('adjusts generation concurrency gradually from rolling segment lengths', () => {
-  assert.equal(adaptiveGenerationConcurrency(2, 2, [40, 80, 100]), 1)
-  assert.equal(adaptiveGenerationConcurrency(1, 2, [180, 220, 240]), 2)
-  assert.equal(adaptiveGenerationConcurrency(1, 1, [400, 500, 600]), 2)
-  assert.equal(adaptiveGenerationConcurrency(4, 1, [400, 500, 600]), 4)
-  assert.equal(adaptiveGenerationConcurrency(6, 6, [400, 500, 600]), 7)
+test('forces fragmented generation windows to one despite long outliers', () => {
+  assert.deepEqual(
+    adaptiveGenerationConcurrency(3, 3, [80, 90, 500, 100, 450, 110]),
+    { concurrency: 1, shortCooldown: 6, longWindowStreak: 0 },
+  )
+})
+
+test('requires sustained long windows before raising concurrency to its configured ceiling', () => {
+  const first = adaptiveGenerationConcurrency(1, 3, [400, 500, 600], 0, 0)
+  assert.deepEqual(first, { concurrency: 1, shortCooldown: 0, longWindowStreak: 1 })
+  assert.deepEqual(
+    adaptiveGenerationConcurrency(
+      first.concurrency,
+      3,
+      [420, 520, 620],
+      first.shortCooldown,
+      first.longWindowStreak,
+    ),
+    { concurrency: 2, shortCooldown: 0, longWindowStreak: 0 },
+  )
+  assert.deepEqual(
+    adaptiveGenerationConcurrency(1, 1, [400, 500, 600], 0, 1),
+    { concurrency: 1, shortCooldown: 0, longWindowStreak: 0 },
+  )
+})
+
+test('holds concurrency at one during the short-segment cooldown', () => {
+  assert.deepEqual(
+    adaptiveGenerationConcurrency(1, 4, [250, 260, 270], 6, 0),
+    { concurrency: 1, shortCooldown: 5, longWindowStreak: 0 },
+  )
 })
 
 test('merges adjacent segments that use the same voice', () => {

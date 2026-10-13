@@ -93,27 +93,54 @@ export interface PcmAudioSegment {
   gain?: number
 }
 
-/** Adjust TTS concurrency gradually from a rolling window of segment character counts. */
+export interface AdaptiveGenerationState {
+  concurrency: number
+  shortCooldown: number
+  longWindowStreak: number
+}
+
+/** Adjust TTS concurrency from fragmentation density while resisting rapid oscillation. */
 export function adaptiveGenerationConcurrency(
   current: number,
-  starting: number,
+  configuredMaximum: number,
   segmentLengths: number[],
+  shortCooldown = 0,
+  longWindowStreak = 0,
   maximum = 10,
-): number {
+): AdaptiveGenerationState {
   const safeMaximum = Math.max(1, Math.round(maximum))
-  const safeStarting = Math.min(safeMaximum, Math.max(1, Math.round(starting)))
-  const safeCurrent = Math.min(safeMaximum, Math.max(1, Math.round(current)))
+  const safeConfiguredMaximum = Math.min(safeMaximum, Math.max(1, Math.round(configuredMaximum)))
+  const safeCurrent = Math.min(safeConfiguredMaximum, Math.max(1, Math.round(current)))
+  const safeCooldown = Math.max(0, Math.round(shortCooldown))
+  const safeLongStreak = Math.max(0, Math.round(longWindowStreak))
   const lengths = segmentLengths.filter(length => Number.isFinite(length) && length >= 0)
-  if (lengths.length === 0) return safeCurrent
-  const averageLength = lengths.reduce((sum, length) => sum + length, 0) / lengths.length
-  if (averageLength < 120) return Math.max(1, safeCurrent - 1)
-  if (averageLength > 320) {
-    const adaptiveMaximum = safeStarting > 4 ? safeMaximum : Math.min(safeMaximum, 4)
-    return Math.min(adaptiveMaximum, safeCurrent + 1)
+  if (lengths.length === 0) {
+    return { concurrency: safeCurrent, shortCooldown: safeCooldown, longWindowStreak: safeLongStreak }
   }
-  if (safeCurrent < safeStarting) return safeCurrent + 1
-  if (safeCurrent > safeStarting) return safeCurrent - 1
-  return safeCurrent
+  const sorted = [...lengths].sort((left, right) => left - right)
+  const middle = Math.floor(sorted.length / 2)
+  const medianLength = sorted.length % 2 === 0
+    ? ((sorted[middle - 1] ?? 0) + (sorted[middle] ?? 0)) / 2
+    : sorted[middle] ?? 0
+  const shortCount = lengths.filter(length => length < 160).length
+  if (shortCount >= 3 || medianLength < 200) {
+    return { concurrency: 1, shortCooldown: 6, longWindowStreak: 0 }
+  }
+  if (safeCooldown > 0) {
+    return { concurrency: 1, shortCooldown: safeCooldown - 1, longWindowStreak: 0 }
+  }
+  if (shortCount === 0 && medianLength > 320) {
+    const nextStreak = safeLongStreak + 1
+    if (nextStreak >= 2) {
+      return {
+        concurrency: Math.min(safeConfiguredMaximum, safeCurrent + 1),
+        shortCooldown: 0,
+        longWindowStreak: 0,
+      }
+    }
+    return { concurrency: safeCurrent, shortCooldown: 0, longWindowStreak: nextStreak }
+  }
+  return { concurrency: safeCurrent, shortCooldown: 0, longWindowStreak: 0 }
 }
 
 /** Combine decoded audio into one PCM WAV so the host does not need FFmpeg to save it. */

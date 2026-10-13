@@ -899,11 +899,11 @@ export function setup(ctx: SpindleFrontendContext) {
   tab.root.appendChild(panel)
 
   const playbackBufferField = createField('Playback buffer segments')
-  const concurrentGenerationField = createField('Starting concurrent generations')
+  const concurrentGenerationField = createField('Maximum concurrent generations')
   const rateLimitWaitField = createField('Rate-limit wait budget (seconds)')
   const advancedHint = document.createElement('div')
   advancedHint.className = 'chat-voice-hint'
-  advancedHint.textContent = 'Concurrency starts at the selected value, then decreases for short-segment runs and increases gradually for long ones. Larger buffers reduce pauses but delay playback. The wait budget controls cumulative rate-limit cooldowns.'
+  advancedHint.textContent = 'Concurrency adapts up to the selected maximum. Dense short-segment runs force one request at a time, while sustained long runs increase gradually. Larger buffers reduce pauses but delay playback. The wait budget controls cumulative rate-limit cooldowns.'
   advancedBody.append(
     playbackBufferField.field,
     concurrentGenerationField.field,
@@ -961,7 +961,9 @@ export function setup(ctx: SpindleFrontendContext) {
   let activeSynthesisTasks = 0
 
   function effectiveSynthesisLimit(): number {
-    return Math.max(concurrentGenerationLimit, ...adaptiveSynthesisLimits.values())
+    return adaptiveSynthesisLimits.size > 0
+      ? Math.max(...adaptiveSynthesisLimits.values())
+      : concurrentGenerationLimit
   }
 
   function drainSynthesisQueue(): void {
@@ -1138,7 +1140,7 @@ export function setup(ctx: SpindleFrontendContext) {
   const concurrentGenerationInput = createNumberInput(
     DEFAULT_CONCURRENT_GENERATIONS,
     MAX_CONCURRENT_GENERATIONS,
-    'Starting concurrent generations',
+    'Maximum concurrent generations',
   )
   const rateLimitWaitInput = createNumberInput(
     DEFAULT_RATE_LIMIT_WAIT_SECONDS,
@@ -1591,6 +1593,11 @@ export function setup(ctx: SpindleFrontendContext) {
       type PreparedSegment =
         | { ok: true; segment: SynthesizedVoiceSegment }
         | { ok: false; error: unknown }
+      const adaptiveLimitToken = Symbol('playback-concurrency')
+      let adaptiveConcurrency = preferences.concurrentGenerations
+      let shortConcurrencyCooldown = 0
+      let longWindowStreak = 0
+      let rateLimitedForRemainder = false
       const prepare = async (index: number): Promise<PreparedSegment> => {
         try {
           const segment = await runSynthesisTask(() => synthesizeVoiceSegment(
@@ -1607,6 +1614,12 @@ export function setup(ctx: SpindleFrontendContext) {
               return gate
             })(),
             (delayMs, cumulativeWaitMs) => {
+              rateLimitedForRemainder = true
+              adaptiveConcurrency = 1
+              shortConcurrencyCooldown = 0
+              longWindowStreak = 0
+              adaptiveSynthesisLimits.set(adaptiveLimitToken, 1)
+              drainSynthesisQueue()
               if (ctx.getActiveChat().chatId === playbackChat.id && (!activePlayback || activePlayback === playback)) {
                 setStatus(
                   `Rate limited; resuming in ${Math.max(1, Math.ceil(delayMs / 1_000))}s… `
@@ -1627,8 +1640,17 @@ export function setup(ctx: SpindleFrontendContext) {
       }))
       let synthesisCursor = 0
       let localSynthesisTasks = 0
-      let adaptiveConcurrency = preferences.concurrentGenerations
-      const adaptiveLimitToken = Symbol('playback-concurrency')
+      const initialAdaptiveState = adaptiveGenerationConcurrency(
+        adaptiveConcurrency,
+        preferences.concurrentGenerations,
+        plan.slice(0, 6).map(segment => segment.text.length),
+        shortConcurrencyCooldown,
+        longWindowStreak,
+        MAX_CONCURRENT_GENERATIONS,
+      )
+      adaptiveConcurrency = initialAdaptiveState.concurrency
+      shortConcurrencyCooldown = initialAdaptiveState.shortCooldown
+      longWindowStreak = initialAdaptiveState.longWindowStreak
       adaptiveSynthesisLimits.set(adaptiveLimitToken, adaptiveConcurrency)
       const scheduleSynthesis = () => {
         while (localSynthesisTasks < adaptiveConcurrency && synthesisCursor < plan.length) {
@@ -1638,17 +1660,20 @@ export function setup(ctx: SpindleFrontendContext) {
             preparedResolvers[index](result)
           }).finally(() => {
             localSynthesisTasks -= 1
-            const rollingLengths = plan
-              .slice(index, Math.min(plan.length, index + 3))
-              .map(segment => segment.text.length)
-            const nextConcurrency = adaptiveGenerationConcurrency(
-              adaptiveConcurrency,
-              preferences.concurrentGenerations,
-              rollingLengths,
-              MAX_CONCURRENT_GENERATIONS,
-            )
-            if (nextConcurrency !== adaptiveConcurrency) {
-              adaptiveConcurrency = nextConcurrency
+            if (!rateLimitedForRemainder) {
+              const nextState = adaptiveGenerationConcurrency(
+                adaptiveConcurrency,
+                preferences.concurrentGenerations,
+                plan
+                  .slice(index + 1, Math.min(plan.length, index + 7))
+                  .map(segment => segment.text.length),
+                shortConcurrencyCooldown,
+                longWindowStreak,
+                MAX_CONCURRENT_GENERATIONS,
+              )
+              adaptiveConcurrency = nextState.concurrency
+              shortConcurrencyCooldown = nextState.shortCooldown
+              longWindowStreak = nextState.longWindowStreak
               adaptiveSynthesisLimits.set(adaptiveLimitToken, adaptiveConcurrency)
               drainSynthesisQueue()
             }
