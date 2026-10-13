@@ -138,6 +138,14 @@ const DEFAULT_RATE_LIMIT_WAIT_SECONDS = 60
 const MAX_PLAYBACK_BUFFER_SEGMENTS = 20
 const MAX_CONCURRENT_GENERATIONS = 10
 const MAX_RATE_LIMIT_WAIT_SECONDS = 3_600
+const NORMALIZATION_TARGET_RMS = 0.1
+const NORMALIZATION_SILENCE_GATE = 0.01
+const NORMALIZATION_MIN_DURATION_SECONDS = 0.6
+const NORMALIZATION_MIN_ACTIVE_SECONDS = 0.25
+const NORMALIZATION_PROFILE_WEIGHT = 0.75
+const NORMALIZATION_MIN_GAIN = 10 ** (-6 / 20)
+const NORMALIZATION_MAX_GAIN = 10 ** (6 / 20)
+const NORMALIZATION_PEAK_CEILING = 10 ** (-1 / 20)
 
 interface DetectedCharacterState {
   id: string
@@ -212,6 +220,8 @@ interface PlaybackMessage {
 interface SynthesizedVoiceSegment {
   data: ArrayBuffer
   mime: string
+  decodedBuffer?: AudioBuffer
+  normalizationGain?: number
 }
 
 interface SavedAudioAttachment {
@@ -247,6 +257,7 @@ interface PlaybackPreferences {
   playbackBufferSegments: number
   concurrentGenerations: number
   rateLimitWaitSeconds: number
+  normalizeVoiceVolumes: boolean
 }
 
 function clampIntegerSetting(value: unknown, fallback: number, maximum: number): number {
@@ -301,6 +312,7 @@ async function loadPlaybackPreferences(): Promise<PlaybackPreferences> {
     playbackBufferSegments: DEFAULT_PLAYBACK_BUFFER_SEGMENTS,
     concurrentGenerations: DEFAULT_CONCURRENT_GENERATIONS,
     rateLimitWaitSeconds: DEFAULT_RATE_LIMIT_WAIT_SECONDS,
+    normalizeVoiceVolumes: false,
   }
   const row = await response.json() as { value?: Record<string, unknown> }
   const speed = typeof row.value?.ttsSpeed === 'number' ? row.value.ttsSpeed : 1
@@ -342,6 +354,7 @@ async function loadPlaybackPreferences(): Promise<PlaybackPreferences> {
       DEFAULT_RATE_LIMIT_WAIT_SECONDS,
       MAX_RATE_LIMIT_WAIT_SECONDS,
     ),
+    normalizeVoiceVolumes: row.value?.chatVoiceNormalizeVoiceVolumes === true,
   }
 }
 
@@ -408,6 +421,7 @@ function saveAdvancedPlaybackPreferences(
   bufferSegments: number,
   concurrentGenerations: number,
   rateLimitWaitSeconds: number,
+  normalizeVoiceVolumes: boolean,
 ): Promise<void> {
   return updateVoiceSettings(current => ({
     ...current,
@@ -426,6 +440,7 @@ function saveAdvancedPlaybackPreferences(
       DEFAULT_RATE_LIMIT_WAIT_SECONDS,
       MAX_RATE_LIMIT_WAIT_SECONDS,
     ),
+    chatVoiceNormalizeVoiceVolumes: normalizeVoiceVolumes,
   }))
 }
 
@@ -489,6 +504,57 @@ function retryAfterMilliseconds(value: string | null): number | null {
   if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1_000
   const timestamp = Date.parse(value)
   return Number.isFinite(timestamp) ? Math.max(0, timestamp - Date.now()) : null
+}
+
+function normalizedVoiceGain(
+  buffer: AudioBuffer,
+  voiceKey: string,
+  profiles: Map<string, number>,
+): number {
+  let peak = 0
+  let gatedSquareSum = 0
+  let gatedSampleCount = 0
+  let activeFrames = 0
+  const channels = Array.from(
+    { length: buffer.numberOfChannels },
+    (_, channel) => buffer.getChannelData(channel),
+  )
+  for (let frame = 0; frame < buffer.length; frame += 1) {
+    let framePeak = 0
+    let frameSquareSum = 0
+    for (const channel of channels) {
+      const sample = channel[frame] ?? 0
+      const magnitude = Math.abs(sample)
+      framePeak = Math.max(framePeak, magnitude)
+      peak = Math.max(peak, magnitude)
+      frameSquareSum += sample * sample
+    }
+    if (framePeak < NORMALIZATION_SILENCE_GATE) continue
+    activeFrames += 1
+    gatedSquareSum += frameSquareSum
+    gatedSampleCount += channels.length
+  }
+
+  const measuredRms = gatedSampleCount > 0 ? Math.sqrt(gatedSquareSum / gatedSampleCount) : 0
+  const substantial = buffer.duration >= NORMALIZATION_MIN_DURATION_SECONDS
+    && activeFrames >= buffer.sampleRate * NORMALIZATION_MIN_ACTIVE_SECONDS
+    && measuredRms > 0
+  const previousRms = profiles.get(voiceKey)
+  if (substantial) {
+    profiles.set(
+      voiceKey,
+      previousRms === undefined
+        ? measuredRms
+        : previousRms * NORMALIZATION_PROFILE_WEIGHT + measuredRms * (1 - NORMALIZATION_PROFILE_WEIGHT),
+    )
+  }
+
+  const referenceRms = profiles.get(voiceKey)
+  let gain = referenceRms === undefined
+    ? 1
+    : Math.min(NORMALIZATION_MAX_GAIN, Math.max(NORMALIZATION_MIN_GAIN, NORMALIZATION_TARGET_RMS / referenceRms))
+  if (peak > 0) gain = Math.min(gain, NORMALIZATION_PEAK_CEILING / peak)
+  return Math.max(0, gain)
 }
 
 async function waitForSynthesisSlot(pacer: SynthesisPacer, signal: AbortSignal): Promise<void> {
@@ -839,6 +905,21 @@ export function setup(ctx: SpindleFrontendContext) {
   const playbackBufferField = createField('Playback buffer segments')
   const concurrentGenerationField = createField('Concurrent generations')
   const rateLimitWaitField = createField('Rate-limit wait budget (seconds)')
+  const normalizeVolumesLabel = document.createElement('label')
+  normalizeVolumesLabel.className = 'chat-voice-toggle'
+  const normalizeVolumesToggle = document.createElement('input')
+  normalizeVolumesToggle.type = 'checkbox'
+  normalizeVolumesToggle.checked = false
+  normalizeVolumesToggle.setAttribute('aria-label', 'Normalize voice volumes')
+  const normalizeVolumesCopy = document.createElement('span')
+  normalizeVolumesCopy.className = 'chat-voice-toggle-copy'
+  const normalizeVolumesText = document.createElement('span')
+  normalizeVolumesText.textContent = 'Normalize voice volumes'
+  const normalizeVolumesHint = document.createElement('span')
+  normalizeVolumesHint.className = 'chat-voice-toggle-hint'
+  normalizeVolumesHint.textContent = 'Balance perceived speech volume with a rolling per-voice profile. Disabled by default.'
+  normalizeVolumesCopy.append(normalizeVolumesText, normalizeVolumesHint)
+  normalizeVolumesLabel.append(normalizeVolumesToggle, normalizeVolumesCopy)
   const advancedHint = document.createElement('div')
   advancedHint.className = 'chat-voice-hint'
   advancedHint.textContent = 'Larger buffers can reduce pauses but delay playback. Higher concurrency increases API load. The wait budget controls how long a playback may cumulatively pause and retry after rate limits.'
@@ -846,6 +927,7 @@ export function setup(ctx: SpindleFrontendContext) {
     playbackBufferField.field,
     concurrentGenerationField.field,
     rateLimitWaitField.field,
+    normalizeVolumesLabel,
     advancedHint,
   )
 
@@ -870,6 +952,7 @@ export function setup(ctx: SpindleFrontendContext) {
   let playbackBufferSegments = DEFAULT_PLAYBACK_BUFFER_SEGMENTS
   let concurrentGenerationLimit = DEFAULT_CONCURRENT_GENERATIONS
   let rateLimitWaitSeconds = DEFAULT_RATE_LIMIT_WAIT_SECONDS
+  let normalizeVoiceVolumes = false
   let advancedSettingsSaveTimer: ReturnType<typeof setTimeout> | null = null
   let savingAdvancedSettings = false
   let saveTimer: ReturnType<typeof setTimeout> | null = null
@@ -1084,9 +1167,14 @@ export function setup(ctx: SpindleFrontendContext) {
   const onPlaybackBufferInput = () => onPlaybackBufferChanged(playbackBufferInput.valueAsNumber)
   const onConcurrentGenerationInput = () => onConcurrentGenerationsChanged(concurrentGenerationInput.valueAsNumber)
   const onRateLimitWaitInput = () => onRateLimitWaitChanged(rateLimitWaitInput.valueAsNumber)
+  const onNormalizeVolumesInput = () => {
+    normalizeVoiceVolumes = normalizeVolumesToggle.checked
+    scheduleAdvancedSettingsSave()
+  }
   playbackBufferInput.addEventListener('change', onPlaybackBufferInput)
   concurrentGenerationInput.addEventListener('change', onConcurrentGenerationInput)
   rateLimitWaitInput.addEventListener('change', onRateLimitWaitInput)
+  normalizeVolumesToggle.addEventListener('change', onNormalizeVolumesInput)
 
   const addNpcInput = ctx.components.mountTextInput(addNpcInputSlot, {
     value: '', placeholder: 'NPC name / aliases', ariaLabel: 'NPC name and aliases to add', disabled: true,
@@ -1262,16 +1350,17 @@ export function setup(ctx: SpindleFrontendContext) {
 
   async function playDecodedBuffer(
     playback: NonNullable<typeof activePlayback>,
-    data: ArrayBuffer,
+    segment: SynthesizedVoiceSegment,
     volume: number,
   ): Promise<AudioBuffer> {
     if (playback.controller.signal.aborted) throw new DOMException('Playback stopped.', 'AbortError')
-    const buffer = await playback.context.decodeAudioData(data.slice(0))
+    const buffer = segment.decodedBuffer
+      ?? await playback.context.decodeAudioData(segment.data.slice(0))
     if (playback.controller.signal.aborted) throw new DOMException('Playback stopped.', 'AbortError')
     await new Promise<void>((resolve, reject) => {
       const source = playback.context.createBufferSource()
       const gain = playback.context.createGain()
-      gain.gain.value = volume
+      gain.gain.value = volume * (segment.normalizationGain ?? 1)
       source.buffer = buffer
       source.connect(gain)
       gain.connect(playback.context.destination)
@@ -1299,14 +1388,15 @@ export function setup(ctx: SpindleFrontendContext) {
     try {
       const decoded: AudioBuffer[] = []
       for (const segment of segments) {
-        decoded.push(await decodeContext.decodeAudioData(segment.data.slice(0)))
+        decoded.push(segment.decodedBuffer ?? await decodeContext.decodeAudioData(segment.data.slice(0)))
       }
-      return encodeConcatenatedWav(decoded.map(buffer => ({
+      return encodeConcatenatedWav(decoded.map((buffer, index) => ({
         sampleRate: buffer.sampleRate,
         channels: Array.from(
           { length: buffer.numberOfChannels },
           (_, channel) => buffer.getChannelData(channel),
         ),
+        gain: segments[index]?.normalizationGain ?? 1,
       })))
     } finally {
       await decodeContext.close().catch(() => undefined)
@@ -1321,15 +1411,27 @@ export function setup(ctx: SpindleFrontendContext) {
     contextClass: typeof AudioContext,
     signal: AbortSignal,
     waitForSafeFallback: () => Promise<void>,
-    onWavFallback: () => void,
+    onWavAssembly: (normalized: boolean) => void,
   ): Promise<SavedMessageAudioResult> {
+    const normalized = segments.some(segment => segment.normalizationGain !== undefined)
+    if (normalized) {
+      onWavAssembly(true)
+      const wav = await encodeCapturedWav(segments, contextClass)
+      return saveMessageAudio(
+        chatId,
+        messageId,
+        swipeId,
+        [{ data: wav, mime: 'audio/wav' }],
+        signal,
+      )
+    }
     try {
       return await saveMessageAudio(chatId, messageId, swipeId, segments, signal)
     } catch (segmentSaveError) {
       if ((segmentSaveError as { name?: string })?.name === 'AbortError') throw segmentSaveError
       await waitForSafeFallback()
       if (signal.aborted) throw new DOMException('Audio saving stopped.', 'AbortError')
-      onWavFallback()
+      onWavAssembly(false)
       const wav = await encodeCapturedWav(segments, contextClass)
       return saveMessageAudio(
         chatId,
@@ -1411,10 +1513,12 @@ export function setup(ctx: SpindleFrontendContext) {
       preferences.playbackBufferSegments = playbackBufferSegments
       preferences.concurrentGenerations = concurrentGenerationLimit
       preferences.rateLimitWaitSeconds = rateLimitWaitSeconds
+      preferences.normalizeVoiceVolumes = normalizeVoiceVolumes
     } else {
       playbackBufferSegments = preferences.playbackBufferSegments
       concurrentGenerationLimit = preferences.concurrentGenerations
       rateLimitWaitSeconds = preferences.rateLimitWaitSeconds
+      normalizeVoiceVolumes = preferences.normalizeVoiceVolumes
     }
     const connectionId = config.connectionId
       || (connections.some(connection => connection.id === preferences.connectionId)
@@ -1554,9 +1658,32 @@ export function setup(ctx: SpindleFrontendContext) {
       }
       const workerCount = Math.min(preferences.concurrentGenerations, plan.length)
       for (let index = 0; index < workerCount; index += 1) void runSynthesisWorker()
+      const normalizationContext = preferences.normalizeVoiceVolumes ? new contextClass() : null
+      const voiceLoudnessProfiles = new Map<string, number>()
+      let normalizationChain: Promise<void> = Promise.resolve()
+      const processed = prepared.map((pending, index) => {
+        const processing = normalizationChain.then(async (): Promise<PreparedSegment> => {
+          const result = await pending
+          if (!result.ok || !normalizationContext) return result
+          const decodedBuffer = await normalizationContext.decodeAudioData(result.segment.data.slice(0))
+          const voiceKey = plan[index].voice.trim().toLowerCase() || '__connection-default__'
+          const normalizationGain = normalizedVoiceGain(decodedBuffer, voiceKey, voiceLoudnessProfiles)
+          return {
+            ok: true,
+            segment: { ...result.segment, decodedBuffer, normalizationGain },
+          }
+        })
+        normalizationChain = processing.then(() => undefined, () => undefined)
+        return processing
+      })
+      if (normalizationContext) {
+        void Promise.all(processed)
+          .finally(() => normalizationContext.close().catch(() => undefined))
+          .catch(() => undefined)
+      }
       if (preferences.saveGeneratedAudio || regeneratingSavedAudio) {
         playback.persistenceState = 'pending'
-        void Promise.all(prepared).then(async (results) => {
+        void Promise.all(processed).then(async (results) => {
           const failed = results.find((result): result is { ok: false; error: unknown } => !result.ok)
           if (failed) throw failed.error
           const captured = results.filter(
@@ -1564,6 +1691,8 @@ export function setup(ctx: SpindleFrontendContext) {
           ).map(result => ({
             data: result.segment.data.slice(0),
             mime: result.segment.mime,
+            decodedBuffer: result.segment.decodedBuffer,
+            normalizationGain: result.segment.normalizationGain,
           }))
           const saved = await persistCapturedAudio(
             playbackChat.id,
@@ -1573,9 +1702,11 @@ export function setup(ctx: SpindleFrontendContext) {
             contextClass,
             synthesisController.signal,
             () => playback.audibleDone,
-            () => {
+            (normalized) => {
               if (ctx.getActiveChat().chatId === playbackChat.id && (!activePlayback || activePlayback === playback)) {
-                setStatus('Server could not combine the source audio; retrying as WAV…')
+                setStatus(normalized
+                  ? 'Preparing normalized saved audio…'
+                  : 'Server could not combine the source audio; retrying as WAV…')
               }
             },
           )
@@ -1622,7 +1753,7 @@ export function setup(ctx: SpindleFrontendContext) {
         })
       } else {
         playback.persistenceState = 'disabled'
-        void Promise.all(prepared)
+        void Promise.all(processed)
           .catch(() => undefined)
           .finally(() => {
             backgroundSynthesisControllers.delete(synthesisController)
@@ -1633,13 +1764,13 @@ export function setup(ctx: SpindleFrontendContext) {
       setStatus(
         `Buffering ${initialBufferSize} voice segment${initialBufferSize === 1 ? '' : 's'} before playback…`,
       )
-      await Promise.all(prepared.slice(0, initialBufferSize))
+      await Promise.all(processed.slice(0, initialBufferSize))
 
       for (let index = 0; index < plan.length; index += 1) {
-        const current = await prepared[index]
+        const current = await processed[index]
         if (!current.ok) throw current.error
         setStatus(`Playing ${index + 1} of ${plan.length} voice segment${plan.length === 1 ? '' : 's'}…`)
-        await playDecodedBuffer(playback, current.segment.data, preferences.volume)
+        await playDecodedBuffer(playback, current.segment, preferences.volume)
       }
       playback.playbackFinished = true
       playback.finishAudible()
@@ -1905,9 +2036,11 @@ export function setup(ctx: SpindleFrontendContext) {
         playbackBufferSegments = preferences.playbackBufferSegments
         concurrentGenerationLimit = preferences.concurrentGenerations
         rateLimitWaitSeconds = preferences.rateLimitWaitSeconds
+        normalizeVoiceVolumes = preferences.normalizeVoiceVolumes
         playbackBufferInput.value = String(playbackBufferSegments)
         concurrentGenerationInput.value = String(concurrentGenerationLimit)
         rateLimitWaitInput.value = String(rateLimitWaitSeconds)
+        normalizeVolumesToggle.checked = normalizeVoiceVolumes
       }
       lumiverseConnectionId = connections.some(connection => connection.id === preferences.connectionId)
         ? preferences.connectionId
@@ -2043,6 +2176,7 @@ export function setup(ctx: SpindleFrontendContext) {
         playbackBufferSegments,
         concurrentGenerationLimit,
         rateLimitWaitSeconds,
+        normalizeVoiceVolumes,
       )
       setStatus('Advanced playback settings saved globally.', 'saved')
     } catch (error) {
@@ -2342,6 +2476,7 @@ export function setup(ctx: SpindleFrontendContext) {
         playbackBufferSegments,
         concurrentGenerationLimit,
         rateLimitWaitSeconds,
+        normalizeVoiceVolumes,
       )
     }
     skippedTrackerTagsInput.destroy()
@@ -2351,6 +2486,7 @@ export function setup(ctx: SpindleFrontendContext) {
     playbackBufferInput.removeEventListener('change', onPlaybackBufferInput)
     concurrentGenerationInput.removeEventListener('change', onConcurrentGenerationInput)
     rateLimitWaitInput.removeEventListener('change', onRateLimitWaitInput)
+    normalizeVolumesToggle.removeEventListener('change', onNormalizeVolumesInput)
     addNpcInput.destroy()
     addNpcButton.removeEventListener('click', onAddNpc)
     addNpcInputSlot.removeEventListener('keydown', onAddNpcKeyDown)

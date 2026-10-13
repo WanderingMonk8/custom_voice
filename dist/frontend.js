@@ -37,6 +37,7 @@ function encodeConcatenatedWav(segments) {
   usable.forEach((segment, segmentIndex) => {
     const outputFrames = frameCounts[segmentIndex];
     const sourceFrames = Math.max(...segment.channels.map((channel) => channel.length));
+    const gain = Number.isFinite(segment.gain) ? Math.max(0, segment.gain ?? 1) : 1;
     for (let frame = 0; frame < outputFrames; frame += 1) {
       const sourcePosition = outputFrames === 1 ? 0 : frame * (sourceFrames - 1) / (outputFrames - 1);
       const lower = Math.floor(sourcePosition);
@@ -46,7 +47,7 @@ function encodeConcatenatedWav(segments) {
         const channel = segment.channels[Math.min(channelIndex, segment.channels.length - 1)];
         const lowerValue = channel[Math.min(lower, channel.length - 1)] ?? 0;
         const upperValue = channel[Math.min(upper, channel.length - 1)] ?? lowerValue;
-        const sample = Math.max(-1, Math.min(1, lowerValue + (upperValue - lowerValue) * fraction));
+        const sample = Math.max(-1, Math.min(1, (lowerValue + (upperValue - lowerValue) * fraction) * gain));
         view.setInt16(writeOffset, sample < 0 ? sample * 32768 : sample * 32767, true);
         writeOffset += bytesPerSample;
       }
@@ -730,6 +731,14 @@ var DEFAULT_RATE_LIMIT_WAIT_SECONDS = 60;
 var MAX_PLAYBACK_BUFFER_SEGMENTS = 20;
 var MAX_CONCURRENT_GENERATIONS = 10;
 var MAX_RATE_LIMIT_WAIT_SECONDS = 3600;
+var NORMALIZATION_TARGET_RMS = 0.1;
+var NORMALIZATION_SILENCE_GATE = 0.01;
+var NORMALIZATION_MIN_DURATION_SECONDS = 0.6;
+var NORMALIZATION_MIN_ACTIVE_SECONDS = 0.25;
+var NORMALIZATION_PROFILE_WEIGHT = 0.75;
+var NORMALIZATION_MIN_GAIN = 10 ** (-6 / 20);
+var NORMALIZATION_MAX_GAIN = 10 ** (6 / 20);
+var NORMALIZATION_PEAK_CEILING = 10 ** (-1 / 20);
 function clampIntegerSetting(value, fallback, maximum) {
   const numeric = typeof value === "number" ? value : Number(value);
   if (!Number.isFinite(numeric)) return fallback;
@@ -777,7 +786,8 @@ async function loadPlaybackPreferences() {
     llmModel: "",
     playbackBufferSegments: DEFAULT_PLAYBACK_BUFFER_SEGMENTS,
     concurrentGenerations: DEFAULT_CONCURRENT_GENERATIONS,
-    rateLimitWaitSeconds: DEFAULT_RATE_LIMIT_WAIT_SECONDS
+    rateLimitWaitSeconds: DEFAULT_RATE_LIMIT_WAIT_SECONDS,
+    normalizeVoiceVolumes: false
   };
   const row = await response.json();
   const speed = typeof row.value?.ttsSpeed === "number" ? row.value.ttsSpeed : 1;
@@ -807,7 +817,8 @@ async function loadPlaybackPreferences() {
       row.value?.chatVoiceRateLimitWaitSeconds,
       DEFAULT_RATE_LIMIT_WAIT_SECONDS,
       MAX_RATE_LIMIT_WAIT_SECONDS
-    )
+    ),
+    normalizeVoiceVolumes: row.value?.chatVoiceNormalizeVoiceVolumes === true
   };
 }
 var voiceSettingsWriteQueue = Promise.resolve();
@@ -857,7 +868,7 @@ function saveLlmParsingPreferences(mode, connectionId, model) {
     chatVoiceLlmModel: model.trim().slice(0, 256)
   }));
 }
-function saveAdvancedPlaybackPreferences(bufferSegments, concurrentGenerations, rateLimitWaitSeconds) {
+function saveAdvancedPlaybackPreferences(bufferSegments, concurrentGenerations, rateLimitWaitSeconds, normalizeVoiceVolumes) {
   return updateVoiceSettings((current) => ({
     ...current,
     chatVoicePlaybackBufferSegments: clampIntegerSetting(
@@ -874,7 +885,8 @@ function saveAdvancedPlaybackPreferences(bufferSegments, concurrentGenerations, 
       rateLimitWaitSeconds,
       DEFAULT_RATE_LIMIT_WAIT_SECONDS,
       MAX_RATE_LIMIT_WAIT_SECONDS
-    )
+    ),
+    chatVoiceNormalizeVoiceVolumes: normalizeVoiceVolumes
   }));
 }
 async function deleteSavedAudioRecord(record) {
@@ -930,6 +942,44 @@ function retryAfterMilliseconds(value) {
   if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1e3;
   const timestamp = Date.parse(value);
   return Number.isFinite(timestamp) ? Math.max(0, timestamp - Date.now()) : null;
+}
+function normalizedVoiceGain(buffer, voiceKey, profiles) {
+  let peak = 0;
+  let gatedSquareSum = 0;
+  let gatedSampleCount = 0;
+  let activeFrames = 0;
+  const channels = Array.from(
+    { length: buffer.numberOfChannels },
+    (_, channel) => buffer.getChannelData(channel)
+  );
+  for (let frame = 0; frame < buffer.length; frame += 1) {
+    let framePeak = 0;
+    let frameSquareSum = 0;
+    for (const channel of channels) {
+      const sample = channel[frame] ?? 0;
+      const magnitude = Math.abs(sample);
+      framePeak = Math.max(framePeak, magnitude);
+      peak = Math.max(peak, magnitude);
+      frameSquareSum += sample * sample;
+    }
+    if (framePeak < NORMALIZATION_SILENCE_GATE) continue;
+    activeFrames += 1;
+    gatedSquareSum += frameSquareSum;
+    gatedSampleCount += channels.length;
+  }
+  const measuredRms = gatedSampleCount > 0 ? Math.sqrt(gatedSquareSum / gatedSampleCount) : 0;
+  const substantial = buffer.duration >= NORMALIZATION_MIN_DURATION_SECONDS && activeFrames >= buffer.sampleRate * NORMALIZATION_MIN_ACTIVE_SECONDS && measuredRms > 0;
+  const previousRms = profiles.get(voiceKey);
+  if (substantial) {
+    profiles.set(
+      voiceKey,
+      previousRms === void 0 ? measuredRms : previousRms * NORMALIZATION_PROFILE_WEIGHT + measuredRms * (1 - NORMALIZATION_PROFILE_WEIGHT)
+    );
+  }
+  const referenceRms = profiles.get(voiceKey);
+  let gain = referenceRms === void 0 ? 1 : Math.min(NORMALIZATION_MAX_GAIN, Math.max(NORMALIZATION_MIN_GAIN, NORMALIZATION_TARGET_RMS / referenceRms));
+  if (peak > 0) gain = Math.min(gain, NORMALIZATION_PEAK_CEILING / peak);
+  return Math.max(0, gain);
 }
 async function waitForSynthesisSlot(pacer, signal) {
   const turn = pacer.startQueue.then(async () => {
@@ -1249,6 +1299,21 @@ function setup(ctx) {
   const playbackBufferField = createField("Playback buffer segments");
   const concurrentGenerationField = createField("Concurrent generations");
   const rateLimitWaitField = createField("Rate-limit wait budget (seconds)");
+  const normalizeVolumesLabel = document.createElement("label");
+  normalizeVolumesLabel.className = "chat-voice-toggle";
+  const normalizeVolumesToggle = document.createElement("input");
+  normalizeVolumesToggle.type = "checkbox";
+  normalizeVolumesToggle.checked = false;
+  normalizeVolumesToggle.setAttribute("aria-label", "Normalize voice volumes");
+  const normalizeVolumesCopy = document.createElement("span");
+  normalizeVolumesCopy.className = "chat-voice-toggle-copy";
+  const normalizeVolumesText = document.createElement("span");
+  normalizeVolumesText.textContent = "Normalize voice volumes";
+  const normalizeVolumesHint = document.createElement("span");
+  normalizeVolumesHint.className = "chat-voice-toggle-hint";
+  normalizeVolumesHint.textContent = "Balance perceived speech volume with a rolling per-voice profile. Disabled by default.";
+  normalizeVolumesCopy.append(normalizeVolumesText, normalizeVolumesHint);
+  normalizeVolumesLabel.append(normalizeVolumesToggle, normalizeVolumesCopy);
   const advancedHint = document.createElement("div");
   advancedHint.className = "chat-voice-hint";
   advancedHint.textContent = "Larger buffers can reduce pauses but delay playback. Higher concurrency increases API load. The wait budget controls how long a playback may cumulatively pause and retry after rate limits.";
@@ -1256,6 +1321,7 @@ function setup(ctx) {
     playbackBufferField.field,
     concurrentGenerationField.field,
     rateLimitWaitField.field,
+    normalizeVolumesLabel,
     advancedHint
   );
   let applyingState = false;
@@ -1279,6 +1345,7 @@ function setup(ctx) {
   let playbackBufferSegments = DEFAULT_PLAYBACK_BUFFER_SEGMENTS;
   let concurrentGenerationLimit = DEFAULT_CONCURRENT_GENERATIONS;
   let rateLimitWaitSeconds = DEFAULT_RATE_LIMIT_WAIT_SECONDS;
+  let normalizeVoiceVolumes = false;
   let advancedSettingsSaveTimer = null;
   let savingAdvancedSettings = false;
   let saveTimer = null;
@@ -1445,9 +1512,14 @@ function setup(ctx) {
   const onPlaybackBufferInput = () => onPlaybackBufferChanged(playbackBufferInput.valueAsNumber);
   const onConcurrentGenerationInput = () => onConcurrentGenerationsChanged(concurrentGenerationInput.valueAsNumber);
   const onRateLimitWaitInput = () => onRateLimitWaitChanged(rateLimitWaitInput.valueAsNumber);
+  const onNormalizeVolumesInput = () => {
+    normalizeVoiceVolumes = normalizeVolumesToggle.checked;
+    scheduleAdvancedSettingsSave();
+  };
   playbackBufferInput.addEventListener("change", onPlaybackBufferInput);
   concurrentGenerationInput.addEventListener("change", onConcurrentGenerationInput);
   rateLimitWaitInput.addEventListener("change", onRateLimitWaitInput);
+  normalizeVolumesToggle.addEventListener("change", onNormalizeVolumesInput);
   const addNpcInput = ctx.components.mountTextInput(addNpcInputSlot, {
     value: "",
     placeholder: "NPC name / aliases",
@@ -1610,14 +1682,14 @@ function setup(ctx) {
     updatePlaybackButtons();
     return playback.persistenceState === "pending";
   }
-  async function playDecodedBuffer(playback, data, volume) {
+  async function playDecodedBuffer(playback, segment, volume) {
     if (playback.controller.signal.aborted) throw new DOMException("Playback stopped.", "AbortError");
-    const buffer = await playback.context.decodeAudioData(data.slice(0));
+    const buffer = segment.decodedBuffer ?? await playback.context.decodeAudioData(segment.data.slice(0));
     if (playback.controller.signal.aborted) throw new DOMException("Playback stopped.", "AbortError");
     await new Promise((resolve, reject) => {
       const source = playback.context.createBufferSource();
       const gain = playback.context.createGain();
-      gain.gain.value = volume;
+      gain.gain.value = volume * (segment.normalizationGain ?? 1);
       source.buffer = buffer;
       source.connect(gain);
       gain.connect(playback.context.destination);
@@ -1644,27 +1716,40 @@ function setup(ctx) {
     try {
       const decoded = [];
       for (const segment of segments) {
-        decoded.push(await decodeContext.decodeAudioData(segment.data.slice(0)));
+        decoded.push(segment.decodedBuffer ?? await decodeContext.decodeAudioData(segment.data.slice(0)));
       }
-      return encodeConcatenatedWav(decoded.map((buffer) => ({
+      return encodeConcatenatedWav(decoded.map((buffer, index) => ({
         sampleRate: buffer.sampleRate,
         channels: Array.from(
           { length: buffer.numberOfChannels },
           (_, channel) => buffer.getChannelData(channel)
-        )
+        ),
+        gain: segments[index]?.normalizationGain ?? 1
       })));
     } finally {
       await decodeContext.close().catch(() => void 0);
     }
   }
-  async function persistCapturedAudio(chatId, messageId, swipeId, segments, contextClass, signal, waitForSafeFallback, onWavFallback) {
+  async function persistCapturedAudio(chatId, messageId, swipeId, segments, contextClass, signal, waitForSafeFallback, onWavAssembly) {
+    const normalized = segments.some((segment) => segment.normalizationGain !== void 0);
+    if (normalized) {
+      onWavAssembly(true);
+      const wav = await encodeCapturedWav(segments, contextClass);
+      return saveMessageAudio(
+        chatId,
+        messageId,
+        swipeId,
+        [{ data: wav, mime: "audio/wav" }],
+        signal
+      );
+    }
     try {
       return await saveMessageAudio(chatId, messageId, swipeId, segments, signal);
     } catch (segmentSaveError) {
       if (segmentSaveError?.name === "AbortError") throw segmentSaveError;
       await waitForSafeFallback();
       if (signal.aborted) throw new DOMException("Audio saving stopped.", "AbortError");
-      onWavFallback();
+      onWavAssembly(false);
       const wav = await encodeCapturedWav(segments, contextClass);
       return saveMessageAudio(
         chatId,
@@ -1740,10 +1825,12 @@ function setup(ctx) {
       preferences.playbackBufferSegments = playbackBufferSegments;
       preferences.concurrentGenerations = concurrentGenerationLimit;
       preferences.rateLimitWaitSeconds = rateLimitWaitSeconds;
+      preferences.normalizeVoiceVolumes = normalizeVoiceVolumes;
     } else {
       playbackBufferSegments = preferences.playbackBufferSegments;
       concurrentGenerationLimit = preferences.concurrentGenerations;
       rateLimitWaitSeconds = preferences.rateLimitWaitSeconds;
+      normalizeVoiceVolumes = preferences.normalizeVoiceVolumes;
     }
     const connectionId = config.connectionId || (connections.some((connection) => connection.id === preferences.connectionId) ? preferences.connectionId : connections.find((connection) => connection.is_default)?.id ?? lumiverseConnectionId);
     if (!connectionId) {
@@ -1863,16 +1950,39 @@ function setup(ctx) {
       };
       const workerCount = Math.min(preferences.concurrentGenerations, plan.length);
       for (let index = 0; index < workerCount; index += 1) void runSynthesisWorker();
+      const normalizationContext = preferences.normalizeVoiceVolumes ? new contextClass() : null;
+      const voiceLoudnessProfiles = /* @__PURE__ */ new Map();
+      let normalizationChain = Promise.resolve();
+      const processed = prepared.map((pending, index) => {
+        const processing = normalizationChain.then(async () => {
+          const result = await pending;
+          if (!result.ok || !normalizationContext) return result;
+          const decodedBuffer = await normalizationContext.decodeAudioData(result.segment.data.slice(0));
+          const voiceKey = plan[index].voice.trim().toLowerCase() || "__connection-default__";
+          const normalizationGain = normalizedVoiceGain(decodedBuffer, voiceKey, voiceLoudnessProfiles);
+          return {
+            ok: true,
+            segment: { ...result.segment, decodedBuffer, normalizationGain }
+          };
+        });
+        normalizationChain = processing.then(() => void 0, () => void 0);
+        return processing;
+      });
+      if (normalizationContext) {
+        void Promise.all(processed).finally(() => normalizationContext.close().catch(() => void 0)).catch(() => void 0);
+      }
       if (preferences.saveGeneratedAudio || regeneratingSavedAudio) {
         playback.persistenceState = "pending";
-        void Promise.all(prepared).then(async (results) => {
+        void Promise.all(processed).then(async (results) => {
           const failed = results.find((result) => !result.ok);
           if (failed) throw failed.error;
           const captured = results.filter(
             (result) => result.ok
           ).map((result) => ({
             data: result.segment.data.slice(0),
-            mime: result.segment.mime
+            mime: result.segment.mime,
+            decodedBuffer: result.segment.decodedBuffer,
+            normalizationGain: result.segment.normalizationGain
           }));
           const saved = await persistCapturedAudio(
             playbackChat.id,
@@ -1882,9 +1992,9 @@ function setup(ctx) {
             contextClass,
             synthesisController.signal,
             () => playback.audibleDone,
-            () => {
+            (normalized) => {
               if (ctx.getActiveChat().chatId === playbackChat.id && (!activePlayback || activePlayback === playback)) {
-                setStatus("Server could not combine the source audio; retrying as WAV\u2026");
+                setStatus(normalized ? "Preparing normalized saved audio\u2026" : "Server could not combine the source audio; retrying as WAV\u2026");
               }
             }
           );
@@ -1926,7 +2036,7 @@ function setup(ctx) {
         });
       } else {
         playback.persistenceState = "disabled";
-        void Promise.all(prepared).catch(() => void 0).finally(() => {
+        void Promise.all(processed).catch(() => void 0).finally(() => {
           backgroundSynthesisControllers.delete(synthesisController);
         });
       }
@@ -1934,12 +2044,12 @@ function setup(ctx) {
       setStatus(
         `Buffering ${initialBufferSize} voice segment${initialBufferSize === 1 ? "" : "s"} before playback\u2026`
       );
-      await Promise.all(prepared.slice(0, initialBufferSize));
+      await Promise.all(processed.slice(0, initialBufferSize));
       for (let index = 0; index < plan.length; index += 1) {
-        const current = await prepared[index];
+        const current = await processed[index];
         if (!current.ok) throw current.error;
         setStatus(`Playing ${index + 1} of ${plan.length} voice segment${plan.length === 1 ? "" : "s"}\u2026`);
-        await playDecodedBuffer(playback, current.segment.data, preferences.volume);
+        await playDecodedBuffer(playback, current.segment, preferences.volume);
       }
       playback.playbackFinished = true;
       playback.finishAudible();
@@ -2186,9 +2296,11 @@ function setup(ctx) {
         playbackBufferSegments = preferences.playbackBufferSegments;
         concurrentGenerationLimit = preferences.concurrentGenerations;
         rateLimitWaitSeconds = preferences.rateLimitWaitSeconds;
+        normalizeVoiceVolumes = preferences.normalizeVoiceVolumes;
         playbackBufferInput.value = String(playbackBufferSegments);
         concurrentGenerationInput.value = String(concurrentGenerationLimit);
         rateLimitWaitInput.value = String(rateLimitWaitSeconds);
+        normalizeVolumesToggle.checked = normalizeVoiceVolumes;
       }
       lumiverseConnectionId = connections.some((connection) => connection.id === preferences.connectionId) ? preferences.connectionId : connections.find((connection) => connection.is_default)?.id ?? "";
       const selectedConnectionId = activeChat?.connectionId || lumiverseConnectionId;
@@ -2305,7 +2417,8 @@ function setup(ctx) {
       await saveAdvancedPlaybackPreferences(
         playbackBufferSegments,
         concurrentGenerationLimit,
-        rateLimitWaitSeconds
+        rateLimitWaitSeconds,
+        normalizeVoiceVolumes
       );
       setStatus("Advanced playback settings saved globally.", "saved");
     } catch (error) {
@@ -2581,7 +2694,8 @@ function setup(ctx) {
       void saveAdvancedPlaybackPreferences(
         playbackBufferSegments,
         concurrentGenerationLimit,
-        rateLimitWaitSeconds
+        rateLimitWaitSeconds,
+        normalizeVoiceVolumes
       );
     }
     skippedTrackerTagsInput.destroy();
@@ -2591,6 +2705,7 @@ function setup(ctx) {
     playbackBufferInput.removeEventListener("change", onPlaybackBufferInput);
     concurrentGenerationInput.removeEventListener("change", onConcurrentGenerationInput);
     rateLimitWaitInput.removeEventListener("change", onRateLimitWaitInput);
+    normalizeVolumesToggle.removeEventListener("change", onNormalizeVolumesInput);
     addNpcInput.destroy();
     addNpcButton.removeEventListener("click", onAddNpc);
     addNpcInputSlot.removeEventListener("keydown", onAddNpcKeyDown);

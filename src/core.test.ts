@@ -48,6 +48,16 @@ test('combines decoded segments into one resampled PCM WAV', () => {
   assert.equal(wav.byteLength, 68)
 })
 
+test('applies per-segment gain while assembling PCM WAV audio', () => {
+  const wav = encodeConcatenatedWav([
+    { sampleRate: 8_000, channels: [new Float32Array([0.5, -0.5])], gain: 0.5 },
+  ])
+  const view = new DataView(wav)
+
+  assert.equal(view.getInt16(44, true), 8191)
+  assert.equal(view.getInt16(46, true), -8192)
+})
+
 test('merges adjacent segments that use the same voice', () => {
   assert.deepEqual(mergeVoicePlan([
     { text: 'First sentence.', voice: 'narrator' },

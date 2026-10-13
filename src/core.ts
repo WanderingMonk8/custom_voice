@@ -90,6 +90,7 @@ export interface VoicePlanSegment {
 export interface PcmAudioSegment {
   sampleRate: number
   channels: Float32Array[]
+  gain?: number
 }
 
 /** Combine decoded audio into one PCM WAV so the host does not need FFmpeg to save it. */
@@ -137,6 +138,7 @@ export function encodeConcatenatedWav(segments: PcmAudioSegment[]): ArrayBuffer 
   usable.forEach((segment, segmentIndex) => {
     const outputFrames = frameCounts[segmentIndex]
     const sourceFrames = Math.max(...segment.channels.map(channel => channel.length))
+    const gain = Number.isFinite(segment.gain) ? Math.max(0, segment.gain ?? 1) : 1
     for (let frame = 0; frame < outputFrames; frame += 1) {
       const sourcePosition = outputFrames === 1 ? 0 : frame * (sourceFrames - 1) / (outputFrames - 1)
       const lower = Math.floor(sourcePosition)
@@ -146,7 +148,7 @@ export function encodeConcatenatedWav(segments: PcmAudioSegment[]): ArrayBuffer 
         const channel = segment.channels[Math.min(channelIndex, segment.channels.length - 1)]
         const lowerValue = channel[Math.min(lower, channel.length - 1)] ?? 0
         const upperValue = channel[Math.min(upper, channel.length - 1)] ?? lowerValue
-        const sample = Math.max(-1, Math.min(1, lowerValue + (upperValue - lowerValue) * fraction))
+        const sample = Math.max(-1, Math.min(1, (lowerValue + (upperValue - lowerValue) * fraction) * gain))
         view.setInt16(writeOffset, sample < 0 ? sample * 0x8000 : sample * 0x7fff, true)
         writeOffset += bytesPerSample
       }
