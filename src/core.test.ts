@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
+  adaptiveGenerationConcurrency,
   addScannedFirstNameAliases,
   mergeScannedCardCast,
   applyConfigToMetadata,
@@ -56,6 +57,14 @@ test('applies per-segment gain while assembling PCM WAV audio', () => {
 
   assert.equal(view.getInt16(44, true), 8191)
   assert.equal(view.getInt16(46, true), -8192)
+})
+
+test('adjusts generation concurrency gradually from rolling segment lengths', () => {
+  assert.equal(adaptiveGenerationConcurrency(2, 2, [40, 80, 100]), 1)
+  assert.equal(adaptiveGenerationConcurrency(1, 2, [180, 220, 240]), 2)
+  assert.equal(adaptiveGenerationConcurrency(1, 1, [400, 500, 600]), 2)
+  assert.equal(adaptiveGenerationConcurrency(4, 1, [400, 500, 600]), 4)
+  assert.equal(adaptiveGenerationConcurrency(6, 6, [400, 500, 600]), 7)
 })
 
 test('merges adjacent segments that use the same voice', () => {

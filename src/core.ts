@@ -93,6 +93,29 @@ export interface PcmAudioSegment {
   gain?: number
 }
 
+/** Adjust TTS concurrency gradually from a rolling window of segment character counts. */
+export function adaptiveGenerationConcurrency(
+  current: number,
+  starting: number,
+  segmentLengths: number[],
+  maximum = 10,
+): number {
+  const safeMaximum = Math.max(1, Math.round(maximum))
+  const safeStarting = Math.min(safeMaximum, Math.max(1, Math.round(starting)))
+  const safeCurrent = Math.min(safeMaximum, Math.max(1, Math.round(current)))
+  const lengths = segmentLengths.filter(length => Number.isFinite(length) && length >= 0)
+  if (lengths.length === 0) return safeCurrent
+  const averageLength = lengths.reduce((sum, length) => sum + length, 0) / lengths.length
+  if (averageLength < 120) return Math.max(1, safeCurrent - 1)
+  if (averageLength > 320) {
+    const adaptiveMaximum = safeStarting > 4 ? safeMaximum : Math.min(safeMaximum, 4)
+    return Math.min(adaptiveMaximum, safeCurrent + 1)
+  }
+  if (safeCurrent < safeStarting) return safeCurrent + 1
+  if (safeCurrent > safeStarting) return safeCurrent - 1
+  return safeCurrent
+}
+
 /** Combine decoded audio into one PCM WAV so the host does not need FFmpeg to save it. */
 export function encodeConcatenatedWav(segments: PcmAudioSegment[]): ArrayBuffer {
   const usable = segments.filter(segment => (

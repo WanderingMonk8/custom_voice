@@ -1,6 +1,22 @@
 // src/core.ts
 var DEFAULT_SAVED_AUDIO_LIMIT = 50;
 var MAX_SAVED_AUDIO_LIMIT = 1e4;
+function adaptiveGenerationConcurrency(current, starting, segmentLengths, maximum = 10) {
+  const safeMaximum = Math.max(1, Math.round(maximum));
+  const safeStarting = Math.min(safeMaximum, Math.max(1, Math.round(starting)));
+  const safeCurrent = Math.min(safeMaximum, Math.max(1, Math.round(current)));
+  const lengths = segmentLengths.filter((length) => Number.isFinite(length) && length >= 0);
+  if (lengths.length === 0) return safeCurrent;
+  const averageLength = lengths.reduce((sum, length) => sum + length, 0) / lengths.length;
+  if (averageLength < 120) return Math.max(1, safeCurrent - 1);
+  if (averageLength > 320) {
+    const adaptiveMaximum = safeStarting > 4 ? safeMaximum : Math.min(safeMaximum, 4);
+    return Math.min(adaptiveMaximum, safeCurrent + 1);
+  }
+  if (safeCurrent < safeStarting) return safeCurrent + 1;
+  if (safeCurrent > safeStarting) return safeCurrent - 1;
+  return safeCurrent;
+}
 function encodeConcatenatedWav(segments) {
   const usable = segments.filter((segment) => Number.isFinite(segment.sampleRate) && segment.sampleRate > 0 && segment.channels.length > 0 && segment.channels.some((channel) => channel.length > 0));
   if (usable.length === 0) throw new Error("No decoded audio is available to save.");
@@ -1294,11 +1310,11 @@ function setup(ctx) {
   );
   tab.root.appendChild(panel);
   const playbackBufferField = createField("Playback buffer segments");
-  const concurrentGenerationField = createField("Concurrent generations");
+  const concurrentGenerationField = createField("Starting concurrent generations");
   const rateLimitWaitField = createField("Rate-limit wait budget (seconds)");
   const advancedHint = document.createElement("div");
   advancedHint.className = "chat-voice-hint";
-  advancedHint.textContent = "Larger buffers can reduce pauses but delay playback. Higher concurrency increases API load. The wait budget controls how long a playback may cumulatively pause and retry after rate limits.";
+  advancedHint.textContent = "Concurrency starts at the selected value, then decreases for short-segment runs and increases gradually for long ones. Larger buffers reduce pauses but delay playback. The wait budget controls cumulative rate-limit cooldowns.";
   advancedBody.append(
     playbackBufferField.field,
     concurrentGenerationField.field,
@@ -1338,9 +1354,13 @@ function setup(ctx) {
   const connectionVoiceGates = /* @__PURE__ */ new Map();
   const foregroundSynthesisQueue = [];
   const backgroundSynthesisQueue = [];
+  const adaptiveSynthesisLimits = /* @__PURE__ */ new Map();
   let activeSynthesisTasks = 0;
+  function effectiveSynthesisLimit() {
+    return Math.max(concurrentGenerationLimit, ...adaptiveSynthesisLimits.values());
+  }
   function drainSynthesisQueue() {
-    while (activeSynthesisTasks < concurrentGenerationLimit) {
+    while (activeSynthesisTasks < effectiveSynthesisLimit()) {
       const next = foregroundSynthesisQueue.shift() ?? backgroundSynthesisQueue.shift();
       if (!next) return;
       activeSynthesisTasks += 1;
@@ -1479,7 +1499,7 @@ function setup(ctx) {
   const concurrentGenerationInput = createNumberInput(
     DEFAULT_CONCURRENT_GENERATIONS,
     MAX_CONCURRENT_GENERATIONS,
-    "Concurrent generations"
+    "Starting concurrent generations"
   );
   const rateLimitWaitInput = createNumberInput(
     DEFAULT_RATE_LIMIT_WAIT_SECONDS,
@@ -1914,15 +1934,39 @@ function setup(ctx) {
         preparedResolvers.push(resolve);
       }));
       let synthesisCursor = 0;
-      const runSynthesisWorker = async () => {
-        while (true) {
+      let localSynthesisTasks = 0;
+      let adaptiveConcurrency = preferences.concurrentGenerations;
+      const adaptiveLimitToken = Symbol("playback-concurrency");
+      adaptiveSynthesisLimits.set(adaptiveLimitToken, adaptiveConcurrency);
+      const scheduleSynthesis = () => {
+        while (localSynthesisTasks < adaptiveConcurrency && synthesisCursor < plan.length) {
           const index = synthesisCursor++;
-          if (index >= plan.length) return;
-          preparedResolvers[index](await prepare(index));
+          localSynthesisTasks += 1;
+          void prepare(index).then((result) => {
+            preparedResolvers[index](result);
+          }).finally(() => {
+            localSynthesisTasks -= 1;
+            const rollingLengths = plan.slice(index, Math.min(plan.length, index + 3)).map((segment) => segment.text.length);
+            const nextConcurrency = adaptiveGenerationConcurrency(
+              adaptiveConcurrency,
+              preferences.concurrentGenerations,
+              rollingLengths,
+              MAX_CONCURRENT_GENERATIONS
+            );
+            if (nextConcurrency !== adaptiveConcurrency) {
+              adaptiveConcurrency = nextConcurrency;
+              adaptiveSynthesisLimits.set(adaptiveLimitToken, adaptiveConcurrency);
+              drainSynthesisQueue();
+            }
+            scheduleSynthesis();
+          });
         }
       };
-      const workerCount = Math.min(preferences.concurrentGenerations, plan.length);
-      for (let index = 0; index < workerCount; index += 1) void runSynthesisWorker();
+      scheduleSynthesis();
+      void Promise.all(prepared).finally(() => {
+        adaptiveSynthesisLimits.delete(adaptiveLimitToken);
+        drainSynthesisQueue();
+      });
       const normalizationContext = new contextClass();
       const voiceLoudnessProfiles = /* @__PURE__ */ new Map();
       let normalizationChain = Promise.resolve();

@@ -3,6 +3,7 @@ import type {
   SpindleTextInputHandle,
 } from 'lumiverse-spindle-types'
 import {
+  adaptiveGenerationConcurrency,
   clampSavedAudioLimit,
   DEFAULT_SAVED_AUDIO_LIMIT,
   encodeConcatenatedWav,
@@ -898,11 +899,11 @@ export function setup(ctx: SpindleFrontendContext) {
   tab.root.appendChild(panel)
 
   const playbackBufferField = createField('Playback buffer segments')
-  const concurrentGenerationField = createField('Concurrent generations')
+  const concurrentGenerationField = createField('Starting concurrent generations')
   const rateLimitWaitField = createField('Rate-limit wait budget (seconds)')
   const advancedHint = document.createElement('div')
   advancedHint.className = 'chat-voice-hint'
-  advancedHint.textContent = 'Larger buffers can reduce pauses but delay playback. Higher concurrency increases API load. The wait budget controls how long a playback may cumulatively pause and retry after rate limits.'
+  advancedHint.textContent = 'Concurrency starts at the selected value, then decreases for short-segment runs and increases gradually for long ones. Larger buffers reduce pauses but delay playback. The wait budget controls cumulative rate-limit cooldowns.'
   advancedBody.append(
     playbackBufferField.field,
     concurrentGenerationField.field,
@@ -956,10 +957,15 @@ export function setup(ctx: SpindleFrontendContext) {
   type SynthesisTask = () => Promise<void>
   const foregroundSynthesisQueue: SynthesisTask[] = []
   const backgroundSynthesisQueue: SynthesisTask[] = []
+  const adaptiveSynthesisLimits = new Map<symbol, number>()
   let activeSynthesisTasks = 0
 
+  function effectiveSynthesisLimit(): number {
+    return Math.max(concurrentGenerationLimit, ...adaptiveSynthesisLimits.values())
+  }
+
   function drainSynthesisQueue(): void {
-    while (activeSynthesisTasks < concurrentGenerationLimit) {
+    while (activeSynthesisTasks < effectiveSynthesisLimit()) {
       const next = foregroundSynthesisQueue.shift() ?? backgroundSynthesisQueue.shift()
       if (!next) return
       activeSynthesisTasks += 1
@@ -1132,7 +1138,7 @@ export function setup(ctx: SpindleFrontendContext) {
   const concurrentGenerationInput = createNumberInput(
     DEFAULT_CONCURRENT_GENERATIONS,
     MAX_CONCURRENT_GENERATIONS,
-    'Concurrent generations',
+    'Starting concurrent generations',
   )
   const rateLimitWaitInput = createNumberInput(
     DEFAULT_RATE_LIMIT_WAIT_SECONDS,
@@ -1620,15 +1626,41 @@ export function setup(ctx: SpindleFrontendContext) {
         preparedResolvers.push(resolve)
       }))
       let synthesisCursor = 0
-      const runSynthesisWorker = async () => {
-        while (true) {
+      let localSynthesisTasks = 0
+      let adaptiveConcurrency = preferences.concurrentGenerations
+      const adaptiveLimitToken = Symbol('playback-concurrency')
+      adaptiveSynthesisLimits.set(adaptiveLimitToken, adaptiveConcurrency)
+      const scheduleSynthesis = () => {
+        while (localSynthesisTasks < adaptiveConcurrency && synthesisCursor < plan.length) {
           const index = synthesisCursor++
-          if (index >= plan.length) return
-          preparedResolvers[index](await prepare(index))
+          localSynthesisTasks += 1
+          void prepare(index).then(result => {
+            preparedResolvers[index](result)
+          }).finally(() => {
+            localSynthesisTasks -= 1
+            const rollingLengths = plan
+              .slice(index, Math.min(plan.length, index + 3))
+              .map(segment => segment.text.length)
+            const nextConcurrency = adaptiveGenerationConcurrency(
+              adaptiveConcurrency,
+              preferences.concurrentGenerations,
+              rollingLengths,
+              MAX_CONCURRENT_GENERATIONS,
+            )
+            if (nextConcurrency !== adaptiveConcurrency) {
+              adaptiveConcurrency = nextConcurrency
+              adaptiveSynthesisLimits.set(adaptiveLimitToken, adaptiveConcurrency)
+              drainSynthesisQueue()
+            }
+            scheduleSynthesis()
+          })
         }
       }
-      const workerCount = Math.min(preferences.concurrentGenerations, plan.length)
-      for (let index = 0; index < workerCount; index += 1) void runSynthesisWorker()
+      scheduleSynthesis()
+      void Promise.all(prepared).finally(() => {
+        adaptiveSynthesisLimits.delete(adaptiveLimitToken)
+        drainSynthesisQueue()
+      })
       const normalizationContext = new contextClass()
       const voiceLoudnessProfiles = new Map<string, number>()
       let normalizationChain: Promise<void> = Promise.resolve()
