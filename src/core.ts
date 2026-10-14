@@ -1000,6 +1000,38 @@ function mainClauseSpeechPossessor(text: string, speakers: CharacterLike[]): str
   return matches.size === 1 ? [...matches][0] : null
 }
 
+const POSSESSIVE_SUBJECT_VERBS = '(?:is|are|was|were|has|have|had|does|do|did|falls?|finds?|takes?|presses?|moves?|comes?|goes?|holds?|keeps?|starts?|stops?|turns?|looks?|watches?|breathes?|shakes?|slides?|opens?|closes?|reaches?|catches?|carries?|knots?|rest(?:s|ed|ing)?)'
+
+/** Resolve an owning character when their possessive noun phrase heads a clause. */
+function mainClausePossessiveSubject(
+  text: string,
+  speakers: CharacterLike[],
+  eligibleSpeakerIds: Set<string>,
+): string | null {
+  const narrative = narrativeOnly(text)
+  const matches = new Set<string>()
+  for (const speaker of speakers) {
+    if (!eligibleSpeakerIds.has(speaker.id)) continue
+    for (const alias of speakerAliases(speaker.name)) {
+      const pattern = new RegExp(`\\b${escapedPattern(alias)}\\b['’]s\\s+(?:[\\p{L}\\p{M}'’-]+\\s+){1,5}${POSSESSIVE_SUBJECT_VERBS}\\b`, 'giu')
+      for (const match of narrative.matchAll(pattern)) {
+        if (match.index === undefined) continue
+        const prefix = narrative.slice(0, match.index)
+        if (/\b(?:to|from|for|with|by|at|on|of|in|into|beside|behind|under|near|against)\s*$/iu.test(prefix)) {
+          continue
+        }
+        const sentenceStart = Math.max(
+          prefix.lastIndexOf('.'), prefix.lastIndexOf('!'), prefix.lastIndexOf('?'),
+          prefix.lastIndexOf(';'), prefix.lastIndexOf('\n'),
+        ) + 1
+        const lead = prefix.slice(sentenceStart)
+        if (!lead.trim() || /\b(?:and|but|then)\s*$/iu.test(lead)) matches.add(speaker.id)
+      }
+    }
+  }
+  return matches.size === 1 ? [...matches][0] : null
+}
+
 function preferredMentionedSpeaker(
   text: string,
   speakers: CharacterLike[],
@@ -1009,7 +1041,7 @@ function preferredMentionedSpeaker(
   if (speechPossessor) return speechPossessor
   if (mentions.clean.size === 1) return [...mentions.clean][0]
   if (mentions.clean.size > 1) return discourseSubjectSpeaker(text, speakers, mentions.clean)
-  return mentions.possessive.size === 1 ? [...mentions.possessive][0] : null
+  return mainClausePossessiveSubject(text, speakers, mentions.possessive)
 }
 
 function hasSpeakerMentions(mentions: SpeakerMentions): boolean {
@@ -1023,7 +1055,9 @@ function soleMentionedSpeaker(text: string, speakers: CharacterLike[]): string |
 function unambiguousNarrativeSpeaker(text: string, speakers: CharacterLike[]): string | null {
   const mentions = mentionedSpeakers(text, speakers)
   if (mentions.clean.size === 1) return [...mentions.clean][0]
-  if (mentions.clean.size === 0 && mentions.possessive.size === 1) return [...mentions.possessive][0]
+  if (mentions.clean.size === 0) {
+    return mainClausePossessiveSubject(text, speakers, mentions.possessive)
+  }
   return null
 }
 
@@ -1052,7 +1086,10 @@ function precedingParagraphSpeaker(before: string, speakers: CharacterLike[]): s
     const mentions = mentionedSpeakers(paragraph, speakers)
     const speakerId = preferredMentionedSpeaker(paragraph, speakers, mentions)
     if (speakerId) return speakerId
-    if (hasSpeakerMentions(mentions)) return null
+    // A possessive buried in an object phrase (for example, "in Grace's
+    // wrist") is not a competing discourse subject and should not stop the
+    // upward search for the last confident speaker.
+    if (mentions.clean.size > 0) return null
   }
   return null
 }

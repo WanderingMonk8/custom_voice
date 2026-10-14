@@ -366,12 +366,40 @@ function mainClauseSpeechPossessor(text, speakers) {
   }
   return matches.size === 1 ? [...matches][0] : null;
 }
+var POSSESSIVE_SUBJECT_VERBS = "(?:is|are|was|were|has|have|had|does|do|did|falls?|finds?|takes?|presses?|moves?|comes?|goes?|holds?|keeps?|starts?|stops?|turns?|looks?|watches?|breathes?|shakes?|slides?|opens?|closes?|reaches?|catches?|carries?|knots?|rest(?:s|ed|ing)?)";
+function mainClausePossessiveSubject(text, speakers, eligibleSpeakerIds) {
+  const narrative = narrativeOnly(text);
+  const matches = /* @__PURE__ */ new Set();
+  for (const speaker of speakers) {
+    if (!eligibleSpeakerIds.has(speaker.id)) continue;
+    for (const alias of speakerAliases(speaker.name)) {
+      const pattern = new RegExp(`\\b${escapedPattern(alias)}\\b['\u2019]s\\s+(?:[\\p{L}\\p{M}'\u2019-]+\\s+){1,5}${POSSESSIVE_SUBJECT_VERBS}\\b`, "giu");
+      for (const match of narrative.matchAll(pattern)) {
+        if (match.index === void 0) continue;
+        const prefix = narrative.slice(0, match.index);
+        if (/\b(?:to|from|for|with|by|at|on|of|in|into|beside|behind|under|near|against)\s*$/iu.test(prefix)) {
+          continue;
+        }
+        const sentenceStart = Math.max(
+          prefix.lastIndexOf("."),
+          prefix.lastIndexOf("!"),
+          prefix.lastIndexOf("?"),
+          prefix.lastIndexOf(";"),
+          prefix.lastIndexOf("\n")
+        ) + 1;
+        const lead = prefix.slice(sentenceStart);
+        if (!lead.trim() || /\b(?:and|but|then)\s*$/iu.test(lead)) matches.add(speaker.id);
+      }
+    }
+  }
+  return matches.size === 1 ? [...matches][0] : null;
+}
 function preferredMentionedSpeaker(text, speakers, mentions) {
   const speechPossessor = mainClauseSpeechPossessor(text, speakers);
   if (speechPossessor) return speechPossessor;
   if (mentions.clean.size === 1) return [...mentions.clean][0];
   if (mentions.clean.size > 1) return discourseSubjectSpeaker(text, speakers, mentions.clean);
-  return mentions.possessive.size === 1 ? [...mentions.possessive][0] : null;
+  return mainClausePossessiveSubject(text, speakers, mentions.possessive);
 }
 function hasSpeakerMentions(mentions) {
   return mentions.clean.size > 0 || mentions.possessive.size > 0;
@@ -382,7 +410,9 @@ function soleMentionedSpeaker(text, speakers) {
 function unambiguousNarrativeSpeaker(text, speakers) {
   const mentions = mentionedSpeakers(text, speakers);
   if (mentions.clean.size === 1) return [...mentions.clean][0];
-  if (mentions.clean.size === 0 && mentions.possessive.size === 1) return [...mentions.possessive][0];
+  if (mentions.clean.size === 0) {
+    return mainClausePossessiveSubject(text, speakers, mentions.possessive);
+  }
   return null;
 }
 function currentParagraphSpeaker(before, after, speakers) {
@@ -406,7 +436,7 @@ function precedingParagraphSpeaker(before, speakers) {
     const mentions = mentionedSpeakers(paragraph, speakers);
     const speakerId = preferredMentionedSpeaker(paragraph, speakers, mentions);
     if (speakerId) return speakerId;
-    if (hasSpeakerMentions(mentions)) return null;
+    if (mentions.clean.size > 0) return null;
   }
   return null;
 }
