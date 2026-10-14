@@ -16,7 +16,7 @@ A [Lumiverse Spindle](https://docs.lumiverse.chat/) extension that detects chara
 - Carries a confidently identified speaker across same-paragraph narration for later unattributed quotes, unless another roster character is introduced.
 - Resolves multi-character paragraphs with confidence-scored main-clause subject detection while discounting objects, passive agents, possessives, and subordinate references.
 - Recognizes confidently seeded two-character dialogue chains and alternates otherwise unattributed back-to-back speech turns.
-- When an entire message lacks a clear roster identity, locally inherits a single anonymous speaker from the immediately preceding assistant message; explicit current attribution and conflicting pronoun speakers disable this fallback.
+- When quotations lack a coherent current identity, locally uses the immediately preceding assistant speaker to resolve identity-free or conflicting narrative candidates; explicit current attribution and conflicting pronoun speakers disable this fallback.
 - Routes Lumiverse's native message TTS button through ordered multi-voice playback.
 - Overrides the matching native context-menu action instead of adding duplicate playback controls.
 - Merges adjacent same-voice passages within each paragraph, splits multi-paragraph passages into smaller requests, and dynamically adjusts generation concurrency from median length and short-segment density to reduce gaps without bursting short requests.

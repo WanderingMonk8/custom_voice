@@ -1414,6 +1414,7 @@ function parseRosterVoiceSegmentsInternal(
   skippedTrackerTagPairs = '',
   quoteSpeakerOverrides?: ReadonlyMap<number, string | null>,
   historicalSpeakerId: string | null = null,
+  preserveLocalOnNullOverride = false,
 ): PlaybackSegment[] {
   const playbackContent = preparePlaybackContent(content, skippedTrackerTagPairs)
   const result: PlaybackSegment[] = []
@@ -1472,15 +1473,19 @@ function parseRosterVoiceSegmentsInternal(
       const historicalFallbackId = inference.source === 'history' || inference.source === 'fallback'
         ? historicalSpeakerId
         : null
-      const speakerId: string | null = quoteSpeakerOverrides?.has(currentQuoteIndex)
-        ? quoteSpeakerOverrides.get(currentQuoteIndex) ?? null
-        : paragraphSpeakers[paragraphIndex]
-          ?? downstreamReplies.get(paragraphIndex)
-          ?? inferredTurnSpeakerId
-          ?? continuedSpeakerId
-          ?? openingSpeakerId
-          ?? historicalFallbackId
-          ?? inference.speakerId
+      const localSpeakerId: string | null = paragraphSpeakers[paragraphIndex]
+        ?? downstreamReplies.get(paragraphIndex)
+        ?? inferredTurnSpeakerId
+        ?? continuedSpeakerId
+        ?? openingSpeakerId
+        ?? historicalFallbackId
+        ?? inference.speakerId
+      const overrideSpeakerId = quoteSpeakerOverrides?.get(currentQuoteIndex) ?? null
+      const hasOverride = quoteSpeakerOverrides?.has(currentQuoteIndex) === true
+      const speakerId: string | null = hasOverride
+        && (!preserveLocalOnNullOverride || overrideSpeakerId !== null || localSpeakerId === null)
+        ? overrideSpeakerId
+        : localSpeakerId
       result.push({
         text: speech,
         speakerId,
@@ -1519,6 +1524,7 @@ export function parseRosterVoiceSegmentsWithAssignments(
   assignments: LlmSpeakerAssignment[],
   skippedTrackerTagPairs = '',
   historicalSpeakerId: string | null = null,
+  preserveLocalOnNullOverride = false,
 ): PlaybackSegment[] {
   return parseRosterVoiceSegmentsInternal(
     content,
@@ -1527,6 +1533,7 @@ export function parseRosterVoiceSegmentsWithAssignments(
     skippedTrackerTagPairs,
     new Map(assignments.map(assignment => [assignment.quote, assignment.speakerId])),
     historicalSpeakerId,
+    preserveLocalOnNullOverride,
   )
 }
 
@@ -1543,23 +1550,23 @@ export function previousAssistantSpeakerFallback(
     .filter(match => !!cleanPlaybackText(match[1] ?? ''))
   if (quoteMatches.length === 0) return null
 
-  const paragraphs = playbackParagraphs(playbackContent)
-  if (paragraphs.some(paragraph => !!preferredMentionedSpeaker(
-    paragraph.text,
-    speakers,
-    mentionedSpeakers(paragraph.text, speakers),
-  ))) return null
+  const historicalInferenceIds = new Set<string>()
   for (const match of quoteMatches) {
     if (match.index === undefined) continue
     const quoteEnd = match.index + match[0].length
-    if (inferQuotedSpeaker(
+    const inference = inferQuotedSpeaker(
       playbackContent.slice(0, match.index),
       playbackContent.slice(quoteEnd),
       match[1] ?? '',
       speakers,
       null,
-    ).confident) return null
+    )
+    if (inference.source === 'explicit' || inference.source === 'paragraph') return null
+    if (inference.source === 'history' && inference.speakerId) {
+      historicalInferenceIds.add(inference.speakerId)
+    }
   }
+  if (historicalInferenceIds.size === 1) return null
   if (pronounSpeechAttributionSubjects(playbackContent).size > 1) return null
 
   const previousContent = preparePlaybackContent(previousAssistantContent, skippedTrackerTagPairs)

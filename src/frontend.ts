@@ -580,6 +580,7 @@ async function synthesizeVoiceSegment(
   while (true) {
     const releaseVoice = await voiceGate.acquire(voice, signal)
     let response: Response
+    let audioData: ArrayBuffer | null = null
     try {
       await waitForSynthesisSlot(pacer, signal)
       response = await fetch('/api/v1/tts/synthesize', {
@@ -594,13 +595,14 @@ async function synthesizeVoiceSegment(
           parameters: { speed },
         }),
       })
+      if (response.ok) audioData = await response.arrayBuffer()
     } finally {
       releaseVoice()
     }
     if (response.ok) {
       rateLimitBudget.consecutiveResponses = 0
       return {
-        data: await response.arrayBuffer(),
+        data: audioData!,
         mime: response.headers.get('content-type') || 'audio/mpeg',
       }
     }

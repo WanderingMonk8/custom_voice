@@ -791,7 +791,7 @@ function needsLlmSpeakerReview(content, defaultSpeakerId, speakers, skippedTrack
   }
   return false;
 }
-function parseRosterVoiceSegmentsInternal(content, defaultSpeakerId, speakers, skippedTrackerTagPairs = "", quoteSpeakerOverrides, historicalSpeakerId = null) {
+function parseRosterVoiceSegmentsInternal(content, defaultSpeakerId, speakers, skippedTrackerTagPairs = "", quoteSpeakerOverrides, historicalSpeakerId = null, preserveLocalOnNullOverride = false) {
   const playbackContent = preparePlaybackContent(content, skippedTrackerTagPairs);
   const result = [];
   const quotePattern = /["“]([\s\S]*?)["”]/g;
@@ -836,7 +836,10 @@ function parseRosterVoiceSegmentsInternal(content, defaultSpeakerId, speakers, s
       const inferredTurnSpeakerId = inference.source === "history" || inference.source === "fallback" ? dialogueTurnSpeakerId : null;
       const openingSpeakerId = inference.source === "fallback" && openingBackfill?.paragraphIndexes.has(paragraphIndex) ? openingBackfill.speakerId : null;
       const historicalFallbackId = inference.source === "history" || inference.source === "fallback" ? historicalSpeakerId : null;
-      const speakerId = quoteSpeakerOverrides?.has(currentQuoteIndex) ? quoteSpeakerOverrides.get(currentQuoteIndex) ?? null : paragraphSpeakers[paragraphIndex] ?? downstreamReplies.get(paragraphIndex) ?? inferredTurnSpeakerId ?? continuedSpeakerId ?? openingSpeakerId ?? historicalFallbackId ?? inference.speakerId;
+      const localSpeakerId = paragraphSpeakers[paragraphIndex] ?? downstreamReplies.get(paragraphIndex) ?? inferredTurnSpeakerId ?? continuedSpeakerId ?? openingSpeakerId ?? historicalFallbackId ?? inference.speakerId;
+      const overrideSpeakerId = quoteSpeakerOverrides?.get(currentQuoteIndex) ?? null;
+      const hasOverride = quoteSpeakerOverrides?.has(currentQuoteIndex) === true;
+      const speakerId = hasOverride && (!preserveLocalOnNullOverride || overrideSpeakerId !== null || localSpeakerId === null) ? overrideSpeakerId : localSpeakerId;
       result.push({
         text: speech,
         speakerId
@@ -860,37 +863,38 @@ function parseRosterVoiceSegments(content, defaultSpeakerId, speakers, skippedTr
     historicalSpeakerId
   );
 }
-function parseRosterVoiceSegmentsWithAssignments(content, defaultSpeakerId, speakers, assignments, skippedTrackerTagPairs = "", historicalSpeakerId = null) {
+function parseRosterVoiceSegmentsWithAssignments(content, defaultSpeakerId, speakers, assignments, skippedTrackerTagPairs = "", historicalSpeakerId = null, preserveLocalOnNullOverride = false) {
   return parseRosterVoiceSegmentsInternal(
     content,
     defaultSpeakerId,
     speakers,
     skippedTrackerTagPairs,
     new Map(assignments.map((assignment) => [assignment.quote, assignment.speakerId])),
-    historicalSpeakerId
+    historicalSpeakerId,
+    preserveLocalOnNullOverride
   );
 }
 function previousAssistantSpeakerFallback(content, previousAssistantContent, previousDefaultSpeakerId, speakers, skippedTrackerTagPairs = "") {
   const playbackContent = preparePlaybackContent(content, skippedTrackerTagPairs);
   const quoteMatches = [...playbackContent.matchAll(/["“]([\s\S]*?)["”]/gu)].filter((match) => !!cleanPlaybackText(match[1] ?? ""));
   if (quoteMatches.length === 0) return null;
-  const paragraphs = playbackParagraphs(playbackContent);
-  if (paragraphs.some((paragraph) => !!preferredMentionedSpeaker(
-    paragraph.text,
-    speakers,
-    mentionedSpeakers(paragraph.text, speakers)
-  ))) return null;
+  const historicalInferenceIds = /* @__PURE__ */ new Set();
   for (const match of quoteMatches) {
     if (match.index === void 0) continue;
     const quoteEnd = match.index + match[0].length;
-    if (inferQuotedSpeaker(
+    const inference = inferQuotedSpeaker(
       playbackContent.slice(0, match.index),
       playbackContent.slice(quoteEnd),
       match[1] ?? "",
       speakers,
       null
-    ).confident) return null;
+    );
+    if (inference.source === "explicit" || inference.source === "paragraph") return null;
+    if (inference.source === "history" && inference.speakerId) {
+      historicalInferenceIds.add(inference.speakerId);
+    }
   }
+  if (historicalInferenceIds.size === 1) return null;
   if (pronounSpeechAttributionSubjects(playbackContent).size > 1) return null;
   const previousContent = preparePlaybackContent(previousAssistantContent, skippedTrackerTagPairs);
   const previousParagraphs = playbackParagraphs(previousContent);
@@ -1160,7 +1164,7 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
     const connectionId = payload.connectionId.trim().slice(0, 128);
     const model = payload.model.trim().slice(0, 256);
     const cacheHash = hashMessageContent(JSON.stringify({
-      parser: 2,
+      parser: 3,
       content: message.content ?? "",
       speakers: speakers.map((speaker) => ({ id: speaker.id, name: speaker.name })),
       defaultSpeakerId,
@@ -1232,7 +1236,8 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
       speakers,
       assignments,
       skippedTrackerTags,
-      historicalSpeakerId
+      historicalSpeakerId,
+      payload.mode === "ambiguous"
     );
     const nextConfig = {
       ...config,

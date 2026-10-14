@@ -337,6 +337,23 @@ test('validates LLM quote assignments and applies only known speaker IDs', () =>
   )
 })
 
+test('does not let an ambiguous LLM null erase a deterministic speaker', () => {
+  const content = 'Grace watches the door.\n\n"Who is there?"'
+  const speakers = [{ id: 'grace', name: 'Grace' }]
+  assert.deepEqual(
+    parseRosterVoiceSegmentsWithAssignments(
+      content,
+      null,
+      speakers,
+      [{ quote: 0, speakerId: null }],
+      '',
+      null,
+      true,
+    ).at(-1),
+    { text: 'Who is there?', speakerId: 'grace' },
+  )
+})
+
 test('requests LLM review only for dialogue requiring historical or fallback attribution', () => {
   const speakers = [{ id: 'grace', name: 'Grace' }, { id: 'katie', name: 'Katie' }]
   assert.equal(needsLlmSpeakerReview('Grace said, "Clearly attributed."', 'grace', speakers), false)
@@ -1009,6 +1026,44 @@ test('does not inherit history over current attribution or conflicting anonymous
     previousAssistantSpeakerFallback(
       '"Wait," she said. "No," he replied.',
       'Mara watched the door.',
+      null,
+      speakers,
+    ),
+    null,
+  )
+})
+
+test('uses the previous assistant speaker to resolve conflicting narrative candidates', () => {
+  const speakers = [
+    { id: 'nathan', name: 'Nathan' },
+    { id: 'kyoko', name: 'Kyoko' },
+  ]
+  const current = [
+    'Nathan watches the doorway.',
+    '',
+    '"The first instruction."',
+    '',
+    'Kyoko appears at the edge of the kitchen.',
+    '',
+    '"The second instruction."',
+  ].join('\n')
+  const historicalSpeakerId = previousAssistantSpeakerFallback(
+    current,
+    'Nathan steps out first.\n\n"Do honest."',
+    null,
+    speakers,
+  )
+  assert.equal(historicalSpeakerId, 'nathan')
+  assert.deepEqual(
+    parseRosterVoiceSegments(current, null, speakers, '', historicalSpeakerId)
+      .filter(segment => segment.speakerId !== null)
+      .map(segment => segment.speakerId),
+    ['nathan', 'nathan'],
+  )
+  assert.equal(
+    previousAssistantSpeakerFallback(
+      'Nathan watches the doorway.\n\n"One instruction."',
+      'Kyoko closes the door.',
       null,
       speakers,
     ),

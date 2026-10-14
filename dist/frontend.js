@@ -632,7 +632,7 @@ function canContinueSpeaker(bridge, previousSpeakerId, speakers) {
   }
   return true;
 }
-function parseRosterVoiceSegmentsInternal(content, defaultSpeakerId, speakers, skippedTrackerTagPairs = "", quoteSpeakerOverrides, historicalSpeakerId = null) {
+function parseRosterVoiceSegmentsInternal(content, defaultSpeakerId, speakers, skippedTrackerTagPairs = "", quoteSpeakerOverrides, historicalSpeakerId = null, preserveLocalOnNullOverride = false) {
   const playbackContent = preparePlaybackContent(content, skippedTrackerTagPairs);
   const result = [];
   const quotePattern = /["“]([\s\S]*?)["”]/g;
@@ -677,7 +677,10 @@ function parseRosterVoiceSegmentsInternal(content, defaultSpeakerId, speakers, s
       const inferredTurnSpeakerId = inference.source === "history" || inference.source === "fallback" ? dialogueTurnSpeakerId : null;
       const openingSpeakerId = inference.source === "fallback" && openingBackfill?.paragraphIndexes.has(paragraphIndex) ? openingBackfill.speakerId : null;
       const historicalFallbackId = inference.source === "history" || inference.source === "fallback" ? historicalSpeakerId : null;
-      const speakerId = quoteSpeakerOverrides?.has(currentQuoteIndex) ? quoteSpeakerOverrides.get(currentQuoteIndex) ?? null : paragraphSpeakers[paragraphIndex] ?? downstreamReplies.get(paragraphIndex) ?? inferredTurnSpeakerId ?? continuedSpeakerId ?? openingSpeakerId ?? historicalFallbackId ?? inference.speakerId;
+      const localSpeakerId = paragraphSpeakers[paragraphIndex] ?? downstreamReplies.get(paragraphIndex) ?? inferredTurnSpeakerId ?? continuedSpeakerId ?? openingSpeakerId ?? historicalFallbackId ?? inference.speakerId;
+      const overrideSpeakerId = quoteSpeakerOverrides?.get(currentQuoteIndex) ?? null;
+      const hasOverride = quoteSpeakerOverrides?.has(currentQuoteIndex) === true;
+      const speakerId = hasOverride && (!preserveLocalOnNullOverride || overrideSpeakerId !== null || localSpeakerId === null) ? overrideSpeakerId : localSpeakerId;
       result.push({
         text: speech,
         speakerId
@@ -1037,6 +1040,7 @@ async function synthesizeVoiceSegment(connectionId, text, voice, speed, signal, 
   while (true) {
     const releaseVoice = await voiceGate.acquire(voice, signal);
     let response;
+    let audioData = null;
     try {
       await waitForSynthesisSlot(pacer, signal);
       response = await fetch("/api/v1/tts/synthesize", {
@@ -1051,13 +1055,14 @@ async function synthesizeVoiceSegment(connectionId, text, voice, speed, signal, 
           parameters: { speed }
         })
       });
+      if (response.ok) audioData = await response.arrayBuffer();
     } finally {
       releaseVoice();
     }
     if (response.ok) {
       rateLimitBudget.consecutiveResponses = 0;
       return {
-        data: await response.arrayBuffer(),
+        data: audioData,
         mime: response.headers.get("content-type") || "audio/mpeg"
       };
     }
