@@ -1273,7 +1273,7 @@ export function setup(ctx: SpindleFrontendContext) {
         chatId,
         messageId,
         requestId,
-        mode: preferences.speakerParsingMode === 'always' ? 'always' : 'ambiguous',
+        mode: preferences.speakerParsingMode,
         connectionId: preferences.llmConnectionId,
         model: preferences.llmModel,
         skippedTrackerTags: preferences.skippedTrackerTags,
@@ -1560,15 +1560,13 @@ export function setup(ctx: SpindleFrontendContext) {
         playbackChat.characters,
         preferences.skippedTrackerTags,
       )
-      if (preferences.speakerParsingMode !== 'off') {
-        setStatus('Reviewing dialogue speakers…')
-        try {
-          segments = await requestSpeakerReviewedSegments(playbackChat.id, messageId, preferences)
-        } catch (error) {
-          console.warn('[Chat Voice] AI speaker review failed; using the local parser.', error)
-          if (playback.controller.signal.aborted) throw new DOMException('Playback stopped.', 'AbortError')
-          setStatus('AI speaker review unavailable; using the local parser.')
-        }
+      if (preferences.speakerParsingMode !== 'off') setStatus('Reviewing dialogue speakers…')
+      try {
+        segments = await requestSpeakerReviewedSegments(playbackChat.id, messageId, preferences)
+      } catch (error) {
+        console.warn('[Chat Voice] Backend speaker parsing failed; using the message-local parser.', error)
+        if (playback.controller.signal.aborted) throw new DOMException('Playback stopped.', 'AbortError')
+        setStatus('Historical speaker lookup unavailable; using the message-local parser.')
       }
       const plan = mergeVoicePlan(segments.map((segment) => {
         const speakerId = segment.speakerId

@@ -1235,6 +1235,22 @@ function hasPronounSpeechAttribution(text: string): boolean {
   return new RegExp(`\\b(?:he|she|they)\\b[^.!?\\n]{0,40}\\b${SPEECH_VERBS}\\b`, 'iu').test(narration)
 }
 
+function pronounSpeechAttributionSubjects(text: string): Set<string> {
+  const narration = cleanPlaybackText(narrativeOnly(text))
+  const subjects = new Set<string>()
+  const patterns = [
+    new RegExp(`\\b(he|she|they)\\b[^.!?\\n]{0,80}\\b${SPEECH_VERBS}\\b`, 'giu'),
+    new RegExp(`\\b${SPEECH_VERBS}\\b\\s+(he|she|they)\\b`, 'giu'),
+  ]
+  for (const pattern of patterns) {
+    for (const match of narration.matchAll(pattern)) {
+      const subject = (match[1] ?? '').toLowerCase()
+      if (subject) subjects.add(subject)
+    }
+  }
+  return subjects
+}
+
 function paragraphDialogueTurns(
   content: string,
   speakers: CharacterLike[],
@@ -1397,6 +1413,7 @@ function parseRosterVoiceSegmentsInternal(
   speakers: CharacterLike[],
   skippedTrackerTagPairs = '',
   quoteSpeakerOverrides?: ReadonlyMap<number, string | null>,
+  historicalSpeakerId: string | null = null,
 ): PlaybackSegment[] {
   const playbackContent = preparePlaybackContent(content, skippedTrackerTagPairs)
   const result: PlaybackSegment[] = []
@@ -1452,6 +1469,9 @@ function parseRosterVoiceSegmentsInternal(
         && openingBackfill?.paragraphIndexes.has(paragraphIndex)
         ? openingBackfill.speakerId
         : null
+      const historicalFallbackId = inference.source === 'history' || inference.source === 'fallback'
+        ? historicalSpeakerId
+        : null
       const speakerId: string | null = quoteSpeakerOverrides?.has(currentQuoteIndex)
         ? quoteSpeakerOverrides.get(currentQuoteIndex) ?? null
         : paragraphSpeakers[paragraphIndex]
@@ -1459,6 +1479,7 @@ function parseRosterVoiceSegmentsInternal(
           ?? inferredTurnSpeakerId
           ?? continuedSpeakerId
           ?? openingSpeakerId
+          ?? historicalFallbackId
           ?? inference.speakerId
       result.push({
         text: speech,
@@ -1479,12 +1500,15 @@ export function parseRosterVoiceSegments(
   defaultSpeakerId: string | null,
   speakers: CharacterLike[],
   skippedTrackerTagPairs = '',
+  historicalSpeakerId: string | null = null,
 ): PlaybackSegment[] {
   return parseRosterVoiceSegmentsInternal(
     content,
     defaultSpeakerId,
     speakers,
     skippedTrackerTagPairs,
+    undefined,
+    historicalSpeakerId,
   )
 }
 
@@ -1494,6 +1518,7 @@ export function parseRosterVoiceSegmentsWithAssignments(
   speakers: CharacterLike[],
   assignments: LlmSpeakerAssignment[],
   skippedTrackerTagPairs = '',
+  historicalSpeakerId: string | null = null,
 ): PlaybackSegment[] {
   return parseRosterVoiceSegmentsInternal(
     content,
@@ -1501,7 +1526,63 @@ export function parseRosterVoiceSegmentsWithAssignments(
     speakers,
     skippedTrackerTagPairs,
     new Map(assignments.map(assignment => [assignment.quote, assignment.speakerId])),
+    historicalSpeakerId,
   )
+}
+
+/** Resolve an identity-free message from the immediately preceding assistant turn. */
+export function previousAssistantSpeakerFallback(
+  content: string,
+  previousAssistantContent: string,
+  previousDefaultSpeakerId: string | null,
+  speakers: CharacterLike[],
+  skippedTrackerTagPairs = '',
+): string | null {
+  const playbackContent = preparePlaybackContent(content, skippedTrackerTagPairs)
+  const quoteMatches = [...playbackContent.matchAll(/["“]([\s\S]*?)["”]/gu)]
+    .filter(match => !!cleanPlaybackText(match[1] ?? ''))
+  if (quoteMatches.length === 0) return null
+
+  const paragraphs = playbackParagraphs(playbackContent)
+  if (paragraphs.some(paragraph => !!preferredMentionedSpeaker(
+    paragraph.text,
+    speakers,
+    mentionedSpeakers(paragraph.text, speakers),
+  ))) return null
+  for (const match of quoteMatches) {
+    if (match.index === undefined) continue
+    const quoteEnd = match.index + match[0].length
+    if (inferQuotedSpeaker(
+      playbackContent.slice(0, match.index),
+      playbackContent.slice(quoteEnd),
+      match[1] ?? '',
+      speakers,
+      null,
+    ).confident) return null
+  }
+  if (pronounSpeechAttributionSubjects(playbackContent).size > 1) return null
+
+  const previousContent = preparePlaybackContent(previousAssistantContent, skippedTrackerTagPairs)
+  const previousParagraphs = playbackParagraphs(previousContent)
+  for (let index = previousParagraphs.length - 1; index >= 0; index--) {
+    const paragraph = previousParagraphs[index]
+    const speakerId = preferredMentionedSpeaker(
+      paragraph.text,
+      speakers,
+      mentionedSpeakers(paragraph.text, speakers),
+    )
+    if (speakerId) return speakerId
+  }
+  const previousSegments = parseRosterVoiceSegmentsInternal(
+    previousAssistantContent,
+    previousDefaultSpeakerId,
+    speakers,
+    skippedTrackerTagPairs,
+  )
+  for (let index = previousSegments.length - 1; index >= 0; index--) {
+    if (previousSegments[index].speakerId) return previousSegments[index].speakerId
+  }
+  return null
 }
 
 export function detectCharacters(

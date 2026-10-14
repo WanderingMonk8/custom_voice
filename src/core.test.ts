@@ -21,6 +21,7 @@ import {
   parseRosterVoiceSegments,
   parseRosterVoiceSegmentsWithAssignments,
   parseSkippedTrackerTags,
+  previousAssistantSpeakerFallback,
   readConfig,
   readSavedAudioHistory,
   speakerAliases,
@@ -956,6 +957,62 @@ test('strips HTML tags and emphasis markers before TTS segmentation', () => {
   assert.deepEqual(
     parseRosterVoiceSegments('&lt;font color=&quot;#4169E1&quot;&gt;"Again."&lt;/font&gt;', 'alice', []),
     [{ text: 'Again.', speakerId: 'alice' }],
+  )
+})
+
+test('inherits an identity-free single speaker from the previous assistant message', () => {
+  const speakers = [
+    { id: 'mara', name: 'Mara' },
+    { id: 'jayden', name: 'Jayden' },
+  ]
+  const current = [
+    'Her hand closes over his.',
+    '',
+    '"That is my hand."',
+    '',
+    'She says it low, to nobody.',
+    '',
+    '"Do not mess this up."',
+    '',
+    '"Get the book first, Jayden."',
+  ].join('\n')
+  const historicalSpeakerId = previousAssistantSpeakerFallback(
+    current,
+    'Mara pulls the blanket over one shoulder. "I should go."',
+    null,
+    speakers,
+  )
+  assert.equal(historicalSpeakerId, 'mara')
+  assert.deepEqual(
+    parseRosterVoiceSegments(current, null, speakers, '', historicalSpeakerId)
+      .filter(segment => segment.speakerId !== null)
+      .map(segment => segment.speakerId),
+    ['mara', 'mara', 'mara'],
+  )
+})
+
+test('does not inherit history over current attribution or conflicting anonymous speakers', () => {
+  const speakers = [
+    { id: 'mara', name: 'Mara' },
+    { id: 'grace', name: 'Grace' },
+  ]
+  assert.equal(
+    previousAssistantSpeakerFallback(
+      'Grace said, "I have this."',
+      'Mara watched the door.',
+      null,
+      speakers,
+    ),
+    null,
+  )
+  assert.equal(
+    previousAssistantSpeakerFallback(
+      '"Wait," she said. "No," he replied.',
+      'Mara watched the door.',
+      null,
+      speakers,
+    ),
+    null,
   )
 })
 

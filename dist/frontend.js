@@ -632,7 +632,7 @@ function canContinueSpeaker(bridge, previousSpeakerId, speakers) {
   }
   return true;
 }
-function parseRosterVoiceSegmentsInternal(content, defaultSpeakerId, speakers, skippedTrackerTagPairs = "", quoteSpeakerOverrides) {
+function parseRosterVoiceSegmentsInternal(content, defaultSpeakerId, speakers, skippedTrackerTagPairs = "", quoteSpeakerOverrides, historicalSpeakerId = null) {
   const playbackContent = preparePlaybackContent(content, skippedTrackerTagPairs);
   const result = [];
   const quotePattern = /["“]([\s\S]*?)["”]/g;
@@ -676,7 +676,8 @@ function parseRosterVoiceSegmentsInternal(content, defaultSpeakerId, speakers, s
       const dialogueTurnSpeakerId = dialogueTurns.get(paragraphIndex) ?? null;
       const inferredTurnSpeakerId = inference.source === "history" || inference.source === "fallback" ? dialogueTurnSpeakerId : null;
       const openingSpeakerId = inference.source === "fallback" && openingBackfill?.paragraphIndexes.has(paragraphIndex) ? openingBackfill.speakerId : null;
-      const speakerId = quoteSpeakerOverrides?.has(currentQuoteIndex) ? quoteSpeakerOverrides.get(currentQuoteIndex) ?? null : paragraphSpeakers[paragraphIndex] ?? downstreamReplies.get(paragraphIndex) ?? inferredTurnSpeakerId ?? continuedSpeakerId ?? openingSpeakerId ?? inference.speakerId;
+      const historicalFallbackId = inference.source === "history" || inference.source === "fallback" ? historicalSpeakerId : null;
+      const speakerId = quoteSpeakerOverrides?.has(currentQuoteIndex) ? quoteSpeakerOverrides.get(currentQuoteIndex) ?? null : paragraphSpeakers[paragraphIndex] ?? downstreamReplies.get(paragraphIndex) ?? inferredTurnSpeakerId ?? continuedSpeakerId ?? openingSpeakerId ?? historicalFallbackId ?? inference.speakerId;
       result.push({
         text: speech,
         speakerId
@@ -690,12 +691,14 @@ function parseRosterVoiceSegmentsInternal(content, defaultSpeakerId, speakers, s
   if (narration) result.push({ text: narration, speakerId: null });
   return result;
 }
-function parseRosterVoiceSegments(content, defaultSpeakerId, speakers, skippedTrackerTagPairs = "") {
+function parseRosterVoiceSegments(content, defaultSpeakerId, speakers, skippedTrackerTagPairs = "", historicalSpeakerId = null) {
   return parseRosterVoiceSegmentsInternal(
     content,
     defaultSpeakerId,
     speakers,
-    skippedTrackerTagPairs
+    skippedTrackerTagPairs,
+    void 0,
+    historicalSpeakerId
   );
 }
 
@@ -1647,7 +1650,7 @@ function setup(ctx) {
         chatId,
         messageId,
         requestId,
-        mode: preferences.speakerParsingMode === "always" ? "always" : "ambiguous",
+        mode: preferences.speakerParsingMode,
         connectionId: preferences.llmConnectionId,
         model: preferences.llmModel,
         skippedTrackerTags: preferences.skippedTrackerTags
@@ -1900,15 +1903,13 @@ function setup(ctx) {
         playbackChat.characters,
         preferences.skippedTrackerTags
       );
-      if (preferences.speakerParsingMode !== "off") {
-        setStatus("Reviewing dialogue speakers\u2026");
-        try {
-          segments = await requestSpeakerReviewedSegments(playbackChat.id, messageId, preferences);
-        } catch (error) {
-          console.warn("[Chat Voice] AI speaker review failed; using the local parser.", error);
-          if (playback.controller.signal.aborted) throw new DOMException("Playback stopped.", "AbortError");
-          setStatus("AI speaker review unavailable; using the local parser.");
-        }
+      if (preferences.speakerParsingMode !== "off") setStatus("Reviewing dialogue speakers\u2026");
+      try {
+        segments = await requestSpeakerReviewedSegments(playbackChat.id, messageId, preferences);
+      } catch (error) {
+        console.warn("[Chat Voice] Backend speaker parsing failed; using the message-local parser.", error);
+        if (playback.controller.signal.aborted) throw new DOMException("Playback stopped.", "AbortError");
+        setStatus("Historical speaker lookup unavailable; using the message-local parser.");
       }
       const plan = mergeVoicePlan(segments.map((segment) => {
         const speakerId = segment.speakerId ? aliases.get(segment.speakerId) ?? segment.speakerId : null;
