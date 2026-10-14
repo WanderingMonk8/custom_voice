@@ -682,6 +682,7 @@ function parseRosterVoiceSegmentsInternal(content, defaultSpeakerId, speakers, s
   let cursor = 0;
   let lastConfidentSpeakerId = null;
   let lastAssignedSpeakerId = null;
+  let historicalPrefixActive = historicalSpeakerId !== null;
   let quoteIndex = 0;
   for (const quote of quotes) {
     const currentQuoteIndex = quoteIndex;
@@ -706,8 +707,12 @@ function parseRosterVoiceSegmentsInternal(content, defaultSpeakerId, speakers, s
       const dialogueTurnSpeakerId = dialogueTurns.get(paragraphIndex) ?? null;
       const inferredTurnSpeakerId = inference.source === "history" || inference.source === "fallback" ? dialogueTurnSpeakerId : null;
       const openingSpeakerId = inference.source === "fallback" && openingBackfill?.paragraphIndexes.has(paragraphIndex) ? openingBackfill.speakerId : null;
-      const historicalFallbackId = inference.source === "history" || inference.source === "fallback" ? historicalSpeakerId : null;
-      const localSpeakerId = paragraphSpeakers[paragraphIndex] ?? downstreamReplies.get(paragraphIndex) ?? inferredTurnSpeakerId ?? continuedSpeakerId ?? openingSpeakerId ?? historicalFallbackId ?? inference.speakerId;
+      const currentEvidenceSpeakerId = paragraphSpeakers[paragraphIndex] ?? (inference.confident ? inference.speakerId : null);
+      if (historicalPrefixActive && (inference.source === "explicit" || inference.source === "paragraph" || paragraphSpeakers[paragraphIndex] !== null && currentEvidenceSpeakerId !== historicalSpeakerId)) {
+        historicalPrefixActive = false;
+      }
+      const historicalFallbackId = historicalPrefixActive && (inference.source === "history" || inference.source === "fallback") ? historicalSpeakerId : null;
+      const localSpeakerId = paragraphSpeakers[paragraphIndex] ?? downstreamReplies.get(paragraphIndex) ?? inferredTurnSpeakerId ?? continuedSpeakerId ?? historicalFallbackId ?? openingSpeakerId ?? inference.speakerId;
       const overrideSpeakerId = quoteSpeakerOverrides?.get(currentQuoteIndex) ?? null;
       const hasOverride = quoteSpeakerOverrides?.has(currentQuoteIndex) === true;
       const speakerId = hasOverride && (!preserveLocalOnNullOverride || overrideSpeakerId !== null || localSpeakerId === null) ? overrideSpeakerId : localSpeakerId;

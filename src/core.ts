@@ -1486,6 +1486,7 @@ function parseRosterVoiceSegmentsInternal(
   let cursor = 0
   let lastConfidentSpeakerId: string | null = null
   let lastAssignedSpeakerId: string | null = null
+  let historicalPrefixActive = historicalSpeakerId !== null
   let quoteIndex = 0
   for (const quote of quotes) {
     const currentQuoteIndex = quoteIndex
@@ -1519,15 +1520,29 @@ function parseRosterVoiceSegmentsInternal(
         && openingBackfill?.paragraphIndexes.has(paragraphIndex)
         ? openingBackfill.speakerId
         : null
-      const historicalFallbackId = inference.source === 'history' || inference.source === 'fallback'
+      const currentEvidenceSpeakerId = paragraphSpeakers[paragraphIndex]
+        ?? (inference.confident ? inference.speakerId : null)
+      if (
+        historicalPrefixActive
+        && (
+          inference.source === 'explicit'
+          || inference.source === 'paragraph'
+          || (paragraphSpeakers[paragraphIndex] !== null
+            && currentEvidenceSpeakerId !== historicalSpeakerId)
+        )
+      ) {
+        historicalPrefixActive = false
+      }
+      const historicalFallbackId = historicalPrefixActive
+        && (inference.source === 'history' || inference.source === 'fallback')
         ? historicalSpeakerId
         : null
       const localSpeakerId: string | null = paragraphSpeakers[paragraphIndex]
         ?? downstreamReplies.get(paragraphIndex)
         ?? inferredTurnSpeakerId
         ?? continuedSpeakerId
-        ?? openingSpeakerId
         ?? historicalFallbackId
+        ?? openingSpeakerId
         ?? inference.speakerId
       const overrideSpeakerId = quoteSpeakerOverrides?.get(currentQuoteIndex) ?? null
       const hasOverride = quoteSpeakerOverrides?.has(currentQuoteIndex) === true
@@ -1599,8 +1614,40 @@ export function previousAssistantSpeakerFallback(
     .filter(quote => !!cleanPlaybackText(quote.text))
   if (quoteMatches.length === 0) return null
 
-  const historicalInferenceIds = new Set<string>()
-  let hasFallbackInference = false
+  const previousContent = preparePlaybackContent(previousAssistantContent, skippedTrackerTagPairs)
+  const previousParagraphs = playbackParagraphs(previousContent)
+  let previousSpeakerId: string | null = null
+  for (let index = previousParagraphs.length - 1; index >= 0; index--) {
+    const paragraph = previousParagraphs[index]
+    const speakerId = preferredMentionedSpeaker(
+      paragraph.text,
+      speakers,
+      mentionedSpeakers(paragraph.text, speakers),
+    )
+    if (speakerId) {
+      previousSpeakerId = speakerId
+      break
+    }
+  }
+  if (!previousSpeakerId) {
+    const previousSegments = parseRosterVoiceSegmentsInternal(
+      previousAssistantContent,
+      previousDefaultSpeakerId,
+      speakers,
+      skippedTrackerTagPairs,
+    )
+    for (let index = previousSegments.length - 1; index >= 0; index--) {
+      if (previousSegments[index].speakerId) {
+        previousSpeakerId = previousSegments[index].speakerId
+        break
+      }
+    }
+  }
+  if (!previousSpeakerId) return null
+
+  let hasOpeningContinuity = false
+  let openingContinuityEnd = 0
+  const currentParagraphs = playbackParagraphs(playbackContent)
   for (const quote of quoteMatches) {
     const inference = inferQuotedSpeaker(
       playbackContent.slice(0, quote.start),
@@ -1609,36 +1656,27 @@ export function previousAssistantSpeakerFallback(
       speakers,
       null,
     )
-    if (inference.source === 'explicit' || inference.source === 'paragraph') return null
-    if (inference.source === 'history' && inference.speakerId) {
-      historicalInferenceIds.add(inference.speakerId)
+    if (inference.source === 'explicit' || inference.source === 'paragraph') break
+    if (
+      inference.source === 'history'
+      && inference.speakerId
+      && inference.speakerId !== previousSpeakerId
+    ) {
+      if (!hasOpeningContinuity) break
+      // A different name in preceding narration is weaker than an actual
+      // dialogue attribution. Keep the established opening continuity; the
+      // segment parser will close it on explicit current-message evidence.
     }
-    if (inference.source === 'fallback') hasFallbackInference = true
+    hasOpeningContinuity = true
+    openingContinuityEnd = currentParagraphs.find(paragraph => (
+      quote.start >= paragraph.start && quote.start < paragraph.end
+    ))?.end ?? quote.end
   }
-  if (historicalInferenceIds.size === 1 && !hasFallbackInference) return null
-  if (pronounSpeechAttributionSubjects(playbackContent).size > 1) return null
-
-  const previousContent = preparePlaybackContent(previousAssistantContent, skippedTrackerTagPairs)
-  const previousParagraphs = playbackParagraphs(previousContent)
-  for (let index = previousParagraphs.length - 1; index >= 0; index--) {
-    const paragraph = previousParagraphs[index]
-    const speakerId = preferredMentionedSpeaker(
-      paragraph.text,
-      speakers,
-      mentionedSpeakers(paragraph.text, speakers),
-    )
-    if (speakerId) return speakerId
+  if (!hasOpeningContinuity) return null
+  if (pronounSpeechAttributionSubjects(playbackContent.slice(0, openingContinuityEnd)).size > 1) {
+    return null
   }
-  const previousSegments = parseRosterVoiceSegmentsInternal(
-    previousAssistantContent,
-    previousDefaultSpeakerId,
-    speakers,
-    skippedTrackerTagPairs,
-  )
-  for (let index = previousSegments.length - 1; index >= 0; index--) {
-    if (previousSegments[index].speakerId) return previousSegments[index].speakerId
-  }
-  return null
+  return previousSpeakerId
 }
 
 export function detectCharacters(

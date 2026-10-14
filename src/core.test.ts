@@ -1118,6 +1118,36 @@ test('recovers duplicated opening quotes without assigning narration to the spea
   )
 })
 
+test('limits previous-message inheritance to an ambiguous opening dialogue run', () => {
+  const speakers = [
+    { id: 'mara', name: 'Mara' },
+    { id: 'grace', name: 'Grace' },
+  ]
+  const current = [
+    '"The first unresolved thought."',
+    '',
+    '"And another part of the same thought."',
+    '',
+    'Grace stepped into the doorway. "This line is mine," Grace said.',
+    '',
+    '"So is this continuation."',
+  ].join('\n')
+  const historicalSpeakerId = previousAssistantSpeakerFallback(
+    current,
+    'Mara folded her arms. "I am still speaking."',
+    null,
+    speakers,
+  )
+
+  assert.equal(historicalSpeakerId, 'mara')
+  assert.deepEqual(
+    parseRosterVoiceSegments(current, null, speakers, '', historicalSpeakerId)
+      .filter(segment => segment.speakerId !== null)
+      .map(segment => segment.speakerId),
+    ['mara', 'mara', 'grace', 'grace'],
+  )
+})
+
 test('detects multiple named NPCs written by one character card', () => {
   const detected = detectCharacters([{
     is_user: false,
