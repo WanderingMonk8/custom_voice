@@ -421,8 +421,8 @@ function discourseSubjectSpeaker(text, speakers, eligibleSpeakerIds) {
     const lead = narrative.slice(start, occurrence.start);
     const earlierInClause = occurrences.some((other) => other.start >= start && other.start < occurrence.start);
     let score = occurrence.start === firstMentionStart ? 2 : 0;
-    if (!lead.trim()) score += 10;
-    else if (!earlierInClause && /^[^,]{1,48},\s*$/u.test(lead)) score += 8;
+    if (!lead.trim() || /^[\s{(\[]*$/u.test(lead)) score += 10;
+    else if (!earlierInClause && /^[^,]{1,48},\s*(?:(?:a|an|the)\s+)?$/iu.test(lead)) score += 8;
     if (/\b(?:to|from|for|with|by|at|on|of|beside|behind|under|near|toward|towards)\s*$/iu.test(lead)) {
       score -= 6;
     }
@@ -475,14 +475,13 @@ function mainClauseSpeechPossessor(text, speakers) {
   }
   return matches.size === 1 ? [...matches][0] : null;
 }
-var POSSESSIVE_SUBJECT_VERBS = "(?:is|are|was|were|has|have|had|does|do|did|falls?|finds?|takes?|presses?|moves?|comes?|goes?|holds?|keeps?|starts?|stops?|turns?|looks?|watches?|breathes?|shakes?|slides?|opens?|closes?|reaches?|catches?|carries?|knots?|rest(?:s|ed|ing)?)";
 function mainClausePossessiveSubject(text, speakers, eligibleSpeakerIds) {
   const narrative = narrativeOnly(text);
   const matches = /* @__PURE__ */ new Set();
   for (const speaker of speakers) {
     if (!eligibleSpeakerIds.has(speaker.id)) continue;
     for (const alias of speakerAliases(speaker.name)) {
-      const pattern = new RegExp(`\\b${escapedPattern(alias)}\\b['\u2019]s\\s+(?:[\\p{L}\\p{M}'\u2019-]+\\s+){1,5}${POSSESSIVE_SUBJECT_VERBS}\\b`, "giu");
+      const pattern = new RegExp(`\\b${escapedPattern(alias)}\\b['\u2019]s\\s+`, "giu");
       for (const match of narrative.matchAll(pattern)) {
         if (match.index === void 0) continue;
         const prefix = narrative.slice(0, match.index);
@@ -497,7 +496,10 @@ function mainClausePossessiveSubject(text, speakers, eligibleSpeakerIds) {
           prefix.lastIndexOf("\n")
         ) + 1;
         const lead = prefix.slice(sentenceStart);
-        if (!lead.trim() || /\b(?:and|but|then)\s*$/iu.test(lead)) matches.add(speaker.id);
+        if (lead.trim() && !/\b(?:and|but|then)\s*$/iu.test(lead)) continue;
+        const clause = narrative.slice(match.index + match[0].length).split(/[.!?;\n]/u, 1)[0];
+        const clauseWords = clause.match(/[\p{L}\p{M}'’-]+/gu) ?? [];
+        if (clauseWords.length >= 3) matches.add(speaker.id);
       }
     }
   }
@@ -506,8 +508,7 @@ function mainClausePossessiveSubject(text, speakers, eligibleSpeakerIds) {
 function preferredMentionedSpeaker(text, speakers, mentions) {
   const speechPossessor = mainClauseSpeechPossessor(text, speakers);
   if (speechPossessor) return speechPossessor;
-  if (mentions.clean.size === 1) return [...mentions.clean][0];
-  if (mentions.clean.size > 1) return discourseSubjectSpeaker(text, speakers, mentions.clean);
+  if (mentions.clean.size > 0) return discourseSubjectSpeaker(text, speakers, mentions.clean);
   return mainClausePossessiveSubject(text, speakers, mentions.possessive);
 }
 function hasSpeakerMentions(mentions) {
@@ -518,7 +519,7 @@ function soleMentionedSpeaker(text, speakers) {
 }
 function unambiguousNarrativeSpeaker(text, speakers) {
   const mentions = mentionedSpeakers(text, speakers);
-  if (mentions.clean.size === 1) return [...mentions.clean][0];
+  if (mentions.clean.size === 1) return discourseSubjectSpeaker(text, speakers, mentions.clean);
   if (mentions.clean.size === 0) {
     return mainClausePossessiveSubject(text, speakers, mentions.possessive);
   }
@@ -837,22 +838,21 @@ function speakerReviewQuotes(content, skippedTrackerTagPairs = "") {
   const playbackContent = preparePlaybackContent(content, skippedTrackerTagPairs);
   return playbackQuotes(playbackContent).map((quote) => cleanPlaybackText(quote.text));
 }
-function needsLlmSpeakerReview(content, defaultSpeakerId, speakers, skippedTrackerTagPairs = "") {
-  const playbackContent = preparePlaybackContent(content, skippedTrackerTagPairs);
-  for (const quote of playbackQuotes(playbackContent)) {
-    if (!cleanPlaybackText(quote.text)) continue;
-    const inference = inferQuotedSpeaker(
-      playbackContent.slice(0, quote.start),
-      playbackContent.slice(quote.end),
-      quote.text,
-      speakers,
-      defaultSpeakerId
-    );
-    if (inference.source === "history" || inference.source === "fallback") return true;
-  }
-  return false;
+function speakerReviewQuoteIndexes(content, defaultSpeakerId, speakers, skippedTrackerTagPairs = "", historicalSpeakerId = null) {
+  const indexes = /* @__PURE__ */ new Set();
+  parseRosterVoiceSegmentsInternal(
+    content,
+    defaultSpeakerId,
+    speakers,
+    skippedTrackerTagPairs,
+    void 0,
+    historicalSpeakerId,
+    false,
+    indexes
+  );
+  return [...indexes];
 }
-function parseRosterVoiceSegmentsInternal(content, defaultSpeakerId, speakers, skippedTrackerTagPairs = "", quoteSpeakerOverrides, historicalSpeakerId = null, preserveLocalOnNullOverride = false) {
+function parseRosterVoiceSegmentsInternal(content, defaultSpeakerId, speakers, skippedTrackerTagPairs = "", quoteSpeakerOverrides, historicalSpeakerId = null, preserveLocalOnNullOverride = false, lowConfidenceQuoteIndexes) {
   const playbackContent = preparePlaybackContent(content, skippedTrackerTagPairs);
   const result = [];
   const quotes = playbackQuotes(playbackContent);
@@ -900,10 +900,21 @@ function parseRosterVoiceSegmentsInternal(content, defaultSpeakerId, speakers, s
         historicalPrefixActive = false;
       }
       const historicalFallbackId = historicalPrefixActive && (inference.source === "history" || inference.source === "fallback") ? historicalSpeakerId : null;
-      const localSpeakerId = paragraphSpeakers[paragraphIndex] ?? downstreamReplies.get(paragraphIndex) ?? inferredTurnSpeakerId ?? continuedSpeakerId ?? historicalFallbackId ?? openingSpeakerId ?? inference.speakerId;
+      const previousParagraph = paragraphs[paragraphIndex - 1];
+      const adjacentNarrativeSpeakerId = previousParagraph && playbackQuotes(previousParagraph.text).length === 0 ? mainClausePossessiveSubject(
+        previousParagraph.text,
+        speakers,
+        mentionedSpeakers(previousParagraph.text, speakers).possessive
+      ) : null;
+      const adjacentNarrativeEvidenceId = previousParagraph && playbackQuotes(previousParagraph.text).length === 0 ? paragraphSpeakers[paragraphIndex - 1] : null;
+      const localSpeakerId = paragraphSpeakers[paragraphIndex] ?? adjacentNarrativeSpeakerId ?? downstreamReplies.get(paragraphIndex) ?? inferredTurnSpeakerId ?? continuedSpeakerId ?? historicalFallbackId ?? openingSpeakerId ?? inference.speakerId;
+      const confidentLocalSpeakerId = paragraphSpeakers[paragraphIndex] ?? adjacentNarrativeEvidenceId ?? (inference.source === "explicit" || inference.source === "paragraph" ? inference.speakerId : null);
+      if (!localSpeakerId || confidentLocalSpeakerId !== localSpeakerId) {
+        lowConfidenceQuoteIndexes?.add(currentQuoteIndex);
+      }
       const overrideSpeakerId = quoteSpeakerOverrides?.get(currentQuoteIndex) ?? null;
       const hasOverride = quoteSpeakerOverrides?.has(currentQuoteIndex) === true;
-      const speakerId = hasOverride && (!preserveLocalOnNullOverride || overrideSpeakerId !== null || localSpeakerId === null) ? overrideSpeakerId : localSpeakerId;
+      const speakerId = hasOverride && (!preserveLocalOnNullOverride || overrideSpeakerId !== null && confidentLocalSpeakerId === null || localSpeakerId === null) ? overrideSpeakerId : localSpeakerId;
       result.push({
         text: speech,
         speakerId
@@ -1229,7 +1240,14 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
       skippedTrackerTags,
       historicalSpeakerId
     );
-    if (payload.mode === "off" || payload.mode === "ambiguous" && (historicalSpeakerId || !needsLlmSpeakerReview(message.content ?? "", defaultSpeakerId, speakers, skippedTrackerTags))) {
+    const reviewQuoteIndexes = new Set(speakerReviewQuoteIndexes(
+      message.content ?? "",
+      defaultSpeakerId,
+      speakers,
+      skippedTrackerTags,
+      historicalSpeakerId
+    ));
+    if (payload.mode === "off" || payload.mode === "ambiguous" && reviewQuoteIndexes.size === 0) {
       sendSpeakerParse({
         requestId: payload.requestId,
         chatId: chat.id,
@@ -1242,7 +1260,8 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
     const connectionId = payload.connectionId.trim().slice(0, 128);
     const model = payload.model.trim().slice(0, 256);
     const cacheHash = hashMessageContent(JSON.stringify({
-      parser: 7,
+      parser: 10,
+      mode: payload.mode,
       content: message.content ?? "",
       speakers: speakers.map((speaker) => ({ id: speaker.id, name: speaker.name })),
       defaultSpeakerId,
@@ -1264,7 +1283,7 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
       return;
     }
     const quotes = speakerReviewQuotes(message.content ?? "", skippedTrackerTags);
-    const nonEmptyQuoteIndexes = quotes.map((text, quote) => ({ text, quote })).filter((item) => !!item.text);
+    const nonEmptyQuoteIndexes = quotes.map((text, quote) => ({ text, quote })).filter((item) => !!item.text && (payload.mode === "always" || reviewQuoteIndexes.has(item.quote)));
     if (nonEmptyQuoteIndexes.length === 0) {
       sendSpeakerParse({
         requestId: payload.requestId,
@@ -1299,11 +1318,12 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
       parameters: { temperature: 0, ...model ? { model } : {} },
       reasoning: { source: "off" }
     });
+    const requestedQuoteIndexes = new Set(nonEmptyQuoteIndexes.map((item) => item.quote));
     const assignments = parseLlmSpeakerAssignments(
       response,
       new Set(speakers.map((speaker) => speaker.id)),
       quotes.length
-    );
+    ).filter((assignment) => requestedQuoteIndexes.has(assignment.quote));
     const assignedQuotes = new Set(assignments.map((assignment) => assignment.quote));
     if (nonEmptyQuoteIndexes.some((item) => !assignedQuotes.has(item.quote))) {
       throw new Error("The selected LLM returned an incomplete speaker assignment.");

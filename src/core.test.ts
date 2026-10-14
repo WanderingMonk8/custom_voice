@@ -26,6 +26,7 @@ import {
   readConfig,
   readSavedAudioHistory,
   speakerAliases,
+  speakerReviewQuoteIndexes,
   rollingRequestWindowDelay,
   stripSkippedTrackerBlocks,
   upsertSavedAudioRecord,
@@ -378,10 +379,19 @@ test('does not let an ambiguous LLM null erase a deterministic speaker', () => {
   )
 })
 
-test('requests LLM review only for dialogue requiring historical or fallback attribution', () => {
+test('requests LLM review only for final low-confidence quote assignments', () => {
   const speakers = [{ id: 'grace', name: 'Grace' }, { id: 'katie', name: 'Katie' }]
   assert.equal(needsLlmSpeakerReview('Grace said, "Clearly attributed."', 'grace', speakers), false)
-  assert.equal(needsLlmSpeakerReview('Grace watched the door.\n\n"Who is there?"', 'grace', speakers), true)
+  assert.equal(needsLlmSpeakerReview('Grace watched the door.\n\n"Who is there?"', 'grace', speakers), false)
+  assert.equal(needsLlmSpeakerReview('"Who is there?"', null, speakers), true)
+  assert.deepEqual(
+    speakerReviewQuoteIndexes(
+      'Grace said, "First."\n\nGrace watches the door.\n\n"Second."\n\n"Third."',
+      null,
+      speakers,
+    ),
+    [2],
+  )
 })
 
 test('message content hashes change when playback content changes', () => {
@@ -671,6 +681,75 @@ test('prefers a possessive clause subject over weak possessive objects and histo
   )
 })
 
+test('inherits speakers from clause-leading possessive action subjects', () => {
+  const content = [
+    '"Then the first act is coming," Katie says. "More oil. Then the fullest."',
+    '',
+    'Zuri\'s breath shards into the throw and reforms as the word the house has been building toward, her hips pressing back into the slow work with the last of her deliberate rhythm.',
+    '',
+    '"More. There. That\'s the more."',
+    '',
+    'Grace\'s black-nailed hands lock at the freckles and hold. The fairy lights make their small gold weather over the four of them and the poem watches from its shelf.',
+    '',
+    '"Name it," she gasps. "The movie claim."',
+    '',
+    '"Seconded," Katie says from the wall.',
+  ].join('\n')
+
+  assert.deepEqual(
+    parseRosterVoiceSegments(content, null, [
+      { id: 'katie', name: 'Katie' },
+      { id: 'zuri', name: 'Zuri' },
+      { id: 'grace', name: 'Grace' },
+    ]).filter(segment => segment.speakerId !== null),
+    [
+      { text: 'Then the first act is coming,', speakerId: 'katie' },
+      { text: 'More oil. Then the fullest.', speakerId: 'katie' },
+      { text: "More. There. That's the more.", speakerId: 'zuri' },
+      { text: 'Name it,', speakerId: 'grace' },
+      { text: 'The movie claim.', speakerId: 'grace' },
+      { text: 'Seconded,', speakerId: 'katie' },
+    ],
+  )
+})
+
+test('does not let ambiguous LLM review override an adjacent narrative subject', () => {
+  const content = [
+    'Zuri\'s breath reforms as she steadies herself.',
+    '',
+    '"More. There."',
+    '',
+    'Grace\'s black-nailed hands close around her and hold.',
+    '',
+    '"Name it," she gasps. "The movie claim."',
+  ].join('\n')
+  const speakers = [
+    { id: 'zuri', name: 'Zuri' },
+    { id: 'grace', name: 'Grace' },
+  ]
+
+  assert.deepEqual(
+    parseRosterVoiceSegmentsWithAssignments(
+      content,
+      null,
+      speakers,
+      [
+        { quote: 0, speakerId: 'zuri' },
+        { quote: 1, speakerId: 'zuri' },
+        { quote: 2, speakerId: 'zuri' },
+      ],
+      '',
+      null,
+      true,
+    ).filter(segment => segment.speakerId !== null),
+    [
+      { text: 'More. There.', speakerId: 'zuri' },
+      { text: 'Name it,', speakerId: 'grace' },
+      { text: 'The movie claim.', speakerId: 'grace' },
+    ],
+  )
+})
+
 test('backfills opening dialogue from a main-clause speech possessor', () => {
   const content = '"And there is one star in Sweetwater."\n\n"That is how it has been. That is how it is."\n\nColton\'s voice comes off the porch before Tess can tap the tablet. He sits with the pocket watch still open in his palm and looks at Ken across the width of the street.\n\nTess glances toward the porch, then back to Ken.\n\n"The badge is a standard guest selection, Sheriff." She pitches her voice to carry the ten yards.'
   const segments = parseRosterVoiceSegments(content, 'card', [
@@ -834,6 +913,29 @@ test('does not treat a name addressed inside dialogue as the speaker', () => {
     { text: 'Stop offering yourself away.', speakerId: 'grace' },
     { text: "You did it with your turn. You're doing it again. Take the gift, Zuri.", speakerId: 'grace' },
   ])
+})
+
+test('does not treat a sole named object as the paragraph speaker', () => {
+  const content = [
+    '"No, I hear you," Duncan says into the phone. "The third. Everything clean."',
+    '',
+    '"Four o\'clock. Her desk. I\'m there. Wouldn\'t miss it." His eyes cut to Poppy and he grins despite himself. "You\'re the star, sweetheart. Whole show."',
+  ].join('\n')
+  const speakers = [
+    { id: 'duncan', name: 'Duncan' },
+    { id: 'poppy', name: 'Poppy' },
+  ]
+
+  assert.deepEqual(
+    parseRosterVoiceSegments(content, null, speakers)
+      .filter(segment => segment.speakerId !== null),
+    [
+      { text: 'No, I hear you,', speakerId: 'duncan' },
+      { text: 'The third. Everything clean.', speakerId: 'duncan' },
+      { text: "Four o'clock. Her desk. I'm there. Wouldn't miss it.", speakerId: 'duncan' },
+      { text: "You're the star, sweetheart. Whole show.", speakerId: 'duncan' },
+    ],
+  )
 })
 
 test('keeps an appositive speaker across stored rich-text variants', () => {

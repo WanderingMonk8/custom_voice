@@ -942,8 +942,8 @@ function discourseSubjectSpeaker(
       other.start >= start && other.start < occurrence.start
     ))
     let score = occurrence.start === firstMentionStart ? 2 : 0
-    if (!lead.trim()) score += 10
-    else if (!earlierInClause && /^[^,]{1,48},\s*$/u.test(lead)) score += 8
+    if (!lead.trim() || /^[\s{(\[]*$/u.test(lead)) score += 10
+    else if (!earlierInClause && /^[^,]{1,48},\s*(?:(?:a|an|the)\s+)?$/iu.test(lead)) score += 8
 
     if (/\b(?:to|from|for|with|by|at|on|of|beside|behind|under|near|toward|towards)\s*$/iu.test(lead)) {
       score -= 6
@@ -1000,8 +1000,6 @@ function mainClauseSpeechPossessor(text: string, speakers: CharacterLike[]): str
   return matches.size === 1 ? [...matches][0] : null
 }
 
-const POSSESSIVE_SUBJECT_VERBS = '(?:is|are|was|were|has|have|had|does|do|did|falls?|finds?|takes?|presses?|moves?|comes?|goes?|holds?|keeps?|starts?|stops?|turns?|looks?|watches?|breathes?|shakes?|slides?|opens?|closes?|reaches?|catches?|carries?|knots?|rest(?:s|ed|ing)?)'
-
 /** Resolve an owning character when their possessive noun phrase heads a clause. */
 function mainClausePossessiveSubject(
   text: string,
@@ -1013,7 +1011,7 @@ function mainClausePossessiveSubject(
   for (const speaker of speakers) {
     if (!eligibleSpeakerIds.has(speaker.id)) continue
     for (const alias of speakerAliases(speaker.name)) {
-      const pattern = new RegExp(`\\b${escapedPattern(alias)}\\b['’]s\\s+(?:[\\p{L}\\p{M}'’-]+\\s+){1,5}${POSSESSIVE_SUBJECT_VERBS}\\b`, 'giu')
+      const pattern = new RegExp(`\\b${escapedPattern(alias)}\\b['’]s\\s+`, 'giu')
       for (const match of narrative.matchAll(pattern)) {
         if (match.index === undefined) continue
         const prefix = narrative.slice(0, match.index)
@@ -1025,7 +1023,12 @@ function mainClausePossessiveSubject(
           prefix.lastIndexOf(';'), prefix.lastIndexOf('\n'),
         ) + 1
         const lead = prefix.slice(sentenceStart)
-        if (!lead.trim() || /\b(?:and|but|then)\s*$/iu.test(lead)) matches.add(speaker.id)
+        if (lead.trim() && !/\b(?:and|but|then)\s*$/iu.test(lead)) continue
+        const clause = narrative.slice(match.index + match[0].length).split(/[.!?;\n]/u, 1)[0]
+        const clauseWords = clause.match(/[\p{L}\p{M}'’-]+/gu) ?? []
+        // Clause position is more durable evidence than a finite verb list.
+        // Three following words also reject fragments such as "Grace's wrist."
+        if (clauseWords.length >= 3) matches.add(speaker.id)
       }
     }
   }
@@ -1039,8 +1042,7 @@ function preferredMentionedSpeaker(
 ): string | null {
   const speechPossessor = mainClauseSpeechPossessor(text, speakers)
   if (speechPossessor) return speechPossessor
-  if (mentions.clean.size === 1) return [...mentions.clean][0]
-  if (mentions.clean.size > 1) return discourseSubjectSpeaker(text, speakers, mentions.clean)
+  if (mentions.clean.size > 0) return discourseSubjectSpeaker(text, speakers, mentions.clean)
   return mainClausePossessiveSubject(text, speakers, mentions.possessive)
 }
 
@@ -1054,7 +1056,7 @@ function soleMentionedSpeaker(text: string, speakers: CharacterLike[]): string |
 
 function unambiguousNarrativeSpeaker(text: string, speakers: CharacterLike[]): string | null {
   const mentions = mentionedSpeakers(text, speakers)
-  if (mentions.clean.size === 1) return [...mentions.clean][0]
+  if (mentions.clean.size === 1) return discourseSubjectSpeaker(text, speakers, mentions.clean)
   if (mentions.clean.size === 0) {
     return mainClausePossessiveSubject(text, speakers, mentions.possessive)
   }
@@ -1509,20 +1511,36 @@ export function needsLlmSpeakerReview(
   defaultSpeakerId: string | null,
   speakers: CharacterLike[],
   skippedTrackerTagPairs = '',
+  historicalSpeakerId: string | null = null,
 ): boolean {
-  const playbackContent = preparePlaybackContent(content, skippedTrackerTagPairs)
-  for (const quote of playbackQuotes(playbackContent)) {
-    if (!cleanPlaybackText(quote.text)) continue
-    const inference = inferQuotedSpeaker(
-      playbackContent.slice(0, quote.start),
-      playbackContent.slice(quote.end),
-      quote.text,
-      speakers,
-      defaultSpeakerId,
-    )
-    if (inference.source === 'history' || inference.source === 'fallback') return true
-  }
-  return false
+  return speakerReviewQuoteIndexes(
+    content,
+    defaultSpeakerId,
+    speakers,
+    skippedTrackerTagPairs,
+    historicalSpeakerId,
+  ).length > 0
+}
+
+export function speakerReviewQuoteIndexes(
+  content: string,
+  defaultSpeakerId: string | null,
+  speakers: CharacterLike[],
+  skippedTrackerTagPairs = '',
+  historicalSpeakerId: string | null = null,
+): number[] {
+  const indexes = new Set<number>()
+  parseRosterVoiceSegmentsInternal(
+    content,
+    defaultSpeakerId,
+    speakers,
+    skippedTrackerTagPairs,
+    undefined,
+    historicalSpeakerId,
+    false,
+    indexes,
+  )
+  return [...indexes]
 }
 
 function parseRosterVoiceSegmentsInternal(
@@ -1533,6 +1551,7 @@ function parseRosterVoiceSegmentsInternal(
   quoteSpeakerOverrides?: ReadonlyMap<number, string | null>,
   historicalSpeakerId: string | null = null,
   preserveLocalOnNullOverride = false,
+  lowConfidenceQuoteIndexes?: Set<number>,
 ): PlaybackSegment[] {
   const playbackContent = preparePlaybackContent(content, skippedTrackerTagPairs)
   const result: PlaybackSegment[] = []
@@ -1604,17 +1623,41 @@ function parseRosterVoiceSegmentsInternal(
         && (inference.source === 'history' || inference.source === 'fallback')
         ? historicalSpeakerId
         : null
+      const previousParagraph = paragraphs[paragraphIndex - 1]
+      const adjacentNarrativeSpeakerId = previousParagraph
+        && playbackQuotes(previousParagraph.text).length === 0
+        ? mainClausePossessiveSubject(
+            previousParagraph.text,
+            speakers,
+            mentionedSpeakers(previousParagraph.text, speakers).possessive,
+          )
+        : null
+      const adjacentNarrativeEvidenceId = previousParagraph
+        && playbackQuotes(previousParagraph.text).length === 0
+        ? paragraphSpeakers[paragraphIndex - 1]
+        : null
       const localSpeakerId: string | null = paragraphSpeakers[paragraphIndex]
+        ?? adjacentNarrativeSpeakerId
         ?? downstreamReplies.get(paragraphIndex)
         ?? inferredTurnSpeakerId
         ?? continuedSpeakerId
         ?? historicalFallbackId
         ?? openingSpeakerId
         ?? inference.speakerId
+      const confidentLocalSpeakerId = paragraphSpeakers[paragraphIndex]
+        ?? adjacentNarrativeEvidenceId
+        ?? (inference.source === 'explicit' || inference.source === 'paragraph'
+          ? inference.speakerId
+          : null)
+      if (!localSpeakerId || confidentLocalSpeakerId !== localSpeakerId) {
+        lowConfidenceQuoteIndexes?.add(currentQuoteIndex)
+      }
       const overrideSpeakerId = quoteSpeakerOverrides?.get(currentQuoteIndex) ?? null
       const hasOverride = quoteSpeakerOverrides?.has(currentQuoteIndex) === true
       const speakerId: string | null = hasOverride
-        && (!preserveLocalOnNullOverride || overrideSpeakerId !== null || localSpeakerId === null)
+        && (!preserveLocalOnNullOverride
+          || (overrideSpeakerId !== null && confidentLocalSpeakerId === null)
+          || localSpeakerId === null)
         ? overrideSpeakerId
         : localSpeakerId
       result.push({

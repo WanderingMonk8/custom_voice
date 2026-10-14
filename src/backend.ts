@@ -4,7 +4,6 @@ import {
   clampMessageLimit,
   hashMessageContent,
   normalizeSpeakerName,
-  needsLlmSpeakerReview,
   parseCardCast,
   parseLlmSpeakerAssignments,
   parseRosterVoiceSegments,
@@ -14,6 +13,7 @@ import {
   mergeScannedCardCast,
   readConfig,
   speakerReviewQuotes,
+  speakerReviewQuoteIndexes,
   speakerAliases,
   type CharacterLike,
   type ChatVoiceConfig,
@@ -352,11 +352,16 @@ function queueSpeakerParse(
       skippedTrackerTags,
       historicalSpeakerId,
     )
+    const reviewQuoteIndexes = new Set(speakerReviewQuoteIndexes(
+      message.content ?? '',
+      defaultSpeakerId,
+      speakers,
+      skippedTrackerTags,
+      historicalSpeakerId,
+    ))
     if (
       payload.mode === 'off'
-      || (payload.mode === 'ambiguous'
-        && (historicalSpeakerId
-          || !needsLlmSpeakerReview(message.content ?? '', defaultSpeakerId, speakers, skippedTrackerTags)))
+      || (payload.mode === 'ambiguous' && reviewQuoteIndexes.size === 0)
     ) {
       sendSpeakerParse({
         requestId: payload.requestId,
@@ -371,7 +376,8 @@ function queueSpeakerParse(
     const connectionId = payload.connectionId.trim().slice(0, 128)
     const model = payload.model.trim().slice(0, 256)
     const cacheHash = hashMessageContent(JSON.stringify({
-      parser: 7,
+      parser: 10,
+      mode: payload.mode,
       content: message.content ?? '',
       speakers: speakers.map(speaker => ({ id: speaker.id, name: speaker.name })),
       defaultSpeakerId,
@@ -396,7 +402,9 @@ function queueSpeakerParse(
     const quotes = speakerReviewQuotes(message.content ?? '', skippedTrackerTags)
     const nonEmptyQuoteIndexes = quotes
       .map((text, quote) => ({ text, quote }))
-      .filter(item => !!item.text)
+      .filter(item => !!item.text && (
+        payload.mode === 'always' || reviewQuoteIndexes.has(item.quote)
+      ))
     if (nonEmptyQuoteIndexes.length === 0) {
       sendSpeakerParse({
         requestId: payload.requestId,
@@ -432,11 +440,12 @@ function queueSpeakerParse(
       parameters: { temperature: 0, ...(model ? { model } : {}) },
       reasoning: { source: 'off' },
     })
+    const requestedQuoteIndexes = new Set(nonEmptyQuoteIndexes.map(item => item.quote))
     const assignments = parseLlmSpeakerAssignments(
       response,
       new Set(speakers.map(speaker => speaker.id)),
       quotes.length,
-    )
+    ).filter(assignment => requestedQuoteIndexes.has(assignment.quote))
     const assignedQuotes = new Set(assignments.map(assignment => assignment.quote))
     if (nonEmptyQuoteIndexes.some(item => !assignedQuotes.has(item.quote))) {
       throw new Error('The selected LLM returned an incomplete speaker assignment.')
