@@ -1079,7 +1079,7 @@ test('recovers duplicated opening quotes without assigning narration to the spea
   const current = [
     'Nathan turns the bottle in his hand and studies the man.',
     '',
-    '""Not for her. For myself."',
+    '""Not for her. For myself.\'',
     '',
     '"That is her sentence wearing your coat."',
     '',

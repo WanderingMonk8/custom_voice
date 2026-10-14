@@ -594,8 +594,10 @@ function playbackParagraphs(content) {
 function playbackQuotes(content) {
   const quotes = [];
   for (const paragraph of playbackParagraphs(content)) {
+    let matched = false;
     for (const match of paragraph.text.matchAll(/["“]([\s\S]*?)["”]/gu)) {
       if (match.index === void 0) continue;
+      matched = true;
       const start = paragraph.start + match.index;
       quotes.push({
         start,
@@ -603,6 +605,15 @@ function playbackQuotes(content) {
         text: match[1] ?? ""
       });
     }
+    if (matched) continue;
+    const leadingQuote = paragraph.text.match(/^(\s*)["“]([\s\S]+)$/u);
+    if (!leadingQuote) continue;
+    const localStart = leadingQuote[1]?.length ?? 0;
+    quotes.push({
+      start: paragraph.start + localStart,
+      end: paragraph.end,
+      text: (leadingQuote[2] ?? "").replace(/['’]\s*$/u, "")
+    });
   }
   return quotes;
 }
@@ -1182,7 +1193,7 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
     const connectionId = payload.connectionId.trim().slice(0, 128);
     const model = payload.model.trim().slice(0, 256);
     const cacheHash = hashMessageContent(JSON.stringify({
-      parser: 4,
+      parser: 5,
       content: message.content ?? "",
       speakers: speakers.map((speaker) => ({ id: speaker.id, name: speaker.name })),
       defaultSpeakerId,

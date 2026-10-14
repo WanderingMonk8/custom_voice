@@ -470,8 +470,10 @@ function playbackParagraphs(content) {
 function playbackQuotes(content) {
   const quotes = [];
   for (const paragraph of playbackParagraphs(content)) {
+    let matched = false;
     for (const match of paragraph.text.matchAll(/["“]([\s\S]*?)["”]/gu)) {
       if (match.index === void 0) continue;
+      matched = true;
       const start = paragraph.start + match.index;
       quotes.push({
         start,
@@ -479,6 +481,15 @@ function playbackQuotes(content) {
         text: match[1] ?? ""
       });
     }
+    if (matched) continue;
+    const leadingQuote = paragraph.text.match(/^(\s*)["“]([\s\S]+)$/u);
+    if (!leadingQuote) continue;
+    const localStart = leadingQuote[1]?.length ?? 0;
+    quotes.push({
+      start: paragraph.start + localStart,
+      end: paragraph.end,
+      text: (leadingQuote[2] ?? "").replace(/['’]\s*$/u, "")
+    });
   }
   return quotes;
 }
