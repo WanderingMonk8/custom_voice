@@ -1071,6 +1071,53 @@ test('uses the previous assistant speaker to resolve conflicting narrative candi
   )
 })
 
+test('recovers duplicated opening quotes without assigning narration to the speaker', () => {
+  const speakers = [
+    { id: 'nathan', name: 'Nathan Bateman / Nathan' },
+    { id: 'kyoko', name: 'Kyoko' },
+  ]
+  const current = [
+    'Nathan turns the bottle in his hand and studies the man.',
+    '',
+    '""Not for her. For myself."',
+    '',
+    '"That is her sentence wearing your coat."',
+    '',
+    'He steps past, close enough that the smell of beer comes off him.',
+    '',
+    '"Granted. Seven-thirty, ridge path, back by nine."',
+    '',
+    'Kyoko appears at the edge of the kitchen. Nathan watches her and then does not.',
+    '',
+    '"Dinner in twenty. Go wash your hands like a guest."',
+  ].join('\n')
+  const historicalSpeakerId = previousAssistantSpeakerFallback(
+    current,
+    'Nathan steps out first. "Do honest."',
+    null,
+    speakers,
+  )
+
+  assert.equal(historicalSpeakerId, 'nathan')
+  const segments = parseRosterVoiceSegments(current, null, speakers, '', historicalSpeakerId)
+  assert.deepEqual(
+    segments.filter(segment => segment.text.startsWith('Not for her')
+      || segment.text.startsWith('That is her sentence')
+      || segment.text.startsWith('Granted')
+      || segment.text.startsWith('Dinner in twenty')),
+    [
+      { text: 'Not for her. For myself.', speakerId: 'nathan' },
+      { text: 'That is her sentence wearing your coat.', speakerId: 'nathan' },
+      { text: 'Granted. Seven-thirty, ridge path, back by nine.', speakerId: 'nathan' },
+      { text: 'Dinner in twenty. Go wash your hands like a guest.', speakerId: 'nathan' },
+    ],
+  )
+  assert.deepEqual(
+    segments.find(segment => segment.text.startsWith('He steps past')),
+    { text: 'He steps past, close enough that the smell of beer comes off him.', speakerId: null },
+  )
+})
+
 test('detects multiple named NPCs written by one character card', () => {
   const detected = detectCharacters([{
     is_user: false,

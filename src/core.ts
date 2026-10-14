@@ -761,6 +761,11 @@ export function stripSkippedTrackerBlocks(content: string, tagPairs: string): st
 
 export function preparePlaybackContent(content: string, skippedTrackerTagPairs = ''): string {
   return stripPlaybackMarkup(stripSkippedTrackerBlocks(content, skippedTrackerTagPairs))
+    // Rich-text sources may preserve quote entities, and some model outputs emit
+    // the same opening mark twice. A doubled opener shifts a global quote regex
+    // by one delimiter, turning later dialogue into narration and vice versa.
+    .replace(/&quot;|&#34;|&#x22;/giu, '"')
+    .replace(/["“”]{2,}/gu, '"')
 }
 
 function cleanPlaybackText(value: string): string {
@@ -828,7 +833,15 @@ interface SpeakerMentions {
 }
 
 function narrativeOnly(text: string): string {
-  return text.replace(/["“][\s\S]*?["”]/gu, ' ')
+  const quotes = playbackQuotes(text)
+  if (quotes.length === 0) return text
+  let result = ''
+  let cursor = 0
+  for (const quote of quotes) {
+    result += `${text.slice(cursor, quote.start)} `
+    cursor = quote.end
+  }
+  return result + text.slice(cursor)
 }
 
 function mentionedSpeakers(text: string, speakers: CharacterLike[]): SpeakerMentions {
@@ -1093,6 +1106,12 @@ interface PlaybackParagraph {
   text: string
 }
 
+interface PlaybackQuote {
+  start: number
+  end: number
+  text: string
+}
+
 function playbackParagraphs(content: string): PlaybackParagraph[] {
   const paragraphs: PlaybackParagraph[] = []
   let cursor = 0
@@ -1105,6 +1124,27 @@ function playbackParagraphs(content: string): PlaybackParagraph[] {
   const text = content.slice(cursor)
   if (text.trim()) paragraphs.push({ start: cursor, end: content.length, text })
   return paragraphs
+}
+
+/**
+ * Extract quotes without ever pairing delimiters across a paragraph boundary.
+ * One malformed paragraph can therefore no longer invert dialogue and narration
+ * throughout the remainder of a message.
+ */
+function playbackQuotes(content: string): PlaybackQuote[] {
+  const quotes: PlaybackQuote[] = []
+  for (const paragraph of playbackParagraphs(content)) {
+    for (const match of paragraph.text.matchAll(/["“]([\s\S]*?)["”]/gu)) {
+      if (match.index === undefined) continue
+      const start = paragraph.start + match.index
+      quotes.push({
+        start,
+        end: start + match[0].length,
+        text: match[1] ?? '',
+      })
+    }
+  }
+  return quotes
 }
 
 interface InitialDialogueBackfill {
@@ -1124,7 +1164,7 @@ function initialDialogueBackfill(
   let dialogueStarted = false
   for (let index = 0; index < paragraphs.length; index++) {
     const paragraph = paragraphs[index]
-    const hasDialogue = /["“][\s\S]*?["”]/u.test(paragraph.text)
+    const hasDialogue = playbackQuotes(paragraph.text).length > 0
     const mentions = mentionedSpeakers(paragraph.text, speakers)
     const localSpeakerId = preferredMentionedSpeaker(paragraph.text, speakers, mentions)
 
@@ -1160,14 +1200,13 @@ function confidentDialogueParagraphSpeaker(
   defaultSpeakerId: string | null,
 ): string | null {
   const speakerIds = new Set<string>()
-  for (const match of paragraph.text.matchAll(/["“]([\s\S]*?)["”]/gu)) {
-    if (match.index === undefined) continue
-    const quoteStart = paragraph.start + match.index
-    const quoteEnd = quoteStart + match[0].length
+  for (const quote of playbackQuotes(paragraph.text)) {
+    const quoteStart = paragraph.start + quote.start
+    const quoteEnd = paragraph.start + quote.end
     const inference = inferQuotedSpeaker(
       content.slice(0, quoteStart),
       content.slice(quoteEnd),
-      match[1] ?? '',
+      quote.text,
       speakers,
       defaultSpeakerId,
     )
@@ -1264,7 +1303,7 @@ function paragraphDialogueTurns(
 
   for (let paragraphIndex = 0; paragraphIndex < paragraphs.length; paragraphIndex++) {
     const paragraph = paragraphs[paragraphIndex]
-    const quoteMatches = [...paragraph.text.matchAll(/["“]([\s\S]*?)["”]/gu)]
+    const quoteMatches = playbackQuotes(paragraph.text)
     if (quoteMatches.length === 0) {
       const narration = cleanPlaybackText(paragraph.text)
       const transparentBeat = narration.length <= 120
@@ -1280,14 +1319,13 @@ function paragraphDialogueTurns(
     const explicitSpeakerIds = new Set<string>()
     const initialHistorySpeakerIds = new Set<string>()
     const continuationHistorySpeakerIds = new Set<string>()
-    for (const match of quoteMatches) {
-      if (match.index === undefined) continue
-      const quoteStart = paragraph.start + match.index
-      const quoteEnd = quoteStart + match[0].length
+    for (const quote of quoteMatches) {
+      const quoteStart = paragraph.start + quote.start
+      const quoteEnd = paragraph.start + quote.end
       const inference = inferQuotedSpeaker(
         content.slice(0, quoteStart),
         content.slice(quoteEnd),
-        match[1] ?? '',
+        quote.text,
         speakers,
         defaultSpeakerId,
       )
@@ -1381,8 +1419,7 @@ function canContinueSpeaker(
 
 export function speakerReviewQuotes(content: string, skippedTrackerTagPairs = ''): string[] {
   const playbackContent = preparePlaybackContent(content, skippedTrackerTagPairs)
-  return [...playbackContent.matchAll(/["“]([\s\S]*?)["”]/gu)]
-    .map(match => cleanPlaybackText(match[1] ?? ''))
+  return playbackQuotes(playbackContent).map(quote => cleanPlaybackText(quote.text))
 }
 
 export function needsLlmSpeakerReview(
@@ -1392,13 +1429,12 @@ export function needsLlmSpeakerReview(
   skippedTrackerTagPairs = '',
 ): boolean {
   const playbackContent = preparePlaybackContent(content, skippedTrackerTagPairs)
-  for (const match of playbackContent.matchAll(/["“]([\s\S]*?)["”]/gu)) {
-    if (match.index === undefined || !cleanPlaybackText(match[1] ?? '')) continue
-    const quoteEnd = match.index + match[0].length
+  for (const quote of playbackQuotes(playbackContent)) {
+    if (!cleanPlaybackText(quote.text)) continue
     const inference = inferQuotedSpeaker(
-      playbackContent.slice(0, match.index),
-      playbackContent.slice(quoteEnd),
-      match[1] ?? '',
+      playbackContent.slice(0, quote.start),
+      playbackContent.slice(quote.end),
+      quote.text,
       speakers,
       defaultSpeakerId,
     )
@@ -1418,7 +1454,7 @@ function parseRosterVoiceSegmentsInternal(
 ): PlaybackSegment[] {
   const playbackContent = preparePlaybackContent(content, skippedTrackerTagPairs)
   const result: PlaybackSegment[] = []
-  const quotePattern = /["“]([\s\S]*?)["”]/g
+  const quotes = playbackQuotes(playbackContent)
   const paragraphs = playbackParagraphs(playbackContent)
   const openingBackfill = initialDialogueBackfill(paragraphs, speakers)
   const dialogueTurns = paragraphDialogueTurns(playbackContent, speakers, defaultSpeakerId)
@@ -1436,23 +1472,21 @@ function parseRosterVoiceSegmentsInternal(
   let lastConfidentSpeakerId: string | null = null
   let lastAssignedSpeakerId: string | null = null
   let quoteIndex = 0
-  for (const match of playbackContent.matchAll(quotePattern)) {
-    if (match.index === undefined) continue
+  for (const quote of quotes) {
     const currentQuoteIndex = quoteIndex
     quoteIndex += 1
-    while (paragraphIndex + 1 < paragraphs.length && match.index >= paragraphs[paragraphIndex].end) {
+    while (paragraphIndex + 1 < paragraphs.length && quote.start >= paragraphs[paragraphIndex].end) {
       paragraphIndex += 1
     }
-    const bridge = playbackContent.slice(cursor, match.index)
+    const bridge = playbackContent.slice(cursor, quote.start)
     const narration = cleanPlaybackText(bridge)
     if (narration) result.push({ text: narration, speakerId: null })
-    const speech = cleanPlaybackText(match[1] ?? '')
+    const speech = cleanPlaybackText(quote.text)
     if (speech) {
-      const quoteEnd = match.index + match[0].length
       const inference = inferQuotedSpeaker(
-        playbackContent.slice(0, match.index),
-        playbackContent.slice(quoteEnd),
-        match[1] ?? '',
+        playbackContent.slice(0, quote.start),
+        playbackContent.slice(quote.end),
+        quote.text,
         speakers,
         defaultSpeakerId,
       )
@@ -1493,7 +1527,7 @@ function parseRosterVoiceSegmentsInternal(
       if ((inference.confident || openingSpeakerId) && speakerId) lastConfidentSpeakerId = speakerId
       if (speakerId) lastAssignedSpeakerId = speakerId
     }
-    cursor = match.index + match[0].length
+    cursor = quote.end
   }
   const narration = cleanPlaybackText(playbackContent.slice(cursor))
   if (narration) result.push({ text: narration, speakerId: null })
@@ -1546,18 +1580,17 @@ export function previousAssistantSpeakerFallback(
   skippedTrackerTagPairs = '',
 ): string | null {
   const playbackContent = preparePlaybackContent(content, skippedTrackerTagPairs)
-  const quoteMatches = [...playbackContent.matchAll(/["“]([\s\S]*?)["”]/gu)]
-    .filter(match => !!cleanPlaybackText(match[1] ?? ''))
+  const quoteMatches = playbackQuotes(playbackContent)
+    .filter(quote => !!cleanPlaybackText(quote.text))
   if (quoteMatches.length === 0) return null
 
   const historicalInferenceIds = new Set<string>()
-  for (const match of quoteMatches) {
-    if (match.index === undefined) continue
-    const quoteEnd = match.index + match[0].length
+  let hasFallbackInference = false
+  for (const quote of quoteMatches) {
     const inference = inferQuotedSpeaker(
-      playbackContent.slice(0, match.index),
-      playbackContent.slice(quoteEnd),
-      match[1] ?? '',
+      playbackContent.slice(0, quote.start),
+      playbackContent.slice(quote.end),
+      quote.text,
       speakers,
       null,
     )
@@ -1565,8 +1598,9 @@ export function previousAssistantSpeakerFallback(
     if (inference.source === 'history' && inference.speakerId) {
       historicalInferenceIds.add(inference.speakerId)
     }
+    if (inference.source === 'fallback') hasFallbackInference = true
   }
-  if (historicalInferenceIds.size === 1) return null
+  if (historicalInferenceIds.size === 1 && !hasFallbackInference) return null
   if (pronounSpeechAttributionSubjects(playbackContent).size > 1) return null
 
   const previousContent = preparePlaybackContent(previousAssistantContent, skippedTrackerTagPairs)
