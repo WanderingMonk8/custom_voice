@@ -475,14 +475,13 @@ function mainClauseSpeechPossessor(text, speakers) {
   }
   return matches.size === 1 ? [...matches][0] : null;
 }
-var POSSESSIVE_SUBJECT_VERBS = "(?:is|are|was|were|has|have|had|does|do|did|falls?|finds?|takes?|presses?|moves?|comes?|goes?|holds?|keeps?|starts?|stops?|turns?|looks?|watches?|breathes?|shakes?|slides?|opens?|closes?|reaches?|catches?|carries?|knots?|locks?|shards?|reforms?|rest(?:s|ed|ing)?)";
 function mainClausePossessiveSubject(text, speakers, eligibleSpeakerIds) {
   const narrative = narrativeOnly(text);
   const matches = /* @__PURE__ */ new Set();
   for (const speaker of speakers) {
     if (!eligibleSpeakerIds.has(speaker.id)) continue;
     for (const alias of speakerAliases(speaker.name)) {
-      const pattern = new RegExp(`\\b${escapedPattern(alias)}\\b['\u2019]s\\s+(?:[\\p{L}\\p{M}'\u2019-]+\\s+){1,5}${POSSESSIVE_SUBJECT_VERBS}\\b`, "giu");
+      const pattern = new RegExp(`\\b${escapedPattern(alias)}\\b['\u2019]s\\s+`, "giu");
       for (const match of narrative.matchAll(pattern)) {
         if (match.index === void 0) continue;
         const prefix = narrative.slice(0, match.index);
@@ -497,7 +496,10 @@ function mainClausePossessiveSubject(text, speakers, eligibleSpeakerIds) {
           prefix.lastIndexOf("\n")
         ) + 1;
         const lead = prefix.slice(sentenceStart);
-        if (!lead.trim() || /\b(?:and|but|then)\s*$/iu.test(lead)) matches.add(speaker.id);
+        if (lead.trim() && !/\b(?:and|but|then)\s*$/iu.test(lead)) continue;
+        const clause = narrative.slice(match.index + match[0].length).split(/[.!?;\n]/u, 1)[0];
+        const clauseWords = clause.match(/[\p{L}\p{M}'’-]+/gu) ?? [];
+        if (clauseWords.length >= 3) matches.add(speaker.id);
       }
     }
   }
@@ -900,10 +902,17 @@ function parseRosterVoiceSegmentsInternal(content, defaultSpeakerId, speakers, s
         historicalPrefixActive = false;
       }
       const historicalFallbackId = historicalPrefixActive && (inference.source === "history" || inference.source === "fallback") ? historicalSpeakerId : null;
-      const localSpeakerId = paragraphSpeakers[paragraphIndex] ?? downstreamReplies.get(paragraphIndex) ?? inferredTurnSpeakerId ?? continuedSpeakerId ?? historicalFallbackId ?? openingSpeakerId ?? inference.speakerId;
+      const previousParagraph = paragraphs[paragraphIndex - 1];
+      const adjacentNarrativeSpeakerId = previousParagraph && playbackQuotes(previousParagraph.text).length === 0 ? mainClausePossessiveSubject(
+        previousParagraph.text,
+        speakers,
+        mentionedSpeakers(previousParagraph.text, speakers).possessive
+      ) : null;
+      const localSpeakerId = paragraphSpeakers[paragraphIndex] ?? adjacentNarrativeSpeakerId ?? downstreamReplies.get(paragraphIndex) ?? inferredTurnSpeakerId ?? continuedSpeakerId ?? historicalFallbackId ?? openingSpeakerId ?? inference.speakerId;
       const overrideSpeakerId = quoteSpeakerOverrides?.get(currentQuoteIndex) ?? null;
       const hasOverride = quoteSpeakerOverrides?.has(currentQuoteIndex) === true;
-      const speakerId = hasOverride && (!preserveLocalOnNullOverride || overrideSpeakerId !== null || localSpeakerId === null) ? overrideSpeakerId : localSpeakerId;
+      const protectedLocalSpeakerId = paragraphSpeakers[paragraphIndex] ?? adjacentNarrativeSpeakerId ?? (inference.source === "explicit" || inference.source === "paragraph" ? inference.speakerId : null);
+      const speakerId = hasOverride && (!preserveLocalOnNullOverride || overrideSpeakerId !== null && protectedLocalSpeakerId === null || localSpeakerId === null) ? overrideSpeakerId : localSpeakerId;
       result.push({
         text: speech,
         speakerId
@@ -1242,7 +1251,7 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
     const connectionId = payload.connectionId.trim().slice(0, 128);
     const model = payload.model.trim().slice(0, 256);
     const cacheHash = hashMessageContent(JSON.stringify({
-      parser: 7,
+      parser: 8,
       content: message.content ?? "",
       speakers: speakers.map((speaker) => ({ id: speaker.id, name: speaker.name })),
       defaultSpeakerId,

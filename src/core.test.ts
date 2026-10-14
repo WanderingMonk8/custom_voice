@@ -675,11 +675,11 @@ test('inherits speakers from clause-leading possessive action subjects', () => {
   const content = [
     '"Then the first act is coming," Katie says. "More oil. Then the fullest."',
     '',
-    'Zuri\'s breath shards into the throw and reforms as the word the house has been building toward.',
+    'Zuri\'s breath shards into the throw and reforms as the word the house has been building toward, her hips pressing back into the slow work with the last of her deliberate rhythm.',
     '',
     '"More. There. That\'s the more."',
     '',
-    'Grace\'s black-nailed hands lock at the freckles and hold.',
+    'Grace\'s black-nailed hands lock at the freckles and hold. The fairy lights make their small gold weather over the four of them and the poem watches from its shelf.',
     '',
     '"Name it," she gasps. "The movie claim."',
     '',
@@ -699,6 +699,43 @@ test('inherits speakers from clause-leading possessive action subjects', () => {
       { text: 'Name it,', speakerId: 'grace' },
       { text: 'The movie claim.', speakerId: 'grace' },
       { text: 'Seconded,', speakerId: 'katie' },
+    ],
+  )
+})
+
+test('does not let ambiguous LLM review override an adjacent narrative subject', () => {
+  const content = [
+    'Zuri\'s breath reforms as she steadies herself.',
+    '',
+    '"More. There."',
+    '',
+    'Grace\'s black-nailed hands close around her and hold.',
+    '',
+    '"Name it," she gasps. "The movie claim."',
+  ].join('\n')
+  const speakers = [
+    { id: 'zuri', name: 'Zuri' },
+    { id: 'grace', name: 'Grace' },
+  ]
+
+  assert.deepEqual(
+    parseRosterVoiceSegmentsWithAssignments(
+      content,
+      null,
+      speakers,
+      [
+        { quote: 0, speakerId: 'zuri' },
+        { quote: 1, speakerId: 'zuri' },
+        { quote: 2, speakerId: 'zuri' },
+      ],
+      '',
+      null,
+      true,
+    ).filter(segment => segment.speakerId !== null),
+    [
+      { text: 'More. There.', speakerId: 'zuri' },
+      { text: 'Name it,', speakerId: 'grace' },
+      { text: 'The movie claim.', speakerId: 'grace' },
     ],
   )
 })

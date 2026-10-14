@@ -1000,8 +1000,6 @@ function mainClauseSpeechPossessor(text: string, speakers: CharacterLike[]): str
   return matches.size === 1 ? [...matches][0] : null
 }
 
-const POSSESSIVE_SUBJECT_VERBS = '(?:is|are|was|were|has|have|had|does|do|did|falls?|finds?|takes?|presses?|moves?|comes?|goes?|holds?|keeps?|starts?|stops?|turns?|looks?|watches?|breathes?|shakes?|slides?|opens?|closes?|reaches?|catches?|carries?|knots?|locks?|shards?|reforms?|rest(?:s|ed|ing)?)'
-
 /** Resolve an owning character when their possessive noun phrase heads a clause. */
 function mainClausePossessiveSubject(
   text: string,
@@ -1013,7 +1011,7 @@ function mainClausePossessiveSubject(
   for (const speaker of speakers) {
     if (!eligibleSpeakerIds.has(speaker.id)) continue
     for (const alias of speakerAliases(speaker.name)) {
-      const pattern = new RegExp(`\\b${escapedPattern(alias)}\\b['’]s\\s+(?:[\\p{L}\\p{M}'’-]+\\s+){1,5}${POSSESSIVE_SUBJECT_VERBS}\\b`, 'giu')
+      const pattern = new RegExp(`\\b${escapedPattern(alias)}\\b['’]s\\s+`, 'giu')
       for (const match of narrative.matchAll(pattern)) {
         if (match.index === undefined) continue
         const prefix = narrative.slice(0, match.index)
@@ -1025,7 +1023,12 @@ function mainClausePossessiveSubject(
           prefix.lastIndexOf(';'), prefix.lastIndexOf('\n'),
         ) + 1
         const lead = prefix.slice(sentenceStart)
-        if (!lead.trim() || /\b(?:and|but|then)\s*$/iu.test(lead)) matches.add(speaker.id)
+        if (lead.trim() && !/\b(?:and|but|then)\s*$/iu.test(lead)) continue
+        const clause = narrative.slice(match.index + match[0].length).split(/[.!?;\n]/u, 1)[0]
+        const clauseWords = clause.match(/[\p{L}\p{M}'’-]+/gu) ?? []
+        // Clause position is more durable evidence than a finite verb list.
+        // Three following words also reject fragments such as "Grace's wrist."
+        if (clauseWords.length >= 3) matches.add(speaker.id)
       }
     }
   }
@@ -1604,7 +1607,17 @@ function parseRosterVoiceSegmentsInternal(
         && (inference.source === 'history' || inference.source === 'fallback')
         ? historicalSpeakerId
         : null
+      const previousParagraph = paragraphs[paragraphIndex - 1]
+      const adjacentNarrativeSpeakerId = previousParagraph
+        && playbackQuotes(previousParagraph.text).length === 0
+        ? mainClausePossessiveSubject(
+            previousParagraph.text,
+            speakers,
+            mentionedSpeakers(previousParagraph.text, speakers).possessive,
+          )
+        : null
       const localSpeakerId: string | null = paragraphSpeakers[paragraphIndex]
+        ?? adjacentNarrativeSpeakerId
         ?? downstreamReplies.get(paragraphIndex)
         ?? inferredTurnSpeakerId
         ?? continuedSpeakerId
@@ -1613,8 +1626,15 @@ function parseRosterVoiceSegmentsInternal(
         ?? inference.speakerId
       const overrideSpeakerId = quoteSpeakerOverrides?.get(currentQuoteIndex) ?? null
       const hasOverride = quoteSpeakerOverrides?.has(currentQuoteIndex) === true
+      const protectedLocalSpeakerId = paragraphSpeakers[paragraphIndex]
+        ?? adjacentNarrativeSpeakerId
+        ?? (inference.source === 'explicit' || inference.source === 'paragraph'
+          ? inference.speakerId
+          : null)
       const speakerId: string | null = hasOverride
-        && (!preserveLocalOnNullOverride || overrideSpeakerId !== null || localSpeakerId === null)
+        && (!preserveLocalOnNullOverride
+          || (overrideSpeakerId !== null && protectedLocalSpeakerId === null)
+          || localSpeakerId === null)
         ? overrideSpeakerId
         : localSpeakerId
       result.push({
