@@ -107,6 +107,7 @@ export function adaptiveGenerationConcurrency(
   shortCooldown = 0,
   longWindowStreak = 0,
   maximum = 10,
+  voiceChanges = 0,
 ): AdaptiveGenerationState {
   const safeMaximum = Math.max(1, Math.round(maximum))
   const safeConfiguredMaximum = Math.min(safeMaximum, Math.max(1, Math.round(configuredMaximum)))
@@ -122,14 +123,20 @@ export function adaptiveGenerationConcurrency(
   const medianLength = sorted.length % 2 === 0
     ? ((sorted[middle - 1] ?? 0) + (sorted[middle] ?? 0)) / 2
     : sorted[middle] ?? 0
+  const lowerQuartileLength = sorted[Math.floor((sorted.length - 1) * 0.25)] ?? 0
   const shortCount = lengths.filter(length => length < 160).length
-  if (shortCount >= 3 || medianLength < 200) {
+  const mixedDenseWindow = lengths.length >= 4 && lowerQuartileLength < 220
+  if (shortCount >= 3 || medianLength < 200 || mixedDenseWindow || voiceChanges >= 3) {
     return { concurrency: 1, shortCooldown: 6, longWindowStreak: 0 }
   }
   if (safeCooldown > 0) {
     return { concurrency: 1, shortCooldown: safeCooldown - 1, longWindowStreak: 0 }
   }
-  if (shortCount === 0 && medianLength > 320) {
+  const uniformlyLongWindow = lengths.length >= 3
+    && Math.min(...lengths) >= 300
+    && lowerQuartileLength > 320
+    && medianLength > 420
+  if (uniformlyLongWindow) {
     const nextStreak = safeLongStreak + 1
     if (nextStreak >= 2) {
       return {

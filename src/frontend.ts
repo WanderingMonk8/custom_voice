@@ -49,6 +49,8 @@ interface RateLimitBudget {
   cumulativeWaitMs: number
   consecutiveResponses: number
   maximumWaitMs: number
+  recovering: boolean
+  recoveryTail: Promise<void>
 }
 
 interface VoiceGateWaiter {
@@ -566,6 +568,44 @@ async function waitForSynthesisSlot(pacer: SynthesisPacer, signal: AbortSignal):
   await turn
 }
 
+async function acquireRateLimitRecoverySlot(
+  budget: RateLimitBudget,
+  signal: AbortSignal,
+): Promise<() => void> {
+  if (!budget.recovering) return () => undefined
+  let releaseSlot!: () => void
+  const slot = new Promise<void>((resolve) => { releaseSlot = resolve })
+  const previous = budget.recoveryTail
+  budget.recoveryTail = previous.catch(() => undefined).then(() => slot)
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const abort = () => reject(new DOMException('Playback stopped.', 'AbortError'))
+      if (signal.aborted) {
+        abort()
+        return
+      }
+      signal.addEventListener('abort', abort, { once: true })
+      void previous.catch(() => undefined).then(() => {
+        signal.removeEventListener('abort', abort)
+        resolve()
+      })
+    })
+  } catch (error) {
+    releaseSlot()
+    throw error
+  }
+  if (signal.aborted) {
+    releaseSlot()
+    throw new DOMException('Playback stopped.', 'AbortError')
+  }
+  let released = false
+  return () => {
+    if (released) return
+    released = true
+    releaseSlot()
+  }
+}
+
 async function synthesizeVoiceSegment(
   connectionId: string,
   text: string,
@@ -578,10 +618,12 @@ async function synthesizeVoiceSegment(
   onRateLimit: (delayMs: number, cumulativeWaitMs: number) => void,
 ): Promise<SynthesizedVoiceSegment> {
   while (true) {
-    const releaseVoice = await voiceGate.acquire(voice, signal)
+    const releaseRecovery = await acquireRateLimitRecoverySlot(rateLimitBudget, signal)
+    let releaseVoice: (() => void) | null = null
     let response: Response
     let audioData: ArrayBuffer | null = null
     try {
+      releaseVoice = await voiceGate.acquire(voice, signal)
       await waitForSynthesisSlot(pacer, signal)
       response = await fetch('/api/v1/tts/synthesize', {
         method: 'POST',
@@ -597,16 +639,18 @@ async function synthesizeVoiceSegment(
       })
       if (response.ok) audioData = await response.arrayBuffer()
     } finally {
-      releaseVoice()
+      releaseVoice?.()
+      releaseRecovery()
     }
     if (response.ok) {
-      rateLimitBudget.consecutiveResponses = 0
+      if (!rateLimitBudget.recovering) rateLimitBudget.consecutiveResponses = 0
       return {
         data: audioData!,
         mime: response.headers.get('content-type') || 'audio/mpeg',
       }
     }
     if (response.status === 429) {
+      rateLimitBudget.recovering = true
       const now = Date.now()
       const requestedDelay = retryAfterMilliseconds(response.headers.get('Retry-After'))
         ?? Math.min(15_000, 2_000 * (2 ** rateLimitBudget.consecutiveResponses))
@@ -1587,6 +1631,8 @@ export function setup(ctx: SpindleFrontendContext) {
         cumulativeWaitMs: 0,
         consecutiveResponses: 0,
         maximumWaitMs: preferences.rateLimitWaitSeconds * 1_000,
+        recovering: false,
+        recoveryTail: Promise.resolve(),
       }
       playback.synthesisController = synthesisController
       backgroundSynthesisControllers.add(synthesisController)
@@ -1647,6 +1693,9 @@ export function setup(ctx: SpindleFrontendContext) {
         shortConcurrencyCooldown,
         longWindowStreak,
         MAX_CONCURRENT_GENERATIONS,
+        plan.slice(1, 6).filter((segment, index) => (
+          segment.voice !== plan[index]?.voice
+        )).length,
       )
       adaptiveConcurrency = initialAdaptiveState.concurrency
       shortConcurrencyCooldown = initialAdaptiveState.shortCooldown
@@ -1670,6 +1719,10 @@ export function setup(ctx: SpindleFrontendContext) {
                 shortConcurrencyCooldown,
                 longWindowStreak,
                 MAX_CONCURRENT_GENERATIONS,
+                plan
+                  .slice(index + 2, Math.min(plan.length, index + 7))
+                  .filter((segment, offset) => segment.voice !== plan[index + 1 + offset]?.voice)
+                  .length,
               )
               adaptiveConcurrency = nextState.concurrency
               shortConcurrencyCooldown = nextState.shortCooldown

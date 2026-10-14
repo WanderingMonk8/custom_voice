@@ -1,7 +1,7 @@
 // src/core.ts
 var DEFAULT_SAVED_AUDIO_LIMIT = 50;
 var MAX_SAVED_AUDIO_LIMIT = 1e4;
-function adaptiveGenerationConcurrency(current, configuredMaximum, segmentLengths, shortCooldown = 0, longWindowStreak = 0, maximum = 10) {
+function adaptiveGenerationConcurrency(current, configuredMaximum, segmentLengths, shortCooldown = 0, longWindowStreak = 0, maximum = 10, voiceChanges = 0) {
   const safeMaximum = Math.max(1, Math.round(maximum));
   const safeConfiguredMaximum = Math.min(safeMaximum, Math.max(1, Math.round(configuredMaximum)));
   const safeCurrent = Math.min(safeConfiguredMaximum, Math.max(1, Math.round(current)));
@@ -14,14 +14,17 @@ function adaptiveGenerationConcurrency(current, configuredMaximum, segmentLength
   const sorted = [...lengths].sort((left, right) => left - right);
   const middle = Math.floor(sorted.length / 2);
   const medianLength = sorted.length % 2 === 0 ? ((sorted[middle - 1] ?? 0) + (sorted[middle] ?? 0)) / 2 : sorted[middle] ?? 0;
+  const lowerQuartileLength = sorted[Math.floor((sorted.length - 1) * 0.25)] ?? 0;
   const shortCount = lengths.filter((length) => length < 160).length;
-  if (shortCount >= 3 || medianLength < 200) {
+  const mixedDenseWindow = lengths.length >= 4 && lowerQuartileLength < 220;
+  if (shortCount >= 3 || medianLength < 200 || mixedDenseWindow || voiceChanges >= 3) {
     return { concurrency: 1, shortCooldown: 6, longWindowStreak: 0 };
   }
   if (safeCooldown > 0) {
     return { concurrency: 1, shortCooldown: safeCooldown - 1, longWindowStreak: 0 };
   }
-  if (shortCount === 0 && medianLength > 320) {
+  const uniformlyLongWindow = lengths.length >= 3 && Math.min(...lengths) >= 300 && lowerQuartileLength > 320 && medianLength > 420;
+  if (uniformlyLongWindow) {
     const nextStreak = safeLongStreak + 1;
     if (nextStreak >= 2) {
       return {
@@ -1071,12 +1074,50 @@ async function waitForSynthesisSlot(pacer, signal) {
   pacer.startQueue = turn.catch(() => void 0);
   await turn;
 }
+async function acquireRateLimitRecoverySlot(budget, signal) {
+  if (!budget.recovering) return () => void 0;
+  let releaseSlot;
+  const slot = new Promise((resolve) => {
+    releaseSlot = resolve;
+  });
+  const previous = budget.recoveryTail;
+  budget.recoveryTail = previous.catch(() => void 0).then(() => slot);
+  try {
+    await new Promise((resolve, reject) => {
+      const abort = () => reject(new DOMException("Playback stopped.", "AbortError"));
+      if (signal.aborted) {
+        abort();
+        return;
+      }
+      signal.addEventListener("abort", abort, { once: true });
+      void previous.catch(() => void 0).then(() => {
+        signal.removeEventListener("abort", abort);
+        resolve();
+      });
+    });
+  } catch (error) {
+    releaseSlot();
+    throw error;
+  }
+  if (signal.aborted) {
+    releaseSlot();
+    throw new DOMException("Playback stopped.", "AbortError");
+  }
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    releaseSlot();
+  };
+}
 async function synthesizeVoiceSegment(connectionId, text, voice, speed, signal, pacer, rateLimitBudget, voiceGate, onRateLimit) {
   while (true) {
-    const releaseVoice = await voiceGate.acquire(voice, signal);
+    const releaseRecovery = await acquireRateLimitRecoverySlot(rateLimitBudget, signal);
+    let releaseVoice = null;
     let response;
     let audioData = null;
     try {
+      releaseVoice = await voiceGate.acquire(voice, signal);
       await waitForSynthesisSlot(pacer, signal);
       response = await fetch("/api/v1/tts/synthesize", {
         method: "POST",
@@ -1092,16 +1133,18 @@ async function synthesizeVoiceSegment(connectionId, text, voice, speed, signal, 
       });
       if (response.ok) audioData = await response.arrayBuffer();
     } finally {
-      releaseVoice();
+      releaseVoice?.();
+      releaseRecovery();
     }
     if (response.ok) {
-      rateLimitBudget.consecutiveResponses = 0;
+      if (!rateLimitBudget.recovering) rateLimitBudget.consecutiveResponses = 0;
       return {
         data: audioData,
         mime: response.headers.get("content-type") || "audio/mpeg"
       };
     }
     if (response.status === 429) {
+      rateLimitBudget.recovering = true;
       const now = Date.now();
       const requestedDelay = retryAfterMilliseconds(response.headers.get("Retry-After")) ?? Math.min(15e3, 2e3 * 2 ** rateLimitBudget.consecutiveResponses);
       rateLimitBudget.consecutiveResponses += 1;
@@ -1962,7 +2005,9 @@ function setup(ctx) {
         blockedUntil: 0,
         cumulativeWaitMs: 0,
         consecutiveResponses: 0,
-        maximumWaitMs: preferences.rateLimitWaitSeconds * 1e3
+        maximumWaitMs: preferences.rateLimitWaitSeconds * 1e3,
+        recovering: false,
+        recoveryTail: Promise.resolve()
       };
       playback.synthesisController = synthesisController;
       backgroundSynthesisControllers.add(synthesisController);
@@ -2017,7 +2062,8 @@ function setup(ctx) {
         plan.slice(0, 6).map((segment) => segment.text.length),
         shortConcurrencyCooldown,
         longWindowStreak,
-        MAX_CONCURRENT_GENERATIONS
+        MAX_CONCURRENT_GENERATIONS,
+        plan.slice(1, 6).filter((segment, index) => segment.voice !== plan[index]?.voice).length
       );
       adaptiveConcurrency = initialAdaptiveState.concurrency;
       shortConcurrencyCooldown = initialAdaptiveState.shortCooldown;
@@ -2038,7 +2084,8 @@ function setup(ctx) {
                 plan.slice(index + 1, Math.min(plan.length, index + 7)).map((segment) => segment.text.length),
                 shortConcurrencyCooldown,
                 longWindowStreak,
-                MAX_CONCURRENT_GENERATIONS
+                MAX_CONCURRENT_GENERATIONS,
+                plan.slice(index + 2, Math.min(plan.length, index + 7)).filter((segment, offset) => segment.voice !== plan[index + 1 + offset]?.voice).length
               );
               adaptiveConcurrency = nextState.concurrency;
               shortConcurrencyCooldown = nextState.shortCooldown;

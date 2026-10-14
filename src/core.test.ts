@@ -93,6 +93,20 @@ test('holds concurrency at one during the short-segment cooldown', () => {
   )
 })
 
+test('keeps mixed long and short synthesis windows at one request', () => {
+  assert.deepEqual(
+    adaptiveGenerationConcurrency(4, 4, [520, 190, 610, 205, 480, 175]),
+    { concurrency: 1, shortCooldown: 6, longWindowStreak: 0 },
+  )
+})
+
+test('keeps frequently switching voice windows at one request', () => {
+  assert.deepEqual(
+    adaptiveGenerationConcurrency(3, 4, [420, 460, 500, 440, 480, 520], 0, 0, 10, 4),
+    { concurrency: 1, shortCooldown: 6, longWindowStreak: 0 },
+  )
+})
+
 test('merges adjacent segments that use the same voice', () => {
   assert.deepEqual(mergeVoicePlan([
     { text: 'First sentence.', voice: 'narrator' },
