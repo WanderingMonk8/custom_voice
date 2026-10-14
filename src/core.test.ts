@@ -915,6 +915,29 @@ test('does not treat a name addressed inside dialogue as the speaker', () => {
   ])
 })
 
+test('does not treat a sole named object as the paragraph speaker', () => {
+  const content = [
+    '"No, I hear you," Duncan says into the phone. "The third. Everything clean."',
+    '',
+    '"Four o\'clock. Her desk. I\'m there. Wouldn\'t miss it." His eyes cut to Poppy and he grins despite himself. "You\'re the star, sweetheart. Whole show."',
+  ].join('\n')
+  const speakers = [
+    { id: 'duncan', name: 'Duncan' },
+    { id: 'poppy', name: 'Poppy' },
+  ]
+
+  assert.deepEqual(
+    parseRosterVoiceSegments(content, null, speakers)
+      .filter(segment => segment.speakerId !== null),
+    [
+      { text: 'No, I hear you,', speakerId: 'duncan' },
+      { text: 'The third. Everything clean.', speakerId: 'duncan' },
+      { text: "Four o'clock. Her desk. I'm there. Wouldn't miss it.", speakerId: 'duncan' },
+      { text: "You're the star, sweetheart. Whole show.", speakerId: 'duncan' },
+    ],
+  )
+})
+
 test('keeps an appositive speaker across stored rich-text variants', () => {
   const speakers = [
     { id: 'zuri', name: 'Zuri' },

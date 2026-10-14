@@ -942,8 +942,8 @@ function discourseSubjectSpeaker(
       other.start >= start && other.start < occurrence.start
     ))
     let score = occurrence.start === firstMentionStart ? 2 : 0
-    if (!lead.trim()) score += 10
-    else if (!earlierInClause && /^[^,]{1,48},\s*$/u.test(lead)) score += 8
+    if (!lead.trim() || /^[\s{(\[]*$/u.test(lead)) score += 10
+    else if (!earlierInClause && /^[^,]{1,48},\s*(?:(?:a|an|the)\s+)?$/iu.test(lead)) score += 8
 
     if (/\b(?:to|from|for|with|by|at|on|of|beside|behind|under|near|toward|towards)\s*$/iu.test(lead)) {
       score -= 6
@@ -1042,8 +1042,7 @@ function preferredMentionedSpeaker(
 ): string | null {
   const speechPossessor = mainClauseSpeechPossessor(text, speakers)
   if (speechPossessor) return speechPossessor
-  if (mentions.clean.size === 1) return [...mentions.clean][0]
-  if (mentions.clean.size > 1) return discourseSubjectSpeaker(text, speakers, mentions.clean)
+  if (mentions.clean.size > 0) return discourseSubjectSpeaker(text, speakers, mentions.clean)
   return mainClausePossessiveSubject(text, speakers, mentions.possessive)
 }
 
@@ -1057,7 +1056,7 @@ function soleMentionedSpeaker(text: string, speakers: CharacterLike[]): string |
 
 function unambiguousNarrativeSpeaker(text: string, speakers: CharacterLike[]): string | null {
   const mentions = mentionedSpeakers(text, speakers)
-  if (mentions.clean.size === 1) return [...mentions.clean][0]
+  if (mentions.clean.size === 1) return discourseSubjectSpeaker(text, speakers, mentions.clean)
   if (mentions.clean.size === 0) {
     return mainClausePossessiveSubject(text, speakers, mentions.possessive)
   }
