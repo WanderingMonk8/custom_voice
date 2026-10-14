@@ -639,6 +639,38 @@ test('uses a sole possessive name when no clean character name is present', () =
   )
 })
 
+test('prefers a possessive clause subject over weak possessive objects and history', () => {
+  const speakers = [
+    { id: 'zuri', name: 'Zuri' },
+    { id: 'grace', name: 'Grace' },
+    { id: 'hailey', name: 'Hailey' },
+    { id: 'katie', name: 'Katie' },
+  ]
+  const current = [
+    'The fever in his mouth and hands finds the girl at the center and Zuri\'s body does the thing she warned everyone about — it falls apart sideways. Her hands knot in the throw and in Grace\'s wrist.',
+    '',
+    '"I\'m — oh. Oh, it\'s here, it\'s all the way here —"',
+    '',
+    'The orgasm takes her sideways, her fingers white-knuckled in Grace\'s wrist.',
+    '',
+    '"There," she breathes into the fabric. "That\'s the falling apart."',
+  ].join('\n')
+  const historicalSpeakerId = previousAssistantSpeakerFallback(
+    current,
+    '"Name it whenever you want," Hailey murmurs from the sleeping bag.',
+    null,
+    speakers,
+  )
+
+  assert.equal(historicalSpeakerId, null)
+  assert.deepEqual(
+    parseRosterVoiceSegments(current, null, speakers, '', historicalSpeakerId)
+      .filter(segment => segment.speakerId !== null)
+      .map(segment => segment.speakerId),
+    ['zuri', 'zuri', 'zuri'],
+  )
+})
+
 test('backfills opening dialogue from a main-clause speech possessor', () => {
   const content = '"And there is one star in Sweetwater."\n\n"That is how it has been. That is how it is."\n\nColton\'s voice comes off the porch before Tess can tap the tablet. He sits with the pocket watch still open in his palm and looks at Ken across the width of the street.\n\nTess glances toward the porch, then back to Ken.\n\n"The badge is a standard guest selection, Sheriff." She pitches her voice to carry the ten yards.'
   const segments = parseRosterVoiceSegments(content, 'card', [
