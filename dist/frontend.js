@@ -1,6 +1,18 @@
 // src/core.ts
 var DEFAULT_SAVED_AUDIO_LIMIT = 50;
 var MAX_SAVED_AUDIO_LIMIT = 1e4;
+function rollingRequestWindowDelay(recentStarts, now, requestLimit, windowMs = 6e4) {
+  const safeLimit = Math.max(1, Math.round(requestLimit));
+  const safeWindow = Math.max(1, Math.round(windowMs));
+  const activeStarts = recentStarts.filter((start) => Number.isFinite(start) && start > now - safeWindow && start <= now).sort((left, right) => left - right);
+  if (activeStarts.length < safeLimit) return 0;
+  const limitingStart = activeStarts[activeStarts.length - safeLimit] ?? now;
+  return Math.max(0, limitingStart + safeWindow - now);
+}
+function reducedRequestWindowLimit(current, minimum = 6) {
+  const safeMinimum = Math.max(1, Math.round(minimum));
+  return Math.max(safeMinimum, Math.floor(Math.max(safeMinimum, current) / 2));
+}
 function adaptiveGenerationConcurrency(current, configuredMaximum, segmentLengths, shortCooldown = 0, longWindowStreak = 0, maximum = 10, voiceChanges = 0) {
   const safeMaximum = Math.max(1, Math.round(maximum));
   const safeConfiguredMaximum = Math.min(safeMaximum, Math.max(1, Math.round(configuredMaximum)));
@@ -809,6 +821,9 @@ var ConnectionVoiceGate = class {
   }
 };
 var MIN_SYNTHESIS_START_INTERVAL_MS = 1250;
+var SYNTHESIS_REQUEST_WINDOW_MS = 6e4;
+var DEFAULT_SYNTHESIS_REQUESTS_PER_WINDOW = 18;
+var MIN_SYNTHESIS_REQUESTS_PER_WINDOW = 6;
 var DEFAULT_PLAYBACK_BUFFER_SEGMENTS = 2;
 var DEFAULT_CONCURRENT_GENERATIONS = 4;
 var DEFAULT_RATE_LIMIT_WAIT_SECONDS = 60;
@@ -1065,9 +1080,26 @@ function normalizedVoiceGain(buffer, voiceKey, profiles) {
 async function waitForSynthesisSlot(pacer, signal) {
   const turn = pacer.startQueue.then(async () => {
     while (true) {
-      await abortableDelay(Math.max(0, pacer.nextStartAt - Date.now()), signal);
-      if (Date.now() < pacer.nextStartAt) continue;
-      pacer.nextStartAt = Date.now() + MIN_SYNTHESIS_START_INTERVAL_MS;
+      const now = Date.now();
+      pacer.recentStarts = pacer.recentStarts.filter((start) => start > now - SYNTHESIS_REQUEST_WINDOW_MS);
+      const windowDelay = rollingRequestWindowDelay(
+        pacer.recentStarts,
+        now,
+        pacer.windowRequestLimit,
+        SYNTHESIS_REQUEST_WINDOW_MS
+      );
+      const delay = Math.max(0, pacer.nextStartAt - now, windowDelay);
+      await abortableDelay(delay, signal);
+      const readyAt = Date.now();
+      if (readyAt < pacer.nextStartAt) continue;
+      if (rollingRequestWindowDelay(
+        pacer.recentStarts,
+        readyAt,
+        pacer.windowRequestLimit,
+        SYNTHESIS_REQUEST_WINDOW_MS
+      ) > 0) continue;
+      pacer.recentStarts.push(readyAt);
+      pacer.nextStartAt = readyAt + MIN_SYNTHESIS_START_INTERVAL_MS;
       return;
     }
   });
@@ -1146,7 +1178,21 @@ async function synthesizeVoiceSegment(connectionId, text, voice, speed, signal, 
     if (response.status === 429) {
       rateLimitBudget.recovering = true;
       const now = Date.now();
-      const requestedDelay = retryAfterMilliseconds(response.headers.get("Retry-After")) ?? Math.min(15e3, 2e3 * 2 ** rateLimitBudget.consecutiveResponses);
+      pacer.windowRequestLimit = reducedRequestWindowLimit(
+        pacer.windowRequestLimit,
+        MIN_SYNTHESIS_REQUESTS_PER_WINDOW
+      );
+      const rollingDelay = rollingRequestWindowDelay(
+        pacer.recentStarts,
+        now,
+        pacer.windowRequestLimit,
+        SYNTHESIS_REQUEST_WINDOW_MS
+      );
+      const requestedDelay = Math.max(
+        retryAfterMilliseconds(response.headers.get("Retry-After")) ?? 0,
+        Math.min(15e3, 2e3 * 2 ** rateLimitBudget.consecutiveResponses),
+        rollingDelay
+      );
       rateLimitBudget.consecutiveResponses += 1;
       const currentBlockEnd = Math.max(now, rateLimitBudget.blockedUntil);
       const desiredBlockEnd = now + requestedDelay;
@@ -1460,7 +1506,12 @@ function setup(ctx) {
   let scanning = false;
   let activePlayback = null;
   const backgroundSynthesisControllers = /* @__PURE__ */ new Set();
-  const sharedSynthesisPacer = { nextStartAt: 0, startQueue: Promise.resolve() };
+  const sharedSynthesisPacer = {
+    nextStartAt: 0,
+    startQueue: Promise.resolve(),
+    recentStarts: [],
+    windowRequestLimit: DEFAULT_SYNTHESIS_REQUESTS_PER_WINDOW
+  };
   const connectionVoiceGates = /* @__PURE__ */ new Map();
   const foregroundSynthesisQueue = [];
   const backgroundSynthesisQueue = [];

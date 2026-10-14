@@ -99,6 +99,29 @@ export interface AdaptiveGenerationState {
   longWindowStreak: number
 }
 
+/** Return the delay required to keep request starts inside a rolling quota window. */
+export function rollingRequestWindowDelay(
+  recentStarts: number[],
+  now: number,
+  requestLimit: number,
+  windowMs = 60_000,
+): number {
+  const safeLimit = Math.max(1, Math.round(requestLimit))
+  const safeWindow = Math.max(1, Math.round(windowMs))
+  const activeStarts = recentStarts
+    .filter(start => Number.isFinite(start) && start > now - safeWindow && start <= now)
+    .sort((left, right) => left - right)
+  if (activeStarts.length < safeLimit) return 0
+  const limitingStart = activeStarts[activeStarts.length - safeLimit] ?? now
+  return Math.max(0, limitingStart + safeWindow - now)
+}
+
+/** Back off a learned rolling request ceiling aggressively after a 429. */
+export function reducedRequestWindowLimit(current: number, minimum = 6): number {
+  const safeMinimum = Math.max(1, Math.round(minimum))
+  return Math.max(safeMinimum, Math.floor(Math.max(safeMinimum, current) / 2))
+}
+
 /** Adjust TTS concurrency from fragmentation density while resisting rapid oscillation. */
 export function adaptiveGenerationConcurrency(
   current: number,

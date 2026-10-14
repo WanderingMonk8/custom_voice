@@ -22,9 +22,11 @@ import {
   parseRosterVoiceSegmentsWithAssignments,
   parseSkippedTrackerTags,
   previousAssistantSpeakerFallback,
+  reducedRequestWindowLimit,
   readConfig,
   readSavedAudioHistory,
   speakerAliases,
+  rollingRequestWindowDelay,
   stripSkippedTrackerBlocks,
   upsertSavedAudioRecord,
   type ChatVoiceConfig,
@@ -105,6 +107,14 @@ test('keeps frequently switching voice windows at one request', () => {
     adaptiveGenerationConcurrency(3, 4, [420, 460, 500, 440, 480, 520], 0, 0, 10, 4),
     { concurrency: 1, shortCooldown: 6, longWindowStreak: 0 },
   )
+})
+
+test('paces synthesis starts inside a rolling request window', () => {
+  assert.equal(rollingRequestWindowDelay([1_000, 2_000, 3_000], 4_000, 4, 60_000), 0)
+  assert.equal(rollingRequestWindowDelay([1_000, 2_000, 3_000, 4_000], 5_000, 4, 60_000), 56_000)
+  assert.equal(rollingRequestWindowDelay([1_000, 2_000, 3_000, 4_000], 61_001, 4, 60_000), 0)
+  assert.equal(reducedRequestWindowLimit(18), 9)
+  assert.equal(reducedRequestWindowLimit(7), 6)
 })
 
 test('merges adjacent segments that use the same voice', () => {
