@@ -475,7 +475,7 @@ function mainClauseSpeechPossessor(text, speakers) {
   }
   return matches.size === 1 ? [...matches][0] : null;
 }
-var POSSESSIVE_SUBJECT_VERBS = "(?:is|are|was|were|has|have|had|does|do|did|falls?|finds?|takes?|presses?|moves?|comes?|goes?|holds?|keeps?|starts?|stops?|turns?|looks?|watches?|breathes?|shakes?|slides?|opens?|closes?|reaches?|catches?|carries?|knots?|rest(?:s|ed|ing)?)";
+var POSSESSIVE_SUBJECT_VERBS = "(?:is|are|was|were|has|have|had|does|do|did|falls?|finds?|takes?|presses?|moves?|comes?|goes?|holds?|keeps?|starts?|stops?|turns?|looks?|watches?|breathes?|shakes?|slides?|opens?|closes?|reaches?|catches?|carries?|knots?|locks?|shards?|reforms?|rest(?:s|ed|ing)?)";
 function mainClausePossessiveSubject(text, speakers, eligibleSpeakerIds) {
   const narrative = narrativeOnly(text);
   const matches = /* @__PURE__ */ new Set();

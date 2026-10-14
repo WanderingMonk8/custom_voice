@@ -1000,7 +1000,7 @@ function mainClauseSpeechPossessor(text: string, speakers: CharacterLike[]): str
   return matches.size === 1 ? [...matches][0] : null
 }
 
-const POSSESSIVE_SUBJECT_VERBS = '(?:is|are|was|were|has|have|had|does|do|did|falls?|finds?|takes?|presses?|moves?|comes?|goes?|holds?|keeps?|starts?|stops?|turns?|looks?|watches?|breathes?|shakes?|slides?|opens?|closes?|reaches?|catches?|carries?|knots?|rest(?:s|ed|ing)?)'
+const POSSESSIVE_SUBJECT_VERBS = '(?:is|are|was|were|has|have|had|does|do|did|falls?|finds?|takes?|presses?|moves?|comes?|goes?|holds?|keeps?|starts?|stops?|turns?|looks?|watches?|breathes?|shakes?|slides?|opens?|closes?|reaches?|catches?|carries?|knots?|locks?|shards?|reforms?|rest(?:s|ed|ing)?)'
 
 /** Resolve an owning character when their possessive noun phrase heads a clause. */
 function mainClausePossessiveSubject(

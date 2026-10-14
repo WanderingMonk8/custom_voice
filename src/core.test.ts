@@ -671,6 +671,38 @@ test('prefers a possessive clause subject over weak possessive objects and histo
   )
 })
 
+test('inherits speakers from clause-leading possessive action subjects', () => {
+  const content = [
+    '"Then the first act is coming," Katie says. "More oil. Then the fullest."',
+    '',
+    'Zuri\'s breath shards into the throw and reforms as the word the house has been building toward.',
+    '',
+    '"More. There. That\'s the more."',
+    '',
+    'Grace\'s black-nailed hands lock at the freckles and hold.',
+    '',
+    '"Name it," she gasps. "The movie claim."',
+    '',
+    '"Seconded," Katie says from the wall.',
+  ].join('\n')
+
+  assert.deepEqual(
+    parseRosterVoiceSegments(content, null, [
+      { id: 'katie', name: 'Katie' },
+      { id: 'zuri', name: 'Zuri' },
+      { id: 'grace', name: 'Grace' },
+    ]).filter(segment => segment.speakerId !== null),
+    [
+      { text: 'Then the first act is coming,', speakerId: 'katie' },
+      { text: 'More oil. Then the fullest.', speakerId: 'katie' },
+      { text: "More. There. That's the more.", speakerId: 'zuri' },
+      { text: 'Name it,', speakerId: 'grace' },
+      { text: 'The movie claim.', speakerId: 'grace' },
+      { text: 'Seconded,', speakerId: 'katie' },
+    ],
+  )
+})
+
 test('backfills opening dialogue from a main-clause speech possessor', () => {
   const content = '"And there is one star in Sweetwater."\n\n"That is how it has been. That is how it is."\n\nColton\'s voice comes off the porch before Tess can tap the tablet. He sits with the pocket watch still open in his palm and looks at Ken across the width of the street.\n\nTess glances toward the porch, then back to Ken.\n\n"The badge is a standard guest selection, Sheriff." She pitches her voice to carry the ten yards.'
   const segments = parseRosterVoiceSegments(content, 'card', [
