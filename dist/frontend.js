@@ -1,7 +1,19 @@
 // src/core.ts
 var DEFAULT_SAVED_AUDIO_LIMIT = 50;
 var MAX_SAVED_AUDIO_LIMIT = 1e4;
-function adaptiveGenerationConcurrency(current, configuredMaximum, segmentLengths, shortCooldown = 0, longWindowStreak = 0, maximum = 10) {
+function rollingRequestWindowDelay(recentStarts, now, requestLimit, windowMs = 6e4) {
+  const safeLimit = Math.max(1, Math.round(requestLimit));
+  const safeWindow = Math.max(1, Math.round(windowMs));
+  const activeStarts = recentStarts.filter((start) => Number.isFinite(start) && start > now - safeWindow && start <= now).sort((left, right) => left - right);
+  if (activeStarts.length < safeLimit) return 0;
+  const limitingStart = activeStarts[activeStarts.length - safeLimit] ?? now;
+  return Math.max(0, limitingStart + safeWindow - now);
+}
+function reducedRequestWindowLimit(current, minimum = 6) {
+  const safeMinimum = Math.max(1, Math.round(minimum));
+  return Math.max(safeMinimum, Math.floor(Math.max(safeMinimum, current) / 2));
+}
+function adaptiveGenerationConcurrency(current, configuredMaximum, segmentLengths, shortCooldown = 0, longWindowStreak = 0, maximum = 10, voiceChanges = 0) {
   const safeMaximum = Math.max(1, Math.round(maximum));
   const safeConfiguredMaximum = Math.min(safeMaximum, Math.max(1, Math.round(configuredMaximum)));
   const safeCurrent = Math.min(safeConfiguredMaximum, Math.max(1, Math.round(current)));
@@ -14,14 +26,17 @@ function adaptiveGenerationConcurrency(current, configuredMaximum, segmentLength
   const sorted = [...lengths].sort((left, right) => left - right);
   const middle = Math.floor(sorted.length / 2);
   const medianLength = sorted.length % 2 === 0 ? ((sorted[middle - 1] ?? 0) + (sorted[middle] ?? 0)) / 2 : sorted[middle] ?? 0;
+  const lowerQuartileLength = sorted[Math.floor((sorted.length - 1) * 0.25)] ?? 0;
   const shortCount = lengths.filter((length) => length < 160).length;
-  if (shortCount >= 3 || medianLength < 200) {
+  const mixedDenseWindow = lengths.length >= 4 && lowerQuartileLength < 220;
+  if (shortCount >= 3 || medianLength < 200 || mixedDenseWindow || voiceChanges >= 3) {
     return { concurrency: 1, shortCooldown: 6, longWindowStreak: 0 };
   }
   if (safeCooldown > 0) {
     return { concurrency: 1, shortCooldown: safeCooldown - 1, longWindowStreak: 0 };
   }
-  if (shortCount === 0 && medianLength > 320) {
+  const uniformlyLongWindow = lengths.length >= 3 && Math.min(...lengths) >= 300 && lowerQuartileLength > 320 && medianLength > 420;
+  if (uniformlyLongWindow) {
     const nextStreak = safeLongStreak + 1;
     if (nextStreak >= 2) {
       return {
@@ -223,7 +238,7 @@ function stripSkippedTrackerBlocks(content, tagPairs) {
   return result;
 }
 function preparePlaybackContent(content, skippedTrackerTagPairs = "") {
-  return stripPlaybackMarkup(stripSkippedTrackerBlocks(content, skippedTrackerTagPairs));
+  return stripPlaybackMarkup(stripSkippedTrackerBlocks(content, skippedTrackerTagPairs)).replace(/&quot;|&#34;|&#x22;/giu, '"').replace(/["“”]{2,}/gu, '"');
 }
 function cleanPlaybackText(value) {
   return decodePlaybackEntities(stripPlaybackMarkup(value)).replace(/```[\s\S]*?```/g, " ").replace(/`[^`\n]*`/g, " ").replace(/\r\n?/g, "\n").replace(/[^\S\n]+/g, " ").replace(/ *\n */g, "\n").replace(/\n{3,}/g, "\n\n").trim();
@@ -233,7 +248,15 @@ function escapedPattern(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 function narrativeOnly(text) {
-  return text.replace(/["“][\s\S]*?["”]/gu, " ");
+  const quotes = playbackQuotes(text);
+  if (quotes.length === 0) return text;
+  let result = "";
+  let cursor = 0;
+  for (const quote of quotes) {
+    result += `${text.slice(cursor, quote.start)} `;
+    cursor = quote.end;
+  }
+  return result + text.slice(cursor);
 }
 function mentionedSpeakers(text, speakers) {
   const narrative = narrativeOnly(text);
@@ -459,12 +482,38 @@ function playbackParagraphs(content) {
   if (text.trim()) paragraphs.push({ start: cursor, end: content.length, text });
   return paragraphs;
 }
+function playbackQuotes(content) {
+  const quotes = [];
+  for (const paragraph of playbackParagraphs(content)) {
+    let matched = false;
+    for (const match of paragraph.text.matchAll(/["“]([\s\S]*?)["”]/gu)) {
+      if (match.index === void 0) continue;
+      matched = true;
+      const start = paragraph.start + match.index;
+      quotes.push({
+        start,
+        end: start + match[0].length,
+        text: match[1] ?? ""
+      });
+    }
+    if (matched) continue;
+    const leadingQuote = paragraph.text.match(/^(\s*)["“]([\s\S]+)$/u);
+    if (!leadingQuote) continue;
+    const localStart = leadingQuote[1]?.length ?? 0;
+    quotes.push({
+      start: paragraph.start + localStart,
+      end: paragraph.end,
+      text: (leadingQuote[2] ?? "").replace(/['’]\s*$/u, "")
+    });
+  }
+  return quotes;
+}
 function initialDialogueBackfill(paragraphs, speakers) {
   const paragraphIndexes = [];
   let dialogueStarted = false;
   for (let index = 0; index < paragraphs.length; index++) {
     const paragraph = paragraphs[index];
-    const hasDialogue = /["“][\s\S]*?["”]/u.test(paragraph.text);
+    const hasDialogue = playbackQuotes(paragraph.text).length > 0;
     const mentions = mentionedSpeakers(paragraph.text, speakers);
     const localSpeakerId = preferredMentionedSpeaker(paragraph.text, speakers, mentions);
     if (!dialogueStarted) {
@@ -491,14 +540,13 @@ function initialDialogueBackfill(paragraphs, speakers) {
 }
 function confidentDialogueParagraphSpeaker(content, paragraph, speakers, defaultSpeakerId) {
   const speakerIds = /* @__PURE__ */ new Set();
-  for (const match of paragraph.text.matchAll(/["“]([\s\S]*?)["”]/gu)) {
-    if (match.index === void 0) continue;
-    const quoteStart = paragraph.start + match.index;
-    const quoteEnd = quoteStart + match[0].length;
+  for (const quote of playbackQuotes(paragraph.text)) {
+    const quoteStart = paragraph.start + quote.start;
+    const quoteEnd = paragraph.start + quote.end;
     const inference = inferQuotedSpeaker(
       content.slice(0, quoteStart),
       content.slice(quoteEnd),
-      match[1] ?? "",
+      quote.text,
       speakers,
       defaultSpeakerId
     );
@@ -554,7 +602,7 @@ function paragraphDialogueTurns(content, speakers, defaultSpeakerId) {
   let lastTurnSpeakerId = null;
   for (let paragraphIndex = 0; paragraphIndex < paragraphs.length; paragraphIndex++) {
     const paragraph = paragraphs[paragraphIndex];
-    const quoteMatches = [...paragraph.text.matchAll(/["“]([\s\S]*?)["”]/gu)];
+    const quoteMatches = playbackQuotes(paragraph.text);
     if (quoteMatches.length === 0) {
       const narration = cleanPlaybackText(paragraph.text);
       const transparentBeat = narration.length <= 120 && !hasSpeakerMentions(mentionedSpeakers(paragraph.text, speakers));
@@ -568,14 +616,13 @@ function paragraphDialogueTurns(content, speakers, defaultSpeakerId) {
     const explicitSpeakerIds = /* @__PURE__ */ new Set();
     const initialHistorySpeakerIds = /* @__PURE__ */ new Set();
     const continuationHistorySpeakerIds = /* @__PURE__ */ new Set();
-    for (const match of quoteMatches) {
-      if (match.index === void 0) continue;
-      const quoteStart = paragraph.start + match.index;
-      const quoteEnd = quoteStart + match[0].length;
+    for (const quote of quoteMatches) {
+      const quoteStart = paragraph.start + quote.start;
+      const quoteEnd = paragraph.start + quote.end;
       const inference = inferQuotedSpeaker(
         content.slice(0, quoteStart),
         content.slice(quoteEnd),
-        match[1] ?? "",
+        quote.text,
         speakers,
         defaultSpeakerId
       );
@@ -632,10 +679,10 @@ function canContinueSpeaker(bridge, previousSpeakerId, speakers) {
   }
   return true;
 }
-function parseRosterVoiceSegmentsInternal(content, defaultSpeakerId, speakers, skippedTrackerTagPairs = "", quoteSpeakerOverrides) {
+function parseRosterVoiceSegmentsInternal(content, defaultSpeakerId, speakers, skippedTrackerTagPairs = "", quoteSpeakerOverrides, historicalSpeakerId = null, preserveLocalOnNullOverride = false) {
   const playbackContent = preparePlaybackContent(content, skippedTrackerTagPairs);
   const result = [];
-  const quotePattern = /["“]([\s\S]*?)["”]/g;
+  const quotes = playbackQuotes(playbackContent);
   const paragraphs = playbackParagraphs(playbackContent);
   const openingBackfill = initialDialogueBackfill(paragraphs, speakers);
   const dialogueTurns = paragraphDialogueTurns(playbackContent, speakers, defaultSpeakerId);
@@ -650,24 +697,23 @@ function parseRosterVoiceSegmentsInternal(content, defaultSpeakerId, speakers, s
   let cursor = 0;
   let lastConfidentSpeakerId = null;
   let lastAssignedSpeakerId = null;
+  let historicalPrefixActive = historicalSpeakerId !== null;
   let quoteIndex = 0;
-  for (const match of playbackContent.matchAll(quotePattern)) {
-    if (match.index === void 0) continue;
+  for (const quote of quotes) {
     const currentQuoteIndex = quoteIndex;
     quoteIndex += 1;
-    while (paragraphIndex + 1 < paragraphs.length && match.index >= paragraphs[paragraphIndex].end) {
+    while (paragraphIndex + 1 < paragraphs.length && quote.start >= paragraphs[paragraphIndex].end) {
       paragraphIndex += 1;
     }
-    const bridge = playbackContent.slice(cursor, match.index);
+    const bridge = playbackContent.slice(cursor, quote.start);
     const narration2 = cleanPlaybackText(bridge);
     if (narration2) result.push({ text: narration2, speakerId: null });
-    const speech = cleanPlaybackText(match[1] ?? "");
+    const speech = cleanPlaybackText(quote.text);
     if (speech) {
-      const quoteEnd = match.index + match[0].length;
       const inference = inferQuotedSpeaker(
-        playbackContent.slice(0, match.index),
-        playbackContent.slice(quoteEnd),
-        match[1] ?? "",
+        playbackContent.slice(0, quote.start),
+        playbackContent.slice(quote.end),
+        quote.text,
         speakers,
         defaultSpeakerId
       );
@@ -676,7 +722,15 @@ function parseRosterVoiceSegmentsInternal(content, defaultSpeakerId, speakers, s
       const dialogueTurnSpeakerId = dialogueTurns.get(paragraphIndex) ?? null;
       const inferredTurnSpeakerId = inference.source === "history" || inference.source === "fallback" ? dialogueTurnSpeakerId : null;
       const openingSpeakerId = inference.source === "fallback" && openingBackfill?.paragraphIndexes.has(paragraphIndex) ? openingBackfill.speakerId : null;
-      const speakerId = quoteSpeakerOverrides?.has(currentQuoteIndex) ? quoteSpeakerOverrides.get(currentQuoteIndex) ?? null : paragraphSpeakers[paragraphIndex] ?? downstreamReplies.get(paragraphIndex) ?? inferredTurnSpeakerId ?? continuedSpeakerId ?? openingSpeakerId ?? inference.speakerId;
+      const currentEvidenceSpeakerId = paragraphSpeakers[paragraphIndex] ?? (inference.confident ? inference.speakerId : null);
+      if (historicalPrefixActive && (inference.source === "explicit" || inference.source === "paragraph" || paragraphSpeakers[paragraphIndex] !== null && currentEvidenceSpeakerId !== historicalSpeakerId)) {
+        historicalPrefixActive = false;
+      }
+      const historicalFallbackId = historicalPrefixActive && (inference.source === "history" || inference.source === "fallback") ? historicalSpeakerId : null;
+      const localSpeakerId = paragraphSpeakers[paragraphIndex] ?? downstreamReplies.get(paragraphIndex) ?? inferredTurnSpeakerId ?? continuedSpeakerId ?? historicalFallbackId ?? openingSpeakerId ?? inference.speakerId;
+      const overrideSpeakerId = quoteSpeakerOverrides?.get(currentQuoteIndex) ?? null;
+      const hasOverride = quoteSpeakerOverrides?.has(currentQuoteIndex) === true;
+      const speakerId = hasOverride && (!preserveLocalOnNullOverride || overrideSpeakerId !== null || localSpeakerId === null) ? overrideSpeakerId : localSpeakerId;
       result.push({
         text: speech,
         speakerId
@@ -684,18 +738,20 @@ function parseRosterVoiceSegmentsInternal(content, defaultSpeakerId, speakers, s
       if ((inference.confident || openingSpeakerId) && speakerId) lastConfidentSpeakerId = speakerId;
       if (speakerId) lastAssignedSpeakerId = speakerId;
     }
-    cursor = match.index + match[0].length;
+    cursor = quote.end;
   }
   const narration = cleanPlaybackText(playbackContent.slice(cursor));
   if (narration) result.push({ text: narration, speakerId: null });
   return result;
 }
-function parseRosterVoiceSegments(content, defaultSpeakerId, speakers, skippedTrackerTagPairs = "") {
+function parseRosterVoiceSegments(content, defaultSpeakerId, speakers, skippedTrackerTagPairs = "", historicalSpeakerId = null) {
   return parseRosterVoiceSegmentsInternal(
     content,
     defaultSpeakerId,
     speakers,
-    skippedTrackerTagPairs
+    skippedTrackerTagPairs,
+    void 0,
+    historicalSpeakerId
   );
 }
 
@@ -765,6 +821,9 @@ var ConnectionVoiceGate = class {
   }
 };
 var MIN_SYNTHESIS_START_INTERVAL_MS = 1250;
+var SYNTHESIS_REQUEST_WINDOW_MS = 6e4;
+var DEFAULT_SYNTHESIS_REQUESTS_PER_WINDOW = 18;
+var MIN_SYNTHESIS_REQUESTS_PER_WINDOW = 6;
 var DEFAULT_PLAYBACK_BUFFER_SEGMENTS = 2;
 var DEFAULT_CONCURRENT_GENERATIONS = 4;
 var DEFAULT_RATE_LIMIT_WAIT_SECONDS = 60;
@@ -1021,20 +1080,76 @@ function normalizedVoiceGain(buffer, voiceKey, profiles) {
 async function waitForSynthesisSlot(pacer, signal) {
   const turn = pacer.startQueue.then(async () => {
     while (true) {
-      await abortableDelay(Math.max(0, pacer.nextStartAt - Date.now()), signal);
-      if (Date.now() < pacer.nextStartAt) continue;
-      pacer.nextStartAt = Date.now() + MIN_SYNTHESIS_START_INTERVAL_MS;
+      const now = Date.now();
+      pacer.recentStarts = pacer.recentStarts.filter((start) => start > now - SYNTHESIS_REQUEST_WINDOW_MS);
+      const windowDelay = rollingRequestWindowDelay(
+        pacer.recentStarts,
+        now,
+        pacer.windowRequestLimit,
+        SYNTHESIS_REQUEST_WINDOW_MS
+      );
+      const delay = Math.max(0, pacer.nextStartAt - now, windowDelay);
+      await abortableDelay(delay, signal);
+      const readyAt = Date.now();
+      if (readyAt < pacer.nextStartAt) continue;
+      if (rollingRequestWindowDelay(
+        pacer.recentStarts,
+        readyAt,
+        pacer.windowRequestLimit,
+        SYNTHESIS_REQUEST_WINDOW_MS
+      ) > 0) continue;
+      pacer.recentStarts.push(readyAt);
+      pacer.nextStartAt = readyAt + MIN_SYNTHESIS_START_INTERVAL_MS;
       return;
     }
   });
   pacer.startQueue = turn.catch(() => void 0);
   await turn;
 }
+async function acquireRateLimitRecoverySlot(budget, signal) {
+  if (!budget.recovering) return () => void 0;
+  let releaseSlot;
+  const slot = new Promise((resolve) => {
+    releaseSlot = resolve;
+  });
+  const previous = budget.recoveryTail;
+  budget.recoveryTail = previous.catch(() => void 0).then(() => slot);
+  try {
+    await new Promise((resolve, reject) => {
+      const abort = () => reject(new DOMException("Playback stopped.", "AbortError"));
+      if (signal.aborted) {
+        abort();
+        return;
+      }
+      signal.addEventListener("abort", abort, { once: true });
+      void previous.catch(() => void 0).then(() => {
+        signal.removeEventListener("abort", abort);
+        resolve();
+      });
+    });
+  } catch (error) {
+    releaseSlot();
+    throw error;
+  }
+  if (signal.aborted) {
+    releaseSlot();
+    throw new DOMException("Playback stopped.", "AbortError");
+  }
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    releaseSlot();
+  };
+}
 async function synthesizeVoiceSegment(connectionId, text, voice, speed, signal, pacer, rateLimitBudget, voiceGate, onRateLimit) {
   while (true) {
-    const releaseVoice = await voiceGate.acquire(voice, signal);
+    const releaseRecovery = await acquireRateLimitRecoverySlot(rateLimitBudget, signal);
+    let releaseVoice = null;
     let response;
+    let audioData = null;
     try {
+      releaseVoice = await voiceGate.acquire(voice, signal);
       await waitForSynthesisSlot(pacer, signal);
       response = await fetch("/api/v1/tts/synthesize", {
         method: "POST",
@@ -1048,19 +1163,36 @@ async function synthesizeVoiceSegment(connectionId, text, voice, speed, signal, 
           parameters: { speed }
         })
       });
+      if (response.ok) audioData = await response.arrayBuffer();
     } finally {
-      releaseVoice();
+      releaseVoice?.();
+      releaseRecovery();
     }
     if (response.ok) {
-      rateLimitBudget.consecutiveResponses = 0;
+      if (!rateLimitBudget.recovering) rateLimitBudget.consecutiveResponses = 0;
       return {
-        data: await response.arrayBuffer(),
+        data: audioData,
         mime: response.headers.get("content-type") || "audio/mpeg"
       };
     }
     if (response.status === 429) {
+      rateLimitBudget.recovering = true;
       const now = Date.now();
-      const requestedDelay = retryAfterMilliseconds(response.headers.get("Retry-After")) ?? Math.min(15e3, 2e3 * 2 ** rateLimitBudget.consecutiveResponses);
+      pacer.windowRequestLimit = reducedRequestWindowLimit(
+        pacer.windowRequestLimit,
+        MIN_SYNTHESIS_REQUESTS_PER_WINDOW
+      );
+      const rollingDelay = rollingRequestWindowDelay(
+        pacer.recentStarts,
+        now,
+        pacer.windowRequestLimit,
+        SYNTHESIS_REQUEST_WINDOW_MS
+      );
+      const requestedDelay = Math.max(
+        retryAfterMilliseconds(response.headers.get("Retry-After")) ?? 0,
+        Math.min(15e3, 2e3 * 2 ** rateLimitBudget.consecutiveResponses),
+        rollingDelay
+      );
       rateLimitBudget.consecutiveResponses += 1;
       const currentBlockEnd = Math.max(now, rateLimitBudget.blockedUntil);
       const desiredBlockEnd = now + requestedDelay;
@@ -1374,7 +1506,12 @@ function setup(ctx) {
   let scanning = false;
   let activePlayback = null;
   const backgroundSynthesisControllers = /* @__PURE__ */ new Set();
-  const sharedSynthesisPacer = { nextStartAt: 0, startQueue: Promise.resolve() };
+  const sharedSynthesisPacer = {
+    nextStartAt: 0,
+    startQueue: Promise.resolve(),
+    recentStarts: [],
+    windowRequestLimit: DEFAULT_SYNTHESIS_REQUESTS_PER_WINDOW
+  };
   const connectionVoiceGates = /* @__PURE__ */ new Map();
   const foregroundSynthesisQueue = [];
   const backgroundSynthesisQueue = [];
@@ -1647,7 +1784,7 @@ function setup(ctx) {
         chatId,
         messageId,
         requestId,
-        mode: preferences.speakerParsingMode === "always" ? "always" : "ambiguous",
+        mode: preferences.speakerParsingMode,
         connectionId: preferences.llmConnectionId,
         model: preferences.llmModel,
         skippedTrackerTags: preferences.skippedTrackerTags
@@ -1900,15 +2037,13 @@ function setup(ctx) {
         playbackChat.characters,
         preferences.skippedTrackerTags
       );
-      if (preferences.speakerParsingMode !== "off") {
-        setStatus("Reviewing dialogue speakers\u2026");
-        try {
-          segments = await requestSpeakerReviewedSegments(playbackChat.id, messageId, preferences);
-        } catch (error) {
-          console.warn("[Chat Voice] AI speaker review failed; using the local parser.", error);
-          if (playback.controller.signal.aborted) throw new DOMException("Playback stopped.", "AbortError");
-          setStatus("AI speaker review unavailable; using the local parser.");
-        }
+      if (preferences.speakerParsingMode !== "off") setStatus("Reviewing dialogue speakers\u2026");
+      try {
+        segments = await requestSpeakerReviewedSegments(playbackChat.id, messageId, preferences);
+      } catch (error) {
+        console.warn("[Chat Voice] Backend speaker parsing failed; using the message-local parser.", error);
+        if (playback.controller.signal.aborted) throw new DOMException("Playback stopped.", "AbortError");
+        setStatus("Historical speaker lookup unavailable; using the message-local parser.");
       }
       const plan = mergeVoicePlan(segments.map((segment) => {
         const speakerId = segment.speakerId ? aliases.get(segment.speakerId) ?? segment.speakerId : null;
@@ -1921,7 +2056,9 @@ function setup(ctx) {
         blockedUntil: 0,
         cumulativeWaitMs: 0,
         consecutiveResponses: 0,
-        maximumWaitMs: preferences.rateLimitWaitSeconds * 1e3
+        maximumWaitMs: preferences.rateLimitWaitSeconds * 1e3,
+        recovering: false,
+        recoveryTail: Promise.resolve()
       };
       playback.synthesisController = synthesisController;
       backgroundSynthesisControllers.add(synthesisController);
@@ -1976,7 +2113,8 @@ function setup(ctx) {
         plan.slice(0, 6).map((segment) => segment.text.length),
         shortConcurrencyCooldown,
         longWindowStreak,
-        MAX_CONCURRENT_GENERATIONS
+        MAX_CONCURRENT_GENERATIONS,
+        plan.slice(1, 6).filter((segment, index) => segment.voice !== plan[index]?.voice).length
       );
       adaptiveConcurrency = initialAdaptiveState.concurrency;
       shortConcurrencyCooldown = initialAdaptiveState.shortCooldown;
@@ -1997,7 +2135,8 @@ function setup(ctx) {
                 plan.slice(index + 1, Math.min(plan.length, index + 7)).map((segment) => segment.text.length),
                 shortConcurrencyCooldown,
                 longWindowStreak,
-                MAX_CONCURRENT_GENERATIONS
+                MAX_CONCURRENT_GENERATIONS,
+                plan.slice(index + 2, Math.min(plan.length, index + 7)).filter((segment, offset) => segment.voice !== plan[index + 1 + offset]?.voice).length
               );
               adaptiveConcurrency = nextState.concurrency;
               shortConcurrencyCooldown = nextState.shortCooldown;

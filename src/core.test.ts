@@ -21,9 +21,12 @@ import {
   parseRosterVoiceSegments,
   parseRosterVoiceSegmentsWithAssignments,
   parseSkippedTrackerTags,
+  previousAssistantSpeakerFallback,
+  reducedRequestWindowLimit,
   readConfig,
   readSavedAudioHistory,
   speakerAliases,
+  rollingRequestWindowDelay,
   stripSkippedTrackerBlocks,
   upsertSavedAudioRecord,
   type ChatVoiceConfig,
@@ -90,6 +93,28 @@ test('holds concurrency at one during the short-segment cooldown', () => {
     adaptiveGenerationConcurrency(1, 4, [250, 260, 270], 6, 0),
     { concurrency: 1, shortCooldown: 5, longWindowStreak: 0 },
   )
+})
+
+test('keeps mixed long and short synthesis windows at one request', () => {
+  assert.deepEqual(
+    adaptiveGenerationConcurrency(4, 4, [520, 190, 610, 205, 480, 175]),
+    { concurrency: 1, shortCooldown: 6, longWindowStreak: 0 },
+  )
+})
+
+test('keeps frequently switching voice windows at one request', () => {
+  assert.deepEqual(
+    adaptiveGenerationConcurrency(3, 4, [420, 460, 500, 440, 480, 520], 0, 0, 10, 4),
+    { concurrency: 1, shortCooldown: 6, longWindowStreak: 0 },
+  )
+})
+
+test('paces synthesis starts inside a rolling request window', () => {
+  assert.equal(rollingRequestWindowDelay([1_000, 2_000, 3_000], 4_000, 4, 60_000), 0)
+  assert.equal(rollingRequestWindowDelay([1_000, 2_000, 3_000, 4_000], 5_000, 4, 60_000), 56_000)
+  assert.equal(rollingRequestWindowDelay([1_000, 2_000, 3_000, 4_000], 61_001, 4, 60_000), 0)
+  assert.equal(reducedRequestWindowLimit(18), 9)
+  assert.equal(reducedRequestWindowLimit(7), 6)
 })
 
 test('merges adjacent segments that use the same voice', () => {
@@ -333,6 +358,23 @@ test('validates LLM quote assignments and applies only known speaker IDs', () =>
       { text: 'First.', speakerId: 'grace' },
       { text: 'Second.', speakerId: 'katie' },
     ],
+  )
+})
+
+test('does not let an ambiguous LLM null erase a deterministic speaker', () => {
+  const content = 'Grace watches the door.\n\n"Who is there?"'
+  const speakers = [{ id: 'grace', name: 'Grace' }]
+  assert.deepEqual(
+    parseRosterVoiceSegmentsWithAssignments(
+      content,
+      null,
+      speakers,
+      [{ quote: 0, speakerId: null }],
+      '',
+      null,
+      true,
+    ).at(-1),
+    { text: 'Who is there?', speakerId: 'grace' },
   )
 })
 
@@ -956,6 +998,177 @@ test('strips HTML tags and emphasis markers before TTS segmentation', () => {
   assert.deepEqual(
     parseRosterVoiceSegments('&lt;font color=&quot;#4169E1&quot;&gt;"Again."&lt;/font&gt;', 'alice', []),
     [{ text: 'Again.', speakerId: 'alice' }],
+  )
+})
+
+test('inherits an identity-free single speaker from the previous assistant message', () => {
+  const speakers = [
+    { id: 'mara', name: 'Mara' },
+    { id: 'jayden', name: 'Jayden' },
+  ]
+  const current = [
+    'Her hand closes over his.',
+    '',
+    '"That is my hand."',
+    '',
+    'She says it low, to nobody.',
+    '',
+    '"Do not mess this up."',
+    '',
+    '"Get the book first, Jayden."',
+  ].join('\n')
+  const historicalSpeakerId = previousAssistantSpeakerFallback(
+    current,
+    'Mara pulls the blanket over one shoulder. "I should go."',
+    null,
+    speakers,
+  )
+  assert.equal(historicalSpeakerId, 'mara')
+  assert.deepEqual(
+    parseRosterVoiceSegments(current, null, speakers, '', historicalSpeakerId)
+      .filter(segment => segment.speakerId !== null)
+      .map(segment => segment.speakerId),
+    ['mara', 'mara', 'mara'],
+  )
+})
+
+test('does not inherit history over current attribution or conflicting anonymous speakers', () => {
+  const speakers = [
+    { id: 'mara', name: 'Mara' },
+    { id: 'grace', name: 'Grace' },
+  ]
+  assert.equal(
+    previousAssistantSpeakerFallback(
+      'Grace said, "I have this."',
+      'Mara watched the door.',
+      null,
+      speakers,
+    ),
+    null,
+  )
+  assert.equal(
+    previousAssistantSpeakerFallback(
+      '"Wait," she said. "No," he replied.',
+      'Mara watched the door.',
+      null,
+      speakers,
+    ),
+    null,
+  )
+})
+
+test('uses the previous assistant speaker to resolve conflicting narrative candidates', () => {
+  const speakers = [
+    { id: 'nathan', name: 'Nathan' },
+    { id: 'kyoko', name: 'Kyoko' },
+  ]
+  const current = [
+    'Nathan watches the doorway.',
+    '',
+    '"The first instruction."',
+    '',
+    'Kyoko appears at the edge of the kitchen.',
+    '',
+    '"The second instruction."',
+  ].join('\n')
+  const historicalSpeakerId = previousAssistantSpeakerFallback(
+    current,
+    'Nathan steps out first.\n\n"Do honest."',
+    null,
+    speakers,
+  )
+  assert.equal(historicalSpeakerId, 'nathan')
+  assert.deepEqual(
+    parseRosterVoiceSegments(current, null, speakers, '', historicalSpeakerId)
+      .filter(segment => segment.speakerId !== null)
+      .map(segment => segment.speakerId),
+    ['nathan', 'nathan'],
+  )
+  assert.equal(
+    previousAssistantSpeakerFallback(
+      'Nathan watches the doorway.\n\n"One instruction."',
+      'Kyoko closes the door.',
+      null,
+      speakers,
+    ),
+    null,
+  )
+})
+
+test('recovers duplicated opening quotes without assigning narration to the speaker', () => {
+  const speakers = [
+    { id: 'nathan', name: 'Nathan Bateman / Nathan' },
+    { id: 'kyoko', name: 'Kyoko' },
+  ]
+  const current = [
+    'Nathan turns the bottle in his hand and studies the man.',
+    '',
+    '""Not for her. For myself.\'',
+    '',
+    '"That is her sentence wearing your coat."',
+    '',
+    'He steps past, close enough that the smell of beer comes off him.',
+    '',
+    '"Granted. Seven-thirty, ridge path, back by nine."',
+    '',
+    'Kyoko appears at the edge of the kitchen. Nathan watches her and then does not.',
+    '',
+    '"Dinner in twenty. Go wash your hands like a guest."',
+  ].join('\n')
+  const historicalSpeakerId = previousAssistantSpeakerFallback(
+    current,
+    'Nathan steps out first. "Do honest."',
+    null,
+    speakers,
+  )
+
+  assert.equal(historicalSpeakerId, 'nathan')
+  const segments = parseRosterVoiceSegments(current, null, speakers, '', historicalSpeakerId)
+  assert.deepEqual(
+    segments.filter(segment => segment.text.startsWith('Not for her')
+      || segment.text.startsWith('That is her sentence')
+      || segment.text.startsWith('Granted')
+      || segment.text.startsWith('Dinner in twenty')),
+    [
+      { text: 'Not for her. For myself.', speakerId: 'nathan' },
+      { text: 'That is her sentence wearing your coat.', speakerId: 'nathan' },
+      { text: 'Granted. Seven-thirty, ridge path, back by nine.', speakerId: 'nathan' },
+      { text: 'Dinner in twenty. Go wash your hands like a guest.', speakerId: 'nathan' },
+    ],
+  )
+  assert.deepEqual(
+    segments.find(segment => segment.text.startsWith('He steps past')),
+    { text: 'He steps past, close enough that the smell of beer comes off him.', speakerId: null },
+  )
+})
+
+test('limits previous-message inheritance to an ambiguous opening dialogue run', () => {
+  const speakers = [
+    { id: 'mara', name: 'Mara' },
+    { id: 'grace', name: 'Grace' },
+  ]
+  const current = [
+    '"The first unresolved thought."',
+    '',
+    '"And another part of the same thought."',
+    '',
+    'Grace stepped into the doorway. "This line is mine," Grace said.',
+    '',
+    '"So is this continuation."',
+  ].join('\n')
+  const historicalSpeakerId = previousAssistantSpeakerFallback(
+    current,
+    'Mara folded her arms. "I am still speaking."',
+    null,
+    speakers,
+  )
+
+  assert.equal(historicalSpeakerId, 'mara')
+  assert.deepEqual(
+    parseRosterVoiceSegments(current, null, speakers, '', historicalSpeakerId)
+      .filter(segment => segment.speakerId !== null)
+      .map(segment => segment.speakerId),
+    ['mara', 'mara', 'grace', 'grace'],
   )
 })
 

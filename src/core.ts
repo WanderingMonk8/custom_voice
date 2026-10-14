@@ -99,6 +99,29 @@ export interface AdaptiveGenerationState {
   longWindowStreak: number
 }
 
+/** Return the delay required to keep request starts inside a rolling quota window. */
+export function rollingRequestWindowDelay(
+  recentStarts: number[],
+  now: number,
+  requestLimit: number,
+  windowMs = 60_000,
+): number {
+  const safeLimit = Math.max(1, Math.round(requestLimit))
+  const safeWindow = Math.max(1, Math.round(windowMs))
+  const activeStarts = recentStarts
+    .filter(start => Number.isFinite(start) && start > now - safeWindow && start <= now)
+    .sort((left, right) => left - right)
+  if (activeStarts.length < safeLimit) return 0
+  const limitingStart = activeStarts[activeStarts.length - safeLimit] ?? now
+  return Math.max(0, limitingStart + safeWindow - now)
+}
+
+/** Back off a learned rolling request ceiling aggressively after a 429. */
+export function reducedRequestWindowLimit(current: number, minimum = 6): number {
+  const safeMinimum = Math.max(1, Math.round(minimum))
+  return Math.max(safeMinimum, Math.floor(Math.max(safeMinimum, current) / 2))
+}
+
 /** Adjust TTS concurrency from fragmentation density while resisting rapid oscillation. */
 export function adaptiveGenerationConcurrency(
   current: number,
@@ -107,6 +130,7 @@ export function adaptiveGenerationConcurrency(
   shortCooldown = 0,
   longWindowStreak = 0,
   maximum = 10,
+  voiceChanges = 0,
 ): AdaptiveGenerationState {
   const safeMaximum = Math.max(1, Math.round(maximum))
   const safeConfiguredMaximum = Math.min(safeMaximum, Math.max(1, Math.round(configuredMaximum)))
@@ -122,14 +146,20 @@ export function adaptiveGenerationConcurrency(
   const medianLength = sorted.length % 2 === 0
     ? ((sorted[middle - 1] ?? 0) + (sorted[middle] ?? 0)) / 2
     : sorted[middle] ?? 0
+  const lowerQuartileLength = sorted[Math.floor((sorted.length - 1) * 0.25)] ?? 0
   const shortCount = lengths.filter(length => length < 160).length
-  if (shortCount >= 3 || medianLength < 200) {
+  const mixedDenseWindow = lengths.length >= 4 && lowerQuartileLength < 220
+  if (shortCount >= 3 || medianLength < 200 || mixedDenseWindow || voiceChanges >= 3) {
     return { concurrency: 1, shortCooldown: 6, longWindowStreak: 0 }
   }
   if (safeCooldown > 0) {
     return { concurrency: 1, shortCooldown: safeCooldown - 1, longWindowStreak: 0 }
   }
-  if (shortCount === 0 && medianLength > 320) {
+  const uniformlyLongWindow = lengths.length >= 3
+    && Math.min(...lengths) >= 300
+    && lowerQuartileLength > 320
+    && medianLength > 420
+  if (uniformlyLongWindow) {
     const nextStreak = safeLongStreak + 1
     if (nextStreak >= 2) {
       return {
@@ -761,6 +791,11 @@ export function stripSkippedTrackerBlocks(content: string, tagPairs: string): st
 
 export function preparePlaybackContent(content: string, skippedTrackerTagPairs = ''): string {
   return stripPlaybackMarkup(stripSkippedTrackerBlocks(content, skippedTrackerTagPairs))
+    // Rich-text sources may preserve quote entities, and some model outputs emit
+    // the same opening mark twice. A doubled opener shifts a global quote regex
+    // by one delimiter, turning later dialogue into narration and vice versa.
+    .replace(/&quot;|&#34;|&#x22;/giu, '"')
+    .replace(/["“”]{2,}/gu, '"')
 }
 
 function cleanPlaybackText(value: string): string {
@@ -828,7 +863,15 @@ interface SpeakerMentions {
 }
 
 function narrativeOnly(text: string): string {
-  return text.replace(/["“][\s\S]*?["”]/gu, ' ')
+  const quotes = playbackQuotes(text)
+  if (quotes.length === 0) return text
+  let result = ''
+  let cursor = 0
+  for (const quote of quotes) {
+    result += `${text.slice(cursor, quote.start)} `
+    cursor = quote.end
+  }
+  return result + text.slice(cursor)
 }
 
 function mentionedSpeakers(text: string, speakers: CharacterLike[]): SpeakerMentions {
@@ -1093,6 +1136,12 @@ interface PlaybackParagraph {
   text: string
 }
 
+interface PlaybackQuote {
+  start: number
+  end: number
+  text: string
+}
+
 function playbackParagraphs(content: string): PlaybackParagraph[] {
   const paragraphs: PlaybackParagraph[] = []
   let cursor = 0
@@ -1105,6 +1154,42 @@ function playbackParagraphs(content: string): PlaybackParagraph[] {
   const text = content.slice(cursor)
   if (text.trim()) paragraphs.push({ start: cursor, end: content.length, text })
   return paragraphs
+}
+
+/**
+ * Extract quotes without ever pairing delimiters across a paragraph boundary.
+ * One malformed paragraph can therefore no longer invert dialogue and narration
+ * throughout the remainder of a message.
+ */
+function playbackQuotes(content: string): PlaybackQuote[] {
+  const quotes: PlaybackQuote[] = []
+  for (const paragraph of playbackParagraphs(content)) {
+    let matched = false
+    for (const match of paragraph.text.matchAll(/["“]([\s\S]*?)["”]/gu)) {
+      if (match.index === undefined) continue
+      matched = true
+      const start = paragraph.start + match.index
+      quotes.push({
+        start,
+        end: start + match[0].length,
+        text: match[1] ?? '',
+      })
+    }
+    if (matched) continue
+
+    // Recover a fully quoted paragraph whose model-generated closing delimiter
+    // is missing or is a single quote. This is deliberately limited to a quote
+    // at the start of one paragraph, so it cannot consume later narration.
+    const leadingQuote = paragraph.text.match(/^(\s*)["“]([\s\S]+)$/u)
+    if (!leadingQuote) continue
+    const localStart = leadingQuote[1]?.length ?? 0
+    quotes.push({
+      start: paragraph.start + localStart,
+      end: paragraph.end,
+      text: (leadingQuote[2] ?? '').replace(/['’]\s*$/u, ''),
+    })
+  }
+  return quotes
 }
 
 interface InitialDialogueBackfill {
@@ -1124,7 +1209,7 @@ function initialDialogueBackfill(
   let dialogueStarted = false
   for (let index = 0; index < paragraphs.length; index++) {
     const paragraph = paragraphs[index]
-    const hasDialogue = /["“][\s\S]*?["”]/u.test(paragraph.text)
+    const hasDialogue = playbackQuotes(paragraph.text).length > 0
     const mentions = mentionedSpeakers(paragraph.text, speakers)
     const localSpeakerId = preferredMentionedSpeaker(paragraph.text, speakers, mentions)
 
@@ -1160,14 +1245,13 @@ function confidentDialogueParagraphSpeaker(
   defaultSpeakerId: string | null,
 ): string | null {
   const speakerIds = new Set<string>()
-  for (const match of paragraph.text.matchAll(/["“]([\s\S]*?)["”]/gu)) {
-    if (match.index === undefined) continue
-    const quoteStart = paragraph.start + match.index
-    const quoteEnd = quoteStart + match[0].length
+  for (const quote of playbackQuotes(paragraph.text)) {
+    const quoteStart = paragraph.start + quote.start
+    const quoteEnd = paragraph.start + quote.end
     const inference = inferQuotedSpeaker(
       content.slice(0, quoteStart),
       content.slice(quoteEnd),
-      match[1] ?? '',
+      quote.text,
       speakers,
       defaultSpeakerId,
     )
@@ -1235,6 +1319,22 @@ function hasPronounSpeechAttribution(text: string): boolean {
   return new RegExp(`\\b(?:he|she|they)\\b[^.!?\\n]{0,40}\\b${SPEECH_VERBS}\\b`, 'iu').test(narration)
 }
 
+function pronounSpeechAttributionSubjects(text: string): Set<string> {
+  const narration = cleanPlaybackText(narrativeOnly(text))
+  const subjects = new Set<string>()
+  const patterns = [
+    new RegExp(`\\b(he|she|they)\\b[^.!?\\n]{0,80}\\b${SPEECH_VERBS}\\b`, 'giu'),
+    new RegExp(`\\b${SPEECH_VERBS}\\b\\s+(he|she|they)\\b`, 'giu'),
+  ]
+  for (const pattern of patterns) {
+    for (const match of narration.matchAll(pattern)) {
+      const subject = (match[1] ?? '').toLowerCase()
+      if (subject) subjects.add(subject)
+    }
+  }
+  return subjects
+}
+
 function paragraphDialogueTurns(
   content: string,
   speakers: CharacterLike[],
@@ -1248,7 +1348,7 @@ function paragraphDialogueTurns(
 
   for (let paragraphIndex = 0; paragraphIndex < paragraphs.length; paragraphIndex++) {
     const paragraph = paragraphs[paragraphIndex]
-    const quoteMatches = [...paragraph.text.matchAll(/["“]([\s\S]*?)["”]/gu)]
+    const quoteMatches = playbackQuotes(paragraph.text)
     if (quoteMatches.length === 0) {
       const narration = cleanPlaybackText(paragraph.text)
       const transparentBeat = narration.length <= 120
@@ -1264,14 +1364,13 @@ function paragraphDialogueTurns(
     const explicitSpeakerIds = new Set<string>()
     const initialHistorySpeakerIds = new Set<string>()
     const continuationHistorySpeakerIds = new Set<string>()
-    for (const match of quoteMatches) {
-      if (match.index === undefined) continue
-      const quoteStart = paragraph.start + match.index
-      const quoteEnd = quoteStart + match[0].length
+    for (const quote of quoteMatches) {
+      const quoteStart = paragraph.start + quote.start
+      const quoteEnd = paragraph.start + quote.end
       const inference = inferQuotedSpeaker(
         content.slice(0, quoteStart),
         content.slice(quoteEnd),
-        match[1] ?? '',
+        quote.text,
         speakers,
         defaultSpeakerId,
       )
@@ -1365,8 +1464,7 @@ function canContinueSpeaker(
 
 export function speakerReviewQuotes(content: string, skippedTrackerTagPairs = ''): string[] {
   const playbackContent = preparePlaybackContent(content, skippedTrackerTagPairs)
-  return [...playbackContent.matchAll(/["“]([\s\S]*?)["”]/gu)]
-    .map(match => cleanPlaybackText(match[1] ?? ''))
+  return playbackQuotes(playbackContent).map(quote => cleanPlaybackText(quote.text))
 }
 
 export function needsLlmSpeakerReview(
@@ -1376,13 +1474,12 @@ export function needsLlmSpeakerReview(
   skippedTrackerTagPairs = '',
 ): boolean {
   const playbackContent = preparePlaybackContent(content, skippedTrackerTagPairs)
-  for (const match of playbackContent.matchAll(/["“]([\s\S]*?)["”]/gu)) {
-    if (match.index === undefined || !cleanPlaybackText(match[1] ?? '')) continue
-    const quoteEnd = match.index + match[0].length
+  for (const quote of playbackQuotes(playbackContent)) {
+    if (!cleanPlaybackText(quote.text)) continue
     const inference = inferQuotedSpeaker(
-      playbackContent.slice(0, match.index),
-      playbackContent.slice(quoteEnd),
-      match[1] ?? '',
+      playbackContent.slice(0, quote.start),
+      playbackContent.slice(quote.end),
+      quote.text,
       speakers,
       defaultSpeakerId,
     )
@@ -1397,10 +1494,12 @@ function parseRosterVoiceSegmentsInternal(
   speakers: CharacterLike[],
   skippedTrackerTagPairs = '',
   quoteSpeakerOverrides?: ReadonlyMap<number, string | null>,
+  historicalSpeakerId: string | null = null,
+  preserveLocalOnNullOverride = false,
 ): PlaybackSegment[] {
   const playbackContent = preparePlaybackContent(content, skippedTrackerTagPairs)
   const result: PlaybackSegment[] = []
-  const quotePattern = /["“]([\s\S]*?)["”]/g
+  const quotes = playbackQuotes(playbackContent)
   const paragraphs = playbackParagraphs(playbackContent)
   const openingBackfill = initialDialogueBackfill(paragraphs, speakers)
   const dialogueTurns = paragraphDialogueTurns(playbackContent, speakers, defaultSpeakerId)
@@ -1417,24 +1516,23 @@ function parseRosterVoiceSegmentsInternal(
   let cursor = 0
   let lastConfidentSpeakerId: string | null = null
   let lastAssignedSpeakerId: string | null = null
+  let historicalPrefixActive = historicalSpeakerId !== null
   let quoteIndex = 0
-  for (const match of playbackContent.matchAll(quotePattern)) {
-    if (match.index === undefined) continue
+  for (const quote of quotes) {
     const currentQuoteIndex = quoteIndex
     quoteIndex += 1
-    while (paragraphIndex + 1 < paragraphs.length && match.index >= paragraphs[paragraphIndex].end) {
+    while (paragraphIndex + 1 < paragraphs.length && quote.start >= paragraphs[paragraphIndex].end) {
       paragraphIndex += 1
     }
-    const bridge = playbackContent.slice(cursor, match.index)
+    const bridge = playbackContent.slice(cursor, quote.start)
     const narration = cleanPlaybackText(bridge)
     if (narration) result.push({ text: narration, speakerId: null })
-    const speech = cleanPlaybackText(match[1] ?? '')
+    const speech = cleanPlaybackText(quote.text)
     if (speech) {
-      const quoteEnd = match.index + match[0].length
       const inference = inferQuotedSpeaker(
-        playbackContent.slice(0, match.index),
-        playbackContent.slice(quoteEnd),
-        match[1] ?? '',
+        playbackContent.slice(0, quote.start),
+        playbackContent.slice(quote.end),
+        quote.text,
         speakers,
         defaultSpeakerId,
       )
@@ -1452,14 +1550,36 @@ function parseRosterVoiceSegmentsInternal(
         && openingBackfill?.paragraphIndexes.has(paragraphIndex)
         ? openingBackfill.speakerId
         : null
-      const speakerId: string | null = quoteSpeakerOverrides?.has(currentQuoteIndex)
-        ? quoteSpeakerOverrides.get(currentQuoteIndex) ?? null
-        : paragraphSpeakers[paragraphIndex]
-          ?? downstreamReplies.get(paragraphIndex)
-          ?? inferredTurnSpeakerId
-          ?? continuedSpeakerId
-          ?? openingSpeakerId
-          ?? inference.speakerId
+      const currentEvidenceSpeakerId = paragraphSpeakers[paragraphIndex]
+        ?? (inference.confident ? inference.speakerId : null)
+      if (
+        historicalPrefixActive
+        && (
+          inference.source === 'explicit'
+          || inference.source === 'paragraph'
+          || (paragraphSpeakers[paragraphIndex] !== null
+            && currentEvidenceSpeakerId !== historicalSpeakerId)
+        )
+      ) {
+        historicalPrefixActive = false
+      }
+      const historicalFallbackId = historicalPrefixActive
+        && (inference.source === 'history' || inference.source === 'fallback')
+        ? historicalSpeakerId
+        : null
+      const localSpeakerId: string | null = paragraphSpeakers[paragraphIndex]
+        ?? downstreamReplies.get(paragraphIndex)
+        ?? inferredTurnSpeakerId
+        ?? continuedSpeakerId
+        ?? historicalFallbackId
+        ?? openingSpeakerId
+        ?? inference.speakerId
+      const overrideSpeakerId = quoteSpeakerOverrides?.get(currentQuoteIndex) ?? null
+      const hasOverride = quoteSpeakerOverrides?.has(currentQuoteIndex) === true
+      const speakerId: string | null = hasOverride
+        && (!preserveLocalOnNullOverride || overrideSpeakerId !== null || localSpeakerId === null)
+        ? overrideSpeakerId
+        : localSpeakerId
       result.push({
         text: speech,
         speakerId,
@@ -1467,7 +1587,7 @@ function parseRosterVoiceSegmentsInternal(
       if ((inference.confident || openingSpeakerId) && speakerId) lastConfidentSpeakerId = speakerId
       if (speakerId) lastAssignedSpeakerId = speakerId
     }
-    cursor = match.index + match[0].length
+    cursor = quote.end
   }
   const narration = cleanPlaybackText(playbackContent.slice(cursor))
   if (narration) result.push({ text: narration, speakerId: null })
@@ -1479,12 +1599,15 @@ export function parseRosterVoiceSegments(
   defaultSpeakerId: string | null,
   speakers: CharacterLike[],
   skippedTrackerTagPairs = '',
+  historicalSpeakerId: string | null = null,
 ): PlaybackSegment[] {
   return parseRosterVoiceSegmentsInternal(
     content,
     defaultSpeakerId,
     speakers,
     skippedTrackerTagPairs,
+    undefined,
+    historicalSpeakerId,
   )
 }
 
@@ -1494,6 +1617,8 @@ export function parseRosterVoiceSegmentsWithAssignments(
   speakers: CharacterLike[],
   assignments: LlmSpeakerAssignment[],
   skippedTrackerTagPairs = '',
+  historicalSpeakerId: string | null = null,
+  preserveLocalOnNullOverride = false,
 ): PlaybackSegment[] {
   return parseRosterVoiceSegmentsInternal(
     content,
@@ -1501,7 +1626,87 @@ export function parseRosterVoiceSegmentsWithAssignments(
     speakers,
     skippedTrackerTagPairs,
     new Map(assignments.map(assignment => [assignment.quote, assignment.speakerId])),
+    historicalSpeakerId,
+    preserveLocalOnNullOverride,
   )
+}
+
+/** Resolve an identity-free message from the immediately preceding assistant turn. */
+export function previousAssistantSpeakerFallback(
+  content: string,
+  previousAssistantContent: string,
+  previousDefaultSpeakerId: string | null,
+  speakers: CharacterLike[],
+  skippedTrackerTagPairs = '',
+): string | null {
+  const playbackContent = preparePlaybackContent(content, skippedTrackerTagPairs)
+  const quoteMatches = playbackQuotes(playbackContent)
+    .filter(quote => !!cleanPlaybackText(quote.text))
+  if (quoteMatches.length === 0) return null
+
+  const previousContent = preparePlaybackContent(previousAssistantContent, skippedTrackerTagPairs)
+  const previousParagraphs = playbackParagraphs(previousContent)
+  let previousSpeakerId: string | null = null
+  for (let index = previousParagraphs.length - 1; index >= 0; index--) {
+    const paragraph = previousParagraphs[index]
+    const speakerId = preferredMentionedSpeaker(
+      paragraph.text,
+      speakers,
+      mentionedSpeakers(paragraph.text, speakers),
+    )
+    if (speakerId) {
+      previousSpeakerId = speakerId
+      break
+    }
+  }
+  if (!previousSpeakerId) {
+    const previousSegments = parseRosterVoiceSegmentsInternal(
+      previousAssistantContent,
+      previousDefaultSpeakerId,
+      speakers,
+      skippedTrackerTagPairs,
+    )
+    for (let index = previousSegments.length - 1; index >= 0; index--) {
+      if (previousSegments[index].speakerId) {
+        previousSpeakerId = previousSegments[index].speakerId
+        break
+      }
+    }
+  }
+  if (!previousSpeakerId) return null
+
+  let hasOpeningContinuity = false
+  let openingContinuityEnd = 0
+  const currentParagraphs = playbackParagraphs(playbackContent)
+  for (const quote of quoteMatches) {
+    const inference = inferQuotedSpeaker(
+      playbackContent.slice(0, quote.start),
+      playbackContent.slice(quote.end),
+      quote.text,
+      speakers,
+      null,
+    )
+    if (inference.source === 'explicit' || inference.source === 'paragraph') break
+    if (
+      inference.source === 'history'
+      && inference.speakerId
+      && inference.speakerId !== previousSpeakerId
+    ) {
+      if (!hasOpeningContinuity) break
+      // A different name in preceding narration is weaker than an actual
+      // dialogue attribution. Keep the established opening continuity; the
+      // segment parser will close it on explicit current-message evidence.
+    }
+    hasOpeningContinuity = true
+    openingContinuityEnd = currentParagraphs.find(paragraph => (
+      quote.start >= paragraph.start && quote.start < paragraph.end
+    ))?.end ?? quote.end
+  }
+  if (!hasOpeningContinuity) return null
+  if (pronounSpeechAttributionSubjects(playbackContent.slice(0, openingContinuityEnd)).size > 1) {
+    return null
+  }
+  return previousSpeakerId
 }
 
 export function detectCharacters(
