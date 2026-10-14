@@ -711,7 +711,7 @@ function canContinueSpeaker(bridge, previousSpeakerId, speakers) {
   }
   return true;
 }
-function parseRosterVoiceSegmentsInternal(content, defaultSpeakerId, speakers, skippedTrackerTagPairs = "", quoteSpeakerOverrides, historicalSpeakerId = null, preserveLocalOnNullOverride = false) {
+function parseRosterVoiceSegmentsInternal(content, defaultSpeakerId, speakers, skippedTrackerTagPairs = "", quoteSpeakerOverrides, historicalSpeakerId = null, preserveLocalOnNullOverride = false, lowConfidenceQuoteIndexes) {
   const playbackContent = preparePlaybackContent(content, skippedTrackerTagPairs);
   const result = [];
   const quotes = playbackQuotes(playbackContent);
@@ -765,11 +765,15 @@ function parseRosterVoiceSegmentsInternal(content, defaultSpeakerId, speakers, s
         speakers,
         mentionedSpeakers(previousParagraph.text, speakers).possessive
       ) : null;
+      const adjacentNarrativeEvidenceId = previousParagraph && playbackQuotes(previousParagraph.text).length === 0 ? paragraphSpeakers[paragraphIndex - 1] : null;
       const localSpeakerId = paragraphSpeakers[paragraphIndex] ?? adjacentNarrativeSpeakerId ?? downstreamReplies.get(paragraphIndex) ?? inferredTurnSpeakerId ?? continuedSpeakerId ?? historicalFallbackId ?? openingSpeakerId ?? inference.speakerId;
+      const confidentLocalSpeakerId = paragraphSpeakers[paragraphIndex] ?? adjacentNarrativeEvidenceId ?? (inference.source === "explicit" || inference.source === "paragraph" ? inference.speakerId : null);
+      if (!localSpeakerId || confidentLocalSpeakerId !== localSpeakerId) {
+        lowConfidenceQuoteIndexes?.add(currentQuoteIndex);
+      }
       const overrideSpeakerId = quoteSpeakerOverrides?.get(currentQuoteIndex) ?? null;
       const hasOverride = quoteSpeakerOverrides?.has(currentQuoteIndex) === true;
-      const protectedLocalSpeakerId = paragraphSpeakers[paragraphIndex] ?? adjacentNarrativeSpeakerId ?? (inference.source === "explicit" || inference.source === "paragraph" ? inference.speakerId : null);
-      const speakerId = hasOverride && (!preserveLocalOnNullOverride || overrideSpeakerId !== null && protectedLocalSpeakerId === null || localSpeakerId === null) ? overrideSpeakerId : localSpeakerId;
+      const speakerId = hasOverride && (!preserveLocalOnNullOverride || overrideSpeakerId !== null && confidentLocalSpeakerId === null || localSpeakerId === null) ? overrideSpeakerId : localSpeakerId;
       result.push({
         text: speech,
         speakerId

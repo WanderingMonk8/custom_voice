@@ -1512,20 +1512,36 @@ export function needsLlmSpeakerReview(
   defaultSpeakerId: string | null,
   speakers: CharacterLike[],
   skippedTrackerTagPairs = '',
+  historicalSpeakerId: string | null = null,
 ): boolean {
-  const playbackContent = preparePlaybackContent(content, skippedTrackerTagPairs)
-  for (const quote of playbackQuotes(playbackContent)) {
-    if (!cleanPlaybackText(quote.text)) continue
-    const inference = inferQuotedSpeaker(
-      playbackContent.slice(0, quote.start),
-      playbackContent.slice(quote.end),
-      quote.text,
-      speakers,
-      defaultSpeakerId,
-    )
-    if (inference.source === 'history' || inference.source === 'fallback') return true
-  }
-  return false
+  return speakerReviewQuoteIndexes(
+    content,
+    defaultSpeakerId,
+    speakers,
+    skippedTrackerTagPairs,
+    historicalSpeakerId,
+  ).length > 0
+}
+
+export function speakerReviewQuoteIndexes(
+  content: string,
+  defaultSpeakerId: string | null,
+  speakers: CharacterLike[],
+  skippedTrackerTagPairs = '',
+  historicalSpeakerId: string | null = null,
+): number[] {
+  const indexes = new Set<number>()
+  parseRosterVoiceSegmentsInternal(
+    content,
+    defaultSpeakerId,
+    speakers,
+    skippedTrackerTagPairs,
+    undefined,
+    historicalSpeakerId,
+    false,
+    indexes,
+  )
+  return [...indexes]
 }
 
 function parseRosterVoiceSegmentsInternal(
@@ -1536,6 +1552,7 @@ function parseRosterVoiceSegmentsInternal(
   quoteSpeakerOverrides?: ReadonlyMap<number, string | null>,
   historicalSpeakerId: string | null = null,
   preserveLocalOnNullOverride = false,
+  lowConfidenceQuoteIndexes?: Set<number>,
 ): PlaybackSegment[] {
   const playbackContent = preparePlaybackContent(content, skippedTrackerTagPairs)
   const result: PlaybackSegment[] = []
@@ -1616,6 +1633,10 @@ function parseRosterVoiceSegmentsInternal(
             mentionedSpeakers(previousParagraph.text, speakers).possessive,
           )
         : null
+      const adjacentNarrativeEvidenceId = previousParagraph
+        && playbackQuotes(previousParagraph.text).length === 0
+        ? paragraphSpeakers[paragraphIndex - 1]
+        : null
       const localSpeakerId: string | null = paragraphSpeakers[paragraphIndex]
         ?? adjacentNarrativeSpeakerId
         ?? downstreamReplies.get(paragraphIndex)
@@ -1624,16 +1645,19 @@ function parseRosterVoiceSegmentsInternal(
         ?? historicalFallbackId
         ?? openingSpeakerId
         ?? inference.speakerId
-      const overrideSpeakerId = quoteSpeakerOverrides?.get(currentQuoteIndex) ?? null
-      const hasOverride = quoteSpeakerOverrides?.has(currentQuoteIndex) === true
-      const protectedLocalSpeakerId = paragraphSpeakers[paragraphIndex]
-        ?? adjacentNarrativeSpeakerId
+      const confidentLocalSpeakerId = paragraphSpeakers[paragraphIndex]
+        ?? adjacentNarrativeEvidenceId
         ?? (inference.source === 'explicit' || inference.source === 'paragraph'
           ? inference.speakerId
           : null)
+      if (!localSpeakerId || confidentLocalSpeakerId !== localSpeakerId) {
+        lowConfidenceQuoteIndexes?.add(currentQuoteIndex)
+      }
+      const overrideSpeakerId = quoteSpeakerOverrides?.get(currentQuoteIndex) ?? null
+      const hasOverride = quoteSpeakerOverrides?.has(currentQuoteIndex) === true
       const speakerId: string | null = hasOverride
         && (!preserveLocalOnNullOverride
-          || (overrideSpeakerId !== null && protectedLocalSpeakerId === null)
+          || (overrideSpeakerId !== null && confidentLocalSpeakerId === null)
           || localSpeakerId === null)
         ? overrideSpeakerId
         : localSpeakerId

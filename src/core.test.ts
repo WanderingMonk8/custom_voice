@@ -26,6 +26,7 @@ import {
   readConfig,
   readSavedAudioHistory,
   speakerAliases,
+  speakerReviewQuoteIndexes,
   rollingRequestWindowDelay,
   stripSkippedTrackerBlocks,
   upsertSavedAudioRecord,
@@ -378,10 +379,19 @@ test('does not let an ambiguous LLM null erase a deterministic speaker', () => {
   )
 })
 
-test('requests LLM review only for dialogue requiring historical or fallback attribution', () => {
+test('requests LLM review only for final low-confidence quote assignments', () => {
   const speakers = [{ id: 'grace', name: 'Grace' }, { id: 'katie', name: 'Katie' }]
   assert.equal(needsLlmSpeakerReview('Grace said, "Clearly attributed."', 'grace', speakers), false)
-  assert.equal(needsLlmSpeakerReview('Grace watched the door.\n\n"Who is there?"', 'grace', speakers), true)
+  assert.equal(needsLlmSpeakerReview('Grace watched the door.\n\n"Who is there?"', 'grace', speakers), false)
+  assert.equal(needsLlmSpeakerReview('"Who is there?"', null, speakers), true)
+  assert.deepEqual(
+    speakerReviewQuoteIndexes(
+      'Grace said, "First."\n\nGrace watches the door.\n\n"Second."\n\n"Third."',
+      null,
+      speakers,
+    ),
+    [2],
+  )
 })
 
 test('message content hashes change when playback content changes', () => {

@@ -839,22 +839,21 @@ function speakerReviewQuotes(content, skippedTrackerTagPairs = "") {
   const playbackContent = preparePlaybackContent(content, skippedTrackerTagPairs);
   return playbackQuotes(playbackContent).map((quote) => cleanPlaybackText(quote.text));
 }
-function needsLlmSpeakerReview(content, defaultSpeakerId, speakers, skippedTrackerTagPairs = "") {
-  const playbackContent = preparePlaybackContent(content, skippedTrackerTagPairs);
-  for (const quote of playbackQuotes(playbackContent)) {
-    if (!cleanPlaybackText(quote.text)) continue;
-    const inference = inferQuotedSpeaker(
-      playbackContent.slice(0, quote.start),
-      playbackContent.slice(quote.end),
-      quote.text,
-      speakers,
-      defaultSpeakerId
-    );
-    if (inference.source === "history" || inference.source === "fallback") return true;
-  }
-  return false;
+function speakerReviewQuoteIndexes(content, defaultSpeakerId, speakers, skippedTrackerTagPairs = "", historicalSpeakerId = null) {
+  const indexes = /* @__PURE__ */ new Set();
+  parseRosterVoiceSegmentsInternal(
+    content,
+    defaultSpeakerId,
+    speakers,
+    skippedTrackerTagPairs,
+    void 0,
+    historicalSpeakerId,
+    false,
+    indexes
+  );
+  return [...indexes];
 }
-function parseRosterVoiceSegmentsInternal(content, defaultSpeakerId, speakers, skippedTrackerTagPairs = "", quoteSpeakerOverrides, historicalSpeakerId = null, preserveLocalOnNullOverride = false) {
+function parseRosterVoiceSegmentsInternal(content, defaultSpeakerId, speakers, skippedTrackerTagPairs = "", quoteSpeakerOverrides, historicalSpeakerId = null, preserveLocalOnNullOverride = false, lowConfidenceQuoteIndexes) {
   const playbackContent = preparePlaybackContent(content, skippedTrackerTagPairs);
   const result = [];
   const quotes = playbackQuotes(playbackContent);
@@ -908,11 +907,15 @@ function parseRosterVoiceSegmentsInternal(content, defaultSpeakerId, speakers, s
         speakers,
         mentionedSpeakers(previousParagraph.text, speakers).possessive
       ) : null;
+      const adjacentNarrativeEvidenceId = previousParagraph && playbackQuotes(previousParagraph.text).length === 0 ? paragraphSpeakers[paragraphIndex - 1] : null;
       const localSpeakerId = paragraphSpeakers[paragraphIndex] ?? adjacentNarrativeSpeakerId ?? downstreamReplies.get(paragraphIndex) ?? inferredTurnSpeakerId ?? continuedSpeakerId ?? historicalFallbackId ?? openingSpeakerId ?? inference.speakerId;
+      const confidentLocalSpeakerId = paragraphSpeakers[paragraphIndex] ?? adjacentNarrativeEvidenceId ?? (inference.source === "explicit" || inference.source === "paragraph" ? inference.speakerId : null);
+      if (!localSpeakerId || confidentLocalSpeakerId !== localSpeakerId) {
+        lowConfidenceQuoteIndexes?.add(currentQuoteIndex);
+      }
       const overrideSpeakerId = quoteSpeakerOverrides?.get(currentQuoteIndex) ?? null;
       const hasOverride = quoteSpeakerOverrides?.has(currentQuoteIndex) === true;
-      const protectedLocalSpeakerId = paragraphSpeakers[paragraphIndex] ?? adjacentNarrativeSpeakerId ?? (inference.source === "explicit" || inference.source === "paragraph" ? inference.speakerId : null);
-      const speakerId = hasOverride && (!preserveLocalOnNullOverride || overrideSpeakerId !== null && protectedLocalSpeakerId === null || localSpeakerId === null) ? overrideSpeakerId : localSpeakerId;
+      const speakerId = hasOverride && (!preserveLocalOnNullOverride || overrideSpeakerId !== null && confidentLocalSpeakerId === null || localSpeakerId === null) ? overrideSpeakerId : localSpeakerId;
       result.push({
         text: speech,
         speakerId
@@ -1238,7 +1241,14 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
       skippedTrackerTags,
       historicalSpeakerId
     );
-    if (payload.mode === "off" || payload.mode === "ambiguous" && (historicalSpeakerId || !needsLlmSpeakerReview(message.content ?? "", defaultSpeakerId, speakers, skippedTrackerTags))) {
+    const reviewQuoteIndexes = new Set(speakerReviewQuoteIndexes(
+      message.content ?? "",
+      defaultSpeakerId,
+      speakers,
+      skippedTrackerTags,
+      historicalSpeakerId
+    ));
+    if (payload.mode === "off" || payload.mode === "ambiguous" && reviewQuoteIndexes.size === 0) {
       sendSpeakerParse({
         requestId: payload.requestId,
         chatId: chat.id,
@@ -1251,7 +1261,8 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
     const connectionId = payload.connectionId.trim().slice(0, 128);
     const model = payload.model.trim().slice(0, 256);
     const cacheHash = hashMessageContent(JSON.stringify({
-      parser: 8,
+      parser: 9,
+      mode: payload.mode,
       content: message.content ?? "",
       speakers: speakers.map((speaker) => ({ id: speaker.id, name: speaker.name })),
       defaultSpeakerId,
@@ -1273,7 +1284,7 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
       return;
     }
     const quotes = speakerReviewQuotes(message.content ?? "", skippedTrackerTags);
-    const nonEmptyQuoteIndexes = quotes.map((text, quote) => ({ text, quote })).filter((item) => !!item.text);
+    const nonEmptyQuoteIndexes = quotes.map((text, quote) => ({ text, quote })).filter((item) => !!item.text && (payload.mode === "always" || reviewQuoteIndexes.has(item.quote)));
     if (nonEmptyQuoteIndexes.length === 0) {
       sendSpeakerParse({
         requestId: payload.requestId,
@@ -1308,11 +1319,12 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
       parameters: { temperature: 0, ...model ? { model } : {} },
       reasoning: { source: "off" }
     });
+    const requestedQuoteIndexes = new Set(nonEmptyQuoteIndexes.map((item) => item.quote));
     const assignments = parseLlmSpeakerAssignments(
       response,
       new Set(speakers.map((speaker) => speaker.id)),
       quotes.length
-    );
+    ).filter((assignment) => requestedQuoteIndexes.has(assignment.quote));
     const assignedQuotes = new Set(assignments.map((assignment) => assignment.quote));
     if (nonEmptyQuoteIndexes.some((item) => !assignedQuotes.has(item.quote))) {
       throw new Error("The selected LLM returned an incomplete speaker assignment.");
