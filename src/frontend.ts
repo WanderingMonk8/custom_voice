@@ -1205,21 +1205,36 @@ export function setup(ctx: SpindleFrontendContext) {
     ].filter(Boolean).join(' ').toLowerCase()
   }
 
-  function nativeTtsMessageId(button: HTMLButtonElement): string | null {
-    if (button.closest('[data-spindle-extension-root]')) return null
-    const known = button.dataset.chatVoiceNativeTts === 'true'
+  function isExplicitTtsButton(button: HTMLButtonElement): boolean {
     const label = nativeTtsButtonLabel(button)
     const iconClass = button.querySelector('svg')?.getAttribute('class')?.toLowerCase() ?? ''
-    const hasNativeTtsIcon = iconClass.includes('volume-2')
+    return button.dataset.chatVoiceNativeTts === 'true'
+      || iconClass.includes('volume-2')
       || iconClass.includes('volume2')
       || iconClass.includes('volume-high')
-    const hasNativeTtsLabel = /\btts\b|text[ -]to[ -]speech|stop playback|regenerate.+audio/.test(label)
-    const bubbleActions = button.closest('[data-component="BubbleActions"]')
-    const bubbleButtons = bubbleActions
-      ? [...bubbleActions.children].filter((child): child is HTMLButtonElement => child.tagName === 'BUTTON')
-      : []
-    const isBubbleTtsPosition = bubbleButtons.length >= 3 && bubbleButtons[2] === button
-    if (!known && !hasNativeTtsIcon && !hasNativeTtsLabel && !isBubbleTtsPosition) return null
+      || /\btts\b|text[ -]to[ -]speech|stop playback|regenerate.+audio/.test(label)
+  }
+
+  function preferredTtsActionIndex(): number {
+    for (const actions of hostDocument.querySelectorAll<HTMLElement>('[data-component="BubbleActions"]')) {
+      const buttons = [...actions.children].filter((child): child is HTMLButtonElement => child.tagName === 'BUTTON')
+      const index = buttons.findIndex(button => isExplicitTtsButton(button))
+      if (index >= 0) return index
+    }
+    return 3
+  }
+
+  function insertAtActionIndex(container: HTMLElement, action: HTMLElement, index: number): void {
+    const actions = [...container.children].filter(child => (
+      child.tagName === 'BUTTON' || child.getAttribute('role') === 'menuitem'
+    ))
+    container.insertBefore(action, actions[index] ?? null)
+  }
+
+  function nativeTtsMessageId(button: HTMLButtonElement): string | null {
+    if (button.closest('[data-spindle-extension-root]')) return null
+    const explicitTtsButton = isExplicitTtsButton(button)
+    if (!explicitTtsButton) return null
 
     const messageElement = button.closest<HTMLElement>('[data-message-id]')
     if (messageElement?.dataset.messageId) return messageElement.dataset.messageId
@@ -2635,7 +2650,7 @@ export function setup(ctx: SpindleFrontendContext) {
       hostDocument.dispatchEvent(new hostWindow.KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
       void playMessage(messageId, true)
     })
-    template.parentElement.appendChild(action)
+    insertAtActionIndex(template.parentElement, action, preferredTtsActionIndex())
   }
 
   const onNativeTtsClick = (event: MouseEvent) => {
@@ -2783,7 +2798,7 @@ export function setup(ctx: SpindleFrontendContext) {
       if (!messageId || !actions || pendingSavedUserControlChecks.has(messageId)) continue
       if (actions.querySelector('[data-chat-voice-saved-user-tts]')) continue
       const hasTtsAction = [...actions.querySelectorAll<HTMLButtonElement>('button')]
-        .some(button => nativeTtsMessageId(button) === messageId)
+        .some(button => isExplicitTtsButton(button))
       if (hasTtsAction) continue
       pendingSavedUserControlChecks.add(messageId)
       void loadMessageForSavedAudioControl(chatId, messageId).then((message) => {
@@ -2798,7 +2813,7 @@ export function setup(ctx: SpindleFrontendContext) {
         button.title = 'Regenerate TTS audio'
         button.setAttribute('aria-label', 'Regenerate TTS audio')
         button.innerHTML = PLAY_TTS_ACTION_ICON
-        currentActions.appendChild(button)
+        insertAtActionIndex(currentActions, button, preferredTtsActionIndex())
       }).catch(() => undefined).finally(() => {
         pendingSavedUserControlChecks.delete(messageId)
       })

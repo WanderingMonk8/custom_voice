@@ -1669,17 +1669,27 @@ function setup(ctx) {
       button.textContent
     ].filter(Boolean).join(" ").toLowerCase();
   }
-  function nativeTtsMessageId(button) {
-    if (button.closest("[data-spindle-extension-root]")) return null;
-    const known = button.dataset.chatVoiceNativeTts === "true";
+  function isExplicitTtsButton(button) {
     const label = nativeTtsButtonLabel(button);
     const iconClass = button.querySelector("svg")?.getAttribute("class")?.toLowerCase() ?? "";
-    const hasNativeTtsIcon = iconClass.includes("volume-2") || iconClass.includes("volume2") || iconClass.includes("volume-high");
-    const hasNativeTtsLabel = /\btts\b|text[ -]to[ -]speech|stop playback|regenerate.+audio/.test(label);
-    const bubbleActions = button.closest('[data-component="BubbleActions"]');
-    const bubbleButtons = bubbleActions ? [...bubbleActions.children].filter((child) => child.tagName === "BUTTON") : [];
-    const isBubbleTtsPosition = bubbleButtons.length >= 3 && bubbleButtons[2] === button;
-    if (!known && !hasNativeTtsIcon && !hasNativeTtsLabel && !isBubbleTtsPosition) return null;
+    return button.dataset.chatVoiceNativeTts === "true" || iconClass.includes("volume-2") || iconClass.includes("volume2") || iconClass.includes("volume-high") || /\btts\b|text[ -]to[ -]speech|stop playback|regenerate.+audio/.test(label);
+  }
+  function preferredTtsActionIndex() {
+    for (const actions of hostDocument.querySelectorAll('[data-component="BubbleActions"]')) {
+      const buttons = [...actions.children].filter((child) => child.tagName === "BUTTON");
+      const index = buttons.findIndex((button) => isExplicitTtsButton(button));
+      if (index >= 0) return index;
+    }
+    return 3;
+  }
+  function insertAtActionIndex(container, action, index) {
+    const actions = [...container.children].filter((child) => child.tagName === "BUTTON" || child.getAttribute("role") === "menuitem");
+    container.insertBefore(action, actions[index] ?? null);
+  }
+  function nativeTtsMessageId(button) {
+    if (button.closest("[data-spindle-extension-root]")) return null;
+    const explicitTtsButton = isExplicitTtsButton(button);
+    if (!explicitTtsButton) return null;
     const messageElement = button.closest("[data-message-id]");
     if (messageElement?.dataset.messageId) return messageElement.dataset.messageId;
     const isPortalMenuAction = button.parentElement?.parentElement === button.ownerDocument.body && !!button.querySelector(":scope > span");
@@ -2954,7 +2964,7 @@ function setup(ctx) {
       hostDocument.dispatchEvent(new hostWindow.KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
       void playMessage(messageId, true);
     });
-    template.parentElement.appendChild(action);
+    insertAtActionIndex(template.parentElement, action, preferredTtsActionIndex());
   }
   const onNativeTtsClick = (event) => {
     const target = event.target && typeof event.target.closest === "function" ? event.target : null;
@@ -3090,7 +3100,7 @@ function setup(ctx) {
       const actions = messageElement.querySelector('[data-component="BubbleActions"]');
       if (!messageId || !actions || pendingSavedUserControlChecks.has(messageId)) continue;
       if (actions.querySelector("[data-chat-voice-saved-user-tts]")) continue;
-      const hasTtsAction = [...actions.querySelectorAll("button")].some((button) => nativeTtsMessageId(button) === messageId);
+      const hasTtsAction = [...actions.querySelectorAll("button")].some((button) => isExplicitTtsButton(button));
       if (hasTtsAction) continue;
       pendingSavedUserControlChecks.add(messageId);
       void loadMessageForSavedAudioControl(chatId, messageId).then((message) => {
@@ -3105,7 +3115,7 @@ function setup(ctx) {
         button.title = "Regenerate TTS audio";
         button.setAttribute("aria-label", "Regenerate TTS audio");
         button.innerHTML = PLAY_TTS_ACTION_ICON;
-        currentActions.appendChild(button);
+        insertAtActionIndex(currentActions, button, preferredTtsActionIndex());
       }).catch(() => void 0).finally(() => {
         pendingSavedUserControlChecks.delete(messageId);
       });
