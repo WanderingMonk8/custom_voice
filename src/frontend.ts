@@ -1823,7 +1823,7 @@ export function setup(ctx: SpindleFrontendContext) {
           ? config.userVoice
           : speakerId
             ? config.characterVoices[speakerId] || ''
-            : message.is_user ? config.userVoice : config.narratorVoice
+            : config.narratorVoice
         return { text: segment.text, voice }
       }))
       if (plan.length === 0) throw new Error('This message has no playable narration or dialogue.')

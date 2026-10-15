@@ -314,6 +314,18 @@ test('uses the user role as the default speaker for unattributed user dialogue',
   )
 })
 
+test('keeps user-message narration separate from defaulted user dialogue', () => {
+  const segments = parseRosterVoiceSegments(
+    'The door opens.\n\n"I can handle it."',
+    USER_SPEAKER_ID,
+    [{ id: USER_SPEAKER_ID, name: 'Ken' }],
+  )
+  assert.ok(segments.some(segment => segment.speakerId === null && segment.text.includes('The door opens.')))
+  assert.ok(segments.some(segment => (
+    segment.speakerId === USER_SPEAKER_ID && segment.text === 'I can handle it.'
+  )))
+})
+
 test('writes native overrides while preserving unrelated character voices', () => {
   const config: ChatVoiceConfig = {
     version: 7,

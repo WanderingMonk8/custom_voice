@@ -2221,7 +2221,7 @@ function setup(ctx) {
       }
       const plan = mergeVoicePlan(segments.map((segment) => {
         const speakerId = segment.speakerId ? aliases.get(segment.speakerId) ?? segment.speakerId : null;
-        const voice = speakerId === USER_SPEAKER_ID ? config.userVoice : speakerId ? config.characterVoices[speakerId] || "" : message.is_user ? config.userVoice : config.narratorVoice;
+        const voice = speakerId === USER_SPEAKER_ID ? config.userVoice : speakerId ? config.characterVoices[speakerId] || "" : config.narratorVoice;
         return { text: segment.text, voice };
       }));
       if (plan.length === 0) throw new Error("This message has no playable narration or dialogue.");
