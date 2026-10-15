@@ -8,6 +8,7 @@ import {
   parseLlmSpeakerAssignments,
   parseRosterVoiceSegments,
   parseRosterVoiceSegmentsWithAssignments,
+  preferredCardSpeakerId,
   previousAssistantSpeakerFallback,
   preparePlaybackContent,
   mergeScannedCardCast,
@@ -134,6 +135,7 @@ async function buildState(chat: ChatLike, userId?: string) {
     userVoice: config.userVoice,
     useGlobalNarratorVoice: config.useGlobalNarratorVoice,
     useGlobalUserVoice: config.useGlobalUserVoice,
+    cardCharacterIds: candidates.map(character => character.id),
     characters: detected.map((character) => ({
       ...character,
       voice: config.characterVoices[character.id] ?? '',
@@ -234,14 +236,9 @@ Return exactly one assignment for every numbered quotation. Use only the supplie
 function defaultMessageSpeakerId(
   message: { name: string; extra?: Record<string, unknown> },
   speakers: CharacterLike[],
+  cardCharacterIds: readonly string[] = [],
 ): string | null {
-  const explicitId = typeof message.extra?.character_id === 'string' ? message.extra.character_id : ''
-  if (explicitId && speakers.some(speaker => speaker.id === explicitId)) return explicitId
-  const messageName = normalizeSpeakerName(message.name).toLowerCase()
-  return speakers.find(speaker => (
-    !speaker.id.startsWith('npc:')
-    && speakerAliases(speaker.name).some(alias => alias.toLowerCase() === messageName)
-  ))?.id ?? null
+  return preferredCardSpeakerId(message, speakers, cardCharacterIds)
 }
 
 function sendSpeakerParse(
@@ -359,7 +356,7 @@ function queueSpeakerParse(
     ]
     const defaultSpeakerId = message.is_user
       ? USER_SPEAKER_ID
-      : defaultMessageSpeakerId(message, speakers)
+      : defaultMessageSpeakerId(message, speakers, cards.map(card => card.id))
     const skippedTrackerTags = payload.skippedTrackerTags.slice(0, 4_000)
     const messageIndex = messages.findIndex(item => item.id === payload.messageId)
     let previousAssistantMessage: typeof message | null = null
@@ -372,7 +369,7 @@ function queueSpeakerParse(
       ? previousAssistantSpeakerFallback(
           message.content ?? '',
           previousAssistantMessage.content ?? '',
-          defaultMessageSpeakerId(previousAssistantMessage, speakers),
+          defaultMessageSpeakerId(previousAssistantMessage, speakers, cards.map(card => card.id)),
           speakers,
           skippedTrackerTags,
         )
@@ -408,7 +405,7 @@ function queueSpeakerParse(
     const connectionId = payload.connectionId.trim().slice(0, 128)
     const model = payload.model.trim().slice(0, 256)
     const cacheHash = hashMessageContent(JSON.stringify({
-      parser: 11,
+      parser: 12,
       mode: payload.mode,
       content: message.content ?? '',
       speakers: speakers.map(speaker => ({ id: speaker.id, name: speaker.name })),
@@ -478,6 +475,14 @@ function queueSpeakerParse(
       new Set(speakers.map(speaker => speaker.id)),
       quotes.length,
     ).filter(assignment => requestedQuoteIndexes.has(assignment.quote))
+      .map(assignment => (
+        payload.mode === 'ambiguous'
+        && !message.is_user
+        && assignment.speakerId === USER_SPEAKER_ID
+        && defaultSpeakerId
+          ? { ...assignment, speakerId: defaultSpeakerId }
+          : assignment
+      ))
     const assignedQuotes = new Set(assignments.map(assignment => assignment.quote))
     if (nonEmptyQuoteIndexes.some(item => !assignedQuotes.has(item.quote))) {
       throw new Error('The selected LLM returned an incomplete speaker assignment.')

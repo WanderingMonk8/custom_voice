@@ -198,6 +198,16 @@ function speakerAliases(value) {
   }
   return aliases;
 }
+function preferredCardSpeakerId(message, speakers, cardCharacterIds) {
+  const speakerIds = new Set(speakers.map((speaker) => speaker.id));
+  const explicitId = typeof message.extra?.character_id === "string" ? message.extra.character_id : "";
+  if (explicitId && speakerIds.has(explicitId)) return explicitId;
+  const messageName = normalizeSpeakerName(message.name ?? "").toLowerCase();
+  const namedSpeaker = messageName ? speakers.find((speaker) => !speaker.id.startsWith("npc:") && speakerAliases(speaker.name).some((alias) => alias.toLowerCase() === messageName)) : void 0;
+  if (namedSpeaker) return namedSpeaker.id;
+  const availableCardIds = [...new Set(cardCharacterIds)].filter((characterId) => speakerIds.has(characterId));
+  return availableCardIds.length === 1 ? availableCardIds[0] : null;
+}
 var SPEAKER_TITLES = /* @__PURE__ */ new Set([
   "mr",
   "mrs",
@@ -1087,6 +1097,7 @@ async function buildState(chat, userId) {
     userVoice: config.userVoice,
     useGlobalNarratorVoice: config.useGlobalNarratorVoice,
     useGlobalUserVoice: config.useGlobalUserVoice,
+    cardCharacterIds: candidates.map((character) => character.id),
     characters: detected.map((character) => ({
       ...character,
       voice: config.characterVoices[character.id] ?? ""
@@ -1158,11 +1169,8 @@ Use narrative attribution, grammatical subjects, dialogue continuity, and call-a
 When historicalSpeakerId is present, it is the locally resolved speaker from the immediately preceding assistant message. Use it only for otherwise unattributed continuity.
 Return JSON only: {"assignments":[{"quote":0,"speakerId":"known id or null"}]}.
 Return exactly one assignment for every numbered quotation. Use only the supplied speaker IDs. Use null only when no listed speaker can reasonably be identified. Do not rewrite or repeat the dialogue.`;
-function defaultMessageSpeakerId(message, speakers) {
-  const explicitId = typeof message.extra?.character_id === "string" ? message.extra.character_id : "";
-  if (explicitId && speakers.some((speaker) => speaker.id === explicitId)) return explicitId;
-  const messageName = normalizeSpeakerName(message.name).toLowerCase();
-  return speakers.find((speaker) => !speaker.id.startsWith("npc:") && speakerAliases(speaker.name).some((alias) => alias.toLowerCase() === messageName))?.id ?? null;
+function defaultMessageSpeakerId(message, speakers, cardCharacterIds = []) {
+  return preferredCardSpeakerId(message, speakers, cardCharacterIds);
 }
 function sendSpeakerParse(payload, userId, frontendSessionId) {
   sendFrontend({ type: "chat_voice_parsed_message", ...payload }, userId, frontendSessionId);
@@ -1245,7 +1253,7 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
       ...config.detectedCharacters,
       ...messages.some((item) => item.is_user) ? [{ id: USER_SPEAKER_ID, name: userAliases.join(" / ") || "User" }] : []
     ];
-    const defaultSpeakerId = message.is_user ? USER_SPEAKER_ID : defaultMessageSpeakerId(message, speakers);
+    const defaultSpeakerId = message.is_user ? USER_SPEAKER_ID : defaultMessageSpeakerId(message, speakers, cards.map((card) => card.id));
     const skippedTrackerTags = payload.skippedTrackerTags.slice(0, 4e3);
     const messageIndex = messages.findIndex((item) => item.id === payload.messageId);
     let previousAssistantMessage = null;
@@ -1257,7 +1265,7 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
     const historicalSpeakerId = !message.is_user && previousAssistantMessage ? previousAssistantSpeakerFallback(
       message.content ?? "",
       previousAssistantMessage.content ?? "",
-      defaultMessageSpeakerId(previousAssistantMessage, speakers),
+      defaultMessageSpeakerId(previousAssistantMessage, speakers, cards.map((card) => card.id)),
       speakers,
       skippedTrackerTags
     ) : null;
@@ -1288,7 +1296,7 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
     const connectionId = payload.connectionId.trim().slice(0, 128);
     const model = payload.model.trim().slice(0, 256);
     const cacheHash = hashMessageContent(JSON.stringify({
-      parser: 11,
+      parser: 12,
       mode: payload.mode,
       content: message.content ?? "",
       speakers: speakers.map((speaker) => ({ id: speaker.id, name: speaker.name })),
@@ -1351,7 +1359,7 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
       response,
       new Set(speakers.map((speaker) => speaker.id)),
       quotes.length
-    ).filter((assignment) => requestedQuoteIndexes.has(assignment.quote));
+    ).filter((assignment) => requestedQuoteIndexes.has(assignment.quote)).map((assignment) => payload.mode === "ambiguous" && !message.is_user && assignment.speakerId === USER_SPEAKER_ID && defaultSpeakerId ? { ...assignment, speakerId: defaultSpeakerId } : assignment);
     const assignedQuotes = new Set(assignments.map((assignment) => assignment.quote));
     if (nonEmptyQuoteIndexes.some((item) => !assignedQuotes.has(item.quote))) {
       throw new Error("The selected LLM returned an incomplete speaker assignment.");

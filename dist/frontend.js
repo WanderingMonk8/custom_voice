@@ -171,6 +171,16 @@ function speakerAliases(value) {
   }
   return aliases;
 }
+function preferredCardSpeakerId(message, speakers, cardCharacterIds) {
+  const speakerIds = new Set(speakers.map((speaker) => speaker.id));
+  const explicitId = typeof message.extra?.character_id === "string" ? message.extra.character_id : "";
+  if (explicitId && speakerIds.has(explicitId)) return explicitId;
+  const messageName = normalizeSpeakerName(message.name ?? "").toLowerCase();
+  const namedSpeaker = messageName ? speakers.find((speaker) => !speaker.id.startsWith("npc:") && speakerAliases(speaker.name).some((alias) => alias.toLowerCase() === messageName)) : void 0;
+  if (namedSpeaker) return namedSpeaker.id;
+  const availableCardIds = [...new Set(cardCharacterIds)].filter((characterId) => speakerIds.has(characterId));
+  return availableCardIds.length === 1 ? availableCardIds[0] : null;
+}
 function npcSpeakerId(name) {
   return `npc:${normalizeSpeakerName(name).toLowerCase()}`;
 }
@@ -2206,9 +2216,11 @@ function setup(ctx) {
     updatePlaybackButtons();
     try {
       if (playback.controller.signal.aborted) throw new DOMException("Playback stopped.", "AbortError");
-      const explicitId = typeof message.extra?.character_id === "string" ? message.extra.character_id : "";
-      const messageName = normalizeSpeakerName(message.name).toLowerCase();
-      const defaultSpeakerId = message.is_user ? USER_SPEAKER_ID : explicitId || playbackChat.characters.find((character) => !character.id.startsWith("npc:") && speakerAliases(character.name).some((alias) => alias.toLowerCase() === messageName))?.id || null;
+      const defaultSpeakerId = message.is_user ? USER_SPEAKER_ID : preferredCardSpeakerId(
+        message,
+        playbackChat.characters,
+        playbackChat.cardCharacterIds ?? []
+      );
       const playbackSpeakers = message.is_user ? [
         ...playbackChat.characters,
         { id: USER_SPEAKER_ID, name: normalizeSpeakerName(message.name) || "User" }
