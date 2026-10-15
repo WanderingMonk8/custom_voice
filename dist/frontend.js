@@ -892,6 +892,7 @@ var VOICE_ICON = `
   </svg>
 `;
 var STOP_ACTION_ICON = `<svg viewBox="0 0 24 24" width="13" height="13" fill="currentColor" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="1"/></svg>`;
+var PLAY_TTS_ACTION_ICON = `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" aria-hidden="true"><path d="M11 5 6 9H3v6h3l5 4V5Z" fill="currentColor"/><path d="M15 9.5a4 4 0 0 1 0 5M18 7a7.5 7.5 0 0 1 0 10" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>`;
 var RENAME_ICON = `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" aria-hidden="true"><path d="M4 20h4l11-11-4-4L4 16v4Zm9.5-13.5 4 4" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
 async function listAllTtsConnections() {
   const pageSize = 200;
@@ -3036,6 +3037,40 @@ function setup(ctx) {
     renderState(payload.chat);
     pendingState?.resolve(payload.chat);
   });
+  const persistentMessageAction = ctx.registerMessageAction?.({
+    id: "chat-voice-playback",
+    label: "Play TTS",
+    onClick: (messageId) => void playMessage(messageId)
+  });
+  const savedUserTtsButtonDecorator = ctx.registerDomDecorator?.({
+    target: '[data-component="BubbleActions"]',
+    decorate: (element) => {
+      const actions = element;
+      const messageElement = actions.closest("[data-message-id]");
+      const messageId = messageElement?.dataset.messageId;
+      if (!messageId) return;
+      let disposed = false;
+      let fallbackButton = null;
+      const loadMessage = ctx.messages.get ? ctx.messages.get(messageId) : Promise.resolve(null);
+      void loadMessage.then((message) => {
+        if (disposed || !message?.is_user || !hasSavedAudioForCurrentSwipe(message)) return;
+        const hasTtsAction = [...actions.querySelectorAll("button")].some((button) => nativeTtsMessageId(button) === messageId);
+        if (hasTtsAction) return;
+        fallbackButton = hostDocument.createElement("button");
+        fallbackButton.type = "button";
+        fallbackButton.className = actions.querySelector("button")?.className ?? "";
+        fallbackButton.dataset.chatVoiceNativeTts = "true";
+        fallbackButton.title = "Regenerate TTS audio";
+        fallbackButton.setAttribute("aria-label", "Regenerate TTS audio");
+        fallbackButton.innerHTML = PLAY_TTS_ACTION_ICON;
+        actions.appendChild(fallbackButton);
+      }).catch((error) => console.warn("[Chat Voice] Could not inspect saved user-message audio.", error));
+      return () => {
+        disposed = true;
+        fallbackButton?.remove();
+      };
+    }
+  });
   const unsubscribeChatSwitched = ctx.events.on("CHAT_SWITCHED", (rawPayload) => {
     const switchedChatId = rawPayload?.chatId ?? null;
     hostWindow.requestAnimationFrame(() => {
@@ -3124,6 +3159,8 @@ function setup(ctx) {
     saveAudioLimitInput.removeEventListener("change", onSaveAudioLimitChanged);
     hostWindow.removeEventListener("contextmenu", onNativeContextMenu, true);
     hostWindow.removeEventListener("click", onNativeTtsClick, true);
+    persistentMessageAction?.destroy();
+    savedUserTtsButtonDecorator?.destroy();
     restoreNativePlaybackButtons();
     tab.destroy();
     removeStyle();
