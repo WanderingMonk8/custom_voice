@@ -2585,6 +2585,57 @@ export function setup(ctx: SpindleFrontendContext) {
       : null
     lastContextMessageId = target?.closest<HTMLElement>('[data-message-id]')?.dataset.messageId ?? null
     hostWindow.requestAnimationFrame(updatePlaybackButtons)
+    if (lastContextMessageId) void ensureSavedUserContextAction(lastContextMessageId)
+  }
+
+  function hasAnySavedAudio(message: PlaybackMessage): boolean {
+    const attachments = message.extra?.attachments
+    return Array.isArray(attachments) && attachments.some(candidate => (
+      !!candidate && typeof candidate === 'object' && (candidate as SavedAudioAttachment).type === 'audio'
+    ))
+  }
+
+  function loadMessageForSavedAudioControl(chatId: string, messageId: string): Promise<PlaybackMessage | null> {
+    if (ctx.messages.get) return ctx.messages.get(messageId) as Promise<PlaybackMessage | null>
+    return requestPlaybackMessage(chatId, messageId)
+  }
+
+  async function ensureSavedUserContextAction(messageId: string): Promise<void> {
+    const chatId = ctx.getActiveChat().chatId
+    if (!chatId) return
+    let message: PlaybackMessage
+    try {
+      const loaded = await loadMessageForSavedAudioControl(chatId, messageId)
+      if (!loaded) return
+      message = loaded
+    } catch {
+      return
+    }
+    if (!message.is_user || !hasAnySavedAudio(message) || lastContextMessageId !== messageId) return
+    await new Promise<void>(resolve => hostWindow.requestAnimationFrame(() => resolve()))
+    const existing = hostDocument.querySelector<HTMLElement>(`[data-chat-voice-context-tts="${CSS.escape(messageId)}"]`)
+    if (existing) return
+    const menuItems = [...hostDocument.querySelectorAll<HTMLElement>('button, [role="menuitem"]')]
+      .filter(item => item.getClientRects().length > 0 && item.closest('[data-message-id]') === null)
+    const template = menuItems.find(item => item.textContent?.trim().toLowerCase() === 'copy')
+      ?? menuItems.find(item => item.textContent?.trim().toLowerCase() === 'edit')
+    if (!template?.parentElement) return
+    const action = template.cloneNode(true) as HTMLElement
+    action.removeAttribute('id')
+    action.dataset.chatVoiceContextTts = messageId
+    action.setAttribute('aria-label', 'Regenerate TTS audio')
+    const label = action.querySelector('span')
+    if (label) label.textContent = 'Regenerate TTS audio'
+    else action.textContent = 'Regenerate TTS audio'
+    const icon = action.querySelector('svg')
+    if (icon) icon.outerHTML = PLAY_TTS_ACTION_ICON
+    action.addEventListener('click', (clickEvent) => {
+      clickEvent.preventDefault()
+      clickEvent.stopPropagation()
+      hostDocument.dispatchEvent(new hostWindow.KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+      void playMessage(messageId, true)
+    })
+    template.parentElement.appendChild(action)
   }
 
   const onNativeTtsClick = (event: MouseEvent) => {
@@ -2722,44 +2773,40 @@ export function setup(ctx: SpindleFrontendContext) {
     pendingState?.resolve(payload.chat)
   })
 
-  const persistentMessageAction = ctx.registerMessageAction?.({
-    id: 'chat-voice-playback',
-    label: 'Play TTS',
-    onClick: messageId => void playMessage(messageId),
-  })
-
-  const savedUserTtsButtonDecorator = ctx.registerDomDecorator?.({
-    target: '[data-component="BubbleActions"]',
-    decorate: (element) => {
-      const actions = element as HTMLElement
-      const messageElement = actions.closest<HTMLElement>('[data-message-id]')
-      const messageId = messageElement?.dataset.messageId
-      if (!messageId) return
-      let disposed = false
-      let fallbackButton: HTMLButtonElement | null = null
-      const loadMessage = ctx.messages.get
-        ? ctx.messages.get(messageId) as Promise<PlaybackMessage | null>
-        : Promise.resolve(null)
-      void loadMessage.then((message) => {
-        if (disposed || !message?.is_user || !hasSavedAudioForCurrentSwipe(message)) return
-        const hasTtsAction = [...actions.querySelectorAll<HTMLButtonElement>('button')]
-          .some(button => nativeTtsMessageId(button) === messageId)
-        if (hasTtsAction) return
-        fallbackButton = hostDocument.createElement('button')
-        fallbackButton.type = 'button'
-        fallbackButton.className = actions.querySelector<HTMLButtonElement>('button')?.className ?? ''
-        fallbackButton.dataset.chatVoiceNativeTts = 'true'
-        fallbackButton.title = 'Regenerate TTS audio'
-        fallbackButton.setAttribute('aria-label', 'Regenerate TTS audio')
-        fallbackButton.innerHTML = PLAY_TTS_ACTION_ICON
-        actions.appendChild(fallbackButton)
-      }).catch(error => console.warn('[Chat Voice] Could not inspect saved user-message audio.', error))
-      return () => {
-        disposed = true
-        fallbackButton?.remove()
-      }
-    },
-  })
+  const pendingSavedUserControlChecks = new Set<string>()
+  const ensureSavedUserBubbleControls = () => {
+    const chatId = ctx.getActiveChat().chatId
+    if (!chatId) return
+    for (const messageElement of hostDocument.querySelectorAll<HTMLElement>('[data-message-id]')) {
+      const messageId = messageElement.dataset.messageId
+      const actions = messageElement.querySelector<HTMLElement>('[data-component="BubbleActions"]')
+      if (!messageId || !actions || pendingSavedUserControlChecks.has(messageId)) continue
+      if (actions.querySelector('[data-chat-voice-saved-user-tts]')) continue
+      const hasTtsAction = [...actions.querySelectorAll<HTMLButtonElement>('button')]
+        .some(button => nativeTtsMessageId(button) === messageId)
+      if (hasTtsAction) continue
+      pendingSavedUserControlChecks.add(messageId)
+      void loadMessageForSavedAudioControl(chatId, messageId).then((message) => {
+        if (!message?.is_user || !hasAnySavedAudio(message) || !messageElement.isConnected) return
+        const currentActions = messageElement.querySelector<HTMLElement>('[data-component="BubbleActions"]')
+        if (!currentActions || currentActions.querySelector('[data-chat-voice-saved-user-tts]')) return
+        const button = hostDocument.createElement('button')
+        button.type = 'button'
+        button.className = currentActions.querySelector<HTMLButtonElement>('button')?.className ?? ''
+        button.dataset.chatVoiceSavedUserTts = 'true'
+        button.dataset.chatVoiceNativeTts = 'true'
+        button.title = 'Regenerate TTS audio'
+        button.setAttribute('aria-label', 'Regenerate TTS audio')
+        button.innerHTML = PLAY_TTS_ACTION_ICON
+        currentActions.appendChild(button)
+      }).catch(() => undefined).finally(() => {
+        pendingSavedUserControlChecks.delete(messageId)
+      })
+    }
+  }
+  const savedUserControlObserver = new hostWindow.MutationObserver(() => ensureSavedUserBubbleControls())
+  savedUserControlObserver.observe(hostDocument.body, { childList: true, subtree: true })
+  ensureSavedUserBubbleControls()
 
   const unsubscribeChatSwitched = ctx.events.on('CHAT_SWITCHED', (rawPayload: unknown) => {
     const switchedChatId = (rawPayload as { chatId?: string | null })?.chatId ?? null
@@ -2852,8 +2899,7 @@ export function setup(ctx: SpindleFrontendContext) {
     saveAudioLimitInput.removeEventListener('change', onSaveAudioLimitChanged)
     hostWindow.removeEventListener('contextmenu', onNativeContextMenu, true)
     hostWindow.removeEventListener('click', onNativeTtsClick, true)
-    persistentMessageAction?.destroy()
-    savedUserTtsButtonDecorator?.destroy()
+    savedUserControlObserver.disconnect()
     restoreNativePlaybackButtons()
     tab.destroy()
     removeStyle()

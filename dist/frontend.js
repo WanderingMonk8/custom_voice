@@ -2911,7 +2911,51 @@ function setup(ctx) {
     const target = event.target && typeof event.target.closest === "function" ? event.target : null;
     lastContextMessageId = target?.closest("[data-message-id]")?.dataset.messageId ?? null;
     hostWindow.requestAnimationFrame(updatePlaybackButtons);
+    if (lastContextMessageId) void ensureSavedUserContextAction(lastContextMessageId);
   };
+  function hasAnySavedAudio(message) {
+    const attachments = message.extra?.attachments;
+    return Array.isArray(attachments) && attachments.some((candidate) => !!candidate && typeof candidate === "object" && candidate.type === "audio");
+  }
+  function loadMessageForSavedAudioControl(chatId, messageId) {
+    if (ctx.messages.get) return ctx.messages.get(messageId);
+    return requestPlaybackMessage(chatId, messageId);
+  }
+  async function ensureSavedUserContextAction(messageId) {
+    const chatId = ctx.getActiveChat().chatId;
+    if (!chatId) return;
+    let message;
+    try {
+      const loaded = await loadMessageForSavedAudioControl(chatId, messageId);
+      if (!loaded) return;
+      message = loaded;
+    } catch {
+      return;
+    }
+    if (!message.is_user || !hasAnySavedAudio(message) || lastContextMessageId !== messageId) return;
+    await new Promise((resolve) => hostWindow.requestAnimationFrame(() => resolve()));
+    const existing = hostDocument.querySelector(`[data-chat-voice-context-tts="${CSS.escape(messageId)}"]`);
+    if (existing) return;
+    const menuItems = [...hostDocument.querySelectorAll('button, [role="menuitem"]')].filter((item) => item.getClientRects().length > 0 && item.closest("[data-message-id]") === null);
+    const template = menuItems.find((item) => item.textContent?.trim().toLowerCase() === "copy") ?? menuItems.find((item) => item.textContent?.trim().toLowerCase() === "edit");
+    if (!template?.parentElement) return;
+    const action = template.cloneNode(true);
+    action.removeAttribute("id");
+    action.dataset.chatVoiceContextTts = messageId;
+    action.setAttribute("aria-label", "Regenerate TTS audio");
+    const label = action.querySelector("span");
+    if (label) label.textContent = "Regenerate TTS audio";
+    else action.textContent = "Regenerate TTS audio";
+    const icon = action.querySelector("svg");
+    if (icon) icon.outerHTML = PLAY_TTS_ACTION_ICON;
+    action.addEventListener("click", (clickEvent) => {
+      clickEvent.preventDefault();
+      clickEvent.stopPropagation();
+      hostDocument.dispatchEvent(new hostWindow.KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+      void playMessage(messageId, true);
+    });
+    template.parentElement.appendChild(action);
+  }
   const onNativeTtsClick = (event) => {
     const target = event.target && typeof event.target.closest === "function" ? event.target : null;
     const button = target?.closest("button");
@@ -3037,40 +3081,39 @@ function setup(ctx) {
     renderState(payload.chat);
     pendingState?.resolve(payload.chat);
   });
-  const persistentMessageAction = ctx.registerMessageAction?.({
-    id: "chat-voice-playback",
-    label: "Play TTS",
-    onClick: (messageId) => void playMessage(messageId)
-  });
-  const savedUserTtsButtonDecorator = ctx.registerDomDecorator?.({
-    target: '[data-component="BubbleActions"]',
-    decorate: (element) => {
-      const actions = element;
-      const messageElement = actions.closest("[data-message-id]");
-      const messageId = messageElement?.dataset.messageId;
-      if (!messageId) return;
-      let disposed = false;
-      let fallbackButton = null;
-      const loadMessage = ctx.messages.get ? ctx.messages.get(messageId) : Promise.resolve(null);
-      void loadMessage.then((message) => {
-        if (disposed || !message?.is_user || !hasSavedAudioForCurrentSwipe(message)) return;
-        const hasTtsAction = [...actions.querySelectorAll("button")].some((button) => nativeTtsMessageId(button) === messageId);
-        if (hasTtsAction) return;
-        fallbackButton = hostDocument.createElement("button");
-        fallbackButton.type = "button";
-        fallbackButton.className = actions.querySelector("button")?.className ?? "";
-        fallbackButton.dataset.chatVoiceNativeTts = "true";
-        fallbackButton.title = "Regenerate TTS audio";
-        fallbackButton.setAttribute("aria-label", "Regenerate TTS audio");
-        fallbackButton.innerHTML = PLAY_TTS_ACTION_ICON;
-        actions.appendChild(fallbackButton);
-      }).catch((error) => console.warn("[Chat Voice] Could not inspect saved user-message audio.", error));
-      return () => {
-        disposed = true;
-        fallbackButton?.remove();
-      };
+  const pendingSavedUserControlChecks = /* @__PURE__ */ new Set();
+  const ensureSavedUserBubbleControls = () => {
+    const chatId = ctx.getActiveChat().chatId;
+    if (!chatId) return;
+    for (const messageElement of hostDocument.querySelectorAll("[data-message-id]")) {
+      const messageId = messageElement.dataset.messageId;
+      const actions = messageElement.querySelector('[data-component="BubbleActions"]');
+      if (!messageId || !actions || pendingSavedUserControlChecks.has(messageId)) continue;
+      if (actions.querySelector("[data-chat-voice-saved-user-tts]")) continue;
+      const hasTtsAction = [...actions.querySelectorAll("button")].some((button) => nativeTtsMessageId(button) === messageId);
+      if (hasTtsAction) continue;
+      pendingSavedUserControlChecks.add(messageId);
+      void loadMessageForSavedAudioControl(chatId, messageId).then((message) => {
+        if (!message?.is_user || !hasAnySavedAudio(message) || !messageElement.isConnected) return;
+        const currentActions = messageElement.querySelector('[data-component="BubbleActions"]');
+        if (!currentActions || currentActions.querySelector("[data-chat-voice-saved-user-tts]")) return;
+        const button = hostDocument.createElement("button");
+        button.type = "button";
+        button.className = currentActions.querySelector("button")?.className ?? "";
+        button.dataset.chatVoiceSavedUserTts = "true";
+        button.dataset.chatVoiceNativeTts = "true";
+        button.title = "Regenerate TTS audio";
+        button.setAttribute("aria-label", "Regenerate TTS audio");
+        button.innerHTML = PLAY_TTS_ACTION_ICON;
+        currentActions.appendChild(button);
+      }).catch(() => void 0).finally(() => {
+        pendingSavedUserControlChecks.delete(messageId);
+      });
     }
-  });
+  };
+  const savedUserControlObserver = new hostWindow.MutationObserver(() => ensureSavedUserBubbleControls());
+  savedUserControlObserver.observe(hostDocument.body, { childList: true, subtree: true });
+  ensureSavedUserBubbleControls();
   const unsubscribeChatSwitched = ctx.events.on("CHAT_SWITCHED", (rawPayload) => {
     const switchedChatId = rawPayload?.chatId ?? null;
     hostWindow.requestAnimationFrame(() => {
@@ -3159,8 +3202,7 @@ function setup(ctx) {
     saveAudioLimitInput.removeEventListener("change", onSaveAudioLimitChanged);
     hostWindow.removeEventListener("contextmenu", onNativeContextMenu, true);
     hostWindow.removeEventListener("click", onNativeTtsClick, true);
-    persistentMessageAction?.destroy();
-    savedUserTtsButtonDecorator?.destroy();
+    savedUserControlObserver.disconnect();
     restoreNativePlaybackButtons();
     tab.destroy();
     removeStyle();
