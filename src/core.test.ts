@@ -21,6 +21,7 @@ import {
   parseRosterVoiceSegments,
   parseRosterVoiceSegmentsWithAssignments,
   parseSkippedTrackerTags,
+  preferredCardSpeakerId,
   previousAssistantSpeakerFallback,
   reducedRequestWindowLimit,
   readConfig,
@@ -1227,6 +1228,53 @@ test('inherits an identity-free single speaker from the previous assistant messa
       .filter(segment => segment.speakerId !== null)
       .map(segment => segment.speakerId),
     ['mara', 'mara', 'mara'],
+  )
+})
+
+test('prefers the sole character card for an unattributed assistant message', () => {
+  const speakers = [
+    { id: 'card-zuri', name: 'Zuri Vale / Zuri' },
+    { id: 'npc-grace', name: 'Grace' },
+    { id: USER_SPEAKER_ID, name: 'Ken' },
+  ]
+  const defaultSpeakerId = preferredCardSpeakerId(
+    { name: 'Assistant' },
+    speakers,
+    ['card-zuri'],
+  )
+
+  assert.equal(defaultSpeakerId, 'card-zuri')
+  assert.deepEqual(
+    parseRosterVoiceSegments('"No names here."\n\n"Still the same speaker."', defaultSpeakerId, speakers)
+      .filter(segment => segment.speakerId !== null),
+    [
+      { text: 'No names here.', speakerId: 'card-zuri' },
+      { text: 'Still the same speaker.', speakerId: 'card-zuri' },
+    ],
+  )
+})
+
+test('keeps explicit and named group-card identities ahead of a card fallback', () => {
+  const speakers = [
+    { id: 'card-zuri', name: 'Zuri Vale / Zuri' },
+    { id: 'card-grace', name: 'Grace Hopper / Grace' },
+  ]
+
+  assert.equal(
+    preferredCardSpeakerId(
+      { name: 'Unknown', extra: { character_id: 'card-grace' } },
+      speakers,
+      ['card-zuri', 'card-grace'],
+    ),
+    'card-grace',
+  )
+  assert.equal(
+    preferredCardSpeakerId({ name: 'Zuri' }, speakers, ['card-zuri', 'card-grace']),
+    'card-zuri',
+  )
+  assert.equal(
+    preferredCardSpeakerId({ name: 'Unknown' }, speakers, ['card-zuri', 'card-grace']),
+    null,
   )
 })
 

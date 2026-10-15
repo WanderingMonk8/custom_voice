@@ -609,6 +609,31 @@ export function speakerAliases(value: string): string[] {
   return aliases
 }
 
+export function preferredCardSpeakerId(
+  message: { name?: string; extra?: Record<string, unknown> },
+  speakers: CharacterLike[],
+  cardCharacterIds: readonly string[],
+): string | null {
+  const speakerIds = new Set(speakers.map(speaker => speaker.id))
+  const explicitId = typeof message.extra?.character_id === 'string'
+    ? message.extra.character_id
+    : ''
+  if (explicitId && speakerIds.has(explicitId)) return explicitId
+
+  const messageName = normalizeSpeakerName(message.name ?? '').toLowerCase()
+  const namedSpeaker = messageName
+    ? speakers.find(speaker => (
+        !speaker.id.startsWith('npc:')
+        && speakerAliases(speaker.name).some(alias => alias.toLowerCase() === messageName)
+      ))
+    : undefined
+  if (namedSpeaker) return namedSpeaker.id
+
+  const availableCardIds = [...new Set(cardCharacterIds)]
+    .filter(characterId => speakerIds.has(characterId))
+  return availableCardIds.length === 1 ? availableCardIds[0] : null
+}
+
 const SPEAKER_TITLES = new Set([
   'mr', 'mrs', 'ms', 'miss', 'mx', 'dr', 'prof', 'sir', 'lady', 'lord',
   'capt', 'captain', 'sgt', 'sergeant',

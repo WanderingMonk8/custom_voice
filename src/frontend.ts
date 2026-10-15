@@ -12,6 +12,7 @@ import {
   npcSpeakerId,
   normalizeSpeakerName,
   parseRosterVoiceSegments,
+  preferredCardSpeakerId,
   readSavedAudioHistory,
   reducedRequestWindowLimit,
   rollingRequestWindowDelay,
@@ -174,6 +175,7 @@ interface ActiveChatState {
   userVoice: string
   useGlobalNarratorVoice: boolean
   useGlobalUserVoice: boolean
+  cardCharacterIds: string[]
   characters: DetectedCharacterState[]
 }
 
@@ -1798,14 +1800,13 @@ export function setup(ctx: SpindleFrontendContext) {
 
     try {
       if (playback.controller.signal.aborted) throw new DOMException('Playback stopped.', 'AbortError')
-      const explicitId = typeof message.extra?.character_id === 'string' ? message.extra.character_id : ''
-      const messageName = normalizeSpeakerName(message.name).toLowerCase()
       const defaultSpeakerId = message.is_user
         ? USER_SPEAKER_ID
-        : explicitId || playbackChat.characters.find((character) => (
-            !character.id.startsWith('npc:')
-            && speakerAliases(character.name).some(alias => alias.toLowerCase() === messageName)
-          ))?.id || null
+        : preferredCardSpeakerId(
+            message,
+            playbackChat.characters,
+            playbackChat.cardCharacterIds ?? [],
+          )
       const playbackSpeakers = message.is_user
         ? [
             ...playbackChat.characters,
