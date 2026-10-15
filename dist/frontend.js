@@ -2195,17 +2195,20 @@ function setup(ctx) {
     updatePlaybackButtons();
     try {
       if (playback.controller.signal.aborted) throw new DOMException("Playback stopped.", "AbortError");
-      if (message.is_user) throw new Error("Custom voice playback is only available for character messages.");
       const explicitId = typeof message.extra?.character_id === "string" ? message.extra.character_id : "";
       const messageName = normalizeSpeakerName(message.name).toLowerCase();
-      const defaultSpeakerId = explicitId || playbackChat.characters.find((character) => !character.id.startsWith("npc:") && speakerAliases(character.name).some((alias) => alias.toLowerCase() === messageName))?.id || null;
+      const defaultSpeakerId = message.is_user ? USER_SPEAKER_ID : explicitId || playbackChat.characters.find((character) => !character.id.startsWith("npc:") && speakerAliases(character.name).some((alias) => alias.toLowerCase() === messageName))?.id || null;
+      const playbackSpeakers = message.is_user ? [
+        ...playbackChat.characters,
+        { id: USER_SPEAKER_ID, name: normalizeSpeakerName(message.name) || "User" }
+      ] : playbackChat.characters;
       const aliases = new Map(
         playbackChat.characters.flatMap((character) => speakerAliases(character.name).map((alias) => [npcSpeakerId(alias), character.id]))
       );
       let segments = parseRosterVoiceSegments(
         message.content,
         defaultSpeakerId,
-        playbackChat.characters,
+        playbackSpeakers,
         preferences.skippedTrackerTags
       );
       if (preferences.speakerParsingMode !== "off") setStatus("Reviewing dialogue speakers\u2026");
@@ -2218,7 +2221,7 @@ function setup(ctx) {
       }
       const plan = mergeVoicePlan(segments.map((segment) => {
         const speakerId = segment.speakerId ? aliases.get(segment.speakerId) ?? segment.speakerId : null;
-        const voice = speakerId === USER_SPEAKER_ID ? config.userVoice : speakerId ? config.characterVoices[speakerId] || "" : config.narratorVoice;
+        const voice = speakerId === USER_SPEAKER_ID ? config.userVoice : speakerId ? config.characterVoices[speakerId] || "" : message.is_user ? config.userVoice : config.narratorVoice;
         return { text: segment.text, voice };
       }));
       if (plan.length === 0) throw new Error("This message has no playable narration or dialogue.");

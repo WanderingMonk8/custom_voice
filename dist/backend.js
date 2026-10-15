@@ -1225,7 +1225,7 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
     if (!chat) throw new Error("The chat is no longer available.");
     const messages = await spindle.chat.getMessages(payload.chatId);
     const message = messages.find((item) => item.id === payload.messageId);
-    if (!message || message.is_user) throw new Error("The character message is no longer available.");
+    if (!message) throw new Error("The message is no longer available.");
     const cards = await loadCharacters(chat, userId);
     const config = readConfig(chat.metadata ?? {}, cards.map((card) => card.id));
     const userAliases = [];
@@ -1243,9 +1243,9 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
     }
     const speakers = [
       ...config.detectedCharacters,
-      ...userAliases.length > 0 ? [{ id: USER_SPEAKER_ID, name: userAliases.join(" / ") }] : []
+      ...messages.some((item) => item.is_user) ? [{ id: USER_SPEAKER_ID, name: userAliases.join(" / ") || "User" }] : []
     ];
-    const defaultSpeakerId = defaultMessageSpeakerId(message, speakers);
+    const defaultSpeakerId = message.is_user ? USER_SPEAKER_ID : defaultMessageSpeakerId(message, speakers);
     const skippedTrackerTags = payload.skippedTrackerTags.slice(0, 4e3);
     const messageIndex = messages.findIndex((item) => item.id === payload.messageId);
     let previousAssistantMessage = null;
@@ -1254,7 +1254,7 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
       previousAssistantMessage = messages[index];
       break;
     }
-    const historicalSpeakerId = previousAssistantMessage ? previousAssistantSpeakerFallback(
+    const historicalSpeakerId = !message.is_user && previousAssistantMessage ? previousAssistantSpeakerFallback(
       message.content ?? "",
       previousAssistantMessage.content ?? "",
       defaultMessageSpeakerId(previousAssistantMessage, speakers),

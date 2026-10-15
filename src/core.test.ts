@@ -303,6 +303,17 @@ test('routes explicitly attributed user-persona dialogue to the dedicated speake
   )
 })
 
+test('uses the user role as the default speaker for unattributed user dialogue', () => {
+  assert.deepEqual(
+    parseRosterVoiceSegments(
+      '"I can handle it."',
+      USER_SPEAKER_ID,
+      [{ id: USER_SPEAKER_ID, name: 'Ken' }],
+    ).filter(segment => segment.speakerId !== null),
+    [{ text: 'I can handle it.', speakerId: USER_SPEAKER_ID }],
+  )
+})
+
 test('writes native overrides while preserving unrelated character voices', () => {
   const config: ChatVoiceConfig = {
     version: 7,
