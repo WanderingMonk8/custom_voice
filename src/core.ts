@@ -1,4 +1,5 @@
 export const CONFIG_KEY = 'chat_voice'
+export const USER_SPEAKER_ID = '__chat_voice_user__'
 export const DEFAULT_MESSAGE_LIMIT = 20
 export const MIN_MESSAGE_LIMIT = 1
 export const MAX_MESSAGE_LIMIT = 500
@@ -24,10 +25,13 @@ export interface VoiceOverrides {
 }
 
 export interface ChatVoiceConfig {
-  version: 5
+  version: 7
   messageLimit: number
   connectionId: string
   narratorVoice: string
+  userVoice: string
+  useGlobalNarratorVoice: boolean
+  useGlobalUserVoice: boolean
   characterVoices: Record<string, string>
   detectedCharacters: Array<{ id: string; name: string; messageCount: number }>
   managedCharacterIds: string[]
@@ -432,15 +436,27 @@ export function readConfig(
     ? Object.keys(storedVoices)
     : managedCharacterIds
 
+  const narratorVoice = typeof raw.narratorVoice === 'string'
+    ? raw.narratorVoice.trim().slice(0, 512)
+    : overrides.narrator?.voice ?? ''
+  const userVoice = typeof raw.userVoice === 'string'
+    ? raw.userVoice.trim().slice(0, 512)
+    : ''
+
   return {
-    version: 5,
+    version: 7,
     messageLimit: clampMessageLimit(raw.messageLimit),
     connectionId: typeof raw.connectionId === 'string'
       ? raw.connectionId.trim().slice(0, 128)
       : inferredConnection,
-    narratorVoice: typeof raw.narratorVoice === 'string'
-      ? raw.narratorVoice.trim().slice(0, 512)
-      : overrides.narrator?.voice ?? '',
+    narratorVoice,
+    userVoice,
+    useGlobalNarratorVoice: typeof raw.useGlobalNarratorVoice === 'boolean'
+      ? raw.useGlobalNarratorVoice
+      : !narratorVoice,
+    useGlobalUserVoice: typeof raw.useGlobalUserVoice === 'boolean'
+      ? raw.useGlobalUserVoice
+      : !userVoice,
     characterVoices,
     detectedCharacters: readDetectedCharacters(raw.detectedCharacters, legacyDetectedIds),
     managedCharacterIds: [...new Set(managedCharacterIds)],

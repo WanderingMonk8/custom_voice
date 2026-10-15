@@ -1,5 +1,6 @@
 // src/core.ts
 var CONFIG_KEY = "chat_voice";
+var USER_SPEAKER_ID = "__chat_voice_user__";
 var DEFAULT_MESSAGE_LIMIT = 20;
 var MIN_MESSAGE_LIMIT = 1;
 var MAX_MESSAGE_LIMIT = 500;
@@ -95,11 +96,16 @@ function readConfig(metadata, candidateCharacterIds) {
   const managedCharacterIds = Array.isArray(raw.managedCharacterIds) ? raw.managedCharacterIds.filter((id) => typeof id === "string" && !!id) : Object.keys(storedVoices);
   const inferredConnection = overrides.narrator?.connectionId ?? candidateCharacterIds.map((id) => overrides.characters?.[id]?.connectionId).find((id) => !!id) ?? "";
   const legacyDetectedIds = Object.keys(storedVoices).length > 0 ? Object.keys(storedVoices) : managedCharacterIds;
+  const narratorVoice = typeof raw.narratorVoice === "string" ? raw.narratorVoice.trim().slice(0, 512) : overrides.narrator?.voice ?? "";
+  const userVoice = typeof raw.userVoice === "string" ? raw.userVoice.trim().slice(0, 512) : "";
   return {
-    version: 5,
+    version: 7,
     messageLimit: clampMessageLimit(raw.messageLimit),
     connectionId: typeof raw.connectionId === "string" ? raw.connectionId.trim().slice(0, 128) : inferredConnection,
-    narratorVoice: typeof raw.narratorVoice === "string" ? raw.narratorVoice.trim().slice(0, 512) : overrides.narrator?.voice ?? "",
+    narratorVoice,
+    userVoice,
+    useGlobalNarratorVoice: typeof raw.useGlobalNarratorVoice === "boolean" ? raw.useGlobalNarratorVoice : !narratorVoice,
+    useGlobalUserVoice: typeof raw.useGlobalUserVoice === "boolean" ? raw.useGlobalUserVoice : !userVoice,
     characterVoices,
     detectedCharacters: readDetectedCharacters(raw.detectedCharacters, legacyDetectedIds),
     managedCharacterIds: [...new Set(managedCharacterIds)],
@@ -1078,6 +1084,9 @@ async function buildState(chat, userId) {
     messageLimit: config.messageLimit,
     connectionId: config.connectionId,
     narratorVoice: config.narratorVoice,
+    userVoice: config.userVoice,
+    useGlobalNarratorVoice: config.useGlobalNarratorVoice,
+    useGlobalUserVoice: config.useGlobalUserVoice,
     characters: detected.map((character) => ({
       ...character,
       voice: config.characterVoices[character.id] ?? ""
@@ -1130,10 +1139,13 @@ function sanitizeSaveConfig(previous, input) {
     }
   }
   return {
-    version: 5,
+    version: 7,
     messageLimit: clampMessageLimit(input.messageLimit),
     connectionId: typeof input.connectionId === "string" ? input.connectionId.trim().slice(0, 128) : "",
     narratorVoice: typeof input.narratorVoice === "string" ? input.narratorVoice.trim().slice(0, 512) : "",
+    userVoice: typeof input.userVoice === "string" ? input.userVoice.trim().slice(0, 512) : "",
+    useGlobalNarratorVoice: input.useGlobalNarratorVoice === true,
+    useGlobalUserVoice: input.useGlobalUserVoice === true,
     characterVoices,
     detectedCharacters,
     managedCharacterIds: previous.managedCharacterIds,
@@ -1216,7 +1228,23 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
     if (!message || message.is_user) throw new Error("The character message is no longer available.");
     const cards = await loadCharacters(chat, userId);
     const config = readConfig(chat.metadata ?? {}, cards.map((card) => card.id));
-    const speakers = config.detectedCharacters;
+    const userAliases = [];
+    const seenUserAliases = /* @__PURE__ */ new Set();
+    for (const item of messages) {
+      if (!item.is_user) continue;
+      const name = normalizeSpeakerName(item.name);
+      if (!name) continue;
+      for (const alias of [name, name.split(/\s+/u)[0] ?? ""]) {
+        const key = alias.toLowerCase();
+        if (!alias || seenUserAliases.has(key)) continue;
+        seenUserAliases.add(key);
+        userAliases.push(alias);
+      }
+    }
+    const speakers = [
+      ...config.detectedCharacters,
+      ...userAliases.length > 0 ? [{ id: USER_SPEAKER_ID, name: userAliases.join(" / ") }] : []
+    ];
     const defaultSpeakerId = defaultMessageSpeakerId(message, speakers);
     const skippedTrackerTags = payload.skippedTrackerTags.slice(0, 4e3);
     const messageIndex = messages.findIndex((item) => item.id === payload.messageId);
@@ -1260,7 +1288,7 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
     const connectionId = payload.connectionId.trim().slice(0, 128);
     const model = payload.model.trim().slice(0, 256);
     const cacheHash = hashMessageContent(JSON.stringify({
-      parser: 10,
+      parser: 11,
       mode: payload.mode,
       content: message.content ?? "",
       speakers: speakers.map((speaker) => ({ id: speaker.id, name: speaker.name })),
@@ -1415,7 +1443,7 @@ function queueScan(payload, userId, frontendSessionId) {
     }
     const nextConfig = {
       ...config,
-      version: 5,
+      version: 7,
       messageLimit,
       characterVoices,
       detectedCharacters: [...detected.values()],

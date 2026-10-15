@@ -1,4 +1,5 @@
 // src/core.ts
+var USER_SPEAKER_ID = "__chat_voice_user__";
 var DEFAULT_SAVED_AUDIO_LIMIT = 50;
 var MAX_SAVED_AUDIO_LIMIT = 1e4;
 function rollingRequestWindowDelay(recentStarts, now, requestLimit, windowMs = 6e4) {
@@ -927,7 +928,9 @@ async function loadPlaybackPreferences() {
     llmModel: "",
     playbackBufferSegments: DEFAULT_PLAYBACK_BUFFER_SEGMENTS,
     concurrentGenerations: DEFAULT_CONCURRENT_GENERATIONS,
-    rateLimitWaitSeconds: DEFAULT_RATE_LIMIT_WAIT_SECONDS
+    rateLimitWaitSeconds: DEFAULT_RATE_LIMIT_WAIT_SECONDS,
+    defaultNarratorVoice: "",
+    defaultUserVoice: ""
   };
   const row = await response.json();
   const speed = typeof row.value?.ttsSpeed === "number" ? row.value.ttsSpeed : 1;
@@ -957,7 +960,9 @@ async function loadPlaybackPreferences() {
       row.value?.chatVoiceRateLimitWaitSeconds,
       DEFAULT_RATE_LIMIT_WAIT_SECONDS,
       MAX_RATE_LIMIT_WAIT_SECONDS
-    )
+    ),
+    defaultNarratorVoice: typeof row.value?.chatVoiceDefaultNarratorVoice === "string" ? row.value.chatVoiceDefaultNarratorVoice.trim().slice(0, 512) : "",
+    defaultUserVoice: typeof row.value?.chatVoiceDefaultUserVoice === "string" ? row.value.chatVoiceDefaultUserVoice.trim().slice(0, 512) : ""
   };
 }
 var voiceSettingsWriteQueue = Promise.resolve();
@@ -1026,6 +1031,14 @@ function saveAdvancedPlaybackPreferences(bufferSegments, concurrentGenerations, 
       MAX_RATE_LIMIT_WAIT_SECONDS
     )
   }));
+}
+function saveDefaultRoleVoice(role, voice) {
+  const key = role === "narrator" ? "chatVoiceDefaultNarratorVoice" : "chatVoiceDefaultUserVoice";
+  return updateVoiceSettings((current) => {
+    const next = { ...current };
+    next[key] = voice.trim().slice(0, 512);
+    return next;
+  });
 }
 async function deleteSavedAudioRecord(record) {
   const response = await fetch(
@@ -1324,6 +1337,13 @@ function setup(ctx) {
     .chat-voice-scan-button:hover:not(:disabled) { filter:brightness(1.08); }
     .chat-voice-scan-button:disabled { cursor:not-allowed; opacity:.5; }
     .chat-voice-label { color:var(--lumiverse-text); font-size:12px; font-weight:600; }
+    .chat-voice-role-heading { display:flex; align-items:center; justify-content:space-between; gap:10px; }
+    .chat-voice-role-default {
+      display:flex; align-items:center; gap:5px; color:var(--lumiverse-text-muted);
+      font-size:11px; font-weight:400; cursor:pointer;
+    }
+    .chat-voice-role-default input { margin:0; accent-color:var(--lumiverse-accent, #7c6df2); }
+    .chat-voice-role-default:has(input:disabled) { cursor:not-allowed; opacity:.55; }
     .chat-voice-toggle {
       display:flex; align-items:flex-start; gap:9px; color:var(--lumiverse-text); font-size:12px;
       cursor:pointer;
@@ -1411,7 +1431,7 @@ function setup(ctx) {
     label.textContent = labelText;
     const slot = document.createElement("div");
     field.append(label, slot);
-    return { field, slot };
+    return { field, label, slot };
   }
   const connectionField = createField("TTS connection");
   const saveAudioField = createField("Audio storage");
@@ -1460,9 +1480,36 @@ function setup(ctx) {
   const llmConnectionField = createField("Speaker-review LLM connection");
   const llmModelField = createField("Custom LLM model (optional)");
   const narratorField = createField("Narrator voice");
+  const userVoiceField = createField("User voice");
+  function addDefaultRoleToggle(field, titleText, ariaLabel) {
+    field.label.textContent = "";
+    field.label.classList.add("chat-voice-role-heading");
+    const title = document.createElement("span");
+    title.textContent = titleText;
+    const toggle = document.createElement("label");
+    toggle.className = "chat-voice-role-default";
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.setAttribute("aria-label", ariaLabel);
+    const copy = document.createElement("span");
+    copy.textContent = "Use global";
+    toggle.append(checkbox, copy);
+    field.label.append(title, toggle);
+    return checkbox;
+  }
+  const narratorDefaultToggle = addDefaultRoleToggle(
+    narratorField,
+    "Narrator voice",
+    "Use the global narrator voice for this chat"
+  );
+  const userDefaultToggle = addDefaultRoleToggle(
+    userVoiceField,
+    "User voice",
+    "Use the global user voice for this chat"
+  );
   const routingHint = document.createElement("div");
   routingHint.className = "chat-voice-hint";
-  routingHint.textContent = "Scan reads the character card, not chat history. During playback, quoted dialogue is matched to the saved cast using names and dialogue tags; everything outside quotes uses the narrator voice.";
+  routingHint.textContent = "Scan reads the character card, not chat history. During playback, quoted dialogue is matched to the user persona or saved cast using names and dialogue tags; everything outside quotes uses the narrator voice.";
   const addNpcField = createField("Add NPC manually");
   addNpcField.slot.className = "chat-voice-add-row";
   const addNpcInputSlot = document.createElement("div");
@@ -1499,6 +1546,7 @@ function setup(ctx) {
     llmConnectionField.field,
     llmModelField.field,
     narratorField.field,
+    userVoiceField.field,
     routingHint,
     addNpcField.field,
     characterTitle,
@@ -1523,6 +1571,16 @@ function setup(ctx) {
   let activeChat = null;
   let connections = [];
   let lumiverseConnectionId = "";
+  let defaultNarratorVoice = "";
+  let defaultUserVoice = "";
+  let localNarratorVoice = "";
+  let localUserVoice = "";
+  let useGlobalNarratorVoice = true;
+  let useGlobalUserVoice = true;
+  let narratorGlobalSaveTimer = null;
+  let userGlobalSaveTimer = null;
+  let savingNarratorGlobalVoice = false;
+  let savingUserGlobalVoice = false;
   let saveGeneratedAudio = false;
   let savedAudioLimit = DEFAULT_SAVED_AUDIO_LIMIT;
   let savingAudioPreference = false;
@@ -1643,7 +1701,32 @@ function setup(ctx) {
     placeholder: "Enter the narrator voice name or ID",
     ariaLabel: "Narrator voice",
     disabled: true,
-    onChange: () => markChanged()
+    onChange: () => {
+      if (applyingState) return;
+      if (useGlobalNarratorVoice) {
+        defaultNarratorVoice = narratorInput.getValue();
+        scheduleGlobalRoleVoiceSave("narrator");
+      } else {
+        localNarratorVoice = narratorInput.getValue();
+        markChanged();
+      }
+    }
+  });
+  const userVoiceInput = ctx.components.mountTextInput(userVoiceField.slot, {
+    value: "",
+    placeholder: "Enter the user voice name or ID",
+    ariaLabel: "User voice",
+    disabled: true,
+    onChange: () => {
+      if (applyingState) return;
+      if (useGlobalUserVoice) {
+        defaultUserVoice = userVoiceInput.getValue();
+        scheduleGlobalRoleVoiceSave("user");
+      } else {
+        localUserVoice = userVoiceInput.getValue();
+        markChanged();
+      }
+    }
   });
   const skippedTrackerTagsInput = ctx.components.mountTextArea(skippedTagsField.slot, {
     value: "",
@@ -1725,11 +1808,14 @@ function setup(ctx) {
     disabled: true,
     onChange: () => void 0
   });
-  function collectConfig() {
+  function collectConfig(forSave = false) {
     return {
       messageLimit: activeChat?.messageLimit ?? 20,
       connectionId: connectionPicker.getValue(),
-      narratorVoice: narratorInput.getValue(),
+      narratorVoice: forSave ? localNarratorVoice : narratorInput.getValue(),
+      userVoice: forSave ? localUserVoice : userVoiceInput.getValue(),
+      useGlobalNarratorVoice,
+      useGlobalUserVoice,
       characterVoices: Object.fromEntries(
         [...characterInputs.entries()].map(([id, input]) => [id, input.getValue()])
       ),
@@ -1748,7 +1834,7 @@ function setup(ctx) {
       type: "chat_voice_save",
       chatId: activeChat.id,
       clientRevision,
-      config: collectConfig()
+      config: collectConfig(true)
     });
   }
   function markChanged(delay = 350) {
@@ -1759,6 +1845,49 @@ function setup(ctx) {
     if (saveTimer) clearTimeout(saveTimer);
     saveTimer = setTimeout(flushSave, delay);
   }
+  function updateRoleDefaultControls() {
+    narratorDefaultToggle.checked = useGlobalNarratorVoice;
+    userDefaultToggle.checked = useGlobalUserVoice;
+    narratorDefaultToggle.disabled = !activeChat;
+    userDefaultToggle.disabled = !activeChat;
+  }
+  function scheduleGlobalRoleVoiceSave(role) {
+    const currentTimer = role === "narrator" ? narratorGlobalSaveTimer : userGlobalSaveTimer;
+    if (currentTimer) clearTimeout(currentTimer);
+    setStatus(`Saving global ${role} voice\u2026`);
+    const timer = setTimeout(() => {
+      if (role === "narrator") narratorGlobalSaveTimer = null;
+      else userGlobalSaveTimer = null;
+      const voice = role === "narrator" ? defaultNarratorVoice : defaultUserVoice;
+      if (role === "narrator") savingNarratorGlobalVoice = true;
+      else savingUserGlobalVoice = true;
+      void saveDefaultRoleVoice(role, voice).then(
+        () => setStatus(`Global ${role} voice saved.`, "saved"),
+        (error) => setStatus(error instanceof Error ? error.message : `Could not save the global ${role} voice.`, "error")
+      ).finally(() => {
+        if (role === "narrator") savingNarratorGlobalVoice = false;
+        else savingUserGlobalVoice = false;
+      });
+    }, 350);
+    if (role === "narrator") narratorGlobalSaveTimer = timer;
+    else userGlobalSaveTimer = timer;
+  }
+  function changeDefaultRoleVoice(role, checked) {
+    const input = role === "narrator" ? narratorInput : userVoiceInput;
+    if (role === "narrator") useGlobalNarratorVoice = checked;
+    else useGlobalUserVoice = checked;
+    input.update({ value: role === "narrator" ? checked ? defaultNarratorVoice : localNarratorVoice : checked ? defaultUserVoice : localUserVoice });
+    updateRoleDefaultControls();
+    markChanged();
+  }
+  const onNarratorDefaultChange = () => {
+    changeDefaultRoleVoice("narrator", narratorDefaultToggle.checked);
+  };
+  const onUserDefaultChange = () => {
+    changeDefaultRoleVoice("user", userDefaultToggle.checked);
+  };
+  narratorDefaultToggle.addEventListener("change", onNarratorDefaultChange);
+  userDefaultToggle.addEventListener("change", onUserDefaultChange);
   function updatePlaybackButtons() {
     for (const button of hostDocument.querySelectorAll("button")) {
       const messageId = nativeTtsMessageId(button);
@@ -2089,7 +2218,7 @@ function setup(ctx) {
       }
       const plan = mergeVoicePlan(segments.map((segment) => {
         const speakerId = segment.speakerId ? aliases.get(segment.speakerId) ?? segment.speakerId : null;
-        const voice = speakerId ? config.characterVoices[speakerId] || "" : config.narratorVoice;
+        const voice = speakerId === USER_SPEAKER_ID ? config.userVoice : speakerId ? config.characterVoices[speakerId] || "" : config.narratorVoice;
         return { text: segment.text, voice };
       }));
       if (plan.length === 0) throw new Error("This message has no playable narration or dialogue.");
@@ -2495,10 +2624,22 @@ function setup(ctx) {
       disabled: !next || connections.length === 0
     });
     scanButton.disabled = !next || scanning;
-    narratorInput.update({ value: next?.narratorVoice ?? "", disabled: !next });
+    localNarratorVoice = next?.narratorVoice ?? "";
+    localUserVoice = next?.userVoice ?? "";
+    useGlobalNarratorVoice = next?.useGlobalNarratorVoice ?? true;
+    useGlobalUserVoice = next?.useGlobalUserVoice ?? true;
+    narratorInput.update({
+      value: next ? useGlobalNarratorVoice ? defaultNarratorVoice : localNarratorVoice : "",
+      disabled: !next
+    });
+    userVoiceInput.update({
+      value: next ? useGlobalUserVoice ? defaultUserVoice : localUserVoice : "",
+      disabled: !next
+    });
     addNpcInput.update({ value: "", disabled: !next });
     addNpcButton.disabled = !next;
     renderCharacters(next?.characters ?? []);
+    updateRoleDefaultControls();
     applyingState = false;
     if (!next) setStatus("Open a chat to edit its voices.");
     else if (connections.length === 0) setStatus("Create a TTS connection in Lumiverse first.");
@@ -2516,6 +2657,23 @@ function setup(ctx) {
       ]);
       connections = loadedConnections;
       llmConnections = loadedLlmConnections;
+      if (!narratorGlobalSaveTimer && !savingNarratorGlobalVoice) {
+        defaultNarratorVoice = preferences.defaultNarratorVoice;
+      }
+      if (!userGlobalSaveTimer && !savingUserGlobalVoice) {
+        defaultUserVoice = preferences.defaultUserVoice;
+      }
+      if (activeChat) {
+        narratorInput.update({
+          value: useGlobalNarratorVoice ? defaultNarratorVoice : localNarratorVoice,
+          disabled: false
+        });
+        userVoiceInput.update({
+          value: useGlobalUserVoice ? defaultUserVoice : localUserVoice,
+          disabled: false
+        });
+      }
+      updateRoleDefaultControls();
       if (!savingAudioPreference) {
         saveGeneratedAudio = preferences.saveGeneratedAudio;
         saveAudioToggle.checked = saveGeneratedAudio;
@@ -2921,6 +3079,17 @@ function setup(ctx) {
     pendingStateRequests.clear();
     connectionPicker.destroy();
     narratorInput.destroy();
+    userVoiceInput.destroy();
+    narratorDefaultToggle.removeEventListener("change", onNarratorDefaultChange);
+    userDefaultToggle.removeEventListener("change", onUserDefaultChange);
+    if (narratorGlobalSaveTimer) {
+      clearTimeout(narratorGlobalSaveTimer);
+      void saveDefaultRoleVoice("narrator", defaultNarratorVoice);
+    }
+    if (userGlobalSaveTimer) {
+      clearTimeout(userGlobalSaveTimer);
+      void saveDefaultRoleVoice("user", defaultUserVoice);
+    }
     if (skippedTrackerTagsSaveTimer) {
       clearTimeout(skippedTrackerTagsSaveTimer);
       void saveSkippedTrackerTagsPreference(skippedTrackerTags);
