@@ -29,6 +29,7 @@ import {
   speakerReviewQuoteIndexes,
   rollingRequestWindowDelay,
   stripSkippedTrackerBlocks,
+  USER_SPEAKER_ID,
   upsertSavedAudioRecord,
   type ChatVoiceConfig,
 } from './core'
@@ -265,15 +266,75 @@ test('migrates existing native voice overrides into extension config', () => {
   }, ['alice'])
   assert.equal(config.connectionId, 'tts')
   assert.equal(config.narratorVoice, 'narrator')
+  assert.equal(config.userVoice, '')
+  assert.equal(config.useGlobalNarratorVoice, false)
+  assert.equal(config.useGlobalUserVoice, true)
   assert.equal(config.characterVoices.alice, 'alice-voice')
+})
+
+test('persists the dedicated user voice in extension metadata', () => {
+  const metadata = applyConfigToMetadata({}, {
+    version: 7,
+    messageLimit: 20,
+    connectionId: 'shared',
+    narratorVoice: 'narrator',
+    userVoice: 'persona-voice',
+    useGlobalNarratorVoice: false,
+    useGlobalUserVoice: false,
+    characterVoices: {},
+    detectedCharacters: [],
+    managedCharacterIds: [],
+    parsedMessages: {},
+  })
+  const restored = readConfig(metadata, [])
+  assert.equal(restored.userVoice, 'persona-voice')
+  assert.equal(restored.useGlobalNarratorVoice, false)
+  assert.equal(restored.useGlobalUserVoice, false)
+})
+
+test('routes explicitly attributed user-persona dialogue to the dedicated speaker role', () => {
+  assert.deepEqual(
+    parseRosterVoiceSegments(
+      'Ken says, "I can handle it."',
+      null,
+      [{ id: USER_SPEAKER_ID, name: 'Ken / Kenneth' }],
+    ).filter(segment => segment.speakerId !== null),
+    [{ text: 'I can handle it.', speakerId: USER_SPEAKER_ID }],
+  )
+})
+
+test('uses the user role as the default speaker for unattributed user dialogue', () => {
+  assert.deepEqual(
+    parseRosterVoiceSegments(
+      '"I can handle it."',
+      USER_SPEAKER_ID,
+      [{ id: USER_SPEAKER_ID, name: 'Ken' }],
+    ).filter(segment => segment.speakerId !== null),
+    [{ text: 'I can handle it.', speakerId: USER_SPEAKER_ID }],
+  )
+})
+
+test('keeps user-message narration separate from defaulted user dialogue', () => {
+  const segments = parseRosterVoiceSegments(
+    'The door opens.\n\n"I can handle it."',
+    USER_SPEAKER_ID,
+    [{ id: USER_SPEAKER_ID, name: 'Ken' }],
+  )
+  assert.ok(segments.some(segment => segment.speakerId === null && segment.text.includes('The door opens.')))
+  assert.ok(segments.some(segment => (
+    segment.speakerId === USER_SPEAKER_ID && segment.text === 'I can handle it.'
+  )))
 })
 
 test('writes native overrides while preserving unrelated character voices', () => {
   const config: ChatVoiceConfig = {
-    version: 5,
+    version: 7,
     messageLimit: 20,
     connectionId: 'shared',
     narratorVoice: 'narrator',
+    userVoice: '',
+    useGlobalNarratorVoice: false,
+    useGlobalUserVoice: true,
     characterVoices: { alice: 'alice-voice', bob: '' },
     detectedCharacters: [
       { id: 'alice', name: 'Alice', messageCount: 4 },
@@ -303,10 +364,13 @@ test('writes native overrides while preserving unrelated character voices', () =
 
 test('persists manual scan results for loading without rescanning messages', () => {
   const metadata = applyConfigToMetadata({}, {
-    version: 5,
+    version: 7,
     messageLimit: 35,
     connectionId: '',
     narratorVoice: '',
+    userVoice: '',
+    useGlobalNarratorVoice: true,
+    useGlobalUserVoice: true,
     characterVoices: { alice: 'voice-a' },
     detectedCharacters: [{ id: 'alice', name: 'Alice', messageCount: 7 }],
     managedCharacterIds: [],

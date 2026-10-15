@@ -15,6 +15,7 @@ import {
   speakerReviewQuotes,
   speakerReviewQuoteIndexes,
   speakerAliases,
+  USER_SPEAKER_ID,
   type CharacterLike,
   type ChatVoiceConfig,
 } from './core'
@@ -74,6 +75,9 @@ type FrontendMessage =
         messageLimit: number
         connectionId: string
         narratorVoice: string
+        userVoice: string
+        useGlobalNarratorVoice: boolean
+        useGlobalUserVoice: boolean
         characterVoices: Record<string, string>
         characters: Array<{ id: string; name: string; messageCount: number }>
       }
@@ -127,6 +131,9 @@ async function buildState(chat: ChatLike, userId?: string) {
     messageLimit: config.messageLimit,
     connectionId: config.connectionId,
     narratorVoice: config.narratorVoice,
+    userVoice: config.userVoice,
+    useGlobalNarratorVoice: config.useGlobalNarratorVoice,
+    useGlobalUserVoice: config.useGlobalUserVoice,
     characters: detected.map((character) => ({
       ...character,
       voice: config.characterVoices[character.id] ?? '',
@@ -197,7 +204,7 @@ function sanitizeSaveConfig(
     }
   }
   return {
-    version: 5,
+    version: 7,
     messageLimit: clampMessageLimit(input.messageLimit),
     connectionId: typeof input.connectionId === 'string'
       ? input.connectionId.trim().slice(0, 128)
@@ -205,6 +212,11 @@ function sanitizeSaveConfig(
     narratorVoice: typeof input.narratorVoice === 'string'
       ? input.narratorVoice.trim().slice(0, 512)
       : '',
+    userVoice: typeof input.userVoice === 'string'
+      ? input.userVoice.trim().slice(0, 512)
+      : '',
+    useGlobalNarratorVoice: input.useGlobalNarratorVoice === true,
+    useGlobalUserVoice: input.useGlobalUserVoice === true,
     characterVoices,
     detectedCharacters,
     managedCharacterIds: previous.managedCharacterIds,
@@ -322,12 +334,32 @@ function queueSpeakerParse(
       extra?: Record<string, unknown>
     }>
     const message = messages.find(item => item.id === payload.messageId)
-    if (!message || message.is_user) throw new Error('The character message is no longer available.')
+    if (!message) throw new Error('The message is no longer available.')
 
     const cards = await loadCharacters(chat, userId)
     const config = readConfig(chat.metadata ?? {}, cards.map(card => card.id))
-    const speakers = config.detectedCharacters
-    const defaultSpeakerId = defaultMessageSpeakerId(message, speakers)
+    const userAliases: string[] = []
+    const seenUserAliases = new Set<string>()
+    for (const item of messages) {
+      if (!item.is_user) continue
+      const name = normalizeSpeakerName(item.name)
+      if (!name) continue
+      for (const alias of [name, name.split(/\s+/u)[0] ?? '']) {
+        const key = alias.toLowerCase()
+        if (!alias || seenUserAliases.has(key)) continue
+        seenUserAliases.add(key)
+        userAliases.push(alias)
+      }
+    }
+    const speakers: CharacterLike[] = [
+      ...config.detectedCharacters,
+      ...(messages.some(item => item.is_user)
+        ? [{ id: USER_SPEAKER_ID, name: userAliases.join(' / ') || 'User' }]
+        : []),
+    ]
+    const defaultSpeakerId = message.is_user
+      ? USER_SPEAKER_ID
+      : defaultMessageSpeakerId(message, speakers)
     const skippedTrackerTags = payload.skippedTrackerTags.slice(0, 4_000)
     const messageIndex = messages.findIndex(item => item.id === payload.messageId)
     let previousAssistantMessage: typeof message | null = null
@@ -336,7 +368,7 @@ function queueSpeakerParse(
       previousAssistantMessage = messages[index]
       break
     }
-    const historicalSpeakerId = previousAssistantMessage
+    const historicalSpeakerId = !message.is_user && previousAssistantMessage
       ? previousAssistantSpeakerFallback(
           message.content ?? '',
           previousAssistantMessage.content ?? '',
@@ -376,7 +408,7 @@ function queueSpeakerParse(
     const connectionId = payload.connectionId.trim().slice(0, 128)
     const model = payload.model.trim().slice(0, 256)
     const cacheHash = hashMessageContent(JSON.stringify({
-      parser: 10,
+      parser: 11,
       mode: payload.mode,
       content: message.content ?? '',
       speakers: speakers.map(speaker => ({ id: speaker.id, name: speaker.name })),
@@ -550,7 +582,7 @@ function queueScan(
     }
     const nextConfig: ChatVoiceConfig = {
       ...config,
-      version: 5,
+      version: 7,
       messageLimit,
       characterVoices,
       detectedCharacters: [...detected.values()],
