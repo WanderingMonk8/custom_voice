@@ -399,6 +399,7 @@ test('matches a name-free message only to a configured name contained in its car
 
   assert.equal(speakerIdMatchingCardTitle('Ruby Vale - The Long Reset', speakers), 'ruby')
   assert.equal(speakerIdMatchingCardTitle('The Long Reset', speakers), null)
+  assert.equal(speakerIdMatchingCardTitle('Ruby and Grace at the Long Reset', speakers), null)
 })
 
 test('never persists generated audio for user messages', () => {

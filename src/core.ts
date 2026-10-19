@@ -732,20 +732,21 @@ export function hasNamedSpeakerMention(
   )))
 }
 
-/** Find the configured speaker whose longest alias occurs in a card title. */
+/** Match a card title only when all matching aliases belong to one speaker. */
 export function speakerIdMatchingCardTitle(
   cardTitle: string,
   speakers: CharacterLike[],
 ): string | null {
   const normalizedTitle = normalizeSpeakerName(cardTitle)
-  let best: { id: string; length: number } | null = null
+  const matchingSpeakerIds = new Set<string>()
   for (const speaker of speakers) {
     for (const alias of speakerAliases(speaker.name)) {
       if (!new RegExp(`\\b${escapedPattern(alias)}\\b`, 'iu').test(normalizedTitle)) continue
-      if (!best || alias.length > best.length) best = { id: speaker.id, length: alias.length }
+      matchingSpeakerIds.add(speaker.id)
+      break
     }
   }
-  return best?.id ?? null
+  return matchingSpeakerIds.size === 1 ? [...matchingSpeakerIds][0] : null
 }
 
 export function preferredCardSpeakerId(

@@ -297,14 +297,15 @@ function hasNamedSpeakerMention(content, speakers, skippedTrackerTagPairs = "") 
 }
 function speakerIdMatchingCardTitle(cardTitle, speakers) {
   const normalizedTitle = normalizeSpeakerName(cardTitle);
-  let best = null;
+  const matchingSpeakerIds = /* @__PURE__ */ new Set();
   for (const speaker of speakers) {
     for (const alias of speakerAliases(speaker.name)) {
       if (!new RegExp(`\\b${escapedPattern(alias)}\\b`, "iu").test(normalizedTitle)) continue;
-      if (!best || alias.length > best.length) best = { id: speaker.id, length: alias.length };
+      matchingSpeakerIds.add(speaker.id);
+      break;
     }
   }
-  return best?.id ?? null;
+  return matchingSpeakerIds.size === 1 ? [...matchingSpeakerIds][0] : null;
 }
 function preferredCardSpeakerId(message, speakers, cardCharacterIds) {
   const speakerIds = new Set(speakers.map((speaker) => speaker.id));
