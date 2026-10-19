@@ -9,6 +9,12 @@ function speakersForMessageRole(speakers, isUserMessage, userName = "User") {
     { id: USER_SPEAKER_ID, name: normalizeSpeakerName(userName) || "User" }
   ] : nonUserSpeakers;
 }
+function protectDefaultSpeakerSegments(localSegments, reviewedSegments, protectedSpeakerId) {
+  if (localSegments.length !== reviewedSegments.length || localSegments.some((segment, index) => segment.text !== reviewedSegments[index]?.text)) {
+    return localSegments;
+  }
+  return reviewedSegments.map((segment, index) => localSegments[index].speakerId === protectedSpeakerId ? { ...segment, speakerId: protectedSpeakerId } : segment);
+}
 function playbackVoiceForSpeaker(speakerId, isUserMessage, characterVoices, narratorVoice, userVoice) {
   if (speakerId === USER_SPEAKER_ID) return isUserMessage ? userVoice : "";
   if (speakerId) return characterVoices[speakerId] || "";
@@ -277,7 +283,7 @@ function preferredCardSpeakerId(message, speakers, cardCharacterIds) {
   const explicitId = typeof message.extra?.character_id === "string" ? message.extra.character_id : "";
   if (explicitId && speakerIds.has(explicitId)) return explicitId;
   const messageName = normalizeSpeakerName(message.name ?? "").toLowerCase();
-  const namedSpeaker = messageName ? speakers.find((speaker) => !speaker.id.startsWith("npc:") && speakerAliases(speaker.name).some((alias) => alias.toLowerCase() === messageName)) : void 0;
+  const namedSpeaker = messageName ? speakers.find((speaker) => speakerAliases(speaker.name).some((alias) => alias.toLowerCase() === messageName)) : void 0;
   if (namedSpeaker) return namedSpeaker.id;
   const availableCardIds = [...new Set(cardCharacterIds)].filter((characterId) => speakerIds.has(characterId));
   return availableCardIds.length === 1 ? availableCardIds[0] : null;
@@ -2333,15 +2339,19 @@ function setup(ctx) {
       const aliases = new Map(
         playbackChat.characters.flatMap((character) => speakerAliases(character.name).map((alias) => [npcSpeakerId(alias), character.id]))
       );
-      let segments = parseRosterVoiceSegments(
+      const localSegments = parseRosterVoiceSegments(
         message.content,
         defaultSpeakerId,
         playbackSpeakers,
         preferences.skippedTrackerTags
       );
+      let segments = localSegments;
       if (preferences.speakerParsingMode !== "off") setStatus("Reviewing dialogue speakers\u2026");
       try {
         segments = await requestSpeakerReviewedSegments(playbackChat.id, messageId, preferences);
+        if (message.is_user) {
+          segments = protectDefaultSpeakerSegments(localSegments, segments, USER_SPEAKER_ID);
+        }
       } catch (error) {
         console.warn("[Chat Voice] Backend speaker parsing failed; using the message-local parser.", error);
         if (playback.controller.signal.aborted) throw new DOMException("Playback stopped.", "AbortError");

@@ -105,6 +105,25 @@ export interface VoicePlanSegment {
   voice: string
 }
 
+/** Keep a deterministic role fallback when optional review tries to replace it. */
+export function protectDefaultSpeakerSegments(
+  localSegments: PlaybackSegment[],
+  reviewedSegments: PlaybackSegment[],
+  protectedSpeakerId: string,
+): PlaybackSegment[] {
+  if (
+    localSegments.length !== reviewedSegments.length
+    || localSegments.some((segment, index) => segment.text !== reviewedSegments[index]?.text)
+  ) {
+    return localSegments
+  }
+  return reviewedSegments.map((segment, index) => (
+    localSegments[index].speakerId === protectedSpeakerId
+      ? { ...segment, speakerId: protectedSpeakerId }
+      : segment
+  ))
+}
+
 export function playbackVoiceForSpeaker(
   speakerId: string | null,
   isUserMessage: boolean,
@@ -763,8 +782,7 @@ export function preferredCardSpeakerId(
   const messageName = normalizeSpeakerName(message.name ?? '').toLowerCase()
   const namedSpeaker = messageName
     ? speakers.find(speaker => (
-        !speaker.id.startsWith('npc:')
-        && speakerAliases(speaker.name).some(alias => alias.toLowerCase() === messageName)
+        speakerAliases(speaker.name).some(alias => alias.toLowerCase() === messageName)
       ))
     : undefined
   if (namedSpeaker) return namedSpeaker.id
@@ -1242,6 +1260,19 @@ function unambiguousNarrativeSpeaker(text: string, speakers: CharacterLike[]): s
     return mainClausePossessiveSubject(text, speakers, mentions.possessive)
   }
   return null
+}
+
+/** Whether playable narration establishes any available character as a clause subject. */
+export function hasNamedSpeakerSubject(
+  content: string,
+  speakers: CharacterLike[],
+  skippedTrackerTagPairs = '',
+): boolean {
+  const playbackContent = preparePlaybackContent(content, skippedTrackerTagPairs)
+  return playbackParagraphs(playbackContent).some(paragraph => {
+    const mentions = mentionedSpeakers(paragraph.text, speakers)
+    return preferredMentionedSpeaker(paragraph.text, speakers, mentions) !== null
+  })
 }
 
 function currentParagraphSpeaker(

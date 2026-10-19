@@ -4,7 +4,7 @@ import {
   applyConfigToMetadata,
   clampMessageLimit,
   hashMessageContent,
-  hasNamedSpeakerMention,
+  hasNamedSpeakerSubject,
   normalizeSpeakerName,
   parseCardCast,
   parseLlmSpeakerAssignments,
@@ -363,7 +363,7 @@ function queueSpeakerParse(
       message.content ?? '',
       configuredSpeakers,
     )
-    const namedSpeakerMention = hasNamedSpeakerMention(
+    const namedSpeakerSubject = hasNamedSpeakerSubject(
       message.content ?? '',
       speakers,
       skippedTrackerTags,
@@ -374,18 +374,18 @@ function queueSpeakerParse(
     const messageCard = messageCardId
       ? cards.find(card => card.id === messageCardId)
       : undefined
-    const namelessCardSpeakerId = !message.is_user && !namedSpeakerMention && messageCard
+    const namelessCardSpeakerId = !message.is_user && !namedSpeakerSubject && messageCard
       ? speakerIdMatchingCardTitle(messageCard.name, configuredSpeakers)
       : null
     const defaultSpeakerId = message.is_user
       ? USER_SPEAKER_ID
-      : !namedSpeakerMention
+      : !namedSpeakerSubject
         ? namelessCardSpeakerId
         : defaultMessageSpeakerId(message, speakers, cards.map(card => card.id))
     let previousAssistantMessage: typeof message | null = null
     let historicalSpeakerId: string | null = null
     if (!message.is_user && !namelessCardSpeakerId) {
-      const searchForLastClearIdentity = !namedSpeakerMention
+      const searchForLastClearIdentity = !namedSpeakerSubject
       for (let index = messageIndex - 1; index >= 0; index--) {
         const previous = messages[index]
         if (previous.is_user) continue
@@ -433,7 +433,7 @@ function queueSpeakerParse(
     if (
       payload.mode === 'off'
       || !!namelessCardSpeakerId
-      || (!namedSpeakerMention && !!historicalSpeakerId)
+      || (!namedSpeakerSubject && !!historicalSpeakerId)
       || (payload.mode === 'ambiguous' && reviewQuoteIndexes.size === 0)
     ) {
       sendSpeakerParse({
@@ -449,7 +449,7 @@ function queueSpeakerParse(
     const connectionId = payload.connectionId.trim().slice(0, 128)
     const model = payload.model.trim().slice(0, 256)
     const cacheHash = hashMessageContent(JSON.stringify({
-      parser: 18,
+      parser: 19,
       mode: payload.mode,
       content: message.content ?? '',
       speakers: speakers.map(speaker => ({ id: speaker.id, name: speaker.name })),

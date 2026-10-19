@@ -13,6 +13,7 @@ import {
   expiredSavedAudioRecords,
   hashMessageContent,
   hasNamedSpeakerMention,
+  hasNamedSpeakerSubject,
   mergeVoicePlan,
   npcSpeakerId,
   needsLlmSpeakerReview,
@@ -25,6 +26,7 @@ import {
   parseSkippedTrackerTags,
   playbackVoiceForSpeaker,
   preferredCardSpeakerId,
+  protectDefaultSpeakerSegments,
   previousAssistantSpeakerFallback,
   reducedRequestWindowLimit,
   readConfig,
@@ -389,6 +391,52 @@ test('distinguishes name-free messages from messages that contain a speaker name
   assert.equal(hasNamedSpeakerMention(nameless, speakers), false)
   assert.equal(hasNamedSpeakerMention('Mara sets down the mug.\n\n"Especially ragged."', speakers), true)
   assert.equal(hasNamedSpeakerMention('She says, "Tell Mara I am ready."', speakers), true)
+})
+
+test('distinguishes named subjects from objects, addressees, and skipped trackers', () => {
+  const speakers = [{ id: 'jayden', name: 'Jayden Flynn / Jayden' }]
+
+  assert.equal(hasNamedSpeakerSubject('Jayden sets down her mug. "I am ready."', speakers), true)
+  assert.equal(hasNamedSpeakerSubject('He looks toward Jayden. "Tell Jayden I am ready."', speakers), false)
+  assert.equal(
+    hasNamedSpeakerSubject(
+      '<tracker>Jayden waits outside.</tracker>\n\nShe sets down her mug. "I am ready."',
+      speakers,
+      'tracker',
+    ),
+    false,
+  )
+})
+
+test('routes subjectless assistant dialogue through a unique card-title NPC alias', () => {
+  const speakers = [{ id: 'npc:jayden-flynn', name: 'Jayden Flynn / Jayden' }]
+  const defaultSpeakerId = speakerIdMatchingCardTitle('Jayden', speakers)
+  const speech = parseRosterVoiceSegments(
+    'She sets down her mug.\n\n"You imagined feeding me."',
+    defaultSpeakerId,
+    speakers,
+  ).filter(segment => segment.speakerId !== null)
+
+  assert.equal(defaultSpeakerId, 'npc:jayden-flynn')
+  assert.deepEqual(speech, [{ text: 'You imagined feeding me.', speakerId: 'npc:jayden-flynn' }])
+})
+
+test('preserves the user role when reviewed unnamed user dialogue selects an NPC', () => {
+  const local = parseRosterVoiceSegments(
+    'I set down the mug.\n\n"This is mine."',
+    USER_SPEAKER_ID,
+    [{ id: USER_SPEAKER_ID, name: 'Ken' }],
+  )
+  const reviewed = local.map(segment => (
+    segment.speakerId === USER_SPEAKER_ID
+      ? { ...segment, speakerId: 'npc:jayden-flynn' }
+      : segment
+  ))
+
+  assert.deepEqual(
+    protectDefaultSpeakerSegments(local, reviewed, USER_SPEAKER_ID),
+    local,
+  )
 })
 
 test('matches a name-free message only to a configured name contained in its card title', () => {
