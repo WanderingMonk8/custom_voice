@@ -4,6 +4,7 @@ import type {
 } from 'lumiverse-spindle-types'
 import {
   adaptiveGenerationConcurrency,
+  addUnconfiguredDialogueSpeakers,
   clampSavedAudioLimit,
   DEFAULT_SAVED_AUDIO_LIMIT,
   encodeConcatenatedWav,
@@ -1811,10 +1812,13 @@ export function setup(ctx: SpindleFrontendContext) {
             playbackChat.characters,
             playbackChat.cardCharacterIds ?? [],
           )
-      const playbackSpeakers = speakersForMessageRole(
-        playbackChat.characters,
-        message.is_user,
-        message.name,
+      const playbackSpeakers = addUnconfiguredDialogueSpeakers(
+        message.content,
+        speakersForMessageRole(
+          playbackChat.characters,
+          message.is_user,
+          message.name,
+        ),
       )
       const aliases = new Map(
         playbackChat.characters.flatMap((character) => (

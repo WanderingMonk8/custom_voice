@@ -3,6 +3,7 @@ import test from 'node:test'
 import {
   adaptiveGenerationConcurrency,
   addScannedFirstNameAliases,
+  addUnconfiguredDialogueSpeakers,
   mergeScannedCardCast,
   applyConfigToMetadata,
   clampMessageLimit,
@@ -336,6 +337,28 @@ test('uses the connection default for unset NPCs and stray user assignments in a
   assert.equal(playbackVoiceForSpeaker(USER_SPEAKER_ID, false, voices, 'narrator', 'user-voice'), '')
   assert.equal(playbackVoiceForSpeaker(USER_SPEAKER_ID, true, voices, 'narrator', 'user-voice'), 'user-voice')
   assert.equal(playbackVoiceForSpeaker(null, false, voices, 'narrator', 'user-voice'), 'narrator')
+})
+
+test('routes clear unconfigured dialogue subjects through connection-default voices', () => {
+  const content = [
+    'Willum came out with the board and set it on the rail.',
+    '',
+    '"I heard your rider too. Told you I sleep light."',
+    '',
+    'Tobben drew the last nail and set the foot down.',
+    '',
+    '"There is a horse made for the road," Tobben said.',
+  ].join('\n')
+  const speakers = addUnconfiguredDialogueSpeakers(content, [{ id: 'card', name: 'Main Character' }])
+  const segments = parseRosterVoiceSegments(content, 'card', speakers)
+    .filter(segment => segment.speakerId !== null)
+
+  assert.deepEqual(segments, [
+    { text: 'I heard your rider too. Told you I sleep light.', speakerId: 'unconfigured:willum' },
+    { text: 'There is a horse made for the road,', speakerId: 'unconfigured:tobben' },
+  ])
+  assert.equal(playbackVoiceForSpeaker(segments[0].speakerId, false, {}, '', 'user-voice'), '')
+  assert.equal(playbackVoiceForSpeaker(segments[1].speakerId, false, {}, '', 'user-voice'), '')
 })
 
 test('never persists generated audio for user messages', () => {
