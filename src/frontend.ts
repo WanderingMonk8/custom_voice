@@ -23,6 +23,7 @@ import {
   speakerAliasIdLookup,
   speakersForMessageRole,
   shouldPersistMessageAudio,
+  UNCAST_SPEAKER_ID,
   USER_SPEAKER_ID,
   upsertSavedAudioRecord,
   type PlaybackSegment,
@@ -1586,6 +1587,7 @@ export function setup(ctx: SpindleFrontendContext) {
   function speakerDebugName(speakerId: string | null, speakers: Array<{ id: string; name: string }>): string {
     if (speakerId === null) return 'narrator'
     if (speakerId === USER_SPEAKER_ID) return 'user persona'
+    if (speakerId === UNCAST_SPEAKER_ID) return 'uncast character'
     const speaker = speakers.find(candidate => candidate.id === speakerId)
     return speaker ? `${speaker.name} [${speakerId}]` : speakerId
   }

@@ -40,6 +40,7 @@ import {
   rollingRequestWindowDelay,
   stripSkippedTrackerBlocks,
   unconfiguredSpeakerId,
+  UNCAST_SPEAKER_ID,
   USER_SPEAKER_ID,
   upsertSavedAudioRecord,
   type ChatVoiceConfig,
@@ -475,6 +476,34 @@ test('routes subjectless assistant dialogue through a unique card-title NPC alia
 
   assert.equal(defaultSpeakerId, 'npc:jayden-flynn')
   assert.deepEqual(speech, [{ text: 'You imagined feeding me.', speakerId: 'npc:jayden-flynn' }])
+})
+
+test('routes dialogue anchored to an anonymous local character through the connection default', () => {
+  const content = [
+    'The phone buzzed.',
+    '',
+    '"Hi. It\'s me. I know you know it\'s me because caller ID."',
+    '',
+    'Near the bacon, an older woman in a quilted jacket reached past and pulled the thick-cut without looking.',
+    '',
+    '"Go with the thick-cut. The thin stuff disappears in the pan."',
+    '',
+    'She was gone before the sentence finished landing.',
+    '',
+    'The phone buzzed again.',
+    '',
+    '"The eggs are still on the counter."',
+  ].join('\n')
+  const speakers = [{ id: 'mira', name: 'Mira' }]
+  const speech = parseRosterVoiceSegments(content, 'mira', speakers)
+    .filter(segment => segment.speakerId !== null)
+
+  assert.deepEqual(speech, [
+    { text: "Hi. It's me. I know you know it's me because caller ID.", speakerId: 'mira' },
+    { text: 'Go with the thick-cut. The thin stuff disappears in the pan.', speakerId: UNCAST_SPEAKER_ID },
+    { text: 'The eggs are still on the counter.', speakerId: 'mira' },
+  ])
+  assert.equal(playbackVoiceForSpeaker(UNCAST_SPEAKER_ID, false, { mira: 'mira-voice' }, '', ''), '')
 })
 
 test('preserves the user role when reviewed unnamed user dialogue selects an NPC', () => {

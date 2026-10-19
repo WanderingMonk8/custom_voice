@@ -1,6 +1,7 @@
 // src/core.ts
 var CONFIG_KEY = "chat_voice";
 var USER_SPEAKER_ID = "__chat_voice_user__";
+var UNCAST_SPEAKER_ID = "__chat_voice_uncast__";
 var DEFAULT_MESSAGE_LIMIT = 20;
 var MIN_MESSAGE_LIMIT = 1;
 var MAX_MESSAGE_LIMIT = 500;
@@ -719,6 +720,40 @@ function unambiguousNarrativeSpeaker(text, speakers) {
   }
   return null;
 }
+var ANONYMOUS_HUMAN_NOUNS = [
+  "boy",
+  "cashier",
+  "child",
+  "clerk",
+  "customer",
+  "driver",
+  "employee",
+  "girl",
+  "guard",
+  "guy",
+  "kid",
+  "lady",
+  "man",
+  "passerby",
+  "person",
+  "server",
+  "shopkeeper",
+  "staffer",
+  "stranger",
+  "teen",
+  "teenager",
+  "waiter",
+  "waitress",
+  "woman",
+  "worker"
+];
+var ANONYMOUS_HUMAN_SUBJECT_PATTERN = new RegExp(
+  `(?:^|[.!?;]\\s+|^[^,\\n]{1,120},\\s*)(?:a|an|another|some)\\s+(?:[\\p{L}\\p{M}'\u2019-]+[ -]){0,5}(?:${ANONYMOUS_HUMAN_NOUNS.join("|")})\\b`,
+  "iu"
+);
+function hasAnonymousHumanSubject(text) {
+  return ANONYMOUS_HUMAN_SUBJECT_PATTERN.test(narrativeOnly(text));
+}
 function hasNamedSpeakerSubject(content, speakers, skippedTrackerTagPairs = "") {
   const playbackContent = preparePlaybackContent(content, skippedTrackerTagPairs);
   return playbackParagraphs(playbackContent).some((paragraph) => {
@@ -1100,12 +1135,15 @@ function parseRosterVoiceSegmentsInternal(content, defaultSpeakerId, speakers, s
       const dialogueTurnSpeakerId = dialogueTurns.get(paragraphIndex) ?? null;
       const inferredTurnSpeakerId = inference.source === "history" || inference.source === "fallback" ? dialogueTurnSpeakerId : null;
       const openingSpeakerId = inference.source === "fallback" && openingBackfill?.paragraphIndexes.has(paragraphIndex) ? openingBackfill.speakerId : null;
-      const currentEvidenceSpeakerId = paragraphSpeakers[paragraphIndex] ?? (inference.confident ? inference.speakerId : null);
-      if (historicalPrefixActive && (inference.source === "explicit" || inference.source === "paragraph" || paragraphSpeakers[paragraphIndex] !== null && currentEvidenceSpeakerId !== historicalSpeakerId)) {
+      const previousParagraph = paragraphs[paragraphIndex - 1];
+      const currentParagraph = paragraphs[paragraphIndex];
+      const currentNarrativePrefix = currentParagraph ? currentParagraph.text.slice(0, Math.max(0, quote.start - currentParagraph.start)) : "";
+      const anonymousLocalSpeakerId = (inference.source === "history" || inference.source === "fallback") && paragraphSpeakers[paragraphIndex] === null && (hasAnonymousHumanSubject(currentNarrativePrefix) || !!(previousParagraph && playbackQuotes(previousParagraph.text).length === 0 && paragraphSpeakers[paragraphIndex - 1] === null && hasAnonymousHumanSubject(previousParagraph.text))) ? UNCAST_SPEAKER_ID : null;
+      const currentEvidenceSpeakerId = paragraphSpeakers[paragraphIndex] ?? anonymousLocalSpeakerId ?? (inference.confident ? inference.speakerId : null);
+      if (historicalPrefixActive && (inference.source === "explicit" || inference.source === "paragraph" || anonymousLocalSpeakerId !== null || paragraphSpeakers[paragraphIndex] !== null && currentEvidenceSpeakerId !== historicalSpeakerId)) {
         historicalPrefixActive = false;
       }
       const historicalFallbackId = historicalPrefixActive && (inference.source === "history" || inference.source === "fallback") ? historicalSpeakerId : null;
-      const previousParagraph = paragraphs[paragraphIndex - 1];
       const adjacentNarrativeSpeakerId = previousParagraph && playbackQuotes(previousParagraph.text).length === 0 ? mainClausePossessiveSubject(
         previousParagraph.text,
         speakers,
@@ -1117,6 +1155,7 @@ function parseRosterVoiceSegmentsInternal(content, defaultSpeakerId, speakers, s
         ["current-paragraph-subject", paragraphSpeakers[paragraphIndex]],
         ["preceding-possessive-subject", adjacentNarrativeSpeakerId],
         ["preceding-narrative-voice-subject", adjacentNarrativeVoiceSpeakerId],
+        ["anonymous-local-subject", anonymousLocalSpeakerId],
         ["downstream-reply", downstreamReplies.get(paragraphIndex) ?? null],
         ["dialogue-turn-alternation", inferredTurnSpeakerId],
         ["speaker-continuation", continuedSpeakerId],
@@ -1126,7 +1165,7 @@ function parseRosterVoiceSegmentsInternal(content, defaultSpeakerId, speakers, s
       ];
       const selectedLocalCandidate = localCandidates.find(([, speakerId2]) => speakerId2 !== null);
       const localSpeakerId = selectedLocalCandidate?.[1] ?? null;
-      const confidentLocalSpeakerId = paragraphSpeakers[paragraphIndex] ?? adjacentNarrativeEvidenceId ?? (inference.source === "explicit" || inference.source === "paragraph" ? inference.speakerId : null);
+      const confidentLocalSpeakerId = paragraphSpeakers[paragraphIndex] ?? adjacentNarrativeEvidenceId ?? anonymousLocalSpeakerId ?? (inference.source === "explicit" || inference.source === "paragraph" ? inference.speakerId : null);
       if (!localSpeakerId || confidentLocalSpeakerId !== localSpeakerId) {
         lowConfidenceQuoteIndexes?.add(currentQuoteIndex);
       }

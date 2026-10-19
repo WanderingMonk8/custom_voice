@@ -1,5 +1,6 @@
 export const CONFIG_KEY = 'chat_voice'
 export const USER_SPEAKER_ID = '__chat_voice_user__'
+export const UNCAST_SPEAKER_ID = '__chat_voice_uncast__'
 export const DEFAULT_MESSAGE_LIMIT = 20
 export const MIN_MESSAGE_LIMIT = 1
 export const MAX_MESSAGE_LIMIT = 500
@@ -1297,6 +1298,24 @@ function unambiguousNarrativeSpeaker(text: string, speakers: CharacterLike[]): s
   return null
 }
 
+const ANONYMOUS_HUMAN_NOUNS = [
+  'boy', 'cashier', 'child', 'clerk', 'customer', 'driver', 'employee', 'girl',
+  'guard', 'guy', 'kid', 'lady', 'man', 'passerby', 'person', 'server',
+  'shopkeeper', 'staffer', 'stranger', 'teen', 'teenager', 'waiter', 'waitress',
+  'woman', 'worker',
+] as const
+
+const ANONYMOUS_HUMAN_SUBJECT_PATTERN = new RegExp(
+  `(?:^|[.!?;]\\s+|^[^,\\n]{1,120},\\s*)(?:a|an|another|some)\\s+`
+    + `(?:[\\p{L}\\p{M}'’-]+[ -]){0,5}(?:${ANONYMOUS_HUMAN_NOUNS.join('|')})\\b`,
+  'iu',
+)
+
+/** Detect a clause-leading, explicitly anonymous person such as "an older woman". */
+function hasAnonymousHumanSubject(text: string): boolean {
+  return ANONYMOUS_HUMAN_SUBJECT_PATTERN.test(narrativeOnly(text))
+}
+
 /** Whether playable narration establishes any available character as a clause subject. */
 export function hasNamedSpeakerSubject(
   content: string,
@@ -1858,13 +1877,33 @@ function parseRosterVoiceSegmentsInternal(
         && openingBackfill?.paragraphIndexes.has(paragraphIndex)
         ? openingBackfill.speakerId
         : null
+      const previousParagraph = paragraphs[paragraphIndex - 1]
+      const currentParagraph = paragraphs[paragraphIndex]
+      const currentNarrativePrefix = currentParagraph
+        ? currentParagraph.text.slice(0, Math.max(0, quote.start - currentParagraph.start))
+        : ''
+      const anonymousLocalSpeakerId = (inference.source === 'history' || inference.source === 'fallback')
+        && paragraphSpeakers[paragraphIndex] === null
+        && (
+          hasAnonymousHumanSubject(currentNarrativePrefix)
+          || !!(
+            previousParagraph
+            && playbackQuotes(previousParagraph.text).length === 0
+            && paragraphSpeakers[paragraphIndex - 1] === null
+            && hasAnonymousHumanSubject(previousParagraph.text)
+          )
+        )
+        ? UNCAST_SPEAKER_ID
+        : null
       const currentEvidenceSpeakerId = paragraphSpeakers[paragraphIndex]
+        ?? anonymousLocalSpeakerId
         ?? (inference.confident ? inference.speakerId : null)
       if (
         historicalPrefixActive
         && (
           inference.source === 'explicit'
           || inference.source === 'paragraph'
+          || anonymousLocalSpeakerId !== null
           || (paragraphSpeakers[paragraphIndex] !== null
             && currentEvidenceSpeakerId !== historicalSpeakerId)
         )
@@ -1875,7 +1914,6 @@ function parseRosterVoiceSegmentsInternal(
         && (inference.source === 'history' || inference.source === 'fallback')
         ? historicalSpeakerId
         : null
-      const previousParagraph = paragraphs[paragraphIndex - 1]
       const adjacentNarrativeSpeakerId = previousParagraph
         && playbackQuotes(previousParagraph.text).length === 0
         ? mainClausePossessiveSubject(
@@ -1897,6 +1935,7 @@ function parseRosterVoiceSegmentsInternal(
         ['current-paragraph-subject', paragraphSpeakers[paragraphIndex]],
         ['preceding-possessive-subject', adjacentNarrativeSpeakerId],
         ['preceding-narrative-voice-subject', adjacentNarrativeVoiceSpeakerId],
+        ['anonymous-local-subject', anonymousLocalSpeakerId],
         ['downstream-reply', downstreamReplies.get(paragraphIndex) ?? null],
         ['dialogue-turn-alternation', inferredTurnSpeakerId],
         ['speaker-continuation', continuedSpeakerId],
@@ -1908,6 +1947,7 @@ function parseRosterVoiceSegmentsInternal(
       const localSpeakerId: string | null = selectedLocalCandidate?.[1] ?? null
       const confidentLocalSpeakerId = paragraphSpeakers[paragraphIndex]
         ?? adjacentNarrativeEvidenceId
+        ?? anonymousLocalSpeakerId
         ?? (inference.source === 'explicit' || inference.source === 'paragraph'
           ? inference.speakerId
           : null)
