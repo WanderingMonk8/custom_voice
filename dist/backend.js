@@ -240,20 +240,27 @@ function unconfiguredSpeakerId(name) {
   return `unconfigured:${normalizeSpeakerName(name).toLowerCase()}`;
 }
 function addUnconfiguredDialogueSpeakers(content, speakers) {
+  const preparedContent = preparePlaybackContent(content);
   const result = [...speakers];
   const knownAliases = new Set(result.flatMap((speaker) => speakerAliases(speaker.name).map((alias) => alias.toLowerCase())));
-  const addCandidate = (rawName) => {
+  const addCandidate = (rawName, explicitlyAttributed = false) => {
     const name = normalizeSpeakerName(rawName.replace(/['’]s$/u, ""));
     const aliases = speakerAliases(name);
     const first = aliases[0]?.split(/\s+/u)[0]?.toLowerCase() ?? "";
     if (!name || !first || NON_NAME_PARAGRAPH_LEADS.has(first)) return;
     if (aliases.some((alias) => knownAliases.has(alias.toLowerCase()))) return;
+    if (!explicitlyAttributed) {
+      const occurrences = [...preparedContent.matchAll(
+        new RegExp(`\\b${escapedPattern(name)}(?:['\u2019]s)?\\b`, "giu")
+      )].length;
+      if (occurrences < 2) return;
+    }
     const id = unconfiguredSpeakerId(name);
     if (result.some((speaker) => speaker.id === id)) return;
     result.push({ id, name });
     for (const alias of aliases) knownAliases.add(alias.toLowerCase());
   };
-  const paragraphs = playbackParagraphs(preparePlaybackContent(content));
+  const paragraphs = playbackParagraphs(preparedContent);
   for (let paragraphIndex = 0; paragraphIndex < paragraphs.length; paragraphIndex += 1) {
     const paragraph = paragraphs[paragraphIndex];
     const quotes = playbackQuotes(paragraph.text);
@@ -276,13 +283,29 @@ function addUnconfiguredDialogueSpeakers(content, speakers) {
     const trailingLead = trailingNarration.match(
       /^([\p{Lu}][\p{L}\p{M}'’.\-]{1,63}(?:\s+[\p{Lu}][\p{L}\p{M}'’.\-]{1,63}){0,2})(?=\s+(?:said|asked|answered|replied|whispered|murmured|called|shouted|added|continued|observed|remarked|gasped|breathed)\b)/u
     )?.[1];
-    if (trailingLead) addCandidate(trailingLead);
+    if (trailingLead) addCandidate(trailingLead, true);
     else {
       const lead = trailingNarration.match(/^([\p{Lu}][\p{L}\p{M}'’.\-]{1,63})(?=\s)/u)?.[1];
       if (lead) addCandidate(lead);
     }
   }
   return result;
+}
+function hasNamedSpeakerMention(content, speakers, skippedTrackerTagPairs = "") {
+  const playbackContent = preparePlaybackContent(content, skippedTrackerTagPairs);
+  return speakers.some((speaker) => speakerAliases(speaker.name).some((alias) => new RegExp(`\\b${escapedPattern(alias)}\\b`, "iu").test(playbackContent)));
+}
+function speakerIdMatchingCardTitle(cardTitle, speakers) {
+  const normalizedTitle = normalizeSpeakerName(cardTitle);
+  const matchingSpeakerIds = /* @__PURE__ */ new Set();
+  for (const speaker of speakers) {
+    for (const alias of speakerAliases(speaker.name)) {
+      if (!new RegExp(`\\b${escapedPattern(alias)}\\b`, "iu").test(normalizedTitle)) continue;
+      matchingSpeakerIds.add(speaker.id);
+      break;
+    }
+  }
+  return matchingSpeakerIds.size === 1 ? [...matchingSpeakerIds][0] : null;
 }
 function preferredCardSpeakerId(message, speakers, cardCharacterIds) {
   const speakerIds = new Set(speakers.map((speaker) => speaker.id));
@@ -1335,30 +1358,56 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
         userAliases.push(alias);
       }
     }
-    const speakers = addUnconfiguredDialogueSpeakers(
-      message.content ?? "",
-      speakersForMessageRole(
-        config.detectedCharacters,
-        message.is_user,
-        userAliases.join(" / ") || "User"
-      )
+    const configuredSpeakers = speakersForMessageRole(
+      config.detectedCharacters,
+      message.is_user,
+      userAliases.join(" / ") || "User"
     );
-    const defaultSpeakerId = message.is_user ? USER_SPEAKER_ID : defaultMessageSpeakerId(message, speakers, cards.map((card) => card.id));
     const skippedTrackerTags = payload.skippedTrackerTags.slice(0, 4e3);
     const messageIndex = messages.findIndex((item) => item.id === payload.messageId);
-    let previousAssistantMessage = null;
-    for (let index = messageIndex - 1; index >= 0; index--) {
-      if (messages[index].is_user) continue;
-      previousAssistantMessage = messages[index];
-      break;
-    }
-    const historicalSpeakerId = !message.is_user && previousAssistantMessage ? previousAssistantSpeakerFallback(
+    const speakers = addUnconfiguredDialogueSpeakers(
       message.content ?? "",
-      previousAssistantMessage.content ?? "",
-      defaultMessageSpeakerId(previousAssistantMessage, speakers, cards.map((card) => card.id)),
+      configuredSpeakers
+    );
+    const namedSpeakerMention = hasNamedSpeakerMention(
+      message.content ?? "",
       speakers,
       skippedTrackerTags
-    ) : null;
+    );
+    const messageCardId = !message.is_user ? defaultMessageSpeakerId(message, cards, cards.map((card) => card.id)) : null;
+    const messageCard = messageCardId ? cards.find((card) => card.id === messageCardId) : void 0;
+    const namelessCardSpeakerId = !message.is_user && !namedSpeakerMention && messageCard ? speakerIdMatchingCardTitle(messageCard.name, configuredSpeakers) : null;
+    const defaultSpeakerId = message.is_user ? USER_SPEAKER_ID : !namedSpeakerMention ? namelessCardSpeakerId : defaultMessageSpeakerId(message, speakers, cards.map((card) => card.id));
+    let previousAssistantMessage = null;
+    let historicalSpeakerId = null;
+    if (!message.is_user && !namelessCardSpeakerId) {
+      const searchForLastClearIdentity = !namedSpeakerMention;
+      for (let index = messageIndex - 1; index >= 0; index--) {
+        const previous = messages[index];
+        if (previous.is_user) continue;
+        const previousSpeakers = searchForLastClearIdentity ? addUnconfiguredDialogueSpeakers(previous.content ?? "", speakers) : speakers;
+        const candidate = previousAssistantSpeakerFallback(
+          message.content ?? "",
+          previous.content ?? "",
+          searchForLastClearIdentity ? null : defaultMessageSpeakerId(previous, speakers, cards.map((card) => card.id)),
+          previousSpeakers,
+          skippedTrackerTags
+        );
+        if (candidate) {
+          previousAssistantMessage = previous;
+          historicalSpeakerId = candidate;
+          const historicalSpeaker = previousSpeakers.find((speaker) => speaker.id === candidate);
+          if (historicalSpeaker && !speakers.some((speaker) => speaker.id === candidate)) {
+            speakers.push(historicalSpeaker);
+          }
+          break;
+        }
+        if (!searchForLastClearIdentity) {
+          previousAssistantMessage = previous;
+          break;
+        }
+      }
+    }
     const deterministic = parseRosterVoiceSegments(
       message.content ?? "",
       defaultSpeakerId,
@@ -1373,7 +1422,7 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
       skippedTrackerTags,
       historicalSpeakerId
     ));
-    if (payload.mode === "off" || payload.mode === "ambiguous" && reviewQuoteIndexes.size === 0) {
+    if (payload.mode === "off" || !!namelessCardSpeakerId || !namedSpeakerMention && !!historicalSpeakerId || payload.mode === "ambiguous" && reviewQuoteIndexes.size === 0) {
       sendSpeakerParse({
         requestId: payload.requestId,
         chatId: chat.id,
@@ -1386,7 +1435,7 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
     const connectionId = payload.connectionId.trim().slice(0, 128);
     const model = payload.model.trim().slice(0, 256);
     const cacheHash = hashMessageContent(JSON.stringify({
-      parser: 14,
+      parser: 18,
       mode: payload.mode,
       content: message.content ?? "",
       speakers: speakers.map((speaker) => ({ id: speaker.id, name: speaker.name })),

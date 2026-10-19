@@ -12,6 +12,7 @@ import {
   encodeConcatenatedWav,
   expiredSavedAudioRecords,
   hashMessageContent,
+  hasNamedSpeakerMention,
   mergeVoicePlan,
   npcSpeakerId,
   needsLlmSpeakerReview,
@@ -29,6 +30,7 @@ import {
   readConfig,
   readSavedAudioHistory,
   speakerAliases,
+  speakerIdMatchingCardTitle,
   speakerReviewQuoteIndexes,
   speakersForMessageRole,
   shouldPersistMessageAudio,
@@ -341,7 +343,9 @@ test('uses the connection default for unset NPCs and stray user assignments in a
 
 test('routes clear unconfigured dialogue subjects through connection-default voices', () => {
   const content = [
-    'Willum came out with the board and set it on the rail.',
+    'Tobben watches as Willum comes out with the board.',
+    '',
+    'Willum sets it on the rail.',
     '',
     '"I heard your rider too. Told you I sleep light."',
     '',
@@ -359,6 +363,43 @@ test('routes clear unconfigured dialogue subjects through connection-default voi
   ])
   assert.equal(playbackVoiceForSpeaker(segments[0].speakerId, false, {}, '', 'user-voice'), '')
   assert.equal(playbackVoiceForSpeaker(segments[1].speakerId, false, {}, '', 'user-voice'), '')
+})
+
+test('does not mistake capitalized narrative words for unconfigured speakers', () => {
+  const content = [
+    'Across the room, she closes the window.',
+    '',
+    '"The first thought."',
+    '',
+    'Silence settles over the table.',
+    '',
+    '"The second thought."',
+  ].join('\n')
+
+  assert.deepEqual(
+    addUnconfiguredDialogueSpeakers(content, [{ id: 'card', name: 'Mara' }]),
+    [{ id: 'card', name: 'Mara' }],
+  )
+})
+
+test('distinguishes name-free messages from messages that contain a speaker name', () => {
+  const speakers = [{ id: 'card', name: 'Mara Vale / Mara' }]
+  const nameless = 'She sets down the mug.\n\n"Especially ragged."\n\nHer hands stay on the table.'
+
+  assert.equal(hasNamedSpeakerMention(nameless, speakers), false)
+  assert.equal(hasNamedSpeakerMention('Mara sets down the mug.\n\n"Especially ragged."', speakers), true)
+  assert.equal(hasNamedSpeakerMention('She says, "Tell Mara I am ready."', speakers), true)
+})
+
+test('matches a name-free message only to a configured name contained in its card title', () => {
+  const speakers = [
+    { id: 'ruby', name: 'Ruby Vale / Ruby' },
+    { id: 'grace', name: 'Grace' },
+  ]
+
+  assert.equal(speakerIdMatchingCardTitle('Ruby Vale - The Long Reset', speakers), 'ruby')
+  assert.equal(speakerIdMatchingCardTitle('The Long Reset', speakers), null)
+  assert.equal(speakerIdMatchingCardTitle('Ruby and Grace at the Long Reset', speakers), null)
 })
 
 test('never persists generated audio for user messages', () => {
