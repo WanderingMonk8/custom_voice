@@ -9,6 +9,9 @@ function speakersForMessageRole(speakers, isUserMessage, userName = "User") {
     { id: USER_SPEAKER_ID, name: normalizeSpeakerName(userName) || "User" }
   ] : nonUserSpeakers;
 }
+function shouldPersistMessageAudio(isUserMessage, saveGeneratedAudio, regeneratingSavedAudio) {
+  return !isUserMessage && (saveGeneratedAudio || regeneratingSavedAudio);
+}
 function rollingRequestWindowDelay(recentStarts, now, requestLimit, windowMs = 6e4) {
   const safeLimit = Math.max(1, Math.round(requestLimit));
   const safeWindow = Math.max(1, Math.round(windowMs));
@@ -1466,7 +1469,7 @@ function setup(ctx) {
   saveAudioText.textContent = "Save generated audio";
   const saveAudioHint = document.createElement("span");
   saveAudioHint.className = "chat-voice-toggle-hint";
-  saveAudioHint.textContent = "Attach completed recordings to messages. Disabled by default.";
+  saveAudioHint.textContent = "Attach completed assistant-message recordings. User-message audio is never saved.";
   saveAudioCopy.append(saveAudioText, saveAudioHint);
   saveAudioLabel.append(saveAudioToggle, saveAudioCopy);
   const saveAudioRetention = document.createElement("label");
@@ -2143,7 +2146,7 @@ function setup(ctx) {
       return;
     }
     if (ctx.getActiveChat().chatId !== requestedChatId) return;
-    const regeneratingSavedAudio = nativeRegenerationAction || hasSavedAudioForCurrentSwipe(message);
+    const regeneratingSavedAudio = !message.is_user && (nativeRegenerationAction || hasSavedAudioForCurrentSwipe(message));
     if (regeneratingSavedAudio) {
       const { confirmed } = await ctx.ui.showConfirm({
         title: "Regenerate TTS audio?",
@@ -2377,7 +2380,11 @@ function setup(ctx) {
         return processing;
       });
       void Promise.all(processed).finally(() => normalizationContext.close().catch(() => void 0)).catch(() => void 0);
-      if (preferences.saveGeneratedAudio || regeneratingSavedAudio) {
+      if (shouldPersistMessageAudio(
+        message.is_user,
+        preferences.saveGeneratedAudio,
+        regeneratingSavedAudio
+      )) {
         playback.persistenceState = "pending";
         void Promise.all(processed).then(async (results) => {
           const failed = results.find((result) => !result.ok);
@@ -2972,17 +2979,17 @@ function setup(ctx) {
     const action = template.cloneNode(true);
     action.removeAttribute("id");
     action.dataset.chatVoiceContextTts = messageId;
-    action.setAttribute("aria-label", "Regenerate TTS audio");
+    action.setAttribute("aria-label", "Play TTS audio");
     const label = action.querySelector("span");
-    if (label) label.textContent = "Regenerate TTS audio";
-    else action.textContent = "Regenerate TTS audio";
+    if (label) label.textContent = "Play TTS audio";
+    else action.textContent = "Play TTS audio";
     const icon = action.querySelector("svg");
     if (icon) icon.outerHTML = PLAY_TTS_ACTION_ICON;
     action.addEventListener("click", (clickEvent) => {
       clickEvent.preventDefault();
       clickEvent.stopPropagation();
       hostDocument.dispatchEvent(new hostWindow.KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
-      void playMessage(messageId, true);
+      void playMessage(messageId, false);
     });
     insertAtActionIndex(template.parentElement, action, preferredTtsActionIndex());
   }
@@ -3132,8 +3139,8 @@ function setup(ctx) {
         button.className = currentActions.querySelector("button")?.className ?? "";
         button.dataset.chatVoiceSavedUserTts = "true";
         button.dataset.chatVoiceNativeTts = "true";
-        button.title = "Regenerate TTS audio";
-        button.setAttribute("aria-label", "Regenerate TTS audio");
+        button.title = "Play TTS audio";
+        button.setAttribute("aria-label", "Play TTS audio");
         button.innerHTML = PLAY_TTS_ACTION_ICON;
         insertAtActionIndex(currentActions, button, preferredTtsActionIndex());
       }).catch(() => void 0).finally(() => {

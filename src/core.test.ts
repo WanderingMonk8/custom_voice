@@ -29,6 +29,7 @@ import {
   speakerAliases,
   speakerReviewQuoteIndexes,
   speakersForMessageRole,
+  shouldPersistMessageAudio,
   rollingRequestWindowDelay,
   stripSkippedTrackerBlocks,
   USER_SPEAKER_ID,
@@ -324,6 +325,16 @@ test('only exposes the dedicated user speaker while parsing user messages', () =
     ...cast,
     { id: USER_SPEAKER_ID, name: 'Ken' },
   ])
+})
+
+test('never persists generated audio for user messages', () => {
+  assert.equal(shouldPersistMessageAudio(true, false, false), false)
+  assert.equal(shouldPersistMessageAudio(true, true, false), false)
+  assert.equal(shouldPersistMessageAudio(true, false, true), false)
+  assert.equal(shouldPersistMessageAudio(true, true, true), false)
+  assert.equal(shouldPersistMessageAudio(false, false, false), false)
+  assert.equal(shouldPersistMessageAudio(false, true, false), true)
+  assert.equal(shouldPersistMessageAudio(false, false, true), true)
 })
 
 test('keeps user-message narration separate from defaulted user dialogue', () => {

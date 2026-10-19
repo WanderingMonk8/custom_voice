@@ -18,6 +18,7 @@ import {
   rollingRequestWindowDelay,
   speakerAliases,
   speakersForMessageRole,
+  shouldPersistMessageAudio,
   USER_SPEAKER_ID,
   upsertSavedAudioRecord,
   type PlaybackSegment,
@@ -936,7 +937,7 @@ export function setup(ctx: SpindleFrontendContext) {
   saveAudioText.textContent = 'Save generated audio'
   const saveAudioHint = document.createElement('span')
   saveAudioHint.className = 'chat-voice-toggle-hint'
-  saveAudioHint.textContent = 'Attach completed recordings to messages. Disabled by default.'
+  saveAudioHint.textContent = 'Attach completed assistant-message recordings. User-message audio is never saved.'
   saveAudioCopy.append(saveAudioText, saveAudioHint)
   saveAudioLabel.append(saveAudioToggle, saveAudioCopy)
   const saveAudioRetention = document.createElement('label')
@@ -1715,7 +1716,8 @@ export function setup(ctx: SpindleFrontendContext) {
     }
     if (ctx.getActiveChat().chatId !== requestedChatId) return
 
-    const regeneratingSavedAudio = nativeRegenerationAction || hasSavedAudioForCurrentSwipe(message)
+    const regeneratingSavedAudio = !message.is_user
+      && (nativeRegenerationAction || hasSavedAudioForCurrentSwipe(message))
     if (regeneratingSavedAudio) {
       const { confirmed } = await ctx.ui.showConfirm({
         title: 'Regenerate TTS audio?',
@@ -1980,7 +1982,11 @@ export function setup(ctx: SpindleFrontendContext) {
       void Promise.all(processed)
         .finally(() => normalizationContext.close().catch(() => undefined))
         .catch(() => undefined)
-      if (preferences.saveGeneratedAudio || regeneratingSavedAudio) {
+      if (shouldPersistMessageAudio(
+        message.is_user,
+        preferences.saveGeneratedAudio,
+        regeneratingSavedAudio,
+      )) {
         playback.persistenceState = 'pending'
         void Promise.all(processed).then(async (results) => {
           const failed = results.find((result): result is { ok: false; error: unknown } => !result.ok)
@@ -2639,17 +2645,17 @@ export function setup(ctx: SpindleFrontendContext) {
     const action = template.cloneNode(true) as HTMLElement
     action.removeAttribute('id')
     action.dataset.chatVoiceContextTts = messageId
-    action.setAttribute('aria-label', 'Regenerate TTS audio')
+    action.setAttribute('aria-label', 'Play TTS audio')
     const label = action.querySelector('span')
-    if (label) label.textContent = 'Regenerate TTS audio'
-    else action.textContent = 'Regenerate TTS audio'
+    if (label) label.textContent = 'Play TTS audio'
+    else action.textContent = 'Play TTS audio'
     const icon = action.querySelector('svg')
     if (icon) icon.outerHTML = PLAY_TTS_ACTION_ICON
     action.addEventListener('click', (clickEvent) => {
       clickEvent.preventDefault()
       clickEvent.stopPropagation()
       hostDocument.dispatchEvent(new hostWindow.KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
-      void playMessage(messageId, true)
+      void playMessage(messageId, false)
     })
     insertAtActionIndex(template.parentElement, action, preferredTtsActionIndex())
   }
@@ -2811,8 +2817,8 @@ export function setup(ctx: SpindleFrontendContext) {
         button.className = currentActions.querySelector<HTMLButtonElement>('button')?.className ?? ''
         button.dataset.chatVoiceSavedUserTts = 'true'
         button.dataset.chatVoiceNativeTts = 'true'
-        button.title = 'Regenerate TTS audio'
-        button.setAttribute('aria-label', 'Regenerate TTS audio')
+        button.title = 'Play TTS audio'
+        button.setAttribute('aria-label', 'Play TTS audio')
         button.innerHTML = PLAY_TTS_ACTION_ICON
         insertAtActionIndex(currentActions, button, preferredTtsActionIndex())
       }).catch(() => undefined).finally(() => {

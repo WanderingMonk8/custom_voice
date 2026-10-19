@@ -117,6 +117,14 @@ export interface AdaptiveGenerationState {
   longWindowStreak: number
 }
 
+export function shouldPersistMessageAudio(
+  isUserMessage: boolean,
+  saveGeneratedAudio: boolean,
+  regeneratingSavedAudio: boolean,
+): boolean {
+  return !isUserMessage && (saveGeneratedAudio || regeneratingSavedAudio)
+}
+
 /** Return the delay required to keep request starts inside a rolling quota window. */
 export function rollingRequestWindowDelay(
   recentStarts: number[],
