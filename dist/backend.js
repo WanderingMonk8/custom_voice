@@ -291,10 +291,6 @@ function addUnconfiguredDialogueSpeakers(content, speakers) {
   }
   return result;
 }
-function hasNamedSpeakerMention(content, speakers, skippedTrackerTagPairs = "") {
-  const playbackContent = preparePlaybackContent(content, skippedTrackerTagPairs);
-  return speakers.some((speaker) => speakerAliases(speaker.name).some((alias) => new RegExp(`\\b${escapedPattern(alias)}\\b`, "iu").test(playbackContent)));
-}
 function speakerIdMatchingCardTitle(cardTitle, speakers) {
   const normalizedTitle = normalizeSpeakerName(cardTitle);
   const matchingSpeakerIds = /* @__PURE__ */ new Set();
@@ -312,7 +308,7 @@ function preferredCardSpeakerId(message, speakers, cardCharacterIds) {
   const explicitId = typeof message.extra?.character_id === "string" ? message.extra.character_id : "";
   if (explicitId && speakerIds.has(explicitId)) return explicitId;
   const messageName = normalizeSpeakerName(message.name ?? "").toLowerCase();
-  const namedSpeaker = messageName ? speakers.find((speaker) => !speaker.id.startsWith("npc:") && speakerAliases(speaker.name).some((alias) => alias.toLowerCase() === messageName)) : void 0;
+  const namedSpeaker = messageName ? speakers.find((speaker) => speakerAliases(speaker.name).some((alias) => alias.toLowerCase() === messageName)) : void 0;
   if (namedSpeaker) return namedSpeaker.id;
   const availableCardIds = [...new Set(cardCharacterIds)].filter((characterId) => speakerIds.has(characterId));
   return availableCardIds.length === 1 ? availableCardIds[0] : null;
@@ -649,6 +645,13 @@ function unambiguousNarrativeSpeaker(text, speakers) {
     return mainClausePossessiveSubject(text, speakers, mentions.possessive);
   }
   return null;
+}
+function hasNamedSpeakerSubject(content, speakers, skippedTrackerTagPairs = "") {
+  const playbackContent = preparePlaybackContent(content, skippedTrackerTagPairs);
+  return playbackParagraphs(playbackContent).some((paragraph) => {
+    const mentions = mentionedSpeakers(paragraph.text, speakers);
+    return preferredMentionedSpeaker(paragraph.text, speakers, mentions) !== null;
+  });
 }
 function currentParagraphSpeaker(before, after, speakers) {
   let paragraphStart = 0;
@@ -1369,19 +1372,19 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
       message.content ?? "",
       configuredSpeakers
     );
-    const namedSpeakerMention = hasNamedSpeakerMention(
+    const namedSpeakerSubject = hasNamedSpeakerSubject(
       message.content ?? "",
       speakers,
       skippedTrackerTags
     );
     const messageCardId = !message.is_user ? defaultMessageSpeakerId(message, cards, cards.map((card) => card.id)) : null;
     const messageCard = messageCardId ? cards.find((card) => card.id === messageCardId) : void 0;
-    const namelessCardSpeakerId = !message.is_user && !namedSpeakerMention && messageCard ? speakerIdMatchingCardTitle(messageCard.name, configuredSpeakers) : null;
-    const defaultSpeakerId = message.is_user ? USER_SPEAKER_ID : !namedSpeakerMention ? namelessCardSpeakerId : defaultMessageSpeakerId(message, speakers, cards.map((card) => card.id));
+    const namelessCardSpeakerId = !message.is_user && !namedSpeakerSubject && messageCard ? speakerIdMatchingCardTitle(messageCard.name, configuredSpeakers) : null;
+    const defaultSpeakerId = message.is_user ? USER_SPEAKER_ID : !namedSpeakerSubject ? namelessCardSpeakerId : defaultMessageSpeakerId(message, speakers, cards.map((card) => card.id));
     let previousAssistantMessage = null;
     let historicalSpeakerId = null;
     if (!message.is_user && !namelessCardSpeakerId) {
-      const searchForLastClearIdentity = !namedSpeakerMention;
+      const searchForLastClearIdentity = !namedSpeakerSubject;
       for (let index = messageIndex - 1; index >= 0; index--) {
         const previous = messages[index];
         if (previous.is_user) continue;
@@ -1422,7 +1425,7 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
       skippedTrackerTags,
       historicalSpeakerId
     ));
-    if (payload.mode === "off" || !!namelessCardSpeakerId || !namedSpeakerMention && !!historicalSpeakerId || payload.mode === "ambiguous" && reviewQuoteIndexes.size === 0) {
+    if (payload.mode === "off" || !!namelessCardSpeakerId || !namedSpeakerSubject && !!historicalSpeakerId || payload.mode === "ambiguous" && reviewQuoteIndexes.size === 0) {
       sendSpeakerParse({
         requestId: payload.requestId,
         chatId: chat.id,
@@ -1435,7 +1438,7 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
     const connectionId = payload.connectionId.trim().slice(0, 128);
     const model = payload.model.trim().slice(0, 256);
     const cacheHash = hashMessageContent(JSON.stringify({
-      parser: 18,
+      parser: 19,
       mode: payload.mode,
       content: message.content ?? "",
       speakers: speakers.map((speaker) => ({ id: speaker.id, name: speaker.name })),

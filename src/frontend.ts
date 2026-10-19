@@ -15,6 +15,7 @@ import {
   parseRosterVoiceSegments,
   playbackVoiceForSpeaker,
   preferredCardSpeakerId,
+  protectDefaultSpeakerSegments,
   readSavedAudioHistory,
   reducedRequestWindowLimit,
   rollingRequestWindowDelay,
@@ -1825,15 +1826,19 @@ export function setup(ctx: SpindleFrontendContext) {
           speakerAliases(character.name).map(alias => [npcSpeakerId(alias), character.id] as const)
         )),
       )
-      let segments = parseRosterVoiceSegments(
+      const localSegments = parseRosterVoiceSegments(
         message.content,
         defaultSpeakerId,
         playbackSpeakers,
         preferences.skippedTrackerTags,
       )
+      let segments = localSegments
       if (preferences.speakerParsingMode !== 'off') setStatus('Reviewing dialogue speakers…')
       try {
         segments = await requestSpeakerReviewedSegments(playbackChat.id, messageId, preferences)
+        if (message.is_user) {
+          segments = protectDefaultSpeakerSegments(localSegments, segments, USER_SPEAKER_ID)
+        }
       } catch (error) {
         console.warn('[Chat Voice] Backend speaker parsing failed; using the message-local parser.', error)
         if (playback.controller.signal.aborted) throw new DOMException('Playback stopped.', 'AbortError')
