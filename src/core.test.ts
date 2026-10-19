@@ -32,12 +32,14 @@ import {
   readConfig,
   readSavedAudioHistory,
   speakerAliases,
+  speakerAliasIdLookup,
   speakerIdMatchingCardTitle,
   speakerReviewQuoteIndexes,
   speakersForMessageRole,
   shouldPersistMessageAudio,
   rollingRequestWindowDelay,
   stripSkippedTrackerBlocks,
+  unconfiguredSpeakerId,
   USER_SPEAKER_ID,
   upsertSavedAudioRecord,
   type ChatVoiceConfig,
@@ -921,6 +923,87 @@ test('inherits speakers from clause-leading possessive action subjects', () => {
       { text: 'Seconded,', speakerId: 'katie' },
     ],
   )
+})
+
+test('anchors Ruby dialogue to the immediately preceding possessive-subject paragraph', () => {
+  const content = [
+    'The laugh comes first — and it lands wrong. Bright, automatic, the laugh she keeps for men who flirt at the bar, fired off at a question about trouble like a reflex striking a dead nerve. It cuts itself short.',
+    '',
+    "Ruby's hand comes to her own mouth. She swallows the rest of the laugh.",
+    '',
+    '"No one gives me trouble." Quiet now. "That isn\'t the word for it. Trouble\'s got a person in it."',
+  ].join('\n')
+  const speakers = [
+    { id: 'ruby', name: 'Ruby' },
+    { id: 'colton', name: 'Colton' },
+    { id: 'tess', name: 'Tess' },
+  ]
+
+  assert.deepEqual(
+    parseRosterVoiceSegments(content, null, speakers)
+      .filter(segment => segment.speakerId !== null)
+      .map(segment => segment.speakerId),
+    ['ruby', 'ruby'],
+  )
+  assert.deepEqual(speakerReviewQuoteIndexes(content, null, speakers), [])
+
+  const singleNewlineContent = [
+    'The laugh comes first — and it lands wrong.',
+    "Ruby's hand comes to her own mouth. She swallows the rest of the laugh.",
+    '"No one gives me trouble." Quiet now. "That isn\'t the word for it."',
+    "Her eyes go past Ken's shoulder to where Colton's chair sits empty.",
+    '"It\'s the same. It\'s always the same."',
+    "Across the street, Tess's tablet pulses once against her palm.",
+    "The edge of Ruby's red dress hangs between them.",
+  ].join('\n')
+  assert.equal(
+    parseRosterVoiceSegments(singleNewlineContent, null, speakers)
+      .find(segment => segment.text === 'No one gives me trouble.')?.speakerId,
+    'ruby',
+  )
+
+})
+
+test('does not invent a speaker from a sentence-leading descriptor between quotes', () => {
+  const content = [
+    "Ruby's hand comes to her own mouth. She swallows the rest of the laugh.",
+    '',
+    '"No one gives me trouble." Quiet now. "That isn\'t the word for it. Trouble\'s got a person in it."',
+    '',
+    'Her voice is level and quiet, the way a person talks who is choosing each word.',
+  ].join('\n')
+  const speakers = addUnconfiguredDialogueSpeakers(content, [{ id: 'ruby', name: 'Ruby' }])
+
+  assert.equal(speakers.some(speaker => speaker.id === unconfiguredSpeakerId('Quiet')), false)
+  assert.deepEqual(
+    parseRosterVoiceSegments(content, null, speakers)
+      .filter(segment => segment.speakerId !== null)
+      .map(segment => segment.speakerId),
+    ['ruby', 'ruby'],
+  )
+})
+
+test('maps message-local speaker aliases back to configured voices', () => {
+  const aliases = speakerAliasIdLookup([{ id: 'ruby', name: 'Ruby Vale / Ruby' }])
+
+  assert.equal(aliases.get(unconfiguredSpeakerId('Ruby')), 'ruby')
+  assert.equal(aliases.get(npcSpeakerId('Ruby')), 'ruby')
+})
+
+test('reports the rule path used for each speaker assignment when diagnostics are enabled', () => {
+  const segments = parseRosterVoiceSegments(
+    'Ruby\'s hand comes to her mouth.\n\n"No one gives me trouble."',
+    null,
+    [{ id: 'ruby', name: 'Ruby' }],
+    '',
+    null,
+    true,
+  )
+
+  assert.deepEqual(segments[0].debugPath, ['segment-type:narration', 'routing:narrator-voice'])
+  assert.ok(segments[1].debugPath?.includes('preceding-possessive-subject:ruby'))
+  assert.ok(segments[1].debugPath?.includes('local-selection:preceding-possessive-subject -> ruby'))
+  assert.ok(segments[1].debugPath?.includes('parser-result:ruby'))
 })
 
 test('does not let ambiguous LLM review override an adjacent narrative subject', () => {

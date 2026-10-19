@@ -98,6 +98,8 @@ export interface DetectedCharacter extends CharacterLike {
 export interface PlaybackSegment {
   text: string
   speakerId: string | null
+  /** Human-readable parser decisions, populated only when diagnostics are requested. */
+  debugPath?: string[]
 }
 
 export interface VoicePlanSegment {
@@ -668,7 +670,7 @@ const NON_NAME_PARAGRAPH_LEADS = new Set([
   'they', 'this', 'those', 'we', 'when', 'while', 'you', 'your',
 ])
 
-function unconfiguredSpeakerId(name: string): string {
+export function unconfiguredSpeakerId(name: string): string {
   return `unconfigured:${normalizeSpeakerName(name).toLowerCase()}`
 }
 
@@ -694,7 +696,10 @@ export function addUnconfiguredDialogueSpeakers(
     if (aliases.some(alias => knownAliases.has(alias.toLowerCase()))) return
     if (!explicitlyAttributed) {
       const occurrences = [...preparedContent.matchAll(
-        new RegExp(`\\b${escapedPattern(name)}(?:['’]s)?\\b`, 'giu'),
+        // A newly inferred proper name must repeat with the same capitalization.
+        // This prevents sentence-leading descriptors such as "Quiet now" from
+        // becoming characters merely because the word appears elsewhere in prose.
+        new RegExp(`\\b${escapedPattern(name)}(?:['’]s)?\\b`, 'gu'),
       )].length
       if (occurrences < 2) return
     }
@@ -887,6 +892,18 @@ export function mergeScannedCardCast(
 
 export function npcSpeakerId(name: string): string {
   return `npc:${normalizeSpeakerName(name).toLowerCase()}`
+}
+
+/** Map every transient alias ID back to its configured roster identity. */
+export function speakerAliasIdLookup(speakers: CharacterLike[]): Map<string, string> {
+  const aliases = new Map<string, string>()
+  for (const speaker of speakers) {
+    for (const alias of speakerAliases(speaker.name)) {
+      aliases.set(npcSpeakerId(alias), speaker.id)
+      aliases.set(unconfiguredSpeakerId(alias), speaker.id)
+    }
+  }
+  return aliases
 }
 
 const SPEAKER_NAME_RE = /^[\p{L}\p{N}][\p{L}\p{N}\p{M} ._'’\-]{0,63}$/u
@@ -1764,6 +1781,7 @@ function parseRosterVoiceSegmentsInternal(
   historicalSpeakerId: string | null = null,
   preserveLocalOnNullOverride = false,
   lowConfidenceQuoteIndexes?: Set<number>,
+  includeDebug = false,
 ): PlaybackSegment[] {
   const playbackContent = preparePlaybackContent(content, skippedTrackerTagPairs)
   const result: PlaybackSegment[] = []
@@ -1794,7 +1812,11 @@ function parseRosterVoiceSegmentsInternal(
     }
     const bridge = playbackContent.slice(cursor, quote.start)
     const narration = cleanPlaybackText(bridge)
-    if (narration) result.push({ text: narration, speakerId: null })
+    if (narration) result.push({
+      text: narration,
+      speakerId: null,
+      ...(includeDebug ? { debugPath: ['segment-type:narration', 'routing:narrator-voice'] } : {}),
+    })
     const speech = cleanPlaybackText(quote.text)
     if (speech) {
       const inference = inferQuotedSpeaker(
@@ -1848,14 +1870,18 @@ function parseRosterVoiceSegmentsInternal(
         && playbackQuotes(previousParagraph.text).length === 0
         ? paragraphSpeakers[paragraphIndex - 1]
         : null
-      const localSpeakerId: string | null = paragraphSpeakers[paragraphIndex]
-        ?? adjacentNarrativeSpeakerId
-        ?? downstreamReplies.get(paragraphIndex)
-        ?? inferredTurnSpeakerId
-        ?? continuedSpeakerId
-        ?? historicalFallbackId
-        ?? openingSpeakerId
-        ?? inference.speakerId
+      const localCandidates: Array<[string, string | null]> = [
+        ['current-paragraph-subject', paragraphSpeakers[paragraphIndex]],
+        ['preceding-possessive-subject', adjacentNarrativeSpeakerId],
+        ['downstream-reply', downstreamReplies.get(paragraphIndex) ?? null],
+        ['dialogue-turn-alternation', inferredTurnSpeakerId],
+        ['speaker-continuation', continuedSpeakerId],
+        ['previous-message-history', historicalFallbackId],
+        ['opening-dialogue-backfill', openingSpeakerId],
+        [`quote-inference:${inference.source}`, inference.speakerId],
+      ]
+      const selectedLocalCandidate = localCandidates.find(([, speakerId]) => speakerId !== null)
+      const localSpeakerId: string | null = selectedLocalCandidate?.[1] ?? null
       const confidentLocalSpeakerId = paragraphSpeakers[paragraphIndex]
         ?? adjacentNarrativeEvidenceId
         ?? (inference.source === 'explicit' || inference.source === 'paragraph'
@@ -1875,6 +1901,18 @@ function parseRosterVoiceSegmentsInternal(
       result.push({
         text: speech,
         speakerId,
+        ...(includeDebug ? {
+          debugPath: [
+            `segment-type:speech (quote ${currentQuoteIndex + 1})`,
+            ...localCandidates.map(([rule, candidate]) => `${rule}:${candidate ?? 'none'}`),
+            `local-selection:${selectedLocalCandidate?.[0] ?? 'none'} -> ${localSpeakerId ?? 'none'}`,
+            `local-confidence:${confidentLocalSpeakerId === localSpeakerId && localSpeakerId !== null ? 'high' : 'low'}`,
+            hasOverride
+              ? `llm-override:${overrideSpeakerId ?? 'none'} (${speakerId === overrideSpeakerId ? 'applied' : 'rejected'})`
+              : 'llm-override:not-present',
+            `parser-result:${speakerId ?? 'none'}`,
+          ],
+        } : {}),
       })
       if ((inference.confident || openingSpeakerId) && speakerId) lastConfidentSpeakerId = speakerId
       if (speakerId) lastAssignedSpeakerId = speakerId
@@ -1882,7 +1920,11 @@ function parseRosterVoiceSegmentsInternal(
     cursor = quote.end
   }
   const narration = cleanPlaybackText(playbackContent.slice(cursor))
-  if (narration) result.push({ text: narration, speakerId: null })
+  if (narration) result.push({
+    text: narration,
+    speakerId: null,
+    ...(includeDebug ? { debugPath: ['segment-type:narration', 'routing:narrator-voice'] } : {}),
+  })
   return result
 }
 
@@ -1892,6 +1934,7 @@ export function parseRosterVoiceSegments(
   speakers: CharacterLike[],
   skippedTrackerTagPairs = '',
   historicalSpeakerId: string | null = null,
+  includeDebug = false,
 ): PlaybackSegment[] {
   return parseRosterVoiceSegmentsInternal(
     content,
@@ -1900,6 +1943,9 @@ export function parseRosterVoiceSegments(
     skippedTrackerTagPairs,
     undefined,
     historicalSpeakerId,
+    false,
+    undefined,
+    includeDebug,
   )
 }
 
@@ -1911,6 +1957,7 @@ export function parseRosterVoiceSegmentsWithAssignments(
   skippedTrackerTagPairs = '',
   historicalSpeakerId: string | null = null,
   preserveLocalOnNullOverride = false,
+  includeDebug = false,
 ): PlaybackSegment[] {
   return parseRosterVoiceSegmentsInternal(
     content,
@@ -1920,6 +1967,8 @@ export function parseRosterVoiceSegmentsWithAssignments(
     new Map(assignments.map(assignment => [assignment.quote, assignment.speakerId])),
     historicalSpeakerId,
     preserveLocalOnNullOverride,
+    undefined,
+    includeDebug,
   )
 }
 
