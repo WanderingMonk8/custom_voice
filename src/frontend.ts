@@ -1155,6 +1155,7 @@ export function setup(ctx: SpindleFrontendContext) {
     finishAudible: () => void
   } | null = null
   const backgroundSynthesisControllers = new Set<AbortController>()
+  const backgroundSynthesisByMessage = new Map<string, AbortController>()
   const sharedSynthesisPacer: SynthesisPacer = {
     nextStartAt: 0,
     startQueue: Promise.resolve(),
@@ -1652,6 +1653,12 @@ export function setup(ctx: SpindleFrontendContext) {
     console.debug('[Chat Voice] Speaker assignment trace\n' + log)
   }
 
+  function appendSpeakerDebugLog(line: string): void {
+    if (!speakerAssignmentDebug) return
+    speakerDebugOutput.value += `${speakerDebugOutput.value ? '\n' : ''}${line}`
+    console.debug(`[Chat Voice] ${line}`)
+  }
+
   function requestLlmConnections(): Promise<LlmConnection[]> {
     const requestId = `connections-${Date.now().toString(36)}-${++llmConnectionRequestSequence}`
     return new Promise((resolve, reject) => {
@@ -1978,7 +1985,20 @@ export function setup(ctx: SpindleFrontendContext) {
         return { text: segment.text, voice }
       }))
       if (plan.length === 0) throw new Error('This message has no playable narration or dialogue.')
+      if (preferences.speakerAssignmentDebug) {
+        appendSpeakerDebugLog('\nSynthesis plan')
+        plan.forEach((segment, index) => appendSpeakerDebugLog(
+          `  [${index + 1}] voice=${JSON.stringify(segment.voice || '<connection default>')} text=${JSON.stringify(segment.text.length > 120 ? `${segment.text.slice(0, 117)}...` : segment.text)}`,
+        ))
+      }
 
+      const synthesisMessageKey = `${playbackChat.id}\u0000${messageId}`
+      const previousSynthesis = backgroundSynthesisByMessage.get(synthesisMessageKey)
+      if (previousSynthesis) {
+        previousSynthesis.abort()
+        backgroundSynthesisByMessage.delete(synthesisMessageKey)
+        appendSpeakerDebugLog('Cancelled an older unfinished synthesis/save for this message.')
+      }
       const synthesisController = new AbortController()
       const rateLimitBudget: RateLimitBudget = {
         blockedUntil: 0,
@@ -1990,6 +2010,7 @@ export function setup(ctx: SpindleFrontendContext) {
       }
       playback.synthesisController = synthesisController
       backgroundSynthesisControllers.add(synthesisController)
+      backgroundSynthesisByMessage.set(synthesisMessageKey, synthesisController)
       type PreparedSegment =
         | { ok: true; segment: SynthesizedVoiceSegment }
         | { ok: false; error: unknown }
@@ -2000,6 +2021,9 @@ export function setup(ctx: SpindleFrontendContext) {
       let rateLimitedForRemainder = false
       const prepare = async (index: number): Promise<PreparedSegment> => {
         try {
+          appendSpeakerDebugLog(
+            `Synthesis request [${index + 1}] started with voice=${JSON.stringify(plan[index].voice || '<connection default>')}.`,
+          )
           const segment = await runSynthesisTask(() => synthesizeVoiceSegment(
             connectionId,
             plan[index].text,
@@ -2028,8 +2052,14 @@ export function setup(ctx: SpindleFrontendContext) {
               }
             },
           ), activePlayback === playback && !playback.playbackStopped)
+          appendSpeakerDebugLog(
+            `Synthesis request [${index + 1}] completed with voice=${JSON.stringify(plan[index].voice || '<connection default>')} (${segment.data.byteLength} bytes, ${segment.mime}).`,
+          )
           return { ok: true, segment }
         } catch (error) {
+          appendSpeakerDebugLog(
+            `Synthesis request [${index + 1}] failed for voice=${JSON.stringify(plan[index].voice || '<connection default>')}: ${error instanceof Error ? error.message : String(error)}`,
+          )
           return { ok: false, error }
         }
       }
@@ -2187,6 +2217,9 @@ export function setup(ctx: SpindleFrontendContext) {
           }
         }).finally(() => {
           backgroundSynthesisControllers.delete(synthesisController)
+          if (backgroundSynthesisByMessage.get(synthesisMessageKey) === synthesisController) {
+            backgroundSynthesisByMessage.delete(synthesisMessageKey)
+          }
         })
       } else {
         playback.persistenceState = 'disabled'
@@ -2194,6 +2227,9 @@ export function setup(ctx: SpindleFrontendContext) {
           .catch(() => undefined)
           .finally(() => {
             backgroundSynthesisControllers.delete(synthesisController)
+            if (backgroundSynthesisByMessage.get(synthesisMessageKey) === synthesisController) {
+              backgroundSynthesisByMessage.delete(synthesisMessageKey)
+            }
           })
       }
 
@@ -2206,6 +2242,9 @@ export function setup(ctx: SpindleFrontendContext) {
       for (let index = 0; index < plan.length; index += 1) {
         const current = await processed[index]
         if (!current.ok) throw current.error
+        appendSpeakerDebugLog(
+          `Playback [${index + 1}] using voice=${JSON.stringify(plan[index].voice || '<connection default>')}.`,
+        )
         setStatus(`Playing ${index + 1} of ${plan.length} voice segment${plan.length === 1 ? '' : 's'}…`)
         await playDecodedBuffer(playback, current.segment, preferences.volume)
       }
@@ -2993,6 +3032,7 @@ export function setup(ctx: SpindleFrontendContext) {
     stopPlayback()
     for (const controller of backgroundSynthesisControllers) controller.abort()
     backgroundSynthesisControllers.clear()
+    backgroundSynthesisByMessage.clear()
     flushSave()
     if (saveTimer) clearTimeout(saveTimer)
     unsubscribeActivate()

@@ -1804,6 +1804,7 @@ function setup(ctx) {
   let scanning = false;
   let activePlayback = null;
   const backgroundSynthesisControllers = /* @__PURE__ */ new Set();
+  const backgroundSynthesisByMessage = /* @__PURE__ */ new Map();
   const sharedSynthesisPacer = {
     nextStartAt: 0,
     startQueue: Promise.resolve(),
@@ -2217,6 +2218,11 @@ function setup(ctx) {
     speakerDebugOutput.value = log;
     console.debug("[Chat Voice] Speaker assignment trace\n" + log);
   }
+  function appendSpeakerDebugLog(line) {
+    if (!speakerAssignmentDebug) return;
+    speakerDebugOutput.value += `${speakerDebugOutput.value ? "\n" : ""}${line}`;
+    console.debug(`[Chat Voice] ${line}`);
+  }
   function requestLlmConnections() {
     const requestId = `connections-${Date.now().toString(36)}-${++llmConnectionRequestSequence}`;
     return new Promise((resolve, reject) => {
@@ -2510,6 +2516,19 @@ function setup(ctx) {
         return { text: segment.text, voice };
       }));
       if (plan.length === 0) throw new Error("This message has no playable narration or dialogue.");
+      if (preferences.speakerAssignmentDebug) {
+        appendSpeakerDebugLog("\nSynthesis plan");
+        plan.forEach((segment, index) => appendSpeakerDebugLog(
+          `  [${index + 1}] voice=${JSON.stringify(segment.voice || "<connection default>")} text=${JSON.stringify(segment.text.length > 120 ? `${segment.text.slice(0, 117)}...` : segment.text)}`
+        ));
+      }
+      const synthesisMessageKey = `${playbackChat.id}\0${messageId}`;
+      const previousSynthesis = backgroundSynthesisByMessage.get(synthesisMessageKey);
+      if (previousSynthesis) {
+        previousSynthesis.abort();
+        backgroundSynthesisByMessage.delete(synthesisMessageKey);
+        appendSpeakerDebugLog("Cancelled an older unfinished synthesis/save for this message.");
+      }
       const synthesisController = new AbortController();
       const rateLimitBudget = {
         blockedUntil: 0,
@@ -2521,6 +2540,7 @@ function setup(ctx) {
       };
       playback.synthesisController = synthesisController;
       backgroundSynthesisControllers.add(synthesisController);
+      backgroundSynthesisByMessage.set(synthesisMessageKey, synthesisController);
       const adaptiveLimitToken = Symbol("playback-concurrency");
       let adaptiveConcurrency = 1;
       let shortConcurrencyCooldown = 0;
@@ -2528,6 +2548,9 @@ function setup(ctx) {
       let rateLimitedForRemainder = false;
       const prepare = async (index) => {
         try {
+          appendSpeakerDebugLog(
+            `Synthesis request [${index + 1}] started with voice=${JSON.stringify(plan[index].voice || "<connection default>")}.`
+          );
           const segment = await runSynthesisTask(() => synthesizeVoiceSegment(
             connectionId,
             plan[index].text,
@@ -2555,8 +2578,14 @@ function setup(ctx) {
               }
             }
           ), activePlayback === playback && !playback.playbackStopped);
+          appendSpeakerDebugLog(
+            `Synthesis request [${index + 1}] completed with voice=${JSON.stringify(plan[index].voice || "<connection default>")} (${segment.data.byteLength} bytes, ${segment.mime}).`
+          );
           return { ok: true, segment };
         } catch (error) {
+          appendSpeakerDebugLog(
+            `Synthesis request [${index + 1}] failed for voice=${JSON.stringify(plan[index].voice || "<connection default>")}: ${error instanceof Error ? error.message : String(error)}`
+          );
           return { ok: false, error };
         }
       };
@@ -2697,11 +2726,17 @@ function setup(ctx) {
           }
         }).finally(() => {
           backgroundSynthesisControllers.delete(synthesisController);
+          if (backgroundSynthesisByMessage.get(synthesisMessageKey) === synthesisController) {
+            backgroundSynthesisByMessage.delete(synthesisMessageKey);
+          }
         });
       } else {
         playback.persistenceState = "disabled";
         void Promise.all(processed).catch(() => void 0).finally(() => {
           backgroundSynthesisControllers.delete(synthesisController);
+          if (backgroundSynthesisByMessage.get(synthesisMessageKey) === synthesisController) {
+            backgroundSynthesisByMessage.delete(synthesisMessageKey);
+          }
         });
       }
       const initialBufferSize = Math.min(preferences.playbackBufferSegments, plan.length);
@@ -2712,6 +2747,9 @@ function setup(ctx) {
       for (let index = 0; index < plan.length; index += 1) {
         const current = await processed[index];
         if (!current.ok) throw current.error;
+        appendSpeakerDebugLog(
+          `Playback [${index + 1}] using voice=${JSON.stringify(plan[index].voice || "<connection default>")}.`
+        );
         setStatus(`Playing ${index + 1} of ${plan.length} voice segment${plan.length === 1 ? "" : "s"}\u2026`);
         await playDecodedBuffer(playback, current.segment, preferences.volume);
       }
@@ -3429,6 +3467,7 @@ function setup(ctx) {
     stopPlayback();
     for (const controller of backgroundSynthesisControllers) controller.abort();
     backgroundSynthesisControllers.clear();
+    backgroundSynthesisByMessage.clear();
     flushSave();
     if (saveTimer) clearTimeout(saveTimer);
     unsubscribeActivate();
