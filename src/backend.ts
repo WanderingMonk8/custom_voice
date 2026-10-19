@@ -4,6 +4,7 @@ import {
   applyConfigToMetadata,
   clampMessageLimit,
   hashMessageContent,
+  hasSustainedUnattributedAssistantDialogue,
   normalizeSpeakerName,
   parseCardCast,
   parseLlmSpeakerAssignments,
@@ -385,6 +386,15 @@ function queueSpeakerParse(
       skippedTrackerTags,
       historicalSpeakerId,
     )
+    const sustainedCardFallback = !message.is_user
+      && cards.length === 1
+      && defaultSpeakerId === cards[0].id
+      && hasSustainedUnattributedAssistantDialogue(
+        messages,
+        messageIndex,
+        config.detectedCharacters,
+        skippedTrackerTags,
+      )
     const reviewQuoteIndexes = new Set(speakerReviewQuoteIndexes(
       message.content ?? '',
       defaultSpeakerId,
@@ -394,6 +404,7 @@ function queueSpeakerParse(
     ))
     if (
       payload.mode === 'off'
+      || sustainedCardFallback
       || (payload.mode === 'ambiguous' && reviewQuoteIndexes.size === 0)
     ) {
       sendSpeakerParse({
@@ -409,7 +420,7 @@ function queueSpeakerParse(
     const connectionId = payload.connectionId.trim().slice(0, 128)
     const model = payload.model.trim().slice(0, 256)
     const cacheHash = hashMessageContent(JSON.stringify({
-      parser: 14,
+      parser: 15,
       mode: payload.mode,
       content: message.content ?? '',
       speakers: speakers.map(speaker => ({ id: speaker.id, name: speaker.name })),

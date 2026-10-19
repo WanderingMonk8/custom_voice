@@ -954,6 +954,26 @@ function speakerReviewQuoteIndexes(content, defaultSpeakerId, speakers, skippedT
   );
   return [...indexes];
 }
+function hasSustainedUnattributedAssistantDialogue(messages, currentMessageIndex, speakers, skippedTrackerTagPairs = "", threshold = 3) {
+  const required = Math.max(1, Math.round(threshold));
+  const assistantMessages = messages.slice(0, currentMessageIndex + 1).filter((message) => !message.is_user).slice(-required);
+  if (assistantMessages.length < required) return false;
+  return assistantMessages.every((message) => {
+    const content = message.content ?? "";
+    const quotes = speakerReviewQuotes(content, skippedTrackerTagPairs);
+    const nonEmptyQuoteIndexes = quotes.map((text, index) => ({ text, index })).filter((item) => !!item.text).map((item) => item.index);
+    if (nonEmptyQuoteIndexes.length === 0) return false;
+    const messageSpeakers = addUnconfiguredDialogueSpeakers(content, speakers);
+    const lowConfidence = new Set(speakerReviewQuoteIndexes(
+      content,
+      null,
+      messageSpeakers,
+      skippedTrackerTagPairs,
+      null
+    ));
+    return nonEmptyQuoteIndexes.every((index) => lowConfidence.has(index));
+  });
+}
 function parseRosterVoiceSegmentsInternal(content, defaultSpeakerId, speakers, skippedTrackerTagPairs = "", quoteSpeakerOverrides, historicalSpeakerId = null, preserveLocalOnNullOverride = false, lowConfidenceQuoteIndexes) {
   const playbackContent = preparePlaybackContent(content, skippedTrackerTagPairs);
   const result = [];
@@ -1366,6 +1386,12 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
       skippedTrackerTags,
       historicalSpeakerId
     );
+    const sustainedCardFallback = !message.is_user && cards.length === 1 && defaultSpeakerId === cards[0].id && hasSustainedUnattributedAssistantDialogue(
+      messages,
+      messageIndex,
+      config.detectedCharacters,
+      skippedTrackerTags
+    );
     const reviewQuoteIndexes = new Set(speakerReviewQuoteIndexes(
       message.content ?? "",
       defaultSpeakerId,
@@ -1373,7 +1399,7 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
       skippedTrackerTags,
       historicalSpeakerId
     ));
-    if (payload.mode === "off" || payload.mode === "ambiguous" && reviewQuoteIndexes.size === 0) {
+    if (payload.mode === "off" || sustainedCardFallback || payload.mode === "ambiguous" && reviewQuoteIndexes.size === 0) {
       sendSpeakerParse({
         requestId: payload.requestId,
         chatId: chat.id,
@@ -1386,7 +1412,7 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
     const connectionId = payload.connectionId.trim().slice(0, 128);
     const model = payload.model.trim().slice(0, 256);
     const cacheHash = hashMessageContent(JSON.stringify({
-      parser: 14,
+      parser: 15,
       mode: payload.mode,
       content: message.content ?? "",
       speakers: speakers.map((speaker) => ({ id: speaker.id, name: speaker.name })),

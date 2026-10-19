@@ -1688,6 +1688,40 @@ export function speakerReviewQuoteIndexes(
   return [...indexes]
 }
 
+export function hasSustainedUnattributedAssistantDialogue(
+  messages: MessageLike[],
+  currentMessageIndex: number,
+  speakers: CharacterLike[],
+  skippedTrackerTagPairs = '',
+  threshold = 3,
+): boolean {
+  const required = Math.max(1, Math.round(threshold))
+  const assistantMessages = messages
+    .slice(0, currentMessageIndex + 1)
+    .filter(message => !message.is_user)
+    .slice(-required)
+  if (assistantMessages.length < required) return false
+
+  return assistantMessages.every((message) => {
+    const content = message.content ?? ''
+    const quotes = speakerReviewQuotes(content, skippedTrackerTagPairs)
+    const nonEmptyQuoteIndexes = quotes
+      .map((text, index) => ({ text, index }))
+      .filter(item => !!item.text)
+      .map(item => item.index)
+    if (nonEmptyQuoteIndexes.length === 0) return false
+    const messageSpeakers = addUnconfiguredDialogueSpeakers(content, speakers)
+    const lowConfidence = new Set(speakerReviewQuoteIndexes(
+      content,
+      null,
+      messageSpeakers,
+      skippedTrackerTagPairs,
+      null,
+    ))
+    return nonEmptyQuoteIndexes.every(index => lowConfidence.has(index))
+  })
+}
+
 function parseRosterVoiceSegmentsInternal(
   content: string,
   defaultSpeakerId: string | null,

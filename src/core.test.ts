@@ -12,6 +12,7 @@ import {
   encodeConcatenatedWav,
   expiredSavedAudioRecords,
   hashMessageContent,
+  hasSustainedUnattributedAssistantDialogue,
   mergeVoicePlan,
   npcSpeakerId,
   needsLlmSpeakerReview,
@@ -359,6 +360,42 @@ test('routes clear unconfigured dialogue subjects through connection-default voi
   ])
   assert.equal(playbackVoiceForSpeaker(segments[0].speakerId, false, {}, '', 'user-voice'), '')
   assert.equal(playbackVoiceForSpeaker(segments[1].speakerId, false, {}, '', 'user-voice'), '')
+})
+
+test('uses a card fallback only after three identity-free assistant messages', () => {
+  const speakers = [{ id: 'card', name: 'Mara Vale / Mara' }]
+  const messages = [
+    { is_user: false, name: 'Assistant', content: 'She waits.\n\n"The first thought."' },
+    { is_user: true, name: 'Ken', content: 'I wait with her.' },
+    { is_user: false, name: 'Assistant', content: 'Her hand moves.\n\n"The second thought."' },
+    { is_user: true, name: 'Ken', content: 'I nod.' },
+    { is_user: false, name: 'Assistant', content: 'She looks away.\n\n"The third thought."' },
+  ]
+
+  assert.equal(hasSustainedUnattributedAssistantDialogue(messages, 2, speakers), false)
+  assert.equal(hasSustainedUnattributedAssistantDialogue(messages, 4, speakers), true)
+})
+
+test('breaks the sustained fallback streak on a clear named identity', () => {
+  const speakers = [{ id: 'card', name: 'Mara Vale / Mara' }]
+  const messages = [
+    { is_user: false, name: 'Assistant', content: '"The first thought."' },
+    { is_user: false, name: 'Assistant', content: 'Mara says, "This one is clear."' },
+    { is_user: false, name: 'Assistant', content: '"The third thought."' },
+  ]
+
+  assert.equal(hasSustainedUnattributedAssistantDialogue(messages, 2, speakers), false)
+})
+
+test('breaks the sustained fallback streak on an unconfigured named speaker', () => {
+  const speakers = [{ id: 'card', name: 'Mara Vale / Mara' }]
+  const messages = [
+    { is_user: false, name: 'Assistant', content: '"The first thought."' },
+    { is_user: false, name: 'Assistant', content: 'Tobben lifts the hammer.\n\n"This one is his."' },
+    { is_user: false, name: 'Assistant', content: '"The third thought."' },
+  ]
+
+  assert.equal(hasSustainedUnattributedAssistantDialogue(messages, 2, speakers), false)
 })
 
 test('never persists generated audio for user messages', () => {
