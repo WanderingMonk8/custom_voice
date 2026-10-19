@@ -105,6 +105,18 @@ export interface VoicePlanSegment {
   voice: string
 }
 
+export function playbackVoiceForSpeaker(
+  speakerId: string | null,
+  isUserMessage: boolean,
+  characterVoices: Readonly<Record<string, string>>,
+  narratorVoice: string,
+  userVoice: string,
+): string {
+  if (speakerId === USER_SPEAKER_ID) return isUserMessage ? userVoice : ''
+  if (speakerId) return characterVoices[speakerId] || ''
+  return narratorVoice
+}
+
 export interface PcmAudioSegment {
   sampleRate: number
   channels: Float32Array[]

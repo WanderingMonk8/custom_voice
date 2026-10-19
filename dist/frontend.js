@@ -9,6 +9,11 @@ function speakersForMessageRole(speakers, isUserMessage, userName = "User") {
     { id: USER_SPEAKER_ID, name: normalizeSpeakerName(userName) || "User" }
   ] : nonUserSpeakers;
 }
+function playbackVoiceForSpeaker(speakerId, isUserMessage, characterVoices, narratorVoice, userVoice) {
+  if (speakerId === USER_SPEAKER_ID) return isUserMessage ? userVoice : "";
+  if (speakerId) return characterVoices[speakerId] || "";
+  return narratorVoice;
+}
 function shouldPersistMessageAudio(isUserMessage, saveGeneratedAudio, regeneratingSavedAudio) {
   return !isUserMessage && (saveGeneratedAudio || regeneratingSavedAudio);
 }
@@ -2255,7 +2260,13 @@ function setup(ctx) {
       }
       const plan = mergeVoicePlan(segments.map((segment) => {
         const speakerId = segment.speakerId ? aliases.get(segment.speakerId) ?? segment.speakerId : null;
-        const voice = speakerId === USER_SPEAKER_ID ? config.userVoice : speakerId ? config.characterVoices[speakerId] || "" : config.narratorVoice;
+        const voice = playbackVoiceForSpeaker(
+          speakerId,
+          message.is_user,
+          config.characterVoices,
+          config.narratorVoice,
+          config.userVoice
+        );
         return { text: segment.text, voice };
       }));
       if (plan.length === 0) throw new Error("This message has no playable narration or dialogue.");

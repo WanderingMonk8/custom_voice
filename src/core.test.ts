@@ -21,6 +21,7 @@ import {
   parseRosterVoiceSegments,
   parseRosterVoiceSegmentsWithAssignments,
   parseSkippedTrackerTags,
+  playbackVoiceForSpeaker,
   preferredCardSpeakerId,
   previousAssistantSpeakerFallback,
   reducedRequestWindowLimit,
@@ -325,6 +326,16 @@ test('only exposes the dedicated user speaker while parsing user messages', () =
     ...cast,
     { id: USER_SPEAKER_ID, name: 'Ken' },
   ])
+})
+
+test('uses the connection default for unset NPCs and stray user assignments in assistant messages', () => {
+  const voices = { configured: 'character-voice', unset: '' }
+
+  assert.equal(playbackVoiceForSpeaker('configured', false, voices, 'narrator', 'user-voice'), 'character-voice')
+  assert.equal(playbackVoiceForSpeaker('unset', false, voices, 'narrator', 'user-voice'), '')
+  assert.equal(playbackVoiceForSpeaker(USER_SPEAKER_ID, false, voices, 'narrator', 'user-voice'), '')
+  assert.equal(playbackVoiceForSpeaker(USER_SPEAKER_ID, true, voices, 'narrator', 'user-voice'), 'user-voice')
+  assert.equal(playbackVoiceForSpeaker(null, false, voices, 'narrator', 'user-voice'), 'narrator')
 })
 
 test('never persists generated audio for user messages', () => {
