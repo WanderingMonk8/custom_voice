@@ -12,7 +12,7 @@ import {
   encodeConcatenatedWav,
   expiredSavedAudioRecords,
   hashMessageContent,
-  hasSustainedUnattributedAssistantDialogue,
+  hasNamedSpeakerMention,
   mergeVoicePlan,
   npcSpeakerId,
   needsLlmSpeakerReview,
@@ -381,56 +381,13 @@ test('does not mistake capitalized narrative words for unconfigured speakers', (
   )
 })
 
-test('uses a card fallback only after three identity-free assistant messages', () => {
+test('distinguishes name-free messages from messages that contain a speaker name', () => {
   const speakers = [{ id: 'card', name: 'Mara Vale / Mara' }]
-  const messages = [
-    { is_user: false, name: 'Assistant', content: 'She waits.\n\n"The first thought."' },
-    { is_user: true, name: 'Ken', content: 'I wait with her.' },
-    { is_user: false, name: 'Assistant', content: 'Her hand moves.\n\n"The second thought."' },
-    { is_user: true, name: 'Ken', content: 'I nod.' },
-    { is_user: false, name: 'Assistant', content: 'She looks away.\n\n"The third thought."' },
-  ]
+  const nameless = 'She sets down the mug.\n\n"Especially ragged."\n\nHer hands stay on the table.'
 
-  assert.equal(hasSustainedUnattributedAssistantDialogue(messages, 2, speakers), false)
-  assert.equal(hasSustainedUnattributedAssistantDialogue(messages, 4, speakers), true)
-})
-
-test('sustained solo-card fallback works even when the card was removed from the saved roster', () => {
-  const messages = [
-    { is_user: false, name: 'Assistant', content: 'She sets down the mug.\n\n"Especially ragged."' },
-    { is_user: false, name: 'Assistant', content: 'She takes the plate.\n\n"That is exactly right."' },
-    { is_user: false, name: 'Assistant', content: 'She points her fork.\n\n"One more each."' },
-  ]
-  const card = { id: 'card-mara', name: 'Mara Vale' }
-
-  assert.equal(hasSustainedUnattributedAssistantDialogue(messages, 2, []), true)
-  const segments = parseRosterVoiceSegments(messages[2].content, card.id, [card])
-  assert.deepEqual(
-    segments.filter(segment => segment.speakerId !== null).map(segment => segment.speakerId),
-    [card.id],
-  )
-})
-
-test('breaks the sustained fallback streak on a clear named identity', () => {
-  const speakers = [{ id: 'card', name: 'Mara Vale / Mara' }]
-  const messages = [
-    { is_user: false, name: 'Assistant', content: '"The first thought."' },
-    { is_user: false, name: 'Assistant', content: 'Mara says, "This one is clear."' },
-    { is_user: false, name: 'Assistant', content: '"The third thought."' },
-  ]
-
-  assert.equal(hasSustainedUnattributedAssistantDialogue(messages, 2, speakers), false)
-})
-
-test('breaks the sustained fallback streak on an unconfigured named speaker', () => {
-  const speakers = [{ id: 'card', name: 'Mara Vale / Mara' }]
-  const messages = [
-    { is_user: false, name: 'Assistant', content: '"The first thought."' },
-    { is_user: false, name: 'Assistant', content: 'Tobben lifts the hammer.\n\n"This one is his," Tobben said.' },
-    { is_user: false, name: 'Assistant', content: '"The third thought."' },
-  ]
-
-  assert.equal(hasSustainedUnattributedAssistantDialogue(messages, 2, speakers), false)
+  assert.equal(hasNamedSpeakerMention(nameless, speakers), false)
+  assert.equal(hasNamedSpeakerMention('Mara sets down the mug.\n\n"Especially ragged."', speakers), true)
+  assert.equal(hasNamedSpeakerMention('She says, "Tell Mara I am ready."', speakers), true)
 })
 
 test('never persists generated audio for user messages', () => {

@@ -4,7 +4,7 @@ import {
   applyConfigToMetadata,
   clampMessageLimit,
   hashMessageContent,
-  hasSustainedUnattributedAssistantDialogue,
+  hasNamedSpeakerMention,
   normalizeSpeakerName,
   parseCardCast,
   parseLlmSpeakerAssignments,
@@ -358,25 +358,28 @@ function queueSpeakerParse(
     )
     const skippedTrackerTags = payload.skippedTrackerTags.slice(0, 4_000)
     const messageIndex = messages.findIndex(item => item.id === payload.messageId)
-    const sustainedCardFallback = !message.is_user
-      && cards.length === 1
-      && hasSustainedUnattributedAssistantDialogue(
-        messages,
-        messageIndex,
-        config.detectedCharacters,
-        skippedTrackerTags,
-      )
     const speakers: CharacterLike[] = addUnconfiguredDialogueSpeakers(
       message.content ?? '',
       configuredSpeakers,
     )
-    if (sustainedCardFallback && !speakers.some(speaker => speaker.id === cards[0].id)) {
-      speakers.push({ id: cards[0].id, name: cards[0].name })
+    const namedSpeakerMention = hasNamedSpeakerMention(
+      message.content ?? '',
+      speakers,
+      skippedTrackerTags,
+    )
+    const namelessCardSpeakerId = !message.is_user && !namedSpeakerMention
+      ? defaultMessageSpeakerId(message, cards, cards.map(card => card.id))
+      : null
+    const namelessCard = namelessCardSpeakerId
+      ? cards.find(card => card.id === namelessCardSpeakerId)
+      : undefined
+    if (namelessCard && !speakers.some(speaker => speaker.id === namelessCard.id)) {
+      speakers.push({ id: namelessCard.id, name: namelessCard.name })
     }
     const defaultSpeakerId = message.is_user
       ? USER_SPEAKER_ID
-      : sustainedCardFallback
-        ? cards[0].id
+      : namelessCardSpeakerId
+        ? namelessCardSpeakerId
         : defaultMessageSpeakerId(message, speakers, cards.map(card => card.id))
     let previousAssistantMessage: typeof message | null = null
     for (let index = messageIndex - 1; index >= 0; index--) {
@@ -384,7 +387,9 @@ function queueSpeakerParse(
       previousAssistantMessage = messages[index]
       break
     }
-    const historicalSpeakerId = !message.is_user && previousAssistantMessage
+    const historicalSpeakerId = !message.is_user
+      && !namelessCardSpeakerId
+      && previousAssistantMessage
       ? previousAssistantSpeakerFallback(
           message.content ?? '',
           previousAssistantMessage.content ?? '',
@@ -409,7 +414,7 @@ function queueSpeakerParse(
     ))
     if (
       payload.mode === 'off'
-      || sustainedCardFallback
+      || !!namelessCardSpeakerId
       || (payload.mode === 'ambiguous' && reviewQuoteIndexes.size === 0)
     ) {
       sendSpeakerParse({
@@ -425,7 +430,7 @@ function queueSpeakerParse(
     const connectionId = payload.connectionId.trim().slice(0, 128)
     const model = payload.model.trim().slice(0, 256)
     const cacheHash = hashMessageContent(JSON.stringify({
-      parser: 16,
+      parser: 17,
       mode: payload.mode,
       content: message.content ?? '',
       speakers: speakers.map(speaker => ({ id: speaker.id, name: speaker.name })),
