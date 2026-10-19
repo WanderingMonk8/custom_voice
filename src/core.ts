@@ -668,7 +668,7 @@ const NON_NAME_PARAGRAPH_LEADS = new Set([
   'they', 'this', 'those', 'we', 'when', 'while', 'you', 'your',
 ])
 
-function unconfiguredSpeakerId(name: string): string {
+export function unconfiguredSpeakerId(name: string): string {
   return `unconfigured:${normalizeSpeakerName(name).toLowerCase()}`
 }
 
@@ -887,6 +887,18 @@ export function mergeScannedCardCast(
 
 export function npcSpeakerId(name: string): string {
   return `npc:${normalizeSpeakerName(name).toLowerCase()}`
+}
+
+/** Map every transient alias ID back to its configured roster identity. */
+export function speakerAliasIdLookup(speakers: CharacterLike[]): Map<string, string> {
+  const aliases = new Map<string, string>()
+  for (const speaker of speakers) {
+    for (const alias of speakerAliases(speaker.name)) {
+      aliases.set(npcSpeakerId(alias), speaker.id)
+      aliases.set(unconfiguredSpeakerId(alias), speaker.id)
+    }
+  }
+  return aliases
 }
 
 const SPEAKER_NAME_RE = /^[\p{L}\p{N}][\p{L}\p{N}\p{M} ._'’\-]{0,63}$/u

@@ -291,6 +291,16 @@ function preferredCardSpeakerId(message, speakers, cardCharacterIds) {
 function npcSpeakerId(name) {
   return `npc:${normalizeSpeakerName(name).toLowerCase()}`;
 }
+function speakerAliasIdLookup(speakers) {
+  const aliases = /* @__PURE__ */ new Map();
+  for (const speaker of speakers) {
+    for (const alias of speakerAliases(speaker.name)) {
+      aliases.set(npcSpeakerId(alias), speaker.id);
+      aliases.set(unconfiguredSpeakerId(alias), speaker.id);
+    }
+  }
+  return aliases;
+}
 function stripPlaybackMarkup(value) {
   return value.replace(/&lt;\/?(?:p|div|br)(?:\s[\s\S]*?)?&gt;/gi, "\n\n").replace(/\\?<\/?(?:p|div|br)(?:\s[^>]*)?>/gi, "\n\n").replace(/&lt;\/?[a-z][\s\S]*?&gt;/gi, " ").replace(/\\?<\/?[a-z][^>]*>/gi, " ").replace(/\[\/?(?:font|color|size|style|span|div|p|b|i|u|em|strong)(?:=[^\]]*)?\]/gi, " ").replace(/[*_~]+/g, " ");
 }
@@ -2336,9 +2346,7 @@ function setup(ctx) {
           message.name
         )
       );
-      const aliases = new Map(
-        playbackChat.characters.flatMap((character) => speakerAliases(character.name).map((alias) => [npcSpeakerId(alias), character.id]))
-      );
+      const aliases = speakerAliasIdLookup(playbackChat.characters);
       const localSegments = parseRosterVoiceSegments(
         message.content,
         defaultSpeakerId,

@@ -20,6 +20,7 @@ import {
   reducedRequestWindowLimit,
   rollingRequestWindowDelay,
   speakerAliases,
+  speakerAliasIdLookup,
   speakersForMessageRole,
   shouldPersistMessageAudio,
   USER_SPEAKER_ID,
@@ -1821,11 +1822,7 @@ export function setup(ctx: SpindleFrontendContext) {
           message.name,
         ),
       )
-      const aliases = new Map(
-        playbackChat.characters.flatMap((character) => (
-          speakerAliases(character.name).map(alias => [npcSpeakerId(alias), character.id] as const)
-        )),
-      )
+      const aliases = speakerAliasIdLookup(playbackChat.characters)
       const localSegments = parseRosterVoiceSegments(
         message.content,
         defaultSpeakerId,
