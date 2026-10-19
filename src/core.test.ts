@@ -342,7 +342,9 @@ test('uses the connection default for unset NPCs and stray user assignments in a
 
 test('routes clear unconfigured dialogue subjects through connection-default voices', () => {
   const content = [
-    'Willum came out with the board and set it on the rail.',
+    'Tobben watches as Willum comes out with the board.',
+    '',
+    'Willum sets it on the rail.',
     '',
     '"I heard your rider too. Told you I sleep light."',
     '',
@@ -360,6 +362,23 @@ test('routes clear unconfigured dialogue subjects through connection-default voi
   ])
   assert.equal(playbackVoiceForSpeaker(segments[0].speakerId, false, {}, '', 'user-voice'), '')
   assert.equal(playbackVoiceForSpeaker(segments[1].speakerId, false, {}, '', 'user-voice'), '')
+})
+
+test('does not mistake capitalized narrative words for unconfigured speakers', () => {
+  const content = [
+    'Across the room, she closes the window.',
+    '',
+    '"The first thought."',
+    '',
+    'Silence settles over the table.',
+    '',
+    '"The second thought."',
+  ].join('\n')
+
+  assert.deepEqual(
+    addUnconfiguredDialogueSpeakers(content, [{ id: 'card', name: 'Mara' }]),
+    [{ id: 'card', name: 'Mara' }],
+  )
 })
 
 test('uses a card fallback only after three identity-free assistant messages', () => {
@@ -391,7 +410,7 @@ test('breaks the sustained fallback streak on an unconfigured named speaker', ()
   const speakers = [{ id: 'card', name: 'Mara Vale / Mara' }]
   const messages = [
     { is_user: false, name: 'Assistant', content: '"The first thought."' },
-    { is_user: false, name: 'Assistant', content: 'Tobben lifts the hammer.\n\n"This one is his."' },
+    { is_user: false, name: 'Assistant', content: 'Tobben lifts the hammer.\n\n"This one is his," Tobben said.' },
     { is_user: false, name: 'Assistant', content: '"The third thought."' },
   ]
 

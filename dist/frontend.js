@@ -221,20 +221,27 @@ function unconfiguredSpeakerId(name) {
   return `unconfigured:${normalizeSpeakerName(name).toLowerCase()}`;
 }
 function addUnconfiguredDialogueSpeakers(content, speakers) {
+  const preparedContent = preparePlaybackContent(content);
   const result = [...speakers];
   const knownAliases = new Set(result.flatMap((speaker) => speakerAliases(speaker.name).map((alias) => alias.toLowerCase())));
-  const addCandidate = (rawName) => {
+  const addCandidate = (rawName, explicitlyAttributed = false) => {
     const name = normalizeSpeakerName(rawName.replace(/['’]s$/u, ""));
     const aliases = speakerAliases(name);
     const first = aliases[0]?.split(/\s+/u)[0]?.toLowerCase() ?? "";
     if (!name || !first || NON_NAME_PARAGRAPH_LEADS.has(first)) return;
     if (aliases.some((alias) => knownAliases.has(alias.toLowerCase()))) return;
+    if (!explicitlyAttributed) {
+      const occurrences = [...preparedContent.matchAll(
+        new RegExp(`\\b${escapedPattern(name)}(?:['\u2019]s)?\\b`, "giu")
+      )].length;
+      if (occurrences < 2) return;
+    }
     const id = unconfiguredSpeakerId(name);
     if (result.some((speaker) => speaker.id === id)) return;
     result.push({ id, name });
     for (const alias of aliases) knownAliases.add(alias.toLowerCase());
   };
-  const paragraphs = playbackParagraphs(preparePlaybackContent(content));
+  const paragraphs = playbackParagraphs(preparedContent);
   for (let paragraphIndex = 0; paragraphIndex < paragraphs.length; paragraphIndex += 1) {
     const paragraph = paragraphs[paragraphIndex];
     const quotes = playbackQuotes(paragraph.text);
@@ -257,7 +264,7 @@ function addUnconfiguredDialogueSpeakers(content, speakers) {
     const trailingLead = trailingNarration.match(
       /^([\p{Lu}][\p{L}\p{M}'’.\-]{1,63}(?:\s+[\p{Lu}][\p{L}\p{M}'’.\-]{1,63}){0,2})(?=\s+(?:said|asked|answered|replied|whispered|murmured|called|shouted|added|continued|observed|remarked|gasped|breathed)\b)/u
     )?.[1];
-    if (trailingLead) addCandidate(trailingLead);
+    if (trailingLead) addCandidate(trailingLead, true);
     else {
       const lead = trailingNarration.match(/^([\p{Lu}][\p{L}\p{M}'’.\-]{1,63})(?=\s)/u)?.[1];
       if (lead) addCandidate(lead);
