@@ -30,6 +30,7 @@ import {
   readConfig,
   readSavedAudioHistory,
   speakerAliases,
+  speakerIdMatchingCardTitle,
   speakerReviewQuoteIndexes,
   speakersForMessageRole,
   shouldPersistMessageAudio,
@@ -388,6 +389,16 @@ test('distinguishes name-free messages from messages that contain a speaker name
   assert.equal(hasNamedSpeakerMention(nameless, speakers), false)
   assert.equal(hasNamedSpeakerMention('Mara sets down the mug.\n\n"Especially ragged."', speakers), true)
   assert.equal(hasNamedSpeakerMention('She says, "Tell Mara I am ready."', speakers), true)
+})
+
+test('matches a name-free message only to a configured name contained in its card title', () => {
+  const speakers = [
+    { id: 'ruby', name: 'Ruby Vale / Ruby' },
+    { id: 'grace', name: 'Grace' },
+  ]
+
+  assert.equal(speakerIdMatchingCardTitle('Ruby Vale - The Long Reset', speakers), 'ruby')
+  assert.equal(speakerIdMatchingCardTitle('The Long Reset', speakers), null)
 })
 
 test('never persists generated audio for user messages', () => {

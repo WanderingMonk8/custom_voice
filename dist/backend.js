@@ -295,6 +295,17 @@ function hasNamedSpeakerMention(content, speakers, skippedTrackerTagPairs = "") 
   const playbackContent = preparePlaybackContent(content, skippedTrackerTagPairs);
   return speakers.some((speaker) => speakerAliases(speaker.name).some((alias) => new RegExp(`\\b${escapedPattern(alias)}\\b`, "iu").test(playbackContent)));
 }
+function speakerIdMatchingCardTitle(cardTitle, speakers) {
+  const normalizedTitle = normalizeSpeakerName(cardTitle);
+  let best = null;
+  for (const speaker of speakers) {
+    for (const alias of speakerAliases(speaker.name)) {
+      if (!new RegExp(`\\b${escapedPattern(alias)}\\b`, "iu").test(normalizedTitle)) continue;
+      if (!best || alias.length > best.length) best = { id: speaker.id, length: alias.length };
+    }
+  }
+  return best?.id ?? null;
+}
 function preferredCardSpeakerId(message, speakers, cardCharacterIds) {
   const speakerIds = new Set(speakers.map((speaker) => speaker.id));
   const explicitId = typeof message.extra?.character_id === "string" ? message.extra.character_id : "";
@@ -1362,25 +1373,40 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
       speakers,
       skippedTrackerTags
     );
-    const namelessCardSpeakerId = !message.is_user && !namedSpeakerMention ? defaultMessageSpeakerId(message, cards, cards.map((card) => card.id)) : null;
-    const namelessCard = namelessCardSpeakerId ? cards.find((card) => card.id === namelessCardSpeakerId) : void 0;
-    if (namelessCard && !speakers.some((speaker) => speaker.id === namelessCard.id)) {
-      speakers.push({ id: namelessCard.id, name: namelessCard.name });
-    }
-    const defaultSpeakerId = message.is_user ? USER_SPEAKER_ID : namelessCardSpeakerId ? namelessCardSpeakerId : defaultMessageSpeakerId(message, speakers, cards.map((card) => card.id));
+    const messageCardId = !message.is_user ? defaultMessageSpeakerId(message, cards, cards.map((card) => card.id)) : null;
+    const messageCard = messageCardId ? cards.find((card) => card.id === messageCardId) : void 0;
+    const namelessCardSpeakerId = !message.is_user && !namedSpeakerMention && messageCard ? speakerIdMatchingCardTitle(messageCard.name, configuredSpeakers) : null;
+    const defaultSpeakerId = message.is_user ? USER_SPEAKER_ID : !namedSpeakerMention ? namelessCardSpeakerId : defaultMessageSpeakerId(message, speakers, cards.map((card) => card.id));
     let previousAssistantMessage = null;
-    for (let index = messageIndex - 1; index >= 0; index--) {
-      if (messages[index].is_user) continue;
-      previousAssistantMessage = messages[index];
-      break;
+    let historicalSpeakerId = null;
+    if (!message.is_user && !namelessCardSpeakerId) {
+      const searchForLastClearIdentity = !namedSpeakerMention;
+      for (let index = messageIndex - 1; index >= 0; index--) {
+        const previous = messages[index];
+        if (previous.is_user) continue;
+        const previousSpeakers = searchForLastClearIdentity ? addUnconfiguredDialogueSpeakers(previous.content ?? "", speakers) : speakers;
+        const candidate = previousAssistantSpeakerFallback(
+          message.content ?? "",
+          previous.content ?? "",
+          searchForLastClearIdentity ? null : defaultMessageSpeakerId(previous, speakers, cards.map((card) => card.id)),
+          previousSpeakers,
+          skippedTrackerTags
+        );
+        if (candidate) {
+          previousAssistantMessage = previous;
+          historicalSpeakerId = candidate;
+          const historicalSpeaker = previousSpeakers.find((speaker) => speaker.id === candidate);
+          if (historicalSpeaker && !speakers.some((speaker) => speaker.id === candidate)) {
+            speakers.push(historicalSpeaker);
+          }
+          break;
+        }
+        if (!searchForLastClearIdentity) {
+          previousAssistantMessage = previous;
+          break;
+        }
+      }
     }
-    const historicalSpeakerId = !message.is_user && !namelessCardSpeakerId && previousAssistantMessage ? previousAssistantSpeakerFallback(
-      message.content ?? "",
-      previousAssistantMessage.content ?? "",
-      defaultMessageSpeakerId(previousAssistantMessage, speakers, cards.map((card) => card.id)),
-      speakers,
-      skippedTrackerTags
-    ) : null;
     const deterministic = parseRosterVoiceSegments(
       message.content ?? "",
       defaultSpeakerId,
@@ -1395,7 +1421,7 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
       skippedTrackerTags,
       historicalSpeakerId
     ));
-    if (payload.mode === "off" || !!namelessCardSpeakerId || payload.mode === "ambiguous" && reviewQuoteIndexes.size === 0) {
+    if (payload.mode === "off" || !!namelessCardSpeakerId || !namedSpeakerMention && !!historicalSpeakerId || payload.mode === "ambiguous" && reviewQuoteIndexes.size === 0) {
       sendSpeakerParse({
         requestId: payload.requestId,
         chatId: chat.id,
@@ -1408,7 +1434,7 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
     const connectionId = payload.connectionId.trim().slice(0, 128);
     const model = payload.model.trim().slice(0, 256);
     const cacheHash = hashMessageContent(JSON.stringify({
-      parser: 17,
+      parser: 18,
       mode: payload.mode,
       content: message.content ?? "",
       speakers: speakers.map((speaker) => ({ id: speaker.id, name: speaker.name })),

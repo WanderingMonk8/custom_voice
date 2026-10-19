@@ -17,6 +17,7 @@ import {
   readConfig,
   speakerReviewQuotes,
   speakerReviewQuoteIndexes,
+  speakerIdMatchingCardTitle,
   speakerAliases,
   speakersForMessageRole,
   USER_SPEAKER_ID,
@@ -367,37 +368,54 @@ function queueSpeakerParse(
       speakers,
       skippedTrackerTags,
     )
-    const namelessCardSpeakerId = !message.is_user && !namedSpeakerMention
+    const messageCardId = !message.is_user
       ? defaultMessageSpeakerId(message, cards, cards.map(card => card.id))
       : null
-    const namelessCard = namelessCardSpeakerId
-      ? cards.find(card => card.id === namelessCardSpeakerId)
+    const messageCard = messageCardId
+      ? cards.find(card => card.id === messageCardId)
       : undefined
-    if (namelessCard && !speakers.some(speaker => speaker.id === namelessCard.id)) {
-      speakers.push({ id: namelessCard.id, name: namelessCard.name })
-    }
+    const namelessCardSpeakerId = !message.is_user && !namedSpeakerMention && messageCard
+      ? speakerIdMatchingCardTitle(messageCard.name, configuredSpeakers)
+      : null
     const defaultSpeakerId = message.is_user
       ? USER_SPEAKER_ID
-      : namelessCardSpeakerId
+      : !namedSpeakerMention
         ? namelessCardSpeakerId
         : defaultMessageSpeakerId(message, speakers, cards.map(card => card.id))
     let previousAssistantMessage: typeof message | null = null
-    for (let index = messageIndex - 1; index >= 0; index--) {
-      if (messages[index].is_user) continue
-      previousAssistantMessage = messages[index]
-      break
-    }
-    const historicalSpeakerId = !message.is_user
-      && !namelessCardSpeakerId
-      && previousAssistantMessage
-      ? previousAssistantSpeakerFallback(
+    let historicalSpeakerId: string | null = null
+    if (!message.is_user && !namelessCardSpeakerId) {
+      const searchForLastClearIdentity = !namedSpeakerMention
+      for (let index = messageIndex - 1; index >= 0; index--) {
+        const previous = messages[index]
+        if (previous.is_user) continue
+        const previousSpeakers = searchForLastClearIdentity
+          ? addUnconfiguredDialogueSpeakers(previous.content ?? '', speakers)
+          : speakers
+        const candidate = previousAssistantSpeakerFallback(
           message.content ?? '',
-          previousAssistantMessage.content ?? '',
-          defaultMessageSpeakerId(previousAssistantMessage, speakers, cards.map(card => card.id)),
-          speakers,
+          previous.content ?? '',
+          searchForLastClearIdentity
+            ? null
+            : defaultMessageSpeakerId(previous, speakers, cards.map(card => card.id)),
+          previousSpeakers,
           skippedTrackerTags,
         )
-      : null
+        if (candidate) {
+          previousAssistantMessage = previous
+          historicalSpeakerId = candidate
+          const historicalSpeaker = previousSpeakers.find(speaker => speaker.id === candidate)
+          if (historicalSpeaker && !speakers.some(speaker => speaker.id === candidate)) {
+            speakers.push(historicalSpeaker)
+          }
+          break
+        }
+        if (!searchForLastClearIdentity) {
+          previousAssistantMessage = previous
+          break
+        }
+      }
+    }
     const deterministic = parseRosterVoiceSegments(
       message.content ?? '',
       defaultSpeakerId,
@@ -415,6 +433,7 @@ function queueSpeakerParse(
     if (
       payload.mode === 'off'
       || !!namelessCardSpeakerId
+      || (!namedSpeakerMention && !!historicalSpeakerId)
       || (payload.mode === 'ambiguous' && reviewQuoteIndexes.size === 0)
     ) {
       sendSpeakerParse({
@@ -430,7 +449,7 @@ function queueSpeakerParse(
     const connectionId = payload.connectionId.trim().slice(0, 128)
     const model = payload.model.trim().slice(0, 256)
     const cacheHash = hashMessageContent(JSON.stringify({
-      parser: 17,
+      parser: 18,
       mode: payload.mode,
       content: message.content ?? '',
       speakers: speakers.map(speaker => ({ id: speaker.id, name: speaker.name })),
