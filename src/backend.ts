@@ -1,5 +1,6 @@
 import {
   addScannedFirstNameAliases,
+  addUnconfiguredDialogueSpeakers,
   applyConfigToMetadata,
   clampMessageLimit,
   hashMessageContent,
@@ -349,10 +350,13 @@ function queueSpeakerParse(
         userAliases.push(alias)
       }
     }
-    const speakers: CharacterLike[] = speakersForMessageRole(
-      config.detectedCharacters,
-      message.is_user,
-      userAliases.join(' / ') || 'User',
+    const speakers: CharacterLike[] = addUnconfiguredDialogueSpeakers(
+      message.content ?? '',
+      speakersForMessageRole(
+        config.detectedCharacters,
+        message.is_user,
+        userAliases.join(' / ') || 'User',
+      ),
     )
     const defaultSpeakerId = message.is_user
       ? USER_SPEAKER_ID
@@ -405,7 +409,7 @@ function queueSpeakerParse(
     const connectionId = payload.connectionId.trim().slice(0, 128)
     const model = payload.model.trim().slice(0, 256)
     const cacheHash = hashMessageContent(JSON.stringify({
-      parser: 13,
+      parser: 14,
       mode: payload.mode,
       content: message.content ?? '',
       speakers: speakers.map(speaker => ({ id: speaker.id, name: speaker.name })),

@@ -105,6 +105,18 @@ export interface VoicePlanSegment {
   voice: string
 }
 
+export function playbackVoiceForSpeaker(
+  speakerId: string | null,
+  isUserMessage: boolean,
+  characterVoices: Readonly<Record<string, string>>,
+  narratorVoice: string,
+  userVoice: string,
+): string {
+  if (speakerId === USER_SPEAKER_ID) return isUserMessage ? userVoice : ''
+  if (speakerId) return characterVoices[speakerId] || ''
+  return narratorVoice
+}
+
 export interface PcmAudioSegment {
   sampleRate: number
   channels: Float32Array[]
@@ -629,6 +641,76 @@ export function speakerAliases(value: string): string[] {
     aliases.push(alias)
   }
   return aliases
+}
+
+const NON_NAME_PARAGRAPH_LEADS = new Set([
+  'a', 'an', 'and', 'after', 'before', 'but', 'down', 'from', 'he', 'her', 'his',
+  'it', 'its', 'she', 'so', 'somewhere', 'that', 'the', 'their', 'then', 'there',
+  'they', 'this', 'those', 'we', 'when', 'while', 'you', 'your',
+])
+
+function unconfiguredSpeakerId(name: string): string {
+  return `unconfigured:${normalizeSpeakerName(name).toLowerCase()}`
+}
+
+/**
+ * Add message-local identities for clear named subjects around dialogue.
+ * These identities are intentionally not persisted to the card cast; an absent
+ * voice mapping therefore routes them through the selected connection's voice.
+ */
+export function addUnconfiguredDialogueSpeakers(
+  content: string,
+  speakers: CharacterLike[],
+): CharacterLike[] {
+  const result = [...speakers]
+  const knownAliases = new Set(result.flatMap(speaker => (
+    speakerAliases(speaker.name).map(alias => alias.toLowerCase())
+  )))
+  const addCandidate = (rawName: string) => {
+    const name = normalizeSpeakerName(rawName.replace(/['’]s$/u, ''))
+    const aliases = speakerAliases(name)
+    const first = aliases[0]?.split(/\s+/u)[0]?.toLowerCase() ?? ''
+    if (!name || !first || NON_NAME_PARAGRAPH_LEADS.has(first)) return
+    if (aliases.some(alias => knownAliases.has(alias.toLowerCase()))) return
+    const id = unconfiguredSpeakerId(name)
+    if (result.some(speaker => speaker.id === id)) return
+    result.push({ id, name })
+    for (const alias of aliases) knownAliases.add(alias.toLowerCase())
+  }
+
+  const paragraphs = playbackParagraphs(preparePlaybackContent(content))
+  for (let paragraphIndex = 0; paragraphIndex < paragraphs.length; paragraphIndex += 1) {
+    const paragraph = paragraphs[paragraphIndex]
+    const quotes = playbackQuotes(paragraph.text)
+    if (quotes.length === 0) {
+      const nextHasDialogue = paragraphIndex + 1 < paragraphs.length
+        && playbackQuotes(paragraphs[paragraphIndex + 1].text).length > 0
+      if (!nextHasDialogue) continue
+      const narration = paragraph.text.replace(/^[\s,.;:!?—–-]+/u, '')
+      const lead = narration.match(/^([\p{Lu}][\p{L}\p{M}'’.\-]{1,63})(?=\s)/u)?.[1]
+      if (lead) addCandidate(lead)
+      continue
+    }
+    let cursor = 0
+    for (const quote of quotes) {
+      const narration = paragraph.text.slice(cursor, quote.start)
+        .replace(/^[\s,.;:!?—–-]+/u, '')
+      const lead = narration.match(/^([\p{Lu}][\p{L}\p{M}'’.\-]{1,63})(?=\s)/u)?.[1]
+      if (lead) addCandidate(lead)
+      cursor = quote.end
+    }
+    const trailingNarration = paragraph.text.slice(cursor)
+      .replace(/^[\s,.;:!?—–-]+/u, '')
+    const trailingLead = trailingNarration.match(
+      /^([\p{Lu}][\p{L}\p{M}'’.\-]{1,63}(?:\s+[\p{Lu}][\p{L}\p{M}'’.\-]{1,63}){0,2})(?=\s+(?:said|asked|answered|replied|whispered|murmured|called|shouted|added|continued|observed|remarked|gasped|breathed)\b)/u,
+    )?.[1]
+    if (trailingLead) addCandidate(trailingLead)
+    else {
+      const lead = trailingNarration.match(/^([\p{Lu}][\p{L}\p{M}'’.\-]{1,63})(?=\s)/u)?.[1]
+      if (lead) addCandidate(lead)
+    }
+  }
+  return result
 }
 
 export function preferredCardSpeakerId(

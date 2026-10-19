@@ -4,6 +4,7 @@ import type {
 } from 'lumiverse-spindle-types'
 import {
   adaptiveGenerationConcurrency,
+  addUnconfiguredDialogueSpeakers,
   clampSavedAudioLimit,
   DEFAULT_SAVED_AUDIO_LIMIT,
   encodeConcatenatedWav,
@@ -12,6 +13,7 @@ import {
   npcSpeakerId,
   normalizeSpeakerName,
   parseRosterVoiceSegments,
+  playbackVoiceForSpeaker,
   preferredCardSpeakerId,
   readSavedAudioHistory,
   reducedRequestWindowLimit,
@@ -1810,10 +1812,13 @@ export function setup(ctx: SpindleFrontendContext) {
             playbackChat.characters,
             playbackChat.cardCharacterIds ?? [],
           )
-      const playbackSpeakers = speakersForMessageRole(
-        playbackChat.characters,
-        message.is_user,
-        message.name,
+      const playbackSpeakers = addUnconfiguredDialogueSpeakers(
+        message.content,
+        speakersForMessageRole(
+          playbackChat.characters,
+          message.is_user,
+          message.name,
+        ),
       )
       const aliases = new Map(
         playbackChat.characters.flatMap((character) => (
@@ -1838,11 +1843,13 @@ export function setup(ctx: SpindleFrontendContext) {
         const speakerId = segment.speakerId
           ? aliases.get(segment.speakerId) ?? segment.speakerId
           : null
-        const voice = speakerId === USER_SPEAKER_ID
-          ? config.userVoice
-          : speakerId
-            ? config.characterVoices[speakerId] || ''
-            : config.narratorVoice
+        const voice = playbackVoiceForSpeaker(
+          speakerId,
+          message.is_user,
+          config.characterVoices,
+          config.narratorVoice,
+          config.userVoice,
+        )
         return { text: segment.text, voice }
       }))
       if (plan.length === 0) throw new Error('This message has no playable narration or dialogue.')

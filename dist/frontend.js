@@ -9,6 +9,11 @@ function speakersForMessageRole(speakers, isUserMessage, userName = "User") {
     { id: USER_SPEAKER_ID, name: normalizeSpeakerName(userName) || "User" }
   ] : nonUserSpeakers;
 }
+function playbackVoiceForSpeaker(speakerId, isUserMessage, characterVoices, narratorVoice, userVoice) {
+  if (speakerId === USER_SPEAKER_ID) return isUserMessage ? userVoice : "";
+  if (speakerId) return characterVoices[speakerId] || "";
+  return narratorVoice;
+}
 function shouldPersistMessageAudio(isUserMessage, saveGeneratedAudio, regeneratingSavedAudio) {
   return !isUserMessage && (saveGeneratedAudio || regeneratingSavedAudio);
 }
@@ -180,6 +185,85 @@ function speakerAliases(value) {
     aliases.push(alias);
   }
   return aliases;
+}
+var NON_NAME_PARAGRAPH_LEADS = /* @__PURE__ */ new Set([
+  "a",
+  "an",
+  "and",
+  "after",
+  "before",
+  "but",
+  "down",
+  "from",
+  "he",
+  "her",
+  "his",
+  "it",
+  "its",
+  "she",
+  "so",
+  "somewhere",
+  "that",
+  "the",
+  "their",
+  "then",
+  "there",
+  "they",
+  "this",
+  "those",
+  "we",
+  "when",
+  "while",
+  "you",
+  "your"
+]);
+function unconfiguredSpeakerId(name) {
+  return `unconfigured:${normalizeSpeakerName(name).toLowerCase()}`;
+}
+function addUnconfiguredDialogueSpeakers(content, speakers) {
+  const result = [...speakers];
+  const knownAliases = new Set(result.flatMap((speaker) => speakerAliases(speaker.name).map((alias) => alias.toLowerCase())));
+  const addCandidate = (rawName) => {
+    const name = normalizeSpeakerName(rawName.replace(/['’]s$/u, ""));
+    const aliases = speakerAliases(name);
+    const first = aliases[0]?.split(/\s+/u)[0]?.toLowerCase() ?? "";
+    if (!name || !first || NON_NAME_PARAGRAPH_LEADS.has(first)) return;
+    if (aliases.some((alias) => knownAliases.has(alias.toLowerCase()))) return;
+    const id = unconfiguredSpeakerId(name);
+    if (result.some((speaker) => speaker.id === id)) return;
+    result.push({ id, name });
+    for (const alias of aliases) knownAliases.add(alias.toLowerCase());
+  };
+  const paragraphs = playbackParagraphs(preparePlaybackContent(content));
+  for (let paragraphIndex = 0; paragraphIndex < paragraphs.length; paragraphIndex += 1) {
+    const paragraph = paragraphs[paragraphIndex];
+    const quotes = playbackQuotes(paragraph.text);
+    if (quotes.length === 0) {
+      const nextHasDialogue = paragraphIndex + 1 < paragraphs.length && playbackQuotes(paragraphs[paragraphIndex + 1].text).length > 0;
+      if (!nextHasDialogue) continue;
+      const narration = paragraph.text.replace(/^[\s,.;:!?—–-]+/u, "");
+      const lead = narration.match(/^([\p{Lu}][\p{L}\p{M}'’.\-]{1,63})(?=\s)/u)?.[1];
+      if (lead) addCandidate(lead);
+      continue;
+    }
+    let cursor = 0;
+    for (const quote of quotes) {
+      const narration = paragraph.text.slice(cursor, quote.start).replace(/^[\s,.;:!?—–-]+/u, "");
+      const lead = narration.match(/^([\p{Lu}][\p{L}\p{M}'’.\-]{1,63})(?=\s)/u)?.[1];
+      if (lead) addCandidate(lead);
+      cursor = quote.end;
+    }
+    const trailingNarration = paragraph.text.slice(cursor).replace(/^[\s,.;:!?—–-]+/u, "");
+    const trailingLead = trailingNarration.match(
+      /^([\p{Lu}][\p{L}\p{M}'’.\-]{1,63}(?:\s+[\p{Lu}][\p{L}\p{M}'’.\-]{1,63}){0,2})(?=\s+(?:said|asked|answered|replied|whispered|murmured|called|shouted|added|continued|observed|remarked|gasped|breathed)\b)/u
+    )?.[1];
+    if (trailingLead) addCandidate(trailingLead);
+    else {
+      const lead = trailingNarration.match(/^([\p{Lu}][\p{L}\p{M}'’.\-]{1,63})(?=\s)/u)?.[1];
+      if (lead) addCandidate(lead);
+    }
+  }
+  return result;
 }
 function preferredCardSpeakerId(message, speakers, cardCharacterIds) {
   const speakerIds = new Set(speakers.map((speaker) => speaker.id));
@@ -2231,10 +2315,13 @@ function setup(ctx) {
         playbackChat.characters,
         playbackChat.cardCharacterIds ?? []
       );
-      const playbackSpeakers = speakersForMessageRole(
-        playbackChat.characters,
-        message.is_user,
-        message.name
+      const playbackSpeakers = addUnconfiguredDialogueSpeakers(
+        message.content,
+        speakersForMessageRole(
+          playbackChat.characters,
+          message.is_user,
+          message.name
+        )
       );
       const aliases = new Map(
         playbackChat.characters.flatMap((character) => speakerAliases(character.name).map((alias) => [npcSpeakerId(alias), character.id]))
@@ -2255,7 +2342,13 @@ function setup(ctx) {
       }
       const plan = mergeVoicePlan(segments.map((segment) => {
         const speakerId = segment.speakerId ? aliases.get(segment.speakerId) ?? segment.speakerId : null;
-        const voice = speakerId === USER_SPEAKER_ID ? config.userVoice : speakerId ? config.characterVoices[speakerId] || "" : config.narratorVoice;
+        const voice = playbackVoiceForSpeaker(
+          speakerId,
+          message.is_user,
+          config.characterVoices,
+          config.narratorVoice,
+          config.userVoice
+        );
         return { text: segment.text, voice };
       }));
       if (plan.length === 0) throw new Error("This message has no playable narration or dialogue.");
