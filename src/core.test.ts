@@ -964,6 +964,25 @@ test('anchors Ruby dialogue to the immediately preceding possessive-subject para
 
 })
 
+test('does not invent a speaker from a sentence-leading descriptor between quotes', () => {
+  const content = [
+    "Ruby's hand comes to her own mouth. She swallows the rest of the laugh.",
+    '',
+    '"No one gives me trouble." Quiet now. "That isn\'t the word for it. Trouble\'s got a person in it."',
+    '',
+    'Her voice is level and quiet, the way a person talks who is choosing each word.',
+  ].join('\n')
+  const speakers = addUnconfiguredDialogueSpeakers(content, [{ id: 'ruby', name: 'Ruby' }])
+
+  assert.equal(speakers.some(speaker => speaker.id === unconfiguredSpeakerId('Quiet')), false)
+  assert.deepEqual(
+    parseRosterVoiceSegments(content, null, speakers)
+      .filter(segment => segment.speakerId !== null)
+      .map(segment => segment.speakerId),
+    ['ruby', 'ruby'],
+  )
+})
+
 test('maps message-local speaker aliases back to configured voices', () => {
   const aliases = speakerAliasIdLookup([{ id: 'ruby', name: 'Ruby Vale / Ruby' }])
 

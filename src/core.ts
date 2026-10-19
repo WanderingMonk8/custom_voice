@@ -696,7 +696,10 @@ export function addUnconfiguredDialogueSpeakers(
     if (aliases.some(alias => knownAliases.has(alias.toLowerCase()))) return
     if (!explicitlyAttributed) {
       const occurrences = [...preparedContent.matchAll(
-        new RegExp(`\\b${escapedPattern(name)}(?:['’]s)?\\b`, 'giu'),
+        // A newly inferred proper name must repeat with the same capitalization.
+        // This prevents sentence-leading descriptors such as "Quiet now" from
+        // becoming characters merely because the word appears elsewhere in prose.
+        new RegExp(`\\b${escapedPattern(name)}(?:['’]s)?\\b`, 'gu'),
       )].length
       if (occurrences < 2) return
     }
