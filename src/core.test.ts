@@ -971,6 +971,22 @@ test('maps message-local speaker aliases back to configured voices', () => {
   assert.equal(aliases.get(npcSpeakerId('Ruby')), 'ruby')
 })
 
+test('reports the rule path used for each speaker assignment when diagnostics are enabled', () => {
+  const segments = parseRosterVoiceSegments(
+    'Ruby\'s hand comes to her mouth.\n\n"No one gives me trouble."',
+    null,
+    [{ id: 'ruby', name: 'Ruby' }],
+    '',
+    null,
+    true,
+  )
+
+  assert.deepEqual(segments[0].debugPath, ['segment-type:narration', 'routing:narrator-voice'])
+  assert.ok(segments[1].debugPath?.includes('preceding-possessive-subject:ruby'))
+  assert.ok(segments[1].debugPath?.includes('local-selection:preceding-possessive-subject -> ruby'))
+  assert.ok(segments[1].debugPath?.includes('parser-result:ruby'))
+})
+
 test('does not let ambiguous LLM review override an adjacent narrative subject', () => {
   const content = [
     'Zuri\'s breath reforms as she steadies herself.',

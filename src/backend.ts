@@ -71,6 +71,7 @@ type FrontendMessage =
       connectionId: string
       model: string
       skippedTrackerTags: string
+      debug: boolean
     }
   | {
       type: 'chat_voice_save'
@@ -422,6 +423,7 @@ function queueSpeakerParse(
       speakers,
       skippedTrackerTags,
       historicalSpeakerId,
+      payload.debug,
     )
     const reviewQuoteIndexes = new Set(speakerReviewQuoteIndexes(
       message.content ?? '',
@@ -461,7 +463,7 @@ function queueSpeakerParse(
       model,
     }))
     const cached = config.parsedMessages[payload.messageId]
-    if (cached?.contentHash === cacheHash) {
+    if (!payload.debug && cached?.contentHash === cacheHash) {
       sendSpeakerParse({
         requestId: payload.requestId,
         chatId: chat.id,
@@ -531,12 +533,16 @@ function queueSpeakerParse(
       skippedTrackerTags,
       historicalSpeakerId,
       payload.mode === 'ambiguous',
+      payload.debug,
     )
     const nextConfig: ChatVoiceConfig = {
       ...config,
       parsedMessages: {
         ...config.parsedMessages,
-        [payload.messageId]: { contentHash: cacheHash, segments },
+        [payload.messageId]: {
+          contentHash: cacheHash,
+          segments: segments.map(segment => ({ text: segment.text, speakerId: segment.speakerId })),
+        },
       },
     }
     const metadata = applyConfigToMetadata(chat.metadata ?? {}, nextConfig)

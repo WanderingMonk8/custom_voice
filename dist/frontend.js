@@ -838,7 +838,7 @@ function canContinueSpeaker(bridge, previousSpeakerId, speakers) {
   }
   return true;
 }
-function parseRosterVoiceSegmentsInternal(content, defaultSpeakerId, speakers, skippedTrackerTagPairs = "", quoteSpeakerOverrides, historicalSpeakerId = null, preserveLocalOnNullOverride = false, lowConfidenceQuoteIndexes) {
+function parseRosterVoiceSegmentsInternal(content, defaultSpeakerId, speakers, skippedTrackerTagPairs = "", quoteSpeakerOverrides, historicalSpeakerId = null, preserveLocalOnNullOverride = false, lowConfidenceQuoteIndexes, includeDebug = false) {
   const playbackContent = preparePlaybackContent(content, skippedTrackerTagPairs);
   const result = [];
   const quotes = playbackQuotes(playbackContent);
@@ -866,7 +866,11 @@ function parseRosterVoiceSegmentsInternal(content, defaultSpeakerId, speakers, s
     }
     const bridge = playbackContent.slice(cursor, quote.start);
     const narration2 = cleanPlaybackText(bridge);
-    if (narration2) result.push({ text: narration2, speakerId: null });
+    if (narration2) result.push({
+      text: narration2,
+      speakerId: null,
+      ...includeDebug ? { debugPath: ["segment-type:narration", "routing:narrator-voice"] } : {}
+    });
     const speech = cleanPlaybackText(quote.text);
     if (speech) {
       const inference = inferQuotedSpeaker(
@@ -893,7 +897,18 @@ function parseRosterVoiceSegmentsInternal(content, defaultSpeakerId, speakers, s
         mentionedSpeakers(previousParagraph.text, speakers).possessive
       ) : null;
       const adjacentNarrativeEvidenceId = previousParagraph && playbackQuotes(previousParagraph.text).length === 0 ? paragraphSpeakers[paragraphIndex - 1] : null;
-      const localSpeakerId = paragraphSpeakers[paragraphIndex] ?? adjacentNarrativeSpeakerId ?? downstreamReplies.get(paragraphIndex) ?? inferredTurnSpeakerId ?? continuedSpeakerId ?? historicalFallbackId ?? openingSpeakerId ?? inference.speakerId;
+      const localCandidates = [
+        ["current-paragraph-subject", paragraphSpeakers[paragraphIndex]],
+        ["preceding-possessive-subject", adjacentNarrativeSpeakerId],
+        ["downstream-reply", downstreamReplies.get(paragraphIndex) ?? null],
+        ["dialogue-turn-alternation", inferredTurnSpeakerId],
+        ["speaker-continuation", continuedSpeakerId],
+        ["previous-message-history", historicalFallbackId],
+        ["opening-dialogue-backfill", openingSpeakerId],
+        [`quote-inference:${inference.source}`, inference.speakerId]
+      ];
+      const selectedLocalCandidate = localCandidates.find(([, speakerId2]) => speakerId2 !== null);
+      const localSpeakerId = selectedLocalCandidate?.[1] ?? null;
       const confidentLocalSpeakerId = paragraphSpeakers[paragraphIndex] ?? adjacentNarrativeEvidenceId ?? (inference.source === "explicit" || inference.source === "paragraph" ? inference.speakerId : null);
       if (!localSpeakerId || confidentLocalSpeakerId !== localSpeakerId) {
         lowConfidenceQuoteIndexes?.add(currentQuoteIndex);
@@ -903,7 +918,17 @@ function parseRosterVoiceSegmentsInternal(content, defaultSpeakerId, speakers, s
       const speakerId = hasOverride && (!preserveLocalOnNullOverride || overrideSpeakerId !== null && confidentLocalSpeakerId === null || localSpeakerId === null) ? overrideSpeakerId : localSpeakerId;
       result.push({
         text: speech,
-        speakerId
+        speakerId,
+        ...includeDebug ? {
+          debugPath: [
+            `segment-type:speech (quote ${currentQuoteIndex + 1})`,
+            ...localCandidates.map(([rule, candidate]) => `${rule}:${candidate ?? "none"}`),
+            `local-selection:${selectedLocalCandidate?.[0] ?? "none"} -> ${localSpeakerId ?? "none"}`,
+            `local-confidence:${confidentLocalSpeakerId === localSpeakerId && localSpeakerId !== null ? "high" : "low"}`,
+            hasOverride ? `llm-override:${overrideSpeakerId ?? "none"} (${speakerId === overrideSpeakerId ? "applied" : "rejected"})` : "llm-override:not-present",
+            `parser-result:${speakerId ?? "none"}`
+          ]
+        } : {}
       });
       if ((inference.confident || openingSpeakerId) && speakerId) lastConfidentSpeakerId = speakerId;
       if (speakerId) lastAssignedSpeakerId = speakerId;
@@ -911,17 +936,24 @@ function parseRosterVoiceSegmentsInternal(content, defaultSpeakerId, speakers, s
     cursor = quote.end;
   }
   const narration = cleanPlaybackText(playbackContent.slice(cursor));
-  if (narration) result.push({ text: narration, speakerId: null });
+  if (narration) result.push({
+    text: narration,
+    speakerId: null,
+    ...includeDebug ? { debugPath: ["segment-type:narration", "routing:narrator-voice"] } : {}
+  });
   return result;
 }
-function parseRosterVoiceSegments(content, defaultSpeakerId, speakers, skippedTrackerTagPairs = "", historicalSpeakerId = null) {
+function parseRosterVoiceSegments(content, defaultSpeakerId, speakers, skippedTrackerTagPairs = "", historicalSpeakerId = null, includeDebug = false) {
   return parseRosterVoiceSegmentsInternal(
     content,
     defaultSpeakerId,
     speakers,
     skippedTrackerTagPairs,
     void 0,
-    historicalSpeakerId
+    historicalSpeakerId,
+    false,
+    void 0,
+    includeDebug
   );
 }
 
@@ -1057,6 +1089,7 @@ async function loadPlaybackPreferences() {
     playbackBufferSegments: DEFAULT_PLAYBACK_BUFFER_SEGMENTS,
     concurrentGenerations: DEFAULT_CONCURRENT_GENERATIONS,
     rateLimitWaitSeconds: DEFAULT_RATE_LIMIT_WAIT_SECONDS,
+    speakerAssignmentDebug: false,
     defaultNarratorVoice: "",
     defaultUserVoice: ""
   };
@@ -1089,6 +1122,7 @@ async function loadPlaybackPreferences() {
       DEFAULT_RATE_LIMIT_WAIT_SECONDS,
       MAX_RATE_LIMIT_WAIT_SECONDS
     ),
+    speakerAssignmentDebug: row.value?.chatVoiceSpeakerAssignmentDebug === true,
     defaultNarratorVoice: typeof row.value?.chatVoiceDefaultNarratorVoice === "string" ? row.value.chatVoiceDefaultNarratorVoice.trim().slice(0, 512) : "",
     defaultUserVoice: typeof row.value?.chatVoiceDefaultUserVoice === "string" ? row.value.chatVoiceDefaultUserVoice.trim().slice(0, 512) : ""
   };
@@ -1140,7 +1174,7 @@ function saveLlmParsingPreferences(mode, connectionId, model) {
     chatVoiceLlmModel: model.trim().slice(0, 256)
   }));
 }
-function saveAdvancedPlaybackPreferences(bufferSegments, concurrentGenerations, rateLimitWaitSeconds) {
+function saveAdvancedPlaybackPreferences(bufferSegments, concurrentGenerations, rateLimitWaitSeconds, speakerAssignmentDebug) {
   return updateVoiceSettings((current) => ({
     ...current,
     chatVoicePlaybackBufferSegments: clampIntegerSetting(
@@ -1157,7 +1191,8 @@ function saveAdvancedPlaybackPreferences(bufferSegments, concurrentGenerations, 
       rateLimitWaitSeconds,
       DEFAULT_RATE_LIMIT_WAIT_SECONDS,
       MAX_RATE_LIMIT_WAIT_SECONDS
-    )
+    ),
+    chatVoiceSpeakerAssignmentDebug: speakerAssignmentDebug
   }));
 }
 function saveDefaultRoleVoice(role, voice) {
@@ -1479,6 +1514,13 @@ function setup(ctx) {
     .chat-voice-toggle input { margin:2px 0 0; accent-color:var(--lumiverse-accent, #7c6df2); }
     .chat-voice-toggle-copy { display:flex; flex-direction:column; gap:2px; }
     .chat-voice-toggle-hint { color:var(--lumiverse-text-muted); font-size:11px; line-height:1.4; }
+    .chat-voice-debug-output {
+      width:100%; min-height:220px; box-sizing:border-box; resize:vertical; padding:9px 10px;
+      border:1px solid var(--lumiverse-border); border-radius:var(--lumiverse-radius);
+      background:var(--lumiverse-fill-subtle); color:var(--lumiverse-text); font:11px/1.45 monospace;
+      white-space:pre; overflow:auto;
+    }
+    .chat-voice-debug-output[hidden] { display:none; }
     .chat-voice-storage { display:flex; flex-direction:column; gap:9px; }
     .chat-voice-retention { display:flex; align-items:center; justify-content:space-between; gap:12px; }
     .chat-voice-retention-copy { color:var(--lumiverse-text-muted); font-size:11px; line-height:1.4; }
@@ -1686,6 +1728,26 @@ function setup(ctx) {
   const playbackBufferField = createField("Playback buffer segments");
   const concurrentGenerationField = createField("Maximum concurrent generations");
   const rateLimitWaitField = createField("Rate-limit wait budget (seconds)");
+  const speakerDebugLabel = document.createElement("label");
+  speakerDebugLabel.className = "chat-voice-toggle";
+  const speakerDebugToggle = document.createElement("input");
+  speakerDebugToggle.type = "checkbox";
+  speakerDebugToggle.setAttribute("aria-label", "Show speaker assignment debug log");
+  const speakerDebugCopy = document.createElement("span");
+  speakerDebugCopy.className = "chat-voice-toggle-copy";
+  const speakerDebugText = document.createElement("span");
+  speakerDebugText.textContent = "Speaker assignment debug";
+  const speakerDebugHint = document.createElement("span");
+  speakerDebugHint.className = "chat-voice-toggle-hint";
+  speakerDebugHint.textContent = "Records the parser, review, alias, fallback, and final voice route for every segment.";
+  speakerDebugCopy.append(speakerDebugText, speakerDebugHint);
+  speakerDebugLabel.append(speakerDebugToggle, speakerDebugCopy);
+  const speakerDebugOutput = document.createElement("textarea");
+  speakerDebugOutput.className = "chat-voice-debug-output";
+  speakerDebugOutput.readOnly = true;
+  speakerDebugOutput.hidden = true;
+  speakerDebugOutput.placeholder = "Generate TTS to see the speaker assignment trace.";
+  speakerDebugOutput.setAttribute("aria-label", "Speaker assignment debug log");
   const advancedHint = document.createElement("div");
   advancedHint.className = "chat-voice-hint";
   advancedHint.textContent = "Concurrency starts at one and adapts up to the selected maximum. Dense short-segment runs stay at one request at a time, while sustained long runs increase gradually. Larger buffers reduce pauses but delay playback. The wait budget controls cumulative rate-limit cooldowns.";
@@ -1693,6 +1755,8 @@ function setup(ctx) {
     playbackBufferField.field,
     concurrentGenerationField.field,
     rateLimitWaitField.field,
+    speakerDebugLabel,
+    speakerDebugOutput,
     advancedHint
   );
   let applyingState = false;
@@ -1726,6 +1790,7 @@ function setup(ctx) {
   let playbackBufferSegments = DEFAULT_PLAYBACK_BUFFER_SEGMENTS;
   let concurrentGenerationLimit = DEFAULT_CONCURRENT_GENERATIONS;
   let rateLimitWaitSeconds = DEFAULT_RATE_LIMIT_WAIT_SECONDS;
+  let speakerAssignmentDebug = false;
   let advancedSettingsSaveTimer = null;
   let savingAdvancedSettings = false;
   let saveTimer = null;
@@ -1939,6 +2004,7 @@ function setup(ctx) {
   playbackBufferInput.addEventListener("change", onPlaybackBufferInput);
   concurrentGenerationInput.addEventListener("change", onConcurrentGenerationInput);
   rateLimitWaitInput.addEventListener("change", onRateLimitWaitInput);
+  speakerDebugToggle.addEventListener("change", onSpeakerDebugChanged);
   const addNpcInput = ctx.components.mountTextInput(addNpcInputSlot, {
     value: "",
     placeholder: "NPC name / aliases",
@@ -2096,9 +2162,55 @@ function setup(ctx) {
         mode: preferences.speakerParsingMode,
         connectionId: preferences.llmConnectionId,
         model: preferences.llmModel,
-        skippedTrackerTags: preferences.skippedTrackerTags
+        skippedTrackerTags: preferences.skippedTrackerTags,
+        debug: preferences.speakerAssignmentDebug
       });
     });
+  }
+  function speakerDebugName(speakerId, speakers) {
+    if (speakerId === null) return "narrator";
+    if (speakerId === USER_SPEAKER_ID) return "user persona";
+    const speaker = speakers.find((candidate) => candidate.id === speakerId);
+    return speaker ? `${speaker.name} [${speakerId}]` : speakerId;
+  }
+  function updateSpeakerDebugLog(messageId, isUserMessage, defaultSpeakerId, parserSpeakers, configuredSpeakers, localSegments, finalSegments, aliases, config, parsingMode) {
+    if (!speakerAssignmentDebug) return;
+    const lines = [
+      `Message ${messageId} (${isUserMessage ? "user" : "assistant"})`,
+      `Default speaker: ${speakerDebugName(defaultSpeakerId, parserSpeakers)}`,
+      `AI review mode: ${parsingMode}`,
+      `Parser roster: ${parserSpeakers.map((speaker) => `${speaker.name} [${speaker.id}]`).join(", ") || "(empty)"}`,
+      ""
+    ];
+    finalSegments.forEach((segment, index) => {
+      const local = localSegments[index]?.text === segment.text ? localSegments[index] : localSegments.find((candidate) => candidate.text === segment.text);
+      const rawSpeakerId = segment.speakerId;
+      const mappedSpeakerId = rawSpeakerId ? aliases.get(rawSpeakerId) ?? rawSpeakerId : null;
+      const voice = playbackVoiceForSpeaker(
+        mappedSpeakerId,
+        isUserMessage,
+        config.characterVoices,
+        config.narratorVoice,
+        config.userVoice
+      );
+      const localSpeaker = local?.speakerId ?? null;
+      const reviewPath = parsingMode === "off" ? localSpeaker === rawSpeakerId ? "backend-result:matches local parser (AI review disabled)" : `backend-result:changed ${localSpeaker ?? "none"} -> ${rawSpeakerId ?? "none"} (AI review disabled)` : localSpeaker === rawSpeakerId ? `backend/review-result:unchanged (${rawSpeakerId ?? "none"})` : `backend/review-result:changed ${localSpeaker ?? "none"} -> ${rawSpeakerId ?? "none"}`;
+      const aliasPath = rawSpeakerId && mappedSpeakerId !== rawSpeakerId ? `alias-map:${rawSpeakerId} -> ${mappedSpeakerId}` : `alias-map:${rawSpeakerId ?? "none"} (unchanged)`;
+      const routeName = speakerDebugName(mappedSpeakerId, configuredSpeakers);
+      const voicePath = voice ? `voice-route:${routeName} -> configured voice ${JSON.stringify(voice)}` : `voice-route:${routeName} -> connection default voice`;
+      lines.push(
+        `[${index + 1}] ${JSON.stringify(segment.text.length > 180 ? `${segment.text.slice(0, 177)}...` : segment.text)}`,
+        ...(segment.debugPath ?? local?.debugPath ?? ["parser-trace:unavailable"]).map((step) => `  ${step}`),
+        `  ${reviewPath}`,
+        `  ${aliasPath}`,
+        `  final-speaker:${speakerDebugName(mappedSpeakerId, configuredSpeakers)}`,
+        `  ${voicePath}`,
+        ""
+      );
+    });
+    const log = lines.join("\n");
+    speakerDebugOutput.value = log;
+    console.debug("[Chat Voice] Speaker assignment trace\n" + log);
   }
   function requestLlmConnections() {
     const requestId = `connections-${Date.now().toString(36)}-${++llmConnectionRequestSequence}`;
@@ -2290,10 +2402,12 @@ function setup(ctx) {
       preferences.playbackBufferSegments = playbackBufferSegments;
       preferences.concurrentGenerations = concurrentGenerationLimit;
       preferences.rateLimitWaitSeconds = rateLimitWaitSeconds;
+      preferences.speakerAssignmentDebug = speakerAssignmentDebug;
     } else {
       playbackBufferSegments = preferences.playbackBufferSegments;
       concurrentGenerationLimit = preferences.concurrentGenerations;
       rateLimitWaitSeconds = preferences.rateLimitWaitSeconds;
+      speakerAssignmentDebug = preferences.speakerAssignmentDebug;
     }
     const connectionId = config.connectionId || (connections.some((connection) => connection.id === preferences.connectionId) ? preferences.connectionId : connections.find((connection) => connection.is_default)?.id ?? lumiverseConnectionId);
     if (!connectionId) {
@@ -2351,7 +2465,9 @@ function setup(ctx) {
         message.content,
         defaultSpeakerId,
         playbackSpeakers,
-        preferences.skippedTrackerTags
+        preferences.skippedTrackerTags,
+        null,
+        preferences.speakerAssignmentDebug
       );
       let segments = localSegments;
       if (preferences.speakerParsingMode !== "off") setStatus("Reviewing dialogue speakers\u2026");
@@ -2365,6 +2481,18 @@ function setup(ctx) {
         if (playback.controller.signal.aborted) throw new DOMException("Playback stopped.", "AbortError");
         setStatus("Historical speaker lookup unavailable; using the message-local parser.");
       }
+      updateSpeakerDebugLog(
+        messageId,
+        message.is_user,
+        defaultSpeakerId,
+        playbackSpeakers,
+        playbackChat.characters,
+        localSegments,
+        segments,
+        aliases,
+        config,
+        preferences.speakerParsingMode
+      );
       const plan = mergeVoicePlan(segments.map((segment) => {
         const speakerId = segment.speakerId ? aliases.get(segment.speakerId) ?? segment.speakerId : null;
         const voice = playbackVoiceForSpeaker(
@@ -2856,9 +2984,12 @@ function setup(ctx) {
         playbackBufferSegments = preferences.playbackBufferSegments;
         concurrentGenerationLimit = preferences.concurrentGenerations;
         rateLimitWaitSeconds = preferences.rateLimitWaitSeconds;
+        speakerAssignmentDebug = preferences.speakerAssignmentDebug;
         playbackBufferInput.value = String(playbackBufferSegments);
         concurrentGenerationInput.value = String(concurrentGenerationLimit);
         rateLimitWaitInput.value = String(rateLimitWaitSeconds);
+        speakerDebugToggle.checked = speakerAssignmentDebug;
+        speakerDebugOutput.hidden = !speakerAssignmentDebug;
       }
       lumiverseConnectionId = connections.some((connection) => connection.id === preferences.connectionId) ? preferences.connectionId : connections.find((connection) => connection.is_default)?.id ?? "";
       const selectedConnectionId = activeChat?.connectionId || lumiverseConnectionId;
@@ -2968,6 +3099,11 @@ function setup(ctx) {
     rateLimitWaitInput.value = String(rateLimitWaitSeconds);
     scheduleAdvancedSettingsSave();
   }
+  function onSpeakerDebugChanged() {
+    speakerAssignmentDebug = speakerDebugToggle.checked;
+    speakerDebugOutput.hidden = !speakerAssignmentDebug;
+    scheduleAdvancedSettingsSave();
+  }
   async function persistAdvancedSettings() {
     savingAdvancedSettings = true;
     setStatus("Saving global advanced playback settings\u2026");
@@ -2975,7 +3111,8 @@ function setup(ctx) {
       await saveAdvancedPlaybackPreferences(
         playbackBufferSegments,
         concurrentGenerationLimit,
-        rateLimitWaitSeconds
+        rateLimitWaitSeconds,
+        speakerAssignmentDebug
       );
       setStatus("Advanced playback settings saved globally.", "saved");
     } catch (error) {
@@ -3339,7 +3476,8 @@ function setup(ctx) {
       void saveAdvancedPlaybackPreferences(
         playbackBufferSegments,
         concurrentGenerationLimit,
-        rateLimitWaitSeconds
+        rateLimitWaitSeconds,
+        speakerAssignmentDebug
       );
     }
     skippedTrackerTagsInput.destroy();
@@ -3349,6 +3487,7 @@ function setup(ctx) {
     playbackBufferInput.removeEventListener("change", onPlaybackBufferInput);
     concurrentGenerationInput.removeEventListener("change", onConcurrentGenerationInput);
     rateLimitWaitInput.removeEventListener("change", onRateLimitWaitInput);
+    speakerDebugToggle.removeEventListener("change", onSpeakerDebugChanged);
     addNpcInput.destroy();
     addNpcButton.removeEventListener("click", onAddNpc);
     addNpcInputSlot.removeEventListener("keydown", onAddNpcKeyDown);

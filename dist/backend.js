@@ -980,7 +980,7 @@ function speakerReviewQuoteIndexes(content, defaultSpeakerId, speakers, skippedT
   );
   return [...indexes];
 }
-function parseRosterVoiceSegmentsInternal(content, defaultSpeakerId, speakers, skippedTrackerTagPairs = "", quoteSpeakerOverrides, historicalSpeakerId = null, preserveLocalOnNullOverride = false, lowConfidenceQuoteIndexes) {
+function parseRosterVoiceSegmentsInternal(content, defaultSpeakerId, speakers, skippedTrackerTagPairs = "", quoteSpeakerOverrides, historicalSpeakerId = null, preserveLocalOnNullOverride = false, lowConfidenceQuoteIndexes, includeDebug = false) {
   const playbackContent = preparePlaybackContent(content, skippedTrackerTagPairs);
   const result = [];
   const quotes = playbackQuotes(playbackContent);
@@ -1008,7 +1008,11 @@ function parseRosterVoiceSegmentsInternal(content, defaultSpeakerId, speakers, s
     }
     const bridge = playbackContent.slice(cursor, quote.start);
     const narration2 = cleanPlaybackText(bridge);
-    if (narration2) result.push({ text: narration2, speakerId: null });
+    if (narration2) result.push({
+      text: narration2,
+      speakerId: null,
+      ...includeDebug ? { debugPath: ["segment-type:narration", "routing:narrator-voice"] } : {}
+    });
     const speech = cleanPlaybackText(quote.text);
     if (speech) {
       const inference = inferQuotedSpeaker(
@@ -1035,7 +1039,18 @@ function parseRosterVoiceSegmentsInternal(content, defaultSpeakerId, speakers, s
         mentionedSpeakers(previousParagraph.text, speakers).possessive
       ) : null;
       const adjacentNarrativeEvidenceId = previousParagraph && playbackQuotes(previousParagraph.text).length === 0 ? paragraphSpeakers[paragraphIndex - 1] : null;
-      const localSpeakerId = paragraphSpeakers[paragraphIndex] ?? adjacentNarrativeSpeakerId ?? downstreamReplies.get(paragraphIndex) ?? inferredTurnSpeakerId ?? continuedSpeakerId ?? historicalFallbackId ?? openingSpeakerId ?? inference.speakerId;
+      const localCandidates = [
+        ["current-paragraph-subject", paragraphSpeakers[paragraphIndex]],
+        ["preceding-possessive-subject", adjacentNarrativeSpeakerId],
+        ["downstream-reply", downstreamReplies.get(paragraphIndex) ?? null],
+        ["dialogue-turn-alternation", inferredTurnSpeakerId],
+        ["speaker-continuation", continuedSpeakerId],
+        ["previous-message-history", historicalFallbackId],
+        ["opening-dialogue-backfill", openingSpeakerId],
+        [`quote-inference:${inference.source}`, inference.speakerId]
+      ];
+      const selectedLocalCandidate = localCandidates.find(([, speakerId2]) => speakerId2 !== null);
+      const localSpeakerId = selectedLocalCandidate?.[1] ?? null;
       const confidentLocalSpeakerId = paragraphSpeakers[paragraphIndex] ?? adjacentNarrativeEvidenceId ?? (inference.source === "explicit" || inference.source === "paragraph" ? inference.speakerId : null);
       if (!localSpeakerId || confidentLocalSpeakerId !== localSpeakerId) {
         lowConfidenceQuoteIndexes?.add(currentQuoteIndex);
@@ -1045,7 +1060,17 @@ function parseRosterVoiceSegmentsInternal(content, defaultSpeakerId, speakers, s
       const speakerId = hasOverride && (!preserveLocalOnNullOverride || overrideSpeakerId !== null && confidentLocalSpeakerId === null || localSpeakerId === null) ? overrideSpeakerId : localSpeakerId;
       result.push({
         text: speech,
-        speakerId
+        speakerId,
+        ...includeDebug ? {
+          debugPath: [
+            `segment-type:speech (quote ${currentQuoteIndex + 1})`,
+            ...localCandidates.map(([rule, candidate]) => `${rule}:${candidate ?? "none"}`),
+            `local-selection:${selectedLocalCandidate?.[0] ?? "none"} -> ${localSpeakerId ?? "none"}`,
+            `local-confidence:${confidentLocalSpeakerId === localSpeakerId && localSpeakerId !== null ? "high" : "low"}`,
+            hasOverride ? `llm-override:${overrideSpeakerId ?? "none"} (${speakerId === overrideSpeakerId ? "applied" : "rejected"})` : "llm-override:not-present",
+            `parser-result:${speakerId ?? "none"}`
+          ]
+        } : {}
       });
       if ((inference.confident || openingSpeakerId) && speakerId) lastConfidentSpeakerId = speakerId;
       if (speakerId) lastAssignedSpeakerId = speakerId;
@@ -1053,20 +1078,27 @@ function parseRosterVoiceSegmentsInternal(content, defaultSpeakerId, speakers, s
     cursor = quote.end;
   }
   const narration = cleanPlaybackText(playbackContent.slice(cursor));
-  if (narration) result.push({ text: narration, speakerId: null });
+  if (narration) result.push({
+    text: narration,
+    speakerId: null,
+    ...includeDebug ? { debugPath: ["segment-type:narration", "routing:narrator-voice"] } : {}
+  });
   return result;
 }
-function parseRosterVoiceSegments(content, defaultSpeakerId, speakers, skippedTrackerTagPairs = "", historicalSpeakerId = null) {
+function parseRosterVoiceSegments(content, defaultSpeakerId, speakers, skippedTrackerTagPairs = "", historicalSpeakerId = null, includeDebug = false) {
   return parseRosterVoiceSegmentsInternal(
     content,
     defaultSpeakerId,
     speakers,
     skippedTrackerTagPairs,
     void 0,
-    historicalSpeakerId
+    historicalSpeakerId,
+    false,
+    void 0,
+    includeDebug
   );
 }
-function parseRosterVoiceSegmentsWithAssignments(content, defaultSpeakerId, speakers, assignments, skippedTrackerTagPairs = "", historicalSpeakerId = null, preserveLocalOnNullOverride = false) {
+function parseRosterVoiceSegmentsWithAssignments(content, defaultSpeakerId, speakers, assignments, skippedTrackerTagPairs = "", historicalSpeakerId = null, preserveLocalOnNullOverride = false, includeDebug = false) {
   return parseRosterVoiceSegmentsInternal(
     content,
     defaultSpeakerId,
@@ -1074,7 +1106,9 @@ function parseRosterVoiceSegmentsWithAssignments(content, defaultSpeakerId, spea
     skippedTrackerTagPairs,
     new Map(assignments.map((assignment) => [assignment.quote, assignment.speakerId])),
     historicalSpeakerId,
-    preserveLocalOnNullOverride
+    preserveLocalOnNullOverride,
+    void 0,
+    includeDebug
   );
 }
 function previousAssistantSpeakerFallback(content, previousAssistantContent, previousDefaultSpeakerId, speakers, skippedTrackerTagPairs = "") {
@@ -1416,7 +1450,8 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
       defaultSpeakerId,
       speakers,
       skippedTrackerTags,
-      historicalSpeakerId
+      historicalSpeakerId,
+      payload.debug
     );
     const reviewQuoteIndexes = new Set(speakerReviewQuoteIndexes(
       message.content ?? "",
@@ -1450,7 +1485,7 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
       model
     }));
     const cached = config.parsedMessages[payload.messageId];
-    if (cached?.contentHash === cacheHash) {
+    if (!payload.debug && cached?.contentHash === cacheHash) {
       sendSpeakerParse({
         requestId: payload.requestId,
         chatId: chat.id,
@@ -1513,13 +1548,17 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
       assignments,
       skippedTrackerTags,
       historicalSpeakerId,
-      payload.mode === "ambiguous"
+      payload.mode === "ambiguous",
+      payload.debug
     );
     const nextConfig = {
       ...config,
       parsedMessages: {
         ...config.parsedMessages,
-        [payload.messageId]: { contentHash: cacheHash, segments }
+        [payload.messageId]: {
+          contentHash: cacheHash,
+          segments: segments.map((segment) => ({ text: segment.text, speakerId: segment.speakerId }))
+        }
       }
     };
     const metadata = applyConfigToMetadata(chat.metadata ?? {}, nextConfig);

@@ -279,6 +279,7 @@ interface PlaybackPreferences {
   playbackBufferSegments: number
   concurrentGenerations: number
   rateLimitWaitSeconds: number
+  speakerAssignmentDebug: boolean
   defaultNarratorVoice: string
   defaultUserVoice: string
 }
@@ -336,6 +337,7 @@ async function loadPlaybackPreferences(): Promise<PlaybackPreferences> {
     playbackBufferSegments: DEFAULT_PLAYBACK_BUFFER_SEGMENTS,
     concurrentGenerations: DEFAULT_CONCURRENT_GENERATIONS,
     rateLimitWaitSeconds: DEFAULT_RATE_LIMIT_WAIT_SECONDS,
+    speakerAssignmentDebug: false,
     defaultNarratorVoice: '',
     defaultUserVoice: '',
   }
@@ -379,6 +381,7 @@ async function loadPlaybackPreferences(): Promise<PlaybackPreferences> {
       DEFAULT_RATE_LIMIT_WAIT_SECONDS,
       MAX_RATE_LIMIT_WAIT_SECONDS,
     ),
+    speakerAssignmentDebug: row.value?.chatVoiceSpeakerAssignmentDebug === true,
     defaultNarratorVoice: typeof row.value?.chatVoiceDefaultNarratorVoice === 'string'
       ? row.value.chatVoiceDefaultNarratorVoice.trim().slice(0, 512)
       : '',
@@ -451,6 +454,7 @@ function saveAdvancedPlaybackPreferences(
   bufferSegments: number,
   concurrentGenerations: number,
   rateLimitWaitSeconds: number,
+  speakerAssignmentDebug: boolean,
 ): Promise<void> {
   return updateVoiceSettings(current => ({
     ...current,
@@ -469,6 +473,7 @@ function saveAdvancedPlaybackPreferences(
       DEFAULT_RATE_LIMIT_WAIT_SECONDS,
       MAX_RATE_LIMIT_WAIT_SECONDS,
     ),
+    chatVoiceSpeakerAssignmentDebug: speakerAssignmentDebug,
   }))
 }
 
@@ -840,6 +845,13 @@ export function setup(ctx: SpindleFrontendContext) {
     .chat-voice-toggle input { margin:2px 0 0; accent-color:var(--lumiverse-accent, #7c6df2); }
     .chat-voice-toggle-copy { display:flex; flex-direction:column; gap:2px; }
     .chat-voice-toggle-hint { color:var(--lumiverse-text-muted); font-size:11px; line-height:1.4; }
+    .chat-voice-debug-output {
+      width:100%; min-height:220px; box-sizing:border-box; resize:vertical; padding:9px 10px;
+      border:1px solid var(--lumiverse-border); border-radius:var(--lumiverse-radius);
+      background:var(--lumiverse-fill-subtle); color:var(--lumiverse-text); font:11px/1.45 monospace;
+      white-space:pre; overflow:auto;
+    }
+    .chat-voice-debug-output[hidden] { display:none; }
     .chat-voice-storage { display:flex; flex-direction:column; gap:9px; }
     .chat-voice-retention { display:flex; align-items:center; justify-content:space-between; gap:12px; }
     .chat-voice-retention-copy { color:var(--lumiverse-text-muted); font-size:11px; line-height:1.4; }
@@ -1059,6 +1071,26 @@ export function setup(ctx: SpindleFrontendContext) {
   const playbackBufferField = createField('Playback buffer segments')
   const concurrentGenerationField = createField('Maximum concurrent generations')
   const rateLimitWaitField = createField('Rate-limit wait budget (seconds)')
+  const speakerDebugLabel = document.createElement('label')
+  speakerDebugLabel.className = 'chat-voice-toggle'
+  const speakerDebugToggle = document.createElement('input')
+  speakerDebugToggle.type = 'checkbox'
+  speakerDebugToggle.setAttribute('aria-label', 'Show speaker assignment debug log')
+  const speakerDebugCopy = document.createElement('span')
+  speakerDebugCopy.className = 'chat-voice-toggle-copy'
+  const speakerDebugText = document.createElement('span')
+  speakerDebugText.textContent = 'Speaker assignment debug'
+  const speakerDebugHint = document.createElement('span')
+  speakerDebugHint.className = 'chat-voice-toggle-hint'
+  speakerDebugHint.textContent = 'Records the parser, review, alias, fallback, and final voice route for every segment.'
+  speakerDebugCopy.append(speakerDebugText, speakerDebugHint)
+  speakerDebugLabel.append(speakerDebugToggle, speakerDebugCopy)
+  const speakerDebugOutput = document.createElement('textarea')
+  speakerDebugOutput.className = 'chat-voice-debug-output'
+  speakerDebugOutput.readOnly = true
+  speakerDebugOutput.hidden = true
+  speakerDebugOutput.placeholder = 'Generate TTS to see the speaker assignment trace.'
+  speakerDebugOutput.setAttribute('aria-label', 'Speaker assignment debug log')
   const advancedHint = document.createElement('div')
   advancedHint.className = 'chat-voice-hint'
   advancedHint.textContent = 'Concurrency starts at one and adapts up to the selected maximum. Dense short-segment runs stay at one request at a time, while sustained long runs increase gradually. Larger buffers reduce pauses but delay playback. The wait budget controls cumulative rate-limit cooldowns.'
@@ -1066,6 +1098,8 @@ export function setup(ctx: SpindleFrontendContext) {
     playbackBufferField.field,
     concurrentGenerationField.field,
     rateLimitWaitField.field,
+    speakerDebugLabel,
+    speakerDebugOutput,
     advancedHint,
   )
 
@@ -1100,6 +1134,7 @@ export function setup(ctx: SpindleFrontendContext) {
   let playbackBufferSegments = DEFAULT_PLAYBACK_BUFFER_SEGMENTS
   let concurrentGenerationLimit = DEFAULT_CONCURRENT_GENERATIONS
   let rateLimitWaitSeconds = DEFAULT_RATE_LIMIT_WAIT_SECONDS
+  let speakerAssignmentDebug = false
   let advancedSettingsSaveTimer: ReturnType<typeof setTimeout> | null = null
   let savingAdvancedSettings = false
   let saveTimer: ReturnType<typeof setTimeout> | null = null
@@ -1368,6 +1403,7 @@ export function setup(ctx: SpindleFrontendContext) {
   playbackBufferInput.addEventListener('change', onPlaybackBufferInput)
   concurrentGenerationInput.addEventListener('change', onConcurrentGenerationInput)
   rateLimitWaitInput.addEventListener('change', onRateLimitWaitInput)
+  speakerDebugToggle.addEventListener('change', onSpeakerDebugChanged)
 
   const addNpcInput = ctx.components.mountTextInput(addNpcInputSlot, {
     value: '', placeholder: 'NPC name / aliases', ariaLabel: 'NPC name and aliases to add', disabled: true,
@@ -1541,8 +1577,79 @@ export function setup(ctx: SpindleFrontendContext) {
         connectionId: preferences.llmConnectionId,
         model: preferences.llmModel,
         skippedTrackerTags: preferences.skippedTrackerTags,
+        debug: preferences.speakerAssignmentDebug,
       })
     })
+  }
+
+  function speakerDebugName(speakerId: string | null, speakers: Array<{ id: string; name: string }>): string {
+    if (speakerId === null) return 'narrator'
+    if (speakerId === USER_SPEAKER_ID) return 'user persona'
+    const speaker = speakers.find(candidate => candidate.id === speakerId)
+    return speaker ? `${speaker.name} [${speakerId}]` : speakerId
+  }
+
+  function updateSpeakerDebugLog(
+    messageId: string,
+    isUserMessage: boolean,
+    defaultSpeakerId: string | null,
+    parserSpeakers: Array<{ id: string; name: string }>,
+    configuredSpeakers: Array<{ id: string; name: string }>,
+    localSegments: PlaybackSegment[],
+    finalSegments: PlaybackSegment[],
+    aliases: ReadonlyMap<string, string>,
+    config: ReturnType<typeof collectConfig>,
+    parsingMode: PlaybackPreferences['speakerParsingMode'],
+  ): void {
+    if (!speakerAssignmentDebug) return
+    const lines = [
+      `Message ${messageId} (${isUserMessage ? 'user' : 'assistant'})`,
+      `Default speaker: ${speakerDebugName(defaultSpeakerId, parserSpeakers)}`,
+      `AI review mode: ${parsingMode}`,
+      `Parser roster: ${parserSpeakers.map(speaker => `${speaker.name} [${speaker.id}]`).join(', ') || '(empty)'}`,
+      '',
+    ]
+    finalSegments.forEach((segment, index) => {
+      const local = localSegments[index]?.text === segment.text
+        ? localSegments[index]
+        : localSegments.find(candidate => candidate.text === segment.text)
+      const rawSpeakerId = segment.speakerId
+      const mappedSpeakerId = rawSpeakerId ? aliases.get(rawSpeakerId) ?? rawSpeakerId : null
+      const voice = playbackVoiceForSpeaker(
+        mappedSpeakerId,
+        isUserMessage,
+        config.characterVoices,
+        config.narratorVoice,
+        config.userVoice,
+      )
+      const localSpeaker = local?.speakerId ?? null
+      const reviewPath = parsingMode === 'off'
+        ? (localSpeaker === rawSpeakerId
+            ? 'backend-result:matches local parser (AI review disabled)'
+            : `backend-result:changed ${localSpeaker ?? 'none'} -> ${rawSpeakerId ?? 'none'} (AI review disabled)`)
+        : localSpeaker === rawSpeakerId
+          ? `backend/review-result:unchanged (${rawSpeakerId ?? 'none'})`
+          : `backend/review-result:changed ${localSpeaker ?? 'none'} -> ${rawSpeakerId ?? 'none'}`
+      const aliasPath = rawSpeakerId && mappedSpeakerId !== rawSpeakerId
+        ? `alias-map:${rawSpeakerId} -> ${mappedSpeakerId}`
+        : `alias-map:${rawSpeakerId ?? 'none'} (unchanged)`
+      const routeName = speakerDebugName(mappedSpeakerId, configuredSpeakers)
+      const voicePath = voice
+        ? `voice-route:${routeName} -> configured voice ${JSON.stringify(voice)}`
+        : `voice-route:${routeName} -> connection default voice`
+      lines.push(
+        `[${index + 1}] ${JSON.stringify(segment.text.length > 180 ? `${segment.text.slice(0, 177)}...` : segment.text)}`,
+        ...((segment.debugPath ?? local?.debugPath ?? ['parser-trace:unavailable']).map(step => `  ${step}`)),
+        `  ${reviewPath}`,
+        `  ${aliasPath}`,
+        `  final-speaker:${speakerDebugName(mappedSpeakerId, configuredSpeakers)}`,
+        `  ${voicePath}`,
+        '',
+      )
+    })
+    const log = lines.join('\n')
+    speakerDebugOutput.value = log
+    console.debug('[Chat Voice] Speaker assignment trace\n' + log)
   }
 
   function requestLlmConnections(): Promise<LlmConnection[]> {
@@ -1759,10 +1866,12 @@ export function setup(ctx: SpindleFrontendContext) {
       preferences.playbackBufferSegments = playbackBufferSegments
       preferences.concurrentGenerations = concurrentGenerationLimit
       preferences.rateLimitWaitSeconds = rateLimitWaitSeconds
+      preferences.speakerAssignmentDebug = speakerAssignmentDebug
     } else {
       playbackBufferSegments = preferences.playbackBufferSegments
       concurrentGenerationLimit = preferences.concurrentGenerations
       rateLimitWaitSeconds = preferences.rateLimitWaitSeconds
+      speakerAssignmentDebug = preferences.speakerAssignmentDebug
     }
     const connectionId = config.connectionId
       || (connections.some(connection => connection.id === preferences.connectionId)
@@ -1828,6 +1937,8 @@ export function setup(ctx: SpindleFrontendContext) {
         defaultSpeakerId,
         playbackSpeakers,
         preferences.skippedTrackerTags,
+        null,
+        preferences.speakerAssignmentDebug,
       )
       let segments = localSegments
       if (preferences.speakerParsingMode !== 'off') setStatus('Reviewing dialogue speakers…')
@@ -1841,6 +1952,18 @@ export function setup(ctx: SpindleFrontendContext) {
         if (playback.controller.signal.aborted) throw new DOMException('Playback stopped.', 'AbortError')
         setStatus('Historical speaker lookup unavailable; using the message-local parser.')
       }
+      updateSpeakerDebugLog(
+        messageId,
+        message.is_user,
+        defaultSpeakerId,
+        playbackSpeakers,
+        playbackChat.characters,
+        localSegments,
+        segments,
+        aliases,
+        config,
+        preferences.speakerParsingMode,
+      )
       const plan = mergeVoicePlan(segments.map((segment) => {
         const speakerId = segment.speakerId
           ? aliases.get(segment.speakerId) ?? segment.speakerId
@@ -2379,9 +2502,12 @@ export function setup(ctx: SpindleFrontendContext) {
         playbackBufferSegments = preferences.playbackBufferSegments
         concurrentGenerationLimit = preferences.concurrentGenerations
         rateLimitWaitSeconds = preferences.rateLimitWaitSeconds
+        speakerAssignmentDebug = preferences.speakerAssignmentDebug
         playbackBufferInput.value = String(playbackBufferSegments)
         concurrentGenerationInput.value = String(concurrentGenerationLimit)
         rateLimitWaitInput.value = String(rateLimitWaitSeconds)
+        speakerDebugToggle.checked = speakerAssignmentDebug
+        speakerDebugOutput.hidden = !speakerAssignmentDebug
       }
       lumiverseConnectionId = connections.some(connection => connection.id === preferences.connectionId)
         ? preferences.connectionId
@@ -2509,6 +2635,12 @@ export function setup(ctx: SpindleFrontendContext) {
     scheduleAdvancedSettingsSave()
   }
 
+  function onSpeakerDebugChanged(): void {
+    speakerAssignmentDebug = speakerDebugToggle.checked
+    speakerDebugOutput.hidden = !speakerAssignmentDebug
+    scheduleAdvancedSettingsSave()
+  }
+
   async function persistAdvancedSettings(): Promise<void> {
     savingAdvancedSettings = true
     setStatus('Saving global advanced playback settings…')
@@ -2517,6 +2649,7 @@ export function setup(ctx: SpindleFrontendContext) {
         playbackBufferSegments,
         concurrentGenerationLimit,
         rateLimitWaitSeconds,
+        speakerAssignmentDebug,
       )
       setStatus('Advanced playback settings saved globally.', 'saved')
     } catch (error) {
@@ -2913,6 +3046,7 @@ export function setup(ctx: SpindleFrontendContext) {
         playbackBufferSegments,
         concurrentGenerationLimit,
         rateLimitWaitSeconds,
+        speakerAssignmentDebug,
       )
     }
     skippedTrackerTagsInput.destroy()
@@ -2922,6 +3056,7 @@ export function setup(ctx: SpindleFrontendContext) {
     playbackBufferInput.removeEventListener('change', onPlaybackBufferInput)
     concurrentGenerationInput.removeEventListener('change', onConcurrentGenerationInput)
     rateLimitWaitInput.removeEventListener('change', onRateLimitWaitInput)
+    speakerDebugToggle.removeEventListener('change', onSpeakerDebugChanged)
     addNpcInput.destroy()
     addNpcButton.removeEventListener('click', onAddNpc)
     addNpcInputSlot.removeEventListener('keydown', onAddNpcKeyDown)
