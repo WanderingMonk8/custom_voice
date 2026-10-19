@@ -205,20 +205,78 @@ function speakerAliases(value) {
   }
   return aliases;
 }
+var PREPOSITION_WORDS = [
+  "above",
+  "across",
+  "after",
+  "against",
+  "along",
+  "amid",
+  "among",
+  "around",
+  "as",
+  "at",
+  "before",
+  "behind",
+  "below",
+  "beneath",
+  "beside",
+  "between",
+  "beyond",
+  "by",
+  "despite",
+  "down",
+  "during",
+  "except",
+  "for",
+  "from",
+  "in",
+  "inside",
+  "into",
+  "like",
+  "near",
+  "of",
+  "off",
+  "on",
+  "onto",
+  "opposite",
+  "out",
+  "outside",
+  "over",
+  "past",
+  "since",
+  "through",
+  "throughout",
+  "to",
+  "toward",
+  "towards",
+  "under",
+  "underneath",
+  "unlike",
+  "until",
+  "up",
+  "upon",
+  "via",
+  "with",
+  "within",
+  "without"
+];
 var NON_NAME_PARAGRAPH_LEADS = /* @__PURE__ */ new Set([
+  ...PREPOSITION_WORDS,
   "a",
   "an",
+  "although",
   "and",
-  "after",
-  "before",
+  "because",
   "but",
-  "down",
-  "from",
   "he",
   "her",
+  "here",
   "his",
+  "if",
   "it",
   "its",
+  "or",
   "she",
   "so",
   "somewhere",
@@ -230,13 +288,24 @@ var NON_NAME_PARAGRAPH_LEADS = /* @__PURE__ */ new Set([
   "they",
   "this",
   "those",
-  "to",
+  "though",
+  "unless",
   "we",
   "when",
+  "where",
+  "whereas",
+  "whether",
   "while",
+  "who",
+  "whom",
+  "whose",
   "you",
   "your"
 ]);
+var PREPOSITION_BEFORE_NAME_PATTERN = new RegExp(
+  `\\b(?:${PREPOSITION_WORDS.join("|")})\\s*$`,
+  "iu"
+);
 function unconfiguredSpeakerId(name) {
   return `unconfigured:${normalizeSpeakerName(name).toLowerCase()}`;
 }
@@ -548,7 +617,7 @@ function discourseSubjectSpeaker(text, speakers, eligibleSpeakerIds) {
     let score = occurrence.start === firstMentionStart ? 2 : 0;
     if (!lead.trim() || /^[\s{(\[]*$/u.test(lead)) score += 10;
     else if (!earlierInClause && /^[^,]{1,48},\s*(?:(?:a|an|the)\s+)?$/iu.test(lead)) score += 8;
-    if (/\b(?:to|from|for|with|by|at|on|of|beside|behind|under|near|toward|towards)\s*$/iu.test(lead)) {
+    if (PREPOSITION_BEFORE_NAME_PATTERN.test(lead)) {
       score -= 6;
     }
     if (/\b(?:that|which|who|whom|whose|because|while|when|if|though|although)\s*$/iu.test(lead)) {

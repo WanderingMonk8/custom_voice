@@ -404,6 +404,42 @@ test('does not mistake repeated sentence-leading prepositions between quotes for
   )
 })
 
+test('rejects common prepositional paragraph leads as inferred character names', () => {
+  const prepositions = ['Across', 'Behind', 'From', 'Inside', 'Near', 'Through', 'Under', 'With']
+
+  for (const preposition of prepositions) {
+    const content = [
+      `${preposition} the room, she waits.`,
+      '',
+      '"The first thought."',
+      '',
+      `${preposition} the hall, she listens.`,
+      '',
+      '"The second thought."',
+    ].join('\n')
+    const speakers = addUnconfiguredDialogueSpeakers(content, [{ id: 'mira', name: 'Mira' }])
+    assert.equal(
+      speakers.some(speaker => speaker.id === unconfiguredSpeakerId(preposition)),
+      false,
+      `${preposition} must not become a speaker`,
+    )
+  }
+})
+
+test('does not treat a configured name after a preposition as a speaker without attribution', () => {
+  const speakers = [
+    { id: 'mira', name: 'Mira' },
+    { id: 'tess', name: 'Tess' },
+  ]
+
+  assert.equal(hasNamedSpeakerSubject('She turns to Tess. "I am ready."', speakers), false)
+  assert.equal(
+    parseRosterVoiceSegments('From beside the door, Mira says, "I am ready."', null, speakers)
+      .find(segment => segment.text === 'I am ready.')?.speakerId,
+    'mira',
+  )
+})
+
 test('distinguishes name-free messages from messages that contain a speaker name', () => {
   const speakers = [{ id: 'card', name: 'Mara Vale / Mara' }]
   const nameless = 'She sets down the mug.\n\n"Especially ragged."\n\nHer hands stay on the table.'

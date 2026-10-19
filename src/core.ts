@@ -664,11 +664,27 @@ export function speakerAliases(value: string): string[] {
   return aliases
 }
 
-const NON_NAME_PARAGRAPH_LEADS = new Set([
-  'a', 'an', 'and', 'after', 'before', 'but', 'down', 'from', 'he', 'her', 'his',
-  'it', 'its', 'she', 'so', 'somewhere', 'that', 'the', 'their', 'then', 'there',
-  'they', 'this', 'those', 'to', 'we', 'when', 'while', 'you', 'your',
+const PREPOSITION_WORDS = [
+  'above', 'across', 'after', 'against', 'along', 'amid', 'among', 'around', 'as',
+  'at', 'before', 'behind', 'below', 'beneath', 'beside', 'between', 'beyond', 'by',
+  'despite', 'down', 'during', 'except', 'for', 'from', 'in', 'inside', 'into',
+  'like', 'near', 'of', 'off', 'on', 'onto', 'opposite', 'out', 'outside', 'over',
+  'past', 'since', 'through', 'throughout', 'to', 'toward', 'towards', 'under',
+  'underneath', 'unlike', 'until', 'up', 'upon', 'via', 'with', 'within', 'without',
+] as const
+
+const NON_NAME_PARAGRAPH_LEADS = new Set<string>([
+  ...PREPOSITION_WORDS,
+  'a', 'an', 'although', 'and', 'because', 'but', 'he', 'her', 'here', 'his', 'if',
+  'it', 'its', 'or', 'she', 'so', 'somewhere', 'that', 'the', 'their', 'then',
+  'there', 'they', 'this', 'those', 'though', 'unless', 'we', 'when', 'where',
+  'whereas', 'whether', 'while', 'who', 'whom', 'whose', 'you', 'your',
 ])
+
+const PREPOSITION_BEFORE_NAME_PATTERN = new RegExp(
+  `\\b(?:${PREPOSITION_WORDS.join('|')})\\s*$`,
+  'iu',
+)
 
 export function unconfiguredSpeakerId(name: string): string {
   return `unconfigured:${normalizeSpeakerName(name).toLowerCase()}`
@@ -1161,7 +1177,9 @@ function discourseSubjectSpeaker(
     if (!lead.trim() || /^[\s{(\[]*$/u.test(lead)) score += 10
     else if (!earlierInClause && /^[^,]{1,48},\s*(?:(?:a|an|the)\s+)?$/iu.test(lead)) score += 8
 
-    if (/\b(?:to|from|for|with|by|at|on|of|beside|behind|under|near|toward|towards)\s*$/iu.test(lead)) {
+    // A roster name used as the object of a preposition is an addressee or
+    // contextual mention, not evidence that the name owns nearby dialogue.
+    if (PREPOSITION_BEFORE_NAME_PATTERN.test(lead)) {
       score -= 6
     }
     if (/\b(?:that|which|who|whom|whose|because|while|when|if|though|although)\s*$/iu.test(lead)) {
