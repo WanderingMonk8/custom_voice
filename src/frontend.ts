@@ -17,6 +17,7 @@ import {
   reducedRequestWindowLimit,
   rollingRequestWindowDelay,
   speakerAliases,
+  speakersForMessageRole,
   USER_SPEAKER_ID,
   upsertSavedAudioRecord,
   type PlaybackSegment,
@@ -1807,12 +1808,11 @@ export function setup(ctx: SpindleFrontendContext) {
             playbackChat.characters,
             playbackChat.cardCharacterIds ?? [],
           )
-      const playbackSpeakers = message.is_user
-        ? [
-            ...playbackChat.characters,
-            { id: USER_SPEAKER_ID, name: normalizeSpeakerName(message.name) || 'User' },
-          ]
-        : playbackChat.characters
+      const playbackSpeakers = speakersForMessageRole(
+        playbackChat.characters,
+        message.is_user,
+        message.name,
+      )
       const aliases = new Map(
         playbackChat.characters.flatMap((character) => (
           speakerAliases(character.name).map(alias => [npcSpeakerId(alias), character.id] as const)

@@ -16,6 +16,7 @@ import {
   speakerReviewQuotes,
   speakerReviewQuoteIndexes,
   speakerAliases,
+  speakersForMessageRole,
   USER_SPEAKER_ID,
   type CharacterLike,
   type ChatVoiceConfig,
@@ -348,12 +349,11 @@ function queueSpeakerParse(
         userAliases.push(alias)
       }
     }
-    const speakers: CharacterLike[] = [
-      ...config.detectedCharacters,
-      ...(messages.some(item => item.is_user)
-        ? [{ id: USER_SPEAKER_ID, name: userAliases.join(' / ') || 'User' }]
-        : []),
-    ]
+    const speakers: CharacterLike[] = speakersForMessageRole(
+      config.detectedCharacters,
+      message.is_user,
+      userAliases.join(' / ') || 'User',
+    )
     const defaultSpeakerId = message.is_user
       ? USER_SPEAKER_ID
       : defaultMessageSpeakerId(message, speakers, cards.map(card => card.id))
@@ -405,7 +405,7 @@ function queueSpeakerParse(
     const connectionId = payload.connectionId.trim().slice(0, 128)
     const model = payload.model.trim().slice(0, 256)
     const cacheHash = hashMessageContent(JSON.stringify({
-      parser: 12,
+      parser: 13,
       mode: payload.mode,
       content: message.content ?? '',
       speakers: speakers.map(speaker => ({ id: speaker.id, name: speaker.name })),
@@ -475,14 +475,6 @@ function queueSpeakerParse(
       new Set(speakers.map(speaker => speaker.id)),
       quotes.length,
     ).filter(assignment => requestedQuoteIndexes.has(assignment.quote))
-      .map(assignment => (
-        payload.mode === 'ambiguous'
-        && !message.is_user
-        && assignment.speakerId === USER_SPEAKER_ID
-        && defaultSpeakerId
-          ? { ...assignment, speakerId: defaultSpeakerId }
-          : assignment
-      ))
     const assignedQuotes = new Set(assignments.map(assignment => assignment.quote))
     if (nonEmptyQuoteIndexes.some(item => !assignedQuotes.has(item.quote))) {
       throw new Error('The selected LLM returned an incomplete speaker assignment.')

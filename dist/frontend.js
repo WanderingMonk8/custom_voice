@@ -2,6 +2,13 @@
 var USER_SPEAKER_ID = "__chat_voice_user__";
 var DEFAULT_SAVED_AUDIO_LIMIT = 50;
 var MAX_SAVED_AUDIO_LIMIT = 1e4;
+function speakersForMessageRole(speakers, isUserMessage, userName = "User") {
+  const nonUserSpeakers = speakers.filter((speaker) => speaker.id !== USER_SPEAKER_ID);
+  return isUserMessage ? [
+    ...nonUserSpeakers,
+    { id: USER_SPEAKER_ID, name: normalizeSpeakerName(userName) || "User" }
+  ] : nonUserSpeakers;
+}
 function rollingRequestWindowDelay(recentStarts, now, requestLimit, windowMs = 6e4) {
   const safeLimit = Math.max(1, Math.round(requestLimit));
   const safeWindow = Math.max(1, Math.round(windowMs));
@@ -2221,10 +2228,11 @@ function setup(ctx) {
         playbackChat.characters,
         playbackChat.cardCharacterIds ?? []
       );
-      const playbackSpeakers = message.is_user ? [
-        ...playbackChat.characters,
-        { id: USER_SPEAKER_ID, name: normalizeSpeakerName(message.name) || "User" }
-      ] : playbackChat.characters;
+      const playbackSpeakers = speakersForMessageRole(
+        playbackChat.characters,
+        message.is_user,
+        message.name
+      );
       const aliases = new Map(
         playbackChat.characters.flatMap((character) => speakerAliases(character.name).map((alias) => [npcSpeakerId(alias), character.id]))
       );

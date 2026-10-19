@@ -4,6 +4,13 @@ var USER_SPEAKER_ID = "__chat_voice_user__";
 var DEFAULT_MESSAGE_LIMIT = 20;
 var MIN_MESSAGE_LIMIT = 1;
 var MAX_MESSAGE_LIMIT = 500;
+function speakersForMessageRole(speakers, isUserMessage, userName = "User") {
+  const nonUserSpeakers = speakers.filter((speaker) => speaker.id !== USER_SPEAKER_ID);
+  return isUserMessage ? [
+    ...nonUserSpeakers,
+    { id: USER_SPEAKER_ID, name: normalizeSpeakerName(userName) || "User" }
+  ] : nonUserSpeakers;
+}
 function isRecord(value) {
   return !!value && typeof value === "object" && !Array.isArray(value);
 }
@@ -1249,10 +1256,11 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
         userAliases.push(alias);
       }
     }
-    const speakers = [
-      ...config.detectedCharacters,
-      ...messages.some((item) => item.is_user) ? [{ id: USER_SPEAKER_ID, name: userAliases.join(" / ") || "User" }] : []
-    ];
+    const speakers = speakersForMessageRole(
+      config.detectedCharacters,
+      message.is_user,
+      userAliases.join(" / ") || "User"
+    );
     const defaultSpeakerId = message.is_user ? USER_SPEAKER_ID : defaultMessageSpeakerId(message, speakers, cards.map((card) => card.id));
     const skippedTrackerTags = payload.skippedTrackerTags.slice(0, 4e3);
     const messageIndex = messages.findIndex((item) => item.id === payload.messageId);
@@ -1296,7 +1304,7 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
     const connectionId = payload.connectionId.trim().slice(0, 128);
     const model = payload.model.trim().slice(0, 256);
     const cacheHash = hashMessageContent(JSON.stringify({
-      parser: 12,
+      parser: 13,
       mode: payload.mode,
       content: message.content ?? "",
       speakers: speakers.map((speaker) => ({ id: speaker.id, name: speaker.name })),
@@ -1359,7 +1367,7 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
       response,
       new Set(speakers.map((speaker) => speaker.id)),
       quotes.length
-    ).filter((assignment) => requestedQuoteIndexes.has(assignment.quote)).map((assignment) => payload.mode === "ambiguous" && !message.is_user && assignment.speakerId === USER_SPEAKER_ID && defaultSpeakerId ? { ...assignment, speakerId: defaultSpeakerId } : assignment);
+    ).filter((assignment) => requestedQuoteIndexes.has(assignment.quote));
     const assignedQuotes = new Set(assignments.map((assignment) => assignment.quote));
     if (nonEmptyQuoteIndexes.some((item) => !assignedQuotes.has(item.quote))) {
       throw new Error("The selected LLM returned an incomplete speaker assignment.");

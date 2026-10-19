@@ -28,6 +28,7 @@ import {
   readSavedAudioHistory,
   speakerAliases,
   speakerReviewQuoteIndexes,
+  speakersForMessageRole,
   rollingRequestWindowDelay,
   stripSkippedTrackerBlocks,
   USER_SPEAKER_ID,
@@ -313,6 +314,16 @@ test('uses the user role as the default speaker for unattributed user dialogue',
     ).filter(segment => segment.speakerId !== null),
     [{ text: 'I can handle it.', speakerId: USER_SPEAKER_ID }],
   )
+})
+
+test('only exposes the dedicated user speaker while parsing user messages', () => {
+  const cast = [{ id: 'card', name: 'Card Character' }]
+
+  assert.deepEqual(speakersForMessageRole(cast, false, 'Ken'), cast)
+  assert.deepEqual(speakersForMessageRole(cast, true, 'Ken'), [
+    ...cast,
+    { id: USER_SPEAKER_ID, name: 'Ken' },
+  ])
 })
 
 test('keeps user-message narration separate from defaulted user dialogue', () => {
