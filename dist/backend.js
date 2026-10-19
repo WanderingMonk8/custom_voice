@@ -1042,9 +1042,11 @@ function parseRosterVoiceSegmentsInternal(content, defaultSpeakerId, speakers, s
         mentionedSpeakers(previousParagraph.text, speakers).possessive
       ) : null;
       const adjacentNarrativeEvidenceId = previousParagraph && playbackQuotes(previousParagraph.text).length === 0 ? paragraphSpeakers[paragraphIndex - 1] : null;
+      const adjacentNarrativeVoiceSpeakerId = adjacentNarrativeEvidenceId && previousParagraph && /\b(?:voice|speaks?|spoke|says?|said|asks?|asked|answers?|answered|replies|replied|whispers?|whispered|calls?|called|shouts?|shouted|murmurs?|murmured)\b/iu.test(previousParagraph.text) ? adjacentNarrativeEvidenceId : null;
       const localCandidates = [
         ["current-paragraph-subject", paragraphSpeakers[paragraphIndex]],
         ["preceding-possessive-subject", adjacentNarrativeSpeakerId],
+        ["preceding-narrative-voice-subject", adjacentNarrativeVoiceSpeakerId],
         ["downstream-reply", downstreamReplies.get(paragraphIndex) ?? null],
         ["dialogue-turn-alternation", inferredTurnSpeakerId],
         ["speaker-continuation", continuedSpeakerId],

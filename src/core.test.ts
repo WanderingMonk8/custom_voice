@@ -983,6 +983,30 @@ test('does not invent a speaker from a sentence-leading descriptor between quote
   )
 })
 
+test('prefers a clear adjacent narrative subject over previous-message history', () => {
+  const content = [
+    "On the boardwalk behind Ken, Tess Harlan's gaze has dropped to the hem of the red dress. Her thumb moves on the tablet. She lifts her hand to her earpiece, her voice dropping under the street noise.",
+    '',
+    '"...Ruby again. Fifth fracture since two. The guest is — yeah. Feeding her story. Log it."',
+  ].join('\n')
+  const segments = parseRosterVoiceSegments(
+    content,
+    null,
+    [
+      { id: 'ruby', name: 'Ruby' },
+      { id: 'tess', name: 'Tess Harlan / Tess' },
+    ],
+    '',
+    'ruby',
+    true,
+  )
+  const speech = segments.find(segment => segment.text.startsWith('...Ruby again.'))
+
+  assert.equal(speech?.speakerId, 'tess')
+  assert.ok(speech?.debugPath?.includes('preceding-narrative-voice-subject:tess'))
+  assert.ok(speech?.debugPath?.includes('local-selection:preceding-narrative-voice-subject -> tess'))
+})
+
 test('maps message-local speaker aliases back to configured voices', () => {
   const aliases = speakerAliasIdLookup([{ id: 'ruby', name: 'Ruby Vale / Ruby' }])
 
