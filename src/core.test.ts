@@ -28,6 +28,8 @@ import {
   readSavedAudioHistory,
   speakerAliases,
   speakerReviewQuoteIndexes,
+  speakersForMessageRole,
+  shouldPersistMessageAudio,
   rollingRequestWindowDelay,
   stripSkippedTrackerBlocks,
   USER_SPEAKER_ID,
@@ -313,6 +315,26 @@ test('uses the user role as the default speaker for unattributed user dialogue',
     ).filter(segment => segment.speakerId !== null),
     [{ text: 'I can handle it.', speakerId: USER_SPEAKER_ID }],
   )
+})
+
+test('only exposes the dedicated user speaker while parsing user messages', () => {
+  const cast = [{ id: 'card', name: 'Card Character' }]
+
+  assert.deepEqual(speakersForMessageRole(cast, false, 'Ken'), cast)
+  assert.deepEqual(speakersForMessageRole(cast, true, 'Ken'), [
+    ...cast,
+    { id: USER_SPEAKER_ID, name: 'Ken' },
+  ])
+})
+
+test('never persists generated audio for user messages', () => {
+  assert.equal(shouldPersistMessageAudio(true, false, false), false)
+  assert.equal(shouldPersistMessageAudio(true, true, false), false)
+  assert.equal(shouldPersistMessageAudio(true, false, true), false)
+  assert.equal(shouldPersistMessageAudio(true, true, true), false)
+  assert.equal(shouldPersistMessageAudio(false, false, false), false)
+  assert.equal(shouldPersistMessageAudio(false, true, false), true)
+  assert.equal(shouldPersistMessageAudio(false, false, true), true)
 })
 
 test('keeps user-message narration separate from defaulted user dialogue', () => {

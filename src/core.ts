@@ -77,6 +77,20 @@ export interface CharacterLike {
   name: string
 }
 
+export function speakersForMessageRole<T extends CharacterLike>(
+  speakers: T[],
+  isUserMessage: boolean,
+  userName = 'User',
+): Array<T | CharacterLike> {
+  const nonUserSpeakers = speakers.filter(speaker => speaker.id !== USER_SPEAKER_ID)
+  return isUserMessage
+    ? [
+        ...nonUserSpeakers,
+        { id: USER_SPEAKER_ID, name: normalizeSpeakerName(userName) || 'User' },
+      ]
+    : nonUserSpeakers
+}
+
 export interface DetectedCharacter extends CharacterLike {
   messageCount: number
 }
@@ -101,6 +115,14 @@ export interface AdaptiveGenerationState {
   concurrency: number
   shortCooldown: number
   longWindowStreak: number
+}
+
+export function shouldPersistMessageAudio(
+  isUserMessage: boolean,
+  saveGeneratedAudio: boolean,
+  regeneratingSavedAudio: boolean,
+): boolean {
+  return !isUserMessage && (saveGeneratedAudio || regeneratingSavedAudio)
 }
 
 /** Return the delay required to keep request starts inside a rolling quota window. */
