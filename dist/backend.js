@@ -1362,17 +1362,27 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
         userAliases.push(alias);
       }
     }
-    const speakers = addUnconfiguredDialogueSpeakers(
-      message.content ?? "",
-      speakersForMessageRole(
-        config.detectedCharacters,
-        message.is_user,
-        userAliases.join(" / ") || "User"
-      )
+    const configuredSpeakers = speakersForMessageRole(
+      config.detectedCharacters,
+      message.is_user,
+      userAliases.join(" / ") || "User"
     );
-    const defaultSpeakerId = message.is_user ? USER_SPEAKER_ID : defaultMessageSpeakerId(message, speakers, cards.map((card) => card.id));
     const skippedTrackerTags = payload.skippedTrackerTags.slice(0, 4e3);
     const messageIndex = messages.findIndex((item) => item.id === payload.messageId);
+    const sustainedCardFallback = !message.is_user && cards.length === 1 && hasSustainedUnattributedAssistantDialogue(
+      messages,
+      messageIndex,
+      config.detectedCharacters,
+      skippedTrackerTags
+    );
+    const speakers = addUnconfiguredDialogueSpeakers(
+      message.content ?? "",
+      configuredSpeakers
+    );
+    if (sustainedCardFallback && !speakers.some((speaker) => speaker.id === cards[0].id)) {
+      speakers.push({ id: cards[0].id, name: cards[0].name });
+    }
+    const defaultSpeakerId = message.is_user ? USER_SPEAKER_ID : sustainedCardFallback ? cards[0].id : defaultMessageSpeakerId(message, speakers, cards.map((card) => card.id));
     let previousAssistantMessage = null;
     for (let index = messageIndex - 1; index >= 0; index--) {
       if (messages[index].is_user) continue;
@@ -1392,12 +1402,6 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
       speakers,
       skippedTrackerTags,
       historicalSpeakerId
-    );
-    const sustainedCardFallback = !message.is_user && cards.length === 1 && defaultSpeakerId === cards[0].id && hasSustainedUnattributedAssistantDialogue(
-      messages,
-      messageIndex,
-      config.detectedCharacters,
-      skippedTrackerTags
     );
     const reviewQuoteIndexes = new Set(speakerReviewQuoteIndexes(
       message.content ?? "",
@@ -1419,7 +1423,7 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
     const connectionId = payload.connectionId.trim().slice(0, 128);
     const model = payload.model.trim().slice(0, 256);
     const cacheHash = hashMessageContent(JSON.stringify({
-      parser: 15,
+      parser: 16,
       mode: payload.mode,
       content: message.content ?? "",
       speakers: speakers.map((speaker) => ({ id: speaker.id, name: speaker.name })),

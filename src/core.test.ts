@@ -395,6 +395,22 @@ test('uses a card fallback only after three identity-free assistant messages', (
   assert.equal(hasSustainedUnattributedAssistantDialogue(messages, 4, speakers), true)
 })
 
+test('sustained solo-card fallback works even when the card was removed from the saved roster', () => {
+  const messages = [
+    { is_user: false, name: 'Assistant', content: 'She sets down the mug.\n\n"Especially ragged."' },
+    { is_user: false, name: 'Assistant', content: 'She takes the plate.\n\n"That is exactly right."' },
+    { is_user: false, name: 'Assistant', content: 'She points her fork.\n\n"One more each."' },
+  ]
+  const card = { id: 'card-mara', name: 'Mara Vale' }
+
+  assert.equal(hasSustainedUnattributedAssistantDialogue(messages, 2, []), true)
+  const segments = parseRosterVoiceSegments(messages[2].content, card.id, [card])
+  assert.deepEqual(
+    segments.filter(segment => segment.speakerId !== null).map(segment => segment.speakerId),
+    [card.id],
+  )
+})
+
 test('breaks the sustained fallback streak on a clear named identity', () => {
   const speakers = [{ id: 'card', name: 'Mara Vale / Mara' }]
   const messages = [
