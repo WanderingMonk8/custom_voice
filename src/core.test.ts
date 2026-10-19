@@ -386,6 +386,24 @@ test('does not mistake capitalized narrative words for unconfigured speakers', (
   )
 })
 
+test('does not mistake repeated sentence-leading prepositions between quotes for speakers', () => {
+  const content = [
+    'Then she got up and crossed to the kitchenette.',
+    '',
+    '"Okay." To the kitchen. To the succulent. To the room. "He\'s coming back. With groceries. And you\'re going to stand here and wait."',
+  ].join('\n')
+  const speakers = addUnconfiguredDialogueSpeakers(content, [{ id: 'mira', name: 'Mira' }])
+
+  assert.equal(speakers.some(speaker => speaker.id === unconfiguredSpeakerId('To')), false)
+  assert.equal(hasNamedSpeakerSubject(content, speakers), false)
+  assert.deepEqual(
+    parseRosterVoiceSegments(content, 'mira', speakers)
+      .filter(segment => segment.speakerId !== null)
+      .map(segment => segment.speakerId),
+    ['mira', 'mira'],
+  )
+})
+
 test('distinguishes name-free messages from messages that contain a speaker name', () => {
   const speakers = [{ id: 'card', name: 'Mara Vale / Mara' }]
   const nameless = 'She sets down the mug.\n\n"Especially ragged."\n\nHer hands stay on the table.'

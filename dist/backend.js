@@ -230,6 +230,7 @@ var NON_NAME_PARAGRAPH_LEADS = /* @__PURE__ */ new Set([
   "they",
   "this",
   "those",
+  "to",
   "we",
   "when",
   "while",

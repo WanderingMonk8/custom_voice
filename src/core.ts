@@ -667,7 +667,7 @@ export function speakerAliases(value: string): string[] {
 const NON_NAME_PARAGRAPH_LEADS = new Set([
   'a', 'an', 'and', 'after', 'before', 'but', 'down', 'from', 'he', 'her', 'his',
   'it', 'its', 'she', 'so', 'somewhere', 'that', 'the', 'their', 'then', 'there',
-  'they', 'this', 'those', 'we', 'when', 'while', 'you', 'your',
+  'they', 'this', 'those', 'to', 'we', 'when', 'while', 'you', 'your',
 ])
 
 export function unconfiguredSpeakerId(name: string): string {
