@@ -6,7 +6,7 @@
   "github": "https://github.com/WanderingMonk8/custom_voice",
   "homepage": "https://github.com/WanderingMonk8/custom_voice",
   "description": "Detect or manually manage a chat cast, then route quoted output to per-character voices locally.",
-  "permissions": ["chats", "chat_mutation", "characters", "generation"],
+  "permissions": ["chats", "chat_mutation", "characters", "generation", "decisions"],
   "entry_backend": "dist/backend.js",
   "entry_frontend": "dist/frontend.js",
   "minimum_lumiverse_version": "1.2.5"

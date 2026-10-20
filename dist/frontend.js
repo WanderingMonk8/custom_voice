@@ -1,5 +1,6 @@
 // src/core.ts
 var USER_SPEAKER_ID = "__chat_voice_user__";
+var UNCAST_SPEAKER_ID = "__chat_voice_uncast__";
 var DEFAULT_SAVED_AUDIO_LIMIT = 50;
 var MAX_SAVED_AUDIO_LIMIT = 1e4;
 function speakersForMessageRole(speakers, isUserMessage, userName = "User") {
@@ -8,12 +9,6 @@ function speakersForMessageRole(speakers, isUserMessage, userName = "User") {
     ...nonUserSpeakers,
     { id: USER_SPEAKER_ID, name: normalizeSpeakerName(userName) || "User" }
   ] : nonUserSpeakers;
-}
-function protectDefaultSpeakerSegments(localSegments, reviewedSegments, protectedSpeakerId) {
-  if (localSegments.length !== reviewedSegments.length || localSegments.some((segment, index) => segment.text !== reviewedSegments[index]?.text)) {
-    return localSegments;
-  }
-  return reviewedSegments.map((segment, index) => localSegments[index].speakerId === protectedSpeakerId ? { ...segment, speakerId: protectedSpeakerId } : segment);
 }
 function playbackVoiceForSpeaker(speakerId, isUserMessage, characterVoices, narratorVoice, userVoice) {
   if (speakerId === USER_SPEAKER_ID) return isUserMessage ? userVoice : "";
@@ -192,20 +187,78 @@ function speakerAliases(value) {
   }
   return aliases;
 }
+var PREPOSITION_WORDS = [
+  "above",
+  "across",
+  "after",
+  "against",
+  "along",
+  "amid",
+  "among",
+  "around",
+  "as",
+  "at",
+  "before",
+  "behind",
+  "below",
+  "beneath",
+  "beside",
+  "between",
+  "beyond",
+  "by",
+  "despite",
+  "down",
+  "during",
+  "except",
+  "for",
+  "from",
+  "in",
+  "inside",
+  "into",
+  "like",
+  "near",
+  "of",
+  "off",
+  "on",
+  "onto",
+  "opposite",
+  "out",
+  "outside",
+  "over",
+  "past",
+  "since",
+  "through",
+  "throughout",
+  "to",
+  "toward",
+  "towards",
+  "under",
+  "underneath",
+  "unlike",
+  "until",
+  "up",
+  "upon",
+  "via",
+  "with",
+  "within",
+  "without"
+];
 var NON_NAME_PARAGRAPH_LEADS = /* @__PURE__ */ new Set([
+  ...PREPOSITION_WORDS,
   "a",
   "an",
+  "although",
   "and",
-  "after",
-  "before",
+  "because",
   "but",
-  "down",
-  "from",
   "he",
   "her",
+  "here",
   "his",
+  "if",
   "it",
   "its",
+  "or",
   "she",
   "so",
   "somewhere",
@@ -217,12 +270,28 @@ var NON_NAME_PARAGRAPH_LEADS = /* @__PURE__ */ new Set([
   "they",
   "this",
   "those",
+  "though",
+  "unless",
   "we",
   "when",
+  "where",
+  "whereas",
+  "whether",
   "while",
+  "who",
+  "whom",
+  "whose",
   "you",
   "your"
 ]);
+var PREPOSITION_BEFORE_NAME_PATTERN = new RegExp(
+  `\\b(?:${PREPOSITION_WORDS.join("|")})\\s*$`,
+  "iu"
+);
+var INTRODUCTORY_PREPOSITIONAL_PHRASE_PATTERN = new RegExp(
+  `^\\s*(?:${PREPOSITION_WORDS.join("|")})\\b(?:\\s+[\\p{L}\\p{M}'\u2019-]+){1,7}\\s*,?\\s*$`,
+  "iu"
+);
 function unconfiguredSpeakerId(name) {
   return `unconfigured:${normalizeSpeakerName(name).toLowerCase()}`;
 }
@@ -258,8 +327,17 @@ function addUnconfiguredDialogueSpeakers(content, speakers) {
       const nextHasDialogue = paragraphIndex + 1 < paragraphs.length && playbackQuotes(paragraphs[paragraphIndex + 1].text).length > 0;
       if (!nextHasDialogue) continue;
       const narration = paragraph.text.replace(/^[\s,.;:!?—–-]+/u, "");
-      const lead = narration.match(/^([\p{Lu}][\p{L}\p{M}'’.\-]{1,63})(?=\s)/u)?.[1];
-      if (lead) addCandidate(lead);
+      const attributedLead = narration.match(
+        new RegExp(
+          `^([\\p{Lu}][\\p{L}\\p{M}'\u2019.\\-]{1,63})(?:(?:\\s*,\\s*[^,\\n]{1,60},\\s*)|\\s+)${SPEECH_VERBS}\\b`,
+          "u"
+        )
+      )?.[1];
+      if (attributedLead) addCandidate(attributedLead, true);
+      else {
+        const lead = narration.match(/^([\p{Lu}][\p{L}\p{M}'’.\-]{1,63})(?=\s)/u)?.[1];
+        if (lead) addCandidate(lead);
+      }
       continue;
     }
     let cursor = 0;
@@ -445,7 +523,7 @@ function discourseSubjectSpeaker(text, speakers, eligibleSpeakerIds) {
     let score = occurrence.start === firstMentionStart ? 2 : 0;
     if (!lead.trim() || /^[\s{(\[]*$/u.test(lead)) score += 10;
     else if (!earlierInClause && /^[^,]{1,48},\s*(?:(?:a|an|the)\s+)?$/iu.test(lead)) score += 8;
-    if (/\b(?:to|from|for|with|by|at|on|of|beside|behind|under|near|toward|towards)\s*$/iu.test(lead)) {
+    if (PREPOSITION_BEFORE_NAME_PATTERN.test(lead)) {
       score -= 6;
     }
     if (/\b(?:that|which|who|whom|whose|because|while|when|if|though|although)\s*$/iu.test(lead)) {
@@ -527,6 +605,31 @@ function mainClausePossessiveSubject(text, speakers, eligibleSpeakerIds) {
   }
   return matches.size === 1 ? [...matches][0] : null;
 }
+function frontedPrepositionalPossessiveSubject(text, speakers) {
+  const narrative = narrativeOnly(text);
+  if (mentionedSpeakers(narrative, speakers).clean.size > 0) return null;
+  const matches = /* @__PURE__ */ new Set();
+  for (const speaker of speakers) {
+    for (const alias of speakerAliases(speaker.name)) {
+      const pattern = new RegExp(`\\b${escapedPattern(alias)}\\b['\u2019]s\\s+`, "giu");
+      for (const match of narrative.matchAll(pattern)) {
+        if (match.index === void 0) continue;
+        const prefix = narrative.slice(0, match.index);
+        const sentenceStart = Math.max(
+          prefix.lastIndexOf("."),
+          prefix.lastIndexOf("!"),
+          prefix.lastIndexOf("?"),
+          prefix.lastIndexOf(";"),
+          prefix.lastIndexOf("\n")
+        ) + 1;
+        if (!INTRODUCTORY_PREPOSITIONAL_PHRASE_PATTERN.test(prefix.slice(sentenceStart))) continue;
+        const clause = narrative.slice(match.index + match[0].length).split(/[.!?;\n]/u, 1)[0];
+        if ((clause.match(/[\p{L}\p{M}'’-]+/gu) ?? []).length >= 3) matches.add(speaker.id);
+      }
+    }
+  }
+  return matches.size === 1 ? [...matches][0] : null;
+}
 function preferredMentionedSpeaker(text, speakers, mentions) {
   const speechPossessor = mainClauseSpeechPossessor(text, speakers);
   if (speechPossessor) return speechPossessor;
@@ -546,6 +649,71 @@ function unambiguousNarrativeSpeaker(text, speakers) {
     return mainClausePossessiveSubject(text, speakers, mentions.possessive);
   }
   return null;
+}
+var ANONYMOUS_ROLE_NOUNS = [
+  "cashier",
+  "clerk",
+  "customer",
+  "driver",
+  "employee",
+  "guard",
+  "passerby",
+  "server",
+  "shopkeeper",
+  "staffer",
+  "stranger",
+  "waiter",
+  "waitress",
+  "worker"
+];
+var ANONYMOUS_HUMAN_NOUNS = [
+  ...ANONYMOUS_ROLE_NOUNS,
+  "boy",
+  "child",
+  "girl",
+  "guy",
+  "kid",
+  "lady",
+  "man",
+  "person",
+  "teen",
+  "teenager",
+  "woman"
+];
+var ANONYMOUS_HUMAN_SUBJECT_PATTERN = new RegExp(
+  `(?:^\\s*|[.!?;]\\s+|^\\s*[^,\\n]{1,120},\\s*)(?:(?:a|an|another|some)\\s+(?:[\\p{L}\\p{M}'\u2019-]+[ -]){0,5}(?:${ANONYMOUS_HUMAN_NOUNS.join("|")})|the\\s+(?:[\\p{L}\\p{M}'\u2019-]+[ -]){0,5}(?:${ANONYMOUS_ROLE_NOUNS.join("|")}))\\b`,
+  "iu"
+);
+var ANONYMOUS_HUMAN_IDENTITY_PATTERN = new RegExp(
+  `\\b(?:(?:a|an|another|some)\\s+(?:[\\p{L}\\p{M}'\u2019-]+[ -]){0,5}(?:${ANONYMOUS_HUMAN_NOUNS.join("|")})|the\\s+(?:[\\p{L}\\p{M}'\u2019-]+[ -]){0,5}(?:${ANONYMOUS_ROLE_NOUNS.join("|")}))\\b`,
+  "iu"
+);
+var ANONYMOUS_ROLE_IDENTITY_PATTERN = new RegExp(
+  `\\b(?:a|an|another|some|the)\\s+(?:[\\p{L}\\p{M}'\u2019-]+[ -]){0,5}(?:${ANONYMOUS_ROLE_NOUNS.join("|")})\\b`,
+  "iu"
+);
+function hasAnonymousHumanSubject(text) {
+  return ANONYMOUS_HUMAN_SUBJECT_PATTERN.test(narrativeOnly(text));
+}
+function hasAnonymousSpeechAttribution(text) {
+  const narrative = narrativeOnly(text);
+  return hasAnonymousHumanSubject(narrative) && new RegExp(`\\b${SPEECH_VERBS}\\b`, "iu").test(narrative);
+}
+function hasLeadingPronounSubject(text) {
+  return /^(?:he|she|they)\b/iu.test(narrativeOnly(text).trimStart());
+}
+function hasNamedSpeakerSubject(content, speakers, skippedTrackerTagPairs = "") {
+  const playbackContent = preparePlaybackContent(content, skippedTrackerTagPairs);
+  return playbackParagraphs(playbackContent).some((paragraph) => {
+    const mentions = mentionedSpeakers(paragraph.text, speakers);
+    return preferredMentionedSpeaker(paragraph.text, speakers, mentions) !== null;
+  });
+}
+function eligibleCardFallbackSpeakerId(content, cardSpeakerId, speakers, skippedTrackerTagPairs = "") {
+  if (!cardSpeakerId) return null;
+  const alternativeSpeakers = speakers.filter((speaker) => speaker.id !== cardSpeakerId);
+  if (hasNamedSpeakerSubject(content, alternativeSpeakers, skippedTrackerTagPairs)) return null;
+  return hasExplicitUncastCue(content, skippedTrackerTagPairs) ? null : cardSpeakerId;
 }
 function currentParagraphSpeaker(before, after, speakers) {
   let paragraphStart = 0;
@@ -841,6 +1009,26 @@ function canContinueSpeaker(bridge, previousSpeakerId, speakers) {
   }
   return true;
 }
+var TURN_CONTINUE_OPTION = "continues_previous_turn";
+var TURN_RESPOND_OPTION = "responds_to_previous_speaker";
+var TURN_OTHER_OPTION = "responds_to_other_participant";
+var TURN_UNCLEAR_OPTION = "no_clear_relation";
+var TURN_RELATION_CRITERIA = {
+  [TURN_CONTINUE_OPTION]: "The same speaker is still talking; no new speaker has taken over.",
+  [TURN_RESPOND_OPTION]: "A different participant answers the immediately preceding speaker.",
+  [TURN_OTHER_OPTION]: "A different participant addresses someone else in the scene, a third party, or an off-scene channel.",
+  [TURN_UNCLEAR_OPTION]: "The text does not establish whether the speaker continues or changes."
+};
+var SPEAKER_TURN_SWITCH_PATTERN = /\b(?:(?:another|a second|a third|a new|the other)\s+(?:voice|woman|man|person|speaker|figure|kid|girl|boy)|(?:someone|somebody)\s+(?:else\s+)?(?:says|said|asks|asked|replies|replied|answers|answered|calls|called|whispers|whispered|shouts|shouted)|(?:a|another)\s+voice\s+(?:from|behind|near|across)|from (?:across the room|the (?:hallway|doorway|next room|other room|shadows)))\b/iu;
+var NARRATIVE_SPEECH_VERB_PATTERN = new RegExp(
+  `\\b(?:${SPEECH_VERBS}|blurt(?:s|ed)|laugh(?:s|ed)|mutter(?:s|ed)|hiss(?:es|ed)|snap(?:s|ped))\\b`,
+  "iu"
+);
+function hasExplicitUncastCue(content, skippedTrackerTagPairs = "") {
+  const playbackContent = preparePlaybackContent(content, skippedTrackerTagPairs);
+  const narration = cleanPlaybackText(narrativeOnly(playbackContent));
+  return ANONYMOUS_ROLE_IDENTITY_PATTERN.test(narration) || hasAnonymousHumanSubject(narration) || SPEAKER_TURN_SWITCH_PATTERN.test(narration);
+}
 function parseRosterVoiceSegmentsInternal(content, defaultSpeakerId, speakers, skippedTrackerTagPairs = "", quoteSpeakerOverrides, historicalSpeakerId = null, preserveLocalOnNullOverride = false, lowConfidenceQuoteIndexes, includeDebug = false) {
   const playbackContent = preparePlaybackContent(content, skippedTrackerTagPairs);
   const result = [];
@@ -888,31 +1076,49 @@ function parseRosterVoiceSegmentsInternal(content, defaultSpeakerId, speakers, s
       const dialogueTurnSpeakerId = dialogueTurns.get(paragraphIndex) ?? null;
       const inferredTurnSpeakerId = inference.source === "history" || inference.source === "fallback" ? dialogueTurnSpeakerId : null;
       const openingSpeakerId = inference.source === "fallback" && openingBackfill?.paragraphIndexes.has(paragraphIndex) ? openingBackfill.speakerId : null;
-      const currentEvidenceSpeakerId = paragraphSpeakers[paragraphIndex] ?? (inference.confident ? inference.speakerId : null);
-      if (historicalPrefixActive && (inference.source === "explicit" || inference.source === "paragraph" || paragraphSpeakers[paragraphIndex] !== null && currentEvidenceSpeakerId !== historicalSpeakerId)) {
+      const frontedPossessiveSpeakerId = inference.source === "history" || inference.source === "fallback" ? frontedPrepositionalPossessiveSubject(bridge, speakers) : null;
+      const previousParagraph = paragraphs[paragraphIndex - 1];
+      const currentParagraph = paragraphs[paragraphIndex];
+      const currentNarrativePrefix = currentParagraph ? currentParagraph.text.slice(0, Math.max(0, quote.start - currentParagraph.start)) : "";
+      const nextQuote = quotes[currentQuoteIndex + 1];
+      const downstreamNarrationEnd = currentParagraph ? Math.min(
+        currentParagraph.end,
+        nextQuote && nextQuote.start < currentParagraph.end ? nextQuote.start : currentParagraph.end
+      ) : quote.end;
+      const immediateDownstreamNarration = playbackContent.slice(quote.end, downstreamNarrationEnd);
+      const anonymousLocalSpeakerId = (inference.source === "history" || inference.source === "fallback") && paragraphSpeakers[paragraphIndex] === null && (hasAnonymousHumanSubject(currentNarrativePrefix) || !!(previousParagraph && playbackQuotes(previousParagraph.text).length === 0 && paragraphSpeakers[paragraphIndex - 1] === null && hasAnonymousHumanSubject(previousParagraph.text))) ? UNCAST_SPEAKER_ID : null;
+      const anonymousDownstreamSpeakerId = (inference.source === "history" || inference.source === "fallback") && paragraphSpeakers[paragraphIndex] === null && hasAnonymousSpeechAttribution(immediateDownstreamNarration) ? UNCAST_SPEAKER_ID : null;
+      const anonymousPronounContinuationId = (inference.source === "history" || inference.source === "fallback") && paragraphSpeakers[paragraphIndex] === null && lastAssignedSpeakerId === UNCAST_SPEAKER_ID && hasLeadingPronounSubject(currentNarrativePrefix) ? UNCAST_SPEAKER_ID : null;
+      const currentEvidenceSpeakerId = paragraphSpeakers[paragraphIndex] ?? frontedPossessiveSpeakerId ?? anonymousLocalSpeakerId ?? anonymousDownstreamSpeakerId ?? anonymousPronounContinuationId ?? (inference.confident ? inference.speakerId : null);
+      if (historicalPrefixActive && (inference.source === "explicit" || inference.source === "paragraph" || frontedPossessiveSpeakerId !== null || anonymousLocalSpeakerId !== null || anonymousDownstreamSpeakerId !== null || anonymousPronounContinuationId !== null || paragraphSpeakers[paragraphIndex] !== null && currentEvidenceSpeakerId !== historicalSpeakerId)) {
         historicalPrefixActive = false;
       }
       const historicalFallbackId = historicalPrefixActive && (inference.source === "history" || inference.source === "fallback") ? historicalSpeakerId : null;
-      const previousParagraph = paragraphs[paragraphIndex - 1];
       const adjacentNarrativeSpeakerId = previousParagraph && playbackQuotes(previousParagraph.text).length === 0 ? mainClausePossessiveSubject(
         previousParagraph.text,
         speakers,
         mentionedSpeakers(previousParagraph.text, speakers).possessive
       ) : null;
       const adjacentNarrativeEvidenceId = previousParagraph && playbackQuotes(previousParagraph.text).length === 0 ? paragraphSpeakers[paragraphIndex - 1] : null;
+      const adjacentNarrativeVoiceSpeakerId = adjacentNarrativeEvidenceId && previousParagraph && /\b(?:voice|speaks?|spoke|says?|said|asks?|asked|answers?|answered|replies|replied|whispers?|whispered|calls?|called|shouts?|shouted|murmurs?|murmured)\b/iu.test(previousParagraph.text) ? adjacentNarrativeEvidenceId : null;
       const localCandidates = [
         ["current-paragraph-subject", paragraphSpeakers[paragraphIndex]],
         ["preceding-possessive-subject", adjacentNarrativeSpeakerId],
+        ["preceding-narrative-voice-subject", adjacentNarrativeVoiceSpeakerId],
+        ["fronted-prepositional-possessive-subject", frontedPossessiveSpeakerId],
+        ["anonymous-local-subject", anonymousLocalSpeakerId],
+        ["anonymous-downstream-attribution", anonymousDownstreamSpeakerId],
+        ["anonymous-pronoun-continuation", anonymousPronounContinuationId],
         ["downstream-reply", downstreamReplies.get(paragraphIndex) ?? null],
-        ["dialogue-turn-alternation", inferredTurnSpeakerId],
         ["speaker-continuation", continuedSpeakerId],
+        ["dialogue-turn-alternation", inferredTurnSpeakerId],
         ["previous-message-history", historicalFallbackId],
         ["opening-dialogue-backfill", openingSpeakerId],
         [`quote-inference:${inference.source}`, inference.speakerId]
       ];
       const selectedLocalCandidate = localCandidates.find(([, speakerId2]) => speakerId2 !== null);
       const localSpeakerId = selectedLocalCandidate?.[1] ?? null;
-      const confidentLocalSpeakerId = paragraphSpeakers[paragraphIndex] ?? adjacentNarrativeEvidenceId ?? (inference.source === "explicit" || inference.source === "paragraph" ? inference.speakerId : null);
+      const confidentLocalSpeakerId = paragraphSpeakers[paragraphIndex] ?? adjacentNarrativeEvidenceId ?? frontedPossessiveSpeakerId ?? anonymousLocalSpeakerId ?? anonymousDownstreamSpeakerId ?? anonymousPronounContinuationId ?? (inference.source === "explicit" || inference.source === "paragraph" ? inference.speakerId : null);
       if (!localSpeakerId || confidentLocalSpeakerId !== localSpeakerId) {
         lowConfidenceQuoteIndexes?.add(currentQuoteIndex);
       }
@@ -1087,8 +1293,6 @@ async function loadPlaybackPreferences() {
     savedAudioLimit: DEFAULT_SAVED_AUDIO_LIMIT,
     skippedTrackerTags: "",
     speakerParsingMode: "ambiguous",
-    llmConnectionId: "",
-    llmModel: "",
     playbackBufferSegments: DEFAULT_PLAYBACK_BUFFER_SEGMENTS,
     concurrentGenerations: DEFAULT_CONCURRENT_GENERATIONS,
     rateLimitWaitSeconds: DEFAULT_RATE_LIMIT_WAIT_SECONDS,
@@ -1099,7 +1303,7 @@ async function loadPlaybackPreferences() {
   const row = await response.json();
   const speed = typeof row.value?.ttsSpeed === "number" ? row.value.ttsSpeed : 1;
   const volume = typeof row.value?.ttsVolume === "number" ? row.value.ttsVolume : 1;
-  const speakerParsingMode = row.value?.chatVoiceSpeakerParsingMode === "off" || row.value?.chatVoiceSpeakerParsingMode === "always" ? row.value.chatVoiceSpeakerParsingMode : "ambiguous";
+  const speakerParsingMode = row.value?.chatVoiceSpeakerParsingMode === "off" ? "off" : "ambiguous";
   return {
     speed: Math.min(4, Math.max(0.25, speed)),
     volume: Math.min(1, Math.max(0, volume)),
@@ -1108,8 +1312,6 @@ async function loadPlaybackPreferences() {
     savedAudioLimit: clampSavedAudioLimit(row.value?.chatVoiceSavedAudioLimit),
     skippedTrackerTags: typeof row.value?.chatVoiceSkippedTrackerTags === "string" ? row.value.chatVoiceSkippedTrackerTags.slice(0, 4e3) : "",
     speakerParsingMode,
-    llmConnectionId: typeof row.value?.chatVoiceLlmConnectionId === "string" ? row.value.chatVoiceLlmConnectionId.trim().slice(0, 128) : "",
-    llmModel: typeof row.value?.chatVoiceLlmModel === "string" ? row.value.chatVoiceLlmModel.trim().slice(0, 256) : "",
     playbackBufferSegments: clampIntegerSetting(
       row.value?.chatVoicePlaybackBufferSegments,
       DEFAULT_PLAYBACK_BUFFER_SEGMENTS,
@@ -1169,12 +1371,10 @@ function saveSkippedTrackerTagsPreference(value) {
     chatVoiceSkippedTrackerTags: value.slice(0, 4e3)
   }));
 }
-function saveLlmParsingPreferences(mode, connectionId, model) {
+function saveLlmParsingPreferences(mode) {
   return updateVoiceSettings((current) => ({
     ...current,
-    chatVoiceSpeakerParsingMode: mode,
-    chatVoiceLlmConnectionId: connectionId.trim().slice(0, 128),
-    chatVoiceLlmModel: model.trim().slice(0, 256)
+    chatVoiceSpeakerParsingMode: mode
   }));
 }
 function saveAdvancedPlaybackPreferences(bufferSegments, concurrentGenerations, rateLimitWaitSeconds, speakerAssignmentDebug) {
@@ -1649,9 +1849,7 @@ function setup(ctx) {
   scanButton.disabled = true;
   scanRow.append(scanButton);
   const skippedTagsField = createField("Skipped tracker tags (global)");
-  const speakerParsingField = createField("AI speaker review (global)");
-  const llmConnectionField = createField("Speaker-review LLM connection");
-  const llmModelField = createField("Custom LLM model (optional)");
+  const speakerParsingField = createField("Jev speaker assignment (global)");
   const narratorField = createField("Narrator voice");
   const userVoiceField = createField("User voice");
   function addDefaultRoleToggle(field, titleText, ariaLabel) {
@@ -1682,7 +1880,7 @@ function setup(ctx) {
   );
   const routingHint = document.createElement("div");
   routingHint.className = "chat-voice-hint";
-  routingHint.textContent = "Scan reads the character card, not chat history. During playback, quoted dialogue is matched to the user persona or saved cast using names and dialogue tags; everything outside quotes uses the narrator voice.";
+  routingHint.textContent = "Scan reads the character card, not chat history. During playback, Jev uses Lumiverse\u2019s default Decision connection to classify paragraph and dialogue identities; everything outside quotes uses the narrator voice.";
   const addNpcField = createField("Add NPC manually");
   addNpcField.slot.className = "chat-voice-add-row";
   const addNpcInputSlot = document.createElement("div");
@@ -1716,8 +1914,6 @@ function setup(ctx) {
     scanField.field,
     skippedTagsField.field,
     speakerParsingField.field,
-    llmConnectionField.field,
-    llmModelField.field,
     narratorField.field,
     userVoiceField.field,
     routingHint,
@@ -1742,14 +1938,14 @@ function setup(ctx) {
   speakerDebugText.textContent = "Speaker assignment debug";
   const speakerDebugHint = document.createElement("span");
   speakerDebugHint.className = "chat-voice-toggle-hint";
-  speakerDebugHint.textContent = "Records the parser, review, alias, fallback, and final voice route for every segment.";
+  speakerDebugHint.textContent = "Records both Jev passes, the turn matrix, narrative cues, dialogue-run review, inheritance, fallbacks, aliases, and the final voice route for every segment.";
   speakerDebugCopy.append(speakerDebugText, speakerDebugHint);
   speakerDebugLabel.append(speakerDebugToggle, speakerDebugCopy);
   const speakerDebugOutput = document.createElement("textarea");
   speakerDebugOutput.className = "chat-voice-debug-output";
   speakerDebugOutput.readOnly = true;
   speakerDebugOutput.hidden = true;
-  speakerDebugOutput.placeholder = "Generate TTS to see the speaker assignment trace.";
+  speakerDebugOutput.placeholder = "Generate TTS to see the turn matrix, discourse review, inheritance, and voice-route trace.";
   speakerDebugOutput.setAttribute("aria-label", "Speaker assignment debug log");
   const advancedHint = document.createElement("div");
   advancedHint.className = "chat-voice-hint";
@@ -1785,9 +1981,10 @@ function setup(ctx) {
   let savingSkippedTrackerTags = false;
   let skippedTrackerTagsSaveTimer = null;
   let speakerParsingMode = "ambiguous";
-  let llmConnections = [];
-  let llmConnectionId = "";
-  let llmModel = "";
+  let decisionConnectionsKnown = false;
+  let decisionConnectionAvailable = false;
+  let decisionConnectionName = "";
+  let decisionStatusFailed = false;
   let llmSettingsSaveTimer = null;
   let savingLlmSettings = false;
   let playbackBufferSegments = DEFAULT_PLAYBACK_BUFFER_SEGMENTS;
@@ -1802,6 +1999,7 @@ function setup(ctx) {
   let scanning = false;
   let activePlayback = null;
   const backgroundSynthesisControllers = /* @__PURE__ */ new Set();
+  const backgroundSynthesisByMessage = /* @__PURE__ */ new Map();
   const sharedSynthesisPacer = {
     nextStartAt: 0,
     startQueue: Promise.resolve(),
@@ -1848,11 +2046,11 @@ function setup(ctx) {
   const pendingMessageRequests = /* @__PURE__ */ new Map();
   const pendingStateRequests = /* @__PURE__ */ new Map();
   const pendingSpeakerParseRequests = /* @__PURE__ */ new Map();
-  const pendingLlmConnectionRequests = /* @__PURE__ */ new Map();
+  const pendingDecisionStatusRequests = /* @__PURE__ */ new Map();
   let messageRequestSequence = 0;
   let stateRequestSequence = 0;
   let speakerParseRequestSequence = 0;
-  let llmConnectionRequestSequence = 0;
+  let decisionStatusRequestSequence = 0;
   const setStatus = (message, state = "normal") => {
     status.textContent = message;
     status.dataset.state = state;
@@ -1945,32 +2143,20 @@ function setup(ctx) {
     value: "ambiguous",
     options: [
       { value: "off", label: "Off", sublabel: "Use the local parser only" },
-      { value: "ambiguous", label: "Ambiguous only", sublabel: "Ask the LLM only when attribution is uncertain" },
-      { value: "always", label: "All dialogue", sublabel: "Review every message containing dialogue" }
+      {
+        value: "ambiguous",
+        label: "On",
+        sublabel: "Checking for a Decision model connection\u2026",
+        disabled: true
+      }
     ],
-    ariaLabel: "AI speaker review mode",
+    ariaLabel: "Jev speaker assignment mode",
     onChange: (value) => onSpeakerParsingModeChanged(value)
   });
-  const llmConnectionPicker = ctx.components.mountSelect(llmConnectionField.slot, {
-    value: "",
-    options: [],
-    placeholder: "Use the default LLM connection",
-    searchPlaceholder: "Search LLM connections\u2026",
-    emptyMessage: "No LLM connections found.",
-    clearable: true,
-    clearLabel: "Use default LLM connection",
-    ariaLabel: "Speaker-review LLM connection",
-    disabled: true,
-    onChange: (value) => onLlmConnectionChanged(value)
-  });
-  const llmModelInput = ctx.components.mountModelCombobox(llmModelField.slot, {
-    value: "",
-    connection: { kind: "llm" },
-    placeholder: "Use the connection model or enter a model name",
-    browseHint: "Leave blank to use the selected connection\u2019s configured model.",
-    disabled: true,
-    onChange: (value) => onLlmModelChanged(value)
-  });
+  const speakerParsingHint = document.createElement("div");
+  speakerParsingHint.className = "chat-voice-hint";
+  speakerParsingHint.hidden = true;
+  speakerParsingField.slot.append(speakerParsingHint);
   function createNumberInput(value, maximum, ariaLabel) {
     const input = document.createElement("input");
     input.className = "chat-voice-number-input";
@@ -2154,8 +2340,8 @@ function setup(ctx) {
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         pendingSpeakerParseRequests.delete(requestId);
-        reject(new Error("AI speaker review timed out."));
-      }, 45e3);
+        reject(new Error("Jev speaker assignment timed out."));
+      }, 7e4);
       pendingSpeakerParseRequests.set(requestId, { resolve, reject, timer });
       ctx.sendToBackend({
         type: "chat_voice_parse_message",
@@ -2163,8 +2349,6 @@ function setup(ctx) {
         messageId,
         requestId,
         mode: preferences.speakerParsingMode,
-        connectionId: preferences.llmConnectionId,
-        model: preferences.llmModel,
         skippedTrackerTags: preferences.skippedTrackerTags,
         debug: preferences.speakerAssignmentDebug
       });
@@ -2173,18 +2357,146 @@ function setup(ctx) {
   function speakerDebugName(speakerId, speakers) {
     if (speakerId === null) return "narrator";
     if (speakerId === USER_SPEAKER_ID) return "user persona";
+    if (speakerId === UNCAST_SPEAKER_ID) return "uncast character";
     const speaker = speakers.find((candidate) => candidate.id === speakerId);
     return speaker ? `${speaker.name} [${speakerId}]` : speakerId;
   }
-  function updateSpeakerDebugLog(messageId, isUserMessage, defaultSpeakerId, parserSpeakers, configuredSpeakers, localSegments, finalSegments, aliases, config, parsingMode) {
+  const SPEAKER_SOURCE_LABELS = {
+    "first-pass": "first pass",
+    "chain-fill": "turn chain fill",
+    "chain-override": "turn chain override",
+    "discourse-fill": "discourse fill",
+    "discourse-override": "discourse override",
+    inheritance: "in-message inheritance",
+    "previous-assistant": "previous assistant",
+    "card-title": "card title",
+    "role-fallback": "role fallback",
+    "local-parser": "local parser",
+    unreported: "unreported"
+  };
+  function speakerDebugLine(steps, prefix) {
+    return steps.find((step) => step.startsWith(prefix));
+  }
+  function speakerDebugStep(segment, prefix) {
+    return speakerDebugLine(segment.debugPath ?? [], prefix);
+  }
+  function speakerAssignmentSource(segment, parsingMode, review) {
+    const resolution = speakerDebugStep(segment, "resolution:");
+    if (resolution?.startsWith("resolution:chain-identity (overrode")) return "chain-override";
+    if (resolution?.startsWith("resolution:chain-identity")) return "chain-fill";
+    if (resolution?.startsWith("resolution:discourse-identity (overrode")) return "discourse-override";
+    if (resolution?.startsWith("resolution:discourse-identity")) return "discourse-fill";
+    if (resolution === "resolution:direct-speech-identity") return "first-pass";
+    if (resolution?.startsWith("resolution:upstream-identity")) return "inheritance";
+    if (resolution?.startsWith("resolution:previous-assistant")) return "previous-assistant";
+    if (resolution?.startsWith("resolution:unique card-title")) return "card-title";
+    if (resolution?.startsWith("resolution:user-role")) return "role-fallback";
+    if (resolution?.startsWith("resolution:assistant connection-default")) return "role-fallback";
+    if (review.failed || review.usedLlm === false || parsingMode === "off") return "local-parser";
+    if (speakerDebugStep(segment, "jev-fallback:") || speakerDebugStep(segment, "jev-disabled:")) {
+      return "local-parser";
+    }
+    return "unreported";
+  }
+  function speakerSourceDetail(segment, source, parsingMode, review) {
+    if (source !== "local-parser") return SPEAKER_SOURCE_LABELS[source];
+    if (parsingMode === "off") return "local parser (Jev disabled)";
+    if (review.failed) return "local parser (backend review unavailable)";
+    const fallback = speakerDebugStep(segment, "jev-fallback:");
+    if (fallback) return `local parser fallback (${fallback.slice("jev-fallback:".length).trim()})`;
+    return "local parser";
+  }
+  function describeBackendReview(localSpeakerId, rawSpeakerId, parsingMode, review) {
+    const before = localSpeakerId ?? "none";
+    const after = rawSpeakerId ?? "none";
+    if (parsingMode === "off") {
+      return localSpeakerId === rawSpeakerId ? "backend-result:matches message-local parser (Jev disabled)" : `backend-result:changed message-local ${before} -> ${after} (Jev disabled)`;
+    }
+    if (review.failed) return `backend-result:unavailable (message-local parser: ${after})`;
+    if (review.usedLlm === false) {
+      return localSpeakerId === rawSpeakerId ? "backend-result:local-parser fallback (matches message-local parser)" : `backend-result:local-parser fallback (changed message-local ${before} -> ${after})`;
+    }
+    return localSpeakerId === rawSpeakerId ? `backend/Jev-result:matches message-local parser (${after})` : `backend/Jev-result:changed message-local ${before} -> Jev ${after}`;
+  }
+  function speakerPipelineHeader(segments, parsingMode, review) {
+    if (parsingMode === "off") return ["Jev pipeline: off (attribution is entirely local)"];
+    if (review.failed) {
+      return ["Jev pipeline: unavailable (backend review did not answer; message-local parser used)"];
+    }
+    const steps = segments.flatMap((segment) => segment.debugPath ?? []);
+    if (review.usedLlm === null) {
+      return ["Jev pipeline: status unknown (the backend did not report whether Jev answered)"];
+    }
+    if (review.usedLlm === false) {
+      const fallback = steps.find((step) => step.startsWith("jev-fallback:") || step.startsWith("jev-disabled:"));
+      const reason = fallback?.replace(/^jev-(?:fallback|disabled):/u, "").trim() || "reason not reported";
+      return [`Jev pipeline: first pass not used (${reason}); deterministic parser output used`];
+    }
+    const lines = ["Jev pipeline: first pass answered; deterministic policy applied after normalization"];
+    const speechSegments = segments.filter((segment) => speakerDebugStep(segment, "segment-type:speech"));
+    const normalized = speechSegments.map((segment) => speakerDebugStep(segment, "jev-speech-normalized:")).filter((step) => step !== void 0);
+    if (normalized.length > 0) {
+      const clear = normalized.filter((step) => !step.includes(":unclear")).length;
+      lines.push(
+        `First pass: ${clear} clear / ${normalized.length} quotations (${normalized.length - clear} unresolved or low-confidence)`
+      );
+    }
+    const turnOmitted = steps.includes("jev-turn-questions:omitted (first-pass question budget)");
+    const relations = steps.filter((step) => step.startsWith("jev-turn-") && step.includes("-choice:")).length;
+    const chainDecisions = steps.filter((step) => step.startsWith("chain-decode:")).map((step) => step.slice("chain-decode:".length));
+    if (turnOmitted) {
+      lines.push("Turn matrix: omitted (first-pass question budget); first-pass policy retained");
+    } else if (relations > 0 || chainDecisions.length > 0) {
+      const filled = chainDecisions.filter((step) => step.startsWith("filled-unresolved")).length;
+      const overrode = chainDecisions.filter((step) => step.startsWith("overrode-clear")).length;
+      const retained = chainDecisions.filter((step) => step.startsWith("retained-unresolved")).length;
+      const direct = chainDecisions.filter((step) => step.startsWith("direct")).length;
+      const overrideRejected = chainDecisions.filter((step) => step.startsWith("override-rejected")).length;
+      lines.push(
+        `Turn matrix: ${relations} relations \xB7 ${filled} chain-filled \xB7 ${overrode} chain-overrode \xB7 ${direct} direct retained` + (retained > 0 ? ` \xB7 ${retained} unresolved retained` : "") + (overrideRejected > 0 ? ` \xB7 ${overrideRejected} override rejected` : "")
+      );
+    }
+    const narrativeAttributions = new Set(
+      steps.filter((step) => step.startsWith("chain-narrative:attribution="))
+    ).size;
+    if (narrativeAttributions > 0) {
+      lines.push(`Narrative cues: ${narrativeAttributions} unambiguous attributions`);
+    }
+    const cardDeference = speakerDebugLine(steps, "card-deference:")?.slice("card-deference:".length).trim();
+    if (cardDeference) lines.push(`Card deference: ${cardDeference}`);
+    const request = speakerDebugLine(steps, "discourse-request:")?.slice("discourse-request:".length).trim();
+    const escalated = steps.includes("discourse-decision:escalated");
+    const runIds = [...new Set(steps.filter((step) => step.startsWith("discourse-run:")).map((step) => step.slice("discourse-run:".length).split(" ")[0] ?? "").filter((runId) => runId.length > 0))];
+    const triggerCodes = [...new Set(steps.filter((step) => step.startsWith("discourse-triggers:")).flatMap((step) => step.slice("discourse-triggers:".length).split("; ")).map((trigger) => trigger.split(" (")[0]?.trim() ?? "").filter((trigger) => trigger.length > 0 && trigger !== "none"))];
+    const rejectedRuns = [...new Set(steps.filter((step) => step.startsWith("discourse-decision:rejected")).map((step) => step.slice("discourse-decision:rejected".length).trim().replace(/^\(|\)$/gu, "")).filter((reason) => reason.length > 0))];
+    const outcomes = steps.filter((step) => step.startsWith("discourse-outcome:"));
+    const countOutcome = (name) => outcomes.filter((step) => step === `discourse-outcome:${name}` || step.startsWith(`discourse-outcome:${name} `)).length;
+    if (escalated) {
+      lines.push(
+        `Discourse review: escalated ${runIds.join(", ") || "one run"} (triggers: ${triggerCodes.join(", ") || "not reported"})`,
+        `Discourse review result: ${countOutcome("filled-unresolved")} filled, ${countOutcome("overrode-conflict")} overrode, ${countOutcome("not-a-target")} retained, ${outcomes.filter((step) => step.startsWith("discourse-outcome:rejected")).length} rejected`
+      );
+    } else if (request?.startsWith("failed")) {
+      lines.push(`Discourse review: ${request}`);
+    } else if (rejectedRuns.length > 0) {
+      lines.push(`Discourse review: not escalated (${rejectedRuns.join("; ")})`);
+    } else {
+      lines.push("Discourse review: not requested");
+    }
+    return lines;
+  }
+  function updateSpeakerDebugLog(messageId, isUserMessage, defaultSpeakerId, parserSpeakers, configuredSpeakers, localSegments, finalSegments, aliases, config, parsingMode, review) {
     if (!speakerAssignmentDebug) return;
     const lines = [
       `Message ${messageId} (${isUserMessage ? "user" : "assistant"})`,
+      `Parsing mode: ${parsingMode === "off" ? "local parser only" : "Jev with local fallback"}`,
+      ...speakerPipelineHeader(finalSegments, parsingMode, review),
       `Default speaker: ${speakerDebugName(defaultSpeakerId, parserSpeakers)}`,
-      `AI review mode: ${parsingMode}`,
       `Parser roster: ${parserSpeakers.map((speaker) => `${speaker.name} [${speaker.id}]`).join(", ") || "(empty)"}`,
       ""
     ];
+    const sourceCounts = /* @__PURE__ */ new Map();
+    let narratorCount = 0;
     finalSegments.forEach((segment, index) => {
       const local = localSegments[index]?.text === segment.text ? localSegments[index] : localSegments.find((candidate) => candidate.text === segment.text);
       const rawSpeakerId = segment.speakerId;
@@ -2197,34 +2509,87 @@ function setup(ctx) {
         config.userVoice
       );
       const localSpeaker = local?.speakerId ?? null;
-      const reviewPath = parsingMode === "off" ? localSpeaker === rawSpeakerId ? "backend-result:matches local parser (AI review disabled)" : `backend-result:changed ${localSpeaker ?? "none"} -> ${rawSpeakerId ?? "none"} (AI review disabled)` : localSpeaker === rawSpeakerId ? `backend/review-result:unchanged (${rawSpeakerId ?? "none"})` : `backend/review-result:changed ${localSpeaker ?? "none"} -> ${rawSpeakerId ?? "none"}`;
+      const isSpeech = segment.debugPath?.some((step) => step.startsWith("segment-type:speech")) ?? false;
+      const source = speakerAssignmentSource(segment, parsingMode, review);
+      if (isSpeech) {
+        sourceCounts.set(source, (sourceCounts.get(source) ?? 0) + 1);
+      } else {
+        narratorCount += 1;
+      }
       const aliasPath = rawSpeakerId && mappedSpeakerId !== rawSpeakerId ? `alias-map:${rawSpeakerId} -> ${mappedSpeakerId}` : `alias-map:${rawSpeakerId ?? "none"} (unchanged)`;
       const routeName = speakerDebugName(mappedSpeakerId, configuredSpeakers);
       const voicePath = voice ? `voice-route:${routeName} -> configured voice ${JSON.stringify(voice)}` : `voice-route:${routeName} -> connection default voice`;
       lines.push(
         `[${index + 1}] ${JSON.stringify(segment.text.length > 180 ? `${segment.text.slice(0, 177)}...` : segment.text)}`,
         ...(segment.debugPath ?? local?.debugPath ?? ["parser-trace:unavailable"]).map((step) => `  ${step}`),
-        `  ${reviewPath}`,
+        `  ${describeBackendReview(localSpeaker, rawSpeakerId, parsingMode, review)}`,
+        `  source:${isSpeech ? speakerSourceDetail(segment, source, parsingMode, review) : "narrator"}`,
         `  ${aliasPath}`,
         `  final-speaker:${speakerDebugName(mappedSpeakerId, configuredSpeakers)}`,
         `  ${voicePath}`,
         ""
       );
     });
+    const sourceSummary = [...sourceCounts.entries()].map(([source, count]) => `${SPEAKER_SOURCE_LABELS[source]} ${count}`).join(" \xB7 ");
+    lines.push(
+      `Assignment sources: ${sourceSummary || "no speech segments"} \xB7 narrator segments ${narratorCount}`,
+      "Legend: jev-* first pass \xB7 jev-turn-* and chain-* turn matrix \xB7 jev-discourse-* and discourse-* cross-paragraph review \xB7 resolution:* deterministic policy \xB7 voice-route:* final routing"
+    );
     const log = lines.join("\n");
     speakerDebugOutput.value = log;
     console.debug("[Chat Voice] Speaker assignment trace\n" + log);
   }
-  function requestLlmConnections() {
-    const requestId = `connections-${Date.now().toString(36)}-${++llmConnectionRequestSequence}`;
+  function appendSpeakerDebugLog(line) {
+    if (!speakerAssignmentDebug) return;
+    speakerDebugOutput.value += `${speakerDebugOutput.value ? "\n" : ""}${line}`;
+    console.debug(`[Chat Voice] ${line}`);
+  }
+  function requestDecisionStatus() {
+    const requestId = `decision-${Date.now().toString(36)}-${++decisionStatusRequestSequence}`;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
-        pendingLlmConnectionRequests.delete(requestId);
-        reject(new Error("Timed out while loading main LLM connections."));
-      }, 15e3);
-      pendingLlmConnectionRequests.set(requestId, { resolve, reject, timer });
-      ctx.sendToBackend({ type: "chat_voice_list_llm_connections", requestId });
+        pendingDecisionStatusRequests.delete(requestId);
+        reject(new Error("Timed out while checking Decision connections."));
+      }, 1e4);
+      pendingDecisionStatusRequests.set(requestId, { resolve, reject, timer });
+      ctx.sendToBackend({ type: "chat_voice_decision_status", requestId });
     });
+  }
+  async function refreshDecisionStatus() {
+    try {
+      const status2 = await requestDecisionStatus();
+      decisionConnectionsKnown = true;
+      decisionConnectionAvailable = status2.available && status2.hasConnection;
+      decisionConnectionName = status2.defaultConnectionName ?? "";
+      decisionStatusFailed = false;
+      updateSpeakerParsingControls();
+      return status2;
+    } catch (error) {
+      decisionConnectionsKnown = true;
+      decisionConnectionAvailable = false;
+      decisionConnectionName = "";
+      decisionStatusFailed = true;
+      updateSpeakerParsingControls();
+      console.warn("[Chat Voice] Could not check Decision connections.", error);
+      return null;
+    }
+  }
+  function updateSpeakerParsingControls() {
+    const description = decisionStatusFailed ? "Could not check Decision connections" : !decisionConnectionsKnown ? "Checking for a Decision model connection\u2026" : decisionConnectionAvailable ? decisionConnectionName ? `Uses ${decisionConnectionName} as the default Decision connection` : "Uses the default Lumiverse Decision connection" : "Create a Decision model connection in Lumiverse first";
+    speakerParsingPicker.update({
+      options: [
+        { value: "off", label: "Off", sublabel: "Use the local parser only" },
+        {
+          value: "ambiguous",
+          label: "On",
+          sublabel: description,
+          disabled: decisionStatusFailed || decisionConnectionsKnown && !decisionConnectionAvailable
+        }
+      ]
+    });
+    const warning = decisionStatusFailed ? "Could not verify a Decision model connection. Jev speaker assignment is unavailable until Lumiverse responds." : decisionConnectionsKnown && !decisionConnectionAvailable ? "Jev speaker assignment needs a Decision model connection. Create one in Lumiverse, then reopen this panel." : "";
+    speakerParsingHint.textContent = warning;
+    speakerParsingHint.hidden = warning === "";
   }
   function refreshLocalState() {
     ctx.sendToBackend({
@@ -2398,8 +2763,6 @@ function setup(ctx) {
     const preferences = await loadPlaybackPreferences();
     if (llmSettingsSaveTimer || savingLlmSettings) {
       preferences.speakerParsingMode = speakerParsingMode;
-      preferences.llmConnectionId = llmConnectionId;
-      preferences.llmModel = llmModel;
     }
     if (advancedSettingsSaveTimer || savingAdvancedSettings) {
       preferences.playbackBufferSegments = playbackBufferSegments;
@@ -2450,11 +2813,6 @@ function setup(ctx) {
     updatePlaybackButtons();
     try {
       if (playback.controller.signal.aborted) throw new DOMException("Playback stopped.", "AbortError");
-      const defaultSpeakerId = message.is_user ? USER_SPEAKER_ID : preferredCardSpeakerId(
-        message,
-        playbackChat.characters,
-        playbackChat.cardCharacterIds ?? []
-      );
       const playbackSpeakers = addUnconfiguredDialogueSpeakers(
         message.content,
         speakersForMessageRole(
@@ -2462,6 +2820,16 @@ function setup(ctx) {
           message.is_user,
           message.name
         )
+      );
+      const defaultSpeakerId = message.is_user ? USER_SPEAKER_ID : eligibleCardFallbackSpeakerId(
+        message.content,
+        preferredCardSpeakerId(
+          message,
+          playbackChat.characters,
+          playbackChat.cardCharacterIds ?? []
+        ),
+        playbackSpeakers,
+        preferences.skippedTrackerTags
       );
       const aliases = speakerAliasIdLookup(playbackChat.characters);
       const localSegments = parseRosterVoiceSegments(
@@ -2472,18 +2840,17 @@ function setup(ctx) {
         null,
         preferences.speakerAssignmentDebug
       );
-      let segments = localSegments;
-      if (preferences.speakerParsingMode !== "off") setStatus("Reviewing dialogue speakers\u2026");
+      let review = { segments: localSegments, usedLlm: null, failed: false };
+      if (preferences.speakerParsingMode !== "off") setStatus("Classifying dialogue speakers with Jev\u2026");
       try {
-        segments = await requestSpeakerReviewedSegments(playbackChat.id, messageId, preferences);
-        if (message.is_user) {
-          segments = protectDefaultSpeakerSegments(localSegments, segments, USER_SPEAKER_ID);
-        }
+        review = await requestSpeakerReviewedSegments(playbackChat.id, messageId, preferences);
       } catch (error) {
         console.warn("[Chat Voice] Backend speaker parsing failed; using the message-local parser.", error);
         if (playback.controller.signal.aborted) throw new DOMException("Playback stopped.", "AbortError");
+        review = { segments: localSegments, usedLlm: null, failed: true };
         setStatus("Historical speaker lookup unavailable; using the message-local parser.");
       }
+      const segments = review.segments;
       updateSpeakerDebugLog(
         messageId,
         message.is_user,
@@ -2494,7 +2861,8 @@ function setup(ctx) {
         segments,
         aliases,
         config,
-        preferences.speakerParsingMode
+        preferences.speakerParsingMode,
+        review
       );
       const plan = mergeVoicePlan(segments.map((segment) => {
         const speakerId = segment.speakerId ? aliases.get(segment.speakerId) ?? segment.speakerId : null;
@@ -2508,6 +2876,19 @@ function setup(ctx) {
         return { text: segment.text, voice };
       }));
       if (plan.length === 0) throw new Error("This message has no playable narration or dialogue.");
+      if (preferences.speakerAssignmentDebug) {
+        appendSpeakerDebugLog("\nSynthesis plan");
+        plan.forEach((segment, index) => appendSpeakerDebugLog(
+          `  [${index + 1}] voice=${JSON.stringify(segment.voice || "<connection default>")} text=${JSON.stringify(segment.text.length > 120 ? `${segment.text.slice(0, 117)}...` : segment.text)}`
+        ));
+      }
+      const synthesisMessageKey = `${playbackChat.id}\0${messageId}`;
+      const previousSynthesis = backgroundSynthesisByMessage.get(synthesisMessageKey);
+      if (previousSynthesis) {
+        previousSynthesis.abort();
+        backgroundSynthesisByMessage.delete(synthesisMessageKey);
+        appendSpeakerDebugLog("Cancelled an older unfinished synthesis/save for this message.");
+      }
       const synthesisController = new AbortController();
       const rateLimitBudget = {
         blockedUntil: 0,
@@ -2519,6 +2900,7 @@ function setup(ctx) {
       };
       playback.synthesisController = synthesisController;
       backgroundSynthesisControllers.add(synthesisController);
+      backgroundSynthesisByMessage.set(synthesisMessageKey, synthesisController);
       const adaptiveLimitToken = Symbol("playback-concurrency");
       let adaptiveConcurrency = 1;
       let shortConcurrencyCooldown = 0;
@@ -2526,6 +2908,9 @@ function setup(ctx) {
       let rateLimitedForRemainder = false;
       const prepare = async (index) => {
         try {
+          appendSpeakerDebugLog(
+            `Synthesis request [${index + 1}] started with voice=${JSON.stringify(plan[index].voice || "<connection default>")}.`
+          );
           const segment = await runSynthesisTask(() => synthesizeVoiceSegment(
             connectionId,
             plan[index].text,
@@ -2553,8 +2938,14 @@ function setup(ctx) {
               }
             }
           ), activePlayback === playback && !playback.playbackStopped);
+          appendSpeakerDebugLog(
+            `Synthesis request [${index + 1}] completed with voice=${JSON.stringify(plan[index].voice || "<connection default>")} (${segment.data.byteLength} bytes, ${segment.mime}).`
+          );
           return { ok: true, segment };
         } catch (error) {
+          appendSpeakerDebugLog(
+            `Synthesis request [${index + 1}] failed for voice=${JSON.stringify(plan[index].voice || "<connection default>")}: ${error instanceof Error ? error.message : String(error)}`
+          );
           return { ok: false, error };
         }
       };
@@ -2695,11 +3086,17 @@ function setup(ctx) {
           }
         }).finally(() => {
           backgroundSynthesisControllers.delete(synthesisController);
+          if (backgroundSynthesisByMessage.get(synthesisMessageKey) === synthesisController) {
+            backgroundSynthesisByMessage.delete(synthesisMessageKey);
+          }
         });
       } else {
         playback.persistenceState = "disabled";
         void Promise.all(processed).catch(() => void 0).finally(() => {
           backgroundSynthesisControllers.delete(synthesisController);
+          if (backgroundSynthesisByMessage.get(synthesisMessageKey) === synthesisController) {
+            backgroundSynthesisByMessage.delete(synthesisMessageKey);
+          }
         });
       }
       const initialBufferSize = Math.min(preferences.playbackBufferSegments, plan.length);
@@ -2710,6 +3107,9 @@ function setup(ctx) {
       for (let index = 0; index < plan.length; index += 1) {
         const current = await processed[index];
         if (!current.ok) throw current.error;
+        appendSpeakerDebugLog(
+          `Playback [${index + 1}] using voice=${JSON.stringify(plan[index].voice || "<connection default>")}.`
+        );
         setStatus(`Playing ${index + 1} of ${plan.length} voice segment${plan.length === 1 ? "" : "s"}\u2026`);
         await playDecodedBuffer(playback, current.segment, preferences.volume);
       }
@@ -2937,16 +3337,12 @@ function setup(ctx) {
   }
   async function loadConnections() {
     try {
-      const [loadedConnections, loadedLlmConnections, preferences] = await Promise.all([
+      const [loadedConnections, preferences] = await Promise.all([
         listAllTtsConnections(),
-        requestLlmConnections().catch((error) => {
-          console.warn("[Chat Voice] Could not load main LLM connections.", error);
-          return [];
-        }),
-        loadPlaybackPreferences()
+        loadPlaybackPreferences(),
+        refreshDecisionStatus()
       ]);
       connections = loadedConnections;
-      llmConnections = loadedLlmConnections;
       if (!narratorGlobalSaveTimer && !savingNarratorGlobalVoice) {
         defaultNarratorVoice = preferences.defaultNarratorVoice;
       }
@@ -2978,10 +3374,16 @@ function setup(ctx) {
       }
       if (!savingLlmSettings && !llmSettingsSaveTimer) {
         speakerParsingMode = preferences.speakerParsingMode;
-        llmConnectionId = preferences.llmConnectionId;
-        llmModel = preferences.llmModel;
         speakerParsingPicker.update({ value: speakerParsingMode });
-        updateLlmControlState();
+      }
+      if (!savingLlmSettings && !llmSettingsSaveTimer && !decisionStatusFailed && decisionConnectionsKnown && !decisionConnectionAvailable && speakerParsingMode !== "off") {
+        speakerParsingMode = "off";
+        speakerParsingPicker.update({ value: "off" });
+        try {
+          await saveLlmParsingPreferences("off");
+        } catch (error) {
+          console.warn("[Chat Voice] Could not persist the Jev safeguard.", error);
+        }
       }
       if (!savingAdvancedSettings && !advancedSettingsSaveTimer) {
         playbackBufferSegments = preferences.playbackBufferSegments;
@@ -3003,36 +3405,16 @@ function setup(ctx) {
         disabled: !activeChat || connections.length === 0
       });
       if (connections.length === 0) setStatus("Create a TTS connection in Lumiverse first.");
+      else if (decisionStatusFailed) {
+        setStatus("Could not verify Decision connections. Jev speaker assignment is unavailable.", "error");
+      } else if (decisionConnectionsKnown && !decisionConnectionAvailable) {
+        setStatus("Create a Decision model connection in Lumiverse to enable Jev speaker assignment.");
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : "Could not load TTS connections.";
       connectionPicker.update({ placeholder: "Connections unavailable", disabled: true });
       setStatus(message, "error");
     }
-  }
-  function llmConnectionOptions(selectedId = "") {
-    const options = llmConnections.map((connection) => ({
-      value: connection.id,
-      label: connection.name,
-      sublabel: `${connection.provider}${connection.model ? ` \xB7 ${connection.model}` : ""}`
-    }));
-    if (selectedId && !llmConnections.some((connection) => connection.id === selectedId)) {
-      options.unshift({ value: selectedId, label: "Missing connection", sublabel: selectedId });
-    }
-    return options;
-  }
-  function updateLlmControlState() {
-    const enabled = speakerParsingMode !== "off";
-    llmConnectionPicker.update({
-      value: llmConnectionId,
-      options: llmConnectionOptions(llmConnectionId),
-      disabled: !enabled,
-      placeholder: llmConnections.length ? "Use the default LLM connection" : "No LLM connections found; default will be used"
-    });
-    llmModelInput.update({
-      value: llmModel,
-      connection: llmConnectionId ? { kind: "llm", id: llmConnectionId } : { kind: "llm" },
-      disabled: !enabled
-    });
   }
   function scheduleLlmSettingsSave() {
     if (llmSettingsSaveTimer) clearTimeout(llmSettingsSaveTimer);
@@ -3042,27 +3424,45 @@ function setup(ctx) {
     }, 400);
   }
   function onSpeakerParsingModeChanged(value) {
-    speakerParsingMode = value === "ambiguous" || value === "always" ? value : "off";
-    updateLlmControlState();
-    scheduleLlmSettingsSave();
+    void applySpeakerParsingMode(value === "ambiguous" ? "ambiguous" : "off");
   }
-  function onLlmConnectionChanged(value) {
-    llmConnectionId = value.trim().slice(0, 128);
-    updateLlmControlState();
-    scheduleLlmSettingsSave();
-  }
-  function onLlmModelChanged(value) {
-    llmModel = value.trim().slice(0, 256);
+  async function applySpeakerParsingMode(next) {
+    if (next === "ambiguous") {
+      const status2 = await refreshDecisionStatus();
+      if (!status2?.available || !status2.hasConnection) {
+        speakerParsingPicker.update({ value: speakerParsingMode });
+        setStatus(
+          status2 ? "Create a Decision model connection in Lumiverse before turning on Jev speaker assignment." : "Could not verify a Decision model connection. Jev speaker assignment stays off.",
+          "error"
+        );
+        return;
+      }
+    }
+    speakerParsingMode = next;
+    speakerParsingPicker.update({ value: next });
     scheduleLlmSettingsSave();
   }
   async function persistLlmSettings() {
     savingLlmSettings = true;
-    setStatus("Saving global AI speaker-review settings\u2026");
     try {
-      await saveLlmParsingPreferences(speakerParsingMode, llmConnectionId, llmModel);
-      setStatus("AI speaker-review settings saved globally.", "saved");
+      if (speakerParsingMode === "ambiguous") {
+        const status2 = await refreshDecisionStatus();
+        if (!status2?.available || !status2.hasConnection) {
+          speakerParsingMode = "off";
+          speakerParsingPicker.update({ value: "off" });
+          await saveLlmParsingPreferences("off");
+          setStatus(
+            "Jev speaker assignment was turned off because no Decision model connection is configured.",
+            "error"
+          );
+          return;
+        }
+      }
+      setStatus("Saving global Jev speaker-assignment setting\u2026");
+      await saveLlmParsingPreferences(speakerParsingMode);
+      setStatus("Jev speaker-assignment setting saved globally.", "saved");
     } catch (error) {
-      setStatus(error instanceof Error ? error.message : "Could not save AI speaker-review settings.", "error");
+      setStatus(error instanceof Error ? error.message : "Could not save Jev speaker-assignment setting.", "error");
     } finally {
       savingLlmSettings = false;
     }
@@ -3288,19 +3688,22 @@ function setup(ctx) {
       clearTimeout(pending.timer);
       pendingSpeakerParseRequests.delete(payload.requestId);
       if (payload.error || !payload.segments) {
-        pending.reject(new Error(payload.error || "The message could not be reviewed."));
+        pending.reject(new Error(payload.error || "The message speakers could not be assigned."));
       } else {
-        pending.resolve(payload.segments);
+        pending.resolve({ segments: payload.segments, usedLlm: payload.usedLlm ?? null, failed: false });
       }
       return;
     }
-    if (payload.type === "chat_voice_llm_connections") {
-      const pending = pendingLlmConnectionRequests.get(payload.requestId);
+    if (payload.type === "chat_voice_decision_status") {
+      const pending = payload.requestId ? pendingDecisionStatusRequests.get(payload.requestId) : void 0;
       if (!pending) return;
       clearTimeout(pending.timer);
-      pendingLlmConnectionRequests.delete(payload.requestId);
-      if (payload.error) pending.reject(new Error(payload.error));
-      else pending.resolve(payload.connections);
+      pendingDecisionStatusRequests.delete(payload.requestId);
+      pending.resolve({
+        available: payload.available,
+        hasConnection: payload.hasConnection,
+        defaultConnectionName: payload.defaultConnectionName ?? null
+      });
       return;
     }
     if (payload.type === "chat_voice_error") {
@@ -3351,6 +3754,11 @@ function setup(ctx) {
         pending.reject(new Error("The active chat changed before speaker review completed."));
       }
       pendingSpeakerParseRequests.clear();
+      for (const pending of pendingDecisionStatusRequests.values()) {
+        clearTimeout(pending.timer);
+        pending.reject(new Error("The active chat changed before the Decision connection check completed."));
+      }
+      pendingDecisionStatusRequests.clear();
       stopPlayback();
       flushSave();
       dirty = false;
@@ -3427,6 +3835,7 @@ function setup(ctx) {
     stopPlayback();
     for (const controller of backgroundSynthesisControllers) controller.abort();
     backgroundSynthesisControllers.clear();
+    backgroundSynthesisByMessage.clear();
     flushSave();
     if (saveTimer) clearTimeout(saveTimer);
     unsubscribeActivate();
@@ -3443,11 +3852,11 @@ function setup(ctx) {
       pending.reject(new Error("Chat Voice was closed."));
     }
     pendingSpeakerParseRequests.clear();
-    for (const pending of pendingLlmConnectionRequests.values()) {
+    for (const pending of pendingDecisionStatusRequests.values()) {
       clearTimeout(pending.timer);
       pending.reject(new Error("Chat Voice was closed."));
     }
-    pendingLlmConnectionRequests.clear();
+    pendingDecisionStatusRequests.clear();
     for (const pending of pendingStateRequests.values()) {
       clearTimeout(pending.timer);
       pending.reject(new Error("Chat Voice was closed."));
@@ -3472,7 +3881,7 @@ function setup(ctx) {
     }
     if (llmSettingsSaveTimer) {
       clearTimeout(llmSettingsSaveTimer);
-      void saveLlmParsingPreferences(speakerParsingMode, llmConnectionId, llmModel);
+      void saveLlmParsingPreferences(speakerParsingMode);
     }
     if (advancedSettingsSaveTimer) {
       clearTimeout(advancedSettingsSaveTimer);
@@ -3485,8 +3894,6 @@ function setup(ctx) {
     }
     skippedTrackerTagsInput.destroy();
     speakerParsingPicker.destroy();
-    llmConnectionPicker.destroy();
-    llmModelInput.destroy();
     playbackBufferInput.removeEventListener("change", onPlaybackBufferInput);
     concurrentGenerationInput.removeEventListener("change", onConcurrentGenerationInput);
     rateLimitWaitInput.removeEventListener("change", onRateLimitWaitInput);

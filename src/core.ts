@@ -1,5 +1,6 @@
 export const CONFIG_KEY = 'chat_voice'
 export const USER_SPEAKER_ID = '__chat_voice_user__'
+export const UNCAST_SPEAKER_ID = '__chat_voice_uncast__'
 export const DEFAULT_MESSAGE_LIMIT = 20
 export const MIN_MESSAGE_LIMIT = 1
 export const MAX_MESSAGE_LIMIT = 500
@@ -49,6 +50,13 @@ export interface MessageLike {
 export interface CachedMessageParse {
   contentHash: string
   segments: PlaybackSegment[]
+  /** Escalated dialogue runs and their triggers, retained for diagnostics. */
+  discourse?: {
+    status: 'not-escalated' | 'completed' | 'failed'
+    /** Whether the first pass issued turn-relation questions. */
+    turns?: 'issued' | 'omitted'
+    runs: Array<{ id: string; targets: string[]; triggers: string[] }>
+  }
 }
 
 export interface LlmParsedSegment {
@@ -397,6 +405,26 @@ function readStringMap(value: unknown): Record<string, string> {
   return result
 }
 
+function readCachedDiscourse(
+  value: unknown,
+): CachedMessageParse['discourse'] {
+  if (!isRecord(value)) return undefined
+  const status = value.status
+  if (status !== 'not-escalated' && status !== 'completed' && status !== 'failed') return undefined
+  const turns = value.turns === 'issued' || value.turns === 'omitted' ? value.turns : undefined
+  const runs: Array<{ id: string; targets: string[]; triggers: string[] }> = []
+  const readIds = (ids: unknown) => Array.isArray(ids)
+    ? ids.filter((id): id is string => typeof id === 'string').slice(0, 256).map(id => id.slice(0, 64))
+    : []
+  if (Array.isArray(value.runs)) {
+    for (const run of value.runs.slice(0, 16)) {
+      if (!isRecord(run) || typeof run.id !== 'string') continue
+      runs.push({ id: run.id.slice(0, 64), targets: readIds(run.targets), triggers: readIds(run.triggers) })
+    }
+  }
+  return { status, runs, ...(turns ? { turns } : {}) }
+}
+
 function readParsedMessages(value: unknown): Record<string, CachedMessageParse> {
   if (!isRecord(value)) return {}
   const result: Record<string, CachedMessageParse> = {}
@@ -412,9 +440,11 @@ function readParsedMessages(value: unknown): Record<string, CachedMessageParse> 
       if (text) segments.push({ text, speakerId: speakerId?.slice(0, 256) ?? null })
     }
     if (segments.length > 0) {
+      const discourse = readCachedDiscourse(item.discourse)
       result[messageId.slice(0, 256)] = {
         contentHash: item.contentHash.slice(0, 32),
         segments,
+        ...(discourse ? { discourse } : {}),
       }
     }
   }
@@ -664,11 +694,32 @@ export function speakerAliases(value: string): string[] {
   return aliases
 }
 
-const NON_NAME_PARAGRAPH_LEADS = new Set([
-  'a', 'an', 'and', 'after', 'before', 'but', 'down', 'from', 'he', 'her', 'his',
-  'it', 'its', 'she', 'so', 'somewhere', 'that', 'the', 'their', 'then', 'there',
-  'they', 'this', 'those', 'we', 'when', 'while', 'you', 'your',
+const PREPOSITION_WORDS = [
+  'above', 'across', 'after', 'against', 'along', 'amid', 'among', 'around', 'as',
+  'at', 'before', 'behind', 'below', 'beneath', 'beside', 'between', 'beyond', 'by',
+  'despite', 'down', 'during', 'except', 'for', 'from', 'in', 'inside', 'into',
+  'like', 'near', 'of', 'off', 'on', 'onto', 'opposite', 'out', 'outside', 'over',
+  'past', 'since', 'through', 'throughout', 'to', 'toward', 'towards', 'under',
+  'underneath', 'unlike', 'until', 'up', 'upon', 'via', 'with', 'within', 'without',
+] as const
+
+const NON_NAME_PARAGRAPH_LEADS = new Set<string>([
+  ...PREPOSITION_WORDS,
+  'a', 'an', 'although', 'and', 'because', 'but', 'he', 'her', 'here', 'his', 'if',
+  'it', 'its', 'or', 'she', 'so', 'somewhere', 'that', 'the', 'their', 'then',
+  'there', 'they', 'this', 'those', 'though', 'unless', 'we', 'when', 'where',
+  'whereas', 'whether', 'while', 'who', 'whom', 'whose', 'you', 'your',
 ])
+
+const PREPOSITION_BEFORE_NAME_PATTERN = new RegExp(
+  `\\b(?:${PREPOSITION_WORDS.join('|')})\\s*$`,
+  'iu',
+)
+
+const INTRODUCTORY_PREPOSITIONAL_PHRASE_PATTERN = new RegExp(
+  `^\\s*(?:${PREPOSITION_WORDS.join('|')})\\b(?:\\s+[\\p{L}\\p{M}'’-]+){1,7}\\s*,?\\s*$`,
+  'iu',
+)
 
 export function unconfiguredSpeakerId(name: string): string {
   return `unconfigured:${normalizeSpeakerName(name).toLowerCase()}`
@@ -718,8 +769,17 @@ export function addUnconfiguredDialogueSpeakers(
         && playbackQuotes(paragraphs[paragraphIndex + 1].text).length > 0
       if (!nextHasDialogue) continue
       const narration = paragraph.text.replace(/^[\s,.;:!?—–-]+/u, '')
-      const lead = narration.match(/^([\p{Lu}][\p{L}\p{M}'’.\-]{1,63})(?=\s)/u)?.[1]
-      if (lead) addCandidate(lead)
+      const attributedLead = narration.match(
+        new RegExp(
+          `^([\\p{Lu}][\\p{L}\\p{M}'’.\\-]{1,63})(?:(?:\\s*,\\s*[^,\\n]{1,60},\\s*)|\\s+)${SPEECH_VERBS}\\b`,
+          'u',
+        ),
+      )?.[1]
+      if (attributedLead) addCandidate(attributedLead, true)
+      else {
+        const lead = narration.match(/^([\p{Lu}][\p{L}\p{M}'’.\-]{1,63})(?=\s)/u)?.[1]
+        if (lead) addCandidate(lead)
+      }
       continue
     }
     let cursor = 0
@@ -1161,7 +1221,9 @@ function discourseSubjectSpeaker(
     if (!lead.trim() || /^[\s{(\[]*$/u.test(lead)) score += 10
     else if (!earlierInClause && /^[^,]{1,48},\s*(?:(?:a|an|the)\s+)?$/iu.test(lead)) score += 8
 
-    if (/\b(?:to|from|for|with|by|at|on|of|beside|behind|under|near|toward|towards)\s*$/iu.test(lead)) {
+    // A roster name used as the object of a preposition is an addressee or
+    // contextual mention, not evidence that the name owns nearby dialogue.
+    if (PREPOSITION_BEFORE_NAME_PATTERN.test(lead)) {
       score -= 6
     }
     if (/\b(?:that|which|who|whom|whose|because|while|when|if|though|although)\s*$/iu.test(lead)) {
@@ -1251,6 +1313,33 @@ function mainClausePossessiveSubject(
   return matches.size === 1 ? [...matches][0] : null
 }
 
+/** Resolve "Across the room Jeremy's breathing..." immediately before dialogue. */
+function frontedPrepositionalPossessiveSubject(
+  text: string,
+  speakers: CharacterLike[],
+): string | null {
+  const narrative = narrativeOnly(text)
+  if (mentionedSpeakers(narrative, speakers).clean.size > 0) return null
+  const matches = new Set<string>()
+  for (const speaker of speakers) {
+    for (const alias of speakerAliases(speaker.name)) {
+      const pattern = new RegExp(`\\b${escapedPattern(alias)}\\b['’]s\\s+`, 'giu')
+      for (const match of narrative.matchAll(pattern)) {
+        if (match.index === undefined) continue
+        const prefix = narrative.slice(0, match.index)
+        const sentenceStart = Math.max(
+          prefix.lastIndexOf('.'), prefix.lastIndexOf('!'), prefix.lastIndexOf('?'),
+          prefix.lastIndexOf(';'), prefix.lastIndexOf('\n'),
+        ) + 1
+        if (!INTRODUCTORY_PREPOSITIONAL_PHRASE_PATTERN.test(prefix.slice(sentenceStart))) continue
+        const clause = narrative.slice(match.index + match[0].length).split(/[.!?;\n]/u, 1)[0]
+        if ((clause.match(/[\p{L}\p{M}'’-]+/gu) ?? []).length >= 3) matches.add(speaker.id)
+      }
+    }
+  }
+  return matches.size === 1 ? [...matches][0] : null
+}
+
 function preferredMentionedSpeaker(
   text: string,
   speakers: CharacterLike[],
@@ -1279,6 +1368,67 @@ function unambiguousNarrativeSpeaker(text: string, speakers: CharacterLike[]): s
   return null
 }
 
+const ANONYMOUS_ROLE_NOUNS = [
+  'cashier', 'clerk', 'customer', 'driver', 'employee', 'guard', 'passerby',
+  'server', 'shopkeeper', 'staffer', 'stranger', 'waiter', 'waitress', 'worker',
+] as const
+
+const ANONYMOUS_HUMAN_NOUNS = [
+  ...ANONYMOUS_ROLE_NOUNS,
+  'boy', 'child', 'girl', 'guy', 'kid', 'lady', 'man', 'person', 'teen',
+  'teenager', 'woman',
+] as const
+
+const ANONYMOUS_HUMAN_SUBJECT_PATTERN = new RegExp(
+  `(?:^\\s*|[.!?;]\\s+|^\\s*[^,\\n]{1,120},\\s*)(?:`
+    + `(?:a|an|another|some)\\s+(?:[\\p{L}\\p{M}'’-]+[ -]){0,5}`
+      + `(?:${ANONYMOUS_HUMAN_NOUNS.join('|')})`
+    + `|the\\s+(?:[\\p{L}\\p{M}'’-]+[ -]){0,5}`
+      + `(?:${ANONYMOUS_ROLE_NOUNS.join('|')})`
+    + `)\\b`,
+  'iu',
+)
+
+const ANONYMOUS_HUMAN_IDENTITY_PATTERN = new RegExp(
+  `\\b(?:`
+    + `(?:a|an|another|some)\\s+(?:[\\p{L}\\p{M}'’-]+[ -]){0,5}`
+      + `(?:${ANONYMOUS_HUMAN_NOUNS.join('|')})`
+    + `|the\\s+(?:[\\p{L}\\p{M}'’-]+[ -]){0,5}`
+      + `(?:${ANONYMOUS_ROLE_NOUNS.join('|')})`
+    + `)\\b`,
+  'iu',
+)
+
+/**
+ * An explicitly anonymous role such as "the clerk" or "a stranger". Unlike the
+ * broader human pattern, generic descriptors like "the woman" or "the man" are
+ * excluded, because those commonly refer to the card character itself.
+ */
+const ANONYMOUS_ROLE_IDENTITY_PATTERN = new RegExp(
+  `\\b(?:a|an|another|some|the)\\s+(?:[\\p{L}\\p{M}'’-]+[ -]){0,5}`
+    + `(?:${ANONYMOUS_ROLE_NOUNS.join('|')})\\b`,
+  'iu',
+)
+
+/** Detect a clause-leading, explicitly anonymous person such as "an older woman". */
+function hasAnonymousHumanSubject(text: string): boolean {
+  return ANONYMOUS_HUMAN_SUBJECT_PATTERN.test(narrativeOnly(text))
+}
+
+function hasAnonymousHumanIdentity(text: string): boolean {
+  return ANONYMOUS_HUMAN_IDENTITY_PATTERN.test(narrativeOnly(text))
+}
+
+function hasAnonymousSpeechAttribution(text: string): boolean {
+  const narrative = narrativeOnly(text)
+  return hasAnonymousHumanSubject(narrative)
+    && new RegExp(`\\b${SPEECH_VERBS}\\b`, 'iu').test(narrative)
+}
+
+function hasLeadingPronounSubject(text: string): boolean {
+  return /^(?:he|she|they)\b/iu.test(narrativeOnly(text).trimStart())
+}
+
 /** Whether playable narration establishes any available character as a clause subject. */
 export function hasNamedSpeakerSubject(
   content: string,
@@ -1290,6 +1440,26 @@ export function hasNamedSpeakerSubject(
     const mentions = mentionedSpeakers(paragraph.text, speakers)
     return preferredMentionedSpeaker(paragraph.text, speakers, mentions) !== null
   })
+}
+
+/**
+ * Use a card-matched speaker only when the message establishes no other
+ * character identity. Named local speakers, explicit anonymous roles, and
+ * indefinite human introductions all make the card match ineligible, leaving
+ * otherwise unresolved dialogue on the connection default voice. A definite
+ * "the woman" or "the man" may be the card itself, so it does not block the
+ * fallback.
+ */
+export function eligibleCardFallbackSpeakerId(
+  content: string,
+  cardSpeakerId: string | null,
+  speakers: CharacterLike[],
+  skippedTrackerTagPairs = '',
+): string | null {
+  if (!cardSpeakerId) return null
+  const alternativeSpeakers = speakers.filter(speaker => speaker.id !== cardSpeakerId)
+  if (hasNamedSpeakerSubject(content, alternativeSpeakers, skippedTrackerTagPairs)) return null
+  return hasExplicitUncastCue(content, skippedTrackerTagPairs) ? null : cardSpeakerId
 }
 
 function currentParagraphSpeaker(
@@ -1735,6 +1905,1720 @@ export function speakerReviewQuotes(content: string, skippedTrackerTagPairs = ''
   return playbackQuotes(playbackContent).map(quote => cleanPlaybackText(quote.text))
 }
 
+export interface SpeakerDecisionPlan {
+  state: {
+    messageRole: 'assistant' | 'user'
+    message: string
+    speakers: Array<{ option: string; id: string; name: string; aliases: string[] }>
+    paragraphs: Array<{ id: string; text: string }>
+    speeches: Array<{
+      id: string
+      paragraphId: string
+      text: string
+      /** Clean narration before and after the quotation inside its paragraph. */
+      narrativeBefore: string
+      narrativeAfter: string
+    }>
+    /** Structural dialogue runs used by the chain decoder. */
+    runs: Array<{ id: string; speechIds: string[] }>
+    /** Adjacent speech pairs that carry a turn-relation question. */
+    turns: Array<{ speechId: string; previousSpeechId: string; bridge: string }>
+    /** True when turn questions were dropped to stay inside the question limit. */
+    turnQuestionsOmitted: boolean
+  }
+  questions: Record<string, {
+    type: 'choice'
+    instructions: string
+    criteria: Record<string, string>
+  }>
+  optionSpeakerIds: Record<string, string>
+}
+
+export interface SpeakerDecisionChoice {
+  choice: string
+  probabilities: Record<string, number>
+  confidence: number
+}
+
+const DECISION_UNCAST_OPTION = 'uncast_character'
+const DECISION_UNCLEAR_OPTION = 'no_clear_identity'
+const TURN_CONTINUE_OPTION = 'continues_previous_turn'
+const TURN_RESPOND_OPTION = 'responds_to_previous_speaker'
+const TURN_OTHER_OPTION = 'responds_to_other_participant'
+const TURN_UNCLEAR_OPTION = 'no_clear_relation'
+const MAX_DECISION_QUESTIONS = 256
+
+const TURN_RELATION_CRITERIA: Record<string, string> = {
+  [TURN_CONTINUE_OPTION]: 'The same speaker is still talking; no new speaker has taken over.',
+  [TURN_RESPOND_OPTION]: 'A different participant answers the immediately preceding speaker.',
+  [TURN_OTHER_OPTION]: 'A different participant addresses someone else in the scene, a third party, or an off-scene channel.',
+  [TURN_UNCLEAR_OPTION]: 'The text does not establish whether the speaker continues or changes.',
+}
+
+function speakerDecisionCriteria(
+  stateSpeakers: SpeakerDecisionPlan['state']['speakers'],
+): Record<string, string> {
+  return Object.fromEntries([
+    ...stateSpeakers.map(speaker => [
+      speaker.option,
+      `${speaker.name}, including these aliases: ${speaker.aliases.join(', ')}`,
+    ]),
+    [DECISION_UNCAST_OPTION, 'A specific character present in the text who is not one of the known speakers.'],
+    [DECISION_UNCLEAR_OPTION, 'The text does not establish a reliable character identity.'],
+  ])
+}
+
+export function buildSpeakerDecisionPlan(
+  content: string,
+  speakers: CharacterLike[],
+  isUserMessage: boolean,
+  skippedTrackerTagPairs = '',
+): SpeakerDecisionPlan {
+  const message = preparePlaybackContent(content, skippedTrackerTagPairs)
+  const paragraphs = playbackParagraphs(message)
+  const quotes = playbackQuotes(message)
+  const optionSpeakerIds: Record<string, string> = {}
+  const stateSpeakers = speakers.slice(0, 253).map((speaker, index) => {
+    const option = `known_${index}`
+    optionSpeakerIds[option] = speaker.id
+    return { option, id: speaker.id, name: speaker.name, aliases: speakerAliases(speaker.name) }
+  })
+  const criteria = speakerDecisionCriteria(stateSpeakers)
+  const stateParagraphs = paragraphs.map((paragraph, index) => ({
+    id: `p${index}`,
+    text: cleanPlaybackText(paragraph.text),
+  }))
+  const stateSpeeches = quotes.map((quote, index) => {
+    const paragraphIndex = Math.max(0, paragraphs.findIndex(paragraph => (
+      quote.start >= paragraph.start && quote.start < paragraph.end
+    )))
+    const paragraph = paragraphs[paragraphIndex]
+    const paragraphStart = paragraph?.start ?? 0
+    const paragraphEnd = paragraph?.end ?? paragraphStart
+    const localStart = Math.max(0, quote.start - paragraphStart)
+    const localEnd = Math.max(localStart, quote.end - paragraphStart)
+    const sameParagraph = (candidate: PlaybackQuote | undefined) => Boolean(
+      candidate && candidate.start >= paragraphStart && candidate.start < paragraphEnd,
+    )
+    const previousQuote = index > 0 && sameParagraph(quotes[index - 1]) ? quotes[index - 1] : undefined
+    const nextQuote = sameParagraph(quotes[index + 1]) ? quotes[index + 1] : undefined
+    const beforeStart = previousQuote ? previousQuote.end - paragraphStart : 0
+    const afterEnd = nextQuote ? nextQuote.start - paragraphStart : (paragraph?.text.length ?? 0)
+    return {
+      id: `s${index}`,
+      paragraphId: `p${paragraphIndex}`,
+      text: cleanPlaybackText(quote.text),
+      narrativeBefore: cleanPlaybackText(narrativeOnly(paragraph?.text.slice(beforeStart, localStart) ?? '')),
+      narrativeAfter: cleanPlaybackText(narrativeOnly(paragraph?.text.slice(localEnd, afterEnd) ?? '')),
+    }
+  })
+  const questions: SpeakerDecisionPlan['questions'] = {}
+  for (const paragraph of stateParagraphs) {
+    questions[`paragraph_${paragraph.id}`] = {
+      type: 'choice',
+      instructions: `Which identity is locally established as the acting or speaking subject of paragraph ${paragraph.id}? Judge the paragraph's narration together with any quotations in it, not card or history preference.`,
+      criteria,
+    }
+  }
+  for (const speech of stateSpeeches) {
+    questions[`speech_${speech.id}`] = {
+      type: 'choice',
+      instructions: `Who speaks quotation ${speech.id}? Use the quotation, the narration before and after it, short narration between quotations, attribution, action ownership, pronouns, and dialogue flow. Do not prefer a known speaker merely because they are listed.`,
+      criteria,
+    }
+  }
+  const plan: SpeakerDecisionPlan = {
+    state: {
+      messageRole: isUserMessage ? 'user' : 'assistant',
+      message,
+      speakers: stateSpeakers,
+      paragraphs: stateParagraphs,
+      speeches: stateSpeeches,
+      runs: [],
+      turns: [],
+      turnQuestionsOmitted: false,
+    },
+    questions,
+    optionSpeakerIds,
+  }
+
+  // Turn questions cover adjacent quotations inside each structural run. They
+  // are dropped rather than rejected when the first pass would exceed the
+  // host's question limit.
+  const drafts = dialogueRunDrafts(plan)
+  const quoteBySpeechId = new Map(stateSpeeches.map((speech, index) => [speech.id, quotes[index]]))
+  plan.state.runs = drafts.map((draft, index) => ({ id: `run_${index}`, speechIds: draft.speeches }))
+  plan.state.turns = drafts.flatMap(draft => draft.speeches.slice(1).flatMap((speechId, index) => {
+    const previousSpeechId = draft.speeches[index]
+    return previousSpeechId
+      ? [{
+          speechId,
+          previousSpeechId,
+          bridge: narrationBridge(message, quoteBySpeechId.get(previousSpeechId), quoteBySpeechId.get(speechId)),
+        }]
+      : []
+  }))
+  for (const turn of plan.state.turns) {
+    questions[`turn_${turn.speechId}`] = {
+      type: 'choice',
+      instructions: `How does quotation ${turn.speechId} relate to quotation ${turn.previousSpeechId} immediately before it in the same dialogue run? Judge the exchange using both quotations and the narration between them. Continuing means the same speaker is still talking; responding means a different participant has taken over.`,
+      criteria: TURN_RELATION_CRITERIA,
+    }
+  }
+  if (Object.keys(questions).length > MAX_DECISION_QUESTIONS) {
+    for (const turn of plan.state.turns) delete questions[`turn_${turn.speechId}`]
+    plan.state.turns = []
+    plan.state.turnQuestionsOmitted = true
+  }
+  return plan
+}
+
+function narrationBridge(
+  message: string,
+  previous: PlaybackQuote | undefined,
+  current: PlaybackQuote | undefined,
+): string {
+  if (!previous || !current || current.start <= previous.end) return ''
+  return cleanPlaybackText(narrativeOnly(message.slice(previous.end, current.start)))
+}
+
+export interface SpeakerDecisionThresholds {
+  probability: number
+  confidence: number
+  margin: number
+}
+
+/**
+ * Gates stay constants instead of becoming settings so the regression corpus
+ * can be compared across releases. Discourse escalation is stricter than the
+ * local pass, and replacing an already-clear local answer is stricter still.
+ */
+export const SPEAKER_DECISION_THRESHOLDS: Record<'local' | 'discourse' | 'override', SpeakerDecisionThresholds> = {
+  local: { probability: 0.5, confidence: 0.5, margin: 0.15 },
+  discourse: { probability: 0.6, confidence: 0.55, margin: 0.2 },
+  override: { probability: 0.7, confidence: 0.65, margin: 0.25 },
+}
+
+/** Bump a version whenever a stage changes the output stored in the cache. */
+export const SPEAKER_DECISION_SCHEMA = {
+  classifier: 'jev-3',
+  discourse: 'discourse-1',
+  hardBoundary: 'boundary-1',
+  turns: 'turn-1',
+  chain: 'chain-1',
+  narrative: 'narrative-1',
+  thresholds: {
+    local: 'local-thresholds-1',
+    discourse: 'discourse-thresholds-1',
+    override: 'discourse-override-thresholds-1',
+    chain: 'chain-thresholds-1',
+    chainOverride: 'chain-override-thresholds-1',
+    card: 'card-thresholds-1',
+  },
+} as const
+
+/**
+ * A card-title match may own a message only when no identity clears these
+ * thresholds. One weak guess must not block the fallback for the whole message.
+ */
+export const SPEAKER_CARD_THRESHOLDS = {
+  probability: 0.65,
+  confidence: 0.6,
+  margin: 0.25,
+} as const
+
+export interface SpeakerDecisionEvaluation {
+  choice: string | null
+  /** Clear identity from the selected option; null when the answer is unresolved. */
+  identity: string | null
+  resolved: boolean
+  leadingChoice: string | null
+  leadingIdentity: string | null
+  leadingProbability: number
+  leadingMargin: number
+  choiceProbability: number
+  margin: number
+  confidence: number
+  probabilities: Array<[string, number]>
+}
+
+function decisionIdentity(
+  option: string | null,
+  optionSpeakerIds: Record<string, string>,
+): string | null {
+  if (option === DECISION_UNCAST_OPTION) return UNCAST_SPEAKER_ID
+  if (!option || option === DECISION_UNCLEAR_OPTION) return null
+  return optionSpeakerIds[option] ?? null
+}
+
+/**
+ * Normalize one Jev answer into a clear identity or an unresolved state. The
+ * selected option, its probability, Jev's confidence, and the winner margin are
+ * independent signals; all must clear the configured gates.
+ */
+export function evaluateSpeakerDecisionAnswer(
+  answer: SpeakerDecisionChoice | undefined,
+  optionSpeakerIds: Record<string, string>,
+  thresholds: SpeakerDecisionThresholds = SPEAKER_DECISION_THRESHOLDS.local,
+): SpeakerDecisionEvaluation {
+  const ranked = answer
+    ? Object.entries(answer.probabilities)
+      .filter((entry): entry is [string, number] => Number.isFinite(entry[1]))
+      .sort((left, right) => right[1] - left[1])
+    : []
+  const choice = answer?.choice ?? null
+  const choiceProbability = choice === null ? 0 : answer?.probabilities[choice] ?? 0
+  const runnerUpProbability = ranked.find(([option]) => option !== choice)?.[1] ?? 0
+  const leadingChoice = ranked[0]?.[0] ?? null
+  const leadingProbability = ranked[0]?.[1] ?? 0
+  const confidence = answer?.confidence ?? 0
+  const usableChoice = choice === DECISION_UNCAST_OPTION
+    || choice === DECISION_UNCLEAR_OPTION
+    || (choice !== null && optionSpeakerIds[choice] !== undefined)
+  const clearsGates = Boolean(
+    answer
+    && usableChoice
+    && choice !== DECISION_UNCLEAR_OPTION
+    && choiceProbability >= thresholds.probability
+    && confidence >= thresholds.confidence
+    && choiceProbability - runnerUpProbability >= thresholds.margin,
+  )
+  const identity = clearsGates ? decisionIdentity(choice, optionSpeakerIds) : null
+  return {
+    choice,
+    identity,
+    resolved: identity !== null,
+    leadingChoice,
+    leadingIdentity: decisionIdentity(leadingChoice, optionSpeakerIds),
+    leadingProbability,
+    leadingMargin: leadingProbability - (ranked[1]?.[1] ?? 0),
+    choiceProbability,
+    margin: choiceProbability - runnerUpProbability,
+    confidence,
+    probabilities: ranked,
+  }
+}
+
+function clearDecisionSpeaker(
+  answer: SpeakerDecisionChoice | undefined,
+  optionSpeakerIds: Record<string, string>,
+): string | null | undefined {
+  return evaluateSpeakerDecisionAnswer(answer, optionSpeakerIds).identity ?? undefined
+}
+
+function decisionDebugIdentity(identity: string | null): string {
+  if (identity === null) return 'unclear'
+  return identity === UNCAST_SPEAKER_ID ? 'uncast-character' : identity
+}
+
+function describeDecisionThresholds(thresholds: SpeakerDecisionThresholds): string {
+  return `probability>=${thresholds.probability},confidence>=${thresholds.confidence},margin>=${thresholds.margin}`
+}
+
+function decisionAnswerDebug(
+  scope: string,
+  answer: SpeakerDecisionChoice | undefined,
+  optionSpeakerIds: Record<string, string>,
+  thresholds: SpeakerDecisionThresholds = SPEAKER_DECISION_THRESHOLDS.local,
+  includeThresholds = false,
+): string[] {
+  const thresholdLines = includeThresholds
+    ? [`${scope}-thresholds:${describeDecisionThresholds(thresholds)}`]
+    : []
+  if (!answer) {
+    return [
+      `${scope}:missing`,
+      `${scope}-normalized:unclear (missing answer)`,
+      ...thresholdLines,
+    ]
+  }
+  const evaluation = evaluateSpeakerDecisionAnswer(answer, optionSpeakerIds, thresholds)
+  return [
+    `${scope}-choice:${answer.choice}`,
+    `${scope}-probabilities:${evaluation.probabilities.map(([option, probability]) => `${option}=${probability.toFixed(3)}`).join(',') || 'none'}`,
+    `${scope}-confidence:${evaluation.confidence.toFixed(3)}`,
+    `${scope}-margin:${evaluation.margin.toFixed(3)}`,
+    `${scope}-normalized:${decisionDebugIdentity(evaluation.identity)}`,
+    ...thresholdLines,
+  ]
+}
+
+const MAX_TRANSPARENT_RUN_NARRATION = 160
+const MAX_DISCOURSE_QUESTIONS = 256
+/** A leading candidate this close to the runner-up cannot drive precedence alone. */
+const DISCOURSE_BRITTLE_MARGIN = 0.3
+
+/**
+ * Communication channels whose interleaving defeats local inheritance. A
+ * channel mention is a discourse cue rather than a run boundary, so interleaved
+ * dialogue can still be reviewed as one sequence.
+ */
+const SPEAKER_CHANNEL_CUES: Array<{ channel: string; pattern: RegExp }> = [
+  {
+    channel: 'telephone',
+    pattern: /\b(?:telephone|phone|landline|handset|receiver|voicemail|dial tone|speakerphone)\b/iu,
+  },
+  {
+    channel: 'radio',
+    pattern: /\b(?:radio|walkie[- ]talkie|intercom|two-way|dispatch)\b/iu,
+  },
+  {
+    channel: 'text',
+    pattern: /\b(?:text message|texted|texting|typed (?:out|back)|phone screen|message notification|over text)\b/iu,
+  },
+  {
+    channel: 'overheard',
+    pattern: /\b(?:overheard|through the wall|muffled (?:voice|voices)|from the (?:hallway|next room|other room))\b/iu,
+  },
+]
+
+/** Structural boundaries that end a dialogue run instead of bridging it. */
+const SPEAKER_HARD_BOUNDARY_PATTERNS: Array<{ name: string; pattern: RegExp }> = [
+  {
+    name: 'time-jump',
+    pattern: /\b(?:(?:moments?|minutes?|hours?|days?|weeks?|months?|years?|a while|an hour|a moment)\s+(?:later|before|after)|(?:the|that) (?:next|following) (?:morning|afternoon|evening|night|day|week|month|year)|later that (?:day|night|morning|evening|week|month|year))\b/iu,
+  },
+  {
+    name: 'scene-change',
+    pattern: /\b(?:meanwhile|elsewhere|when they (?:arrived|returned|reached)|returns? (?:home|to the)|steps? (?:into|out of) the (?:room|building|hall|office)|enters? the (?:room|building|hall|office))\b/iu,
+  },
+]
+
+/** A different, unnamed participant taking a turn inside the run. */
+const SPEAKER_TURN_SWITCH_PATTERN = /\b(?:(?:another|a second|a third|a new|the other)\s+(?:voice|woman|man|person|speaker|figure|kid|girl|boy)|(?:someone|somebody)\s+(?:else\s+)?(?:says|said|asks|asked|replies|replied|answers|answered|calls|called|whispers|whispered|shouts|shouted)|(?:a|another)\s+voice\s+(?:from|behind|near|across)|from (?:across the room|the (?:hallway|doorway|next room|other room|shadows)))\b/iu
+
+// These state records are type aliases rather than interfaces so the Decision
+// state object satisfies the host's JSON value type.
+export type SpeakerDiscourseEvidence = {
+  choice: string | null
+  normalized: 'clear-known' | 'clear-uncast' | 'unresolved'
+  identity: string | null
+  probabilities: Record<string, number>
+  confidence: number
+  margin: number
+}
+
+export type SpeakerDiscourseTriggerCode =
+  | 'adjacent-unresolved'
+  | 'unattributed-replies-after-anchor'
+  | 'between-anchors'
+  | 'paragraph-speech-conflict'
+  | 'alternating-participants'
+  | 'turn-switch-cue'
+  | 'interleaved-channels'
+  | 'known-uncast-transition'
+  | 'chain-ambiguity'
+
+export type SpeakerDiscourseTrigger = {
+  code: SpeakerDiscourseTriggerCode
+  detail: string
+}
+
+export type SpeakerDiscourseRun = {
+  id: string
+  paragraphIds: string[]
+  speechIds: string[]
+  targets: string[]
+  triggers: SpeakerDiscourseTrigger[]
+  boundaryBeforeParagraphId: string | null
+  boundaryAfterParagraphId: string | null
+  boundaryBeforeIdentity: string | null
+  boundaryAfterIdentity: string | null
+  hardBoundaries: string[]
+  channels: string[]
+}
+
+export interface SpeakerDiscourseRunAssessment extends SpeakerDiscourseRun {
+  /** Null when the run escalates; otherwise why first-pass policy stays authoritative. */
+  rejection: string | null
+}
+
+export type SpeakerDiscourseEvidenceRecord = {
+  speechId: string
+  paragraphId: string
+  speech: SpeakerDiscourseEvidence
+  paragraph: SpeakerDiscourseEvidence
+  /** Chain evidence produced after the first pass, when available. */
+  chain: {
+    identity: string | null
+    directIdentity: string | null
+    margin: number
+    filled: boolean
+    overrode: boolean
+    narrativeAttribution: string | null
+  } | null
+}
+
+export interface SpeakerDiscoursePlan {
+  state: {
+    messageRole: 'assistant' | 'user'
+    message: string
+    speakers: SpeakerDecisionPlan['state']['speakers']
+    paragraphs: SpeakerDecisionPlan['state']['paragraphs']
+    speeches: SpeakerDecisionPlan['state']['speeches']
+    runs: SpeakerDiscourseRun[]
+    firstPass: SpeakerDiscourseEvidenceRecord[]
+    establishedIdentities: Array<{ identity: string; source: string }>
+    cues: string[]
+  }
+  questions: SpeakerDecisionPlan['questions']
+  optionSpeakerIds: Record<string, string>
+  runIds: string[]
+  targets: string[]
+}
+
+export interface SpeakerDiscourseAssessment {
+  plan: SpeakerDiscoursePlan | null
+  runs: SpeakerDiscourseRunAssessment[]
+}
+
+interface SpeakerDecisionSpeechEvidence {
+  speechId: string
+  paragraphId: string
+  speech: SpeakerDecisionEvaluation
+  paragraph: SpeakerDecisionEvaluation
+}
+
+interface DiscourseParagraph {
+  id: string
+  index: number
+  speechIds: string[]
+  narration: string
+  channels: string[]
+  hardBoundaries: string[]
+  turnSwitch: boolean
+}
+
+function discourseParagraphs(plan: SpeakerDecisionPlan): DiscourseParagraph[] {
+  const speechIdsByParagraph = new Map<string, string[]>()
+  for (const speech of plan.state.speeches) {
+    const existing = speechIdsByParagraph.get(speech.paragraphId) ?? []
+    existing.push(speech.id)
+    speechIdsByParagraph.set(speech.paragraphId, existing)
+  }
+  return plan.state.paragraphs.map((paragraph, index) => {
+    const narration = cleanPlaybackText(narrativeOnly(paragraph.text))
+    return {
+      id: paragraph.id,
+      index,
+      speechIds: speechIdsByParagraph.get(paragraph.id) ?? [],
+      narration,
+      channels: SPEAKER_CHANNEL_CUES
+        .filter(cue => cue.pattern.test(narration))
+        .map(cue => cue.channel),
+      hardBoundaries: SPEAKER_HARD_BOUNDARY_PATTERNS
+        .filter(boundary => boundary.pattern.test(narration))
+        .map(boundary => boundary.name),
+      turnSwitch: SPEAKER_TURN_SWITCH_PATTERN.test(narration),
+    }
+  })
+}
+
+function discourseEvidence(evaluation: SpeakerDecisionEvaluation): SpeakerDiscourseEvidence {
+  return {
+    choice: evaluation.choice,
+    normalized: evaluation.identity === null
+      ? 'unresolved'
+      : evaluation.identity === UNCAST_SPEAKER_ID
+        ? 'clear-uncast'
+        : 'clear-known',
+    identity: evaluation.identity,
+    // Only the leading candidates are resent; the complete distribution is
+    // already implied by the normalized state and would bloat large rosters.
+    probabilities: Object.fromEntries(evaluation.probabilities.slice(0, 5)),
+    confidence: evaluation.confidence,
+    margin: evaluation.margin,
+  }
+}
+
+function paragraphAnchorIdentity(
+  paragraph: DiscourseParagraph,
+  speechEvidence: ReadonlyMap<string, SpeakerDecisionSpeechEvidence>,
+  paragraphEvaluations: ReadonlyMap<string, SpeakerDecisionEvaluation>,
+  chainDecisions: ReadonlyMap<string, SpeakerChainDecision> = new Map(),
+): string | null {
+  const paragraphIdentity = paragraphEvaluations.get(paragraph.id)?.identity ?? null
+  if (paragraphIdentity) return paragraphIdentity
+  const speechIdentities = new Set<string>()
+  for (const speechId of paragraph.speechIds) {
+    const identity = speechEvidence.get(speechId)?.speech.identity
+      ?? chainDecisions.get(speechId)?.identity
+      ?? null
+    if (identity) speechIdentities.add(identity)
+  }
+  return speechIdentities.size === 1 ? [...speechIdentities][0] : null
+}
+
+interface DiscourseAnchor {
+  paragraphId: string
+  identity: string
+}
+
+function nearestAnchor(
+  paragraphs: DiscourseParagraph[],
+  speechEvidence: ReadonlyMap<string, SpeakerDecisionSpeechEvidence>,
+  paragraphEvaluations: ReadonlyMap<string, SpeakerDecisionEvaluation>,
+  startIndex: number,
+  step: 1 | -1,
+  chainDecisions: ReadonlyMap<string, SpeakerChainDecision> = new Map(),
+): DiscourseAnchor | null {
+  for (let index = startIndex; index >= 0 && index < paragraphs.length; index += step) {
+    const paragraph = paragraphs[index]
+    const identity = paragraphAnchorIdentity(paragraph, speechEvidence, paragraphEvaluations, chainDecisions)
+    if (identity) return { paragraphId: paragraph.id, identity }
+  }
+  return null
+}
+
+interface DialogueRunDraft {
+  paragraphs: string[]
+  speeches: string[]
+  hard: string[]
+}
+
+/**
+ * Group speech-bearing paragraphs into structural runs. Short narration beats
+ * stay inside a run; hard boundaries or sustained narration split it. This is
+ * shared by the first-pass turn questions and the discourse assessment so both
+ * stages agree on run membership.
+ */
+function dialogueRunDrafts(plan: SpeakerDecisionPlan): DialogueRunDraft[] {
+  const paragraphs = discourseParagraphs(plan)
+  const drafts: DialogueRunDraft[] = []
+  let draft: DialogueRunDraft | null = null
+  let gap: { paragraphs: string[]; hard: string[]; narrationLength: number } | null = null
+  for (const paragraph of paragraphs) {
+    if (paragraph.speechIds.length === 0) {
+      if (!draft) continue
+      gap = gap ?? { paragraphs: [], hard: [], narrationLength: 0 }
+      gap.paragraphs.push(paragraph.id)
+      gap.hard.push(...paragraph.hardBoundaries)
+      gap.narrationLength += paragraph.narration.length
+      continue
+    }
+    if (draft && gap && (gap.hard.length > 0 || gap.narrationLength > MAX_TRANSPARENT_RUN_NARRATION)) {
+      drafts.push(draft)
+      draft = null
+      gap = null
+    }
+    if (draft && paragraph.hardBoundaries.length > 0) {
+      drafts.push(draft)
+      draft = null
+      gap = null
+    }
+    if (!draft) draft = { paragraphs: [], speeches: [], hard: [] }
+    if (gap) {
+      draft.paragraphs.push(...gap.paragraphs)
+      gap = null
+    }
+    draft.paragraphs.push(paragraph.id)
+    draft.speeches.push(...paragraph.speechIds)
+    draft.hard.push(...paragraph.hardBoundaries)
+  }
+  if (draft) drafts.push(draft)
+  return drafts
+}
+
+/**
+ * Decide which dialogue runs need a second, discourse-level evaluation.
+ *
+ * The first pass deliberately asks only local questions, so turn-taking across
+ * paragraphs can leave every local answer unresolved or self-contradictory.
+ * Detection here is purely structural plus the normalized first-pass evidence;
+ * it never assigns a speaker and never alternates turns from paragraph order.
+ */
+export function assessSpeakerDiscourseEscalation(
+  plan: SpeakerDecisionPlan,
+  answers: Record<string, SpeakerDecisionChoice>,
+  options: { questionLimit?: number } = {},
+): SpeakerDiscourseAssessment {
+  const questionLimit = Math.min(
+    Math.max(Math.floor(options.questionLimit ?? MAX_DISCOURSE_QUESTIONS), 1),
+    MAX_DISCOURSE_QUESTIONS,
+  )
+  const paragraphs = discourseParagraphs(plan)
+  const paragraphById = new Map(paragraphs.map(paragraph => [paragraph.id, paragraph]))
+  const paragraphEvaluations = new Map(plan.state.paragraphs.map(paragraph => [
+    paragraph.id,
+    evaluateSpeakerDecisionAnswer(answers[`paragraph_${paragraph.id}`], plan.optionSpeakerIds),
+  ]))
+  const speechEvidence = new Map<string, SpeakerDecisionSpeechEvidence>()
+  for (const speech of plan.state.speeches) {
+    speechEvidence.set(speech.id, {
+      speechId: speech.id,
+      paragraphId: speech.paragraphId,
+      speech: evaluateSpeakerDecisionAnswer(answers[`speech_${speech.id}`], plan.optionSpeakerIds),
+      paragraph: paragraphEvaluations.get(speech.paragraphId)
+        ?? evaluateSpeakerDecisionAnswer(undefined, plan.optionSpeakerIds),
+    })
+  }
+  const chainDecisions = decodeSpeakerChain(plan, answers)
+  const effectiveIdentity = (evidence: SpeakerDecisionSpeechEvidence): string | null => (
+    evidence.speech.identity ?? chainDecisions.get(evidence.speechId)?.identity ?? null
+  )
+
+  const drafts = dialogueRunDrafts(plan)
+
+  const runs: SpeakerDiscourseRunAssessment[] = []
+  const escalated: SpeakerDiscourseRun[] = []
+  const escalatedTargets: string[] = []
+  const cues: string[] = []
+
+  drafts.forEach((runDraft, runIndex) => {
+    const runId = `run_${runIndex}`
+    const runParagraphs = runDraft.paragraphs
+      .map(id => paragraphById.get(id))
+      .filter((paragraph): paragraph is DiscourseParagraph => paragraph !== undefined)
+    const evidences = runDraft.speeches
+      .map(id => speechEvidence.get(id))
+      .filter((evidence): evidence is SpeakerDecisionSpeechEvidence => evidence !== undefined)
+    const speechParagraphIds = [...new Set(evidences.map(evidence => evidence.paragraphId))]
+    const evidenceByParagraph = new Map<string, SpeakerDecisionSpeechEvidence[]>()
+    for (const evidence of evidences) {
+      const existing = evidenceByParagraph.get(evidence.paragraphId) ?? []
+      existing.push(evidence)
+      evidenceByParagraph.set(evidence.paragraphId, existing)
+    }
+    const clearIdentityFor = (paragraphId: string): string | null => {
+      const direct = paragraphEvaluations.get(paragraphId)?.identity ?? null
+      if (direct) return direct
+      const identities = new Set(
+        (evidenceByParagraph.get(paragraphId) ?? [])
+          .map(evidence => effectiveIdentity(evidence))
+          .filter((identity): identity is string => identity !== null),
+      )
+      return identities.size === 1 ? [...identities][0] : null
+    }
+
+    const firstIndex = runParagraphs[0]?.index ?? 0
+    const lastIndex = runParagraphs[runParagraphs.length - 1]?.index ?? firstIndex
+    const before = nearestAnchor(paragraphs, speechEvidence, paragraphEvaluations, firstIndex - 1, -1, chainDecisions)
+    const after = nearestAnchor(paragraphs, speechEvidence, paragraphEvaluations, lastIndex + 1, 1, chainDecisions)
+    const channels = [...new Set(runParagraphs.flatMap(paragraph => paragraph.channels))]
+    const turnSwitchParagraphs = runParagraphs
+      .filter(paragraph => paragraph.turnSwitch)
+      .map(paragraph => paragraph.id)
+
+    const hardConflicts = evidences.filter(evidence => {
+      const identity = effectiveIdentity(evidence)
+      return identity !== null
+        && evidence.paragraph.resolved
+        && identity !== evidence.paragraph.identity
+    })
+    const brittleConflicts = evidences.filter(evidence => (
+      effectiveIdentity(evidence) === null
+      && evidence.paragraph.resolved
+      && evidence.speech.leadingIdentity !== null
+      && evidence.speech.leadingIdentity !== evidence.paragraph.identity
+      && evidence.speech.leadingProbability >= 0.25
+      && evidence.speech.leadingMargin < DISCOURSE_BRITTLE_MARGIN
+    ))
+    const targets = evidences
+      .filter(evidence => effectiveIdentity(evidence) === null || hardConflicts.includes(evidence))
+      .map(evidence => evidence.speechId)
+
+    const triggers: SpeakerDiscourseTrigger[] = []
+    const weakParagraphs = speechParagraphIds.filter(paragraphId => (
+      (evidenceByParagraph.get(paragraphId) ?? []).every(evidence => effectiveIdentity(evidence) === null)
+    ))
+    for (let index = 1; index < weakParagraphs.length; index += 1) {
+      const previousPosition = speechParagraphIds.indexOf(weakParagraphs[index - 1])
+      const position = speechParagraphIds.indexOf(weakParagraphs[index])
+      if (position - previousPosition === 1) {
+        triggers.push({
+          code: 'adjacent-unresolved',
+          detail: `${weakParagraphs[index - 1]} and ${weakParagraphs[index]} both lack clear local identities`,
+        })
+        break
+      }
+    }
+
+    let anchored = false
+    let unattributedRun = 0
+    for (const paragraphId of speechParagraphIds) {
+      if (clearIdentityFor(paragraphId)) {
+        anchored = true
+        unattributedRun = 0
+        continue
+      }
+      if (!anchored) continue
+      unattributedRun += 1
+      if (unattributedRun >= 2) {
+        triggers.push({
+          code: 'unattributed-replies-after-anchor',
+          detail: `${unattributedRun} unattributed replies ending at ${paragraphId}`,
+        })
+        break
+      }
+    }
+
+    if (before && after) {
+      triggers.push({
+        code: 'between-anchors',
+        detail: `between ${before.paragraphId}=${before.identity} and ${after.paragraphId}=${after.identity}`,
+      })
+    }
+
+    if (hardConflicts.length > 0 || brittleConflicts.length > 0) {
+      triggers.push({
+        code: 'paragraph-speech-conflict',
+        detail: [
+          ...(hardConflicts.length > 0
+            ? [`clear conflict on ${hardConflicts.map(evidence => evidence.speechId).join(', ')}`]
+            : []),
+          ...(brittleConflicts.length > 0
+            ? [`brittle precedence on ${brittleConflicts.map(evidence => evidence.speechId).join(', ')}`]
+            : []),
+        ].join('; '),
+      })
+    }
+
+    const sceneIdentities = new Set<string>()
+    for (const evidence of evidences) {
+      const identity = effectiveIdentity(evidence)
+      if (identity) sceneIdentities.add(identity)
+      if (evidence.paragraph.identity) sceneIdentities.add(evidence.paragraph.identity)
+    }
+    if (before) sceneIdentities.add(before.identity)
+    if (after) sceneIdentities.add(after.identity)
+    if (sceneIdentities.size >= 2 && targets.length >= 2) {
+      triggers.push({
+        code: 'alternating-participants',
+        detail: `${sceneIdentities.size} participants established around ${targets.length} unresolved speeches`,
+      })
+    }
+
+    if (turnSwitchParagraphs.length > 0) {
+      triggers.push({
+        code: 'turn-switch-cue',
+        detail: `unnamed turn switch in ${turnSwitchParagraphs.join(', ')}`,
+      })
+    }
+
+    if (channels.length >= 2) {
+      triggers.push({
+        code: 'interleaved-channels',
+        detail: channels.join(' + '),
+      })
+    }
+
+    const runIdentities = new Set<string>()
+    for (const evidence of evidences) {
+      const identity = effectiveIdentity(evidence)
+      if (identity) runIdentities.add(identity)
+      if (evidence.paragraph.identity) runIdentities.add(evidence.paragraph.identity)
+    }
+    const hasKnownRunIdentity = [...runIdentities].some(identity => identity !== UNCAST_SPEAKER_ID)
+    if (
+      hasKnownRunIdentity
+      && runIdentities.has(UNCAST_SPEAKER_ID)
+      && evidences.some(evidence => effectiveIdentity(evidence) === null)
+    ) {
+      triggers.push({
+        code: 'known-uncast-transition',
+        detail: 'known and uncast identities share an ambiguous sequence',
+      })
+    }
+
+    const chainOverrides = evidences.filter(evidence => chainDecisions.get(evidence.speechId)?.overrode)
+    const chainLowMargin = evidences.filter(evidence => {
+      const decision = chainDecisions.get(evidence.speechId)
+      return decision !== undefined && decision.margin < SPEAKER_CHAIN_THRESHOLDS.acceptMargin
+    })
+    if (chainOverrides.length > 0 || chainLowMargin.length > 0) {
+      triggers.push({
+        code: 'chain-ambiguity',
+        detail: [
+          ...(chainOverrides.length > 0
+            ? [`chain overrode ${chainOverrides.map(evidence => evidence.speechId).join(', ')}`]
+            : []),
+          ...(chainLowMargin.length > 0
+            ? [`low chain margin on ${chainLowMargin.map(evidence => evidence.speechId).join(', ')}`]
+            : []),
+        ].join('; '),
+      })
+    }
+
+    let rejection: string | null = null
+    if (targets.length === 0) {
+      rejection = 'no unresolved or conflicting speech'
+    } else if (
+      targets.length === 1
+      && hardConflicts.length === 0
+      && brittleConflicts.length === 0
+      && !after
+      && turnSwitchParagraphs.length === 0
+      && channels.length < 2
+    ) {
+      // A single low-confidence quotation with only upstream evidence keeps
+      // ordinary inheritance instead of paying for a discourse pass.
+      rejection = 'isolated low-confidence speech with only upstream evidence'
+    } else if (triggers.length === 0) {
+      rejection = 'no escalation trigger'
+    } else if (escalatedTargets.length + targets.length > questionLimit) {
+      rejection = `question budget exceeded (${escalatedTargets.length + targets.length}/${questionLimit})`
+    }
+
+    const run: SpeakerDiscourseRun = {
+      id: runId,
+      paragraphIds: runDraft.paragraphs,
+      speechIds: runDraft.speeches,
+      targets,
+      triggers,
+      boundaryBeforeParagraphId: before?.paragraphId ?? null,
+      boundaryAfterParagraphId: after?.paragraphId ?? null,
+      boundaryBeforeIdentity: before?.identity ?? null,
+      boundaryAfterIdentity: after?.identity ?? null,
+      hardBoundaries: [...new Set(runDraft.hard)],
+      channels,
+    }
+    runs.push({ ...run, rejection })
+    if (rejection !== null) return
+    escalated.push(run)
+    escalatedTargets.push(...targets)
+    for (const boundary of run.hardBoundaries) cues.push(`${runId}:hard-boundary:${boundary}`)
+    for (const channel of run.channels) cues.push(`${runId}:channel:${channel}`)
+    for (const paragraphId of turnSwitchParagraphs) cues.push(`${runId}:turn-switch:${paragraphId}`)
+  })
+
+  if (escalated.length === 0) return { plan: null, runs }
+
+  const establishedIdentities: Array<{ identity: string; source: string }> = []
+  const seenIdentities = new Set<string>()
+  const addIdentity = (identity: string | null, source: string) => {
+    if (!identity || seenIdentities.has(identity)) return
+    seenIdentities.add(identity)
+    establishedIdentities.push({ identity, source })
+  }
+  for (const paragraph of plan.state.paragraphs) {
+    addIdentity(paragraphEvaluations.get(paragraph.id)?.identity ?? null, `paragraph-${paragraph.id}`)
+  }
+  for (const speech of plan.state.speeches) {
+    const evidence = speechEvidence.get(speech.id)
+    addIdentity(evidence ? effectiveIdentity(evidence) : null, `speech-${speech.id}`)
+  }
+
+  const criteria = speakerDecisionCriteria(plan.state.speakers)
+  const questions: SpeakerDecisionPlan['questions'] = {}
+  for (const run of escalated) {
+    for (const speechId of run.targets) {
+      questions[`discourse_${speechId}`] = {
+        type: 'choice',
+        instructions: `Who speaks quotation ${speechId} in dialogue run ${run.id}? Use the complete dialogue sequence, response relationships, turn continuity, channel changes, and both boundary anchors. First-pass answers are evidence, not fixed answers. Do not alternate speakers from paragraph order alone.`,
+        criteria,
+      }
+    }
+  }
+
+  const firstPass: SpeakerDiscourseEvidenceRecord[] = escalated.flatMap(run => (
+    run.speechIds.flatMap(speechId => {
+      const evidence = speechEvidence.get(speechId)
+      if (!evidence) return []
+      const decision = chainDecisions.get(speechId)
+      return [{
+        speechId,
+        paragraphId: evidence.paragraphId,
+        speech: discourseEvidence(evidence.speech),
+        paragraph: discourseEvidence(evidence.paragraph),
+        chain: decision
+          ? {
+              identity: decision.identity,
+              directIdentity: decision.directIdentity,
+              margin: decision.margin,
+              filled: decision.filled,
+              overrode: decision.overrode,
+              narrativeAttribution: decision.narrativeAttribution,
+            }
+          : null,
+      }]
+    })
+  ))
+
+  return {
+    plan: {
+      state: {
+        messageRole: plan.state.messageRole,
+        message: plan.state.message,
+        speakers: plan.state.speakers,
+        paragraphs: plan.state.paragraphs,
+        speeches: plan.state.speeches,
+        runs: escalated,
+        firstPass,
+        establishedIdentities,
+        cues,
+      },
+      questions,
+      optionSpeakerIds: plan.optionSpeakerIds,
+      runIds: escalated.map(run => run.id),
+      targets: escalatedTargets,
+    },
+    runs,
+  }
+}
+
+export type SpeakerDiscourseOutcomeReason =
+  | 'filled-unresolved'
+  | 'overrode-conflict'
+  | 'rejected-missing-answer'
+  | 'rejected-gates'
+  | 'rejected-override-threshold'
+
+export interface SpeakerDiscourseOutcome {
+  speechId: string
+  runId: string
+  applied: boolean
+  reason: SpeakerDiscourseOutcomeReason
+  identity: string | null
+  conflict: boolean
+  evaluation: SpeakerDecisionEvaluation
+  overrideEvaluation: SpeakerDecisionEvaluation | null
+}
+
+/**
+ * Apply discourse answers to the first-pass evidence. A discourse answer may
+ * fill an unresolved span directly; it may only replace a clear first-pass
+ * answer when paragraph and speech disagreed and it clears the higher
+ * override threshold.
+ */
+export function resolveSpeakerDiscourseAnswers(
+  discourse: SpeakerDiscoursePlan,
+  answers: Record<string, SpeakerDecisionChoice>,
+): Map<string, SpeakerDiscourseOutcome> {
+  const outcomes = new Map<string, SpeakerDiscourseOutcome>()
+  const evidenceById = new Map(discourse.state.firstPass.map(entry => [entry.speechId, entry]))
+  const runIdBySpeech = new Map<string, string>()
+  for (const run of discourse.state.runs) {
+    for (const speechId of run.speechIds) runIdBySpeech.set(speechId, run.id)
+  }
+  for (const speechId of discourse.targets) {
+    const evidence = evidenceById.get(speechId)
+    const runId = runIdBySpeech.get(speechId) ?? 'run_unknown'
+    const answer = answers[`discourse_${speechId}`]
+    const evaluation = evaluateSpeakerDecisionAnswer(
+      answer,
+      discourse.optionSpeakerIds,
+      SPEAKER_DECISION_THRESHOLDS.discourse,
+    )
+    const speechIdentity = evidence?.speech.identity ?? evidence?.chain?.identity ?? null
+    const paragraphIdentity = evidence?.paragraph.identity ?? null
+    const conflict = speechIdentity !== null
+      && paragraphIdentity !== null
+      && speechIdentity !== paragraphIdentity
+    if (!answer) {
+      outcomes.set(speechId, {
+        speechId, runId, conflict, evaluation, overrideEvaluation: null,
+        applied: false, reason: 'rejected-missing-answer', identity: null,
+      })
+      continue
+    }
+    if (!evaluation.resolved) {
+      outcomes.set(speechId, {
+        speechId, runId, conflict, evaluation, overrideEvaluation: null,
+        applied: false, reason: 'rejected-gates', identity: null,
+      })
+      continue
+    }
+    if (!conflict) {
+      outcomes.set(speechId, {
+        speechId, runId, conflict, evaluation, overrideEvaluation: null,
+        applied: true, reason: 'filled-unresolved', identity: evaluation.identity,
+      })
+      continue
+    }
+    const overrideEvaluation = evaluateSpeakerDecisionAnswer(
+      answer,
+      discourse.optionSpeakerIds,
+      SPEAKER_DECISION_THRESHOLDS.override,
+    )
+    outcomes.set(speechId, overrideEvaluation.resolved
+      ? {
+          speechId, runId, conflict, evaluation, overrideEvaluation,
+          applied: true, reason: 'overrode-conflict', identity: overrideEvaluation.identity,
+        }
+      : {
+          speechId, runId, conflict, evaluation, overrideEvaluation,
+          applied: false, reason: 'rejected-override-threshold', identity: null,
+        })
+  }
+  return outcomes
+}
+
+export const SPEAKER_CHAIN_THRESHOLDS = {
+  /** Minimum identity probability for filling an unresolved span. */
+  acceptEmission: 0.15,
+  /** Minimum path margin for filling an unresolved span. */
+  acceptMargin: 1,
+  /** Minimum identity probability for overriding a clear answer. */
+  overrideEmission: 0.25,
+  /** Minimum path margin for overriding a clear answer. */
+  overrideMargin: 2,
+  /** Switch prior used when a relation answer is missing. */
+  neutralSwitch: 0.4,
+  /** Floor for the switch probability derived from a relation answer. */
+  baseSwitch: 0.15,
+  /** Switch probability imposed by an unnamed turn-switch cue in the bridge. */
+  turnSwitchCue: 0.7,
+  /** Emission bonus for an unambiguous narrative attribution. */
+  narrativeAttributionBonus: 0.75,
+  /** Identity candidates considered per speech. */
+  candidates: 4,
+} as const
+
+export interface SpeakerChainDecision {
+  speechId: string
+  /** Final identity after the decode: direct answer, filled, or overridden. */
+  identity: string | null
+  /** Best-path identity before acceptance and override gates. */
+  decodedIdentity: string | null
+  /** Probability of the decoded identity in its speech answer. */
+  identityProbability: number
+  /** Jev confidence of the speech answer behind the decoded identity. */
+  identityConfidence: number
+  directIdentity: string | null
+  changed: boolean
+  filled: boolean
+  overrode: boolean
+  /** Smaller of the per-position and whole-path margins. */
+  margin: number
+  relationChoice: string | null
+  switchProbability: number
+  narrativeAttribution: string | null
+}
+
+const NARRATIVE_SPEECH_VERB_PATTERN = new RegExp(
+  `\\b(?:${SPEECH_VERBS}|blurt(?:s|ed)|laugh(?:s|ed)|mutter(?:s|ed)|hiss(?:es|ed)|snap(?:s|ped))\\b`,
+  'iu',
+)
+
+/**
+ * Read an unambiguous attribution from a paragraph's narration: a speech verb
+ * plus exactly one clean known-speaker mention. This is evidence for the chain,
+ * never an assignment on its own.
+ */
+function narrativeAttributionSpeaker(
+  paragraphText: string,
+  speakers: CharacterLike[],
+): string | null {
+  const narration = cleanPlaybackText(narrativeOnly(paragraphText))
+  if (!narration || !NARRATIVE_SPEECH_VERB_PATTERN.test(narration)) return null
+  const mentions = mentionedSpeakers(narration, speakers)
+  if (mentions.clean.size !== 1 || mentions.possessive.size > 0) return null
+  return [...mentions.clean][0] ?? null
+}
+
+function chainSwitchProbability(
+  answer: SpeakerDecisionChoice | undefined,
+  bridge: string,
+): number {
+  let probability: number
+  if (!answer) {
+    probability = SPEAKER_CHAIN_THRESHOLDS.neutralSwitch
+  } else {
+    const respond = Math.max(0, answer.probabilities[TURN_RESPOND_OPTION] ?? 0)
+    const other = Math.max(0, answer.probabilities[TURN_OTHER_OPTION] ?? 0)
+    const unclear = Math.max(0, answer.probabilities[TURN_UNCLEAR_OPTION] ?? 0)
+    probability = respond + 0.5 * (other + unclear)
+  }
+  if (bridge && SPEAKER_TURN_SWITCH_PATTERN.test(bridge)) {
+    probability = Math.max(probability, SPEAKER_CHAIN_THRESHOLDS.turnSwitchCue)
+  }
+  return Math.min(0.95, Math.max(SPEAKER_CHAIN_THRESHOLDS.baseSwitch, probability))
+}
+
+/**
+ * Jointly decode every dialogue run from identity emissions, turn-relation
+ * transitions, and narrative attribution evidence.
+ *
+ * A decoded identity fills a span whose direct answer is unresolved. A direct
+ * clear answer may be overridden only when the chain strongly disagrees and the
+ * higher override constants pass. The decode is deterministic and never throws
+ * for missing or malformed answers.
+ */
+export function decodeSpeakerChain(
+  plan: SpeakerDecisionPlan,
+  answers: Record<string, SpeakerDecisionChoice>,
+): Map<string, SpeakerChainDecision> {
+  const decisions = new Map<string, SpeakerChainDecision>()
+  if (plan.state.turns.length === 0 || plan.state.runs.length === 0) return decisions
+
+  const speakers: CharacterLike[] = plan.state.speakers.map(speaker => ({
+    id: speaker.id,
+    name: speaker.name,
+  }))
+  const speechById = new Map(plan.state.speeches.map(speech => [speech.id, speech]))
+  const paragraphEvaluations = new Map(plan.state.paragraphs.map(paragraph => [
+    paragraph.id,
+    evaluateSpeakerDecisionAnswer(answers[`paragraph_${paragraph.id}`], plan.optionSpeakerIds),
+  ]))
+  const paragraphAttributions = new Map(plan.state.paragraphs.map(paragraph => [
+    paragraph.id,
+    narrativeAttributionSpeaker(paragraph.text, speakers),
+  ]))
+  const turnBySpeech = new Map(plan.state.turns.map(turn => [turn.speechId, turn]))
+  const speechEvaluations = new Map<string, SpeakerDecisionEvaluation>()
+  for (const speech of plan.state.speeches) {
+    speechEvaluations.set(
+      speech.id,
+      evaluateSpeakerDecisionAnswer(answers[`speech_${speech.id}`], plan.optionSpeakerIds),
+    )
+  }
+
+  const identityProbabilities = new Map<string, Map<string, number>>()
+  const candidates = new Map<string, string[]>()
+  const emissions = new Map<string, Map<string, number>>()
+  for (const speech of plan.state.speeches) {
+    const evaluation = speechEvaluations.get(speech.id)
+    if (!evaluation) continue
+    const byIdentity = new Map<string, number>()
+    for (const [option, probability] of evaluation.probabilities) {
+      const identity = decisionIdentity(option, plan.optionSpeakerIds)
+      if (!identity) continue
+      byIdentity.set(identity, (byIdentity.get(identity) ?? 0) + probability)
+    }
+    const paragraphIdentity = paragraphEvaluations.get(speech.paragraphId)?.identity ?? null
+    const attribution = paragraphAttributions.get(speech.paragraphId) ?? null
+    const candidateIds = [...byIdentity.entries()]
+      .sort((left, right) => right[1] - left[1])
+      .slice(0, SPEAKER_CHAIN_THRESHOLDS.candidates)
+      .map(([identity]) => identity)
+    for (const identity of [paragraphIdentity, attribution, evaluation.identity]) {
+      if (identity && !candidateIds.includes(identity)) candidateIds.push(identity)
+    }
+    if (candidateIds.length === 0) continue
+    const emission = new Map<string, number>()
+    for (const identity of candidateIds) {
+      let score = Math.log(Math.max(byIdentity.get(identity) ?? 0, 1e-6))
+      if (identity === attribution) score += SPEAKER_CHAIN_THRESHOLDS.narrativeAttributionBonus
+      emission.set(identity, score)
+    }
+    identityProbabilities.set(speech.id, byIdentity)
+    candidates.set(speech.id, candidateIds)
+    emissions.set(speech.id, emission)
+  }
+
+  const decodeSegment = (speechIds: string[]) => {
+    const positionScores: Array<Map<string, number>> = []
+    const backPointers: Array<Map<string, string | null>> = []
+    speechIds.forEach((speechId, index) => {
+      const candidateIds = candidates.get(speechId) ?? []
+      const emission = emissions.get(speechId) ?? new Map<string, number>()
+      const scores = new Map<string, number>()
+      const back = new Map<string, string | null>()
+      if (index === 0) {
+        for (const identity of candidateIds) {
+          scores.set(identity, emission.get(identity) ?? Math.log(1e-6))
+          back.set(identity, null)
+        }
+      } else {
+        const previousScores = positionScores[index - 1] ?? new Map<string, number>()
+        const previousCandidates = candidates.get(speechIds[index - 1]) ?? []
+        const switchProbability = chainSwitchProbability(
+          answers[`turn_${speechId}`],
+          turnBySpeech.get(speechId)?.bridge ?? '',
+        )
+        for (const identity of candidateIds) {
+          let best = Number.NEGATIVE_INFINITY
+          let bestPrevious: string | null = null
+          for (const previousIdentity of previousCandidates) {
+            const previousScore = previousScores.get(previousIdentity)
+            if (previousScore === undefined) continue
+            const transition = Math.log(
+              identity === previousIdentity ? 1 - switchProbability : switchProbability,
+            )
+            const score = previousScore + transition
+            if (score > best) {
+              best = score
+              bestPrevious = previousIdentity
+            }
+          }
+          scores.set(identity, best + (emission.get(identity) ?? Math.log(1e-6)))
+          back.set(identity, bestPrevious)
+        }
+      }
+      positionScores.push(scores)
+      backPointers.push(back)
+    })
+
+    const finalScores = [...(positionScores[positionScores.length - 1] ?? new Map<string, number>()).entries()]
+      .sort((left, right) => right[1] - left[1])
+    if (finalScores.length === 0) return
+    const bestTotal = finalScores[0][1]
+    const path: string[] = new Array(speechIds.length)
+    let state = finalScores[0][0]
+    for (let index = speechIds.length - 1; index >= 0; index -= 1) {
+      path[index] = state
+      state = backPointers[index]?.get(state) ?? state
+    }
+
+    // Backward scores turn each position margin into the true decision margin:
+    // how much better the best complete path is than the best path that commits
+    // to a different identity at this speech.
+    const backward: Array<Map<string, number>> = new Array(speechIds.length)
+    for (let index = speechIds.length - 1; index >= 0; index -= 1) {
+      const scores = new Map<string, number>()
+      const candidateIds = candidates.get(speechIds[index]) ?? []
+      if (index === speechIds.length - 1) {
+        for (const identity of candidateIds) scores.set(identity, 0)
+      } else {
+        const nextCandidates = candidates.get(speechIds[index + 1]) ?? []
+        const nextEmission = emissions.get(speechIds[index + 1]) ?? new Map<string, number>()
+        const switchProbability = chainSwitchProbability(
+          answers[`turn_${speechIds[index + 1]}`],
+          turnBySpeech.get(speechIds[index + 1])?.bridge ?? '',
+        )
+        for (const identity of candidateIds) {
+          let best = Number.NEGATIVE_INFINITY
+          for (const nextIdentity of nextCandidates) {
+            const score = Math.log(
+              identity === nextIdentity ? 1 - switchProbability : switchProbability,
+            ) + (nextEmission.get(nextIdentity) ?? Math.log(1e-6))
+              + (backward[index + 1]?.get(nextIdentity) ?? 0)
+            if (score > best) best = score
+          }
+          scores.set(identity, best)
+        }
+      }
+      backward[index] = scores
+    }
+
+    speechIds.forEach((speechId, index) => {
+      const evaluation = speechEvaluations.get(speechId)
+      if (!evaluation) return
+      const speech = speechById.get(speechId)
+      const candidateIds = candidates.get(speechId) ?? []
+      const decoded = path[index]
+      const probability = identityProbabilities.get(speechId)?.get(decoded) ?? 0
+      const direct = evaluation.identity
+      const switchProbability = chainSwitchProbability(
+        answers[`turn_${speechId}`],
+        turnBySpeech.get(speechId)?.bridge ?? '',
+      )
+      let alternative = Number.NEGATIVE_INFINITY
+      for (const identity of candidateIds) {
+        if (identity === decoded) continue
+        const constrained = (positionScores[index]?.get(identity) ?? Number.NEGATIVE_INFINITY)
+          + (backward[index]?.get(identity) ?? Number.NEGATIVE_INFINITY)
+        if (constrained > alternative) alternative = constrained
+      }
+      const margin = alternative === Number.NEGATIVE_INFINITY
+        ? Number.POSITIVE_INFINITY
+        : bestTotal - alternative
+      let identity = direct
+      let filled = false
+      let overrode = false
+      if (direct === null) {
+        if (
+          probability >= SPEAKER_CHAIN_THRESHOLDS.acceptEmission
+          && margin >= SPEAKER_CHAIN_THRESHOLDS.acceptMargin
+        ) {
+          identity = decoded
+          filled = true
+        }
+      } else if (decoded !== direct) {
+        if (
+          probability >= SPEAKER_CHAIN_THRESHOLDS.overrideEmission
+          && margin >= SPEAKER_CHAIN_THRESHOLDS.overrideMargin
+          && switchProbability >= 0.5
+        ) {
+          identity = decoded
+          overrode = true
+        }
+      }
+      decisions.set(speechId, {
+        speechId,
+        identity,
+        decodedIdentity: decoded,
+        identityProbability: probability,
+        identityConfidence: evaluation.confidence,
+        directIdentity: direct,
+        changed: identity !== direct,
+        filled,
+        overrode,
+        margin,
+        relationChoice: answers[`turn_${speechId}`]?.choice ?? null,
+        switchProbability,
+        narrativeAttribution: speech
+          ? paragraphAttributions.get(speech.paragraphId) ?? null
+          : null,
+      })
+    })
+  }
+
+  for (const run of plan.state.runs) {
+    let segment: string[] = []
+    const flush = () => {
+      if (segment.length > 0) decodeSegment(segment)
+      segment = []
+    }
+    for (const speechId of run.speechIds) {
+      if (!candidates.has(speechId)) {
+        flush()
+        continue
+      }
+      if (segment.length > 0 && !turnBySpeech.has(speechId)) flush()
+      segment.push(speechId)
+    }
+    flush()
+  }
+  return decisions
+}
+
+/**
+ * Whether the text explicitly establishes a person other than the card through
+ * an anonymous role or an unnamed turn. Pronoun-only scenes do not count, so a
+ * unique card can still own a whole-message uncast identity.
+ */
+function hasExplicitUncastCue(content: string, skippedTrackerTagPairs = ''): boolean {
+  const playbackContent = preparePlaybackContent(content, skippedTrackerTagPairs)
+  const narration = cleanPlaybackText(narrativeOnly(playbackContent))
+  return ANONYMOUS_ROLE_IDENTITY_PATTERN.test(narration)
+    || hasAnonymousHumanSubject(narration)
+    || SPEAKER_TURN_SWITCH_PATTERN.test(narration)
+}
+
+export function resolveSpeakerDecisionSegments(
+  content: string,
+  plan: SpeakerDecisionPlan,
+  answers: Record<string, SpeakerDecisionChoice>,
+  speakers: CharacterLike[],
+  options: {
+    isUserMessage: boolean
+    cardSpeakerId: string | null
+    historicalSpeakerId: string | null
+    skippedTrackerTagPairs?: string
+    includeDebug?: boolean
+    /**
+     * Discourse escalation results. The assessment keeps rejected runs so
+     * diagnostics can explain why a run stayed on first-pass policy.
+     */
+    discourse?: {
+      assessment: SpeakerDiscourseAssessment
+      answers: Record<string, SpeakerDecisionChoice> | null
+      status?: string | null
+    }
+  },
+): PlaybackSegment[] {
+  const paragraphIdentities = new Map(plan.state.paragraphs.map(paragraph => [
+    paragraph.id,
+    clearDecisionSpeaker(answers[`paragraph_${paragraph.id}`], plan.optionSpeakerIds),
+  ]))
+  const firstPassSpeechIdentities = plan.state.speeches.map(speech => (
+    clearDecisionSpeaker(answers[`speech_${speech.id}`], plan.optionSpeakerIds)
+  ))
+  const chain = decodeSpeakerChain(plan, answers)
+  const discoursePlan = options.discourse?.assessment.plan ?? null
+  const discourseAnswers = options.discourse?.answers ?? null
+  const discourseOutcomes = discoursePlan && discourseAnswers
+    ? resolveSpeakerDiscourseAnswers(discoursePlan, discourseAnswers)
+    : new Map<string, SpeakerDiscourseOutcome>()
+  const discourseRunBySpeech = new Map<string, SpeakerDiscourseRunAssessment>()
+  for (const run of options.discourse?.assessment.runs ?? []) {
+    for (const speechId of run.speechIds) discourseRunBySpeech.set(speechId, run)
+  }
+  const discoursePathBySpeechIndex = new Map<number, string>()
+  const chainPathBySpeechIndex = new Map<number, string>()
+  const speechIdentities = firstPassSpeechIdentities.map((identity, index) => {
+    const speech = plan.state.speeches[index]
+    const chainDecision = speech ? chain.get(speech.id) : undefined
+    if (chainDecision?.filled || chainDecision?.overrode) {
+      chainPathBySpeechIndex.set(index, chainDecision.overrode
+        ? 'resolution:chain-identity (overrode clear answer)'
+        : 'resolution:chain-identity (filled unresolved span)')
+    }
+    const baseIdentity = (chainDecision?.identity ?? undefined) ?? identity
+    const outcome = speech ? discourseOutcomes.get(speech.id) : undefined
+    if (!outcome?.applied) return baseIdentity
+    discoursePathBySpeechIndex.set(index, outcome.reason === 'overrode-conflict'
+      ? 'resolution:discourse-identity (overrode paragraph/speech conflict)'
+      : 'resolution:discourse-identity (filled unresolved first pass)')
+    return outcome.identity ?? undefined
+  })
+  const hasLocalIdentity = [...paragraphIdentities.values(), ...speechIdentities]
+    .some(identity => identity !== undefined)
+  const hasUncastIdentity = [...paragraphIdentities.values(), ...speechIdentities]
+    .some(identity => identity === UNCAST_SPEAKER_ID)
+  const explicitUncastCue = hasExplicitUncastCue(content, options.skippedTrackerTagPairs ?? '')
+  const alternativeSpeakers = plan.state.speakers
+    .filter(speaker => speaker.id !== options.cardSpeakerId)
+    .map(speaker => ({ id: speaker.id, name: speaker.name }))
+  const namedAlternative = alternativeSpeakers.length > 0
+    && hasNamedSpeakerSubject(content, alternativeSpeakers, options.skippedTrackerTagPairs ?? '')
+  const speechEvaluations = new Map(plan.state.speeches.map(speech => [
+    speech.id,
+    evaluateSpeakerDecisionAnswer(answers[`speech_${speech.id}`], plan.optionSpeakerIds),
+  ]))
+  const clearsCardThresholds = (evaluation: SpeakerDecisionEvaluation): boolean => (
+    evaluation.identity !== null
+    && evaluation.choiceProbability >= SPEAKER_CARD_THRESHOLDS.probability
+    && evaluation.confidence >= SPEAKER_CARD_THRESHOLDS.confidence
+    && evaluation.margin >= SPEAKER_CARD_THRESHOLDS.margin
+  )
+  const identityStrengths: number[] = []
+  let hasStrongIdentity = false
+  for (const evaluation of speechEvaluations.values()) {
+    if (evaluation.identity === null) continue
+    identityStrengths.push(Math.min(evaluation.choiceProbability, evaluation.confidence))
+    if (clearsCardThresholds(evaluation)) hasStrongIdentity = true
+  }
+  for (const decision of chain.values()) {
+    if (decision.identity === null) continue
+    identityStrengths.push(Math.min(decision.identityProbability, decision.identityConfidence))
+    if (decision.overrode || (
+      decision.identityProbability >= SPEAKER_CARD_THRESHOLDS.probability
+      && decision.identityConfidence >= SPEAKER_CARD_THRESHOLDS.confidence
+    )) {
+      hasStrongIdentity = true
+    }
+  }
+  for (const outcome of discourseOutcomes.values()) {
+    if (!outcome.applied || outcome.identity === null) continue
+    identityStrengths.push(Math.min(outcome.evaluation.choiceProbability, outcome.evaluation.confidence))
+    if (outcome.reason === 'overrode-conflict' || clearsCardThresholds(outcome.evaluation)) {
+      hasStrongIdentity = true
+    }
+  }
+  const maxIdentityStrength = identityStrengths.length > 0 ? Math.max(...identityStrengths) : 0
+  const cardBlockDescription = `p>=${SPEAKER_CARD_THRESHOLDS.probability}`
+    + `,c>=${SPEAKER_CARD_THRESHOLDS.confidence}`
+    + `,m>=${SPEAKER_CARD_THRESHOLDS.margin}`
+  const cardReason = explicitUncastCue
+    ? 'explicit anonymous role or unnamed turn in narration'
+    : namedAlternative
+      ? 'narration names another known speaker'
+      : hasStrongIdentity
+        ? `an identity cleared ${cardBlockDescription}`
+        : `no identity cleared ${cardBlockDescription} (max strength ${maxIdentityStrength.toFixed(2)})`
+  // A card-title match owns a message only when no speech identity is strong
+  // enough to contest it. One weak guess must not veto the fallback.
+  const cardIdentity = options.cardSpeakerId
+    && !explicitUncastCue
+    && !namedAlternative
+    && !hasStrongIdentity
+    ? options.cardSpeakerId
+    : null
+  const deferredUncast = Boolean(cardIdentity && hasUncastIdentity)
+  const routingIdentity = (identity: string | null | undefined): string | undefined => {
+    if (identity === undefined || identity === null) return undefined
+    return deferredUncast && identity === UNCAST_SPEAKER_ID ? undefined : identity
+  }
+  const routingIdentities = speechIdentities.map(identity => routingIdentity(identity))
+  const resolved: Array<string | null> = []
+  const resolutionPaths: string[][] = []
+  let upstreamIdentity: string | null = null
+  let upstreamSource = 'none'
+  let processedParagraphIndex = -1
+  for (let index = 0; index < plan.state.speeches.length; index += 1) {
+    const speech = plan.state.speeches[index]
+    const currentParagraphIndex = Number.parseInt(speech.paragraphId.slice(1), 10)
+    while (processedParagraphIndex < currentParagraphIndex) {
+      processedParagraphIndex += 1
+      const paragraphIdentity = routingIdentity(paragraphIdentities.get(`p${processedParagraphIndex}`))
+      if (paragraphIdentity !== undefined) {
+        upstreamIdentity = paragraphIdentity
+        upstreamSource = `paragraph-p${processedParagraphIndex}`
+      }
+    }
+    const direct = routingIdentities[index]
+    let speakerId: string | null
+    if (direct !== undefined) {
+      speakerId = direct
+      upstreamIdentity = direct
+      upstreamSource = `speech-s${index}`
+      resolutionPaths.push([
+        discoursePathBySpeechIndex.get(index)
+          ?? chainPathBySpeechIndex.get(index)
+          ?? 'resolution:direct-speech-identity',
+      ])
+    } else if (upstreamIdentity) {
+      speakerId = upstreamIdentity
+      resolutionPaths.push([`resolution:upstream-identity (${upstreamSource})`])
+    } else if (
+      options.historicalSpeakerId
+      && (
+        routingIdentities.slice(index + 1).some(identity => identity !== undefined)
+        || plan.state.paragraphs.slice(currentParagraphIndex + 1)
+          .some(paragraph => routingIdentity(paragraphIdentities.get(paragraph.id)) !== undefined)
+      )
+    ) {
+      speakerId = options.historicalSpeakerId
+      resolutionPaths.push(['resolution:previous-assistant opening inheritance before later local identity'])
+    } else if (cardIdentity) {
+      speakerId = cardIdentity
+      resolutionPaths.push([
+        deferredUncast
+          ? 'resolution:unique card-title match (uncast identity had no explicit role cue)'
+          : 'resolution:unique card-title match (no local known or uncast identity)',
+      ])
+    } else if (!hasLocalIdentity && options.historicalSpeakerId) {
+      speakerId = options.historicalSpeakerId
+      resolutionPaths.push(['resolution:previous-assistant identity (no local identity or card match)'])
+    } else {
+      speakerId = options.isUserMessage ? USER_SPEAKER_ID : null
+      resolutionPaths.push([
+        options.isUserMessage
+          ? 'resolution:user-role fallback (no clear identity)'
+          : 'resolution:assistant connection-default fallback (no clear identity)',
+      ])
+    }
+    resolved.push(speakerId)
+  }
+
+  let speechIndex = 0
+  return parseRosterVoiceSegments(
+    content,
+    null,
+    speakers,
+    options.skippedTrackerTagPairs ?? '',
+    null,
+    true,
+  ).map(segment => {
+    if (!segment.debugPath?.some(step => step.startsWith('segment-type:speech'))) {
+      return options.includeDebug ? segment : { text: segment.text, speakerId: segment.speakerId }
+    }
+    const index = speechIndex++
+    const speakerId = resolved[index] ?? null
+    const answer = answers[`speech_s${index}`]
+    const speech = plan.state.speeches[index]
+    const paragraphAnswer = speech ? answers[`paragraph_${speech.paragraphId}`] : undefined
+    const run = speech ? discourseRunBySpeech.get(speech.id) : undefined
+    const outcome = speech ? discourseOutcomes.get(speech.id) : undefined
+    const discourseAnswer = speech && options.discourse?.answers
+      ? options.discourse.answers[`discourse_${speech.id}`]
+      : undefined
+    const chainDecision = speech ? chain.get(speech.id) : undefined
+    const turn = speech
+      ? plan.state.turns.find(candidate => candidate.speechId === speech.id)
+      : undefined
+    return {
+      text: segment.text,
+      speakerId,
+      ...(options.includeDebug ? {
+        debugPath: [
+          `segment-type:speech (quote ${index + 1})`,
+          ...decisionAnswerDebug('jev-speech', answer, plan.optionSpeakerIds),
+          ...decisionAnswerDebug(`jev-${speech?.paragraphId ?? 'paragraph'}`, paragraphAnswer, plan.optionSpeakerIds),
+          `jev-local-thresholds:${describeDecisionThresholds(SPEAKER_DECISION_THRESHOLDS.local)}`,
+          ...(index === 0
+            ? [`card-deference:${cardIdentity ? 'eligible' : 'blocked'} (${cardReason})`]
+            : []),
+          ...(index === 0 && plan.state.turnQuestionsOmitted
+            ? ['jev-turn-questions:omitted (first-pass question budget)']
+            : []),
+          ...relationAnswerDebug(turn, speech ? answers[`turn_${speech.id}`] : undefined),
+          ...chainSpeechDebug(chainDecision, speech?.paragraphId),
+          ...discourseSpeechDebug({
+            run,
+            evaluated: Boolean(options.discourse),
+            lead: Boolean(speech && run && run.speechIds[0] === speech.id),
+            outcome,
+            discourseAnswer,
+            optionSpeakerIds: plan.optionSpeakerIds,
+            status: options.discourse?.status ?? null,
+          }),
+          ...(resolutionPaths[index] ?? ['resolution:unavailable']),
+          `jev-final-speaker:${speakerId ?? 'none'}`,
+        ],
+      } : {}),
+    }
+  })
+}
+
+function relationAnswerDebug(
+  turn: SpeakerDecisionPlan['state']['turns'][number] | undefined,
+  answer: SpeakerDecisionChoice | undefined,
+): string[] {
+  if (!turn) return ['jev-turn:not-applicable (run start or turn questions omitted)']
+  if (!answer) return [`jev-turn-${turn.speechId}:missing`]
+  const ranked = Object.entries(answer.probabilities)
+    .filter((entry): entry is [string, number] => Number.isFinite(entry[1]))
+    .sort((left, right) => right[1] - left[1])
+  return [
+    `jev-turn-${turn.speechId}-choice:${answer.choice}`,
+    `jev-turn-${turn.speechId}-probabilities:${ranked.map(([option, probability]) => `${option}=${probability.toFixed(3)}`).join(',') || 'none'}`,
+    `jev-turn-${turn.speechId}-confidence:${answer.confidence.toFixed(3)}`,
+    `jev-turn-bridge:${turn.bridge || '(none)'}`,
+  ]
+}
+
+function chainSpeechDebug(
+  decision: SpeakerChainDecision | undefined,
+  paragraphId?: string,
+): string[] {
+  if (!decision) return ['chain:not-considered']
+  const outcome = decision.overrode
+    ? 'overrode-clear'
+    : decision.filled
+      ? 'filled-unresolved'
+      : decision.identity === null
+        ? 'retained-unresolved'
+        : decision.decodedIdentity !== null && decision.decodedIdentity !== decision.directIdentity
+          ? 'override-rejected'
+          : 'direct'
+  return [
+    `chain-decode:${outcome} identity=${decision.identity ?? 'none'}`
+      + ` candidate=${decision.decodedIdentity ?? 'none'}`
+      + ` direct=${decision.directIdentity ?? 'none'}`
+      + ` margin=${Number.isFinite(decision.margin) ? decision.margin.toFixed(2) : 'inf'}`,
+    `chain-switch:${decision.switchProbability.toFixed(2)}`
+      + ` relation=${decision.relationChoice ?? 'none'}`,
+    `chain-narrative:${decision.narrativeAttribution
+      ? `attribution=${decision.narrativeAttribution} (paragraph ${paragraphId ?? 'unknown'})`
+      : 'none'}`,
+  ]
+}
+
+function discourseSpeechDebug(input: {
+  run: SpeakerDiscourseRunAssessment | undefined
+  /** False when the caller did not run the discourse assessment at all. */
+  evaluated: boolean
+  /** Only the first speech of a run repeats the run-level evidence. */
+  lead: boolean
+  outcome: SpeakerDiscourseOutcome | undefined
+  discourseAnswer: SpeakerDecisionChoice | undefined
+  optionSpeakerIds: Record<string, string>
+  status: string | null
+}): string[] {
+  const { run, evaluated, lead, outcome, discourseAnswer, optionSpeakerIds, status } = input
+  if (!run) {
+    return [evaluated
+      ? 'discourse:not-considered (outside a dialogue run)'
+      : 'discourse:not-evaluated (no discourse assessment for this request)']
+  }
+  const lines = lead
+    ? [
+        `discourse-run:${run.id} speeches=${run.speechIds.join(',')} targets=${run.targets.join(',') || 'none'}`,
+        `discourse-triggers:${run.triggers.map(trigger => `${trigger.code} (${trigger.detail})`).join('; ') || 'none'}`,
+        `discourse-anchors:before=${run.boundaryBeforeParagraphId ?? 'none'}=${run.boundaryBeforeIdentity ?? 'none'}`
+          + ` after=${run.boundaryAfterParagraphId ?? 'none'}=${run.boundaryAfterIdentity ?? 'none'}`,
+        `discourse-hard-boundaries:${run.hardBoundaries.join(',') || 'none'}`,
+        `discourse-channels:${run.channels.join(',') || 'none'}`,
+        run.rejection
+          ? `discourse-decision:rejected (${run.rejection})`
+          : 'discourse-decision:escalated',
+        ...(status ? [`discourse-request:${status}`] : []),
+      ]
+    : [`discourse-run:${run.id}${run.rejection ? ' (not escalated)' : ''}`]
+  if (outcome) {
+    lines.push(
+      ...decisionAnswerDebug(
+        `jev-discourse-${outcome.speechId}`,
+        discourseAnswer,
+        optionSpeakerIds,
+        SPEAKER_DECISION_THRESHOLDS.discourse,
+        true,
+      ),
+      `discourse-conflict:${outcome.conflict}`,
+      `discourse-outcome:${outcome.reason}`,
+      ...(outcome.overrideEvaluation
+        ? [`discourse-override-thresholds:${describeDecisionThresholds(SPEAKER_DECISION_THRESHOLDS.override)}`]
+        : []),
+    )
+  } else if (!run.rejection) {
+    lines.push('discourse-outcome:not-a-target (first-pass identity retained)')
+  }
+  return lines
+}
+
 export function needsLlmSpeakerReview(
   content: string,
   defaultSpeakerId: string | null,
@@ -1840,13 +3724,61 @@ function parseRosterVoiceSegmentsInternal(
         && openingBackfill?.paragraphIndexes.has(paragraphIndex)
         ? openingBackfill.speakerId
         : null
+      const frontedPossessiveSpeakerId = (inference.source === 'history' || inference.source === 'fallback')
+        ? frontedPrepositionalPossessiveSubject(bridge, speakers)
+        : null
+      const previousParagraph = paragraphs[paragraphIndex - 1]
+      const currentParagraph = paragraphs[paragraphIndex]
+      const currentNarrativePrefix = currentParagraph
+        ? currentParagraph.text.slice(0, Math.max(0, quote.start - currentParagraph.start))
+        : ''
+      const nextQuote = quotes[currentQuoteIndex + 1]
+      const downstreamNarrationEnd = currentParagraph
+        ? Math.min(
+            currentParagraph.end,
+            nextQuote && nextQuote.start < currentParagraph.end ? nextQuote.start : currentParagraph.end,
+          )
+        : quote.end
+      const immediateDownstreamNarration = playbackContent.slice(quote.end, downstreamNarrationEnd)
+      const anonymousLocalSpeakerId = (inference.source === 'history' || inference.source === 'fallback')
+        && paragraphSpeakers[paragraphIndex] === null
+        && (
+          hasAnonymousHumanSubject(currentNarrativePrefix)
+          || !!(
+            previousParagraph
+            && playbackQuotes(previousParagraph.text).length === 0
+            && paragraphSpeakers[paragraphIndex - 1] === null
+            && hasAnonymousHumanSubject(previousParagraph.text)
+          )
+        )
+        ? UNCAST_SPEAKER_ID
+        : null
+      const anonymousDownstreamSpeakerId = (inference.source === 'history' || inference.source === 'fallback')
+        && paragraphSpeakers[paragraphIndex] === null
+        && hasAnonymousSpeechAttribution(immediateDownstreamNarration)
+        ? UNCAST_SPEAKER_ID
+        : null
+      const anonymousPronounContinuationId: string | null = (inference.source === 'history' || inference.source === 'fallback')
+        && paragraphSpeakers[paragraphIndex] === null
+        && lastAssignedSpeakerId === UNCAST_SPEAKER_ID
+        && hasLeadingPronounSubject(currentNarrativePrefix)
+        ? UNCAST_SPEAKER_ID
+        : null
       const currentEvidenceSpeakerId = paragraphSpeakers[paragraphIndex]
+        ?? frontedPossessiveSpeakerId
+        ?? anonymousLocalSpeakerId
+        ?? anonymousDownstreamSpeakerId
+        ?? anonymousPronounContinuationId
         ?? (inference.confident ? inference.speakerId : null)
       if (
         historicalPrefixActive
         && (
           inference.source === 'explicit'
           || inference.source === 'paragraph'
+          || frontedPossessiveSpeakerId !== null
+          || anonymousLocalSpeakerId !== null
+          || anonymousDownstreamSpeakerId !== null
+          || anonymousPronounContinuationId !== null
           || (paragraphSpeakers[paragraphIndex] !== null
             && currentEvidenceSpeakerId !== historicalSpeakerId)
         )
@@ -1857,7 +3789,6 @@ function parseRosterVoiceSegmentsInternal(
         && (inference.source === 'history' || inference.source === 'fallback')
         ? historicalSpeakerId
         : null
-      const previousParagraph = paragraphs[paragraphIndex - 1]
       const adjacentNarrativeSpeakerId = previousParagraph
         && playbackQuotes(previousParagraph.text).length === 0
         ? mainClausePossessiveSubject(
@@ -1870,20 +3801,34 @@ function parseRosterVoiceSegmentsInternal(
         && playbackQuotes(previousParagraph.text).length === 0
         ? paragraphSpeakers[paragraphIndex - 1]
         : null
+      const adjacentNarrativeVoiceSpeakerId = adjacentNarrativeEvidenceId
+        && previousParagraph
+        && /\b(?:voice|speaks?|spoke|says?|said|asks?|asked|answers?|answered|replies|replied|whispers?|whispered|calls?|called|shouts?|shouted|murmurs?|murmured)\b/iu.test(previousParagraph.text)
+        ? adjacentNarrativeEvidenceId
+        : null
       const localCandidates: Array<[string, string | null]> = [
         ['current-paragraph-subject', paragraphSpeakers[paragraphIndex]],
         ['preceding-possessive-subject', adjacentNarrativeSpeakerId],
+        ['preceding-narrative-voice-subject', adjacentNarrativeVoiceSpeakerId],
+        ['fronted-prepositional-possessive-subject', frontedPossessiveSpeakerId],
+        ['anonymous-local-subject', anonymousLocalSpeakerId],
+        ['anonymous-downstream-attribution', anonymousDownstreamSpeakerId],
+        ['anonymous-pronoun-continuation', anonymousPronounContinuationId],
         ['downstream-reply', downstreamReplies.get(paragraphIndex) ?? null],
-        ['dialogue-turn-alternation', inferredTurnSpeakerId],
         ['speaker-continuation', continuedSpeakerId],
+        ['dialogue-turn-alternation', inferredTurnSpeakerId],
         ['previous-message-history', historicalFallbackId],
         ['opening-dialogue-backfill', openingSpeakerId],
         [`quote-inference:${inference.source}`, inference.speakerId],
       ]
       const selectedLocalCandidate = localCandidates.find(([, speakerId]) => speakerId !== null)
       const localSpeakerId: string | null = selectedLocalCandidate?.[1] ?? null
-      const confidentLocalSpeakerId = paragraphSpeakers[paragraphIndex]
+      const confidentLocalSpeakerId: string | null = paragraphSpeakers[paragraphIndex]
         ?? adjacentNarrativeEvidenceId
+        ?? frontedPossessiveSpeakerId
+        ?? anonymousLocalSpeakerId
+        ?? anonymousDownstreamSpeakerId
+        ?? anonymousPronounContinuationId
         ?? (inference.source === 'explicit' || inference.source === 'paragraph'
           ? inference.speakerId
           : null)

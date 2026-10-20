@@ -7,7 +7,7 @@ A [Lumiverse Spindle](https://docs.lumiverse.chat/) extension that detects chara
 - Reads the active character card only when you click **Scan**; chat history is never sent for cast detection.
 - Uses one short language-model request to identify the primary persona and recurring speaking NPCs represented by the card.
 - Automatically adds an unambiguous first name as an alias when a card scan returns a full character name.
-- Assigns each quoted passage locally during playback using explicit speaker labels, dialogue tags, and the saved card cast.
+- Uses Jev through Lumiverse Decisions to classify paragraph and quotation identities, then applies deterministic inheritance and fallback policy.
 - Uses one shared TTS connection for the entire chat.
 - Assigns a different custom voice name or provider voice ID to every detected character.
 - Allows every detected or manually added character to be renamed or deleted. Slash-separated aliases share that character's voice.
@@ -41,14 +41,14 @@ A [Lumiverse Spindle](https://docs.lumiverse.chat/) extension that detects chara
 
 - Lumiverse 1.2.5 or newer
 - At least one configured TTS connection
-- An active language-model connection for AI-assisted speaker detection
-- The extension's `chats`, `chat_mutation`, `characters`, and `generation` permissions
+- A default Lumiverse Decision model connection for Jev speaker assignment
+- The extension's `chats`, `chat_mutation`, `characters`, `generation`, and `decisions` permissions
 
 ## Installation
 
 1. Open **Settings → Extensions → Install** in Lumiverse.
 2. Enter `https://github.com/WanderingMonk8/custom_voice.git` as the repository URL.
-3. Enable **Chat Voice** and grant all four requested permissions.
+3. Enable **Chat Voice** and grant all requested permissions.
 
 The compiled frontend and backend bundles are committed under `dist/`, so users do not need Node.js or a local build environment.
 
@@ -58,7 +58,7 @@ The compiled frontend and backend bundles are committed under `dist/`, so users 
 2. Select **Voice** in the Lumiverse drawer.
 3. Click **Scan** to read the active character card and save its speaking cast.
 4. Optionally enter comma-separated tag names under **Skipped tracker tags**, such as `tracker, status, o_scene`. These global exclusions remove both the opening/closing tags and everything enclosed by them before TTS generation. Previously saved paired-tag entries remain compatible.
-5. Global **AI speaker review** defaults to **Ambiguous only**. Choose an existing Lumiverse LLM connection and, if desired, enter a custom model name; both controls remain disabled if review is switched off.
+5. Global **Jev speaker assignment** defaults to **On** and uses the account's default Lumiverse Decision connection. Switch it off to use only the local parser. The On option is available only when Lumiverse has at least one Decision model connection; without one it stays Off.
 6. Choose one TTS connection for the chat.
 7. Enter the narrator voice and a voice for each detected character. Add characters manually, or rename and delete any roster entry as needed. Separate aliases with `/` (for example, `Scott / The sergeant`) to route every name to the same voice; use the rename button to add aliases later without losing the assigned voice.
 8. Optionally enable **Save generated audio** to attach completed recordings to messages across every chat. This global setting is off by default. Set **Maximum saved recordings** to control global retention (default: 50); the oldest extension-created attachments are removed first.
@@ -76,9 +76,9 @@ Alice: "I was wondering when you'd arrive."
 Bob: "We should leave before midnight."
 ```
 
-Only text inside straight or curly quotation marks is treated as character speech. Everything outside quotes uses the narrator voice. While the extension is enabled, Lumiverse's native **Play with TTS** button and matching context-menu action send narration, Alice, and Bob in order through the shared connection. This supports any number of configured cast voices. With AI speaker review off, attribution is entirely local; the optional review modes make a cached language-model request before synthesis when required.
+Only text inside straight or curly quotation marks is treated as character speech. Everything outside quotes uses the narrator voice. While the extension is enabled, Lumiverse's native **Play with TTS** button and matching context-menu action send narration, Alice, and Bob in order through the shared connection. This supports any number of configured cast voices. With Jev speaker assignment off, attribution is entirely local. When it is on, one cached Lumiverse Decision request classifies the message before the extension applies its speaker-resolution rules. That request also scores each quotation against the previous one as a continuation or a response; a deterministic chain decode combines those scores with the narration around each quote. An ambiguous cross-paragraph dialogue run may trigger one additional discourse-level request before those rules run.
 
-Card-cast AI parsing happens only when **Scan** is clicked and receives card fields such as description, scenario, greeting, and example dialogue. Optional playback speaker review receives the cleaned current message, its numbered quotations, and the saved roster. Model output is validated against known speaker IDs; failures fall back to deterministic parsing.
+Card-cast AI parsing happens only when **Scan** is clicked and receives card fields such as description, scenario, greeting, and example dialogue. Jev receives the cleaned current message as numbered paragraphs and quotations plus the saved roster. It can identify a known speaker, an uncast character, or no clear identity; confidence gates and deterministic policy decide the final route. When a message never names its speaker, a unique card match still owns the dialogue unless a speech identity clears the card-block confidence thresholds or the text explicitly introduces an anonymous role such as “the clerk,” an indefinite person such as “an older woman,” or an unnamed second speaker. Missing Decision capability, errors, low-confidence answers, and oversized requests fall back safely to deterministic parsing.
 
 Chat Voice configures Lumiverse's speech detection so quoted text is classified as character speech and both asterisked and undecorated text are classified as narration. Other Voice & Speech preferences are preserved.
 

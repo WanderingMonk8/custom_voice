@@ -7,6 +7,7 @@ import {
   addUnconfiguredDialogueSpeakers,
   clampSavedAudioLimit,
   DEFAULT_SAVED_AUDIO_LIMIT,
+  eligibleCardFallbackSpeakerId,
   encodeConcatenatedWav,
   expiredSavedAudioRecords,
   mergeVoicePlan,
@@ -15,7 +16,6 @@ import {
   parseRosterVoiceSegments,
   playbackVoiceForSpeaker,
   preferredCardSpeakerId,
-  protectDefaultSpeakerSegments,
   readSavedAudioHistory,
   reducedRequestWindowLimit,
   rollingRequestWindowDelay,
@@ -23,6 +23,7 @@ import {
   speakerAliasIdLookup,
   speakersForMessageRole,
   shouldPersistMessageAudio,
+  UNCAST_SPEAKER_ID,
   USER_SPEAKER_ID,
   upsertSavedAudioRecord,
   type PlaybackSegment,
@@ -39,14 +40,6 @@ interface TtsConnection {
 interface ConnectionPage {
   data?: TtsConnection[]
   total?: number
-}
-
-interface LlmConnection {
-  id: string
-  name: string
-  provider: string
-  model: string
-  is_default: boolean
 }
 
 interface SynthesisPacer {
@@ -223,11 +216,24 @@ interface ParsedMessagePayload {
   error?: string
 }
 
-interface LlmConnectionsPayload {
-  type: 'chat_voice_llm_connections'
-  requestId: string
-  connections: LlmConnection[]
-  error?: string
+interface DecisionConnectionStatus {
+  available: boolean
+  hasConnection: boolean
+  defaultConnectionName: string | null
+}
+
+interface DecisionStatusPayload extends DecisionConnectionStatus {
+  type: 'chat_voice_decision_status'
+  requestId?: string
+}
+
+/** Result of asking the backend for reviewed speaker assignments. */
+interface SpeakerParseReview {
+  segments: PlaybackSegment[]
+  /** Whether Jev supplied the assignments; null when the backend did not say. */
+  usedLlm: boolean | null
+  /** True when the backend request failed and the message-local parser was used. */
+  failed: boolean
 }
 
 interface PlaybackMessage {
@@ -273,9 +279,7 @@ interface PlaybackPreferences {
   saveGeneratedAudio: boolean
   savedAudioLimit: number
   skippedTrackerTags: string
-  speakerParsingMode: 'off' | 'ambiguous' | 'always'
-  llmConnectionId: string
-  llmModel: string
+  speakerParsingMode: 'off' | 'ambiguous'
   playbackBufferSegments: number
   concurrentGenerations: number
   rateLimitWaitSeconds: number
@@ -332,8 +336,6 @@ async function loadPlaybackPreferences(): Promise<PlaybackPreferences> {
     savedAudioLimit: DEFAULT_SAVED_AUDIO_LIMIT,
     skippedTrackerTags: '',
     speakerParsingMode: 'ambiguous',
-    llmConnectionId: '',
-    llmModel: '',
     playbackBufferSegments: DEFAULT_PLAYBACK_BUFFER_SEGMENTS,
     concurrentGenerations: DEFAULT_CONCURRENT_GENERATIONS,
     rateLimitWaitSeconds: DEFAULT_RATE_LIMIT_WAIT_SECONDS,
@@ -345,8 +347,7 @@ async function loadPlaybackPreferences(): Promise<PlaybackPreferences> {
   const speed = typeof row.value?.ttsSpeed === 'number' ? row.value.ttsSpeed : 1
   const volume = typeof row.value?.ttsVolume === 'number' ? row.value.ttsVolume : 1
   const speakerParsingMode = row.value?.chatVoiceSpeakerParsingMode === 'off'
-    || row.value?.chatVoiceSpeakerParsingMode === 'always'
-    ? row.value.chatVoiceSpeakerParsingMode
+    ? 'off'
     : 'ambiguous'
   return {
     speed: Math.min(4, Math.max(0.25, speed)),
@@ -360,12 +361,6 @@ async function loadPlaybackPreferences(): Promise<PlaybackPreferences> {
       ? row.value.chatVoiceSkippedTrackerTags.slice(0, 4_000)
       : '',
     speakerParsingMode,
-    llmConnectionId: typeof row.value?.chatVoiceLlmConnectionId === 'string'
-      ? row.value.chatVoiceLlmConnectionId.trim().slice(0, 128)
-      : '',
-    llmModel: typeof row.value?.chatVoiceLlmModel === 'string'
-      ? row.value.chatVoiceLlmModel.trim().slice(0, 256)
-      : '',
     playbackBufferSegments: clampIntegerSetting(
       row.value?.chatVoicePlaybackBufferSegments,
       DEFAULT_PLAYBACK_BUFFER_SEGMENTS,
@@ -438,15 +433,11 @@ function saveSkippedTrackerTagsPreference(value: string): Promise<void> {
 }
 
 function saveLlmParsingPreferences(
-  mode: 'off' | 'ambiguous' | 'always',
-  connectionId: string,
-  model: string,
+  mode: 'off' | 'ambiguous',
 ): Promise<void> {
   return updateVoiceSettings(current => ({
     ...current,
     chatVoiceSpeakerParsingMode: mode,
-    chatVoiceLlmConnectionId: connectionId.trim().slice(0, 128),
-    chatVoiceLlmModel: model.trim().slice(0, 256),
   }))
 }
 
@@ -981,9 +972,7 @@ export function setup(ctx: SpindleFrontendContext) {
   scanButton.disabled = true
   scanRow.append(scanButton)
   const skippedTagsField = createField('Skipped tracker tags (global)')
-  const speakerParsingField = createField('AI speaker review (global)')
-  const llmConnectionField = createField('Speaker-review LLM connection')
-  const llmModelField = createField('Custom LLM model (optional)')
+  const speakerParsingField = createField('Jev speaker assignment (global)')
   const narratorField = createField('Narrator voice')
   const userVoiceField = createField('User voice')
 
@@ -1020,7 +1009,7 @@ export function setup(ctx: SpindleFrontendContext) {
   )
   const routingHint = document.createElement('div')
   routingHint.className = 'chat-voice-hint'
-  routingHint.textContent = 'Scan reads the character card, not chat history. During playback, quoted dialogue is matched to the user persona or saved cast using names and dialogue tags; everything outside quotes uses the narrator voice.'
+  routingHint.textContent = 'Scan reads the character card, not chat history. During playback, Jev uses Lumiverse’s default Decision connection to classify paragraph and dialogue identities; everything outside quotes uses the narrator voice.'
   const addNpcField = createField('Add NPC manually')
   addNpcField.slot.className = 'chat-voice-add-row'
   const addNpcInputSlot = document.createElement('div')
@@ -1055,8 +1044,6 @@ export function setup(ctx: SpindleFrontendContext) {
     scanField.field,
     skippedTagsField.field,
     speakerParsingField.field,
-    llmConnectionField.field,
-    llmModelField.field,
     narratorField.field,
     userVoiceField.field,
     routingHint,
@@ -1082,14 +1069,14 @@ export function setup(ctx: SpindleFrontendContext) {
   speakerDebugText.textContent = 'Speaker assignment debug'
   const speakerDebugHint = document.createElement('span')
   speakerDebugHint.className = 'chat-voice-toggle-hint'
-  speakerDebugHint.textContent = 'Records the parser, review, alias, fallback, and final voice route for every segment.'
+  speakerDebugHint.textContent = 'Records both Jev passes, the turn matrix, narrative cues, dialogue-run review, inheritance, fallbacks, aliases, and the final voice route for every segment.'
   speakerDebugCopy.append(speakerDebugText, speakerDebugHint)
   speakerDebugLabel.append(speakerDebugToggle, speakerDebugCopy)
   const speakerDebugOutput = document.createElement('textarea')
   speakerDebugOutput.className = 'chat-voice-debug-output'
   speakerDebugOutput.readOnly = true
   speakerDebugOutput.hidden = true
-  speakerDebugOutput.placeholder = 'Generate TTS to see the speaker assignment trace.'
+  speakerDebugOutput.placeholder = 'Generate TTS to see the turn matrix, discourse review, inheritance, and voice-route trace.'
   speakerDebugOutput.setAttribute('aria-label', 'Speaker assignment debug log')
   const advancedHint = document.createElement('div')
   advancedHint.className = 'chat-voice-hint'
@@ -1125,10 +1112,11 @@ export function setup(ctx: SpindleFrontendContext) {
   let skippedTrackerTagsDirty = false
   let savingSkippedTrackerTags = false
   let skippedTrackerTagsSaveTimer: ReturnType<typeof setTimeout> | null = null
-  let speakerParsingMode: 'off' | 'ambiguous' | 'always' = 'ambiguous'
-  let llmConnections: LlmConnection[] = []
-  let llmConnectionId = ''
-  let llmModel = ''
+  let speakerParsingMode: 'off' | 'ambiguous' = 'ambiguous'
+  let decisionConnectionsKnown = false
+  let decisionConnectionAvailable = false
+  let decisionConnectionName = ''
+  let decisionStatusFailed = false
   let llmSettingsSaveTimer: ReturnType<typeof setTimeout> | null = null
   let savingLlmSettings = false
   let playbackBufferSegments = DEFAULT_PLAYBACK_BUFFER_SEGMENTS
@@ -1155,6 +1143,7 @@ export function setup(ctx: SpindleFrontendContext) {
     finishAudible: () => void
   } | null = null
   const backgroundSynthesisControllers = new Set<AbortController>()
+  const backgroundSynthesisByMessage = new Map<string, AbortController>()
   const sharedSynthesisPacer: SynthesisPacer = {
     nextStartAt: 0,
     startQueue: Promise.resolve(),
@@ -1221,19 +1210,19 @@ export function setup(ctx: SpindleFrontendContext) {
     timer: ReturnType<typeof setTimeout>
   }>()
   const pendingSpeakerParseRequests = new Map<string, {
-    resolve: (segments: PlaybackSegment[]) => void
+    resolve: (review: SpeakerParseReview) => void
     reject: (error: Error) => void
     timer: ReturnType<typeof setTimeout>
   }>()
-  const pendingLlmConnectionRequests = new Map<string, {
-    resolve: (connections: LlmConnection[]) => void
+  const pendingDecisionStatusRequests = new Map<string, {
+    resolve: (status: DecisionConnectionStatus) => void
     reject: (error: Error) => void
     timer: ReturnType<typeof setTimeout>
   }>()
   let messageRequestSequence = 0
   let stateRequestSequence = 0
   let speakerParseRequestSequence = 0
-  let llmConnectionRequestSequence = 0
+  let decisionStatusRequestSequence = 0
 
   const setStatus = (message: string, state: 'normal' | 'saved' | 'error' = 'normal') => {
     status.textContent = message
@@ -1337,34 +1326,20 @@ export function setup(ctx: SpindleFrontendContext) {
     value: 'ambiguous',
     options: [
       { value: 'off', label: 'Off', sublabel: 'Use the local parser only' },
-      { value: 'ambiguous', label: 'Ambiguous only', sublabel: 'Ask the LLM only when attribution is uncertain' },
-      { value: 'always', label: 'All dialogue', sublabel: 'Review every message containing dialogue' },
+      {
+        value: 'ambiguous',
+        label: 'On',
+        sublabel: 'Checking for a Decision model connection…',
+        disabled: true,
+      },
     ],
-    ariaLabel: 'AI speaker review mode',
+    ariaLabel: 'Jev speaker assignment mode',
     onChange: value => onSpeakerParsingModeChanged(value),
   })
-
-  const llmConnectionPicker = ctx.components.mountSelect(llmConnectionField.slot, {
-    value: '',
-    options: [],
-    placeholder: 'Use the default LLM connection',
-    searchPlaceholder: 'Search LLM connections…',
-    emptyMessage: 'No LLM connections found.',
-    clearable: true,
-    clearLabel: 'Use default LLM connection',
-    ariaLabel: 'Speaker-review LLM connection',
-    disabled: true,
-    onChange: value => onLlmConnectionChanged(value),
-  })
-
-  const llmModelInput = ctx.components.mountModelCombobox(llmModelField.slot, {
-    value: '',
-    connection: { kind: 'llm' },
-    placeholder: 'Use the connection model or enter a model name',
-    browseHint: 'Leave blank to use the selected connection’s configured model.',
-    disabled: true,
-    onChange: value => onLlmModelChanged(value),
-  })
+  const speakerParsingHint = document.createElement('div')
+  speakerParsingHint.className = 'chat-voice-hint'
+  speakerParsingHint.hidden = true
+  speakerParsingField.slot.append(speakerParsingHint)
 
   function createNumberInput(value: number, maximum: number, ariaLabel: string): HTMLInputElement {
     const input = document.createElement('input')
@@ -1560,13 +1535,15 @@ export function setup(ctx: SpindleFrontendContext) {
     chatId: string,
     messageId: string,
     preferences: PlaybackPreferences,
-  ): Promise<PlaybackSegment[]> {
+  ): Promise<SpeakerParseReview> {
     const requestId = `parse-${Date.now().toString(36)}-${++speakerParseRequestSequence}`
     return new Promise((resolve, reject) => {
+      // Jev may run a local pass and one discourse escalation back to back, and
+      // each host evaluation has its own 30-second deadline.
       const timer = setTimeout(() => {
         pendingSpeakerParseRequests.delete(requestId)
-        reject(new Error('AI speaker review timed out.'))
-      }, 45_000)
+        reject(new Error('Jev speaker assignment timed out.'))
+      }, 70_000)
       pendingSpeakerParseRequests.set(requestId, { resolve, reject, timer })
       ctx.sendToBackend({
         type: 'chat_voice_parse_message',
@@ -1574,8 +1551,6 @@ export function setup(ctx: SpindleFrontendContext) {
         messageId,
         requestId,
         mode: preferences.speakerParsingMode,
-        connectionId: preferences.llmConnectionId,
-        model: preferences.llmModel,
         skippedTrackerTags: preferences.skippedTrackerTags,
         debug: preferences.speakerAssignmentDebug,
       })
@@ -1585,8 +1560,207 @@ export function setup(ctx: SpindleFrontendContext) {
   function speakerDebugName(speakerId: string | null, speakers: Array<{ id: string; name: string }>): string {
     if (speakerId === null) return 'narrator'
     if (speakerId === USER_SPEAKER_ID) return 'user persona'
+    if (speakerId === UNCAST_SPEAKER_ID) return 'uncast character'
     const speaker = speakers.find(candidate => candidate.id === speakerId)
     return speaker ? `${speaker.name} [${speakerId}]` : speakerId
+  }
+
+  type SpeakerAssignmentSource =
+    | 'first-pass'
+    | 'chain-fill'
+    | 'chain-override'
+    | 'discourse-fill'
+    | 'discourse-override'
+    | 'inheritance'
+    | 'previous-assistant'
+    | 'card-title'
+    | 'role-fallback'
+    | 'local-parser'
+    | 'unreported'
+
+  const SPEAKER_SOURCE_LABELS: Record<SpeakerAssignmentSource, string> = {
+    'first-pass': 'first pass',
+    'chain-fill': 'turn chain fill',
+    'chain-override': 'turn chain override',
+    'discourse-fill': 'discourse fill',
+    'discourse-override': 'discourse override',
+    inheritance: 'in-message inheritance',
+    'previous-assistant': 'previous assistant',
+    'card-title': 'card title',
+    'role-fallback': 'role fallback',
+    'local-parser': 'local parser',
+    unreported: 'unreported',
+  }
+
+  function speakerDebugLine(steps: string[], prefix: string): string | undefined {
+    return steps.find(step => step.startsWith(prefix))
+  }
+
+  function speakerDebugStep(segment: PlaybackSegment, prefix: string): string | undefined {
+    return speakerDebugLine(segment.debugPath ?? [], prefix)
+  }
+
+  /** Which pipeline stage produced the final speaker for one segment. */
+  function speakerAssignmentSource(
+    segment: PlaybackSegment,
+    parsingMode: PlaybackPreferences['speakerParsingMode'],
+    review: SpeakerParseReview,
+  ): SpeakerAssignmentSource {
+    const resolution = speakerDebugStep(segment, 'resolution:')
+    if (resolution?.startsWith('resolution:chain-identity (overrode')) return 'chain-override'
+    if (resolution?.startsWith('resolution:chain-identity')) return 'chain-fill'
+    if (resolution?.startsWith('resolution:discourse-identity (overrode')) return 'discourse-override'
+    if (resolution?.startsWith('resolution:discourse-identity')) return 'discourse-fill'
+    if (resolution === 'resolution:direct-speech-identity') return 'first-pass'
+    if (resolution?.startsWith('resolution:upstream-identity')) return 'inheritance'
+    if (resolution?.startsWith('resolution:previous-assistant')) return 'previous-assistant'
+    if (resolution?.startsWith('resolution:unique card-title')) return 'card-title'
+    if (resolution?.startsWith('resolution:user-role')) return 'role-fallback'
+    if (resolution?.startsWith('resolution:assistant connection-default')) return 'role-fallback'
+    if (review.failed || review.usedLlm === false || parsingMode === 'off') return 'local-parser'
+    if (speakerDebugStep(segment, 'jev-fallback:') || speakerDebugStep(segment, 'jev-disabled:')) {
+      return 'local-parser'
+    }
+    return 'unreported'
+  }
+
+  function speakerSourceDetail(
+    segment: PlaybackSegment,
+    source: SpeakerAssignmentSource,
+    parsingMode: PlaybackPreferences['speakerParsingMode'],
+    review: SpeakerParseReview,
+  ): string {
+    if (source !== 'local-parser') return SPEAKER_SOURCE_LABELS[source]
+    if (parsingMode === 'off') return 'local parser (Jev disabled)'
+    if (review.failed) return 'local parser (backend review unavailable)'
+    const fallback = speakerDebugStep(segment, 'jev-fallback:')
+    if (fallback) return `local parser fallback (${fallback.slice('jev-fallback:'.length).trim()})`
+    return 'local parser'
+  }
+
+  function describeBackendReview(
+    localSpeakerId: string | null,
+    rawSpeakerId: string | null,
+    parsingMode: PlaybackPreferences['speakerParsingMode'],
+    review: SpeakerParseReview,
+  ): string {
+    const before = localSpeakerId ?? 'none'
+    const after = rawSpeakerId ?? 'none'
+    if (parsingMode === 'off') {
+      return localSpeakerId === rawSpeakerId
+        ? 'backend-result:matches message-local parser (Jev disabled)'
+        : `backend-result:changed message-local ${before} -> ${after} (Jev disabled)`
+    }
+    if (review.failed) return `backend-result:unavailable (message-local parser: ${after})`
+    if (review.usedLlm === false) {
+      return localSpeakerId === rawSpeakerId
+        ? 'backend-result:local-parser fallback (matches message-local parser)'
+        : `backend-result:local-parser fallback (changed message-local ${before} -> ${after})`
+    }
+    return localSpeakerId === rawSpeakerId
+      ? `backend/Jev-result:matches message-local parser (${after})`
+      : `backend/Jev-result:changed message-local ${before} -> Jev ${after}`
+  }
+
+  /** Two-pass status for the message header, derived from the backend trace. */
+  function speakerPipelineHeader(
+    segments: PlaybackSegment[],
+    parsingMode: PlaybackPreferences['speakerParsingMode'],
+    review: SpeakerParseReview,
+  ): string[] {
+    if (parsingMode === 'off') return ['Jev pipeline: off (attribution is entirely local)']
+    if (review.failed) {
+      return ['Jev pipeline: unavailable (backend review did not answer; message-local parser used)']
+    }
+    const steps = segments.flatMap(segment => segment.debugPath ?? [])
+    if (review.usedLlm === null) {
+      return ['Jev pipeline: status unknown (the backend did not report whether Jev answered)']
+    }
+    if (review.usedLlm === false) {
+      const fallback = steps.find(step => step.startsWith('jev-fallback:') || step.startsWith('jev-disabled:'))
+      const reason = fallback?.replace(/^jev-(?:fallback|disabled):/u, '').trim() || 'reason not reported'
+      return [`Jev pipeline: first pass not used (${reason}); deterministic parser output used`]
+    }
+    const lines = ['Jev pipeline: first pass answered; deterministic policy applied after normalization']
+    const speechSegments = segments.filter(segment => speakerDebugStep(segment, 'segment-type:speech'))
+    const normalized = speechSegments
+      .map(segment => speakerDebugStep(segment, 'jev-speech-normalized:'))
+      .filter((step): step is string => step !== undefined)
+    if (normalized.length > 0) {
+      const clear = normalized.filter(step => !step.includes(':unclear')).length
+      lines.push(
+        `First pass: ${clear} clear / ${normalized.length} quotations`
+        + ` (${normalized.length - clear} unresolved or low-confidence)`,
+      )
+    }
+    const turnOmitted = steps.includes('jev-turn-questions:omitted (first-pass question budget)')
+    const relations = steps
+      .filter(step => step.startsWith('jev-turn-') && step.includes('-choice:'))
+      .length
+    const chainDecisions = steps
+      .filter(step => step.startsWith('chain-decode:'))
+      .map(step => step.slice('chain-decode:'.length))
+    if (turnOmitted) {
+      lines.push('Turn matrix: omitted (first-pass question budget); first-pass policy retained')
+    } else if (relations > 0 || chainDecisions.length > 0) {
+      const filled = chainDecisions.filter(step => step.startsWith('filled-unresolved')).length
+      const overrode = chainDecisions.filter(step => step.startsWith('overrode-clear')).length
+      const retained = chainDecisions.filter(step => step.startsWith('retained-unresolved')).length
+      const direct = chainDecisions.filter(step => step.startsWith('direct')).length
+      const overrideRejected = chainDecisions.filter(step => step.startsWith('override-rejected')).length
+      lines.push(
+        `Turn matrix: ${relations} relations · ${filled} chain-filled`
+        + ` · ${overrode} chain-overrode · ${direct} direct retained`
+        + (retained > 0 ? ` · ${retained} unresolved retained` : '')
+        + (overrideRejected > 0 ? ` · ${overrideRejected} override rejected` : ''),
+      )
+    }
+    const narrativeAttributions = new Set(
+      steps.filter(step => step.startsWith('chain-narrative:attribution=')),
+    ).size
+    if (narrativeAttributions > 0) {
+      lines.push(`Narrative cues: ${narrativeAttributions} unambiguous attributions`)
+    }
+    const cardDeference = speakerDebugLine(steps, 'card-deference:')
+      ?.slice('card-deference:'.length).trim()
+    if (cardDeference) lines.push(`Card deference: ${cardDeference}`)
+    const request = speakerDebugLine(steps, 'discourse-request:')
+      ?.slice('discourse-request:'.length).trim()
+    const escalated = steps.includes('discourse-decision:escalated')
+    const runIds = [...new Set(steps
+      .filter(step => step.startsWith('discourse-run:'))
+      .map(step => step.slice('discourse-run:'.length).split(' ')[0] ?? '')
+      .filter(runId => runId.length > 0))]
+    const triggerCodes = [...new Set(steps
+      .filter(step => step.startsWith('discourse-triggers:'))
+      .flatMap(step => step.slice('discourse-triggers:'.length).split('; '))
+      .map(trigger => trigger.split(' (')[0]?.trim() ?? '')
+      .filter(trigger => trigger.length > 0 && trigger !== 'none'))]
+    const rejectedRuns = [...new Set(steps
+      .filter(step => step.startsWith('discourse-decision:rejected'))
+      .map(step => step.slice('discourse-decision:rejected'.length).trim().replace(/^\(|\)$/gu, ''))
+      .filter(reason => reason.length > 0))]
+    const outcomes = steps.filter(step => step.startsWith('discourse-outcome:'))
+    const countOutcome = (name: string) => outcomes
+      .filter(step => step === `discourse-outcome:${name}` || step.startsWith(`discourse-outcome:${name} `))
+      .length
+    if (escalated) {
+      lines.push(
+        `Discourse review: escalated ${runIds.join(', ') || 'one run'}`
+        + ` (triggers: ${triggerCodes.join(', ') || 'not reported'})`,
+        `Discourse review result: ${countOutcome('filled-unresolved')} filled`
+        + `, ${countOutcome('overrode-conflict')} overrode`
+        + `, ${countOutcome('not-a-target')} retained`
+        + `, ${outcomes.filter(step => step.startsWith('discourse-outcome:rejected')).length} rejected`,
+      )
+    } else if (request?.startsWith('failed')) {
+      lines.push(`Discourse review: ${request}`)
+    } else if (rejectedRuns.length > 0) {
+      lines.push(`Discourse review: not escalated (${rejectedRuns.join('; ')})`)
+    } else {
+      lines.push('Discourse review: not requested')
+    }
+    return lines
   }
 
   function updateSpeakerDebugLog(
@@ -1600,15 +1774,19 @@ export function setup(ctx: SpindleFrontendContext) {
     aliases: ReadonlyMap<string, string>,
     config: ReturnType<typeof collectConfig>,
     parsingMode: PlaybackPreferences['speakerParsingMode'],
+    review: SpeakerParseReview,
   ): void {
     if (!speakerAssignmentDebug) return
     const lines = [
       `Message ${messageId} (${isUserMessage ? 'user' : 'assistant'})`,
+      `Parsing mode: ${parsingMode === 'off' ? 'local parser only' : 'Jev with local fallback'}`,
+      ...speakerPipelineHeader(finalSegments, parsingMode, review),
       `Default speaker: ${speakerDebugName(defaultSpeakerId, parserSpeakers)}`,
-      `AI review mode: ${parsingMode}`,
       `Parser roster: ${parserSpeakers.map(speaker => `${speaker.name} [${speaker.id}]`).join(', ') || '(empty)'}`,
       '',
     ]
+    const sourceCounts = new Map<SpeakerAssignmentSource, number>()
+    let narratorCount = 0
     finalSegments.forEach((segment, index) => {
       const local = localSegments[index]?.text === segment.text
         ? localSegments[index]
@@ -1623,13 +1801,13 @@ export function setup(ctx: SpindleFrontendContext) {
         config.userVoice,
       )
       const localSpeaker = local?.speakerId ?? null
-      const reviewPath = parsingMode === 'off'
-        ? (localSpeaker === rawSpeakerId
-            ? 'backend-result:matches local parser (AI review disabled)'
-            : `backend-result:changed ${localSpeaker ?? 'none'} -> ${rawSpeakerId ?? 'none'} (AI review disabled)`)
-        : localSpeaker === rawSpeakerId
-          ? `backend/review-result:unchanged (${rawSpeakerId ?? 'none'})`
-          : `backend/review-result:changed ${localSpeaker ?? 'none'} -> ${rawSpeakerId ?? 'none'}`
+      const isSpeech = segment.debugPath?.some(step => step.startsWith('segment-type:speech')) ?? false
+      const source = speakerAssignmentSource(segment, parsingMode, review)
+      if (isSpeech) {
+        sourceCounts.set(source, (sourceCounts.get(source) ?? 0) + 1)
+      } else {
+        narratorCount += 1
+      }
       const aliasPath = rawSpeakerId && mappedSpeakerId !== rawSpeakerId
         ? `alias-map:${rawSpeakerId} -> ${mappedSpeakerId}`
         : `alias-map:${rawSpeakerId ?? 'none'} (unchanged)`
@@ -1640,28 +1818,92 @@ export function setup(ctx: SpindleFrontendContext) {
       lines.push(
         `[${index + 1}] ${JSON.stringify(segment.text.length > 180 ? `${segment.text.slice(0, 177)}...` : segment.text)}`,
         ...((segment.debugPath ?? local?.debugPath ?? ['parser-trace:unavailable']).map(step => `  ${step}`)),
-        `  ${reviewPath}`,
+        `  ${describeBackendReview(localSpeaker, rawSpeakerId, parsingMode, review)}`,
+        `  source:${isSpeech ? speakerSourceDetail(segment, source, parsingMode, review) : 'narrator'}`,
         `  ${aliasPath}`,
         `  final-speaker:${speakerDebugName(mappedSpeakerId, configuredSpeakers)}`,
         `  ${voicePath}`,
         '',
       )
     })
+    const sourceSummary = [...sourceCounts.entries()]
+      .map(([source, count]) => `${SPEAKER_SOURCE_LABELS[source]} ${count}`)
+      .join(' · ')
+    lines.push(
+      `Assignment sources: ${sourceSummary || 'no speech segments'} · narrator segments ${narratorCount}`,
+      'Legend: jev-* first pass · jev-turn-* and chain-* turn matrix · jev-discourse-* and discourse-* cross-paragraph review · resolution:* deterministic policy · voice-route:* final routing',
+    )
     const log = lines.join('\n')
     speakerDebugOutput.value = log
     console.debug('[Chat Voice] Speaker assignment trace\n' + log)
   }
 
-  function requestLlmConnections(): Promise<LlmConnection[]> {
-    const requestId = `connections-${Date.now().toString(36)}-${++llmConnectionRequestSequence}`
+  function appendSpeakerDebugLog(line: string): void {
+    if (!speakerAssignmentDebug) return
+    speakerDebugOutput.value += `${speakerDebugOutput.value ? '\n' : ''}${line}`
+    console.debug(`[Chat Voice] ${line}`)
+  }
+
+  function requestDecisionStatus(): Promise<DecisionConnectionStatus> {
+    const requestId = `decision-${Date.now().toString(36)}-${++decisionStatusRequestSequence}`
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
-        pendingLlmConnectionRequests.delete(requestId)
-        reject(new Error('Timed out while loading main LLM connections.'))
-      }, 15_000)
-      pendingLlmConnectionRequests.set(requestId, { resolve, reject, timer })
-      ctx.sendToBackend({ type: 'chat_voice_list_llm_connections', requestId })
+        pendingDecisionStatusRequests.delete(requestId)
+        reject(new Error('Timed out while checking Decision connections.'))
+      }, 10_000)
+      pendingDecisionStatusRequests.set(requestId, { resolve, reject, timer })
+      ctx.sendToBackend({ type: 'chat_voice_decision_status', requestId })
     })
+  }
+
+  async function refreshDecisionStatus(): Promise<DecisionConnectionStatus | null> {
+    try {
+      const status = await requestDecisionStatus()
+      decisionConnectionsKnown = true
+      decisionConnectionAvailable = status.available && status.hasConnection
+      decisionConnectionName = status.defaultConnectionName ?? ''
+      decisionStatusFailed = false
+      updateSpeakerParsingControls()
+      return status
+    } catch (error) {
+      decisionConnectionsKnown = true
+      decisionConnectionAvailable = false
+      decisionConnectionName = ''
+      decisionStatusFailed = true
+      updateSpeakerParsingControls()
+      console.warn('[Chat Voice] Could not check Decision connections.', error)
+      return null
+    }
+  }
+
+  function updateSpeakerParsingControls(): void {
+    const description = decisionStatusFailed
+      ? 'Could not check Decision connections'
+      : !decisionConnectionsKnown
+        ? 'Checking for a Decision model connection…'
+        : decisionConnectionAvailable
+          ? (decisionConnectionName
+              ? `Uses ${decisionConnectionName} as the default Decision connection`
+              : 'Uses the default Lumiverse Decision connection')
+          : 'Create a Decision model connection in Lumiverse first'
+    speakerParsingPicker.update({
+      options: [
+        { value: 'off', label: 'Off', sublabel: 'Use the local parser only' },
+        {
+          value: 'ambiguous',
+          label: 'On',
+          sublabel: description,
+          disabled: decisionStatusFailed || (decisionConnectionsKnown && !decisionConnectionAvailable),
+        },
+      ],
+    })
+    const warning = decisionStatusFailed
+      ? 'Could not verify a Decision model connection. Jev speaker assignment is unavailable until Lumiverse responds.'
+      : decisionConnectionsKnown && !decisionConnectionAvailable
+        ? 'Jev speaker assignment needs a Decision model connection. Create one in Lumiverse, then reopen this panel.'
+        : ''
+    speakerParsingHint.textContent = warning
+    speakerParsingHint.hidden = warning === ''
   }
 
   function refreshLocalState(): void {
@@ -1859,8 +2101,6 @@ export function setup(ctx: SpindleFrontendContext) {
     const preferences = await loadPlaybackPreferences()
     if (llmSettingsSaveTimer || savingLlmSettings) {
       preferences.speakerParsingMode = speakerParsingMode
-      preferences.llmConnectionId = llmConnectionId
-      preferences.llmModel = llmModel
     }
     if (advancedSettingsSaveTimer || savingAdvancedSettings) {
       preferences.playbackBufferSegments = playbackBufferSegments
@@ -1916,13 +2156,6 @@ export function setup(ctx: SpindleFrontendContext) {
 
     try {
       if (playback.controller.signal.aborted) throw new DOMException('Playback stopped.', 'AbortError')
-      const defaultSpeakerId = message.is_user
-        ? USER_SPEAKER_ID
-        : preferredCardSpeakerId(
-            message,
-            playbackChat.characters,
-            playbackChat.cardCharacterIds ?? [],
-          )
       const playbackSpeakers = addUnconfiguredDialogueSpeakers(
         message.content,
         speakersForMessageRole(
@@ -1931,6 +2164,18 @@ export function setup(ctx: SpindleFrontendContext) {
           message.name,
         ),
       )
+      const defaultSpeakerId = message.is_user
+        ? USER_SPEAKER_ID
+        : eligibleCardFallbackSpeakerId(
+            message.content,
+            preferredCardSpeakerId(
+              message,
+              playbackChat.characters,
+              playbackChat.cardCharacterIds ?? [],
+            ),
+            playbackSpeakers,
+            preferences.skippedTrackerTags,
+          )
       const aliases = speakerAliasIdLookup(playbackChat.characters)
       const localSegments = parseRosterVoiceSegments(
         message.content,
@@ -1940,18 +2185,17 @@ export function setup(ctx: SpindleFrontendContext) {
         null,
         preferences.speakerAssignmentDebug,
       )
-      let segments = localSegments
-      if (preferences.speakerParsingMode !== 'off') setStatus('Reviewing dialogue speakers…')
+      let review: SpeakerParseReview = { segments: localSegments, usedLlm: null, failed: false }
+      if (preferences.speakerParsingMode !== 'off') setStatus('Classifying dialogue speakers with Jev…')
       try {
-        segments = await requestSpeakerReviewedSegments(playbackChat.id, messageId, preferences)
-        if (message.is_user) {
-          segments = protectDefaultSpeakerSegments(localSegments, segments, USER_SPEAKER_ID)
-        }
+        review = await requestSpeakerReviewedSegments(playbackChat.id, messageId, preferences)
       } catch (error) {
         console.warn('[Chat Voice] Backend speaker parsing failed; using the message-local parser.', error)
         if (playback.controller.signal.aborted) throw new DOMException('Playback stopped.', 'AbortError')
+        review = { segments: localSegments, usedLlm: null, failed: true }
         setStatus('Historical speaker lookup unavailable; using the message-local parser.')
       }
+      const segments = review.segments
       updateSpeakerDebugLog(
         messageId,
         message.is_user,
@@ -1963,6 +2207,7 @@ export function setup(ctx: SpindleFrontendContext) {
         aliases,
         config,
         preferences.speakerParsingMode,
+        review,
       )
       const plan = mergeVoicePlan(segments.map((segment) => {
         const speakerId = segment.speakerId
@@ -1978,7 +2223,20 @@ export function setup(ctx: SpindleFrontendContext) {
         return { text: segment.text, voice }
       }))
       if (plan.length === 0) throw new Error('This message has no playable narration or dialogue.')
+      if (preferences.speakerAssignmentDebug) {
+        appendSpeakerDebugLog('\nSynthesis plan')
+        plan.forEach((segment, index) => appendSpeakerDebugLog(
+          `  [${index + 1}] voice=${JSON.stringify(segment.voice || '<connection default>')} text=${JSON.stringify(segment.text.length > 120 ? `${segment.text.slice(0, 117)}...` : segment.text)}`,
+        ))
+      }
 
+      const synthesisMessageKey = `${playbackChat.id}\u0000${messageId}`
+      const previousSynthesis = backgroundSynthesisByMessage.get(synthesisMessageKey)
+      if (previousSynthesis) {
+        previousSynthesis.abort()
+        backgroundSynthesisByMessage.delete(synthesisMessageKey)
+        appendSpeakerDebugLog('Cancelled an older unfinished synthesis/save for this message.')
+      }
       const synthesisController = new AbortController()
       const rateLimitBudget: RateLimitBudget = {
         blockedUntil: 0,
@@ -1990,6 +2248,7 @@ export function setup(ctx: SpindleFrontendContext) {
       }
       playback.synthesisController = synthesisController
       backgroundSynthesisControllers.add(synthesisController)
+      backgroundSynthesisByMessage.set(synthesisMessageKey, synthesisController)
       type PreparedSegment =
         | { ok: true; segment: SynthesizedVoiceSegment }
         | { ok: false; error: unknown }
@@ -2000,6 +2259,9 @@ export function setup(ctx: SpindleFrontendContext) {
       let rateLimitedForRemainder = false
       const prepare = async (index: number): Promise<PreparedSegment> => {
         try {
+          appendSpeakerDebugLog(
+            `Synthesis request [${index + 1}] started with voice=${JSON.stringify(plan[index].voice || '<connection default>')}.`,
+          )
           const segment = await runSynthesisTask(() => synthesizeVoiceSegment(
             connectionId,
             plan[index].text,
@@ -2028,8 +2290,14 @@ export function setup(ctx: SpindleFrontendContext) {
               }
             },
           ), activePlayback === playback && !playback.playbackStopped)
+          appendSpeakerDebugLog(
+            `Synthesis request [${index + 1}] completed with voice=${JSON.stringify(plan[index].voice || '<connection default>')} (${segment.data.byteLength} bytes, ${segment.mime}).`,
+          )
           return { ok: true, segment }
         } catch (error) {
+          appendSpeakerDebugLog(
+            `Synthesis request [${index + 1}] failed for voice=${JSON.stringify(plan[index].voice || '<connection default>')}: ${error instanceof Error ? error.message : String(error)}`,
+          )
           return { ok: false, error }
         }
       }
@@ -2187,6 +2455,9 @@ export function setup(ctx: SpindleFrontendContext) {
           }
         }).finally(() => {
           backgroundSynthesisControllers.delete(synthesisController)
+          if (backgroundSynthesisByMessage.get(synthesisMessageKey) === synthesisController) {
+            backgroundSynthesisByMessage.delete(synthesisMessageKey)
+          }
         })
       } else {
         playback.persistenceState = 'disabled'
@@ -2194,6 +2465,9 @@ export function setup(ctx: SpindleFrontendContext) {
           .catch(() => undefined)
           .finally(() => {
             backgroundSynthesisControllers.delete(synthesisController)
+            if (backgroundSynthesisByMessage.get(synthesisMessageKey) === synthesisController) {
+              backgroundSynthesisByMessage.delete(synthesisMessageKey)
+            }
           })
       }
 
@@ -2206,6 +2480,9 @@ export function setup(ctx: SpindleFrontendContext) {
       for (let index = 0; index < plan.length; index += 1) {
         const current = await processed[index]
         if (!current.ok) throw current.error
+        appendSpeakerDebugLog(
+          `Playback [${index + 1}] using voice=${JSON.stringify(plan[index].voice || '<connection default>')}.`,
+        )
         setStatus(`Playing ${index + 1} of ${plan.length} voice segment${plan.length === 1 ? '' : 's'}…`)
         await playDecodedBuffer(playback, current.segment, preferences.volume)
       }
@@ -2452,16 +2729,12 @@ export function setup(ctx: SpindleFrontendContext) {
 
   async function loadConnections() {
     try {
-      const [loadedConnections, loadedLlmConnections, preferences] = await Promise.all([
+      const [loadedConnections, preferences] = await Promise.all([
         listAllTtsConnections(),
-        requestLlmConnections().catch((error) => {
-          console.warn('[Chat Voice] Could not load main LLM connections.', error)
-          return []
-        }),
         loadPlaybackPreferences(),
+        refreshDecisionStatus(),
       ])
       connections = loadedConnections
-      llmConnections = loadedLlmConnections
       if (!narratorGlobalSaveTimer && !savingNarratorGlobalVoice) {
         defaultNarratorVoice = preferences.defaultNarratorVoice
       }
@@ -2493,10 +2766,23 @@ export function setup(ctx: SpindleFrontendContext) {
       }
       if (!savingLlmSettings && !llmSettingsSaveTimer) {
         speakerParsingMode = preferences.speakerParsingMode
-        llmConnectionId = preferences.llmConnectionId
-        llmModel = preferences.llmModel
         speakerParsingPicker.update({ value: speakerParsingMode })
-        updateLlmControlState()
+      }
+      if (
+        !savingLlmSettings
+        && !llmSettingsSaveTimer
+        && !decisionStatusFailed
+        && decisionConnectionsKnown
+        && !decisionConnectionAvailable
+        && speakerParsingMode !== 'off'
+      ) {
+        speakerParsingMode = 'off'
+        speakerParsingPicker.update({ value: 'off' })
+        try {
+          await saveLlmParsingPreferences('off')
+        } catch (error) {
+          console.warn('[Chat Voice] Could not persist the Jev safeguard.', error)
+        }
       }
       if (!savingAdvancedSettings && !advancedSettingsSaveTimer) {
         playbackBufferSegments = preferences.playbackBufferSegments
@@ -2520,42 +2806,16 @@ export function setup(ctx: SpindleFrontendContext) {
         disabled: !activeChat || connections.length === 0,
       })
       if (connections.length === 0) setStatus('Create a TTS connection in Lumiverse first.')
+      else if (decisionStatusFailed) {
+        setStatus('Could not verify Decision connections. Jev speaker assignment is unavailable.', 'error')
+      } else if (decisionConnectionsKnown && !decisionConnectionAvailable) {
+        setStatus('Create a Decision model connection in Lumiverse to enable Jev speaker assignment.')
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Could not load TTS connections.'
       connectionPicker.update({ placeholder: 'Connections unavailable', disabled: true })
       setStatus(message, 'error')
     }
-  }
-
-  function llmConnectionOptions(selectedId = '') {
-    const options = llmConnections.map(connection => ({
-      value: connection.id,
-      label: connection.name,
-      sublabel: `${connection.provider}${connection.model ? ` · ${connection.model}` : ''}`,
-    }))
-    if (selectedId && !llmConnections.some(connection => connection.id === selectedId)) {
-      options.unshift({ value: selectedId, label: 'Missing connection', sublabel: selectedId })
-    }
-    return options
-  }
-
-  function updateLlmControlState(): void {
-    const enabled = speakerParsingMode !== 'off'
-    llmConnectionPicker.update({
-      value: llmConnectionId,
-      options: llmConnectionOptions(llmConnectionId),
-      disabled: !enabled,
-      placeholder: llmConnections.length
-        ? 'Use the default LLM connection'
-        : 'No LLM connections found; default will be used',
-    })
-    llmModelInput.update({
-      value: llmModel,
-      connection: llmConnectionId
-        ? { kind: 'llm', id: llmConnectionId }
-        : { kind: 'llm' },
-      disabled: !enabled,
-    })
   }
 
   function scheduleLlmSettingsSave(): void {
@@ -2567,30 +2827,49 @@ export function setup(ctx: SpindleFrontendContext) {
   }
 
   function onSpeakerParsingModeChanged(value: string): void {
-    speakerParsingMode = value === 'ambiguous' || value === 'always' ? value : 'off'
-    updateLlmControlState()
-    scheduleLlmSettingsSave()
+    void applySpeakerParsingMode(value === 'ambiguous' ? 'ambiguous' : 'off')
   }
 
-  function onLlmConnectionChanged(value: string): void {
-    llmConnectionId = value.trim().slice(0, 128)
-    updateLlmControlState()
-    scheduleLlmSettingsSave()
-  }
-
-  function onLlmModelChanged(value: string): void {
-    llmModel = value.trim().slice(0, 256)
+  async function applySpeakerParsingMode(next: 'off' | 'ambiguous'): Promise<void> {
+    if (next === 'ambiguous') {
+      const status = await refreshDecisionStatus()
+      if (!status?.available || !status.hasConnection) {
+        speakerParsingPicker.update({ value: speakerParsingMode })
+        setStatus(
+          status
+            ? 'Create a Decision model connection in Lumiverse before turning on Jev speaker assignment.'
+            : 'Could not verify a Decision model connection. Jev speaker assignment stays off.',
+          'error',
+        )
+        return
+      }
+    }
+    speakerParsingMode = next
+    speakerParsingPicker.update({ value: next })
     scheduleLlmSettingsSave()
   }
 
   async function persistLlmSettings(): Promise<void> {
     savingLlmSettings = true
-    setStatus('Saving global AI speaker-review settings…')
     try {
-      await saveLlmParsingPreferences(speakerParsingMode, llmConnectionId, llmModel)
-      setStatus('AI speaker-review settings saved globally.', 'saved')
+      if (speakerParsingMode === 'ambiguous') {
+        const status = await refreshDecisionStatus()
+        if (!status?.available || !status.hasConnection) {
+          speakerParsingMode = 'off'
+          speakerParsingPicker.update({ value: 'off' })
+          await saveLlmParsingPreferences('off')
+          setStatus(
+            'Jev speaker assignment was turned off because no Decision model connection is configured.',
+            'error',
+          )
+          return
+        }
+      }
+      setStatus('Saving global Jev speaker-assignment setting…')
+      await saveLlmParsingPreferences(speakerParsingMode)
+      setStatus('Jev speaker-assignment setting saved globally.', 'saved')
     } catch (error) {
-      setStatus(error instanceof Error ? error.message : 'Could not save AI speaker-review settings.', 'error')
+      setStatus(error instanceof Error ? error.message : 'Could not save Jev speaker-assignment setting.', 'error')
     } finally {
       savingLlmSettings = false
     }
@@ -2827,7 +3106,13 @@ export function setup(ctx: SpindleFrontendContext) {
   hostWindow.requestAnimationFrame(updatePlaybackButtons)
 
   const unsubscribeBackend = ctx.onBackendMessage((rawPayload: unknown) => {
-    const payload = rawPayload as StatePayload | ErrorPayload | ScanCompletePayload | MessagePayload | ParsedMessagePayload | LlmConnectionsPayload
+    const payload = rawPayload as
+      | StatePayload
+      | ErrorPayload
+      | ScanCompletePayload
+      | MessagePayload
+      | ParsedMessagePayload
+      | DecisionStatusPayload
     if (payload.type === 'chat_voice_message') {
       const pending = pendingMessageRequests.get(payload.requestId)
       if (!pending) return
@@ -2843,19 +3128,22 @@ export function setup(ctx: SpindleFrontendContext) {
       clearTimeout(pending.timer)
       pendingSpeakerParseRequests.delete(payload.requestId)
       if (payload.error || !payload.segments) {
-        pending.reject(new Error(payload.error || 'The message could not be reviewed.'))
+        pending.reject(new Error(payload.error || 'The message speakers could not be assigned.'))
       } else {
-        pending.resolve(payload.segments)
+        pending.resolve({ segments: payload.segments, usedLlm: payload.usedLlm ?? null, failed: false })
       }
       return
     }
-    if (payload.type === 'chat_voice_llm_connections') {
-      const pending = pendingLlmConnectionRequests.get(payload.requestId)
+    if (payload.type === 'chat_voice_decision_status') {
+      const pending = payload.requestId ? pendingDecisionStatusRequests.get(payload.requestId) : undefined
       if (!pending) return
       clearTimeout(pending.timer)
-      pendingLlmConnectionRequests.delete(payload.requestId)
-      if (payload.error) pending.reject(new Error(payload.error))
-      else pending.resolve(payload.connections)
+      pendingDecisionStatusRequests.delete(payload.requestId!)
+      pending.resolve({
+        available: payload.available,
+        hasConnection: payload.hasConnection,
+        defaultConnectionName: payload.defaultConnectionName ?? null,
+      })
       return
     }
     if (payload.type === 'chat_voice_error') {
@@ -2909,6 +3197,11 @@ export function setup(ctx: SpindleFrontendContext) {
         pending.reject(new Error('The active chat changed before speaker review completed.'))
       }
       pendingSpeakerParseRequests.clear()
+      for (const pending of pendingDecisionStatusRequests.values()) {
+        clearTimeout(pending.timer)
+        pending.reject(new Error('The active chat changed before the Decision connection check completed.'))
+      }
+      pendingDecisionStatusRequests.clear()
       stopPlayback()
       flushSave()
       dirty = false
@@ -2993,6 +3286,7 @@ export function setup(ctx: SpindleFrontendContext) {
     stopPlayback()
     for (const controller of backgroundSynthesisControllers) controller.abort()
     backgroundSynthesisControllers.clear()
+    backgroundSynthesisByMessage.clear()
     flushSave()
     if (saveTimer) clearTimeout(saveTimer)
     unsubscribeActivate()
@@ -3009,11 +3303,11 @@ export function setup(ctx: SpindleFrontendContext) {
       pending.reject(new Error('Chat Voice was closed.'))
     }
     pendingSpeakerParseRequests.clear()
-    for (const pending of pendingLlmConnectionRequests.values()) {
+    for (const pending of pendingDecisionStatusRequests.values()) {
       clearTimeout(pending.timer)
       pending.reject(new Error('Chat Voice was closed.'))
     }
-    pendingLlmConnectionRequests.clear()
+    pendingDecisionStatusRequests.clear()
     for (const pending of pendingStateRequests.values()) {
       clearTimeout(pending.timer)
       pending.reject(new Error('Chat Voice was closed.'))
@@ -3038,7 +3332,7 @@ export function setup(ctx: SpindleFrontendContext) {
     }
     if (llmSettingsSaveTimer) {
       clearTimeout(llmSettingsSaveTimer)
-      void saveLlmParsingPreferences(speakerParsingMode, llmConnectionId, llmModel)
+      void saveLlmParsingPreferences(speakerParsingMode)
     }
     if (advancedSettingsSaveTimer) {
       clearTimeout(advancedSettingsSaveTimer)
@@ -3051,8 +3345,6 @@ export function setup(ctx: SpindleFrontendContext) {
     }
     skippedTrackerTagsInput.destroy()
     speakerParsingPicker.destroy()
-    llmConnectionPicker.destroy()
-    llmModelInput.destroy()
     playbackBufferInput.removeEventListener('change', onPlaybackBufferInput)
     concurrentGenerationInput.removeEventListener('change', onConcurrentGenerationInput)
     rateLimitWaitInput.removeEventListener('change', onRateLimitWaitInput)
