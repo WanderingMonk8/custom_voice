@@ -7,6 +7,7 @@ import {
   addUnconfiguredDialogueSpeakers,
   clampSavedAudioLimit,
   DEFAULT_SAVED_AUDIO_LIMIT,
+  eligibleCardFallbackSpeakerId,
   encodeConcatenatedWav,
   expiredSavedAudioRecords,
   mergeVoicePlan,
@@ -1925,13 +1926,6 @@ export function setup(ctx: SpindleFrontendContext) {
 
     try {
       if (playback.controller.signal.aborted) throw new DOMException('Playback stopped.', 'AbortError')
-      const defaultSpeakerId = message.is_user
-        ? USER_SPEAKER_ID
-        : preferredCardSpeakerId(
-            message,
-            playbackChat.characters,
-            playbackChat.cardCharacterIds ?? [],
-          )
       const playbackSpeakers = addUnconfiguredDialogueSpeakers(
         message.content,
         speakersForMessageRole(
@@ -1940,6 +1934,18 @@ export function setup(ctx: SpindleFrontendContext) {
           message.name,
         ),
       )
+      const defaultSpeakerId = message.is_user
+        ? USER_SPEAKER_ID
+        : eligibleCardFallbackSpeakerId(
+            message.content,
+            preferredCardSpeakerId(
+              message,
+              playbackChat.characters,
+              playbackChat.cardCharacterIds ?? [],
+            ),
+            playbackSpeakers,
+            preferences.skippedTrackerTags,
+          )
       const aliases = speakerAliasIdLookup(playbackChat.characters)
       const localSegments = parseRosterVoiceSegments(
         message.content,

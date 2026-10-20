@@ -691,6 +691,20 @@ function hasAnonymousSpeechAttribution(text) {
 function hasLeadingPronounSubject(text) {
   return /^(?:he|she|they)\b/iu.test(narrativeOnly(text).trimStart());
 }
+function hasNamedSpeakerSubject(content, speakers, skippedTrackerTagPairs = "") {
+  const playbackContent = preparePlaybackContent(content, skippedTrackerTagPairs);
+  return playbackParagraphs(playbackContent).some((paragraph) => {
+    const mentions = mentionedSpeakers(paragraph.text, speakers);
+    return preferredMentionedSpeaker(paragraph.text, speakers, mentions) !== null;
+  });
+}
+function eligibleCardFallbackSpeakerId(content, cardSpeakerId, speakers, skippedTrackerTagPairs = "") {
+  if (!cardSpeakerId) return null;
+  const alternativeSpeakers = speakers.filter((speaker) => speaker.id !== cardSpeakerId);
+  if (hasNamedSpeakerSubject(content, alternativeSpeakers, skippedTrackerTagPairs)) return null;
+  const playbackContent = preparePlaybackContent(content, skippedTrackerTagPairs);
+  return hasAnonymousHumanSubject(playbackContent) ? null : cardSpeakerId;
+}
 function currentParagraphSpeaker(before, after, speakers) {
   let paragraphStart = 0;
   for (const match of before.matchAll(/\n[^\S\n]*\n/gu)) {
@@ -2619,11 +2633,6 @@ function setup(ctx) {
     updatePlaybackButtons();
     try {
       if (playback.controller.signal.aborted) throw new DOMException("Playback stopped.", "AbortError");
-      const defaultSpeakerId = message.is_user ? USER_SPEAKER_ID : preferredCardSpeakerId(
-        message,
-        playbackChat.characters,
-        playbackChat.cardCharacterIds ?? []
-      );
       const playbackSpeakers = addUnconfiguredDialogueSpeakers(
         message.content,
         speakersForMessageRole(
@@ -2631,6 +2640,16 @@ function setup(ctx) {
           message.is_user,
           message.name
         )
+      );
+      const defaultSpeakerId = message.is_user ? USER_SPEAKER_ID : eligibleCardFallbackSpeakerId(
+        message.content,
+        preferredCardSpeakerId(
+          message,
+          playbackChat.characters,
+          playbackChat.cardCharacterIds ?? []
+        ),
+        playbackSpeakers,
+        preferences.skippedTrackerTags
       );
       const aliases = speakerAliasIdLookup(playbackChat.characters);
       const localSegments = parseRosterVoiceSegments(

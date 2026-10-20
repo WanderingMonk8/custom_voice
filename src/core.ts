@@ -1379,6 +1379,25 @@ export function hasNamedSpeakerSubject(
   })
 }
 
+/**
+ * Use a card-matched speaker only when the message establishes no other
+ * character identity. Named local speakers and anonymous roles both make the
+ * card match ineligible, leaving otherwise unresolved dialogue on the
+ * connection default voice.
+ */
+export function eligibleCardFallbackSpeakerId(
+  content: string,
+  cardSpeakerId: string | null,
+  speakers: CharacterLike[],
+  skippedTrackerTagPairs = '',
+): string | null {
+  if (!cardSpeakerId) return null
+  const alternativeSpeakers = speakers.filter(speaker => speaker.id !== cardSpeakerId)
+  if (hasNamedSpeakerSubject(content, alternativeSpeakers, skippedTrackerTagPairs)) return null
+  const playbackContent = preparePlaybackContent(content, skippedTrackerTagPairs)
+  return hasAnonymousHumanSubject(playbackContent) ? null : cardSpeakerId
+}
+
 function currentParagraphSpeaker(
   before: string,
   after: string,

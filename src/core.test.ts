@@ -9,6 +9,7 @@ import {
   clampMessageLimit,
   clampSavedAudioLimit,
   detectCharacters,
+  eligibleCardFallbackSpeakerId,
   encodeConcatenatedWav,
   expiredSavedAudioRecords,
   hashMessageContent,
@@ -478,6 +479,22 @@ test('routes subjectless assistant dialogue through a unique card-title NPC alia
   assert.deepEqual(speech, [{ text: 'You imagined feeding me.', speakerId: 'npc:jayden-flynn' }])
 })
 
+test('uses a card-title fallback only when no other cast identity is established', () => {
+  const speakers = [
+    { id: 'naomi', name: 'Naomi Lin / Naomi' },
+    { id: 'ruby', name: 'Ruby' },
+  ]
+
+  assert.equal(
+    eligibleCardFallbackSpeakerId('She waits. "Still here."', 'naomi', speakers),
+    'naomi',
+  )
+  assert.equal(
+    eligibleCardFallbackSpeakerId('Ruby closes the door. "Still here."', 'naomi', speakers),
+    null,
+  )
+})
+
 test('routes dialogue anchored to an anonymous local character through the connection default', () => {
   const content = [
     'The phone buzzed.',
@@ -506,7 +523,7 @@ test('routes dialogue anchored to an anonymous local character through the conne
   assert.equal(playbackVoiceForSpeaker(UNCAST_SPEAKER_ID, false, { mira: 'mira-voice' }, '', ''), '')
 })
 
-test('keeps a definite anonymous role on the default voice across attribution and pronoun beats', () => {
+test('disables the card fallback across a message containing a definite anonymous role', () => {
   const content = [
     '"You\'re the piano guy." The clerk — older, reading glasses on a chain, sorting envelopes without looking up — said it to fill the space. "No wait. You\'re the one who never gets packages."',
     '',
@@ -516,21 +533,30 @@ test('keeps a definite anonymous role on the default voice across attribution an
     '',
     '"No. That\'s everything."',
   ].join('\n')
+  const speakers = [{ id: 'naomi', name: 'Naomi Lin / Naomi' }]
+  const defaultSpeakerId = eligibleCardFallbackSpeakerId(content, 'naomi', speakers)
   const segments = parseRosterVoiceSegments(
     content,
-    'naomi',
-    [{ id: 'naomi', name: 'Naomi Lin / Naomi' }],
+    defaultSpeakerId,
+    speakers,
     '',
     'naomi',
     true,
-  ).filter(segment => segment.speakerId !== null)
+  ).filter(segment => [
+    "You're the piano guy.",
+    "No wait. You're the one who never gets packages.",
+    "Campus things. Meetings. Somebody's garage band.",
+    'Anything else today, piano guy?',
+    "No. That's everything.",
+  ].includes(segment.text))
 
+  assert.equal(defaultSpeakerId, null)
   assert.deepEqual(segments.map(segment => segment.speakerId), [
     UNCAST_SPEAKER_ID,
     UNCAST_SPEAKER_ID,
     UNCAST_SPEAKER_ID,
     UNCAST_SPEAKER_ID,
-    'naomi',
+    null,
   ])
   assert.ok(segments[0].debugPath?.includes(`anonymous-downstream-attribution:${UNCAST_SPEAKER_ID}`))
   assert.ok(segments[2].debugPath?.includes(`anonymous-pronoun-continuation:${UNCAST_SPEAKER_ID}`))

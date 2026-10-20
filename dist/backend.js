@@ -800,6 +800,13 @@ function hasNamedSpeakerSubject(content, speakers, skippedTrackerTagPairs = "") 
     return preferredMentionedSpeaker(paragraph.text, speakers, mentions) !== null;
   });
 }
+function eligibleCardFallbackSpeakerId(content, cardSpeakerId, speakers, skippedTrackerTagPairs = "") {
+  if (!cardSpeakerId) return null;
+  const alternativeSpeakers = speakers.filter((speaker) => speaker.id !== cardSpeakerId);
+  if (hasNamedSpeakerSubject(content, alternativeSpeakers, skippedTrackerTagPairs)) return null;
+  const playbackContent = preparePlaybackContent(content, skippedTrackerTagPairs);
+  return hasAnonymousHumanSubject(playbackContent) ? null : cardSpeakerId;
+}
 function currentParagraphSpeaker(before, after, speakers) {
   let paragraphStart = 0;
   for (const match of before.matchAll(/\n[^\S\n]*\n/gu)) {
@@ -1578,8 +1585,14 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
     );
     const messageCardId = !message.is_user ? defaultMessageSpeakerId(message, cards, cards.map((card) => card.id)) : null;
     const messageCard = messageCardId ? cards.find((card) => card.id === messageCardId) : void 0;
-    const namelessCardSpeakerId = !message.is_user && !namedSpeakerSubject && messageCard ? speakerIdMatchingCardTitle(messageCard.name, configuredSpeakers) : null;
-    const defaultSpeakerId = message.is_user ? USER_SPEAKER_ID : !namedSpeakerSubject ? namelessCardSpeakerId : defaultMessageSpeakerId(message, speakers, cards.map((card) => card.id));
+    const titleMatchedCardSpeakerId = !message.is_user && messageCard ? speakerIdMatchingCardTitle(messageCard.name, configuredSpeakers) : null;
+    const namelessCardSpeakerId = eligibleCardFallbackSpeakerId(
+      message.content ?? "",
+      titleMatchedCardSpeakerId,
+      speakers,
+      skippedTrackerTags
+    );
+    const defaultSpeakerId = message.is_user ? USER_SPEAKER_ID : namelessCardSpeakerId;
     let previousAssistantMessage = null;
     let historicalSpeakerId = null;
     if (!message.is_user && !namelessCardSpeakerId) {

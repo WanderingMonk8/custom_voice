@@ -3,6 +3,7 @@ import {
   addUnconfiguredDialogueSpeakers,
   applyConfigToMetadata,
   clampMessageLimit,
+  eligibleCardFallbackSpeakerId,
   hashMessageContent,
   hasNamedSpeakerSubject,
   normalizeSpeakerName,
@@ -375,14 +376,18 @@ function queueSpeakerParse(
     const messageCard = messageCardId
       ? cards.find(card => card.id === messageCardId)
       : undefined
-    const namelessCardSpeakerId = !message.is_user && !namedSpeakerSubject && messageCard
+    const titleMatchedCardSpeakerId = !message.is_user && messageCard
       ? speakerIdMatchingCardTitle(messageCard.name, configuredSpeakers)
       : null
+    const namelessCardSpeakerId = eligibleCardFallbackSpeakerId(
+      message.content ?? '',
+      titleMatchedCardSpeakerId,
+      speakers,
+      skippedTrackerTags,
+    )
     const defaultSpeakerId = message.is_user
       ? USER_SPEAKER_ID
-      : !namedSpeakerSubject
-        ? namelessCardSpeakerId
-        : defaultMessageSpeakerId(message, speakers, cards.map(card => card.id))
+      : namelessCardSpeakerId
     let previousAssistantMessage: typeof message | null = null
     let historicalSpeakerId: string | null = null
     if (!message.is_user && !namelessCardSpeakerId) {
