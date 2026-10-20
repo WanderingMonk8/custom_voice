@@ -557,6 +557,103 @@ test('chain decode uses narrative attribution and refuses a downstream responden
 })
 
 
+test('chain decode handles phone monologues and turn alternation across a scene', () => {
+  const content = [
+    'Duncan is at his desk with the phone cradled at his ear.',
+    '',
+    '"—no, I completely understand. And look, this is exactly what I would want to hear."',
+    '',
+    'Duncan leans back. "Yeah. No, that is the right call and I will tell you why."',
+    '',
+    '"I know!" Poppy says. "I know! Isn\'t it perfect?"',
+    '',
+    '"Do you like it? Do you like how I look?"',
+    '',
+    '"Perfect." Duncan says. "You are a goddamn institution."',
+    '',
+    '"Keep me! Keep me! No — he is taking me to the conference room."',
+    '',
+    'His eyes move to Ken and he nods once.',
+    '',
+    '"Good for you, man. She is the best we got."',
+    '',
+    'Then Duncan uncovers the phone and his voice snaps back to business.',
+    '',
+    '"—sorry about that. No, I am here."',
+  ].join('\n')
+  const speakers = [
+    { id: 'poppy', name: 'Poppy' },
+    { id: 'duncan', name: 'Duncan' },
+    { id: 'ken', name: 'Ken' },
+  ]
+  const plan = buildSpeakerDecisionPlan(content, speakers, false)
+  const poppy = decisionOption(plan, 'poppy')
+  const duncan = decisionOption(plan, 'duncan')
+  const unclear = confidentDecision('no_clear_identity')
+  const answers = {
+    paragraph_p0: confidentDecision(duncan),
+    paragraph_p1: unclear,
+    speech_s0: unclear,
+    paragraph_p2: confidentDecision(duncan),
+    speech_s1: confidentDecision(duncan),
+    turn_s1: turnDecision('responds_to_other_participant', 0.8, 0.8),
+    paragraph_p3: confidentDecision(poppy),
+    speech_s2: confidentDecision(poppy),
+    speech_s3: confidentDecision(poppy),
+    turn_s3: turnDecision('continues_previous_turn', 0.9, 0.9),
+    paragraph_p4: unclear,
+    speech_s4: {
+      choice: poppy,
+      probabilities: { [poppy]: 0.45, [duncan]: 0.35, no_clear_identity: 0.2 },
+      confidence: 0.4,
+    },
+    turn_s4: turnDecision('continues_previous_turn', 0.9, 0.9),
+    paragraph_p5: confidentDecision(duncan),
+    speech_s5: confidentDecision(duncan),
+    speech_s6: confidentDecision(duncan),
+    turn_s5: turnDecision('responds_to_previous_speaker', 0.9, 0.9),
+    turn_s6: turnDecision('continues_previous_turn', 0.9, 0.9),
+    paragraph_p6: unclear,
+    speech_s7: {
+      choice: poppy,
+      probabilities: { [poppy]: 0.45, [duncan]: 0.35, no_clear_identity: 0.2 },
+      confidence: 0.4,
+    },
+    turn_s7: turnDecision('responds_to_previous_speaker', 0.9, 0.9),
+    paragraph_p7: confidentDecision(duncan),
+    paragraph_p8: unclear,
+    speech_s8: {
+      choice: duncan,
+      probabilities: { [duncan]: 0.5, [poppy]: 0.2, no_clear_identity: 0.3 },
+      confidence: 0.4,
+    },
+    turn_s8: turnDecision('responds_to_previous_speaker', 0.9, 0.9),
+    paragraph_p9: confidentDecision(duncan),
+    paragraph_p10: unclear,
+    speech_s9: unclear,
+    turn_s9: turnDecision('responds_to_other_participant', 0.8, 0.8),
+  }
+
+  const chain = decodeSpeakerChain(plan, answers)
+  assert.equal(chain.get('s4')?.identity, 'poppy')
+  assert.equal(chain.get('s4')?.filled, true)
+  assert.equal(chain.get('s7')?.identity, 'poppy')
+  assert.equal(chain.get('s7')?.filled, true)
+  assert.equal(chain.get('s8')?.identity, 'duncan')
+
+  const segments = resolveSpeakerDecisionSegments(content, plan, answers, speakers, {
+    isUserMessage: false,
+    cardSpeakerId: null,
+    historicalSpeakerId: null,
+  })
+  const speakerOf = (text: string) => segments.find(segment => segment.text === text)?.speakerId
+  assert.equal(speakerOf('—no, I completely understand. And look, this is exactly what I would want to hear.'), 'duncan')
+  assert.equal(speakerOf('Do you like it? Do you like how I look?'), 'poppy')
+  assert.equal(speakerOf('Keep me! Keep me! No — he is taking me to the conference room.'), 'poppy')
+  assert.equal(speakerOf('Good for you, man. She is the best we got.'), 'duncan')
+  assert.equal(speakerOf('—sorry about that. No, I am here.'), 'duncan')
+})
+
 test('extracts narrative context for spans and inter-quote bridges', () => {
   const content = 'Poppy says, "Look at me." Duncan says, "I am."'
   const plan = buildSpeakerDecisionPlan(content, [

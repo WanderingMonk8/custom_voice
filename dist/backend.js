@@ -2542,7 +2542,7 @@ function appendSpeakerDebugReason(segments, reason, enabled) {
     debugPath: [...segment.debugPath ?? [], reason]
   }));
 }
-async function reviewDiscourseEscalation(plan, answers) {
+async function reviewDiscourseEscalation(plan, answers, userId) {
   try {
     const assessment = assessSpeakerDiscourseEscalation(plan, answers);
     if (!assessment.plan) {
@@ -2557,7 +2557,8 @@ async function reviewDiscourseEscalation(plan, answers) {
     }
     const result = await spindle.decisions.evaluate({
       state: assessment.plan.state,
-      questions: assessment.plan.questions
+      questions: assessment.plan.questions,
+      ...userId ? { userId } : {}
     });
     const discourseAnswers = {};
     for (const [questionId, answer] of Object.entries(result.answers)) {
@@ -2775,7 +2776,8 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
         try {
           const result = await spindle.decisions.evaluate({
             state: decisionPlan.state,
-            questions: decisionPlan.questions
+            questions: decisionPlan.questions,
+            ...userId ? { userId } : {}
           });
           const answers = {};
           for (const [questionId, answer] of Object.entries(result.answers)) {
@@ -2788,7 +2790,8 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
           }
           const { assessment: discourseAssessment, evaluation: discourse } = await reviewDiscourseEscalation(
             decisionPlan,
-            answers
+            answers,
+            userId
           );
           const segments = resolveSpeakerDecisionSegments(
             message.content ?? "",

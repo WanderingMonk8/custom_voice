@@ -39,6 +39,9 @@ Lumiverse to resolve the account's default Decision connection.
 - Feature-detect `spindle.host.capabilities['decisions-v1']` before evaluation.
 - Omit `connection_id` and `model` on every evaluation so the default Decision
   connection is always used.
+- Pass the active `userId` on every evaluation. Operator-scoped installations
+  reject evaluations without it, and the extension never invents or stores a
+  user identity.
 - Treat missing permission, missing capability, missing default connection,
   provider errors, invalid answers, aborts, and the host's 30-second deadline as
   recoverable classifier failures.

@@ -281,6 +281,7 @@ interface DiscourseEvaluation {
 async function reviewDiscourseEscalation(
   plan: SpeakerDecisionPlan,
   answers: Record<string, SpeakerDecisionChoice>,
+  userId?: string,
 ): Promise<{ assessment: SpeakerDiscourseAssessment; evaluation: DiscourseEvaluation }> {
   try {
     const assessment = assessSpeakerDiscourseEscalation(plan, answers)
@@ -297,6 +298,7 @@ async function reviewDiscourseEscalation(
     const result = await spindle.decisions.evaluate({
       state: assessment.plan.state,
       questions: assessment.plan.questions,
+      ...(userId ? { userId } : {}),
     })
     const discourseAnswers: Record<string, SpeakerDecisionChoice> = {}
     for (const [questionId, answer] of Object.entries(result.answers)) {
@@ -550,6 +552,7 @@ function queueSpeakerParse(
           const result = await spindle.decisions.evaluate({
             state: decisionPlan.state,
             questions: decisionPlan.questions,
+            ...(userId ? { userId } : {}),
           })
           const answers: Record<string, SpeakerDecisionChoice> = {}
           for (const [questionId, answer] of Object.entries(result.answers)) {
@@ -563,6 +566,7 @@ function queueSpeakerParse(
           const { assessment: discourseAssessment, evaluation: discourse } = await reviewDiscourseEscalation(
             decisionPlan,
             answers,
+            userId,
           )
           const segments = resolveSpeakerDecisionSegments(
             message.content ?? '',
