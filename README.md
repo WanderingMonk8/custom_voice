@@ -58,7 +58,7 @@ The compiled frontend and backend bundles are committed under `dist/`, so users 
 2. Select **Voice** in the Lumiverse drawer.
 3. Click **Scan** to read the active character card and save its speaking cast.
 4. Optionally enter comma-separated tag names under **Skipped tracker tags**, such as `tracker, status, o_scene`. These global exclusions remove both the opening/closing tags and everything enclosed by them before TTS generation. Previously saved paired-tag entries remain compatible.
-5. Global **Jev speaker assignment** defaults to **On** and uses the account's default Lumiverse Decision connection. Switch it off to use only the local parser.
+5. Global **Jev speaker assignment** defaults to **On** and uses the account's default Lumiverse Decision connection. Switch it off to use only the local parser. The On option is available only when Lumiverse has at least one Decision model connection; without one it stays Off.
 6. Choose one TTS connection for the chat.
 7. Enter the narrator voice and a voice for each detected character. Add characters manually, or rename and delete any roster entry as needed. Separate aliases with `/` (for example, `Scott / The sergeant`) to route every name to the same voice; use the rename button to add aliases later without losing the assigned voice.
 8. Optionally enable **Save generated audio** to attach completed recordings to messages across every chat. This global setting is off by default. Set **Maximum saved recordings** to control global retention (default: 50); the oldest extension-created attachments are removed first.

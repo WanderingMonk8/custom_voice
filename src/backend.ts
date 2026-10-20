@@ -62,6 +62,7 @@ interface CardPromptData {
 
 type FrontendMessage =
   | { type: 'chat_voice_refresh'; chatId?: string | null; requestId?: string }
+  | { type: 'chat_voice_decision_status'; requestId?: string }
   | { type: 'chat_voice_scan'; chatId: string; messageLimit: number }
   | { type: 'chat_voice_get_message'; chatId: string; messageId: string; requestId: string }
   | {
@@ -88,6 +89,35 @@ type FrontendMessage =
         characters: Array<{ id: string; name: string; messageCount: number }>
       }
     }
+
+interface DecisionConnectionStatus {
+  available: boolean
+  hasConnection: boolean
+  defaultConnectionName: string | null
+}
+
+/**
+ * Inspect the account's Decision connections. Jev assignment is only enabled
+ * when the host advertises the capability and at least one connection exists.
+ */
+async function decisionConnectionStatus(userId?: string): Promise<DecisionConnectionStatus> {
+  const available = (spindle.host.capabilities['decisions-v1'] ?? 0) >= 1
+  if (!available) return { available: false, hasConnection: false, defaultConnectionName: null }
+  try {
+    const connections = await spindle.decisions.listConnections({ ...(userId ? { userId } : {}) })
+    const defaultConnection = connections.find(connection => connection.is_default) ?? connections[0]
+    return {
+      available: true,
+      hasConnection: connections.length > 0,
+      defaultConnectionName: defaultConnection?.name ?? null,
+    }
+  } catch (error) {
+    spindle.log.warn(
+      `[Chat Voice] Could not inspect Decision connections: ${error instanceof Error ? error.message : String(error)}`,
+    )
+    return { available: false, hasConnection: false, defaultConnectionName: null }
+  }
+}
 
 function chatMemberIds(chat: ChatLike): string[] {
   const rawIds = chat.metadata?.character_ids
@@ -748,6 +778,12 @@ spindle.onFrontendMessage(async (rawPayload: unknown, userId, frontendSessionId)
   try {
     if (payload?.type === 'chat_voice_refresh') {
       await sendState(userId, undefined, payload.chatId, frontendSessionId, payload.requestId)
+    } else if (payload?.type === 'chat_voice_decision_status') {
+      sendFrontend({
+        type: 'chat_voice_decision_status',
+        requestId: payload.requestId,
+        ...await decisionConnectionStatus(userId),
+      }, userId, frontendSessionId)
     } else if (payload?.type === 'chat_voice_parse_message') {
       await queueSpeakerParse(payload, userId, frontendSessionId)
     } else if (payload?.type === 'chat_voice_get_message') {

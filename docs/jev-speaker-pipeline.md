@@ -424,6 +424,10 @@ the cancelled session.
 - Stop using `spindle.generate.quiet` for speaker assignment.
 - Use the default Lumiverse Decision connection without an extension-level
   override.
+- Disable Jev assignment while no Decision model connection exists. Check
+  `spindle.decisions.listConnections` on load and on save, keep the On option
+  disabled when none is available, and persist Off when the last connection is
+  removed.
 - Retain the speaker-assignment debug switch.
 - During rollout, retain a temporary engine switch only if needed for shadow
   comparison; it is not part of the intended final UI.

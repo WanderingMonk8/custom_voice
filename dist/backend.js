@@ -2475,6 +2475,24 @@ function applyConfigToMetadata(metadata, config) {
 }
 
 // src/backend.ts
+async function decisionConnectionStatus(userId) {
+  const available = (spindle.host.capabilities["decisions-v1"] ?? 0) >= 1;
+  if (!available) return { available: false, hasConnection: false, defaultConnectionName: null };
+  try {
+    const connections = await spindle.decisions.listConnections({ ...userId ? { userId } : {} });
+    const defaultConnection = connections.find((connection) => connection.is_default) ?? connections[0];
+    return {
+      available: true,
+      hasConnection: connections.length > 0,
+      defaultConnectionName: defaultConnection?.name ?? null
+    };
+  } catch (error) {
+    spindle.log.warn(
+      `[Chat Voice] Could not inspect Decision connections: ${error instanceof Error ? error.message : String(error)}`
+    );
+    return { available: false, hasConnection: false, defaultConnectionName: null };
+  }
+}
 function chatMemberIds(chat) {
   const rawIds = chat.metadata?.character_ids;
   if (chat.metadata?.group === true && Array.isArray(rawIds)) {
@@ -3012,6 +3030,12 @@ spindle.onFrontendMessage(async (rawPayload, userId, frontendSessionId) => {
   try {
     if (payload?.type === "chat_voice_refresh") {
       await sendState(userId, void 0, payload.chatId, frontendSessionId, payload.requestId);
+    } else if (payload?.type === "chat_voice_decision_status") {
+      sendFrontend({
+        type: "chat_voice_decision_status",
+        requestId: payload.requestId,
+        ...await decisionConnectionStatus(userId)
+      }, userId, frontendSessionId);
     } else if (payload?.type === "chat_voice_parse_message") {
       await queueSpeakerParse(payload, userId, frontendSessionId);
     } else if (payload?.type === "chat_voice_get_message") {

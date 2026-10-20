@@ -1981,6 +1981,10 @@ function setup(ctx) {
   let savingSkippedTrackerTags = false;
   let skippedTrackerTagsSaveTimer = null;
   let speakerParsingMode = "ambiguous";
+  let decisionConnectionsKnown = false;
+  let decisionConnectionAvailable = false;
+  let decisionConnectionName = "";
+  let decisionStatusFailed = false;
   let llmSettingsSaveTimer = null;
   let savingLlmSettings = false;
   let playbackBufferSegments = DEFAULT_PLAYBACK_BUFFER_SEGMENTS;
@@ -2042,9 +2046,11 @@ function setup(ctx) {
   const pendingMessageRequests = /* @__PURE__ */ new Map();
   const pendingStateRequests = /* @__PURE__ */ new Map();
   const pendingSpeakerParseRequests = /* @__PURE__ */ new Map();
+  const pendingDecisionStatusRequests = /* @__PURE__ */ new Map();
   let messageRequestSequence = 0;
   let stateRequestSequence = 0;
   let speakerParseRequestSequence = 0;
+  let decisionStatusRequestSequence = 0;
   const setStatus = (message, state = "normal") => {
     status.textContent = message;
     status.dataset.state = state;
@@ -2137,11 +2143,20 @@ function setup(ctx) {
     value: "ambiguous",
     options: [
       { value: "off", label: "Off", sublabel: "Use the local parser only" },
-      { value: "ambiguous", label: "On", sublabel: "Use the default Lumiverse Decision connection" }
+      {
+        value: "ambiguous",
+        label: "On",
+        sublabel: "Checking for a Decision model connection\u2026",
+        disabled: true
+      }
     ],
     ariaLabel: "Jev speaker assignment mode",
     onChange: (value) => onSpeakerParsingModeChanged(value)
   });
+  const speakerParsingHint = document.createElement("div");
+  speakerParsingHint.className = "chat-voice-hint";
+  speakerParsingHint.hidden = true;
+  speakerParsingField.slot.append(speakerParsingHint);
   function createNumberInput(value, maximum, ariaLabel) {
     const input = document.createElement("input");
     input.className = "chat-voice-number-input";
@@ -2528,6 +2543,53 @@ function setup(ctx) {
     if (!speakerAssignmentDebug) return;
     speakerDebugOutput.value += `${speakerDebugOutput.value ? "\n" : ""}${line}`;
     console.debug(`[Chat Voice] ${line}`);
+  }
+  function requestDecisionStatus() {
+    const requestId = `decision-${Date.now().toString(36)}-${++decisionStatusRequestSequence}`;
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        pendingDecisionStatusRequests.delete(requestId);
+        reject(new Error("Timed out while checking Decision connections."));
+      }, 1e4);
+      pendingDecisionStatusRequests.set(requestId, { resolve, reject, timer });
+      ctx.sendToBackend({ type: "chat_voice_decision_status", requestId });
+    });
+  }
+  async function refreshDecisionStatus() {
+    try {
+      const status2 = await requestDecisionStatus();
+      decisionConnectionsKnown = true;
+      decisionConnectionAvailable = status2.available && status2.hasConnection;
+      decisionConnectionName = status2.defaultConnectionName ?? "";
+      decisionStatusFailed = false;
+      updateSpeakerParsingControls();
+      return status2;
+    } catch (error) {
+      decisionConnectionsKnown = true;
+      decisionConnectionAvailable = false;
+      decisionConnectionName = "";
+      decisionStatusFailed = true;
+      updateSpeakerParsingControls();
+      console.warn("[Chat Voice] Could not check Decision connections.", error);
+      return null;
+    }
+  }
+  function updateSpeakerParsingControls() {
+    const description = decisionStatusFailed ? "Could not check Decision connections" : !decisionConnectionsKnown ? "Checking for a Decision model connection\u2026" : decisionConnectionAvailable ? decisionConnectionName ? `Uses ${decisionConnectionName} as the default Decision connection` : "Uses the default Lumiverse Decision connection" : "Create a Decision model connection in Lumiverse first";
+    speakerParsingPicker.update({
+      options: [
+        { value: "off", label: "Off", sublabel: "Use the local parser only" },
+        {
+          value: "ambiguous",
+          label: "On",
+          sublabel: description,
+          disabled: decisionStatusFailed || decisionConnectionsKnown && !decisionConnectionAvailable
+        }
+      ]
+    });
+    const warning = decisionStatusFailed ? "Could not verify a Decision model connection. Jev speaker assignment is unavailable until Lumiverse responds." : decisionConnectionsKnown && !decisionConnectionAvailable ? "Jev speaker assignment needs a Decision model connection. Create one in Lumiverse, then reopen this panel." : "";
+    speakerParsingHint.textContent = warning;
+    speakerParsingHint.hidden = warning === "";
   }
   function refreshLocalState() {
     ctx.sendToBackend({
@@ -3277,7 +3339,8 @@ function setup(ctx) {
     try {
       const [loadedConnections, preferences] = await Promise.all([
         listAllTtsConnections(),
-        loadPlaybackPreferences()
+        loadPlaybackPreferences(),
+        refreshDecisionStatus()
       ]);
       connections = loadedConnections;
       if (!narratorGlobalSaveTimer && !savingNarratorGlobalVoice) {
@@ -3313,6 +3376,15 @@ function setup(ctx) {
         speakerParsingMode = preferences.speakerParsingMode;
         speakerParsingPicker.update({ value: speakerParsingMode });
       }
+      if (!savingLlmSettings && !llmSettingsSaveTimer && !decisionStatusFailed && decisionConnectionsKnown && !decisionConnectionAvailable && speakerParsingMode !== "off") {
+        speakerParsingMode = "off";
+        speakerParsingPicker.update({ value: "off" });
+        try {
+          await saveLlmParsingPreferences("off");
+        } catch (error) {
+          console.warn("[Chat Voice] Could not persist the Jev safeguard.", error);
+        }
+      }
       if (!savingAdvancedSettings && !advancedSettingsSaveTimer) {
         playbackBufferSegments = preferences.playbackBufferSegments;
         concurrentGenerationLimit = preferences.concurrentGenerations;
@@ -3333,6 +3405,11 @@ function setup(ctx) {
         disabled: !activeChat || connections.length === 0
       });
       if (connections.length === 0) setStatus("Create a TTS connection in Lumiverse first.");
+      else if (decisionStatusFailed) {
+        setStatus("Could not verify Decision connections. Jev speaker assignment is unavailable.", "error");
+      } else if (decisionConnectionsKnown && !decisionConnectionAvailable) {
+        setStatus("Create a Decision model connection in Lumiverse to enable Jev speaker assignment.");
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : "Could not load TTS connections.";
       connectionPicker.update({ placeholder: "Connections unavailable", disabled: true });
@@ -3347,13 +3424,41 @@ function setup(ctx) {
     }, 400);
   }
   function onSpeakerParsingModeChanged(value) {
-    speakerParsingMode = value === "ambiguous" ? "ambiguous" : "off";
+    void applySpeakerParsingMode(value === "ambiguous" ? "ambiguous" : "off");
+  }
+  async function applySpeakerParsingMode(next) {
+    if (next === "ambiguous") {
+      const status2 = await refreshDecisionStatus();
+      if (!status2?.available || !status2.hasConnection) {
+        speakerParsingPicker.update({ value: speakerParsingMode });
+        setStatus(
+          status2 ? "Create a Decision model connection in Lumiverse before turning on Jev speaker assignment." : "Could not verify a Decision model connection. Jev speaker assignment stays off.",
+          "error"
+        );
+        return;
+      }
+    }
+    speakerParsingMode = next;
+    speakerParsingPicker.update({ value: next });
     scheduleLlmSettingsSave();
   }
   async function persistLlmSettings() {
     savingLlmSettings = true;
-    setStatus("Saving global Jev speaker-assignment setting\u2026");
     try {
+      if (speakerParsingMode === "ambiguous") {
+        const status2 = await refreshDecisionStatus();
+        if (!status2?.available || !status2.hasConnection) {
+          speakerParsingMode = "off";
+          speakerParsingPicker.update({ value: "off" });
+          await saveLlmParsingPreferences("off");
+          setStatus(
+            "Jev speaker assignment was turned off because no Decision model connection is configured.",
+            "error"
+          );
+          return;
+        }
+      }
+      setStatus("Saving global Jev speaker-assignment setting\u2026");
       await saveLlmParsingPreferences(speakerParsingMode);
       setStatus("Jev speaker-assignment setting saved globally.", "saved");
     } catch (error) {
@@ -3589,6 +3694,18 @@ function setup(ctx) {
       }
       return;
     }
+    if (payload.type === "chat_voice_decision_status") {
+      const pending = payload.requestId ? pendingDecisionStatusRequests.get(payload.requestId) : void 0;
+      if (!pending) return;
+      clearTimeout(pending.timer);
+      pendingDecisionStatusRequests.delete(payload.requestId);
+      pending.resolve({
+        available: payload.available,
+        hasConnection: payload.hasConnection,
+        defaultConnectionName: payload.defaultConnectionName ?? null
+      });
+      return;
+    }
     if (payload.type === "chat_voice_error") {
       if (payload.requestId) {
         const pending = pendingStateRequests.get(payload.requestId);
@@ -3637,6 +3754,11 @@ function setup(ctx) {
         pending.reject(new Error("The active chat changed before speaker review completed."));
       }
       pendingSpeakerParseRequests.clear();
+      for (const pending of pendingDecisionStatusRequests.values()) {
+        clearTimeout(pending.timer);
+        pending.reject(new Error("The active chat changed before the Decision connection check completed."));
+      }
+      pendingDecisionStatusRequests.clear();
       stopPlayback();
       flushSave();
       dirty = false;
@@ -3730,6 +3852,11 @@ function setup(ctx) {
       pending.reject(new Error("Chat Voice was closed."));
     }
     pendingSpeakerParseRequests.clear();
+    for (const pending of pendingDecisionStatusRequests.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(new Error("Chat Voice was closed."));
+    }
+    pendingDecisionStatusRequests.clear();
     for (const pending of pendingStateRequests.values()) {
       clearTimeout(pending.timer);
       pending.reject(new Error("Chat Voice was closed."));
