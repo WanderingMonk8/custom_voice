@@ -1058,14 +1058,14 @@ export function setup(ctx: SpindleFrontendContext) {
   speakerDebugText.textContent = 'Speaker assignment debug'
   const speakerDebugHint = document.createElement('span')
   speakerDebugHint.className = 'chat-voice-toggle-hint'
-  speakerDebugHint.textContent = 'Records both Jev passes, dialogue-run review, inheritance, fallbacks, aliases, and the final voice route for every segment.'
+  speakerDebugHint.textContent = 'Records both Jev passes, the turn matrix, narrative cues, dialogue-run review, inheritance, fallbacks, aliases, and the final voice route for every segment.'
   speakerDebugCopy.append(speakerDebugText, speakerDebugHint)
   speakerDebugLabel.append(speakerDebugToggle, speakerDebugCopy)
   const speakerDebugOutput = document.createElement('textarea')
   speakerDebugOutput.className = 'chat-voice-debug-output'
   speakerDebugOutput.readOnly = true
   speakerDebugOutput.hidden = true
-  speakerDebugOutput.placeholder = 'Generate TTS to see the first-pass, discourse review, inheritance, and voice-route trace.'
+  speakerDebugOutput.placeholder = 'Generate TTS to see the turn matrix, discourse review, inheritance, and voice-route trace.'
   speakerDebugOutput.setAttribute('aria-label', 'Speaker assignment debug log')
   const advancedHint = document.createElement('div')
   advancedHint.className = 'chat-voice-hint'
@@ -1537,6 +1537,8 @@ export function setup(ctx: SpindleFrontendContext) {
 
   type SpeakerAssignmentSource =
     | 'first-pass'
+    | 'chain-fill'
+    | 'chain-override'
     | 'discourse-fill'
     | 'discourse-override'
     | 'inheritance'
@@ -1548,6 +1550,8 @@ export function setup(ctx: SpindleFrontendContext) {
 
   const SPEAKER_SOURCE_LABELS: Record<SpeakerAssignmentSource, string> = {
     'first-pass': 'first pass',
+    'chain-fill': 'turn chain fill',
+    'chain-override': 'turn chain override',
     'discourse-fill': 'discourse fill',
     'discourse-override': 'discourse override',
     inheritance: 'in-message inheritance',
@@ -1573,6 +1577,8 @@ export function setup(ctx: SpindleFrontendContext) {
     review: SpeakerParseReview,
   ): SpeakerAssignmentSource {
     const resolution = speakerDebugStep(segment, 'resolution:')
+    if (resolution?.startsWith('resolution:chain-identity (overrode')) return 'chain-override'
+    if (resolution?.startsWith('resolution:chain-identity')) return 'chain-fill'
     if (resolution?.startsWith('resolution:discourse-identity (overrode')) return 'discourse-override'
     if (resolution?.startsWith('resolution:discourse-identity')) return 'discourse-fill'
     if (resolution === 'resolution:direct-speech-identity') return 'first-pass'
@@ -1656,6 +1662,34 @@ export function setup(ctx: SpindleFrontendContext) {
         `First pass: ${clear} clear / ${normalized.length} quotations`
         + ` (${normalized.length - clear} unresolved or low-confidence)`,
       )
+    }
+    const turnOmitted = steps.includes('jev-turn-questions:omitted (first-pass question budget)')
+    const relations = steps
+      .filter(step => step.startsWith('jev-turn-') && step.includes('-choice:'))
+      .length
+    const chainDecisions = steps
+      .filter(step => step.startsWith('chain-decode:'))
+      .map(step => step.slice('chain-decode:'.length))
+    if (turnOmitted) {
+      lines.push('Turn matrix: omitted (first-pass question budget); first-pass policy retained')
+    } else if (relations > 0 || chainDecisions.length > 0) {
+      const filled = chainDecisions.filter(step => step.startsWith('filled-unresolved')).length
+      const overrode = chainDecisions.filter(step => step.startsWith('overrode-clear')).length
+      const retained = chainDecisions.filter(step => step.startsWith('retained-unresolved')).length
+      const direct = chainDecisions.filter(step => step.startsWith('direct')).length
+      const overrideRejected = chainDecisions.filter(step => step.startsWith('override-rejected')).length
+      lines.push(
+        `Turn matrix: ${relations} relations · ${filled} chain-filled`
+        + ` · ${overrode} chain-overrode · ${direct} direct retained`
+        + (retained > 0 ? ` · ${retained} unresolved retained` : '')
+        + (overrideRejected > 0 ? ` · ${overrideRejected} override rejected` : ''),
+      )
+    }
+    const narrativeAttributions = new Set(
+      steps.filter(step => step.startsWith('chain-narrative:attribution=')),
+    ).size
+    if (narrativeAttributions > 0) {
+      lines.push(`Narrative cues: ${narrativeAttributions} unambiguous attributions`)
     }
     const request = speakerDebugLine(steps, 'discourse-request:')
       ?.slice('discourse-request:'.length).trim()
@@ -1764,7 +1798,7 @@ export function setup(ctx: SpindleFrontendContext) {
       .join(' · ')
     lines.push(
       `Assignment sources: ${sourceSummary || 'no speech segments'} · narrator segments ${narratorCount}`,
-      'Legend: jev-* first pass · jev-discourse-* and discourse-* cross-paragraph review · resolution:* deterministic policy · voice-route:* final routing',
+      'Legend: jev-* first pass · jev-turn-* and chain-* turn matrix · jev-discourse-* and discourse-* cross-paragraph review · resolution:* deterministic policy · voice-route:* final routing',
     )
     const log = lines.join('\n')
     speakerDebugOutput.value = log

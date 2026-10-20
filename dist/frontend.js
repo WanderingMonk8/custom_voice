@@ -1009,6 +1009,20 @@ function canContinueSpeaker(bridge, previousSpeakerId, speakers) {
   }
   return true;
 }
+var TURN_CONTINUE_OPTION = "continues_previous_turn";
+var TURN_RESPOND_OPTION = "responds_to_previous_speaker";
+var TURN_OTHER_OPTION = "responds_to_other_participant";
+var TURN_UNCLEAR_OPTION = "no_clear_relation";
+var TURN_RELATION_CRITERIA = {
+  [TURN_CONTINUE_OPTION]: "The same speaker is still talking; no new speaker has taken over.",
+  [TURN_RESPOND_OPTION]: "A different participant answers the immediately preceding speaker.",
+  [TURN_OTHER_OPTION]: "A different participant addresses someone else in the scene, a third party, or an off-scene channel.",
+  [TURN_UNCLEAR_OPTION]: "The text does not establish whether the speaker continues or changes."
+};
+var NARRATIVE_SPEECH_VERB_PATTERN = new RegExp(
+  `\\b(?:${SPEECH_VERBS}|blurt(?:s|ed)|laugh(?:s|ed)|mutter(?:s|ed)|hiss(?:es|ed)|snap(?:s|ped))\\b`,
+  "iu"
+);
 function parseRosterVoiceSegmentsInternal(content, defaultSpeakerId, speakers, skippedTrackerTagPairs = "", quoteSpeakerOverrides, historicalSpeakerId = null, preserveLocalOnNullOverride = false, lowConfidenceQuoteIndexes, includeDebug = false) {
   const playbackContent = preparePlaybackContent(content, skippedTrackerTagPairs);
   const result = [];
@@ -1918,14 +1932,14 @@ function setup(ctx) {
   speakerDebugText.textContent = "Speaker assignment debug";
   const speakerDebugHint = document.createElement("span");
   speakerDebugHint.className = "chat-voice-toggle-hint";
-  speakerDebugHint.textContent = "Records both Jev passes, dialogue-run review, inheritance, fallbacks, aliases, and the final voice route for every segment.";
+  speakerDebugHint.textContent = "Records both Jev passes, the turn matrix, narrative cues, dialogue-run review, inheritance, fallbacks, aliases, and the final voice route for every segment.";
   speakerDebugCopy.append(speakerDebugText, speakerDebugHint);
   speakerDebugLabel.append(speakerDebugToggle, speakerDebugCopy);
   const speakerDebugOutput = document.createElement("textarea");
   speakerDebugOutput.className = "chat-voice-debug-output";
   speakerDebugOutput.readOnly = true;
   speakerDebugOutput.hidden = true;
-  speakerDebugOutput.placeholder = "Generate TTS to see the first-pass, discourse review, inheritance, and voice-route trace.";
+  speakerDebugOutput.placeholder = "Generate TTS to see the turn matrix, discourse review, inheritance, and voice-route trace.";
   speakerDebugOutput.setAttribute("aria-label", "Speaker assignment debug log");
   const advancedHint = document.createElement("div");
   advancedHint.className = "chat-voice-hint";
@@ -2328,6 +2342,8 @@ function setup(ctx) {
   }
   const SPEAKER_SOURCE_LABELS = {
     "first-pass": "first pass",
+    "chain-fill": "turn chain fill",
+    "chain-override": "turn chain override",
     "discourse-fill": "discourse fill",
     "discourse-override": "discourse override",
     inheritance: "in-message inheritance",
@@ -2345,6 +2361,8 @@ function setup(ctx) {
   }
   function speakerAssignmentSource(segment, parsingMode, review) {
     const resolution = speakerDebugStep(segment, "resolution:");
+    if (resolution?.startsWith("resolution:chain-identity (overrode")) return "chain-override";
+    if (resolution?.startsWith("resolution:chain-identity")) return "chain-fill";
     if (resolution?.startsWith("resolution:discourse-identity (overrode")) return "discourse-override";
     if (resolution?.startsWith("resolution:discourse-identity")) return "discourse-fill";
     if (resolution === "resolution:direct-speech-identity") return "first-pass";
@@ -2401,6 +2419,27 @@ function setup(ctx) {
       lines.push(
         `First pass: ${clear} clear / ${normalized.length} quotations (${normalized.length - clear} unresolved or low-confidence)`
       );
+    }
+    const turnOmitted = steps.includes("jev-turn-questions:omitted (first-pass question budget)");
+    const relations = steps.filter((step) => step.startsWith("jev-turn-") && step.includes("-choice:")).length;
+    const chainDecisions = steps.filter((step) => step.startsWith("chain-decode:")).map((step) => step.slice("chain-decode:".length));
+    if (turnOmitted) {
+      lines.push("Turn matrix: omitted (first-pass question budget); first-pass policy retained");
+    } else if (relations > 0 || chainDecisions.length > 0) {
+      const filled = chainDecisions.filter((step) => step.startsWith("filled-unresolved")).length;
+      const overrode = chainDecisions.filter((step) => step.startsWith("overrode-clear")).length;
+      const retained = chainDecisions.filter((step) => step.startsWith("retained-unresolved")).length;
+      const direct = chainDecisions.filter((step) => step.startsWith("direct")).length;
+      const overrideRejected = chainDecisions.filter((step) => step.startsWith("override-rejected")).length;
+      lines.push(
+        `Turn matrix: ${relations} relations \xB7 ${filled} chain-filled \xB7 ${overrode} chain-overrode \xB7 ${direct} direct retained` + (retained > 0 ? ` \xB7 ${retained} unresolved retained` : "") + (overrideRejected > 0 ? ` \xB7 ${overrideRejected} override rejected` : "")
+      );
+    }
+    const narrativeAttributions = new Set(
+      steps.filter((step) => step.startsWith("chain-narrative:attribution="))
+    ).size;
+    if (narrativeAttributions > 0) {
+      lines.push(`Narrative cues: ${narrativeAttributions} unambiguous attributions`);
     }
     const request = speakerDebugLine(steps, "discourse-request:")?.slice("discourse-request:".length).trim();
     const escalated = steps.includes("discourse-decision:escalated");
@@ -2471,7 +2510,7 @@ function setup(ctx) {
     const sourceSummary = [...sourceCounts.entries()].map(([source, count]) => `${SPEAKER_SOURCE_LABELS[source]} ${count}`).join(" \xB7 ");
     lines.push(
       `Assignment sources: ${sourceSummary || "no speech segments"} \xB7 narrator segments ${narratorCount}`,
-      "Legend: jev-* first pass \xB7 jev-discourse-* and discourse-* cross-paragraph review \xB7 resolution:* deterministic policy \xB7 voice-route:* final routing"
+      "Legend: jev-* first pass \xB7 jev-turn-* and chain-* turn matrix \xB7 jev-discourse-* and discourse-* cross-paragraph review \xB7 resolution:* deterministic policy \xB7 voice-route:* final routing"
     );
     const log = lines.join("\n");
     speakerDebugOutput.value = log;

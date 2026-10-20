@@ -519,6 +519,9 @@ function queueSpeakerParse(
           parser: SPEAKER_DECISION_SCHEMA.classifier,
           discourse: SPEAKER_DECISION_SCHEMA.discourse,
           hardBoundary: SPEAKER_DECISION_SCHEMA.hardBoundary,
+          turns: SPEAKER_DECISION_SCHEMA.turns,
+          chain: SPEAKER_DECISION_SCHEMA.chain,
+          narrative: SPEAKER_DECISION_SCHEMA.narrative,
           thresholds: SPEAKER_DECISION_SCHEMA.thresholds,
           content: message.content ?? '',
           role: message.is_user ? 'user' : 'assistant',
@@ -588,6 +591,7 @@ function queueSpeakerParse(
                 segments: segments.map(segment => ({ text: segment.text, speakerId: segment.speakerId })),
                 discourse: {
                   status: discourse.outcome,
+                  turns: decisionPlan.state.turnQuestionsOmitted ? 'omitted' : 'issued',
                   runs: discourseAssessment.runs
                     .filter(run => run.rejection === null)
                     .map(run => ({

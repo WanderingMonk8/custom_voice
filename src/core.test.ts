@@ -11,6 +11,7 @@ import {
   clampMessageLimit,
   clampSavedAudioLimit,
   detectCharacters,
+  decodeSpeakerChain,
   eligibleCardFallbackSpeakerId,
   encodeConcatenatedWav,
   evaluateSpeakerDecisionAnswer,
@@ -98,7 +99,11 @@ test('builds batched Jev questions and resolves speaker policy after semantic de
   assert.ok(rubyOption)
   assert.equal(plan.state.paragraphs.length, 3)
   assert.equal(plan.state.speeches.length, 3)
-  assert.equal(Object.keys(plan.questions).length, 6)
+  assert.deepEqual(plan.state.turns.map(turn => turn.speechId), ['s1', 's2'])
+  assert.ok(plan.questions.turn_s1)
+  assert.ok(plan.questions.turn_s2)
+  assert.equal(plan.questions.turn_s0, undefined)
+  assert.equal(Object.keys(plan.questions).length, 8)
 
   const segments = resolveSpeakerDecisionSegments(
     content,
@@ -225,6 +230,17 @@ function confidentDecision(choice: string, probability = 0.92, confidence = 0.9)
   }
 }
 
+function turnDecision(choice: string, probability = 0.85, confidence = 0.85): SpeakerDecisionChoice {
+  return {
+    choice,
+    probabilities: {
+      [choice]: probability,
+      no_clear_relation: Number(Math.max(0, 1 - probability).toFixed(4)),
+    },
+    confidence,
+  }
+}
+
 const CALL_AND_RESPONSE = [
   'Ruby looks at the doorway. "You are late."',
   '',
@@ -322,11 +338,7 @@ test('leaves an isolated low-confidence quotation to ordinary inheritance', () =
     paragraph_p0: confidentDecision(ruby),
     speech_s0: confidentDecision(ruby),
     paragraph_p1: confidentDecision('no_clear_identity'),
-    speech_s1: {
-      choice: ruby,
-      probabilities: { [ruby]: 0.45, no_clear_identity: 0.4, uncast_character: 0.15 },
-      confidence: 0.4,
-    },
+    speech_s1: confidentDecision('no_clear_identity'),
   }
 
   const assessment = assessSpeakerDiscourseEscalation(plan, answers)
@@ -343,6 +355,241 @@ test('leaves an isolated low-confidence quotation to ordinary inheritance', () =
     discourse: { assessment, answers: null, status: 'not-requested' },
   })
   assert.equal(segments.find(segment => segment.text === 'Where is the ledger?')?.speakerId, 'ruby')
+})
+
+test('chain decode fills a weak continuation instead of escalating it', () => {
+  const content = ['Ruby closes the door. "I am staying."', '', '"Where is the ledger?"'].join('\n')
+  const speakers = [{ id: 'ruby', name: 'Ruby' }, { id: 'vega', name: 'Vega' }]
+  const plan = buildSpeakerDecisionPlan(content, speakers, false)
+  const ruby = decisionOption(plan, 'ruby')
+  const answers = {
+    paragraph_p0: confidentDecision(ruby),
+    speech_s0: confidentDecision(ruby),
+    paragraph_p1: confidentDecision('no_clear_identity'),
+    speech_s1: {
+      choice: ruby,
+      probabilities: { [ruby]: 0.45, no_clear_identity: 0.35, uncast_character: 0.2 },
+      confidence: 0.4,
+    },
+    turn_s1: turnDecision('continues_previous_turn', 0.85, 0.85),
+  }
+
+  const chain = decodeSpeakerChain(plan, answers)
+  assert.equal(chain.get('s1')?.filled, true)
+  assert.equal(chain.get('s1')?.identity, 'ruby')
+
+  const assessment = assessSpeakerDiscourseEscalation(plan, answers)
+  assert.equal(assessment.plan, null)
+
+  const segments = resolveSpeakerDecisionSegments(content, plan, answers, speakers, {
+    isUserMessage: false,
+    cardSpeakerId: null,
+    historicalSpeakerId: null,
+    includeDebug: true,
+  })
+  const reply = segments.find(segment => segment.text === 'Where is the ledger?')
+  assert.equal(reply?.speakerId, 'ruby')
+  assert.ok(reply?.debugPath?.some(step => step.startsWith('chain-decode:filled-unresolved')))
+})
+
+test('chain decode switches speakers when the quotation responds to the previous one', () => {
+  const content = [
+    'Ruby closes the door. "I am staying."',
+    '',
+    '"Then I will wait outside."',
+    '',
+    'Vega leans against the frame. "Suit yourself."',
+  ].join('\n')
+  const speakers = [{ id: 'ruby', name: 'Ruby' }, { id: 'vega', name: 'Vega' }]
+  const plan = buildSpeakerDecisionPlan(content, speakers, false)
+  const ruby = decisionOption(plan, 'ruby')
+  const vega = decisionOption(plan, 'vega')
+  const answers = {
+    paragraph_p0: confidentDecision(ruby),
+    speech_s0: confidentDecision(ruby),
+    paragraph_p1: confidentDecision('no_clear_identity'),
+    speech_s1: {
+      choice: ruby,
+      probabilities: { [ruby]: 0.2, [vega]: 0.45, no_clear_identity: 0.35 },
+      confidence: 0.4,
+    },
+    turn_s1: turnDecision('responds_to_previous_speaker', 0.85, 0.85),
+    paragraph_p2: confidentDecision(vega),
+    speech_s2: confidentDecision(vega),
+    turn_s2: turnDecision('continues_previous_turn', 0.85, 0.85),
+  }
+
+  const chain = decodeSpeakerChain(plan, answers)
+  assert.equal(chain.get('s1')?.identity, 'vega')
+  assert.equal(chain.get('s1')?.filled, true)
+
+  const segments = resolveSpeakerDecisionSegments(content, plan, answers, speakers, {
+    isUserMessage: false,
+    cardSpeakerId: null,
+    historicalSpeakerId: null,
+  })
+  assert.equal(segments.find(segment => segment.text === 'Then I will wait outside.')?.speakerId, 'vega')
+})
+
+test('keeps upstream inheritance when the chain cannot confidently fill a span', () => {
+  const content = ['Ruby closes the door. "I am staying."', '', '"Where is the ledger?"'].join('\n')
+  const speakers = [{ id: 'ruby', name: 'Ruby' }, { id: 'vega', name: 'Vega' }]
+  const plan = buildSpeakerDecisionPlan(content, speakers, false)
+  const ruby = decisionOption(plan, 'ruby')
+  const vega = decisionOption(plan, 'vega')
+  const answers = {
+    paragraph_p0: confidentDecision(ruby),
+    speech_s0: confidentDecision(ruby),
+    paragraph_p1: confidentDecision('no_clear_identity'),
+    speech_s1: {
+      choice: ruby,
+      probabilities: { [ruby]: 0.1, [vega]: 0.1, no_clear_identity: 0.8 },
+      confidence: 0.5,
+    },
+    turn_s1: turnDecision('continues_previous_turn', 0.8, 0.8),
+  }
+
+  const chain = decodeSpeakerChain(plan, answers)
+  assert.equal(chain.get('s1')?.identity, null)
+  assert.equal(chain.get('s1')?.filled, false)
+  const segments = resolveSpeakerDecisionSegments(content, plan, answers, speakers, {
+    isUserMessage: false,
+    cardSpeakerId: null,
+    historicalSpeakerId: null,
+    includeDebug: true,
+  })
+  const reply = segments.find(segment => segment.text === 'Where is the ledger?')
+  assert.equal(reply?.speakerId, 'ruby')
+  assert.ok(reply?.debugPath?.some(step => step.startsWith('chain-decode:retained-unresolved')))
+})
+
+test('chain decode may override a clear answer when the chain strongly disagrees', () => {
+  const content = [
+    'Duncan covers the phone. "Hold on."',
+    '',
+    'Poppy laughs. "Tell me again."',
+    '',
+    'Duncan sighs. "Fine."',
+  ].join('\n')
+  const speakers = [{ id: 'poppy', name: 'Poppy' }, { id: 'duncan', name: 'Duncan' }]
+  const plan = buildSpeakerDecisionPlan(content, speakers, false)
+  const poppy = decisionOption(plan, 'poppy')
+  const duncan = decisionOption(plan, 'duncan')
+  // The first pass claims Duncan speaks the middle line, but both neighbours
+  // are Duncan and both relations say the line responds to the previous speaker.
+  const answers = {
+    paragraph_p0: confidentDecision(duncan),
+    speech_s0: confidentDecision(duncan),
+    paragraph_p1: confidentDecision('no_clear_identity'),
+    speech_s1: {
+      choice: duncan,
+      probabilities: { [duncan]: 0.55, [poppy]: 0.4, no_clear_identity: 0.05 },
+      confidence: 0.9,
+    },
+    turn_s1: turnDecision('responds_to_previous_speaker', 0.92, 0.9),
+    paragraph_p2: confidentDecision(duncan),
+    speech_s2: confidentDecision(duncan),
+    turn_s2: turnDecision('responds_to_previous_speaker', 0.9, 0.9),
+  }
+
+  const chain = decodeSpeakerChain(plan, answers)
+  assert.equal(chain.get('s1')?.directIdentity, 'duncan')
+  assert.equal(chain.get('s1')?.overrode, true)
+  assert.equal(chain.get('s1')?.identity, 'poppy')
+
+  const segments = resolveSpeakerDecisionSegments(content, plan, answers, speakers, {
+    isUserMessage: false,
+    cardSpeakerId: null,
+    historicalSpeakerId: null,
+    includeDebug: true,
+  })
+  const reply = segments.find(segment => segment.text === 'Tell me again.')
+  assert.equal(reply?.speakerId, 'poppy')
+  assert.ok(reply?.debugPath?.includes('resolution:chain-identity (overrode clear answer)'))
+})
+
+test('chain decode uses narrative attribution and refuses a downstream respondent', () => {
+  const content = [
+    'Poppy blurts, "Look at me."',
+    '',
+    '"Do you like it? Do you like how I look?"',
+    '',
+    '"Perfect," Duncan laughs. "An institution."',
+  ].join('\n')
+  const speakers = [
+    { id: 'poppy', name: 'Poppy' },
+    { id: 'duncan', name: 'Duncan' },
+    { id: 'ken', name: 'Ken' },
+  ]
+  const plan = buildSpeakerDecisionPlan(content, speakers, false)
+  const poppy = decisionOption(plan, 'poppy')
+  const duncan = decisionOption(plan, 'duncan')
+  const unclear = confidentDecision('no_clear_identity')
+  const answers = {
+    paragraph_p0: confidentDecision(poppy),
+    speech_s0: confidentDecision(poppy),
+    paragraph_p1: unclear,
+    speech_s1: {
+      choice: poppy,
+      probabilities: { [poppy]: 0.45, [duncan]: 0.35, no_clear_identity: 0.2 },
+      confidence: 0.4,
+    },
+    turn_s1: turnDecision('continues_previous_turn', 0.8, 0.85),
+    paragraph_p2: confidentDecision(duncan),
+    speech_s2: confidentDecision(duncan),
+    turn_s2: turnDecision('responds_to_previous_speaker', 0.8, 0.85),
+  }
+
+  const chain = decodeSpeakerChain(plan, answers)
+  assert.equal(chain.get('s0')?.narrativeAttribution, 'poppy')
+  assert.equal(chain.get('s1')?.narrativeAttribution, null)
+  assert.equal(chain.get('s1')?.identity, 'poppy')
+  assert.equal(chain.get('s2')?.narrativeAttribution, 'duncan')
+
+  const segments = resolveSpeakerDecisionSegments(content, plan, answers, speakers, {
+    isUserMessage: false,
+    cardSpeakerId: null,
+    historicalSpeakerId: null,
+  })
+  assert.equal(segments.find(segment => segment.text === 'Do you like it? Do you like how I look?')?.speakerId, 'poppy')
+  assert.equal(segments.find(segment => segment.text === 'Perfect,')?.speakerId, 'duncan')
+  assert.equal(segments.find(segment => segment.text === 'An institution.')?.speakerId, 'duncan')
+})
+
+
+test('extracts narrative context for spans and inter-quote bridges', () => {
+  const content = 'Poppy says, "Look at me." Duncan says, "I am."'
+  const plan = buildSpeakerDecisionPlan(content, [
+    { id: 'poppy', name: 'Poppy' },
+    { id: 'duncan', name: 'Duncan' },
+  ], false)
+  assert.equal(plan.state.speeches[0]?.narrativeBefore, 'Poppy says,')
+  assert.equal(plan.state.speeches[0]?.narrativeAfter, 'Duncan says,')
+  assert.equal(plan.state.speeches[1]?.narrativeBefore, 'Duncan says,')
+  assert.equal(plan.state.speeches[1]?.narrativeAfter, '')
+  assert.equal(plan.state.turns[0]?.bridge, 'Duncan says,')
+})
+
+test('drops turn questions and chain decoding when the first pass exceeds the question budget', () => {
+  const lines: string[] = []
+  for (let index = 0; index < 90; index += 1) {
+    lines.push(`Ruby says, "Line ${index}."`)
+    if (index < 89) lines.push('')
+  }
+  const content = lines.join('\n')
+  const plan = buildSpeakerDecisionPlan(content, [{ id: 'ruby', name: 'Ruby' }], false)
+  assert.equal(plan.state.speeches.length, 90)
+  assert.equal(plan.state.paragraphs.length, 90)
+  assert.equal(plan.state.turnQuestionsOmitted, true)
+  assert.deepEqual(plan.state.turns, [])
+  assert.equal(Object.keys(plan.questions).some(id => id.startsWith('turn_')), false)
+  assert.ok(Object.keys(plan.questions).length <= 256)
+
+  const ruby = decisionOption(plan, 'ruby')
+  const answers: Record<string, SpeakerDecisionChoice> = {}
+  for (const paragraph of plan.state.paragraphs) answers[`paragraph_${paragraph.id}`] = confidentDecision(ruby)
+  for (const speech of plan.state.speeches) answers[`speech_${speech.id}`] = confidentDecision(ruby)
+  assert.equal(decodeSpeakerChain(plan, answers).size, 0)
 })
 
 test('reviews an ambiguous opening run before its later attribution', () => {
