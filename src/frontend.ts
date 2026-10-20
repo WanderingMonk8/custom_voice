@@ -1691,6 +1691,9 @@ export function setup(ctx: SpindleFrontendContext) {
     if (narrativeAttributions > 0) {
       lines.push(`Narrative cues: ${narrativeAttributions} unambiguous attributions`)
     }
+    const cardDeference = speakerDebugLine(steps, 'card-deference:')
+      ?.slice('card-deference:'.length).trim()
+    if (cardDeference) lines.push(`Card deference: ${cardDeference}`)
     const request = speakerDebugLine(steps, 'discourse-request:')
       ?.slice('discourse-request:'.length).trim()
     const escalated = steps.includes('discourse-decision:escalated')

@@ -71,6 +71,10 @@ Lumiverse to resolve the account's default Decision connection.
   per-span identity probabilities.
 - **Chain decode**: a deterministic joint assignment over a dialogue run that
   combines identity probabilities, turn relations, and explicit attributions.
+- **Card-blocking identity**: a speech-level identity whose probability, Jev
+  confidence, and winner margin clear the card-block thresholds, or an explicit
+  anonymous-role, indefinite-human, or unnamed-turn cue, or a named alternative
+  speaker. Card deference is eligible only when none is present.
 
 ## Pipeline
 
@@ -329,13 +333,15 @@ and discourse answer is available.
    identity within the current message, stopping at a conflicting clear identity.
 5. An ambiguous opening run may inherit the last clear previous-assistant
    identity until the first clear current-message identity appears.
-6. Card-title deference is eligible when the complete current assistant message
-   contains no clear known identity and the title matches exactly one configured
-   NPC. A clear uncast identity blocks deference only when the text also carries
-   an explicit anonymous-role cue (“the clerk,” “a stranger”), an indefinite
-   human introduction (“an older woman”), or an unnamed-turn cue. A pronoun-only
-   message whose only identities are uncast — or a definite “the woman”/“the
-   man” — therefore defers to the unique card.
+6. Card-title deference is eligible when the title matches exactly one configured
+   NPC and no speech-level identity (direct, chain, or discourse) clears the
+   card-block thresholds: probability, Jev confidence, and winner margin. A
+   single weak guess therefore does not veto the fallback for the whole message.
+   Deference is also blocked by an explicit anonymous-role cue, an indefinite
+   human introduction, an unnamed-turn cue, or a named alternative speaker.
+   Narration that merely names or describes the card is context, not a competing
+   identity. The card-block thresholds are constants in the resolver and are
+   versioned in the cache.
 7. When no unique card match exists and the message has no local clear identity,
    the previous-assistant identity rule remains available.
 8. Remaining unresolved assistant speech uses the TTS connection default.
@@ -345,10 +351,11 @@ The chain decode is the primary inheritance mechanism. Rules 3 and 4 remain as
 conservative fallbacks for spans the chain could not decide.
 
 All non-speech text remains narrator audio. A clear uncast result counts as an
-identity for inheritance. It disables card-title deference only when the text
-also names or implies another person through an explicit anonymous role, an
-indefinite human introduction, or an unnamed turn; otherwise the unique card
-owns the message and the connection default is not used.
+identity for inheritance. It blocks card-title deference only when it clears the
+card-block thresholds or the text names or implies another person through an
+explicit anonymous role, an indefinite human introduction, or an unnamed turn.
+Otherwise a weak uncast guess leaves the unique card in control and the
+connection default is not used.
 
 ### 7. Voice routing
 
@@ -377,6 +384,7 @@ Cache final assignments per message. The cache hash includes:
 - first- and second-pass confidence-threshold versions;
 - turn-relation question and chain-decoder schema versions;
 - chain acceptance and chain override threshold versions;
+- card-block threshold version;
 - narrative-context extraction schema version;
 - discourse-run detection and hard-boundary schema versions.
 
@@ -444,6 +452,8 @@ When speaker debug logging is enabled, each speech span records:
   or was rejected;
 - whether a later attribution participated in the chain;
 - upstream or previous-message inheritance;
+- the strongest speech identity strength and whether card deference was blocked
+  by thresholds, an explicit cue, or a named alternative speaker;
 - whether card-title deference was eligible and why;
 - final speaker ID and voice route;
 - cache, compatibility fallback, or Decision error status.
@@ -479,9 +489,11 @@ that merely routes to the same connection-default voice.
     grammatical rules separately after the Jev path is stable.
 11. Add paired fixtures for card deference: a pronoun-only message — or one that
     uses only a definite “the woman”/“the man” — whose identities are uncast and
-    whose title matches one card must route to that card. The same message with
-    an explicit “stranger,” “another voice,” or “an older woman” must stay on the
-    connection default.
+    whose title matches one card must route to that card when the uncast guesses
+    stay below the card-block thresholds. A strong uncast identity, an explicit
+    “stranger,” “another voice,” or “an older woman” must stay on the connection
+    default. Similes such as “like a person who has decided” must not count as
+    anonymous cues.
 
 ## Security and privacy
 

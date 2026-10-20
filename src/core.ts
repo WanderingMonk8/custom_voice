@@ -1410,17 +1410,6 @@ const ANONYMOUS_ROLE_IDENTITY_PATTERN = new RegExp(
   'iu',
 )
 
-/**
- * An indefinite human introduction such as "an older woman" or "a kid with a
- * bag". A definite "the woman" is ambiguous and may be the card, so it is not
- * treated as a cue by itself.
- */
-const ANONYMOUS_INDEFINITE_HUMAN_PATTERN = new RegExp(
-  `\\b(?:a|an|another|some)\\s+(?:[\\p{L}\\p{M}'’-]+[ -]){0,5}`
-    + `(?:${ANONYMOUS_HUMAN_NOUNS.join('|')})\\b`,
-  'iu',
-)
-
 /** Detect a clause-leading, explicitly anonymous person such as "an older woman". */
 function hasAnonymousHumanSubject(text: string): boolean {
   return ANONYMOUS_HUMAN_SUBJECT_PATTERN.test(narrativeOnly(text))
@@ -2110,7 +2099,7 @@ export const SPEAKER_DECISION_THRESHOLDS: Record<'local' | 'discourse' | 'overri
   override: { probability: 0.7, confidence: 0.65, margin: 0.25 },
 }
 
-/** Bump a version whenever that stage changes the output stored in the cache. */
+/** Bump a version whenever a stage changes the output stored in the cache. */
 export const SPEAKER_DECISION_SCHEMA = {
   classifier: 'jev-3',
   discourse: 'discourse-1',
@@ -2124,7 +2113,18 @@ export const SPEAKER_DECISION_SCHEMA = {
     override: 'discourse-override-thresholds-1',
     chain: 'chain-thresholds-1',
     chainOverride: 'chain-override-thresholds-1',
+    card: 'card-thresholds-1',
   },
+} as const
+
+/**
+ * A card-title match may own a message only when no identity clears these
+ * thresholds. One weak guess must not block the fallback for the whole message.
+ */
+export const SPEAKER_CARD_THRESHOLDS = {
+  probability: 0.65,
+  confidence: 0.6,
+  margin: 0.25,
 } as const
 
 export interface SpeakerDecisionEvaluation {
@@ -2970,6 +2970,10 @@ export interface SpeakerChainDecision {
   identity: string | null
   /** Best-path identity before acceptance and override gates. */
   decodedIdentity: string | null
+  /** Probability of the decoded identity in its speech answer. */
+  identityProbability: number
+  /** Jev confidence of the speech answer behind the decoded identity. */
+  identityConfidence: number
   directIdentity: string | null
   changed: boolean
   filled: boolean
@@ -3224,6 +3228,8 @@ export function decodeSpeakerChain(
         speechId,
         identity,
         decodedIdentity: decoded,
+        identityProbability: probability,
+        identityConfidence: evaluation.confidence,
         directIdentity: direct,
         changed: identity !== direct,
         filled,
@@ -3266,7 +3272,7 @@ function hasExplicitUncastCue(content: string, skippedTrackerTagPairs = ''): boo
   const playbackContent = preparePlaybackContent(content, skippedTrackerTagPairs)
   const narration = cleanPlaybackText(narrativeOnly(playbackContent))
   return ANONYMOUS_ROLE_IDENTITY_PATTERN.test(narration)
-    || ANONYMOUS_INDEFINITE_HUMAN_PATTERN.test(narration)
+    || hasAnonymousHumanSubject(narration)
     || SPEAKER_TURN_SWITCH_PATTERN.test(narration)
 }
 
@@ -3329,17 +3335,65 @@ export function resolveSpeakerDecisionSegments(
   })
   const hasLocalIdentity = [...paragraphIdentities.values(), ...speechIdentities]
     .some(identity => identity !== undefined)
-  const hasKnownIdentity = [...paragraphIdentities.values(), ...speechIdentities]
-    .some(identity => identity !== undefined && identity !== UNCAST_SPEAKER_ID)
   const hasUncastIdentity = [...paragraphIdentities.values(), ...speechIdentities]
     .some(identity => identity === UNCAST_SPEAKER_ID)
   const explicitUncastCue = hasExplicitUncastCue(content, options.skippedTrackerTagPairs ?? '')
-  // A whole-message uncast guess should not outrank a unique card when nothing
-  // in the text names or describes another person. An explicit anonymous role
-  // ("the clerk", "a stranger") or an unnamed turn keeps the default voice.
+  const alternativeSpeakers = plan.state.speakers
+    .filter(speaker => speaker.id !== options.cardSpeakerId)
+    .map(speaker => ({ id: speaker.id, name: speaker.name }))
+  const namedAlternative = alternativeSpeakers.length > 0
+    && hasNamedSpeakerSubject(content, alternativeSpeakers, options.skippedTrackerTagPairs ?? '')
+  const speechEvaluations = new Map(plan.state.speeches.map(speech => [
+    speech.id,
+    evaluateSpeakerDecisionAnswer(answers[`speech_${speech.id}`], plan.optionSpeakerIds),
+  ]))
+  const clearsCardThresholds = (evaluation: SpeakerDecisionEvaluation): boolean => (
+    evaluation.identity !== null
+    && evaluation.choiceProbability >= SPEAKER_CARD_THRESHOLDS.probability
+    && evaluation.confidence >= SPEAKER_CARD_THRESHOLDS.confidence
+    && evaluation.margin >= SPEAKER_CARD_THRESHOLDS.margin
+  )
+  const identityStrengths: number[] = []
+  let hasStrongIdentity = false
+  for (const evaluation of speechEvaluations.values()) {
+    if (evaluation.identity === null) continue
+    identityStrengths.push(Math.min(evaluation.choiceProbability, evaluation.confidence))
+    if (clearsCardThresholds(evaluation)) hasStrongIdentity = true
+  }
+  for (const decision of chain.values()) {
+    if (decision.identity === null) continue
+    identityStrengths.push(Math.min(decision.identityProbability, decision.identityConfidence))
+    if (decision.overrode || (
+      decision.identityProbability >= SPEAKER_CARD_THRESHOLDS.probability
+      && decision.identityConfidence >= SPEAKER_CARD_THRESHOLDS.confidence
+    )) {
+      hasStrongIdentity = true
+    }
+  }
+  for (const outcome of discourseOutcomes.values()) {
+    if (!outcome.applied || outcome.identity === null) continue
+    identityStrengths.push(Math.min(outcome.evaluation.choiceProbability, outcome.evaluation.confidence))
+    if (outcome.reason === 'overrode-conflict' || clearsCardThresholds(outcome.evaluation)) {
+      hasStrongIdentity = true
+    }
+  }
+  const maxIdentityStrength = identityStrengths.length > 0 ? Math.max(...identityStrengths) : 0
+  const cardBlockDescription = `p>=${SPEAKER_CARD_THRESHOLDS.probability}`
+    + `,c>=${SPEAKER_CARD_THRESHOLDS.confidence}`
+    + `,m>=${SPEAKER_CARD_THRESHOLDS.margin}`
+  const cardReason = explicitUncastCue
+    ? 'explicit anonymous role or unnamed turn in narration'
+    : namedAlternative
+      ? 'narration names another known speaker'
+      : hasStrongIdentity
+        ? `an identity cleared ${cardBlockDescription}`
+        : `no identity cleared ${cardBlockDescription} (max strength ${maxIdentityStrength.toFixed(2)})`
+  // A card-title match owns a message only when no speech identity is strong
+  // enough to contest it. One weak guess must not veto the fallback.
   const cardIdentity = options.cardSpeakerId
-    && !hasKnownIdentity
-    && (!hasUncastIdentity || !explicitUncastCue)
+    && !explicitUncastCue
+    && !namedAlternative
+    && !hasStrongIdentity
     ? options.cardSpeakerId
     : null
   const deferredUncast = Boolean(cardIdentity && hasUncastIdentity)
@@ -3444,6 +3498,9 @@ export function resolveSpeakerDecisionSegments(
           ...decisionAnswerDebug('jev-speech', answer, plan.optionSpeakerIds),
           ...decisionAnswerDebug(`jev-${speech?.paragraphId ?? 'paragraph'}`, paragraphAnswer, plan.optionSpeakerIds),
           `jev-local-thresholds:${describeDecisionThresholds(SPEAKER_DECISION_THRESHOLDS.local)}`,
+          ...(index === 0
+            ? [`card-deference:${cardIdentity ? 'eligible' : 'blocked'} (${cardReason})`]
+            : []),
           ...(index === 0 && plan.state.turnQuestionsOmitted
             ? ['jev-turn-questions:omitted (first-pass question budget)']
             : []),

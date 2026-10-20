@@ -861,16 +861,20 @@ test('defers a whole-message uncast identity to the unique card', () => {
   ].join('\n')
   const speakers = [{ id: 'jayden', name: 'Jayden Flynn / Jayden' }]
   const plan = buildSpeakerDecisionPlan(content, speakers, false)
-  const uncast = confidentDecision('uncast_character')
+  const weakUncast = {
+    choice: 'uncast_character',
+    probabilities: { uncast_character: 0.69, no_clear_identity: 0.2, known_0: 0.11 },
+    confidence: 0.53,
+  }
   const answers = {
-    paragraph_p0: uncast,
+    paragraph_p0: weakUncast,
     speech_s0: {
       choice: 'uncast_character',
       probabilities: { uncast_character: 0.55, known_0: 0.1, no_clear_identity: 0.35 },
       confidence: 0.4,
     },
-    paragraph_p1: uncast,
-    speech_s1: uncast,
+    paragraph_p1: weakUncast,
+    speech_s1: weakUncast,
   }
 
   const chain = decodeSpeakerChain(plan, answers)
@@ -891,6 +895,36 @@ test('defers a whole-message uncast identity to the unique card', () => {
   assert.ok(spoken[0]?.debugPath?.includes(
     'resolution:unique card-title match (uncast identity had no explicit role cue)',
   ))
+})
+
+test('a strong uncast identity blocks card deference', () => {
+  const content = [
+    'She turns on the sidewalk. "That is a hand-kiss. In public."',
+    '',
+    '"And the cardigan. Look at you."',
+  ].join('\n')
+  const speakers = [{ id: 'jayden', name: 'Jayden Flynn / Jayden' }]
+  const plan = buildSpeakerDecisionPlan(content, speakers, false)
+  const uncast = confidentDecision('uncast_character')
+  const answers = {
+    paragraph_p0: uncast,
+    speech_s0: uncast,
+    paragraph_p1: uncast,
+    speech_s1: uncast,
+  }
+
+  const segments = resolveSpeakerDecisionSegments(content, plan, answers, speakers, {
+    isUserMessage: false,
+    cardSpeakerId: 'jayden',
+    historicalSpeakerId: null,
+    includeDebug: true,
+  })
+  const spoken = segments.filter(segment => [
+    'That is a hand-kiss. In public.',
+    'And the cardigan. Look at you.',
+  ].includes(segment.text))
+  assert.deepEqual(spoken.map(segment => segment.speakerId), [UNCAST_SPEAKER_ID, UNCAST_SPEAKER_ID])
+  assert.ok(spoken[0]?.debugPath?.some(step => step.startsWith('card-deference:blocked')))
 })
 
 test('splits dialogue runs at time jumps instead of inferring across scenes', () => {
@@ -1424,6 +1458,14 @@ test('treats definite human descriptors as card-friendly but indefinite ones as 
   assert.equal(
     eligibleCardFallbackSpeakerId('The clerk waits. "Still here."', 'naomi', speakers),
     null,
+  )
+  assert.equal(
+    eligibleCardFallbackSpeakerId(
+      'She steps back and waits, chin up, feet planted like a person who has decided. "Still here."',
+      'naomi',
+      speakers,
+    ),
+    'naomi',
   )
 })
 

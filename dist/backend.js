@@ -789,10 +789,6 @@ var ANONYMOUS_ROLE_IDENTITY_PATTERN = new RegExp(
   `\\b(?:a|an|another|some|the)\\s+(?:[\\p{L}\\p{M}'\u2019-]+[ -]){0,5}(?:${ANONYMOUS_ROLE_NOUNS.join("|")})\\b`,
   "iu"
 );
-var ANONYMOUS_INDEFINITE_HUMAN_PATTERN = new RegExp(
-  `\\b(?:a|an|another|some)\\s+(?:[\\p{L}\\p{M}'\u2019-]+[ -]){0,5}(?:${ANONYMOUS_HUMAN_NOUNS.join("|")})\\b`,
-  "iu"
-);
 function hasAnonymousHumanSubject(text) {
   return ANONYMOUS_HUMAN_SUBJECT_PATTERN.test(narrativeOnly(text));
 }
@@ -1260,8 +1256,14 @@ var SPEAKER_DECISION_SCHEMA = {
     discourse: "discourse-thresholds-1",
     override: "discourse-override-thresholds-1",
     chain: "chain-thresholds-1",
-    chainOverride: "chain-override-thresholds-1"
+    chainOverride: "chain-override-thresholds-1",
+    card: "card-thresholds-1"
   }
+};
+var SPEAKER_CARD_THRESHOLDS = {
+  probability: 0.65,
+  confidence: 0.6,
+  margin: 0.25
 };
 function decisionIdentity(option, optionSpeakerIds) {
   if (option === DECISION_UNCAST_OPTION) return UNCAST_SPEAKER_ID;
@@ -1994,6 +1996,8 @@ function decodeSpeakerChain(plan, answers) {
         speechId,
         identity,
         decodedIdentity: decoded,
+        identityProbability: probability,
+        identityConfidence: evaluation.confidence,
         directIdentity: direct,
         changed: identity !== direct,
         filled,
@@ -2026,7 +2030,7 @@ function decodeSpeakerChain(plan, answers) {
 function hasExplicitUncastCue(content, skippedTrackerTagPairs = "") {
   const playbackContent = preparePlaybackContent(content, skippedTrackerTagPairs);
   const narration = cleanPlaybackText(narrativeOnly(playbackContent));
-  return ANONYMOUS_ROLE_IDENTITY_PATTERN.test(narration) || ANONYMOUS_INDEFINITE_HUMAN_PATTERN.test(narration) || SPEAKER_TURN_SWITCH_PATTERN.test(narration);
+  return ANONYMOUS_ROLE_IDENTITY_PATTERN.test(narration) || hasAnonymousHumanSubject(narration) || SPEAKER_TURN_SWITCH_PATTERN.test(narration);
 }
 function resolveSpeakerDecisionSegments(content, plan, answers, speakers, options) {
   const paragraphIdentities = new Map(plan.state.paragraphs.map((paragraph) => [
@@ -2057,10 +2061,40 @@ function resolveSpeakerDecisionSegments(content, plan, answers, speakers, option
     return outcome.identity ?? void 0;
   });
   const hasLocalIdentity = [...paragraphIdentities.values(), ...speechIdentities].some((identity) => identity !== void 0);
-  const hasKnownIdentity = [...paragraphIdentities.values(), ...speechIdentities].some((identity) => identity !== void 0 && identity !== UNCAST_SPEAKER_ID);
   const hasUncastIdentity = [...paragraphIdentities.values(), ...speechIdentities].some((identity) => identity === UNCAST_SPEAKER_ID);
   const explicitUncastCue = hasExplicitUncastCue(content, options.skippedTrackerTagPairs ?? "");
-  const cardIdentity = options.cardSpeakerId && !hasKnownIdentity && (!hasUncastIdentity || !explicitUncastCue) ? options.cardSpeakerId : null;
+  const alternativeSpeakers = plan.state.speakers.filter((speaker) => speaker.id !== options.cardSpeakerId).map((speaker) => ({ id: speaker.id, name: speaker.name }));
+  const namedAlternative = alternativeSpeakers.length > 0 && hasNamedSpeakerSubject(content, alternativeSpeakers, options.skippedTrackerTagPairs ?? "");
+  const speechEvaluations = new Map(plan.state.speeches.map((speech) => [
+    speech.id,
+    evaluateSpeakerDecisionAnswer(answers[`speech_${speech.id}`], plan.optionSpeakerIds)
+  ]));
+  const clearsCardThresholds = (evaluation) => evaluation.identity !== null && evaluation.choiceProbability >= SPEAKER_CARD_THRESHOLDS.probability && evaluation.confidence >= SPEAKER_CARD_THRESHOLDS.confidence && evaluation.margin >= SPEAKER_CARD_THRESHOLDS.margin;
+  const identityStrengths = [];
+  let hasStrongIdentity = false;
+  for (const evaluation of speechEvaluations.values()) {
+    if (evaluation.identity === null) continue;
+    identityStrengths.push(Math.min(evaluation.choiceProbability, evaluation.confidence));
+    if (clearsCardThresholds(evaluation)) hasStrongIdentity = true;
+  }
+  for (const decision of chain.values()) {
+    if (decision.identity === null) continue;
+    identityStrengths.push(Math.min(decision.identityProbability, decision.identityConfidence));
+    if (decision.overrode || decision.identityProbability >= SPEAKER_CARD_THRESHOLDS.probability && decision.identityConfidence >= SPEAKER_CARD_THRESHOLDS.confidence) {
+      hasStrongIdentity = true;
+    }
+  }
+  for (const outcome of discourseOutcomes.values()) {
+    if (!outcome.applied || outcome.identity === null) continue;
+    identityStrengths.push(Math.min(outcome.evaluation.choiceProbability, outcome.evaluation.confidence));
+    if (outcome.reason === "overrode-conflict" || clearsCardThresholds(outcome.evaluation)) {
+      hasStrongIdentity = true;
+    }
+  }
+  const maxIdentityStrength = identityStrengths.length > 0 ? Math.max(...identityStrengths) : 0;
+  const cardBlockDescription = `p>=${SPEAKER_CARD_THRESHOLDS.probability},c>=${SPEAKER_CARD_THRESHOLDS.confidence},m>=${SPEAKER_CARD_THRESHOLDS.margin}`;
+  const cardReason = explicitUncastCue ? "explicit anonymous role or unnamed turn in narration" : namedAlternative ? "narration names another known speaker" : hasStrongIdentity ? `an identity cleared ${cardBlockDescription}` : `no identity cleared ${cardBlockDescription} (max strength ${maxIdentityStrength.toFixed(2)})`;
+  const cardIdentity = options.cardSpeakerId && !explicitUncastCue && !namedAlternative && !hasStrongIdentity ? options.cardSpeakerId : null;
   const deferredUncast = Boolean(cardIdentity && hasUncastIdentity);
   const routingIdentity = (identity) => {
     if (identity === void 0 || identity === null) return void 0;
@@ -2145,6 +2179,7 @@ function resolveSpeakerDecisionSegments(content, plan, answers, speakers, option
           ...decisionAnswerDebug("jev-speech", answer, plan.optionSpeakerIds),
           ...decisionAnswerDebug(`jev-${speech?.paragraphId ?? "paragraph"}`, paragraphAnswer, plan.optionSpeakerIds),
           `jev-local-thresholds:${describeDecisionThresholds(SPEAKER_DECISION_THRESHOLDS.local)}`,
+          ...index === 0 ? [`card-deference:${cardIdentity ? "eligible" : "blocked"} (${cardReason})`] : [],
           ...index === 0 && plan.state.turnQuestionsOmitted ? ["jev-turn-questions:omitted (first-pass question budget)"] : [],
           ...relationAnswerDebug(turn, speech ? answers[`turn_${speech.id}`] : void 0),
           ...chainSpeechDebug(chainDecision, speech?.paragraphId),

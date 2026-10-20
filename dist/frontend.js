@@ -692,10 +692,6 @@ var ANONYMOUS_ROLE_IDENTITY_PATTERN = new RegExp(
   `\\b(?:a|an|another|some|the)\\s+(?:[\\p{L}\\p{M}'\u2019-]+[ -]){0,5}(?:${ANONYMOUS_ROLE_NOUNS.join("|")})\\b`,
   "iu"
 );
-var ANONYMOUS_INDEFINITE_HUMAN_PATTERN = new RegExp(
-  `\\b(?:a|an|another|some)\\s+(?:[\\p{L}\\p{M}'\u2019-]+[ -]){0,5}(?:${ANONYMOUS_HUMAN_NOUNS.join("|")})\\b`,
-  "iu"
-);
 function hasAnonymousHumanSubject(text) {
   return ANONYMOUS_HUMAN_SUBJECT_PATTERN.test(narrativeOnly(text));
 }
@@ -1031,7 +1027,7 @@ var NARRATIVE_SPEECH_VERB_PATTERN = new RegExp(
 function hasExplicitUncastCue(content, skippedTrackerTagPairs = "") {
   const playbackContent = preparePlaybackContent(content, skippedTrackerTagPairs);
   const narration = cleanPlaybackText(narrativeOnly(playbackContent));
-  return ANONYMOUS_ROLE_IDENTITY_PATTERN.test(narration) || ANONYMOUS_INDEFINITE_HUMAN_PATTERN.test(narration) || SPEAKER_TURN_SWITCH_PATTERN.test(narration);
+  return ANONYMOUS_ROLE_IDENTITY_PATTERN.test(narration) || hasAnonymousHumanSubject(narration) || SPEAKER_TURN_SWITCH_PATTERN.test(narration);
 }
 function parseRosterVoiceSegmentsInternal(content, defaultSpeakerId, speakers, skippedTrackerTagPairs = "", quoteSpeakerOverrides, historicalSpeakerId = null, preserveLocalOnNullOverride = false, lowConfidenceQuoteIndexes, includeDebug = false) {
   const playbackContent = preparePlaybackContent(content, skippedTrackerTagPairs);
@@ -2451,6 +2447,8 @@ function setup(ctx) {
     if (narrativeAttributions > 0) {
       lines.push(`Narrative cues: ${narrativeAttributions} unambiguous attributions`);
     }
+    const cardDeference = speakerDebugLine(steps, "card-deference:")?.slice("card-deference:".length).trim();
+    if (cardDeference) lines.push(`Card deference: ${cardDeference}`);
     const request = speakerDebugLine(steps, "discourse-request:")?.slice("discourse-request:".length).trim();
     const escalated = steps.includes("discourse-decision:escalated");
     const runIds = [...new Set(steps.filter((step) => step.startsWith("discourse-run:")).map((step) => step.slice("discourse-run:".length).split(" ")[0] ?? "").filter((runId) => runId.length > 0))];
