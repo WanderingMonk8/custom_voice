@@ -506,6 +506,37 @@ test('routes dialogue anchored to an anonymous local character through the conne
   assert.equal(playbackVoiceForSpeaker(UNCAST_SPEAKER_ID, false, { mira: 'mira-voice' }, '', ''), '')
 })
 
+test('keeps a definite anonymous role on the default voice across attribution and pronoun beats', () => {
+  const content = [
+    '"You\'re the piano guy." The clerk — older, reading glasses on a chain, sorting envelopes without looking up — said it to fill the space. "No wait. You\'re the one who never gets packages."',
+    '',
+    'She pulled a stack of flyers from the box and set it on the counter. "Campus things. Meetings. Somebody\'s garage band."',
+    '',
+    'The clerk had gone back to her sorting. "Anything else today, piano guy?"',
+    '',
+    '"No. That\'s everything."',
+  ].join('\n')
+  const segments = parseRosterVoiceSegments(
+    content,
+    'naomi',
+    [{ id: 'naomi', name: 'Naomi Lin / Naomi' }],
+    '',
+    'naomi',
+    true,
+  ).filter(segment => segment.speakerId !== null)
+
+  assert.deepEqual(segments.map(segment => segment.speakerId), [
+    UNCAST_SPEAKER_ID,
+    UNCAST_SPEAKER_ID,
+    UNCAST_SPEAKER_ID,
+    UNCAST_SPEAKER_ID,
+    'naomi',
+  ])
+  assert.ok(segments[0].debugPath?.includes(`anonymous-downstream-attribution:${UNCAST_SPEAKER_ID}`))
+  assert.ok(segments[2].debugPath?.includes(`anonymous-pronoun-continuation:${UNCAST_SPEAKER_ID}`))
+  assert.ok(segments[3].debugPath?.includes(`anonymous-local-subject:${UNCAST_SPEAKER_ID}`))
+})
+
 test('preserves the user role when reviewed unnamed user dialogue selects an NPC', () => {
   const local = parseRosterVoiceSegments(
     'I set down the mug.\n\n"This is mine."',

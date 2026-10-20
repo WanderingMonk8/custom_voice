@@ -1330,22 +1330,40 @@ function unambiguousNarrativeSpeaker(text: string, speakers: CharacterLike[]): s
   return null
 }
 
+const ANONYMOUS_ROLE_NOUNS = [
+  'cashier', 'clerk', 'customer', 'driver', 'employee', 'guard', 'passerby',
+  'server', 'shopkeeper', 'staffer', 'stranger', 'waiter', 'waitress', 'worker',
+] as const
+
 const ANONYMOUS_HUMAN_NOUNS = [
-  'boy', 'cashier', 'child', 'clerk', 'customer', 'driver', 'employee', 'girl',
-  'guard', 'guy', 'kid', 'lady', 'man', 'passerby', 'person', 'server',
-  'shopkeeper', 'staffer', 'stranger', 'teen', 'teenager', 'waiter', 'waitress',
-  'woman', 'worker',
+  ...ANONYMOUS_ROLE_NOUNS,
+  'boy', 'child', 'girl', 'guy', 'kid', 'lady', 'man', 'person', 'teen',
+  'teenager', 'woman',
 ] as const
 
 const ANONYMOUS_HUMAN_SUBJECT_PATTERN = new RegExp(
-  `(?:^|[.!?;]\\s+|^[^,\\n]{1,120},\\s*)(?:a|an|another|some)\\s+`
-    + `(?:[\\p{L}\\p{M}'’-]+[ -]){0,5}(?:${ANONYMOUS_HUMAN_NOUNS.join('|')})\\b`,
+  `(?:^\\s*|[.!?;]\\s+|^\\s*[^,\\n]{1,120},\\s*)(?:`
+    + `(?:a|an|another|some)\\s+(?:[\\p{L}\\p{M}'’-]+[ -]){0,5}`
+      + `(?:${ANONYMOUS_HUMAN_NOUNS.join('|')})`
+    + `|the\\s+(?:[\\p{L}\\p{M}'’-]+[ -]){0,5}`
+      + `(?:${ANONYMOUS_ROLE_NOUNS.join('|')})`
+    + `)\\b`,
   'iu',
 )
 
 /** Detect a clause-leading, explicitly anonymous person such as "an older woman". */
 function hasAnonymousHumanSubject(text: string): boolean {
   return ANONYMOUS_HUMAN_SUBJECT_PATTERN.test(narrativeOnly(text))
+}
+
+function hasAnonymousSpeechAttribution(text: string): boolean {
+  const narrative = narrativeOnly(text)
+  return hasAnonymousHumanSubject(narrative)
+    && new RegExp(`\\b${SPEECH_VERBS}\\b`, 'iu').test(narrative)
+}
+
+function hasLeadingPronounSubject(text: string): boolean {
+  return /^(?:he|she|they)\b/iu.test(narrativeOnly(text).trimStart())
 }
 
 /** Whether playable narration establishes any available character as a clause subject. */
@@ -1917,6 +1935,14 @@ function parseRosterVoiceSegmentsInternal(
       const currentNarrativePrefix = currentParagraph
         ? currentParagraph.text.slice(0, Math.max(0, quote.start - currentParagraph.start))
         : ''
+      const nextQuote = quotes[currentQuoteIndex + 1]
+      const downstreamNarrationEnd = currentParagraph
+        ? Math.min(
+            currentParagraph.end,
+            nextQuote && nextQuote.start < currentParagraph.end ? nextQuote.start : currentParagraph.end,
+          )
+        : quote.end
+      const immediateDownstreamNarration = playbackContent.slice(quote.end, downstreamNarrationEnd)
       const anonymousLocalSpeakerId = (inference.source === 'history' || inference.source === 'fallback')
         && paragraphSpeakers[paragraphIndex] === null
         && (
@@ -1930,9 +1956,22 @@ function parseRosterVoiceSegmentsInternal(
         )
         ? UNCAST_SPEAKER_ID
         : null
+      const anonymousDownstreamSpeakerId = (inference.source === 'history' || inference.source === 'fallback')
+        && paragraphSpeakers[paragraphIndex] === null
+        && hasAnonymousSpeechAttribution(immediateDownstreamNarration)
+        ? UNCAST_SPEAKER_ID
+        : null
+      const anonymousPronounContinuationId: string | null = (inference.source === 'history' || inference.source === 'fallback')
+        && paragraphSpeakers[paragraphIndex] === null
+        && lastAssignedSpeakerId === UNCAST_SPEAKER_ID
+        && hasLeadingPronounSubject(currentNarrativePrefix)
+        ? UNCAST_SPEAKER_ID
+        : null
       const currentEvidenceSpeakerId = paragraphSpeakers[paragraphIndex]
         ?? frontedPossessiveSpeakerId
         ?? anonymousLocalSpeakerId
+        ?? anonymousDownstreamSpeakerId
+        ?? anonymousPronounContinuationId
         ?? (inference.confident ? inference.speakerId : null)
       if (
         historicalPrefixActive
@@ -1941,6 +1980,8 @@ function parseRosterVoiceSegmentsInternal(
           || inference.source === 'paragraph'
           || frontedPossessiveSpeakerId !== null
           || anonymousLocalSpeakerId !== null
+          || anonymousDownstreamSpeakerId !== null
+          || anonymousPronounContinuationId !== null
           || (paragraphSpeakers[paragraphIndex] !== null
             && currentEvidenceSpeakerId !== historicalSpeakerId)
         )
@@ -1974,6 +2015,8 @@ function parseRosterVoiceSegmentsInternal(
         ['preceding-narrative-voice-subject', adjacentNarrativeVoiceSpeakerId],
         ['fronted-prepositional-possessive-subject', frontedPossessiveSpeakerId],
         ['anonymous-local-subject', anonymousLocalSpeakerId],
+        ['anonymous-downstream-attribution', anonymousDownstreamSpeakerId],
+        ['anonymous-pronoun-continuation', anonymousPronounContinuationId],
         ['downstream-reply', downstreamReplies.get(paragraphIndex) ?? null],
         ['speaker-continuation', continuedSpeakerId],
         ['dialogue-turn-alternation', inferredTurnSpeakerId],
@@ -1983,10 +2026,12 @@ function parseRosterVoiceSegmentsInternal(
       ]
       const selectedLocalCandidate = localCandidates.find(([, speakerId]) => speakerId !== null)
       const localSpeakerId: string | null = selectedLocalCandidate?.[1] ?? null
-      const confidentLocalSpeakerId = paragraphSpeakers[paragraphIndex]
+      const confidentLocalSpeakerId: string | null = paragraphSpeakers[paragraphIndex]
         ?? adjacentNarrativeEvidenceId
         ?? frontedPossessiveSpeakerId
         ?? anonymousLocalSpeakerId
+        ?? anonymousDownstreamSpeakerId
+        ?? anonymousPronounContinuationId
         ?? (inference.source === 'explicit' || inference.source === 'paragraph'
           ? inference.speakerId
           : null)
