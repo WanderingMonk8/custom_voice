@@ -2,7 +2,7 @@
 
 ## Status
 
-Design proposal for the `jev` branch. This document precedes implementation.
+Implemented on the `jev` branch. The initial design was committed before implementation.
 
 ## Objective
 
@@ -188,8 +188,9 @@ does not add retries to the playback critical path. On failure:
 3. run the current local parser as a compatibility fallback;
 4. continue synthesis rather than failing the entire audio request.
 
-Cancellation of playback aborts the pending Decision evaluation. A late answer
-must never mutate an aborted playback session.
+Cancellation stops the frontend from waiting for the assignment. Because the
+Decision SDK does not expose an abort signal, a late backend result may still
+populate the assignment cache, but it is not played by the cancelled session.
 
 ## Settings changes
 

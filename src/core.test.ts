@@ -6,6 +6,7 @@ import {
   addUnconfiguredDialogueSpeakers,
   mergeScannedCardCast,
   applyConfigToMetadata,
+  buildSpeakerDecisionPlan,
   clampMessageLimit,
   clampSavedAudioLimit,
   detectCharacters,
@@ -32,6 +33,7 @@ import {
   reducedRequestWindowLimit,
   readConfig,
   readSavedAudioHistory,
+  resolveSpeakerDecisionSegments,
   speakerAliases,
   speakerAliasIdLookup,
   speakerIdMatchingCardTitle,
@@ -65,6 +67,135 @@ test('combines decoded segments into one resampled PCM WAV', () => {
   assert.equal(view.getUint32(24, true), 16_000)
   assert.equal(view.getUint32(40, true), 24)
   assert.equal(wav.byteLength, 68)
+})
+
+test('builds batched Jev questions and resolves speaker policy after semantic decisions', () => {
+  const content = [
+    'Ruby closes the door. "I am staying."',
+    '',
+    'The clerk checks the register. "That will be all."',
+    '',
+    '"One more thing."',
+  ].join('\n')
+  const speakers = [
+    { id: 'naomi', name: 'Naomi' },
+    { id: 'ruby', name: 'Ruby' },
+  ]
+  const plan = buildSpeakerDecisionPlan(content, speakers, false)
+  const confident = (choice: string) => ({
+    type: 'choice' as const,
+    choice,
+    probabilities: { [choice]: 0.92, no_clear_identity: 0.08 },
+    confidence: 0.9,
+  })
+  const rubyOption = Object.entries(plan.optionSpeakerIds)
+    .find(([, speakerId]) => speakerId === 'ruby')?.[0]
+  assert.ok(rubyOption)
+  assert.equal(plan.state.paragraphs.length, 3)
+  assert.equal(plan.state.speeches.length, 3)
+  assert.equal(Object.keys(plan.questions).length, 6)
+
+  const segments = resolveSpeakerDecisionSegments(
+    content,
+    plan,
+    {
+      paragraph_p0: confident(rubyOption),
+      speech_s0: confident(rubyOption),
+      paragraph_p1: confident('uncast_character'),
+      speech_s1: confident('uncast_character'),
+      paragraph_p2: confident('no_clear_identity'),
+      speech_s2: confident('no_clear_identity'),
+    },
+    speakers,
+    {
+      isUserMessage: false,
+      cardSpeakerId: 'naomi',
+      historicalSpeakerId: null,
+    },
+  ).filter(segment => ['I am staying.', 'That will be all.', 'One more thing.'].includes(segment.text))
+
+  assert.deepEqual(segments.map(segment => segment.speakerId), [
+    'ruby',
+    UNCAST_SPEAKER_ID,
+    UNCAST_SPEAKER_ID,
+  ])
+})
+
+test('Jev resolver carries narration-only identity into later ambiguous speech', () => {
+  const content = ['Ruby enters the room.', '', '"I brought the ledger."'].join('\n')
+  const speakers = [{ id: 'ruby', name: 'Ruby' }]
+  const plan = buildSpeakerDecisionPlan(content, speakers, false)
+  const rubyOption = Object.entries(plan.optionSpeakerIds)
+    .find(([, speakerId]) => speakerId === 'ruby')?.[0]
+  assert.ok(rubyOption)
+  const confident = (choice: string) => ({
+    choice,
+    probabilities: { [choice]: 0.9, no_clear_identity: 0.1 },
+    confidence: 0.9,
+  })
+
+  const segments = resolveSpeakerDecisionSegments(
+    content,
+    plan,
+    {
+      paragraph_p0: confident(rubyOption),
+      paragraph_p1: confident('no_clear_identity'),
+      speech_s0: confident('no_clear_identity'),
+    },
+    speakers,
+    { isUserMessage: false, cardSpeakerId: null, historicalSpeakerId: null },
+  )
+
+  assert.equal(segments.find(segment => segment.text === 'I brought the ledger.')?.speakerId, 'ruby')
+})
+
+test('Jev resolver uses role fallbacks only when the complete message has no identity', () => {
+  const content = '"No one has named me."'
+  const speakers = [{ id: 'ruby', name: 'Ruby' }]
+  const plan = buildSpeakerDecisionPlan(content, speakers, false)
+  const unclear = {
+    choice: 'no_clear_identity',
+    probabilities: { no_clear_identity: 0.9, uncast_character: 0.1 },
+    confidence: 0.9,
+  }
+  const answers = { paragraph_p0: unclear, speech_s0: unclear }
+  const assistant = resolveSpeakerDecisionSegments(
+    content,
+    plan,
+    answers,
+    speakers,
+    { isUserMessage: false, cardSpeakerId: 'ruby', historicalSpeakerId: null },
+  )
+  const user = resolveSpeakerDecisionSegments(
+    content,
+    plan,
+    answers,
+    speakers,
+    { isUserMessage: true, cardSpeakerId: null, historicalSpeakerId: null },
+  )
+
+  assert.equal(assistant.find(segment => segment.text === 'No one has named me.')?.speakerId, 'ruby')
+  assert.equal(user.find(segment => segment.text === 'No one has named me.')?.speakerId, USER_SPEAKER_ID)
+})
+
+test('Jev uncast identity disables card-title deference and routes to connection default', () => {
+  const content = 'The clerk looks up. "Next in line."'
+  const speakers = [{ id: 'naomi', name: 'Naomi' }]
+  const plan = buildSpeakerDecisionPlan(content, speakers, false)
+  const uncast = {
+    choice: 'uncast_character',
+    probabilities: { uncast_character: 0.91, no_clear_identity: 0.09 },
+    confidence: 0.9,
+  }
+  const segments = resolveSpeakerDecisionSegments(
+    content,
+    plan,
+    { paragraph_p0: uncast, speech_s0: uncast },
+    speakers,
+    { isUserMessage: false, cardSpeakerId: 'naomi', historicalSpeakerId: null },
+  )
+
+  assert.equal(segments.find(segment => segment.text === 'Next in line.')?.speakerId, UNCAST_SPEAKER_ID)
 })
 
 test('applies per-segment gain while assembling PCM WAV audio', () => {

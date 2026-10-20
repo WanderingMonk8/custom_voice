@@ -10,12 +10,6 @@ function speakersForMessageRole(speakers, isUserMessage, userName = "User") {
     { id: USER_SPEAKER_ID, name: normalizeSpeakerName(userName) || "User" }
   ] : nonUserSpeakers;
 }
-function protectDefaultSpeakerSegments(localSegments, reviewedSegments, protectedSpeakerId) {
-  if (localSegments.length !== reviewedSegments.length || localSegments.some((segment, index) => segment.text !== reviewedSegments[index]?.text)) {
-    return localSegments;
-  }
-  return reviewedSegments.map((segment, index) => localSegments[index].speakerId === protectedSpeakerId ? { ...segment, speakerId: protectedSpeakerId } : segment);
-}
 function playbackVoiceForSpeaker(speakerId, isUserMessage, characterVoices, narratorVoice, userVoice) {
   if (speakerId === USER_SPEAKER_ID) return isUserMessage ? userVoice : "";
   if (speakerId) return characterVoices[speakerId] || "";
@@ -1279,8 +1273,6 @@ async function loadPlaybackPreferences() {
     savedAudioLimit: DEFAULT_SAVED_AUDIO_LIMIT,
     skippedTrackerTags: "",
     speakerParsingMode: "ambiguous",
-    llmConnectionId: "",
-    llmModel: "",
     playbackBufferSegments: DEFAULT_PLAYBACK_BUFFER_SEGMENTS,
     concurrentGenerations: DEFAULT_CONCURRENT_GENERATIONS,
     rateLimitWaitSeconds: DEFAULT_RATE_LIMIT_WAIT_SECONDS,
@@ -1291,7 +1283,7 @@ async function loadPlaybackPreferences() {
   const row = await response.json();
   const speed = typeof row.value?.ttsSpeed === "number" ? row.value.ttsSpeed : 1;
   const volume = typeof row.value?.ttsVolume === "number" ? row.value.ttsVolume : 1;
-  const speakerParsingMode = row.value?.chatVoiceSpeakerParsingMode === "off" || row.value?.chatVoiceSpeakerParsingMode === "always" ? row.value.chatVoiceSpeakerParsingMode : "ambiguous";
+  const speakerParsingMode = row.value?.chatVoiceSpeakerParsingMode === "off" ? "off" : "ambiguous";
   return {
     speed: Math.min(4, Math.max(0.25, speed)),
     volume: Math.min(1, Math.max(0, volume)),
@@ -1300,8 +1292,6 @@ async function loadPlaybackPreferences() {
     savedAudioLimit: clampSavedAudioLimit(row.value?.chatVoiceSavedAudioLimit),
     skippedTrackerTags: typeof row.value?.chatVoiceSkippedTrackerTags === "string" ? row.value.chatVoiceSkippedTrackerTags.slice(0, 4e3) : "",
     speakerParsingMode,
-    llmConnectionId: typeof row.value?.chatVoiceLlmConnectionId === "string" ? row.value.chatVoiceLlmConnectionId.trim().slice(0, 128) : "",
-    llmModel: typeof row.value?.chatVoiceLlmModel === "string" ? row.value.chatVoiceLlmModel.trim().slice(0, 256) : "",
     playbackBufferSegments: clampIntegerSetting(
       row.value?.chatVoicePlaybackBufferSegments,
       DEFAULT_PLAYBACK_BUFFER_SEGMENTS,
@@ -1361,12 +1351,10 @@ function saveSkippedTrackerTagsPreference(value) {
     chatVoiceSkippedTrackerTags: value.slice(0, 4e3)
   }));
 }
-function saveLlmParsingPreferences(mode, connectionId, model) {
+function saveLlmParsingPreferences(mode) {
   return updateVoiceSettings((current) => ({
     ...current,
-    chatVoiceSpeakerParsingMode: mode,
-    chatVoiceLlmConnectionId: connectionId.trim().slice(0, 128),
-    chatVoiceLlmModel: model.trim().slice(0, 256)
+    chatVoiceSpeakerParsingMode: mode
   }));
 }
 function saveAdvancedPlaybackPreferences(bufferSegments, concurrentGenerations, rateLimitWaitSeconds, speakerAssignmentDebug) {
@@ -1841,9 +1829,7 @@ function setup(ctx) {
   scanButton.disabled = true;
   scanRow.append(scanButton);
   const skippedTagsField = createField("Skipped tracker tags (global)");
-  const speakerParsingField = createField("AI speaker review (global)");
-  const llmConnectionField = createField("Speaker-review LLM connection");
-  const llmModelField = createField("Custom LLM model (optional)");
+  const speakerParsingField = createField("Jev speaker assignment (global)");
   const narratorField = createField("Narrator voice");
   const userVoiceField = createField("User voice");
   function addDefaultRoleToggle(field, titleText, ariaLabel) {
@@ -1874,7 +1860,7 @@ function setup(ctx) {
   );
   const routingHint = document.createElement("div");
   routingHint.className = "chat-voice-hint";
-  routingHint.textContent = "Scan reads the character card, not chat history. During playback, quoted dialogue is matched to the user persona or saved cast using names and dialogue tags; everything outside quotes uses the narrator voice.";
+  routingHint.textContent = "Scan reads the character card, not chat history. During playback, Jev uses Lumiverse\u2019s default Decision connection to classify paragraph and dialogue identities; everything outside quotes uses the narrator voice.";
   const addNpcField = createField("Add NPC manually");
   addNpcField.slot.className = "chat-voice-add-row";
   const addNpcInputSlot = document.createElement("div");
@@ -1908,8 +1894,6 @@ function setup(ctx) {
     scanField.field,
     skippedTagsField.field,
     speakerParsingField.field,
-    llmConnectionField.field,
-    llmModelField.field,
     narratorField.field,
     userVoiceField.field,
     routingHint,
@@ -1977,9 +1961,6 @@ function setup(ctx) {
   let savingSkippedTrackerTags = false;
   let skippedTrackerTagsSaveTimer = null;
   let speakerParsingMode = "ambiguous";
-  let llmConnections = [];
-  let llmConnectionId = "";
-  let llmModel = "";
   let llmSettingsSaveTimer = null;
   let savingLlmSettings = false;
   let playbackBufferSegments = DEFAULT_PLAYBACK_BUFFER_SEGMENTS;
@@ -2041,11 +2022,9 @@ function setup(ctx) {
   const pendingMessageRequests = /* @__PURE__ */ new Map();
   const pendingStateRequests = /* @__PURE__ */ new Map();
   const pendingSpeakerParseRequests = /* @__PURE__ */ new Map();
-  const pendingLlmConnectionRequests = /* @__PURE__ */ new Map();
   let messageRequestSequence = 0;
   let stateRequestSequence = 0;
   let speakerParseRequestSequence = 0;
-  let llmConnectionRequestSequence = 0;
   const setStatus = (message, state = "normal") => {
     status.textContent = message;
     status.dataset.state = state;
@@ -2138,31 +2117,10 @@ function setup(ctx) {
     value: "ambiguous",
     options: [
       { value: "off", label: "Off", sublabel: "Use the local parser only" },
-      { value: "ambiguous", label: "Ambiguous only", sublabel: "Ask the LLM only when attribution is uncertain" },
-      { value: "always", label: "All dialogue", sublabel: "Review every message containing dialogue" }
+      { value: "ambiguous", label: "On", sublabel: "Use the default Lumiverse Decision connection" }
     ],
-    ariaLabel: "AI speaker review mode",
+    ariaLabel: "Jev speaker assignment mode",
     onChange: (value) => onSpeakerParsingModeChanged(value)
-  });
-  const llmConnectionPicker = ctx.components.mountSelect(llmConnectionField.slot, {
-    value: "",
-    options: [],
-    placeholder: "Use the default LLM connection",
-    searchPlaceholder: "Search LLM connections\u2026",
-    emptyMessage: "No LLM connections found.",
-    clearable: true,
-    clearLabel: "Use default LLM connection",
-    ariaLabel: "Speaker-review LLM connection",
-    disabled: true,
-    onChange: (value) => onLlmConnectionChanged(value)
-  });
-  const llmModelInput = ctx.components.mountModelCombobox(llmModelField.slot, {
-    value: "",
-    connection: { kind: "llm" },
-    placeholder: "Use the connection model or enter a model name",
-    browseHint: "Leave blank to use the selected connection\u2019s configured model.",
-    disabled: true,
-    onChange: (value) => onLlmModelChanged(value)
   });
   function createNumberInput(value, maximum, ariaLabel) {
     const input = document.createElement("input");
@@ -2347,7 +2305,7 @@ function setup(ctx) {
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         pendingSpeakerParseRequests.delete(requestId);
-        reject(new Error("AI speaker review timed out."));
+        reject(new Error("Jev speaker assignment timed out."));
       }, 45e3);
       pendingSpeakerParseRequests.set(requestId, { resolve, reject, timer });
       ctx.sendToBackend({
@@ -2356,8 +2314,6 @@ function setup(ctx) {
         messageId,
         requestId,
         mode: preferences.speakerParsingMode,
-        connectionId: preferences.llmConnectionId,
-        model: preferences.llmModel,
         skippedTrackerTags: preferences.skippedTrackerTags,
         debug: preferences.speakerAssignmentDebug
       });
@@ -2375,7 +2331,7 @@ function setup(ctx) {
     const lines = [
       `Message ${messageId} (${isUserMessage ? "user" : "assistant"})`,
       `Default speaker: ${speakerDebugName(defaultSpeakerId, parserSpeakers)}`,
-      `AI review mode: ${parsingMode}`,
+      `Jev assignment mode: ${parsingMode}`,
       `Parser roster: ${parserSpeakers.map((speaker) => `${speaker.name} [${speaker.id}]`).join(", ") || "(empty)"}`,
       ""
     ];
@@ -2391,7 +2347,7 @@ function setup(ctx) {
         config.userVoice
       );
       const localSpeaker = local?.speakerId ?? null;
-      const reviewPath = parsingMode === "off" ? localSpeaker === rawSpeakerId ? "backend-result:matches local parser (AI review disabled)" : `backend-result:changed ${localSpeaker ?? "none"} -> ${rawSpeakerId ?? "none"} (AI review disabled)` : localSpeaker === rawSpeakerId ? `backend/review-result:unchanged (${rawSpeakerId ?? "none"})` : `backend/review-result:changed ${localSpeaker ?? "none"} -> ${rawSpeakerId ?? "none"}`;
+      const reviewPath = parsingMode === "off" ? localSpeaker === rawSpeakerId ? "backend-result:matches local parser (Jev disabled)" : `backend-result:changed ${localSpeaker ?? "none"} -> ${rawSpeakerId ?? "none"} (Jev disabled)` : localSpeaker === rawSpeakerId ? `backend/Jev-result:unchanged (${rawSpeakerId ?? "none"})` : `backend/Jev-result:changed ${localSpeaker ?? "none"} -> ${rawSpeakerId ?? "none"}`;
       const aliasPath = rawSpeakerId && mappedSpeakerId !== rawSpeakerId ? `alias-map:${rawSpeakerId} -> ${mappedSpeakerId}` : `alias-map:${rawSpeakerId ?? "none"} (unchanged)`;
       const routeName = speakerDebugName(mappedSpeakerId, configuredSpeakers);
       const voicePath = voice ? `voice-route:${routeName} -> configured voice ${JSON.stringify(voice)}` : `voice-route:${routeName} -> connection default voice`;
@@ -2413,17 +2369,6 @@ function setup(ctx) {
     if (!speakerAssignmentDebug) return;
     speakerDebugOutput.value += `${speakerDebugOutput.value ? "\n" : ""}${line}`;
     console.debug(`[Chat Voice] ${line}`);
-  }
-  function requestLlmConnections() {
-    const requestId = `connections-${Date.now().toString(36)}-${++llmConnectionRequestSequence}`;
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        pendingLlmConnectionRequests.delete(requestId);
-        reject(new Error("Timed out while loading main LLM connections."));
-      }, 15e3);
-      pendingLlmConnectionRequests.set(requestId, { resolve, reject, timer });
-      ctx.sendToBackend({ type: "chat_voice_list_llm_connections", requestId });
-    });
   }
   function refreshLocalState() {
     ctx.sendToBackend({
@@ -2597,8 +2542,6 @@ function setup(ctx) {
     const preferences = await loadPlaybackPreferences();
     if (llmSettingsSaveTimer || savingLlmSettings) {
       preferences.speakerParsingMode = speakerParsingMode;
-      preferences.llmConnectionId = llmConnectionId;
-      preferences.llmModel = llmModel;
     }
     if (advancedSettingsSaveTimer || savingAdvancedSettings) {
       preferences.playbackBufferSegments = playbackBufferSegments;
@@ -2677,12 +2620,9 @@ function setup(ctx) {
         preferences.speakerAssignmentDebug
       );
       let segments = localSegments;
-      if (preferences.speakerParsingMode !== "off") setStatus("Reviewing dialogue speakers\u2026");
+      if (preferences.speakerParsingMode !== "off") setStatus("Classifying dialogue speakers with Jev\u2026");
       try {
         segments = await requestSpeakerReviewedSegments(playbackChat.id, messageId, preferences);
-        if (message.is_user) {
-          segments = protectDefaultSpeakerSegments(localSegments, segments, USER_SPEAKER_ID);
-        }
       } catch (error) {
         console.warn("[Chat Voice] Backend speaker parsing failed; using the message-local parser.", error);
         if (playback.controller.signal.aborted) throw new DOMException("Playback stopped.", "AbortError");
@@ -3173,16 +3113,11 @@ function setup(ctx) {
   }
   async function loadConnections() {
     try {
-      const [loadedConnections, loadedLlmConnections, preferences] = await Promise.all([
+      const [loadedConnections, preferences] = await Promise.all([
         listAllTtsConnections(),
-        requestLlmConnections().catch((error) => {
-          console.warn("[Chat Voice] Could not load main LLM connections.", error);
-          return [];
-        }),
         loadPlaybackPreferences()
       ]);
       connections = loadedConnections;
-      llmConnections = loadedLlmConnections;
       if (!narratorGlobalSaveTimer && !savingNarratorGlobalVoice) {
         defaultNarratorVoice = preferences.defaultNarratorVoice;
       }
@@ -3214,10 +3149,7 @@ function setup(ctx) {
       }
       if (!savingLlmSettings && !llmSettingsSaveTimer) {
         speakerParsingMode = preferences.speakerParsingMode;
-        llmConnectionId = preferences.llmConnectionId;
-        llmModel = preferences.llmModel;
         speakerParsingPicker.update({ value: speakerParsingMode });
-        updateLlmControlState();
       }
       if (!savingAdvancedSettings && !advancedSettingsSaveTimer) {
         playbackBufferSegments = preferences.playbackBufferSegments;
@@ -3245,31 +3177,6 @@ function setup(ctx) {
       setStatus(message, "error");
     }
   }
-  function llmConnectionOptions(selectedId = "") {
-    const options = llmConnections.map((connection) => ({
-      value: connection.id,
-      label: connection.name,
-      sublabel: `${connection.provider}${connection.model ? ` \xB7 ${connection.model}` : ""}`
-    }));
-    if (selectedId && !llmConnections.some((connection) => connection.id === selectedId)) {
-      options.unshift({ value: selectedId, label: "Missing connection", sublabel: selectedId });
-    }
-    return options;
-  }
-  function updateLlmControlState() {
-    const enabled = speakerParsingMode !== "off";
-    llmConnectionPicker.update({
-      value: llmConnectionId,
-      options: llmConnectionOptions(llmConnectionId),
-      disabled: !enabled,
-      placeholder: llmConnections.length ? "Use the default LLM connection" : "No LLM connections found; default will be used"
-    });
-    llmModelInput.update({
-      value: llmModel,
-      connection: llmConnectionId ? { kind: "llm", id: llmConnectionId } : { kind: "llm" },
-      disabled: !enabled
-    });
-  }
   function scheduleLlmSettingsSave() {
     if (llmSettingsSaveTimer) clearTimeout(llmSettingsSaveTimer);
     llmSettingsSaveTimer = setTimeout(() => {
@@ -3278,27 +3185,17 @@ function setup(ctx) {
     }, 400);
   }
   function onSpeakerParsingModeChanged(value) {
-    speakerParsingMode = value === "ambiguous" || value === "always" ? value : "off";
-    updateLlmControlState();
-    scheduleLlmSettingsSave();
-  }
-  function onLlmConnectionChanged(value) {
-    llmConnectionId = value.trim().slice(0, 128);
-    updateLlmControlState();
-    scheduleLlmSettingsSave();
-  }
-  function onLlmModelChanged(value) {
-    llmModel = value.trim().slice(0, 256);
+    speakerParsingMode = value === "ambiguous" ? "ambiguous" : "off";
     scheduleLlmSettingsSave();
   }
   async function persistLlmSettings() {
     savingLlmSettings = true;
-    setStatus("Saving global AI speaker-review settings\u2026");
+    setStatus("Saving global Jev speaker-assignment setting\u2026");
     try {
-      await saveLlmParsingPreferences(speakerParsingMode, llmConnectionId, llmModel);
-      setStatus("AI speaker-review settings saved globally.", "saved");
+      await saveLlmParsingPreferences(speakerParsingMode);
+      setStatus("Jev speaker-assignment setting saved globally.", "saved");
     } catch (error) {
-      setStatus(error instanceof Error ? error.message : "Could not save AI speaker-review settings.", "error");
+      setStatus(error instanceof Error ? error.message : "Could not save Jev speaker-assignment setting.", "error");
     } finally {
       savingLlmSettings = false;
     }
@@ -3524,19 +3421,10 @@ function setup(ctx) {
       clearTimeout(pending.timer);
       pendingSpeakerParseRequests.delete(payload.requestId);
       if (payload.error || !payload.segments) {
-        pending.reject(new Error(payload.error || "The message could not be reviewed."));
+        pending.reject(new Error(payload.error || "The message speakers could not be assigned."));
       } else {
         pending.resolve(payload.segments);
       }
-      return;
-    }
-    if (payload.type === "chat_voice_llm_connections") {
-      const pending = pendingLlmConnectionRequests.get(payload.requestId);
-      if (!pending) return;
-      clearTimeout(pending.timer);
-      pendingLlmConnectionRequests.delete(payload.requestId);
-      if (payload.error) pending.reject(new Error(payload.error));
-      else pending.resolve(payload.connections);
       return;
     }
     if (payload.type === "chat_voice_error") {
@@ -3680,11 +3568,6 @@ function setup(ctx) {
       pending.reject(new Error("Chat Voice was closed."));
     }
     pendingSpeakerParseRequests.clear();
-    for (const pending of pendingLlmConnectionRequests.values()) {
-      clearTimeout(pending.timer);
-      pending.reject(new Error("Chat Voice was closed."));
-    }
-    pendingLlmConnectionRequests.clear();
     for (const pending of pendingStateRequests.values()) {
       clearTimeout(pending.timer);
       pending.reject(new Error("Chat Voice was closed."));
@@ -3709,7 +3592,7 @@ function setup(ctx) {
     }
     if (llmSettingsSaveTimer) {
       clearTimeout(llmSettingsSaveTimer);
-      void saveLlmParsingPreferences(speakerParsingMode, llmConnectionId, llmModel);
+      void saveLlmParsingPreferences(speakerParsingMode);
     }
     if (advancedSettingsSaveTimer) {
       clearTimeout(advancedSettingsSaveTimer);
@@ -3722,8 +3605,6 @@ function setup(ctx) {
     }
     skippedTrackerTagsInput.destroy();
     speakerParsingPicker.destroy();
-    llmConnectionPicker.destroy();
-    llmModelInput.destroy();
     playbackBufferInput.removeEventListener("change", onPlaybackBufferInput);
     concurrentGenerationInput.removeEventListener("change", onConcurrentGenerationInput);
     rateLimitWaitInput.removeEventListener("change", onRateLimitWaitInput);

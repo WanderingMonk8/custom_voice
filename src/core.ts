@@ -1864,6 +1864,248 @@ export function speakerReviewQuotes(content: string, skippedTrackerTagPairs = ''
   return playbackQuotes(playbackContent).map(quote => cleanPlaybackText(quote.text))
 }
 
+export interface SpeakerDecisionPlan {
+  state: {
+    messageRole: 'assistant' | 'user'
+    message: string
+    speakers: Array<{ option: string; id: string; name: string; aliases: string[] }>
+    paragraphs: Array<{ id: string; text: string }>
+    speeches: Array<{ id: string; paragraphId: string; text: string }>
+  }
+  questions: Record<string, {
+    type: 'choice'
+    instructions: string
+    criteria: Record<string, string>
+  }>
+  optionSpeakerIds: Record<string, string>
+}
+
+export interface SpeakerDecisionChoice {
+  choice: string
+  probabilities: Record<string, number>
+  confidence: number
+}
+
+const DECISION_UNCAST_OPTION = 'uncast_character'
+const DECISION_UNCLEAR_OPTION = 'no_clear_identity'
+
+export function buildSpeakerDecisionPlan(
+  content: string,
+  speakers: CharacterLike[],
+  isUserMessage: boolean,
+  skippedTrackerTagPairs = '',
+): SpeakerDecisionPlan {
+  const message = preparePlaybackContent(content, skippedTrackerTagPairs)
+  const paragraphs = playbackParagraphs(message)
+  const quotes = playbackQuotes(message)
+  const optionSpeakerIds: Record<string, string> = {}
+  const stateSpeakers = speakers.slice(0, 253).map((speaker, index) => {
+    const option = `known_${index}`
+    optionSpeakerIds[option] = speaker.id
+    return { option, id: speaker.id, name: speaker.name, aliases: speakerAliases(speaker.name) }
+  })
+  const criteria: Record<string, string> = Object.fromEntries([
+    ...stateSpeakers.map(speaker => [
+      speaker.option,
+      `${speaker.name}, including these aliases: ${speaker.aliases.join(', ')}`,
+    ]),
+    [DECISION_UNCAST_OPTION, 'A specific character present in the text who is not one of the known speakers.'],
+    [DECISION_UNCLEAR_OPTION, 'The text does not establish a reliable character identity.'],
+  ])
+  const stateParagraphs = paragraphs.map((paragraph, index) => ({
+    id: `p${index}`,
+    text: cleanPlaybackText(paragraph.text),
+  }))
+  const stateSpeeches = quotes.map((quote, index) => {
+    const paragraphIndex = Math.max(0, paragraphs.findIndex(paragraph => (
+      quote.start >= paragraph.start && quote.start < paragraph.end
+    )))
+    return {
+      id: `s${index}`,
+      paragraphId: `p${paragraphIndex}`,
+      text: cleanPlaybackText(quote.text),
+    }
+  })
+  const questions: SpeakerDecisionPlan['questions'] = {}
+  for (const paragraph of stateParagraphs) {
+    questions[`paragraph_${paragraph.id}`] = {
+      type: 'choice',
+      instructions: `Which identity is locally established as the acting or speaking subject of paragraph ${paragraph.id}? Judge only the text, not card or history preference.`,
+      criteria,
+    }
+  }
+  for (const speech of stateSpeeches) {
+    questions[`speech_${speech.id}`] = {
+      type: 'choice',
+      instructions: `Who speaks quotation ${speech.id}? Use local attribution, action ownership, pronouns, and dialogue flow. Do not prefer a known speaker merely because they are listed.`,
+      criteria,
+    }
+  }
+  return {
+    state: {
+      messageRole: isUserMessage ? 'user' : 'assistant',
+      message,
+      speakers: stateSpeakers,
+      paragraphs: stateParagraphs,
+      speeches: stateSpeeches,
+    },
+    questions,
+    optionSpeakerIds,
+  }
+}
+
+function clearDecisionSpeaker(
+  answer: SpeakerDecisionChoice | undefined,
+  optionSpeakerIds: Record<string, string>,
+): string | null | undefined {
+  if (!answer || answer.choice === DECISION_UNCLEAR_OPTION) return undefined
+  const ranked = Object.entries(answer.probabilities)
+    .filter((entry): entry is [string, number] => Number.isFinite(entry[1]))
+    .sort((left, right) => right[1] - left[1])
+  const winnerProbability = answer.probabilities[answer.choice] ?? 0
+  const runnerUpProbability = ranked.find(([option]) => option !== answer.choice)?.[1] ?? 0
+  if (winnerProbability < 0.5 || answer.confidence < 0.5 || winnerProbability - runnerUpProbability < 0.15) {
+    return undefined
+  }
+  if (answer.choice === DECISION_UNCAST_OPTION) return UNCAST_SPEAKER_ID
+  return optionSpeakerIds[answer.choice]
+}
+
+function decisionAnswerDebug(
+  scope: string,
+  answer: SpeakerDecisionChoice | undefined,
+  optionSpeakerIds: Record<string, string>,
+): string[] {
+  if (!answer) return [`${scope}:missing`, `${scope}-normalized:unclear (missing answer)`]
+  const ranked = Object.entries(answer.probabilities)
+    .filter((entry): entry is [string, number] => Number.isFinite(entry[1]))
+    .sort((left, right) => right[1] - left[1])
+  const winnerProbability = answer.probabilities[answer.choice] ?? 0
+  const runnerUpProbability = ranked.find(([option]) => option !== answer.choice)?.[1] ?? 0
+  const margin = winnerProbability - runnerUpProbability
+  const normalized = clearDecisionSpeaker(answer, optionSpeakerIds)
+  const result = normalized === undefined
+    ? 'unclear'
+    : normalized === UNCAST_SPEAKER_ID
+      ? 'uncast-character'
+      : normalized
+  return [
+    `${scope}-choice:${answer.choice}`,
+    `${scope}-probabilities:${ranked.map(([option, probability]) => `${option}=${probability.toFixed(3)}`).join(',') || 'none'}`,
+    `${scope}-confidence:${answer.confidence.toFixed(3)}`,
+    `${scope}-margin:${margin.toFixed(3)}`,
+    `${scope}-normalized:${result}`,
+  ]
+}
+
+export function resolveSpeakerDecisionSegments(
+  content: string,
+  plan: SpeakerDecisionPlan,
+  answers: Record<string, SpeakerDecisionChoice>,
+  speakers: CharacterLike[],
+  options: {
+    isUserMessage: boolean
+    cardSpeakerId: string | null
+    historicalSpeakerId: string | null
+    skippedTrackerTagPairs?: string
+    includeDebug?: boolean
+  },
+): PlaybackSegment[] {
+  const paragraphIdentities = new Map(plan.state.paragraphs.map(paragraph => [
+    paragraph.id,
+    clearDecisionSpeaker(answers[`paragraph_${paragraph.id}`], plan.optionSpeakerIds),
+  ]))
+  const speechIdentities = plan.state.speeches.map(speech => (
+    clearDecisionSpeaker(answers[`speech_${speech.id}`], plan.optionSpeakerIds)
+  ))
+  const hasLocalIdentity = [...paragraphIdentities.values(), ...speechIdentities]
+    .some(identity => identity !== undefined)
+  const resolved: Array<string | null> = []
+  const resolutionPaths: string[][] = []
+  let upstreamIdentity: string | null = null
+  let upstreamSource = 'none'
+  let processedParagraphIndex = -1
+  for (let index = 0; index < plan.state.speeches.length; index += 1) {
+    const speech = plan.state.speeches[index]
+    const currentParagraphIndex = Number.parseInt(speech.paragraphId.slice(1), 10)
+    while (processedParagraphIndex < currentParagraphIndex) {
+      processedParagraphIndex += 1
+      const paragraphIdentity = paragraphIdentities.get(`p${processedParagraphIndex}`)
+      if (paragraphIdentity !== undefined) {
+        upstreamIdentity = paragraphIdentity
+        upstreamSource = `paragraph-p${processedParagraphIndex}`
+      }
+    }
+    const direct = speechIdentities[index]
+    let speakerId: string | null
+    if (direct !== undefined) {
+      speakerId = direct
+      upstreamIdentity = direct
+      upstreamSource = `speech-s${index}`
+      resolutionPaths.push(['resolution:direct-speech-identity'])
+    } else if (upstreamIdentity) {
+      speakerId = upstreamIdentity
+      resolutionPaths.push([`resolution:upstream-identity (${upstreamSource})`])
+    } else if (
+      options.historicalSpeakerId
+      && (
+        speechIdentities.slice(index + 1).some(identity => identity !== undefined)
+        || plan.state.paragraphs.slice(currentParagraphIndex + 1)
+          .some(paragraph => paragraphIdentities.get(paragraph.id) !== undefined)
+      )
+    ) {
+      speakerId = options.historicalSpeakerId
+      resolutionPaths.push(['resolution:previous-assistant opening inheritance before later local identity'])
+    } else if (!hasLocalIdentity && options.cardSpeakerId) {
+      speakerId = options.cardSpeakerId
+      resolutionPaths.push(['resolution:unique card-title match (no local known or uncast identity)'])
+    } else if (!hasLocalIdentity && options.historicalSpeakerId) {
+      speakerId = options.historicalSpeakerId
+      resolutionPaths.push(['resolution:previous-assistant identity (no local identity or card match)'])
+    } else {
+      speakerId = options.isUserMessage ? USER_SPEAKER_ID : null
+      resolutionPaths.push([
+        options.isUserMessage
+          ? 'resolution:user-role fallback (no clear identity)'
+          : 'resolution:assistant connection-default fallback (no clear identity)',
+      ])
+    }
+    resolved.push(speakerId)
+  }
+
+  let speechIndex = 0
+  return parseRosterVoiceSegments(
+    content,
+    null,
+    speakers,
+    options.skippedTrackerTagPairs ?? '',
+    null,
+    true,
+  ).map(segment => {
+    if (!segment.debugPath?.some(step => step.startsWith('segment-type:speech'))) {
+      return options.includeDebug ? segment : { text: segment.text, speakerId: segment.speakerId }
+    }
+    const index = speechIndex++
+    const speakerId = resolved[index] ?? null
+    const answer = answers[`speech_s${index}`]
+    const speech = plan.state.speeches[index]
+    const paragraphAnswer = speech ? answers[`paragraph_${speech.paragraphId}`] : undefined
+    return {
+      text: segment.text,
+      speakerId,
+      ...(options.includeDebug ? {
+        debugPath: [
+          `segment-type:speech (quote ${index + 1})`,
+          ...decisionAnswerDebug('jev-speech', answer, plan.optionSpeakerIds),
+          ...decisionAnswerDebug(`jev-${speech?.paragraphId ?? 'paragraph'}`, paragraphAnswer, plan.optionSpeakerIds),
+          ...(resolutionPaths[index] ?? ['resolution:unavailable']),
+          `jev-final-speaker:${speakerId ?? 'none'}`,
+        ],
+      } : {}),
+    }
+  })
+}
+
 export function needsLlmSpeakerReview(
   content: string,
   defaultSpeakerId: string | null,
