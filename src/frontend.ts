@@ -1316,11 +1316,15 @@ export function setup(ctx: SpindleFrontendContext) {
 
   const skippedTrackerTagsInput = ctx.components.mountTextArea(skippedTagsField.slot, {
     value: '',
-    placeholder: 'tracker, status, o_scene',
+    placeholder: 'tracker, status, <o_ledger></o_l>',
     rows: 3,
-    ariaLabel: 'Tracker tag names to skip globally',
+    ariaLabel: 'Tracker tag names or full asymmetric tag pairs to skip globally',
     onChange: () => scheduleSkippedTrackerTagsSave(),
   })
+  const skippedTagsHint = document.createElement('div')
+  skippedTagsHint.className = 'chat-voice-hint'
+  skippedTagsHint.textContent = 'Enter tag names, or full pairs for asymmetric tags such as <o_ledger></o_l>.'
+  skippedTagsField.slot.append(skippedTagsHint)
 
   const speakerParsingPicker = ctx.components.mountSelect(speakerParsingField.slot, {
     value: 'ambiguous',

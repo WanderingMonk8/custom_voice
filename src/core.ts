@@ -1000,33 +1000,85 @@ function decodePlaybackEntities(value: string): string {
     .replace(/&amp;|&#38;|&#x26;/gi, '&')
 }
 
-export function parseSkippedTrackerTags(value: string): string[] {
-  const decoded = decodePlaybackEntities(value)
-  const tags: string[] = []
-  const seen = new Set<string>()
-  const addTag = (value: string) => {
-    const tag = value.toLowerCase()
-    if (!tag || seen.has(tag) || !/^[a-z][a-z0-9:._-]*$/u.test(tag)) return
-    seen.add(tag)
-    tags.push(tag)
-  }
-  for (const entry of decoded.split(',')) {
-    addTag(entry.trim())
-    if (tags.length >= 100) return tags
-  }
-  // Keep previously saved paired-tag settings working after the simpler name-only format is introduced.
-  const pairPattern = /\\?<\s*([a-z][a-z0-9:._-]*)\b[^>]*>[\s\S]*?\\?<\s*\/\s*\1\s*>/giu
-  for (const match of decoded.matchAll(pairPattern)) {
-    addTag(match[1] ?? '')
-    if (tags.length >= 100) break
-  }
-  return tags
+export interface SkippedTrackerTagPair {
+  open: string
+  close: string
 }
 
-function stripPairedTagBlocks(value: string, tag: string): string {
-  const escapedTag = tag.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+const TRACKER_TAG_NAME_RE = /^[a-z][a-z0-9:._-]*$/u
+
+function normalizeTrackerTagName(value: string): string | null {
+  const tag = value.trim().toLowerCase()
+  return TRACKER_TAG_NAME_RE.test(tag) ? tag : null
+}
+
+/**
+ * Parse the global exclusion setting. Each comma-separated entry is one of:
+ * - a tag name (`tracker`), treated as a symmetric pair;
+ * - a single full tag (`<tracker>`), treated as a symmetric pair;
+ * - a full pair (`<o_ledger></o_l>`), which may open and close with different
+ *   names.
+ *
+ * Attributes and surrounding whitespace are ignored; only the tag names are
+ * retained so the same entry matches tags with attributes in the message.
+ */
+export function parseSkippedTrackerTagPairs(value: string): SkippedTrackerTagPair[] {
+  const decoded = decodePlaybackEntities(value)
+  const pairs: SkippedTrackerTagPair[] = []
+  const seen = new Set<string>()
+  const addPair = (open: string | null, close: string | null) => {
+    if (!open || !close) return
+    const key = `${open}\u0000${close}`
+    if (seen.has(key)) return
+    seen.add(key)
+    pairs.push({ open, close })
+  }
+  const addSymmetric = (name: string | null) => addPair(name, name)
+
+  for (const entry of decoded.split(',')) {
+    const trimmed = entry.trim()
+    if (!trimmed) continue
+    const pairMatch = trimmed.match(
+      /^\\?<\s*([a-z][a-z0-9:._-]*)(?=\s|>)[^>]*>\s*\\?<\s*\/\s*([a-z][a-z0-9:._-]*)(?=\s|>)[^>]*>$/iu,
+    )
+    if (pairMatch) {
+      addPair(
+        normalizeTrackerTagName(pairMatch[1] ?? ''),
+        normalizeTrackerTagName(pairMatch[2] ?? ''),
+      )
+      if (pairs.length >= 100) return pairs
+      continue
+    }
+    const tagMatch = trimmed.match(/^\\?<\s*([a-z][a-z0-9:._-]*)(?=\s|>)[^>]*>$/iu)
+    if (tagMatch) {
+      addSymmetric(normalizeTrackerTagName(tagMatch[1] ?? ''))
+      if (pairs.length >= 100) return pairs
+      continue
+    }
+    addSymmetric(normalizeTrackerTagName(trimmed))
+    if (pairs.length >= 100) return pairs
+  }
+  // Keep previously saved paired-tag settings working after the simpler
+  // name-only format was introduced. This also accepts an entry that embeds
+  // example content between symmetric tags.
+  const legacyPattern = /\\?<\s*([a-z][a-z0-9:._-]*)(?=\s|>)[^>]*>[\s\S]*?\\?<\s*\/\s*\1\s*>/giu
+  for (const match of decoded.matchAll(legacyPattern)) {
+    addSymmetric(normalizeTrackerTagName(match[1] ?? ''))
+    if (pairs.length >= 100) break
+  }
+  return pairs
+}
+
+/** Opening tag names for callers that only need the tag itself. */
+export function parseSkippedTrackerTags(value: string): string[] {
+  return [...new Set(parseSkippedTrackerTagPairs(value).map(pair => pair.open))].slice(0, 100)
+}
+
+function stripTagBlock(value: string, openTag: string, closeTag: string): string {
+  const open = escapedPattern(openTag)
+  const close = escapedPattern(closeTag)
   const tokenPattern = new RegExp(
-    `\\\\?<\\s*(/?)\\s*${escapedTag}(?=\\s|>)[^>]*>`,
+    `(\\\\?<\\s*${open}(?=\\s|>)[^>]*>)|(\\\\?<\\s*\\/\\s*${close}(?=\\s|>)[^>]*>)`,
     'giu',
   )
   const ranges: Array<{ start: number; end: number }> = []
@@ -1034,11 +1086,13 @@ function stripPairedTagBlocks(value: string, tag: string): string {
   let blockStart = -1
   for (const match of value.matchAll(tokenPattern)) {
     if (match.index === undefined) continue
-    const closing = match[1] === '/'
-    if (!closing && !/\/\s*>$/u.test(match[0])) {
-      if (depth === 0) blockStart = match.index
-      depth += 1
-    } else if (closing && depth > 0) {
+    const opening = match[1] !== undefined
+    if (opening) {
+      if (!/\/\s*>$/u.test(match[0])) {
+        if (depth === 0) blockStart = match.index
+        depth += 1
+      }
+    } else if (depth > 0) {
       depth -= 1
       if (depth === 0 && blockStart >= 0) {
         ranges.push({ start: blockStart, end: match.index + match[0].length })
@@ -1059,8 +1113,8 @@ export function stripSkippedTrackerBlocks(content: string, tagPairs: string): st
     .replace(/&lt;|&#60;|&#x3c;/gi, '<')
     .replace(/&gt;|&#62;|&#x3e;/gi, '>')
     .replace(/<!--[\s\S]*?-->/g, ' ')
-  for (const tag of parseSkippedTrackerTags(tagPairs)) {
-    result = stripPairedTagBlocks(result, tag)
+  for (const pair of parseSkippedTrackerTagPairs(tagPairs)) {
+    result = stripTagBlock(result, pair.open, pair.close)
   }
   return result
 }

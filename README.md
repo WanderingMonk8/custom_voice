@@ -27,7 +27,7 @@ A [Lumiverse Spindle](https://docs.lumiverse.chat/) extension that detects chara
 - When enabled, saves the exact synthesized custom-voice segments as a native Lumiverse audio attachment for the active message swipe, with a browser-generated WAV fallback when the server cannot mux their source formats.
 - When saving is enabled, continues bounded background synthesis and saves the complete recording even when audible playback is stopped early.
 - Removes HTML/escaped tags and Markdown emphasis markers before sending readable text to TTS.
-- Provides a global, autosaved list of tracker tag names whose tags and enclosed contents are removed before playback generation.
+- Provides a global, autosaved list of tracker tag names or full asymmetric tag pairs whose tags and enclosed contents are removed before playback generation.
 - Automatically excludes well-formed HTML comments (`<!-- ... -->`) from playback and speaker detection.
 - Alternates short unattributed dialogue turns after two speakers have been confidently established, including chains preceded by same-speaker continuation paragraphs.
 - Optionally reviews ambiguous—or all—dialogue with an LLM, using a selectable Lumiverse connection and optional custom model override. Results are cached per message and safely fall back to local parsing.
@@ -57,7 +57,7 @@ The compiled frontend and backend bundles are committed under `dist/`, so users 
 1. Open a chat.
 2. Select **Voice** in the Lumiverse drawer.
 3. Click **Scan** to read the active character card and save its speaking cast.
-4. Optionally enter comma-separated tag names under **Skipped tracker tags**, such as `tracker, status, o_scene`. These global exclusions remove both the opening/closing tags and everything enclosed by them before TTS generation. Previously saved paired-tag entries remain compatible.
+4. Optionally enter comma-separated tag names under **Skipped tracker tags**, such as `tracker, status, o_scene`. For asymmetric tags, enter the full pair, such as `<o_ledger></o_l>`. These global exclusions remove both the opening/closing tags and everything enclosed by them before TTS generation. Previously saved paired-tag entries remain compatible.
 5. Global **Jev speaker assignment** defaults to **On** and uses the account's default Lumiverse Decision connection. Switch it off to use only the local parser. The On option is available only when Lumiverse has at least one Decision model connection; without one it stays Off.
 6. Choose one TTS connection for the chat.
 7. Enter the narrator voice and a voice for each detected character. Add characters manually, or rename and delete any roster entry as needed. Separate aliases with `/` (for example, `Scott / The sergeant`) to route every name to the same voice; use the rename button to add aliases later without losing the assigned voice.

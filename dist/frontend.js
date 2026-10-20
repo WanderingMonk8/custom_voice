@@ -388,31 +388,58 @@ function stripPlaybackMarkup(value) {
 function decodePlaybackEntities(value) {
   return value.replace(/&nbsp;/gi, " ").replace(/&quot;|&#34;|&#x22;/gi, '"').replace(/&apos;|&#39;|&#x27;/gi, "'").replace(/&lt;|&#60;|&#x3c;/gi, "<").replace(/&gt;|&#62;|&#x3e;/gi, ">").replace(/&amp;|&#38;|&#x26;/gi, "&");
 }
-function parseSkippedTrackerTags(value) {
-  const decoded = decodePlaybackEntities(value);
-  const tags = [];
-  const seen = /* @__PURE__ */ new Set();
-  const addTag = (value2) => {
-    const tag = value2.toLowerCase();
-    if (!tag || seen.has(tag) || !/^[a-z][a-z0-9:._-]*$/u.test(tag)) return;
-    seen.add(tag);
-    tags.push(tag);
-  };
-  for (const entry of decoded.split(",")) {
-    addTag(entry.trim());
-    if (tags.length >= 100) return tags;
-  }
-  const pairPattern = /\\?<\s*([a-z][a-z0-9:._-]*)\b[^>]*>[\s\S]*?\\?<\s*\/\s*\1\s*>/giu;
-  for (const match of decoded.matchAll(pairPattern)) {
-    addTag(match[1] ?? "");
-    if (tags.length >= 100) break;
-  }
-  return tags;
+var TRACKER_TAG_NAME_RE = /^[a-z][a-z0-9:._-]*$/u;
+function normalizeTrackerTagName(value) {
+  const tag = value.trim().toLowerCase();
+  return TRACKER_TAG_NAME_RE.test(tag) ? tag : null;
 }
-function stripPairedTagBlocks(value, tag) {
-  const escapedTag = tag.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+function parseSkippedTrackerTagPairs(value) {
+  const decoded = decodePlaybackEntities(value);
+  const pairs = [];
+  const seen = /* @__PURE__ */ new Set();
+  const addPair = (open, close) => {
+    if (!open || !close) return;
+    const key = `${open}\0${close}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    pairs.push({ open, close });
+  };
+  const addSymmetric = (name) => addPair(name, name);
+  for (const entry of decoded.split(",")) {
+    const trimmed = entry.trim();
+    if (!trimmed) continue;
+    const pairMatch = trimmed.match(
+      /^\\?<\s*([a-z][a-z0-9:._-]*)(?=\s|>)[^>]*>\s*\\?<\s*\/\s*([a-z][a-z0-9:._-]*)(?=\s|>)[^>]*>$/iu
+    );
+    if (pairMatch) {
+      addPair(
+        normalizeTrackerTagName(pairMatch[1] ?? ""),
+        normalizeTrackerTagName(pairMatch[2] ?? "")
+      );
+      if (pairs.length >= 100) return pairs;
+      continue;
+    }
+    const tagMatch = trimmed.match(/^\\?<\s*([a-z][a-z0-9:._-]*)(?=\s|>)[^>]*>$/iu);
+    if (tagMatch) {
+      addSymmetric(normalizeTrackerTagName(tagMatch[1] ?? ""));
+      if (pairs.length >= 100) return pairs;
+      continue;
+    }
+    addSymmetric(normalizeTrackerTagName(trimmed));
+    if (pairs.length >= 100) return pairs;
+  }
+  const legacyPattern = /\\?<\s*([a-z][a-z0-9:._-]*)(?=\s|>)[^>]*>[\s\S]*?\\?<\s*\/\s*\1\s*>/giu;
+  for (const match of decoded.matchAll(legacyPattern)) {
+    addSymmetric(normalizeTrackerTagName(match[1] ?? ""));
+    if (pairs.length >= 100) break;
+  }
+  return pairs;
+}
+function stripTagBlock(value, openTag, closeTag) {
+  const open = escapedPattern(openTag);
+  const close = escapedPattern(closeTag);
   const tokenPattern = new RegExp(
-    `\\\\?<\\s*(/?)\\s*${escapedTag}(?=\\s|>)[^>]*>`,
+    `(\\\\?<\\s*${open}(?=\\s|>)[^>]*>)|(\\\\?<\\s*\\/\\s*${close}(?=\\s|>)[^>]*>)`,
     "giu"
   );
   const ranges = [];
@@ -420,11 +447,13 @@ function stripPairedTagBlocks(value, tag) {
   let blockStart = -1;
   for (const match of value.matchAll(tokenPattern)) {
     if (match.index === void 0) continue;
-    const closing = match[1] === "/";
-    if (!closing && !/\/\s*>$/u.test(match[0])) {
-      if (depth === 0) blockStart = match.index;
-      depth += 1;
-    } else if (closing && depth > 0) {
+    const opening = match[1] !== void 0;
+    if (opening) {
+      if (!/\/\s*>$/u.test(match[0])) {
+        if (depth === 0) blockStart = match.index;
+        depth += 1;
+      }
+    } else if (depth > 0) {
       depth -= 1;
       if (depth === 0 && blockStart >= 0) {
         ranges.push({ start: blockStart, end: match.index + match[0].length });
@@ -441,8 +470,8 @@ function stripPairedTagBlocks(value, tag) {
 }
 function stripSkippedTrackerBlocks(content, tagPairs) {
   let result = content.replace(/&lt;|&#60;|&#x3c;/gi, "<").replace(/&gt;|&#62;|&#x3e;/gi, ">").replace(/<!--[\s\S]*?-->/g, " ");
-  for (const tag of parseSkippedTrackerTags(tagPairs)) {
-    result = stripPairedTagBlocks(result, tag);
+  for (const pair of parseSkippedTrackerTagPairs(tagPairs)) {
+    result = stripTagBlock(result, pair.open, pair.close);
   }
   return result;
 }
@@ -2134,11 +2163,15 @@ function setup(ctx) {
   });
   const skippedTrackerTagsInput = ctx.components.mountTextArea(skippedTagsField.slot, {
     value: "",
-    placeholder: "tracker, status, o_scene",
+    placeholder: "tracker, status, <o_ledger></o_l>",
     rows: 3,
-    ariaLabel: "Tracker tag names to skip globally",
+    ariaLabel: "Tracker tag names or full asymmetric tag pairs to skip globally",
     onChange: () => scheduleSkippedTrackerTagsSave()
   });
+  const skippedTagsHint = document.createElement("div");
+  skippedTagsHint.className = "chat-voice-hint";
+  skippedTagsHint.textContent = "Enter tag names, or full pairs for asymmetric tags such as <o_ledger></o_l>.";
+  skippedTagsField.slot.append(skippedTagsHint);
   const speakerParsingPicker = ctx.components.mountSelect(speakerParsingField.slot, {
     value: "ambiguous",
     options: [

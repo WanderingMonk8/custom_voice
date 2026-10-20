@@ -29,6 +29,7 @@ import {
   parseRosterVoiceSegments,
   parseRosterVoiceSegmentsWithAssignments,
   parseSkippedTrackerTags,
+  parseSkippedTrackerTagPairs,
   playbackVoiceForSpeaker,
   preferredCardSpeakerId,
   protectDefaultSpeakerSegments,
@@ -1139,6 +1140,67 @@ test('removes escaped and nested configured tracker blocks', () => {
       '&lt;tracker&gt;&lt;/tracker&gt;',
     ),
     'Before   After',
+  )
+})
+
+test('supports asymmetric tracker tag pairs alongside symmetric names', () => {
+  const value = 'tracker, <o_ledger></o_l>, <o_plan class="x"></o_p>'
+  assert.deepEqual(parseSkippedTrackerTagPairs(value), [
+    { open: 'tracker', close: 'tracker' },
+    { open: 'o_ledger', close: 'o_l' },
+    { open: 'o_plan', close: 'o_p' },
+  ])
+  assert.deepEqual(parseSkippedTrackerTags(value), ['tracker', 'o_ledger', 'o_plan'])
+})
+
+test('removes asymmetric tracker blocks including nested and escaped forms', () => {
+  assert.equal(
+    stripSkippedTrackerBlocks('Before<o_ledger>hidden</o_l>After', '<o_ledger></o_l>'),
+    'Before After',
+  )
+  assert.equal(
+    stripSkippedTrackerBlocks(
+      'A<o_ledger>one<o_ledger>two</o_l>three</o_l>B',
+      '<O_LEDGER></O_L>',
+    ),
+    'A B',
+  )
+  assert.equal(
+    stripSkippedTrackerBlocks(
+      'A&lt;o_ledger id="x"&gt;hidden&lt;/o_l &gt;B',
+      '<o_ledger></o_l>',
+    ),
+    'A B',
+  )
+  assert.equal(
+    stripSkippedTrackerBlocks(
+      'Before\n<o_ledger>\nhidden\n</o_l>\nAfter',
+      '<o_ledger></o_l>',
+    ),
+    'Before\n \nAfter',
+  )
+  assert.equal(
+    stripSkippedTrackerBlocks('<o_ledger>hidden</o_ledger>', '<o_ledger></o_l>'),
+    '<o_ledger>hidden</o_ledger>',
+  )
+  assert.equal(
+    stripSkippedTrackerBlocks('A<o_ledger/>B', '<o_ledger></o_l>'),
+    'A<o_ledger/>B',
+  )
+})
+
+test('skips quotations inside asymmetric tracker blocks during playback', () => {
+  assert.deepEqual(
+    parseRosterVoiceSegments(
+      '"Keep this." <o_ledger>"Do not synthesize this."</o_l> Narration remains.',
+      'alice',
+      [{ id: 'alice', name: 'Alice' }],
+      '<o_ledger></o_l>',
+    ),
+    [
+      { text: 'Keep this.', speakerId: 'alice' },
+      { text: 'Narration remains.', speakerId: null },
+    ],
   )
 })
 
