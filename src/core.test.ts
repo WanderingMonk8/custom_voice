@@ -1008,6 +1008,26 @@ test('inherits speakers from clause-leading possessive action subjects', () => {
   )
 })
 
+test('recognizes a possessive speaker after a fronted prepositional phrase', () => {
+  const content = [
+    'Across the room Jeremy\'s breathing goes ragged and short. "Yo— hold on— hold—" He grits it out and spills over his own fist. "...That was warmup. That was a warmup."',
+  ].join('\n')
+  const speakers = [
+    { id: 'diana', name: 'Diana' },
+    { id: 'judy', name: 'Judy' },
+    { id: 'jeremy', name: 'Jeremy' },
+  ]
+
+  assert.deepEqual(
+    parseRosterVoiceSegments(content, 'diana', speakers)
+      .filter(segment => segment.speakerId !== null),
+    [
+      { text: 'Yo— hold on— hold—', speakerId: 'jeremy' },
+      { text: '...That was warmup. That was a warmup.', speakerId: 'jeremy' },
+    ],
+  )
+})
+
 test('anchors Ruby dialogue to the immediately preceding possessive-subject paragraph', () => {
   const content = [
     'The laugh comes first — and it lands wrong. Bright, automatic, the laugh she keeps for men who flirt at the bar, fired off at a question about trouble like a reflex striking a dead nerve. It cuts itself short.',

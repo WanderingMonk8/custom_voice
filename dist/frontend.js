@@ -294,6 +294,10 @@ var PREPOSITION_BEFORE_NAME_PATTERN = new RegExp(
   `\\b(?:${PREPOSITION_WORDS.join("|")})\\s*$`,
   "iu"
 );
+var INTRODUCTORY_PREPOSITIONAL_PHRASE_PATTERN = new RegExp(
+  `^\\s*(?:${PREPOSITION_WORDS.join("|")})\\b(?:\\s+[\\p{L}\\p{M}'\u2019-]+){1,7}\\s*,?\\s*$`,
+  "iu"
+);
 function unconfiguredSpeakerId(name) {
   return `unconfigured:${normalizeSpeakerName(name).toLowerCase()}`;
 }
@@ -593,6 +597,31 @@ function mainClausePossessiveSubject(text, speakers, eligibleSpeakerIds) {
         const clause = narrative.slice(match.index + match[0].length).split(/[.!?;\n]/u, 1)[0];
         const clauseWords = clause.match(/[\p{L}\p{M}'’-]+/gu) ?? [];
         if (clauseWords.length >= 3) matches.add(speaker.id);
+      }
+    }
+  }
+  return matches.size === 1 ? [...matches][0] : null;
+}
+function frontedPrepositionalPossessiveSubject(text, speakers) {
+  const narrative = narrativeOnly(text);
+  if (mentionedSpeakers(narrative, speakers).clean.size > 0) return null;
+  const matches = /* @__PURE__ */ new Set();
+  for (const speaker of speakers) {
+    for (const alias of speakerAliases(speaker.name)) {
+      const pattern = new RegExp(`\\b${escapedPattern(alias)}\\b['\u2019]s\\s+`, "giu");
+      for (const match of narrative.matchAll(pattern)) {
+        if (match.index === void 0) continue;
+        const prefix = narrative.slice(0, match.index);
+        const sentenceStart = Math.max(
+          prefix.lastIndexOf("."),
+          prefix.lastIndexOf("!"),
+          prefix.lastIndexOf("?"),
+          prefix.lastIndexOf(";"),
+          prefix.lastIndexOf("\n")
+        ) + 1;
+        if (!INTRODUCTORY_PREPOSITIONAL_PHRASE_PATTERN.test(prefix.slice(sentenceStart))) continue;
+        const clause = narrative.slice(match.index + match[0].length).split(/[.!?;\n]/u, 1)[0];
+        if ((clause.match(/[\p{L}\p{M}'’-]+/gu) ?? []).length >= 3) matches.add(speaker.id);
       }
     }
   }
@@ -993,12 +1022,13 @@ function parseRosterVoiceSegmentsInternal(content, defaultSpeakerId, speakers, s
       const dialogueTurnSpeakerId = dialogueTurns.get(paragraphIndex) ?? null;
       const inferredTurnSpeakerId = inference.source === "history" || inference.source === "fallback" ? dialogueTurnSpeakerId : null;
       const openingSpeakerId = inference.source === "fallback" && openingBackfill?.paragraphIndexes.has(paragraphIndex) ? openingBackfill.speakerId : null;
+      const frontedPossessiveSpeakerId = inference.source === "history" || inference.source === "fallback" ? frontedPrepositionalPossessiveSubject(bridge, speakers) : null;
       const previousParagraph = paragraphs[paragraphIndex - 1];
       const currentParagraph = paragraphs[paragraphIndex];
       const currentNarrativePrefix = currentParagraph ? currentParagraph.text.slice(0, Math.max(0, quote.start - currentParagraph.start)) : "";
       const anonymousLocalSpeakerId = (inference.source === "history" || inference.source === "fallback") && paragraphSpeakers[paragraphIndex] === null && (hasAnonymousHumanSubject(currentNarrativePrefix) || !!(previousParagraph && playbackQuotes(previousParagraph.text).length === 0 && paragraphSpeakers[paragraphIndex - 1] === null && hasAnonymousHumanSubject(previousParagraph.text))) ? UNCAST_SPEAKER_ID : null;
-      const currentEvidenceSpeakerId = paragraphSpeakers[paragraphIndex] ?? anonymousLocalSpeakerId ?? (inference.confident ? inference.speakerId : null);
-      if (historicalPrefixActive && (inference.source === "explicit" || inference.source === "paragraph" || anonymousLocalSpeakerId !== null || paragraphSpeakers[paragraphIndex] !== null && currentEvidenceSpeakerId !== historicalSpeakerId)) {
+      const currentEvidenceSpeakerId = paragraphSpeakers[paragraphIndex] ?? frontedPossessiveSpeakerId ?? anonymousLocalSpeakerId ?? (inference.confident ? inference.speakerId : null);
+      if (historicalPrefixActive && (inference.source === "explicit" || inference.source === "paragraph" || frontedPossessiveSpeakerId !== null || anonymousLocalSpeakerId !== null || paragraphSpeakers[paragraphIndex] !== null && currentEvidenceSpeakerId !== historicalSpeakerId)) {
         historicalPrefixActive = false;
       }
       const historicalFallbackId = historicalPrefixActive && (inference.source === "history" || inference.source === "fallback") ? historicalSpeakerId : null;
@@ -1013,17 +1043,18 @@ function parseRosterVoiceSegmentsInternal(content, defaultSpeakerId, speakers, s
         ["current-paragraph-subject", paragraphSpeakers[paragraphIndex]],
         ["preceding-possessive-subject", adjacentNarrativeSpeakerId],
         ["preceding-narrative-voice-subject", adjacentNarrativeVoiceSpeakerId],
+        ["fronted-prepositional-possessive-subject", frontedPossessiveSpeakerId],
         ["anonymous-local-subject", anonymousLocalSpeakerId],
         ["downstream-reply", downstreamReplies.get(paragraphIndex) ?? null],
-        ["dialogue-turn-alternation", inferredTurnSpeakerId],
         ["speaker-continuation", continuedSpeakerId],
+        ["dialogue-turn-alternation", inferredTurnSpeakerId],
         ["previous-message-history", historicalFallbackId],
         ["opening-dialogue-backfill", openingSpeakerId],
         [`quote-inference:${inference.source}`, inference.speakerId]
       ];
       const selectedLocalCandidate = localCandidates.find(([, speakerId2]) => speakerId2 !== null);
       const localSpeakerId = selectedLocalCandidate?.[1] ?? null;
-      const confidentLocalSpeakerId = paragraphSpeakers[paragraphIndex] ?? adjacentNarrativeEvidenceId ?? anonymousLocalSpeakerId ?? (inference.source === "explicit" || inference.source === "paragraph" ? inference.speakerId : null);
+      const confidentLocalSpeakerId = paragraphSpeakers[paragraphIndex] ?? adjacentNarrativeEvidenceId ?? frontedPossessiveSpeakerId ?? anonymousLocalSpeakerId ?? (inference.source === "explicit" || inference.source === "paragraph" ? inference.speakerId : null);
       if (!localSpeakerId || confidentLocalSpeakerId !== localSpeakerId) {
         lowConfidenceQuoteIndexes?.add(currentQuoteIndex);
       }
