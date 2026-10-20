@@ -216,6 +216,15 @@ interface ParsedMessagePayload {
   error?: string
 }
 
+/** Result of asking the backend for reviewed speaker assignments. */
+interface SpeakerParseReview {
+  segments: PlaybackSegment[]
+  /** Whether Jev supplied the assignments; null when the backend did not say. */
+  usedLlm: boolean | null
+  /** True when the backend request failed and the message-local parser was used. */
+  failed: boolean
+}
+
 interface PlaybackMessage {
   id: string
   is_user: boolean
@@ -1049,14 +1058,14 @@ export function setup(ctx: SpindleFrontendContext) {
   speakerDebugText.textContent = 'Speaker assignment debug'
   const speakerDebugHint = document.createElement('span')
   speakerDebugHint.className = 'chat-voice-toggle-hint'
-  speakerDebugHint.textContent = 'Records the parser, review, alias, fallback, and final voice route for every segment.'
+  speakerDebugHint.textContent = 'Records both Jev passes, dialogue-run review, inheritance, fallbacks, aliases, and the final voice route for every segment.'
   speakerDebugCopy.append(speakerDebugText, speakerDebugHint)
   speakerDebugLabel.append(speakerDebugToggle, speakerDebugCopy)
   const speakerDebugOutput = document.createElement('textarea')
   speakerDebugOutput.className = 'chat-voice-debug-output'
   speakerDebugOutput.readOnly = true
   speakerDebugOutput.hidden = true
-  speakerDebugOutput.placeholder = 'Generate TTS to see the speaker assignment trace.'
+  speakerDebugOutput.placeholder = 'Generate TTS to see the first-pass, discourse review, inheritance, and voice-route trace.'
   speakerDebugOutput.setAttribute('aria-label', 'Speaker assignment debug log')
   const advancedHint = document.createElement('div')
   advancedHint.className = 'chat-voice-hint'
@@ -1186,7 +1195,7 @@ export function setup(ctx: SpindleFrontendContext) {
     timer: ReturnType<typeof setTimeout>
   }>()
   const pendingSpeakerParseRequests = new Map<string, {
-    resolve: (segments: PlaybackSegment[]) => void
+    resolve: (review: SpeakerParseReview) => void
     reject: (error: Error) => void
     timer: ReturnType<typeof setTimeout>
   }>()
@@ -1496,7 +1505,7 @@ export function setup(ctx: SpindleFrontendContext) {
     chatId: string,
     messageId: string,
     preferences: PlaybackPreferences,
-  ): Promise<PlaybackSegment[]> {
+  ): Promise<SpeakerParseReview> {
     const requestId = `parse-${Date.now().toString(36)}-${++speakerParseRequestSequence}`
     return new Promise((resolve, reject) => {
       // Jev may run a local pass and one discourse escalation back to back, and
@@ -1526,6 +1535,167 @@ export function setup(ctx: SpindleFrontendContext) {
     return speaker ? `${speaker.name} [${speakerId}]` : speakerId
   }
 
+  type SpeakerAssignmentSource =
+    | 'first-pass'
+    | 'discourse-fill'
+    | 'discourse-override'
+    | 'inheritance'
+    | 'previous-assistant'
+    | 'card-title'
+    | 'role-fallback'
+    | 'local-parser'
+    | 'unreported'
+
+  const SPEAKER_SOURCE_LABELS: Record<SpeakerAssignmentSource, string> = {
+    'first-pass': 'first pass',
+    'discourse-fill': 'discourse fill',
+    'discourse-override': 'discourse override',
+    inheritance: 'in-message inheritance',
+    'previous-assistant': 'previous assistant',
+    'card-title': 'card title',
+    'role-fallback': 'role fallback',
+    'local-parser': 'local parser',
+    unreported: 'unreported',
+  }
+
+  function speakerDebugLine(steps: string[], prefix: string): string | undefined {
+    return steps.find(step => step.startsWith(prefix))
+  }
+
+  function speakerDebugStep(segment: PlaybackSegment, prefix: string): string | undefined {
+    return speakerDebugLine(segment.debugPath ?? [], prefix)
+  }
+
+  /** Which pipeline stage produced the final speaker for one segment. */
+  function speakerAssignmentSource(
+    segment: PlaybackSegment,
+    parsingMode: PlaybackPreferences['speakerParsingMode'],
+    review: SpeakerParseReview,
+  ): SpeakerAssignmentSource {
+    const resolution = speakerDebugStep(segment, 'resolution:')
+    if (resolution?.startsWith('resolution:discourse-identity (overrode')) return 'discourse-override'
+    if (resolution?.startsWith('resolution:discourse-identity')) return 'discourse-fill'
+    if (resolution === 'resolution:direct-speech-identity') return 'first-pass'
+    if (resolution?.startsWith('resolution:upstream-identity')) return 'inheritance'
+    if (resolution?.startsWith('resolution:previous-assistant')) return 'previous-assistant'
+    if (resolution?.startsWith('resolution:unique card-title')) return 'card-title'
+    if (resolution?.startsWith('resolution:user-role')) return 'role-fallback'
+    if (resolution?.startsWith('resolution:assistant connection-default')) return 'role-fallback'
+    if (review.failed || review.usedLlm === false || parsingMode === 'off') return 'local-parser'
+    if (speakerDebugStep(segment, 'jev-fallback:') || speakerDebugStep(segment, 'jev-disabled:')) {
+      return 'local-parser'
+    }
+    return 'unreported'
+  }
+
+  function speakerSourceDetail(
+    segment: PlaybackSegment,
+    source: SpeakerAssignmentSource,
+    parsingMode: PlaybackPreferences['speakerParsingMode'],
+    review: SpeakerParseReview,
+  ): string {
+    if (source !== 'local-parser') return SPEAKER_SOURCE_LABELS[source]
+    if (parsingMode === 'off') return 'local parser (Jev disabled)'
+    if (review.failed) return 'local parser (backend review unavailable)'
+    const fallback = speakerDebugStep(segment, 'jev-fallback:')
+    if (fallback) return `local parser fallback (${fallback.slice('jev-fallback:'.length).trim()})`
+    return 'local parser'
+  }
+
+  function describeBackendReview(
+    localSpeakerId: string | null,
+    rawSpeakerId: string | null,
+    parsingMode: PlaybackPreferences['speakerParsingMode'],
+    review: SpeakerParseReview,
+  ): string {
+    const before = localSpeakerId ?? 'none'
+    const after = rawSpeakerId ?? 'none'
+    if (parsingMode === 'off') {
+      return localSpeakerId === rawSpeakerId
+        ? 'backend-result:matches message-local parser (Jev disabled)'
+        : `backend-result:changed message-local ${before} -> ${after} (Jev disabled)`
+    }
+    if (review.failed) return `backend-result:unavailable (message-local parser: ${after})`
+    if (review.usedLlm === false) {
+      return localSpeakerId === rawSpeakerId
+        ? 'backend-result:local-parser fallback (matches message-local parser)'
+        : `backend-result:local-parser fallback (changed message-local ${before} -> ${after})`
+    }
+    return localSpeakerId === rawSpeakerId
+      ? `backend/Jev-result:matches message-local parser (${after})`
+      : `backend/Jev-result:changed message-local ${before} -> Jev ${after}`
+  }
+
+  /** Two-pass status for the message header, derived from the backend trace. */
+  function speakerPipelineHeader(
+    segments: PlaybackSegment[],
+    parsingMode: PlaybackPreferences['speakerParsingMode'],
+    review: SpeakerParseReview,
+  ): string[] {
+    if (parsingMode === 'off') return ['Jev pipeline: off (attribution is entirely local)']
+    if (review.failed) {
+      return ['Jev pipeline: unavailable (backend review did not answer; message-local parser used)']
+    }
+    const steps = segments.flatMap(segment => segment.debugPath ?? [])
+    if (review.usedLlm === null) {
+      return ['Jev pipeline: status unknown (the backend did not report whether Jev answered)']
+    }
+    if (review.usedLlm === false) {
+      const fallback = steps.find(step => step.startsWith('jev-fallback:') || step.startsWith('jev-disabled:'))
+      const reason = fallback?.replace(/^jev-(?:fallback|disabled):/u, '').trim() || 'reason not reported'
+      return [`Jev pipeline: first pass not used (${reason}); deterministic parser output used`]
+    }
+    const lines = ['Jev pipeline: first pass answered; deterministic policy applied after normalization']
+    const speechSegments = segments.filter(segment => speakerDebugStep(segment, 'segment-type:speech'))
+    const normalized = speechSegments
+      .map(segment => speakerDebugStep(segment, 'jev-speech-normalized:'))
+      .filter((step): step is string => step !== undefined)
+    if (normalized.length > 0) {
+      const clear = normalized.filter(step => !step.includes(':unclear')).length
+      lines.push(
+        `First pass: ${clear} clear / ${normalized.length} quotations`
+        + ` (${normalized.length - clear} unresolved or low-confidence)`,
+      )
+    }
+    const request = speakerDebugLine(steps, 'discourse-request:')
+      ?.slice('discourse-request:'.length).trim()
+    const escalated = steps.includes('discourse-decision:escalated')
+    const runIds = [...new Set(steps
+      .filter(step => step.startsWith('discourse-run:'))
+      .map(step => step.slice('discourse-run:'.length).split(' ')[0] ?? '')
+      .filter(runId => runId.length > 0))]
+    const triggerCodes = [...new Set(steps
+      .filter(step => step.startsWith('discourse-triggers:'))
+      .flatMap(step => step.slice('discourse-triggers:'.length).split('; '))
+      .map(trigger => trigger.split(' (')[0]?.trim() ?? '')
+      .filter(trigger => trigger.length > 0 && trigger !== 'none'))]
+    const rejectedRuns = [...new Set(steps
+      .filter(step => step.startsWith('discourse-decision:rejected'))
+      .map(step => step.slice('discourse-decision:rejected'.length).trim().replace(/^\(|\)$/gu, ''))
+      .filter(reason => reason.length > 0))]
+    const outcomes = steps.filter(step => step.startsWith('discourse-outcome:'))
+    const countOutcome = (name: string) => outcomes
+      .filter(step => step === `discourse-outcome:${name}` || step.startsWith(`discourse-outcome:${name} `))
+      .length
+    if (escalated) {
+      lines.push(
+        `Discourse review: escalated ${runIds.join(', ') || 'one run'}`
+        + ` (triggers: ${triggerCodes.join(', ') || 'not reported'})`,
+        `Discourse review result: ${countOutcome('filled-unresolved')} filled`
+        + `, ${countOutcome('overrode-conflict')} overrode`
+        + `, ${countOutcome('not-a-target')} retained`
+        + `, ${outcomes.filter(step => step.startsWith('discourse-outcome:rejected')).length} rejected`,
+      )
+    } else if (request?.startsWith('failed')) {
+      lines.push(`Discourse review: ${request}`)
+    } else if (rejectedRuns.length > 0) {
+      lines.push(`Discourse review: not escalated (${rejectedRuns.join('; ')})`)
+    } else {
+      lines.push('Discourse review: not requested')
+    }
+    return lines
+  }
+
   function updateSpeakerDebugLog(
     messageId: string,
     isUserMessage: boolean,
@@ -1537,15 +1707,19 @@ export function setup(ctx: SpindleFrontendContext) {
     aliases: ReadonlyMap<string, string>,
     config: ReturnType<typeof collectConfig>,
     parsingMode: PlaybackPreferences['speakerParsingMode'],
+    review: SpeakerParseReview,
   ): void {
     if (!speakerAssignmentDebug) return
     const lines = [
       `Message ${messageId} (${isUserMessage ? 'user' : 'assistant'})`,
+      `Parsing mode: ${parsingMode === 'off' ? 'local parser only' : 'Jev with local fallback'}`,
+      ...speakerPipelineHeader(finalSegments, parsingMode, review),
       `Default speaker: ${speakerDebugName(defaultSpeakerId, parserSpeakers)}`,
-      `Jev assignment mode: ${parsingMode}`,
       `Parser roster: ${parserSpeakers.map(speaker => `${speaker.name} [${speaker.id}]`).join(', ') || '(empty)'}`,
       '',
     ]
+    const sourceCounts = new Map<SpeakerAssignmentSource, number>()
+    let narratorCount = 0
     finalSegments.forEach((segment, index) => {
       const local = localSegments[index]?.text === segment.text
         ? localSegments[index]
@@ -1560,13 +1734,13 @@ export function setup(ctx: SpindleFrontendContext) {
         config.userVoice,
       )
       const localSpeaker = local?.speakerId ?? null
-      const reviewPath = parsingMode === 'off'
-        ? (localSpeaker === rawSpeakerId
-            ? 'backend-result:matches local parser (Jev disabled)'
-            : `backend-result:changed ${localSpeaker ?? 'none'} -> ${rawSpeakerId ?? 'none'} (Jev disabled)`)
-        : localSpeaker === rawSpeakerId
-          ? `backend/Jev-result:unchanged (${rawSpeakerId ?? 'none'})`
-          : `backend/Jev-result:changed ${localSpeaker ?? 'none'} -> ${rawSpeakerId ?? 'none'}`
+      const isSpeech = segment.debugPath?.some(step => step.startsWith('segment-type:speech')) ?? false
+      const source = speakerAssignmentSource(segment, parsingMode, review)
+      if (isSpeech) {
+        sourceCounts.set(source, (sourceCounts.get(source) ?? 0) + 1)
+      } else {
+        narratorCount += 1
+      }
       const aliasPath = rawSpeakerId && mappedSpeakerId !== rawSpeakerId
         ? `alias-map:${rawSpeakerId} -> ${mappedSpeakerId}`
         : `alias-map:${rawSpeakerId ?? 'none'} (unchanged)`
@@ -1577,13 +1751,21 @@ export function setup(ctx: SpindleFrontendContext) {
       lines.push(
         `[${index + 1}] ${JSON.stringify(segment.text.length > 180 ? `${segment.text.slice(0, 177)}...` : segment.text)}`,
         ...((segment.debugPath ?? local?.debugPath ?? ['parser-trace:unavailable']).map(step => `  ${step}`)),
-        `  ${reviewPath}`,
+        `  ${describeBackendReview(localSpeaker, rawSpeakerId, parsingMode, review)}`,
+        `  source:${isSpeech ? speakerSourceDetail(segment, source, parsingMode, review) : 'narrator'}`,
         `  ${aliasPath}`,
         `  final-speaker:${speakerDebugName(mappedSpeakerId, configuredSpeakers)}`,
         `  ${voicePath}`,
         '',
       )
     })
+    const sourceSummary = [...sourceCounts.entries()]
+      .map(([source, count]) => `${SPEAKER_SOURCE_LABELS[source]} ${count}`)
+      .join(' · ')
+    lines.push(
+      `Assignment sources: ${sourceSummary || 'no speech segments'} · narrator segments ${narratorCount}`,
+      'Legend: jev-* first pass · jev-discourse-* and discourse-* cross-paragraph review · resolution:* deterministic policy · voice-route:* final routing',
+    )
     const log = lines.join('\n')
     speakerDebugOutput.value = log
     console.debug('[Chat Voice] Speaker assignment trace\n' + log)
@@ -1874,15 +2056,17 @@ export function setup(ctx: SpindleFrontendContext) {
         null,
         preferences.speakerAssignmentDebug,
       )
-      let segments = localSegments
+      let review: SpeakerParseReview = { segments: localSegments, usedLlm: null, failed: false }
       if (preferences.speakerParsingMode !== 'off') setStatus('Classifying dialogue speakers with Jev…')
       try {
-        segments = await requestSpeakerReviewedSegments(playbackChat.id, messageId, preferences)
+        review = await requestSpeakerReviewedSegments(playbackChat.id, messageId, preferences)
       } catch (error) {
         console.warn('[Chat Voice] Backend speaker parsing failed; using the message-local parser.', error)
         if (playback.controller.signal.aborted) throw new DOMException('Playback stopped.', 'AbortError')
+        review = { segments: localSegments, usedLlm: null, failed: true }
         setStatus('Historical speaker lookup unavailable; using the message-local parser.')
       }
+      const segments = review.segments
       updateSpeakerDebugLog(
         messageId,
         message.is_user,
@@ -1894,6 +2078,7 @@ export function setup(ctx: SpindleFrontendContext) {
         aliases,
         config,
         preferences.speakerParsingMode,
+        review,
       )
       const plan = mergeVoicePlan(segments.map((segment) => {
         const speakerId = segment.speakerId
@@ -2757,7 +2942,7 @@ export function setup(ctx: SpindleFrontendContext) {
       if (payload.error || !payload.segments) {
         pending.reject(new Error(payload.error || 'The message speakers could not be assigned.'))
       } else {
-        pending.resolve(payload.segments)
+        pending.resolve({ segments: payload.segments, usedLlm: payload.usedLlm ?? null, failed: false })
       }
       return
     }
