@@ -2306,7 +2306,7 @@ function setup(ctx) {
       const timer = setTimeout(() => {
         pendingSpeakerParseRequests.delete(requestId);
         reject(new Error("Jev speaker assignment timed out."));
-      }, 45e3);
+      }, 7e4);
       pendingSpeakerParseRequests.set(requestId, { resolve, reject, timer });
       ctx.sendToBackend({
         type: "chat_voice_parse_message",

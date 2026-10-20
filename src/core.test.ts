@@ -6,12 +6,14 @@ import {
   addUnconfiguredDialogueSpeakers,
   mergeScannedCardCast,
   applyConfigToMetadata,
+  assessSpeakerDiscourseEscalation,
   buildSpeakerDecisionPlan,
   clampMessageLimit,
   clampSavedAudioLimit,
   detectCharacters,
   eligibleCardFallbackSpeakerId,
   encodeConcatenatedWav,
+  evaluateSpeakerDecisionAnswer,
   expiredSavedAudioRecords,
   hashMessageContent,
   hasNamedSpeakerMention,
@@ -34,6 +36,7 @@ import {
   readConfig,
   readSavedAudioHistory,
   resolveSpeakerDecisionSegments,
+  resolveSpeakerDiscourseAnswers,
   speakerAliases,
   speakerAliasIdLookup,
   speakerIdMatchingCardTitle,
@@ -41,12 +44,14 @@ import {
   speakersForMessageRole,
   shouldPersistMessageAudio,
   rollingRequestWindowDelay,
+  SPEAKER_DECISION_THRESHOLDS,
   stripSkippedTrackerBlocks,
   unconfiguredSpeakerId,
   UNCAST_SPEAKER_ID,
   USER_SPEAKER_ID,
   upsertSavedAudioRecord,
   type ChatVoiceConfig,
+  type SpeakerDecisionChoice,
 } from './core'
 
 test('combines decoded segments into one resampled PCM WAV', () => {
@@ -198,7 +203,413 @@ test('Jev uncast identity disables card-title deference and routes to connection
   assert.equal(segments.find(segment => segment.text === 'Next in line.')?.speakerId, UNCAST_SPEAKER_ID)
 })
 
+const DECISION_UNCAST_CRITERION = 'uncast_character'
+
+function decisionOption(
+  plan: ReturnType<typeof buildSpeakerDecisionPlan>,
+  speakerId: string,
+): string {
+  const option = Object.entries(plan.optionSpeakerIds).find(([, id]) => id === speakerId)?.[0]
+  assert.ok(option, `missing Jev option for ${speakerId}`)
+  return option
+}
+
+function confidentDecision(choice: string, probability = 0.92, confidence = 0.9): SpeakerDecisionChoice {
+  return {
+    choice,
+    probabilities: {
+      [choice]: probability,
+      no_clear_identity: Number(Math.max(0, 1 - probability).toFixed(4)),
+    },
+    confidence,
+  }
+}
+
+const CALL_AND_RESPONSE = [
+  'Ruby looks at the doorway. "You are late."',
+  '',
+  '"Yes. The bridge was out."',
+  '',
+  '"And the horses?"',
+  '',
+  '"Took the long way."',
+  '',
+  'Vega sighs. "We leave at dawn."',
+].join('\n')
+
+const CALL_AND_RESPONSE_SPEAKERS = [
+  { id: 'ruby', name: 'Ruby' },
+  { id: 'vega', name: 'Vega' },
+]
+
+function callAndResponseAnswers(plan: ReturnType<typeof buildSpeakerDecisionPlan>) {
+  const ruby = decisionOption(plan, 'ruby')
+  const vega = decisionOption(plan, 'vega')
+  const unclear = confidentDecision('no_clear_identity')
+  return {
+    paragraph_p0: confidentDecision(ruby),
+    speech_s0: confidentDecision(ruby),
+    paragraph_p1: unclear,
+    speech_s1: unclear,
+    paragraph_p2: unclear,
+    speech_s2: unclear,
+    paragraph_p3: unclear,
+    speech_s3: unclear,
+    paragraph_p4: confidentDecision(vega),
+    speech_s4: confidentDecision(vega),
+  }
+}
+
+test('escalates a cross-paragraph call-and-response run and fills unresolved speeches', () => {
+  const plan = buildSpeakerDecisionPlan(CALL_AND_RESPONSE, CALL_AND_RESPONSE_SPEAKERS, false)
+  const answers = callAndResponseAnswers(plan)
+  const assessment = assessSpeakerDiscourseEscalation(plan, answers)
+
+  assert.ok(assessment.plan)
+  assert.deepEqual(assessment.plan.targets, ['s1', 's2', 's3'])
+  assert.deepEqual(
+    Object.keys(assessment.plan.questions),
+    ['discourse_s1', 'discourse_s2', 'discourse_s3'],
+  )
+  const run = assessment.runs[0]
+  assert.equal(run.rejection, null)
+  assert.ok(run.triggers.some(trigger => trigger.code === 'adjacent-unresolved'))
+  assert.ok(run.triggers.some(trigger => trigger.code === 'unattributed-replies-after-anchor'))
+  assert.ok(run.triggers.some(trigger => trigger.code === 'alternating-participants'))
+  const evidence = assessment.plan.state.firstPass.find(entry => entry.speechId === 's1')
+  assert.equal(evidence?.speech.normalized, 'unresolved')
+  assert.equal(evidence?.paragraph.normalized, 'unresolved')
+  assert.deepEqual(
+    assessment.plan.state.establishedIdentities.map(identity => identity.identity).sort(),
+    ['ruby', 'vega'],
+  )
+  for (const criteria of Object.values(assessment.plan.questions)) {
+    assert.ok(criteria.criteria[DECISION_UNCAST_CRITERION])
+    assert.ok(criteria.criteria.no_clear_identity)
+  }
+
+  const vega = decisionOption(plan, 'vega')
+  const ruby = decisionOption(plan, 'ruby')
+  const discourseAnswers = {
+    discourse_s1: confidentDecision(vega),
+    discourse_s2: confidentDecision(ruby),
+    discourse_s3: confidentDecision(vega),
+  }
+  const outcomes = resolveSpeakerDiscourseAnswers(assessment.plan, discourseAnswers)
+  assert.equal(outcomes.get('s1')?.reason, 'filled-unresolved')
+  assert.equal(outcomes.has('s0'), false)
+
+  const segments = resolveSpeakerDecisionSegments(CALL_AND_RESPONSE, plan, answers, CALL_AND_RESPONSE_SPEAKERS, {
+    isUserMessage: false,
+    cardSpeakerId: null,
+    historicalSpeakerId: null,
+    discourse: { assessment, answers: discourseAnswers, status: 'completed' },
+  })
+  const spoken = segments.filter(segment => [
+    'Yes. The bridge was out.',
+    'And the horses?',
+    'Took the long way.',
+  ].includes(segment.text))
+  assert.deepEqual(spoken.map(segment => segment.speakerId), ['vega', 'ruby', 'vega'])
+})
+
+test('leaves an isolated low-confidence quotation to ordinary inheritance', () => {
+  const content = ['Ruby closes the door. "I am staying."', '', '"Where is the ledger?"'].join('\n')
+  const speakers = [{ id: 'ruby', name: 'Ruby' }]
+  const plan = buildSpeakerDecisionPlan(content, speakers, false)
+  const ruby = decisionOption(plan, 'ruby')
+  const answers = {
+    paragraph_p0: confidentDecision(ruby),
+    speech_s0: confidentDecision(ruby),
+    paragraph_p1: confidentDecision('no_clear_identity'),
+    speech_s1: {
+      choice: ruby,
+      probabilities: { [ruby]: 0.45, no_clear_identity: 0.4, uncast_character: 0.15 },
+      confidence: 0.4,
+    },
+  }
+
+  const assessment = assessSpeakerDiscourseEscalation(plan, answers)
+  assert.equal(assessment.plan, null)
+  assert.equal(
+    assessment.runs[0]?.rejection,
+    'isolated low-confidence speech with only upstream evidence',
+  )
+
+  const segments = resolveSpeakerDecisionSegments(content, plan, answers, speakers, {
+    isUserMessage: false,
+    cardSpeakerId: null,
+    historicalSpeakerId: null,
+    discourse: { assessment, answers: null, status: 'not-requested' },
+  })
+  assert.equal(segments.find(segment => segment.text === 'Where is the ledger?')?.speakerId, 'ruby')
+})
+
+test('reviews an ambiguous opening run before its later attribution', () => {
+  const content = [
+    '"Where is the ledger?"',
+    '',
+    '"The study, I think."',
+    '',
+    'Ruby frowns. "Then fetch it."',
+  ].join('\n')
+  const speakers = [{ id: 'ruby', name: 'Ruby' }]
+  const plan = buildSpeakerDecisionPlan(content, speakers, false)
+  const ruby = decisionOption(plan, 'ruby')
+  const unclear = confidentDecision('no_clear_identity')
+  const answers = {
+    paragraph_p0: unclear,
+    speech_s0: unclear,
+    paragraph_p1: unclear,
+    speech_s1: unclear,
+    paragraph_p2: confidentDecision(ruby),
+    speech_s2: confidentDecision(ruby),
+  }
+
+  const assessment = assessSpeakerDiscourseEscalation(plan, answers)
+  assert.ok(assessment.plan)
+  assert.deepEqual(assessment.plan.targets, ['s0', 's1'])
+
+  const discourseAnswers = {
+    discourse_s0: confidentDecision('uncast_character'),
+    discourse_s1: confidentDecision('uncast_character'),
+  }
+  const segments = resolveSpeakerDecisionSegments(content, plan, answers, speakers, {
+    isUserMessage: false,
+    cardSpeakerId: null,
+    historicalSpeakerId: null,
+    discourse: { assessment, answers: discourseAnswers, status: 'completed' },
+  })
+  const spoken = segments.filter(segment => [
+    'Where is the ledger?',
+    'The study, I think.',
+  ].includes(segment.text))
+  assert.deepEqual(spoken.map(segment => segment.speakerId), [UNCAST_SPEAKER_ID, UNCAST_SPEAKER_ID])
+})
+
+test('only overrides a conflicting clear answer above the discourse override threshold', () => {
+  const content = [
+    'Ruby steps forward. "I will go."',
+    '',
+    'Vega folds her arms. "No."',
+  ].join('\n')
+  const speakers = [
+    { id: 'ruby', name: 'Ruby' },
+    { id: 'vega', name: 'Vega' },
+  ]
+  const plan = buildSpeakerDecisionPlan(content, speakers, false)
+  const ruby = decisionOption(plan, 'ruby')
+  const vega = decisionOption(plan, 'vega')
+  const answers = {
+    paragraph_p0: confidentDecision(ruby),
+    speech_s0: confidentDecision(ruby),
+    paragraph_p1: confidentDecision(vega),
+    speech_s1: confidentDecision(ruby),
+  }
+
+  const assessment = assessSpeakerDiscourseEscalation(plan, answers)
+  assert.ok(assessment.plan)
+  assert.deepEqual(assessment.plan.targets, ['s1'])
+  assert.ok(assessment.runs[0]?.triggers.some(trigger => trigger.code === 'paragraph-speech-conflict'))
+
+  const belowOverride = resolveSpeakerDiscourseAnswers(assessment.plan, {
+    discourse_s1: confidentDecision(vega, 0.66, 0.6),
+  })
+  assert.equal(belowOverride.get('s1')?.reason, 'rejected-override-threshold')
+
+  const belowOverrideSegments = resolveSpeakerDecisionSegments(content, plan, answers, speakers, {
+    isUserMessage: false,
+    cardSpeakerId: null,
+    historicalSpeakerId: null,
+    discourse: {
+      assessment,
+      answers: { discourse_s1: confidentDecision(vega, 0.66, 0.6) },
+      status: 'completed',
+    },
+  })
+  assert.equal(belowOverrideSegments.find(segment => segment.text === 'No.')?.speakerId, 'ruby')
+
+  const aboveOverride = resolveSpeakerDiscourseAnswers(assessment.plan, {
+    discourse_s1: confidentDecision(vega, 0.9, 0.9),
+  })
+  assert.equal(aboveOverride.get('s1')?.reason, 'overrode-conflict')
+  const aboveOverrideSegments = resolveSpeakerDecisionSegments(content, plan, answers, speakers, {
+    isUserMessage: false,
+    cardSpeakerId: null,
+    historicalSpeakerId: null,
+    discourse: {
+      assessment,
+      answers: { discourse_s1: confidentDecision(vega, 0.9, 0.9) },
+      status: 'completed',
+    },
+  })
+  assert.equal(aboveOverrideSegments.find(segment => segment.text === 'No.')?.speakerId, 'vega')
+  assert.ok(SPEAKER_DECISION_THRESHOLDS.override.probability > SPEAKER_DECISION_THRESHOLDS.discourse.probability)
+})
+
+test('keeps normalized first-pass answers when the discourse request fails', () => {
+  const plan = buildSpeakerDecisionPlan(CALL_AND_RESPONSE, CALL_AND_RESPONSE_SPEAKERS, false)
+  const answers = callAndResponseAnswers(plan)
+  const assessment = assessSpeakerDiscourseEscalation(plan, answers)
+  assert.ok(assessment.plan)
+  const baseline = resolveSpeakerDecisionSegments(CALL_AND_RESPONSE, plan, answers, CALL_AND_RESPONSE_SPEAKERS, {
+    isUserMessage: false,
+    cardSpeakerId: null,
+    historicalSpeakerId: null,
+  })
+  const failed = resolveSpeakerDecisionSegments(CALL_AND_RESPONSE, plan, answers, CALL_AND_RESPONSE_SPEAKERS, {
+    isUserMessage: false,
+    cardSpeakerId: null,
+    historicalSpeakerId: null,
+    includeDebug: true,
+    discourse: { assessment, answers: null, status: 'failed (timed out); first-pass results retained' },
+  })
+  assert.deepEqual(
+    failed.map(segment => segment.speakerId),
+    baseline.map(segment => segment.speakerId),
+  )
+  const problem = failed.find(segment => segment.text === 'And the horses?')
+  const debugLines = failed.flatMap(segment => segment.debugPath ?? [])
+  assert.ok(debugLines.includes('discourse-request:failed (timed out); first-pass results retained'))
+  assert.ok(debugLines.includes('discourse-decision:escalated'))
+  assert.ok(debugLines.some(line => line.startsWith('discourse-triggers:')))
+  assert.ok(problem?.debugPath?.includes('discourse-run:run_0'))
+  assert.ok(problem?.debugPath?.includes('discourse-outcome:not-a-target (first-pass identity retained)'))
+})
+
+test('a clear discourse uncast identity disables card-title deference', () => {
+  const content = ['"The door is locked."', '', '"Then find another way."'].join('\n')
+  const speakers = [{ id: 'naomi', name: 'Naomi' }]
+  const plan = buildSpeakerDecisionPlan(content, speakers, false)
+  const unclear = confidentDecision('no_clear_identity')
+  const answers = {
+    paragraph_p0: unclear,
+    speech_s0: unclear,
+    paragraph_p1: unclear,
+    speech_s1: unclear,
+  }
+  const assessment = assessSpeakerDiscourseEscalation(plan, answers)
+  assert.ok(assessment.plan)
+
+  const withoutDiscourse = resolveSpeakerDecisionSegments(content, plan, answers, speakers, {
+    isUserMessage: false,
+    cardSpeakerId: 'naomi',
+    historicalSpeakerId: null,
+  })
+  assert.deepEqual(
+    withoutDiscourse.filter(segment => segment.speakerId).map(segment => segment.speakerId),
+    ['naomi', 'naomi'],
+  )
+
+  const discourseAnswers = {
+    discourse_s0: confidentDecision('uncast_character'),
+    discourse_s1: confidentDecision('uncast_character'),
+  }
+  const withDiscourse = resolveSpeakerDecisionSegments(content, plan, answers, speakers, {
+    isUserMessage: false,
+    cardSpeakerId: 'naomi',
+    historicalSpeakerId: null,
+    includeDebug: true,
+    discourse: { assessment, answers: discourseAnswers, status: 'completed' },
+  })
+  const spoken = withDiscourse.filter(segment => ['The door is locked.', 'Then find another way.'].includes(segment.text))
+  assert.deepEqual(spoken.map(segment => segment.speakerId), [UNCAST_SPEAKER_ID, UNCAST_SPEAKER_ID])
+  assert.ok(spoken[0]?.debugPath?.includes(
+    'resolution:discourse-identity (filled unresolved first pass)',
+  ))
+})
+
+test('splits dialogue runs at time jumps instead of inferring across scenes', () => {
+  const content = [
+    'Ruby says, "I am leaving."',
+    '',
+    '"Take the north road."',
+    '',
+    '"The north road is watched."',
+    '',
+    'The next morning, Vega waits by the gate.',
+    '',
+    '"You came."',
+    '',
+    '"I did."',
+  ].join('\n')
+  const speakers = [
+    { id: 'ruby', name: 'Ruby' },
+    { id: 'vega', name: 'Vega' },
+  ]
+  const plan = buildSpeakerDecisionPlan(content, speakers, false)
+  const ruby = decisionOption(plan, 'ruby')
+  const vega = decisionOption(plan, 'vega')
+  const unclear = confidentDecision('no_clear_identity')
+  const answers = {
+    paragraph_p0: confidentDecision(ruby),
+    speech_s0: confidentDecision(ruby),
+    paragraph_p1: unclear,
+    speech_s1: unclear,
+    paragraph_p2: unclear,
+    speech_s2: unclear,
+    paragraph_p3: confidentDecision(vega),
+    paragraph_p4: unclear,
+    speech_s3: unclear,
+    paragraph_p5: unclear,
+    speech_s4: unclear,
+  }
+
+  const assessment = assessSpeakerDiscourseEscalation(plan, answers)
+  assert.equal(assessment.runs.length, 2)
+  assert.deepEqual(assessment.runs[0]?.paragraphIds, ['p0', 'p1', 'p2'])
+  assert.deepEqual(assessment.runs[1]?.paragraphIds, ['p4', 'p5'])
+  assert.equal(assessment.runs[1]?.boundaryBeforeParagraphId, 'p3')
+  assert.equal(assessment.runs[1]?.boundaryBeforeIdentity, 'vega')
+  assert.equal(assessment.runs[0]?.boundaryAfterParagraphId, 'p3')
+  assert.ok(assessment.plan)
+  assert.deepEqual(assessment.plan.targets, ['s1', 's2', 's3', 's4'])
+  assert.deepEqual(assessment.plan.runIds, ['run_0', 'run_1'])
+})
+
+test('gates a decision answer on probability, confidence, and winner margin', () => {
+  const optionSpeakerIds = { known_0: 'ruby' }
+  const passes = evaluateSpeakerDecisionAnswer(
+    { choice: 'known_0', probabilities: { known_0: 0.8, no_clear_identity: 0.2 }, confidence: 0.8 },
+    optionSpeakerIds,
+  )
+  assert.equal(passes.identity, 'ruby')
+
+  const lowProbability = evaluateSpeakerDecisionAnswer(
+    { choice: 'known_0', probabilities: { known_0: 0.45, no_clear_identity: 0.3, uncast_character: 0.25 }, confidence: 0.9 },
+    optionSpeakerIds,
+  )
+  assert.equal(lowProbability.resolved, false)
+  assert.equal(lowProbability.leadingIdentity, 'ruby')
+
+  const lowConfidence = evaluateSpeakerDecisionAnswer(
+    { choice: 'known_0', probabilities: { known_0: 0.9, no_clear_identity: 0.1 }, confidence: 0.4 },
+    optionSpeakerIds,
+  )
+  assert.equal(lowConfidence.resolved, false)
+
+  const narrowMargin = evaluateSpeakerDecisionAnswer(
+    { choice: 'known_0', probabilities: { known_0: 0.55, no_clear_identity: 0.45 }, confidence: 0.9 },
+    optionSpeakerIds,
+  )
+  assert.equal(narrowMargin.resolved, false)
+  assert.ok(narrowMargin.margin < SPEAKER_DECISION_THRESHOLDS.local.margin)
+
+  const unknownOption = evaluateSpeakerDecisionAnswer(
+    { choice: 'known_9', probabilities: { known_9: 0.95, no_clear_identity: 0.05 }, confidence: 0.9 },
+    optionSpeakerIds,
+  )
+  assert.equal(unknownOption.resolved, false)
+
+  const uncast = evaluateSpeakerDecisionAnswer(
+    { choice: 'uncast_character', probabilities: { uncast_character: 0.9, no_clear_identity: 0.1 }, confidence: 0.9 },
+    optionSpeakerIds,
+  )
+  assert.equal(uncast.identity, UNCAST_SPEAKER_ID)
+})
+
 test('applies per-segment gain while assembling PCM WAV audio', () => {
+
   const wav = encodeConcatenatedWav([
     { sampleRate: 8_000, channels: [new Float32Array([0.5, -0.5])], gain: 0.5 },
   ])

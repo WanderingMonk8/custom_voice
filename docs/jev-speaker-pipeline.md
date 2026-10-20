@@ -4,6 +4,11 @@
 
 Implemented on the `jev` branch. The initial design was committed before implementation.
 
+Pipeline steps 1-6, including cross-paragraph discourse escalation, confidence
+normalization, caching, and diagnostics, are implemented in `src/core.ts` and
+wired through the backend Decision calls. Shadow mode and the promotion checklist
+in "Validation and rollout" remain rollout tasks.
+
 ## Objective
 
 Replace deterministic grammatical speaker inference as the primary assignment

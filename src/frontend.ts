@@ -1499,10 +1499,12 @@ export function setup(ctx: SpindleFrontendContext) {
   ): Promise<PlaybackSegment[]> {
     const requestId = `parse-${Date.now().toString(36)}-${++speakerParseRequestSequence}`
     return new Promise((resolve, reject) => {
+      // Jev may run a local pass and one discourse escalation back to back, and
+      // each host evaluation has its own 30-second deadline.
       const timer = setTimeout(() => {
         pendingSpeakerParseRequests.delete(requestId)
         reject(new Error('Jev speaker assignment timed out.'))
-      }, 45_000)
+      }, 70_000)
       pendingSpeakerParseRequests.set(requestId, { resolve, reject, timer })
       ctx.sendToBackend({
         type: 'chat_voice_parse_message',
