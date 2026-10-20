@@ -688,11 +688,16 @@ var ANONYMOUS_HUMAN_IDENTITY_PATTERN = new RegExp(
   `\\b(?:(?:a|an|another|some)\\s+(?:[\\p{L}\\p{M}'\u2019-]+[ -]){0,5}(?:${ANONYMOUS_HUMAN_NOUNS.join("|")})|the\\s+(?:[\\p{L}\\p{M}'\u2019-]+[ -]){0,5}(?:${ANONYMOUS_ROLE_NOUNS.join("|")}))\\b`,
   "iu"
 );
+var ANONYMOUS_ROLE_IDENTITY_PATTERN = new RegExp(
+  `\\b(?:a|an|another|some|the)\\s+(?:[\\p{L}\\p{M}'\u2019-]+[ -]){0,5}(?:${ANONYMOUS_ROLE_NOUNS.join("|")})\\b`,
+  "iu"
+);
+var ANONYMOUS_INDEFINITE_HUMAN_PATTERN = new RegExp(
+  `\\b(?:a|an|another|some)\\s+(?:[\\p{L}\\p{M}'\u2019-]+[ -]){0,5}(?:${ANONYMOUS_HUMAN_NOUNS.join("|")})\\b`,
+  "iu"
+);
 function hasAnonymousHumanSubject(text) {
   return ANONYMOUS_HUMAN_SUBJECT_PATTERN.test(narrativeOnly(text));
-}
-function hasAnonymousHumanIdentity(text) {
-  return ANONYMOUS_HUMAN_IDENTITY_PATTERN.test(narrativeOnly(text));
 }
 function hasAnonymousSpeechAttribution(text) {
   const narrative = narrativeOnly(text);
@@ -712,8 +717,7 @@ function eligibleCardFallbackSpeakerId(content, cardSpeakerId, speakers, skipped
   if (!cardSpeakerId) return null;
   const alternativeSpeakers = speakers.filter((speaker) => speaker.id !== cardSpeakerId);
   if (hasNamedSpeakerSubject(content, alternativeSpeakers, skippedTrackerTagPairs)) return null;
-  const playbackContent = preparePlaybackContent(content, skippedTrackerTagPairs);
-  return hasAnonymousHumanIdentity(playbackContent) ? null : cardSpeakerId;
+  return hasExplicitUncastCue(content, skippedTrackerTagPairs) ? null : cardSpeakerId;
 }
 function currentParagraphSpeaker(before, after, speakers) {
   let paragraphStart = 0;
@@ -1019,10 +1023,16 @@ var TURN_RELATION_CRITERIA = {
   [TURN_OTHER_OPTION]: "A different participant addresses someone else in the scene, a third party, or an off-scene channel.",
   [TURN_UNCLEAR_OPTION]: "The text does not establish whether the speaker continues or changes."
 };
+var SPEAKER_TURN_SWITCH_PATTERN = /\b(?:(?:another|a second|a third|a new|the other)\s+(?:voice|woman|man|person|speaker|figure|kid|girl|boy)|(?:someone|somebody)\s+(?:else\s+)?(?:says|said|asks|asked|replies|replied|answers|answered|calls|called|whispers|whispered|shouts|shouted)|(?:a|another)\s+voice\s+(?:from|behind|near|across)|from (?:across the room|the (?:hallway|doorway|next room|other room|shadows)))\b/iu;
 var NARRATIVE_SPEECH_VERB_PATTERN = new RegExp(
   `\\b(?:${SPEECH_VERBS}|blurt(?:s|ed)|laugh(?:s|ed)|mutter(?:s|ed)|hiss(?:es|ed)|snap(?:s|ped))\\b`,
   "iu"
 );
+function hasExplicitUncastCue(content, skippedTrackerTagPairs = "") {
+  const playbackContent = preparePlaybackContent(content, skippedTrackerTagPairs);
+  const narration = cleanPlaybackText(narrativeOnly(playbackContent));
+  return ANONYMOUS_ROLE_IDENTITY_PATTERN.test(narration) || ANONYMOUS_INDEFINITE_HUMAN_PATTERN.test(narration) || SPEAKER_TURN_SWITCH_PATTERN.test(narration);
+}
 function parseRosterVoiceSegmentsInternal(content, defaultSpeakerId, speakers, skippedTrackerTagPairs = "", quoteSpeakerOverrides, historicalSpeakerId = null, preserveLocalOnNullOverride = false, lowConfidenceQuoteIndexes, includeDebug = false) {
   const playbackContent = preparePlaybackContent(content, skippedTrackerTagPairs);
   const result = [];

@@ -821,8 +821,8 @@ test('keeps normalized first-pass answers when the discourse request fails', () 
   assert.ok(problem?.debugPath?.includes('discourse-outcome:not-a-target (first-pass identity retained)'))
 })
 
-test('a clear discourse uncast identity disables card-title deference', () => {
-  const content = ['"The door is locked."', '', '"Then find another way."'].join('\n')
+test('an explicitly anonymous role keeps discourse uncast ahead of card deference', () => {
+  const content = ['The stranger says, "The door is locked."', '', '"Then find another way."'].join('\n')
   const speakers = [{ id: 'naomi', name: 'Naomi' }]
   const plan = buildSpeakerDecisionPlan(content, speakers, false)
   const unclear = confidentDecision('no_clear_identity')
@@ -834,16 +834,6 @@ test('a clear discourse uncast identity disables card-title deference', () => {
   }
   const assessment = assessSpeakerDiscourseEscalation(plan, answers)
   assert.ok(assessment.plan)
-
-  const withoutDiscourse = resolveSpeakerDecisionSegments(content, plan, answers, speakers, {
-    isUserMessage: false,
-    cardSpeakerId: 'naomi',
-    historicalSpeakerId: null,
-  })
-  assert.deepEqual(
-    withoutDiscourse.filter(segment => segment.speakerId).map(segment => segment.speakerId),
-    ['naomi', 'naomi'],
-  )
 
   const discourseAnswers = {
     discourse_s0: confidentDecision('uncast_character'),
@@ -860,6 +850,46 @@ test('a clear discourse uncast identity disables card-title deference', () => {
   assert.deepEqual(spoken.map(segment => segment.speakerId), [UNCAST_SPEAKER_ID, UNCAST_SPEAKER_ID])
   assert.ok(spoken[0]?.debugPath?.includes(
     'resolution:discourse-identity (filled unresolved first pass)',
+  ))
+})
+
+test('defers a whole-message uncast identity to the unique card', () => {
+  const content = [
+    'She turns on the sidewalk. "That is a hand-kiss. In public."',
+    '',
+    '"And the cardigan. Look at you."',
+  ].join('\n')
+  const speakers = [{ id: 'jayden', name: 'Jayden Flynn / Jayden' }]
+  const plan = buildSpeakerDecisionPlan(content, speakers, false)
+  const uncast = confidentDecision('uncast_character')
+  const answers = {
+    paragraph_p0: uncast,
+    speech_s0: {
+      choice: 'uncast_character',
+      probabilities: { uncast_character: 0.55, known_0: 0.1, no_clear_identity: 0.35 },
+      confidence: 0.4,
+    },
+    paragraph_p1: uncast,
+    speech_s1: uncast,
+  }
+
+  const chain = decodeSpeakerChain(plan, answers)
+  assert.equal(chain.get('s0')?.filled, true)
+  assert.equal(chain.get('s0')?.identity, UNCAST_SPEAKER_ID)
+
+  const segments = resolveSpeakerDecisionSegments(content, plan, answers, speakers, {
+    isUserMessage: false,
+    cardSpeakerId: 'jayden',
+    historicalSpeakerId: null,
+    includeDebug: true,
+  })
+  const spoken = segments.filter(segment => [
+    'That is a hand-kiss. In public.',
+    'And the cardigan. Look at you.',
+  ].includes(segment.text))
+  assert.deepEqual(spoken.map(segment => segment.speakerId), ['jayden', 'jayden'])
+  assert.ok(spoken[0]?.debugPath?.includes(
+    'resolution:unique card-title match (uncast identity had no explicit role cue)',
   ))
 })
 
@@ -1377,6 +1407,22 @@ test('uses a card-title fallback only when no other cast identity is established
   )
   assert.equal(
     eligibleCardFallbackSpeakerId('Ruby closes the door. "Still here."', 'naomi', speakers),
+    null,
+  )
+})
+
+test('treats definite human descriptors as card-friendly but indefinite ones as anonymous', () => {
+  const speakers = [{ id: 'naomi', name: 'Naomi Lin / Naomi' }]
+  assert.equal(
+    eligibleCardFallbackSpeakerId('The woman waits. "Still here."', 'naomi', speakers),
+    'naomi',
+  )
+  assert.equal(
+    eligibleCardFallbackSpeakerId('An older woman waits. "Still here."', 'naomi', speakers),
+    null,
+  )
+  assert.equal(
+    eligibleCardFallbackSpeakerId('The clerk waits. "Still here."', 'naomi', speakers),
     null,
   )
 })

@@ -312,8 +312,9 @@ results and existing deterministic policy. There is no third semantic pass.
 Card-title deference, previous-message inheritance, user-role fallback, and the
 connection default are not candidates in the discourse questions. They remain
 post-classification policies and run only after every eligible escalation has
-finished. A clear discourse-level uncast identity disables card-title deference
-just like a clear first-pass uncast identity.
+finished. A clear discourse-level uncast identity follows the same card-title
+eligibility rules as a first-pass uncast identity, including the pronoun-only
+exception in section 6.
 
 ### 6. Deterministic resolution
 
@@ -328,9 +329,13 @@ and discourse answer is available.
    identity within the current message, stopping at a conflicting clear identity.
 5. An ambiguous opening run may inherit the last clear previous-assistant
    identity until the first clear current-message identity appears.
-6. Card-title deference is eligible only when the complete current assistant
-   message contains no clear known or uncast identity from paragraph, speech,
-   chain, or discourse decisions. The title must match exactly one configured NPC.
+6. Card-title deference is eligible when the complete current assistant message
+   contains no clear known identity and the title matches exactly one configured
+   NPC. A clear uncast identity blocks deference only when the text also carries
+   an explicit anonymous-role cue (“the clerk,” “a stranger”), an indefinite
+   human introduction (“an older woman”), or an unnamed-turn cue. A pronoun-only
+   message whose only identities are uncast — or a definite “the woman”/“the
+   man” — therefore defers to the unique card.
 7. When no unique card match exists and the message has no local clear identity,
    the previous-assistant identity rule remains available.
 8. Remaining unresolved assistant speech uses the TTS connection default.
@@ -340,8 +345,10 @@ The chain decode is the primary inheritance mechanism. Rules 3 and 4 remain as
 conservative fallbacks for spans the chain could not decide.
 
 All non-speech text remains narrator audio. A clear uncast result counts as an
-identity for inheritance and disables card-title deference, even though its
-voice route is the connection default.
+identity for inheritance. It disables card-title deference only when the text
+also names or implies another person through an explicit anonymous role, an
+indefinite human introduction, or an unnamed turn; otherwise the unique card
+owns the message and the connection default is not used.
 
 ### 7. Voice routing
 
@@ -470,6 +477,11 @@ that merely routes to the same connection-default voice.
 9. Promote Jev to primary only after the known regression corpus passes.
 10. Keep the current parser for one compatibility cycle, then remove obsolete
     grammatical rules separately after the Jev path is stable.
+11. Add paired fixtures for card deference: a pronoun-only message — or one that
+    uses only a definite “the woman”/“the man” — whose identities are uncast and
+    whose title matches one card must route to that card. The same message with
+    an explicit “stranger,” “another voice,” or “an older woman” must stay on the
+    connection default.
 
 ## Security and privacy
 

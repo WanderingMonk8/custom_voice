@@ -1399,6 +1399,28 @@ const ANONYMOUS_HUMAN_IDENTITY_PATTERN = new RegExp(
   'iu',
 )
 
+/**
+ * An explicitly anonymous role such as "the clerk" or "a stranger". Unlike the
+ * broader human pattern, generic descriptors like "the woman" or "the man" are
+ * excluded, because those commonly refer to the card character itself.
+ */
+const ANONYMOUS_ROLE_IDENTITY_PATTERN = new RegExp(
+  `\\b(?:a|an|another|some|the)\\s+(?:[\\p{L}\\p{M}'’-]+[ -]){0,5}`
+    + `(?:${ANONYMOUS_ROLE_NOUNS.join('|')})\\b`,
+  'iu',
+)
+
+/**
+ * An indefinite human introduction such as "an older woman" or "a kid with a
+ * bag". A definite "the woman" is ambiguous and may be the card, so it is not
+ * treated as a cue by itself.
+ */
+const ANONYMOUS_INDEFINITE_HUMAN_PATTERN = new RegExp(
+  `\\b(?:a|an|another|some)\\s+(?:[\\p{L}\\p{M}'’-]+[ -]){0,5}`
+    + `(?:${ANONYMOUS_HUMAN_NOUNS.join('|')})\\b`,
+  'iu',
+)
+
 /** Detect a clause-leading, explicitly anonymous person such as "an older woman". */
 function hasAnonymousHumanSubject(text: string): boolean {
   return ANONYMOUS_HUMAN_SUBJECT_PATTERN.test(narrativeOnly(text))
@@ -1433,9 +1455,11 @@ export function hasNamedSpeakerSubject(
 
 /**
  * Use a card-matched speaker only when the message establishes no other
- * character identity. Named local speakers and anonymous roles both make the
- * card match ineligible, leaving otherwise unresolved dialogue on the
- * connection default voice.
+ * character identity. Named local speakers, explicit anonymous roles, and
+ * indefinite human introductions all make the card match ineligible, leaving
+ * otherwise unresolved dialogue on the connection default voice. A definite
+ * "the woman" or "the man" may be the card itself, so it does not block the
+ * fallback.
  */
 export function eligibleCardFallbackSpeakerId(
   content: string,
@@ -1446,8 +1470,7 @@ export function eligibleCardFallbackSpeakerId(
   if (!cardSpeakerId) return null
   const alternativeSpeakers = speakers.filter(speaker => speaker.id !== cardSpeakerId)
   if (hasNamedSpeakerSubject(content, alternativeSpeakers, skippedTrackerTagPairs)) return null
-  const playbackContent = preparePlaybackContent(content, skippedTrackerTagPairs)
-  return hasAnonymousHumanIdentity(playbackContent) ? null : cardSpeakerId
+  return hasExplicitUncastCue(content, skippedTrackerTagPairs) ? null : cardSpeakerId
 }
 
 function currentParagraphSpeaker(
@@ -3234,6 +3257,19 @@ export function decodeSpeakerChain(
   return decisions
 }
 
+/**
+ * Whether the text explicitly establishes a person other than the card through
+ * an anonymous role or an unnamed turn. Pronoun-only scenes do not count, so a
+ * unique card can still own a whole-message uncast identity.
+ */
+function hasExplicitUncastCue(content: string, skippedTrackerTagPairs = ''): boolean {
+  const playbackContent = preparePlaybackContent(content, skippedTrackerTagPairs)
+  const narration = cleanPlaybackText(narrativeOnly(playbackContent))
+  return ANONYMOUS_ROLE_IDENTITY_PATTERN.test(narration)
+    || ANONYMOUS_INDEFINITE_HUMAN_PATTERN.test(narration)
+    || SPEAKER_TURN_SWITCH_PATTERN.test(narration)
+}
+
 export function resolveSpeakerDecisionSegments(
   content: string,
   plan: SpeakerDecisionPlan,
@@ -3293,6 +3329,25 @@ export function resolveSpeakerDecisionSegments(
   })
   const hasLocalIdentity = [...paragraphIdentities.values(), ...speechIdentities]
     .some(identity => identity !== undefined)
+  const hasKnownIdentity = [...paragraphIdentities.values(), ...speechIdentities]
+    .some(identity => identity !== undefined && identity !== UNCAST_SPEAKER_ID)
+  const hasUncastIdentity = [...paragraphIdentities.values(), ...speechIdentities]
+    .some(identity => identity === UNCAST_SPEAKER_ID)
+  const explicitUncastCue = hasExplicitUncastCue(content, options.skippedTrackerTagPairs ?? '')
+  // A whole-message uncast guess should not outrank a unique card when nothing
+  // in the text names or describes another person. An explicit anonymous role
+  // ("the clerk", "a stranger") or an unnamed turn keeps the default voice.
+  const cardIdentity = options.cardSpeakerId
+    && !hasKnownIdentity
+    && (!hasUncastIdentity || !explicitUncastCue)
+    ? options.cardSpeakerId
+    : null
+  const deferredUncast = Boolean(cardIdentity && hasUncastIdentity)
+  const routingIdentity = (identity: string | null | undefined): string | undefined => {
+    if (identity === undefined || identity === null) return undefined
+    return deferredUncast && identity === UNCAST_SPEAKER_ID ? undefined : identity
+  }
+  const routingIdentities = speechIdentities.map(identity => routingIdentity(identity))
   const resolved: Array<string | null> = []
   const resolutionPaths: string[][] = []
   let upstreamIdentity: string | null = null
@@ -3303,13 +3358,13 @@ export function resolveSpeakerDecisionSegments(
     const currentParagraphIndex = Number.parseInt(speech.paragraphId.slice(1), 10)
     while (processedParagraphIndex < currentParagraphIndex) {
       processedParagraphIndex += 1
-      const paragraphIdentity = paragraphIdentities.get(`p${processedParagraphIndex}`)
+      const paragraphIdentity = routingIdentity(paragraphIdentities.get(`p${processedParagraphIndex}`))
       if (paragraphIdentity !== undefined) {
         upstreamIdentity = paragraphIdentity
         upstreamSource = `paragraph-p${processedParagraphIndex}`
       }
     }
-    const direct = speechIdentities[index]
+    const direct = routingIdentities[index]
     let speakerId: string | null
     if (direct !== undefined) {
       speakerId = direct
@@ -3326,16 +3381,20 @@ export function resolveSpeakerDecisionSegments(
     } else if (
       options.historicalSpeakerId
       && (
-        speechIdentities.slice(index + 1).some(identity => identity !== undefined)
+        routingIdentities.slice(index + 1).some(identity => identity !== undefined)
         || plan.state.paragraphs.slice(currentParagraphIndex + 1)
-          .some(paragraph => paragraphIdentities.get(paragraph.id) !== undefined)
+          .some(paragraph => routingIdentity(paragraphIdentities.get(paragraph.id)) !== undefined)
       )
     ) {
       speakerId = options.historicalSpeakerId
       resolutionPaths.push(['resolution:previous-assistant opening inheritance before later local identity'])
-    } else if (!hasLocalIdentity && options.cardSpeakerId) {
-      speakerId = options.cardSpeakerId
-      resolutionPaths.push(['resolution:unique card-title match (no local known or uncast identity)'])
+    } else if (cardIdentity) {
+      speakerId = cardIdentity
+      resolutionPaths.push([
+        deferredUncast
+          ? 'resolution:unique card-title match (uncast identity had no explicit role cue)'
+          : 'resolution:unique card-title match (no local known or uncast identity)',
+      ])
     } else if (!hasLocalIdentity && options.historicalSpeakerId) {
       speakerId = options.historicalSpeakerId
       resolutionPaths.push(['resolution:previous-assistant identity (no local identity or card match)'])

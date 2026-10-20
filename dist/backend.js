@@ -785,11 +785,16 @@ var ANONYMOUS_HUMAN_IDENTITY_PATTERN = new RegExp(
   `\\b(?:(?:a|an|another|some)\\s+(?:[\\p{L}\\p{M}'\u2019-]+[ -]){0,5}(?:${ANONYMOUS_HUMAN_NOUNS.join("|")})|the\\s+(?:[\\p{L}\\p{M}'\u2019-]+[ -]){0,5}(?:${ANONYMOUS_ROLE_NOUNS.join("|")}))\\b`,
   "iu"
 );
+var ANONYMOUS_ROLE_IDENTITY_PATTERN = new RegExp(
+  `\\b(?:a|an|another|some|the)\\s+(?:[\\p{L}\\p{M}'\u2019-]+[ -]){0,5}(?:${ANONYMOUS_ROLE_NOUNS.join("|")})\\b`,
+  "iu"
+);
+var ANONYMOUS_INDEFINITE_HUMAN_PATTERN = new RegExp(
+  `\\b(?:a|an|another|some)\\s+(?:[\\p{L}\\p{M}'\u2019-]+[ -]){0,5}(?:${ANONYMOUS_HUMAN_NOUNS.join("|")})\\b`,
+  "iu"
+);
 function hasAnonymousHumanSubject(text) {
   return ANONYMOUS_HUMAN_SUBJECT_PATTERN.test(narrativeOnly(text));
-}
-function hasAnonymousHumanIdentity(text) {
-  return ANONYMOUS_HUMAN_IDENTITY_PATTERN.test(narrativeOnly(text));
 }
 function hasAnonymousSpeechAttribution(text) {
   const narrative = narrativeOnly(text);
@@ -809,8 +814,7 @@ function eligibleCardFallbackSpeakerId(content, cardSpeakerId, speakers, skipped
   if (!cardSpeakerId) return null;
   const alternativeSpeakers = speakers.filter((speaker) => speaker.id !== cardSpeakerId);
   if (hasNamedSpeakerSubject(content, alternativeSpeakers, skippedTrackerTagPairs)) return null;
-  const playbackContent = preparePlaybackContent(content, skippedTrackerTagPairs);
-  return hasAnonymousHumanIdentity(playbackContent) ? null : cardSpeakerId;
+  return hasExplicitUncastCue(content, skippedTrackerTagPairs) ? null : cardSpeakerId;
 }
 function currentParagraphSpeaker(before, after, speakers) {
   let paragraphStart = 0;
@@ -2019,6 +2023,11 @@ function decodeSpeakerChain(plan, answers) {
   }
   return decisions;
 }
+function hasExplicitUncastCue(content, skippedTrackerTagPairs = "") {
+  const playbackContent = preparePlaybackContent(content, skippedTrackerTagPairs);
+  const narration = cleanPlaybackText(narrativeOnly(playbackContent));
+  return ANONYMOUS_ROLE_IDENTITY_PATTERN.test(narration) || ANONYMOUS_INDEFINITE_HUMAN_PATTERN.test(narration) || SPEAKER_TURN_SWITCH_PATTERN.test(narration);
+}
 function resolveSpeakerDecisionSegments(content, plan, answers, speakers, options) {
   const paragraphIdentities = new Map(plan.state.paragraphs.map((paragraph) => [
     paragraph.id,
@@ -2048,6 +2057,16 @@ function resolveSpeakerDecisionSegments(content, plan, answers, speakers, option
     return outcome.identity ?? void 0;
   });
   const hasLocalIdentity = [...paragraphIdentities.values(), ...speechIdentities].some((identity) => identity !== void 0);
+  const hasKnownIdentity = [...paragraphIdentities.values(), ...speechIdentities].some((identity) => identity !== void 0 && identity !== UNCAST_SPEAKER_ID);
+  const hasUncastIdentity = [...paragraphIdentities.values(), ...speechIdentities].some((identity) => identity === UNCAST_SPEAKER_ID);
+  const explicitUncastCue = hasExplicitUncastCue(content, options.skippedTrackerTagPairs ?? "");
+  const cardIdentity = options.cardSpeakerId && !hasKnownIdentity && (!hasUncastIdentity || !explicitUncastCue) ? options.cardSpeakerId : null;
+  const deferredUncast = Boolean(cardIdentity && hasUncastIdentity);
+  const routingIdentity = (identity) => {
+    if (identity === void 0 || identity === null) return void 0;
+    return deferredUncast && identity === UNCAST_SPEAKER_ID ? void 0 : identity;
+  };
+  const routingIdentities = speechIdentities.map((identity) => routingIdentity(identity));
   const resolved = [];
   const resolutionPaths = [];
   let upstreamIdentity = null;
@@ -2058,13 +2077,13 @@ function resolveSpeakerDecisionSegments(content, plan, answers, speakers, option
     const currentParagraphIndex = Number.parseInt(speech.paragraphId.slice(1), 10);
     while (processedParagraphIndex < currentParagraphIndex) {
       processedParagraphIndex += 1;
-      const paragraphIdentity = paragraphIdentities.get(`p${processedParagraphIndex}`);
+      const paragraphIdentity = routingIdentity(paragraphIdentities.get(`p${processedParagraphIndex}`));
       if (paragraphIdentity !== void 0) {
         upstreamIdentity = paragraphIdentity;
         upstreamSource = `paragraph-p${processedParagraphIndex}`;
       }
     }
-    const direct = speechIdentities[index];
+    const direct = routingIdentities[index];
     let speakerId;
     if (direct !== void 0) {
       speakerId = direct;
@@ -2076,12 +2095,14 @@ function resolveSpeakerDecisionSegments(content, plan, answers, speakers, option
     } else if (upstreamIdentity) {
       speakerId = upstreamIdentity;
       resolutionPaths.push([`resolution:upstream-identity (${upstreamSource})`]);
-    } else if (options.historicalSpeakerId && (speechIdentities.slice(index + 1).some((identity) => identity !== void 0) || plan.state.paragraphs.slice(currentParagraphIndex + 1).some((paragraph) => paragraphIdentities.get(paragraph.id) !== void 0))) {
+    } else if (options.historicalSpeakerId && (routingIdentities.slice(index + 1).some((identity) => identity !== void 0) || plan.state.paragraphs.slice(currentParagraphIndex + 1).some((paragraph) => routingIdentity(paragraphIdentities.get(paragraph.id)) !== void 0))) {
       speakerId = options.historicalSpeakerId;
       resolutionPaths.push(["resolution:previous-assistant opening inheritance before later local identity"]);
-    } else if (!hasLocalIdentity && options.cardSpeakerId) {
-      speakerId = options.cardSpeakerId;
-      resolutionPaths.push(["resolution:unique card-title match (no local known or uncast identity)"]);
+    } else if (cardIdentity) {
+      speakerId = cardIdentity;
+      resolutionPaths.push([
+        deferredUncast ? "resolution:unique card-title match (uncast identity had no explicit role cue)" : "resolution:unique card-title match (no local known or uncast identity)"
+      ]);
     } else if (!hasLocalIdentity && options.historicalSpeakerId) {
       speakerId = options.historicalSpeakerId;
       resolutionPaths.push(["resolution:previous-assistant identity (no local identity or card match)"]);
