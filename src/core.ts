@@ -740,8 +740,17 @@ export function addUnconfiguredDialogueSpeakers(
         && playbackQuotes(paragraphs[paragraphIndex + 1].text).length > 0
       if (!nextHasDialogue) continue
       const narration = paragraph.text.replace(/^[\s,.;:!?—–-]+/u, '')
-      const lead = narration.match(/^([\p{Lu}][\p{L}\p{M}'’.\-]{1,63})(?=\s)/u)?.[1]
-      if (lead) addCandidate(lead)
+      const attributedLead = narration.match(
+        new RegExp(
+          `^([\\p{Lu}][\\p{L}\\p{M}'’.\\-]{1,63})(?:(?:\\s*,\\s*[^,\\n]{1,60},\\s*)|\\s+)${SPEECH_VERBS}\\b`,
+          'u',
+        ),
+      )?.[1]
+      if (attributedLead) addCandidate(attributedLead, true)
+      else {
+        const lead = narration.match(/^([\p{Lu}][\p{L}\p{M}'’.\-]{1,63})(?=\s)/u)?.[1]
+        if (lead) addCandidate(lead)
+      }
       continue
     }
     let cursor = 0
@@ -1351,9 +1360,23 @@ const ANONYMOUS_HUMAN_SUBJECT_PATTERN = new RegExp(
   'iu',
 )
 
+const ANONYMOUS_HUMAN_IDENTITY_PATTERN = new RegExp(
+  `\\b(?:`
+    + `(?:a|an|another|some)\\s+(?:[\\p{L}\\p{M}'’-]+[ -]){0,5}`
+      + `(?:${ANONYMOUS_HUMAN_NOUNS.join('|')})`
+    + `|the\\s+(?:[\\p{L}\\p{M}'’-]+[ -]){0,5}`
+      + `(?:${ANONYMOUS_ROLE_NOUNS.join('|')})`
+    + `)\\b`,
+  'iu',
+)
+
 /** Detect a clause-leading, explicitly anonymous person such as "an older woman". */
 function hasAnonymousHumanSubject(text: string): boolean {
   return ANONYMOUS_HUMAN_SUBJECT_PATTERN.test(narrativeOnly(text))
+}
+
+function hasAnonymousHumanIdentity(text: string): boolean {
+  return ANONYMOUS_HUMAN_IDENTITY_PATTERN.test(narrativeOnly(text))
 }
 
 function hasAnonymousSpeechAttribution(text: string): boolean {
@@ -1395,7 +1418,7 @@ export function eligibleCardFallbackSpeakerId(
   const alternativeSpeakers = speakers.filter(speaker => speaker.id !== cardSpeakerId)
   if (hasNamedSpeakerSubject(content, alternativeSpeakers, skippedTrackerTagPairs)) return null
   const playbackContent = preparePlaybackContent(content, skippedTrackerTagPairs)
-  return hasAnonymousHumanSubject(playbackContent) ? null : cardSpeakerId
+  return hasAnonymousHumanIdentity(playbackContent) ? null : cardSpeakerId
 }
 
 function currentParagraphSpeaker(

@@ -495,6 +495,30 @@ test('uses a card-title fallback only when no other cast identity is established
   )
 })
 
+test('disables a card-title fallback for mid-paragraph anonymous and aside-attributed identities', () => {
+  const content = [
+    'The guy from the end of the hall was talking to the person attached to the phone: a broad kid with a grocery bag.',
+    '"No, the reading was fine."',
+    '',
+    'Dev, apparently, said something out of frame.',
+    '',
+    '"Yeah, he has got the face."',
+  ].join('\n')
+  const speakers = addUnconfiguredDialogueSpeakers(
+    content,
+    [{ id: 'naomi', name: 'Naomi Lin / Naomi' }],
+  )
+
+  assert.equal(eligibleCardFallbackSpeakerId(content, 'naomi', speakers), null)
+  assert.ok(speakers.some(speaker => speaker.name === 'Dev'))
+  const speech = parseRosterVoiceSegments(content, null, speakers)
+    .filter(segment => segment.text === 'No, the reading was fine.' || segment.text === 'Yeah, he has got the face.')
+  assert.ok(speech.every(segment => segment.speakerId !== 'naomi'))
+  assert.ok(speech.every(segment => (
+    playbackVoiceForSpeaker(segment.speakerId, false, { naomi: 'naomi-voice' }, '', '') === ''
+  )))
+})
+
 test('routes dialogue anchored to an anonymous local character through the connection default', () => {
   const content = [
     'The phone buzzed.',

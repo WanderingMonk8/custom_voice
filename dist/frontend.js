@@ -333,8 +333,17 @@ function addUnconfiguredDialogueSpeakers(content, speakers) {
       const nextHasDialogue = paragraphIndex + 1 < paragraphs.length && playbackQuotes(paragraphs[paragraphIndex + 1].text).length > 0;
       if (!nextHasDialogue) continue;
       const narration = paragraph.text.replace(/^[\s,.;:!?—–-]+/u, "");
-      const lead = narration.match(/^([\p{Lu}][\p{L}\p{M}'’.\-]{1,63})(?=\s)/u)?.[1];
-      if (lead) addCandidate(lead);
+      const attributedLead = narration.match(
+        new RegExp(
+          `^([\\p{Lu}][\\p{L}\\p{M}'\u2019.\\-]{1,63})(?:(?:\\s*,\\s*[^,\\n]{1,60},\\s*)|\\s+)${SPEECH_VERBS}\\b`,
+          "u"
+        )
+      )?.[1];
+      if (attributedLead) addCandidate(attributedLead, true);
+      else {
+        const lead = narration.match(/^([\p{Lu}][\p{L}\p{M}'’.\-]{1,63})(?=\s)/u)?.[1];
+        if (lead) addCandidate(lead);
+      }
       continue;
     }
     let cursor = 0;
@@ -681,8 +690,15 @@ var ANONYMOUS_HUMAN_SUBJECT_PATTERN = new RegExp(
   `(?:^\\s*|[.!?;]\\s+|^\\s*[^,\\n]{1,120},\\s*)(?:(?:a|an|another|some)\\s+(?:[\\p{L}\\p{M}'\u2019-]+[ -]){0,5}(?:${ANONYMOUS_HUMAN_NOUNS.join("|")})|the\\s+(?:[\\p{L}\\p{M}'\u2019-]+[ -]){0,5}(?:${ANONYMOUS_ROLE_NOUNS.join("|")}))\\b`,
   "iu"
 );
+var ANONYMOUS_HUMAN_IDENTITY_PATTERN = new RegExp(
+  `\\b(?:(?:a|an|another|some)\\s+(?:[\\p{L}\\p{M}'\u2019-]+[ -]){0,5}(?:${ANONYMOUS_HUMAN_NOUNS.join("|")})|the\\s+(?:[\\p{L}\\p{M}'\u2019-]+[ -]){0,5}(?:${ANONYMOUS_ROLE_NOUNS.join("|")}))\\b`,
+  "iu"
+);
 function hasAnonymousHumanSubject(text) {
   return ANONYMOUS_HUMAN_SUBJECT_PATTERN.test(narrativeOnly(text));
+}
+function hasAnonymousHumanIdentity(text) {
+  return ANONYMOUS_HUMAN_IDENTITY_PATTERN.test(narrativeOnly(text));
 }
 function hasAnonymousSpeechAttribution(text) {
   const narrative = narrativeOnly(text);
@@ -703,7 +719,7 @@ function eligibleCardFallbackSpeakerId(content, cardSpeakerId, speakers, skipped
   const alternativeSpeakers = speakers.filter((speaker) => speaker.id !== cardSpeakerId);
   if (hasNamedSpeakerSubject(content, alternativeSpeakers, skippedTrackerTagPairs)) return null;
   const playbackContent = preparePlaybackContent(content, skippedTrackerTagPairs);
-  return hasAnonymousHumanSubject(playbackContent) ? null : cardSpeakerId;
+  return hasAnonymousHumanIdentity(playbackContent) ? null : cardSpeakerId;
 }
 function currentParagraphSpeaker(before, after, speakers) {
   let paragraphStart = 0;
