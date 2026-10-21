@@ -124,14 +124,8 @@ function mergeVoicePlan(segments) {
   const result = [];
   for (const segment of segments) {
     const paragraphs = segment.text.trim().split(/\n\s*\n+/).map((paragraph) => paragraph.replace(/\s*\n\s*/g, " ").trim()).filter(Boolean);
-    for (let index = 0; index < paragraphs.length; index += 1) {
-      const text = paragraphs[index];
-      const previous = result.at(-1);
-      if (index === 0 && previous?.voice === segment.voice) {
-        previous.text = `${previous.text} ${text}`;
-      } else {
-        result.push({ text, voice: segment.voice });
-      }
+    for (const text of paragraphs) {
+      result.push({ text, voice: segment.voice });
     }
   }
   return result;

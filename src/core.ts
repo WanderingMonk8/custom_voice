@@ -305,7 +305,12 @@ export function encodeConcatenatedWav(segments: PcmAudioSegment[]): ArrayBuffer 
   return output
 }
 
-/** Reduce TTS requests without changing playback order or voice boundaries. */
+/**
+ * Normalize each planned segment into paragraph-sized TTS requests. Segments
+ * are split on blank lines, but never merged across parser boundaries: a long
+ * speech made of several paragraphs should synthesize as several requests so
+ * playback can start sooner and paragraphs can generate concurrently.
+ */
 export function mergeVoicePlan(segments: VoicePlanSegment[]): VoicePlanSegment[] {
   const result: VoicePlanSegment[] = []
   for (const segment of segments) {
@@ -314,14 +319,8 @@ export function mergeVoicePlan(segments: VoicePlanSegment[]): VoicePlanSegment[]
       .split(/\n\s*\n+/)
       .map(paragraph => paragraph.replace(/\s*\n\s*/g, ' ').trim())
       .filter(Boolean)
-    for (let index = 0; index < paragraphs.length; index += 1) {
-      const text = paragraphs[index]
-      const previous = result.at(-1)
-      if (index === 0 && previous?.voice === segment.voice) {
-        previous.text = `${previous.text} ${text}`
-      } else {
-        result.push({ text, voice: segment.voice })
-      }
+    for (const text of paragraphs) {
+      result.push({ text, voice: segment.voice })
     }
   }
   return result

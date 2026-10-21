@@ -1083,7 +1083,7 @@ test('paces synthesis starts inside a rolling request window', () => {
   assert.equal(reducedRequestWindowLimit(7), 6)
 })
 
-test('merges adjacent segments that use the same voice', () => {
+test('keeps adjacent same-voice segments as separate synthesis requests', () => {
   assert.deepEqual(mergeVoicePlan([
     { text: 'First sentence.', voice: 'narrator' },
     { text: ' Second sentence. ', voice: 'narrator' },
@@ -1091,9 +1091,33 @@ test('merges adjacent segments that use the same voice', () => {
     { text: '', voice: 'alice' },
     { text: 'Back to narration.', voice: 'narrator' },
   ]), [
-    { text: 'First sentence. Second sentence.', voice: 'narrator' },
+    { text: 'First sentence.', voice: 'narrator' },
+    { text: 'Second sentence.', voice: 'narrator' },
     { text: 'Hello.', voice: 'alice' },
     { text: 'Back to narration.', voice: 'narrator' },
+  ])
+})
+
+test('plans each same-speaker paragraph as an independent synthesis request', () => {
+  const content = [
+    'Narration.',
+    '',
+    '"First paragraph of the speech."',
+    '',
+    '"Second paragraph of the same speech."',
+    '',
+    '"Third paragraph."',
+  ].join('\n')
+  const segments = parseRosterVoiceSegments(content, 'alice', [{ id: 'alice', name: 'Alice' }])
+  const plan = mergeVoicePlan(segments.map(segment => ({
+    text: segment.text,
+    voice: segment.speakerId ?? 'narrator',
+  })))
+  assert.deepEqual(plan, [
+    { text: 'Narration.', voice: 'narrator' },
+    { text: 'First paragraph of the speech.', voice: 'alice' },
+    { text: 'Second paragraph of the same speech.', voice: 'alice' },
+    { text: 'Third paragraph.', voice: 'alice' },
   ])
 })
 

@@ -19,7 +19,7 @@ A [Lumiverse Spindle](https://docs.lumiverse.chat/) extension that detects chara
 - When quotations lack a coherent current identity, locally uses the immediately preceding assistant speaker to resolve identity-free or conflicting narrative candidates; explicit current attribution and conflicting pronoun speakers disable this fallback.
 - Routes Lumiverse's native message TTS button through ordered multi-voice playback.
 - Overrides the matching native context-menu action instead of adding duplicate playback controls.
-- Merges adjacent same-voice passages within each paragraph, splits multi-paragraph passages into smaller requests, and dynamically adjusts generation concurrency from median length and short-segment density to reduce gaps without bursting short requests.
+- Splits playback into paragraph-sized TTS requests, including separate requests for consecutive same-speaker paragraphs, and dynamically adjusts generation concurrency from median length and short-segment density to reduce gaps without bursting short requests.
 - Paces request starts and automatically pauses and resumes unfinished generation when a TTS provider responds with HTTP 429. It honors `Retry-After`, keeps completed segments, and uses a configurable cumulative rate-limit wait budget.
 - Automatically balances differing TTS voice levels with silence-gated RMS analysis, a rolling profile for each voice, ±6 dB gain limits, and a -1 dBFS peak ceiling.
 - Uses Lumiverse's selected TTS connection, falling back to the profile marked as the default, when a chat has no saved connection.
