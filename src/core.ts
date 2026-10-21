@@ -103,9 +103,21 @@ export interface DetectedCharacter extends CharacterLike {
   messageCount: number
 }
 
+export interface TtsTagPlacement {
+  /** Speech ID from the decision plan, used to correlate placement chunks. */
+  id: string
+  tag: string
+  position: string
+  source: 'jev' | 'llm'
+}
+
 export interface PlaybackSegment {
   text: string
   speakerId: string | null
+  /** Text delivered to TTS. May contain inline vocal tags; text is unchanged. */
+  ttsText?: string
+  /** The inline tag represented by ttsText, when one was added. */
+  ttsTag?: TtsTagPlacement
   /** Human-readable parser decisions, populated only when diagnostics are requested. */
   debugPath?: string[]
 }
@@ -113,6 +125,8 @@ export interface PlaybackSegment {
 export interface VoicePlanSegment {
   text: string
   voice: string
+  /** Speech plan ID so late tag placements can update this entry. */
+  tagId?: string
 }
 
 /** Keep a deterministic role fallback when optional review tries to replace it. */
@@ -320,7 +334,11 @@ export function mergeVoicePlan(segments: VoicePlanSegment[]): VoicePlanSegment[]
       .map(paragraph => paragraph.replace(/\s*\n\s*/g, ' ').trim())
       .filter(Boolean)
     for (const text of paragraphs) {
-      result.push({ text, voice: segment.voice })
+      result.push({
+        text,
+        voice: segment.voice,
+        ...(segment.tagId ? { tagId: segment.tagId } : {}),
+      })
     }
   }
   return result
@@ -436,7 +454,30 @@ function readParsedMessages(value: unknown): Record<string, CachedMessageParse> 
       const speakerId = segment.speakerId === null || typeof segment.speakerId === 'string'
         ? segment.speakerId
         : null
-      if (text) segments.push({ text, speakerId: speakerId?.slice(0, 256) ?? null })
+      const ttsText = typeof segment.ttsText === 'string'
+        ? segment.ttsText.trim().slice(0, 20_000)
+        : ''
+      const ttsTag = isRecord(segment.ttsTag)
+        && typeof segment.ttsTag.id === 'string'
+        && typeof segment.ttsTag.tag === 'string'
+        && (segment.ttsTag.source === 'jev' || segment.ttsTag.source === 'llm')
+        ? {
+            id: segment.ttsTag.id.slice(0, 64),
+            tag: normalizeTtsTagName(segment.ttsTag.tag) ?? '',
+            position: typeof segment.ttsTag.position === 'string'
+              ? segment.ttsTag.position.slice(0, 32)
+              : 'start',
+            source: segment.ttsTag.source as 'jev' | 'llm',
+          }
+        : null
+      if (text) {
+        segments.push({
+          text,
+          speakerId: speakerId?.slice(0, 256) ?? null,
+          ...(ttsText ? { ttsText } : {}),
+          ...(ttsTag?.tag ? { ttsTag } : {}),
+        })
+      }
     }
     if (segments.length > 0) {
       const discourse = readCachedDiscourse(item.discourse)
@@ -557,7 +598,7 @@ export function hashMessageContent(content: string): string {
   return `${content.length.toString(36)}-${(hash >>> 0).toString(36)}`
 }
 
-function extractGenerationText(value: unknown): string {
+export function extractGenerationText(value: unknown): string {
   if (typeof value === 'string') return value
   if (!isRecord(value)) return ''
   if (typeof value.content === 'string') return value.content
@@ -2126,6 +2167,445 @@ export function buildSpeakerDecisionPlan(
   return plan
 }
 
+export type TtsTagStyle = 'off' | 'gemini' | 'fish'
+
+export interface TtsTagThresholds {
+  probability: number
+  confidence: number
+  margin: number
+}
+
+export const TTS_TAG_THRESHOLDS: TtsTagThresholds = {
+  probability: 0.65,
+  confidence: 0.6,
+  margin: 0.2,
+}
+
+export const TTS_TAG_POSITION_THRESHOLDS: TtsTagThresholds = {
+  probability: 0.5,
+  confidence: 0.5,
+  margin: 0.1,
+}
+
+export interface TtsTagOption {
+  value: string
+  description: string
+}
+
+/** The momentary vocal vocabulary accepted by the TTS engines. */
+export const TTS_TAG_OPTIONS: readonly TtsTagOption[] = [
+  { value: 'laugh', description: 'A brief laugh.' },
+  { value: 'chuckle', description: 'A soft, low laugh.' },
+  { value: 'giggle', description: 'A light, high giggle.' },
+  { value: 'snicker', description: 'A half-suppressed laugh.' },
+  { value: 'cackle', description: 'A sharp, harsh laugh.' },
+  { value: 'cheer', description: 'A short cheer or whoop.' },
+  { value: 'gasp', description: 'A sharp intake of breath.' },
+  { value: 'sigh', description: 'A long exhale of relief, frustration, or resignation.' },
+  { value: 'groan', description: 'A low sound of pain or dismay.' },
+  { value: 'grunt', description: 'A short, effortful grunt.' },
+  { value: 'grr', description: 'A low, frustrated growl-like sound.' },
+  { value: 'growl', description: 'A menacing growl.' },
+  { value: 'hiss', description: 'A sharp hiss.' },
+  { value: 'moan', description: 'A low moan of pain or pleasure.' },
+  { value: 'pant', description: 'A few panting breaths.' },
+  { value: 'pff', description: 'A dismissive puff of breath.' },
+  { value: 'phew', description: 'A relieved phew.' },
+  { value: 'tsk', description: 'A disapproving tsk.' },
+  { value: 'whispers', description: 'A whispered delivery.' },
+  { value: 'shout', description: 'A sudden shout.' },
+  { value: 'argh', description: 'A frustrated argh.' },
+  { value: 'whimper', description: 'A small whimper.' },
+  { value: 'cry', description: 'A brief cry.' },
+  { value: 'sob', description: 'A sob.' },
+  { value: 'scream', description: 'A scream.' },
+  { value: 'shriek', description: 'A high shriek.' },
+  { value: 'snort', description: 'A snort of amusement or contempt.' },
+  { value: 'breath', description: 'A single audible breath.' },
+  { value: 'heavy breath', description: 'A heavy breath.' },
+  { value: 'exhales', description: 'A deliberate exhale.' },
+  { value: 'cough', description: 'A cough.' },
+  { value: 'throat-clearing', description: 'A throat-clearing sound.' },
+  { value: 'sneeze', description: 'A sneeze.' },
+  { value: 'yawn', description: 'A yawn.' },
+  { value: 'short pause', description: 'A brief pause.' },
+  { value: 'long pause', description: 'A longer pause.' },
+] as const
+
+const TTS_TAG_NAMES = new Set(TTS_TAG_OPTIONS.map(option => option.value))
+const TTS_TAG_ALIASES = new Map<string, string>([
+  ['laughter', 'laugh'], ['laughs', 'laugh'],
+  ['chuckles', 'chuckle'], ['giggles', 'giggle'], ['snickers', 'snicker'],
+  ['cackles', 'cackle'], ['cheers', 'cheer'],
+  ['gasps', 'gasp'], ['sighs', 'sigh'], ['groans', 'groan'], ['grunts', 'grunt'],
+  ['growls', 'growl'], ['hisses', 'hiss'], ['moans', 'moan'], ['pants', 'pant'],
+  ['whisper', 'whispers'], ['whispering', 'whispers'], ['shouts', 'shout'],
+  ['cries', 'cry'], ['sobs', 'sob'], ['screams', 'scream'], ['shrieks', 'shriek'],
+  ['snorts', 'snort'], ['breaths', 'breath'], ['exhale', 'exhales'],
+  ['coughs', 'cough'], ['sneezes', 'sneeze'], ['yawns', 'yawn'],
+])
+
+const TTS_TAG_TOKEN_RE = /\[\s*([a-z][a-z -]*?)\s*\]|<\s*([a-z][a-z -]*?)\s*>/giu
+
+export function normalizeTtsTagName(value: string): string | null {
+  const tag = value.trim().toLowerCase()
+  if (TTS_TAG_NAMES.has(tag)) return tag
+  return TTS_TAG_ALIASES.get(tag) ?? null
+}
+
+export function formatTtsTag(tag: string, style: Exclude<TtsTagStyle, 'off'>): string {
+  return style === 'gemini' ? `<${tag}>` : `[${tag}]`
+}
+
+function replaceTtsTags(
+  text: string,
+  replacer: (tag: string, match: string) => string,
+): string {
+  return text.replace(TTS_TAG_TOKEN_RE, (match, square: string | undefined, angle: string | undefined) => {
+    const tag = normalizeTtsTagName(square ?? angle ?? '')
+    return tag ? replacer(tag, match) : match
+  })
+}
+
+/** Normalize recognized tags to the requested provider style, preserving placement. */
+export function normalizeTtsTags(text: string, style: Exclude<TtsTagStyle, 'off'>): string {
+  return replaceTtsTags(text, (tag) => formatTtsTag(tag, style))
+}
+
+/** Remove recognized tags for validation and comparison. */
+export function stripTtsTags(text: string): string {
+  return replaceTtsTags(text, () => '')
+}
+
+export function extractTtsTags(text: string): string[] {
+  const tags: string[] = []
+  replaceTtsTags(text, (tag) => {
+    tags.push(tag)
+    return ''
+  })
+  return tags
+}
+
+export function countTtsTag(text: string, tag: string): number {
+  let count = 0
+  replaceTtsTags(text, (candidate) => {
+    if (candidate === tag) count += 1
+    return ''
+  })
+  return count
+}
+
+/**
+ * Validate LLM placement: only the requested tag may be added, and removing all
+ * recognized tags must leave the original wording. Whitespace is normalized
+ * because an inserted tag necessarily changes the spacing around it.
+ */
+export function validateTtsTagPlacement(original: string, tagged: string, tag: string): boolean {
+  const canonical = normalizeTtsTagName(tag)
+  if (!canonical) return false
+  const normalizedOriginal = stripTtsTags(original).replace(/\s+/gu, ' ').trim()
+  const normalizedTagged = stripTtsTags(tagged).replace(/\s+/gu, ' ').trim()
+  if (normalizedOriginal !== normalizedTagged) return false
+
+  const originalTags = new Map<string, number>()
+  const taggedTags = new Map<string, number>()
+  replaceTtsTags(original, (candidate) => {
+    originalTags.set(candidate, (originalTags.get(candidate) ?? 0) + 1)
+    return ''
+  })
+  replaceTtsTags(tagged, (candidate) => {
+    taggedTags.set(candidate, (taggedTags.get(candidate) ?? 0) + 1)
+    return ''
+  })
+  for (const [name, count] of originalTags) {
+    if (name === canonical) continue
+    if ((taggedTags.get(name) ?? 0) !== count) return false
+  }
+  if ((taggedTags.get(canonical) ?? 0) - (originalTags.get(canonical) ?? 0) !== 1) return false
+  for (const [name, count] of taggedTags) {
+    if (name === canonical) continue
+    if (!originalTags.has(name) || originalTags.get(name) !== count) return false
+  }
+  return true
+}
+
+export interface TtsTagPositionOption {
+  id: string
+  charIndex: number
+  description: string
+}
+
+function ttsTagPositionOptions(text: string): TtsTagPositionOption[] {
+  const options: TtsTagPositionOption[] = [{
+    id: 'start',
+    charIndex: 0,
+    description: 'At the very start of the quotation.',
+  }]
+  const boundaries: number[] = []
+  for (const match of text.matchAll(/[.!?…]+["'”’)]*\s+/gu)) {
+    if (match.index === undefined) continue
+    const charIndex = match.index + match[0].length
+    if (charIndex > 0 && charIndex < text.length && !boundaries.includes(charIndex)) {
+      boundaries.push(charIndex)
+    }
+  }
+  for (const [index, charIndex] of boundaries.slice(0, 4).entries()) {
+    const snippet = text.slice(charIndex, charIndex + 48).trim()
+    options.push({
+      id: `b${index + 1}`,
+      charIndex,
+      description: `Just before "${snippet}${snippet.length >= 48 ? '…' : ''}".`,
+    })
+  }
+  options.push({
+    id: 'end',
+    charIndex: text.length,
+    description: 'At the very end of the quotation.',
+  })
+  return options
+}
+
+function insertTtsTag(text: string, token: string, charIndex: number): string {
+  if (charIndex <= 0) return `${token} ${text}`
+  if (charIndex >= text.length) return `${text} ${token}`
+  const before = text.slice(0, charIndex).trimEnd()
+  const after = text.slice(charIndex).trimStart()
+  return `${before} ${token} ${after}`
+}
+
+export interface TtsTagPlan {
+  state: {
+    messageRole: 'assistant' | 'user'
+    message: string
+    speeches: Array<{
+      id: string
+      paragraphId: string
+      text: string
+      narrativeBefore: string
+      narrativeAfter: string
+    }>
+  }
+  questions: SpeakerDecisionPlan['questions']
+  /** Position options per speech, shared with the resolver for insertion. */
+  positions: Record<string, TtsTagPositionOption[]>
+}
+
+const TTS_NO_TAG_OPTION = 'no_tag'
+
+function ttsTagCriteria(): Record<string, string> {
+  return Object.fromEntries([
+    ...TTS_TAG_OPTIONS.map(option => [option.value, option.description]),
+    [TTS_NO_TAG_OPTION, 'No momentary vocal tag. Most lines should choose this.'],
+  ])
+}
+
+/**
+ * Build the batched tag questions. One tag ranking and one placement question
+ * per speech; every speech is decided in the same evaluation.
+ */
+export function buildTtsTagPlan(
+  plan: SpeakerDecisionPlan,
+  speechIds?: readonly string[],
+): TtsTagPlan {
+  const allowed = speechIds ? new Set(speechIds) : null
+  const speeches = plan.state.speeches
+    .filter(speech => !allowed || allowed.has(speech.id))
+    .map(speech => ({
+      id: speech.id,
+      paragraphId: speech.paragraphId,
+      text: speech.text,
+      narrativeBefore: speech.narrativeBefore,
+      narrativeAfter: speech.narrativeAfter,
+    }))
+  const criteria = ttsTagCriteria()
+  const questions: SpeakerDecisionPlan['questions'] = {}
+  const positions: Record<string, TtsTagPositionOption[]> = {}
+  for (const speech of speeches) {
+    questions[`tag_${speech.id}`] = {
+      type: 'choice',
+      instructions: `Which momentary vocal tag does quotation ${speech.id} strongly express? Use the quotation and its surrounding narration. Most quotations need none; choose no_tag unless the moment is unmistakable. Never use ambient sound, sustained mood, or hesitation.`,
+      criteria,
+    }
+    const speechPositions = ttsTagPositionOptions(speech.text)
+    positions[speech.id] = speechPositions
+    questions[`tagpos_${speech.id}`] = {
+      type: 'choice',
+      instructions: `If quotation ${speech.id} receives a vocal tag, where should it be inserted? Choose the boundary closest to the exact vocal moment.`,
+      criteria: Object.fromEntries(speechPositions.map(option => [option.id, option.description])),
+    }
+  }
+  return {
+    state: {
+      messageRole: plan.state.messageRole,
+      message: plan.state.message,
+      speeches,
+    },
+    questions,
+    positions,
+  }
+}
+
+export interface TtsTagSelection {
+  speechId: string
+  tag: string | null
+  position: string
+  ttsText: string | null
+  tagProbability: number
+  tagConfidence: number
+  tagMargin: number
+  positionProbability: number
+  positionConfidence: number
+  existingTags: string[]
+  skippedExisting: boolean
+}
+
+function clearTagChoice(
+  answer: SpeakerDecisionChoice | undefined,
+  thresholds: TtsTagThresholds,
+): { tag: string | null; probability: number; confidence: number; margin: number } {
+  if (!answer) return { tag: null, probability: 0, confidence: 0, margin: 0 }
+  const ranked = Object.entries(answer.probabilities)
+    .filter((entry): entry is [string, number] => Number.isFinite(entry[1]))
+    .sort((left, right) => right[1] - left[1])
+  const probability = answer.probabilities[answer.choice] ?? 0
+  const runnerUp = ranked.find(([option]) => option !== answer.choice)?.[1] ?? 0
+  const confidence = answer.confidence
+  const margin = probability - runnerUp
+  const tag = answer.choice === TTS_NO_TAG_OPTION ? null : normalizeTtsTagName(answer.choice)
+  if (
+    !tag
+    || probability < thresholds.probability
+    || confidence < thresholds.confidence
+    || margin < thresholds.margin
+  ) {
+    return { tag: null, probability, confidence, margin }
+  }
+  return { tag, probability, confidence, margin }
+}
+
+/**
+ * Normalize tag answers into insertions. Every speech gets a selection so
+ * existing provider tags can still be normalized even when Jev adds nothing.
+ */
+export function resolveTtsTagAnswers(
+  plan: TtsTagPlan,
+  answers: Record<string, SpeakerDecisionChoice>,
+  style: Exclude<TtsTagStyle, 'off'>,
+  thresholds: TtsTagThresholds = TTS_TAG_THRESHOLDS,
+  positionThresholds: TtsTagThresholds = TTS_TAG_POSITION_THRESHOLDS,
+): Map<string, TtsTagSelection> {
+  const selections = new Map<string, TtsTagSelection>()
+  for (const speech of plan.state.speeches) {
+    const tagChoice = clearTagChoice(answers[`tag_${speech.id}`], thresholds)
+    const positionOptions = plan.positions[speech.id]
+      ?? [{ id: 'start', charIndex: 0, description: '' }]
+    const positionAnswer = answers[`tagpos_${speech.id}`]
+    let position = positionOptions[0]
+    let positionProbability = 0
+    let positionConfidence = 0
+    if (positionAnswer) {
+      const ranked = Object.entries(positionAnswer.probabilities)
+        .filter((entry): entry is [string, number] => Number.isFinite(entry[1]))
+        .sort((left, right) => right[1] - left[1])
+      positionProbability = positionAnswer.probabilities[positionAnswer.choice] ?? 0
+      const runnerUp = ranked.find(([option]) => option !== positionAnswer.choice)?.[1] ?? 0
+      positionConfidence = positionAnswer.confidence
+      if (
+        positionProbability >= positionThresholds.probability
+        && positionConfidence >= positionThresholds.confidence
+        && positionProbability - runnerUp >= positionThresholds.margin
+      ) {
+        position = positionOptions.find(option => option.id === positionAnswer.choice) ?? position
+      }
+    }
+
+    const existingTags = extractTtsTags(speech.text)
+    const normalized = normalizeTtsTags(speech.text, style)
+    let ttsText = normalized !== speech.text ? normalized : null
+    let skippedExisting = false
+    if (tagChoice.tag) {
+      if (existingTags.includes(tagChoice.tag)) {
+        skippedExisting = true
+      } else {
+        const token = formatTtsTag(tagChoice.tag, style)
+        const tagged = insertTtsTag(speech.text, token, position.charIndex)
+        ttsText = normalizeTtsTags(tagged, style)
+      }
+    }
+    selections.set(speech.id, {
+      speechId: speech.id,
+      tag: skippedExisting ? null : tagChoice.tag,
+      position: position.id,
+      ttsText,
+      tagProbability: tagChoice.probability,
+      tagConfidence: tagChoice.confidence,
+      tagMargin: tagChoice.margin,
+      positionProbability,
+      positionConfidence,
+      existingTags,
+      skippedExisting,
+    })
+  }
+  return selections
+}
+
+/**
+ * Attach tagged text to the matching speech segments. Speech segments are
+ * matched by their cleaned quotation text in plan order, which keeps narration
+ * and unresolved speech separate without adding a second segment kind.
+ */
+export function applyTtsTagSelections(
+  segments: PlaybackSegment[],
+  plan: TtsTagPlan,
+  selections: ReadonlyMap<string, TtsTagSelection>,
+  includeDebug: boolean,
+): PlaybackSegment[] {
+  const queues = new Map<string, TtsTagSelection[]>()
+  for (const speech of plan.state.speeches) {
+    const selection = selections.get(speech.id)
+    if (!selection) continue
+    const queue = queues.get(speech.text) ?? []
+    queue.push(selection)
+    queues.set(speech.text, queue)
+  }
+  return segments.map(segment => {
+    const queue = queues.get(segment.text)
+    const selection = queue?.shift()
+    if (!selection) return segment
+    const debugPath = includeDebug && segment.debugPath
+      ? [
+          ...segment.debugPath,
+          `tts-tag:${selection.tag ?? 'none'}`,
+          `tts-tag-probability:${selection.tagProbability.toFixed(3)}`,
+          `tts-tag-confidence:${selection.tagConfidence.toFixed(3)}`,
+          `tts-tag-margin:${selection.tagMargin.toFixed(3)}`,
+          `tts-tag-position:${selection.position}`,
+          `tts-tag-position-confidence:${selection.positionConfidence.toFixed(3)}`,
+          ...(selection.skippedExisting ? ['tts-tag:existing tag retained'] : []),
+          ...(selection.tag
+            ? [`tts-tag-source:jev`, `tts-text:${selection.ttsText ?? segment.text}`]
+            : [`tts-text:${selection.ttsText ?? segment.text}`]),
+        ]
+      : segment.debugPath
+    if (!selection.ttsText) return segment
+    return {
+      ...segment,
+      ttsText: selection.ttsText,
+      ...(selection.tag
+        ? {
+            ttsTag: {
+              id: selection.speechId,
+              tag: selection.tag,
+              position: selection.position,
+              source: 'jev' as const,
+            },
+          }
+        : {}),
+      ...(debugPath ? { debugPath } : {}),
+    }
+  })
+}
+
 function narrationBridge(
   message: string,
   previous: PlaybackQuote | undefined,
@@ -2151,6 +2631,8 @@ export const SPEAKER_DECISION_THRESHOLDS: Record<'local' | 'discourse' | 'overri
   discourse: { probability: 0.6, confidence: 0.55, margin: 0.2 },
   override: { probability: 0.7, confidence: 0.65, margin: 0.25 },
 }
+
+export const TTS_TAG_SCHEMA = 'tts-tags-1'
 
 /** Bump a version whenever a stage changes the output stored in the cache. */
 export const SPEAKER_DECISION_SCHEMA = {

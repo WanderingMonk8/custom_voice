@@ -125,7 +125,11 @@ function mergeVoicePlan(segments) {
   for (const segment of segments) {
     const paragraphs = segment.text.trim().split(/\n\s*\n+/).map((paragraph) => paragraph.replace(/\s*\n\s*/g, " ").trim()).filter(Boolean);
     for (const text of paragraphs) {
-      result.push({ text, voice: segment.voice });
+      result.push({
+        text,
+        voice: segment.voice,
+        ...segment.tagId ? { tagId: segment.tagId } : {}
+      });
     }
   }
   return result;
@@ -1042,6 +1046,45 @@ var TURN_RELATION_CRITERIA = {
   [TURN_OTHER_OPTION]: "A different participant addresses someone else in the scene, a third party, or an off-scene channel.",
   [TURN_UNCLEAR_OPTION]: "The text does not establish whether the speaker continues or changes."
 };
+var TTS_TAG_OPTIONS = [
+  { value: "laugh", description: "A brief laugh." },
+  { value: "chuckle", description: "A soft, low laugh." },
+  { value: "giggle", description: "A light, high giggle." },
+  { value: "snicker", description: "A half-suppressed laugh." },
+  { value: "cackle", description: "A sharp, harsh laugh." },
+  { value: "cheer", description: "A short cheer or whoop." },
+  { value: "gasp", description: "A sharp intake of breath." },
+  { value: "sigh", description: "A long exhale of relief, frustration, or resignation." },
+  { value: "groan", description: "A low sound of pain or dismay." },
+  { value: "grunt", description: "A short, effortful grunt." },
+  { value: "grr", description: "A low, frustrated growl-like sound." },
+  { value: "growl", description: "A menacing growl." },
+  { value: "hiss", description: "A sharp hiss." },
+  { value: "moan", description: "A low moan of pain or pleasure." },
+  { value: "pant", description: "A few panting breaths." },
+  { value: "pff", description: "A dismissive puff of breath." },
+  { value: "phew", description: "A relieved phew." },
+  { value: "tsk", description: "A disapproving tsk." },
+  { value: "whispers", description: "A whispered delivery." },
+  { value: "shout", description: "A sudden shout." },
+  { value: "argh", description: "A frustrated argh." },
+  { value: "whimper", description: "A small whimper." },
+  { value: "cry", description: "A brief cry." },
+  { value: "sob", description: "A sob." },
+  { value: "scream", description: "A scream." },
+  { value: "shriek", description: "A high shriek." },
+  { value: "snort", description: "A snort of amusement or contempt." },
+  { value: "breath", description: "A single audible breath." },
+  { value: "heavy breath", description: "A heavy breath." },
+  { value: "exhales", description: "A deliberate exhale." },
+  { value: "cough", description: "A cough." },
+  { value: "throat-clearing", description: "A throat-clearing sound." },
+  { value: "sneeze", description: "A sneeze." },
+  { value: "yawn", description: "A yawn." },
+  { value: "short pause", description: "A brief pause." },
+  { value: "long pause", description: "A longer pause." }
+];
+var TTS_TAG_NAMES = new Set(TTS_TAG_OPTIONS.map((option) => option.value));
 var SPEAKER_TURN_SWITCH_PATTERN = /\b(?:(?:another|a second|a third|a new|the other)\s+(?:voice|woman|man|person|speaker|figure|kid|girl|boy)|(?:someone|somebody)\s+(?:else\s+)?(?:says|said|asks|asked|replies|replied|answers|answered|calls|called|whispers|whispered|shouts|shouted)|(?:a|another)\s+voice\s+(?:from|behind|near|across)|from (?:across the room|the (?:hallway|doorway|next room|other room|shadows)))\b/iu;
 var NARRATIVE_SPEECH_VERB_PATTERN = new RegExp(
   `\\b(?:${SPEECH_VERBS}|blurt(?:s|ed)|laugh(?:s|ed)|mutter(?:s|ed)|hiss(?:es|ed)|snap(?:s|ped))\\b`,
@@ -1316,6 +1359,10 @@ async function loadPlaybackPreferences() {
     savedAudioLimit: DEFAULT_SAVED_AUDIO_LIMIT,
     skippedTrackerTags: "",
     speakerParsingMode: "ambiguous",
+    ttsTagStyle: "off",
+    ttsTagPlacement: "jev",
+    tagLlmConnectionId: "",
+    tagLlmModel: "",
     playbackBufferSegments: DEFAULT_PLAYBACK_BUFFER_SEGMENTS,
     concurrentGenerations: DEFAULT_CONCURRENT_GENERATIONS,
     rateLimitWaitSeconds: DEFAULT_RATE_LIMIT_WAIT_SECONDS,
@@ -1327,6 +1374,8 @@ async function loadPlaybackPreferences() {
   const speed = typeof row.value?.ttsSpeed === "number" ? row.value.ttsSpeed : 1;
   const volume = typeof row.value?.ttsVolume === "number" ? row.value.ttsVolume : 1;
   const speakerParsingMode = row.value?.chatVoiceSpeakerParsingMode === "off" ? "off" : "ambiguous";
+  const ttsTagStyle = row.value?.chatVoiceTtsTagStyle === "gemini" || row.value?.chatVoiceTtsTagStyle === "fish" ? row.value.chatVoiceTtsTagStyle : "off";
+  const ttsTagPlacement = row.value?.chatVoiceTtsTagPlacement === "llm" ? "llm" : "jev";
   return {
     speed: Math.min(4, Math.max(0.25, speed)),
     volume: Math.min(1, Math.max(0, volume)),
@@ -1335,6 +1384,10 @@ async function loadPlaybackPreferences() {
     savedAudioLimit: clampSavedAudioLimit(row.value?.chatVoiceSavedAudioLimit),
     skippedTrackerTags: typeof row.value?.chatVoiceSkippedTrackerTags === "string" ? row.value.chatVoiceSkippedTrackerTags.slice(0, 4e3) : "",
     speakerParsingMode,
+    ttsTagStyle,
+    ttsTagPlacement,
+    tagLlmConnectionId: typeof row.value?.chatVoiceTagLlmConnectionId === "string" ? row.value.chatVoiceTagLlmConnectionId.trim().slice(0, 128) : "",
+    tagLlmModel: typeof row.value?.chatVoiceTagLlmModel === "string" ? row.value.chatVoiceTagLlmModel.trim().slice(0, 256) : "",
     playbackBufferSegments: clampIntegerSetting(
       row.value?.chatVoicePlaybackBufferSegments,
       DEFAULT_PLAYBACK_BUFFER_SEGMENTS,
@@ -1398,6 +1451,15 @@ function saveLlmParsingPreferences(mode) {
   return updateVoiceSettings((current) => ({
     ...current,
     chatVoiceSpeakerParsingMode: mode
+  }));
+}
+function saveTtsTagPreferences(style, placement, connectionId, model) {
+  return updateVoiceSettings((current) => ({
+    ...current,
+    chatVoiceTtsTagStyle: style,
+    chatVoiceTtsTagPlacement: placement,
+    chatVoiceTagLlmConnectionId: connectionId.trim().slice(0, 128),
+    chatVoiceTagLlmModel: model.trim().slice(0, 256)
   }));
 }
 function saveAdvancedPlaybackPreferences(bufferSegments, concurrentGenerations, rateLimitWaitSeconds, speakerAssignmentDebug) {
@@ -1873,6 +1935,10 @@ function setup(ctx) {
   scanRow.append(scanButton);
   const skippedTagsField = createField("Skipped tracker tags (global)");
   const speakerParsingField = createField("Jev speaker assignment (global)");
+  const ttsTagField = createField("TTS vocal tags (global)");
+  const ttsTagPlacementField = createField("Vocal tag placement");
+  const tagLlmConnectionField = createField("Vocal tag LLM connection");
+  const tagLlmModelField = createField("Vocal tag model (optional)");
   const narratorField = createField("Narrator voice");
   const userVoiceField = createField("User voice");
   function addDefaultRoleToggle(field, titleText, ariaLabel) {
@@ -1937,6 +2003,10 @@ function setup(ctx) {
     scanField.field,
     skippedTagsField.field,
     speakerParsingField.field,
+    ttsTagField.field,
+    ttsTagPlacementField.field,
+    tagLlmConnectionField.field,
+    tagLlmModelField.field,
     narratorField.field,
     userVoiceField.field,
     routingHint,
@@ -2004,6 +2074,12 @@ function setup(ctx) {
   let savingSkippedTrackerTags = false;
   let skippedTrackerTagsSaveTimer = null;
   let speakerParsingMode = "ambiguous";
+  let ttsTagStyle = "off";
+  let ttsTagPlacement = "jev";
+  let tagLlmConnectionId = "";
+  let tagLlmModel = "";
+  let llmConnections = [];
+  const tagPlacementCache = /* @__PURE__ */ new Map();
   let decisionConnectionsKnown = false;
   let decisionConnectionAvailable = false;
   let decisionConnectionName = "";
@@ -2070,10 +2146,14 @@ function setup(ctx) {
   const pendingStateRequests = /* @__PURE__ */ new Map();
   const pendingSpeakerParseRequests = /* @__PURE__ */ new Map();
   const pendingDecisionStatusRequests = /* @__PURE__ */ new Map();
+  const pendingLlmConnectionRequests = /* @__PURE__ */ new Map();
+  const pendingTagPlacementRequests = /* @__PURE__ */ new Map();
   let messageRequestSequence = 0;
   let stateRequestSequence = 0;
   let speakerParseRequestSequence = 0;
   let decisionStatusRequestSequence = 0;
+  let llmConnectionRequestSequence = 0;
+  let tagPlacementRequestSequence = 0;
   const setStatus = (message, state = "normal") => {
     status.textContent = message;
     status.dataset.state = state;
@@ -2184,6 +2264,48 @@ function setup(ctx) {
   speakerParsingHint.className = "chat-voice-hint";
   speakerParsingHint.hidden = true;
   speakerParsingField.slot.append(speakerParsingHint);
+  const ttsTagPicker = ctx.components.mountSelect(ttsTagField.slot, {
+    value: "off",
+    options: [
+      { value: "off", label: "Off", sublabel: "Do not add inline vocal tags" },
+      { value: "gemini", label: "Gemini", sublabel: "Angle brackets, for example <gasp>" },
+      { value: "fish", label: "Fish", sublabel: "Square brackets, for example [gasp]" }
+    ],
+    ariaLabel: "TTS vocal tag style",
+    onChange: (value) => onTtsTagStyleChanged(value)
+  });
+  const ttsTagHint = document.createElement("div");
+  ttsTagHint.className = "chat-voice-hint";
+  ttsTagHint.textContent = "Tags are inserted only into quoted speech, never into the message. One new tag per speech; existing tags are preserved.";
+  ttsTagField.slot.append(ttsTagHint);
+  const ttsTagPlacementPicker = ctx.components.mountSelect(ttsTagPlacementField.slot, {
+    value: "jev",
+    options: [
+      { value: "jev", label: "Jev sentence boundaries", sublabel: "Fast, approximate placement" },
+      { value: "llm", label: "LLM exact placement", sublabel: "Place each chosen tag at the exact word" }
+    ],
+    ariaLabel: "Vocal tag placement",
+    onChange: (value) => onTtsTagPlacementChanged(value)
+  });
+  const tagLlmConnectionPicker = ctx.components.mountSelect(tagLlmConnectionField.slot, {
+    value: "",
+    options: [],
+    placeholder: "Use the active Lumiverse LLM connection",
+    searchPlaceholder: "Search LLM connections\u2026",
+    emptyMessage: "No LLM connections found.",
+    clearable: true,
+    clearLabel: "Use the active LLM connection",
+    ariaLabel: "Vocal tag LLM connection",
+    disabled: true,
+    onChange: (value) => onTagLlmConnectionChanged(value)
+  });
+  const tagLlmModelInput = ctx.components.mountTextInput(tagLlmModelField.slot, {
+    value: "",
+    placeholder: "Use the connection model or enter a model name",
+    ariaLabel: "Vocal tag model",
+    disabled: true,
+    onChange: (value) => onTagLlmModelChanged(value)
+  });
   function createNumberInput(value, maximum, ariaLabel) {
     const input = document.createElement("input");
     input.className = "chat-voice-number-input";
@@ -2376,6 +2498,10 @@ function setup(ctx) {
         messageId,
         requestId,
         mode: preferences.speakerParsingMode,
+        tagStyle: preferences.ttsTagStyle,
+        tagPlacement: preferences.ttsTagPlacement,
+        tagLlmConnectionId: preferences.tagLlmConnectionId,
+        tagLlmModel: preferences.tagLlmModel,
         skippedTrackerTags: preferences.skippedTrackerTags,
         debug: preferences.speakerAssignmentDebug
       });
@@ -2517,6 +2643,7 @@ function setup(ctx) {
     const lines = [
       `Message ${messageId} (${isUserMessage ? "user" : "assistant"})`,
       `Parsing mode: ${parsingMode === "off" ? "local parser only" : "Jev with local fallback"}`,
+      `TTS tags: ${ttsTagStyle === "off" ? "off" : `${ttsTagStyle} (${ttsTagPlacement === "llm" ? "LLM placement" : "Jev placement"})`}`,
       ...speakerPipelineHeader(finalSegments, parsingMode, review),
       `Default speaker: ${speakerDebugName(defaultSpeakerId, parserSpeakers)}`,
       `Parser roster: ${parserSpeakers.map((speaker) => `${speaker.name} [${speaker.id}]`).join(", ") || "(empty)"}`,
@@ -2551,6 +2678,7 @@ function setup(ctx) {
         ...(segment.debugPath ?? local?.debugPath ?? ["parser-trace:unavailable"]).map((step) => `  ${step}`),
         `  ${describeBackendReview(localSpeaker, rawSpeakerId, parsingMode, review)}`,
         `  source:${isSpeech ? speakerSourceDetail(segment, source, parsingMode, review) : "narrator"}`,
+        ...segment.ttsText && segment.ttsText !== segment.text ? [`  tts-tagged:${JSON.stringify(segment.ttsText.length > 180 ? `${segment.ttsText.slice(0, 177)}...` : segment.ttsText)}`] : [],
         `  ${aliasPath}`,
         `  final-speaker:${speakerDebugName(mappedSpeakerId, configuredSpeakers)}`,
         `  ${voicePath}`,
@@ -2617,6 +2745,86 @@ function setup(ctx) {
     const warning = decisionStatusFailed ? "Could not verify a Decision model connection. Jev speaker assignment is unavailable until Lumiverse responds." : decisionConnectionsKnown && !decisionConnectionAvailable ? "Jev speaker assignment needs a Decision model connection. Create one in Lumiverse, then reopen this panel." : "";
     speakerParsingHint.textContent = warning;
     speakerParsingHint.hidden = warning === "";
+  }
+  function requestLlmConnections() {
+    const requestId = `llm-connections-${Date.now().toString(36)}-${++llmConnectionRequestSequence}`;
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        pendingLlmConnectionRequests.delete(requestId);
+        reject(new Error("Timed out while loading Lumiverse LLM connections."));
+      }, 15e3);
+      pendingLlmConnectionRequests.set(requestId, { resolve, reject, timer });
+      ctx.sendToBackend({ type: "chat_voice_list_llm_connections", requestId });
+    });
+  }
+  function requestTagPlacements(message, style, connectionId, model, items) {
+    const requestId = `tag-placement-${Date.now().toString(36)}-${++tagPlacementRequestSequence}`;
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        pendingTagPlacementRequests.delete(requestId);
+        reject(new Error("Timed out while placing TTS vocal tags."));
+      }, 6e4);
+      pendingTagPlacementRequests.set(requestId, { resolve, reject, timer });
+      ctx.sendToBackend({
+        type: "chat_voice_place_tags",
+        requestId,
+        message,
+        style,
+        connectionId,
+        model,
+        items
+      });
+    });
+  }
+  function llmConnectionOptions(selectedId = "") {
+    const options = llmConnections.map((connection) => ({
+      value: connection.id,
+      label: connection.name,
+      sublabel: `${connection.provider}${connection.model ? ` \xB7 ${connection.model}` : ""}`
+    }));
+    if (selectedId && !llmConnections.some((connection) => connection.id === selectedId)) {
+      options.unshift({ value: selectedId, label: "Missing connection", sublabel: selectedId });
+    }
+    return options;
+  }
+  function updateTtsTagControls() {
+    const tagEnabled = ttsTagStyle !== "off";
+    const llmEnabled = tagEnabled && ttsTagPlacement === "llm";
+    ttsTagPlacementPicker.update({
+      value: ttsTagPlacement,
+      disabled: !tagEnabled
+    });
+    tagLlmConnectionPicker.update({
+      value: tagLlmConnectionId,
+      options: llmConnectionOptions(tagLlmConnectionId),
+      disabled: !llmEnabled,
+      placeholder: llmConnections.length ? "Use the active Lumiverse LLM connection" : "No LLM connections found; the active connection will be used"
+    });
+    tagLlmModelInput.update({
+      value: tagLlmModel,
+      disabled: !llmEnabled
+    });
+  }
+  function onTtsTagStyleChanged(value) {
+    ttsTagStyle = value === "gemini" || value === "fish" ? value : "off";
+    ttsTagPicker.update({ value: ttsTagStyle });
+    updateTtsTagControls();
+    scheduleLlmSettingsSave();
+  }
+  function onTtsTagPlacementChanged(value) {
+    ttsTagPlacement = value === "llm" ? "llm" : "jev";
+    ttsTagPlacementPicker.update({ value: ttsTagPlacement });
+    updateTtsTagControls();
+    scheduleLlmSettingsSave();
+  }
+  function onTagLlmConnectionChanged(value) {
+    tagLlmConnectionId = value.trim().slice(0, 128);
+    updateTtsTagControls();
+    scheduleLlmSettingsSave();
+  }
+  function onTagLlmModelChanged(value) {
+    tagLlmModel = value.trim().slice(0, 256);
+    scheduleLlmSettingsSave();
   }
   function refreshLocalState() {
     ctx.sendToBackend({
@@ -2790,6 +2998,10 @@ function setup(ctx) {
     const preferences = await loadPlaybackPreferences();
     if (llmSettingsSaveTimer || savingLlmSettings) {
       preferences.speakerParsingMode = speakerParsingMode;
+      preferences.ttsTagStyle = ttsTagStyle;
+      preferences.ttsTagPlacement = ttsTagPlacement;
+      preferences.tagLlmConnectionId = tagLlmConnectionId;
+      preferences.tagLlmModel = tagLlmModel;
     }
     if (advancedSettingsSaveTimer || savingAdvancedSettings) {
       preferences.playbackBufferSegments = playbackBufferSegments;
@@ -2868,7 +3080,11 @@ function setup(ctx) {
         preferences.speakerAssignmentDebug
       );
       let review = { segments: localSegments, usedLlm: null, failed: false };
-      if (preferences.speakerParsingMode !== "off") setStatus("Classifying dialogue speakers with Jev\u2026");
+      if (preferences.speakerParsingMode !== "off" || preferences.ttsTagStyle !== "off") {
+        setStatus(
+          preferences.speakerParsingMode !== "off" ? "Classifying dialogue speakers with Jev\u2026" : "Adding TTS vocal tags\u2026"
+        );
+      }
       try {
         review = await requestSpeakerReviewedSegments(playbackChat.id, messageId, preferences);
       } catch (error) {
@@ -2900,8 +3116,95 @@ function setup(ctx) {
           config.narratorVoice,
           config.userVoice
         );
-        return { text: segment.text, voice };
+        return {
+          text: segment.ttsText ?? segment.text,
+          voice,
+          ...segment.ttsTag ? { tagId: segment.ttsTag.id } : {}
+        };
       }));
+      const tagIndexes = /* @__PURE__ */ new Map();
+      plan.forEach((entry, index) => {
+        if (!entry.tagId) return;
+        const indexes = tagIndexes.get(entry.tagId) ?? [];
+        indexes.push(index);
+        tagIndexes.set(entry.tagId, indexes);
+      });
+      const tagSources = /* @__PURE__ */ new Map();
+      for (const segment of segments) {
+        if (segment.ttsTag && !/\n\s*\n/u.test(segment.text.trim())) {
+          tagSources.set(segment.ttsTag.id, { text: segment.text, tag: segment.ttsTag.tag });
+        }
+      }
+      const applyTagPlacements = (placements) => {
+        for (const placement of placements) {
+          const source = tagSources.get(placement.id);
+          if (!source) continue;
+          tagPlacementCache.set(
+            `${playbackChat.id}\0${messageId}\0${preferences.ttsTagStyle}\0${preferences.tagLlmConnectionId}\0${preferences.tagLlmModel}\0${placement.id}\0${source.tag}\0${source.text}`,
+            placement.text
+          );
+          for (const index of tagIndexes.get(placement.id) ?? []) {
+            plan[index] = { ...plan[index], text: placement.text };
+          }
+          for (const segment of segments) {
+            if (segment.ttsTag?.id !== placement.id) continue;
+            segment.ttsText = placement.text;
+            segment.ttsTag = { ...segment.ttsTag, source: "llm" };
+          }
+        }
+      };
+      if (preferences.ttsTagStyle !== "off" && preferences.ttsTagPlacement === "llm" && tagSources.size > 0) {
+        const placementStyle = preferences.ttsTagStyle;
+        const keyFor = (id, tag, text) => `${playbackChat.id}\0${messageId}\0${placementStyle}\0${preferences.tagLlmConnectionId}\0${preferences.tagLlmModel}\0${id}\0${tag}\0${text}`;
+        const cachedPlacements = [];
+        for (const [id, source] of tagSources) {
+          const cached = tagPlacementCache.get(keyFor(id, source.tag, source.text));
+          if (cached) cachedPlacements.push({ id, text: cached });
+        }
+        if (cachedPlacements.length > 0) applyTagPlacements(cachedPlacements);
+        const items = [...tagSources.entries()].filter(([id, source]) => !tagPlacementCache.has(keyFor(id, source.tag, source.text))).map(([id, source]) => ({ id, text: source.text, tag: source.tag }));
+        const chunks = [];
+        for (let index = 0; index < items.length; index += 4) {
+          chunks.push(items.slice(index, index + 4));
+        }
+        if (chunks.length > 0) {
+          const firstPlacement = requestTagPlacements(
+            message.content,
+            placementStyle,
+            preferences.tagLlmConnectionId,
+            preferences.tagLlmModel,
+            chunks[0]
+          ).then((placements) => {
+            applyTagPlacements(placements);
+            return placements;
+          }).catch((error) => {
+            console.warn("[Chat Voice] First vocal tag placement chunk failed.", error);
+            return [];
+          });
+          setStatus("Placing vocal tags\u2026");
+          await Promise.race([
+            firstPlacement,
+            new Promise((resolve) => setTimeout(resolve, 8e3))
+          ]);
+          void (async () => {
+            for (const chunk of chunks.slice(1)) {
+              if (playback.controller.signal.aborted) return;
+              try {
+                const placements = await requestTagPlacements(
+                  message.content,
+                  placementStyle,
+                  preferences.tagLlmConnectionId,
+                  preferences.tagLlmModel,
+                  chunk
+                );
+                applyTagPlacements(placements);
+              } catch (error) {
+                console.warn("[Chat Voice] Vocal tag placement chunk failed.", error);
+              }
+            }
+          })();
+        }
+      }
       if (plan.length === 0) throw new Error("This message has no playable narration or dialogue.");
       if (preferences.speakerAssignmentDebug) {
         appendSpeakerDebugLog("\nSynthesis plan");
@@ -3364,12 +3667,18 @@ function setup(ctx) {
   }
   async function loadConnections() {
     try {
-      const [loadedConnections, preferences] = await Promise.all([
+      const [loadedConnections, loadedLlmConnections, preferences] = await Promise.all([
         listAllTtsConnections(),
+        requestLlmConnections().catch((error) => {
+          console.warn("[Chat Voice] Could not load Lumiverse LLM connections.", error);
+          return [];
+        }),
         loadPlaybackPreferences(),
         refreshDecisionStatus()
       ]);
       connections = loadedConnections;
+      llmConnections = loadedLlmConnections;
+      updateTtsTagControls();
       if (!narratorGlobalSaveTimer && !savingNarratorGlobalVoice) {
         defaultNarratorVoice = preferences.defaultNarratorVoice;
       }
@@ -3401,7 +3710,13 @@ function setup(ctx) {
       }
       if (!savingLlmSettings && !llmSettingsSaveTimer) {
         speakerParsingMode = preferences.speakerParsingMode;
+        ttsTagStyle = preferences.ttsTagStyle;
+        ttsTagPlacement = preferences.ttsTagPlacement;
+        tagLlmConnectionId = preferences.tagLlmConnectionId;
+        tagLlmModel = preferences.tagLlmModel;
         speakerParsingPicker.update({ value: speakerParsingMode });
+        ttsTagPicker.update({ value: ttsTagStyle });
+        updateTtsTagControls();
       }
       if (!savingLlmSettings && !llmSettingsSaveTimer && !decisionStatusFailed && decisionConnectionsKnown && !decisionConnectionAvailable && speakerParsingMode !== "off") {
         speakerParsingMode = "off";
@@ -3471,25 +3786,25 @@ function setup(ctx) {
   }
   async function persistLlmSettings() {
     savingLlmSettings = true;
+    let forcedOff = false;
     try {
       if (speakerParsingMode === "ambiguous") {
         const status2 = await refreshDecisionStatus();
         if (!status2?.available || !status2.hasConnection) {
           speakerParsingMode = "off";
           speakerParsingPicker.update({ value: "off" });
-          await saveLlmParsingPreferences("off");
-          setStatus(
-            "Jev speaker assignment was turned off because no Decision model connection is configured.",
-            "error"
-          );
-          return;
+          forcedOff = true;
         }
       }
-      setStatus("Saving global Jev speaker-assignment setting\u2026");
+      setStatus("Saving global speaker and tag settings\u2026");
       await saveLlmParsingPreferences(speakerParsingMode);
-      setStatus("Jev speaker-assignment setting saved globally.", "saved");
+      await saveTtsTagPreferences(ttsTagStyle, ttsTagPlacement, tagLlmConnectionId, tagLlmModel);
+      setStatus(
+        forcedOff ? "Jev speaker assignment was turned off because no Decision model connection is configured." : "Speaker and tag settings saved globally.",
+        forcedOff ? "error" : "saved"
+      );
     } catch (error) {
-      setStatus(error instanceof Error ? error.message : "Could not save Jev speaker-assignment setting.", "error");
+      setStatus(error instanceof Error ? error.message : "Could not save speaker and tag settings.", "error");
     } finally {
       savingLlmSettings = false;
     }
@@ -3733,6 +4048,24 @@ function setup(ctx) {
       });
       return;
     }
+    if (payload.type === "chat_voice_llm_connections") {
+      const pending = pendingLlmConnectionRequests.get(payload.requestId);
+      if (!pending) return;
+      clearTimeout(pending.timer);
+      pendingLlmConnectionRequests.delete(payload.requestId);
+      if (payload.error) pending.reject(new Error(payload.error));
+      else pending.resolve(payload.connections);
+      return;
+    }
+    if (payload.type === "chat_voice_tag_placement") {
+      const pending = pendingTagPlacementRequests.get(payload.requestId);
+      if (!pending) return;
+      clearTimeout(pending.timer);
+      pendingTagPlacementRequests.delete(payload.requestId);
+      if (payload.error) pending.reject(new Error(payload.error));
+      else pending.resolve(payload.placements);
+      return;
+    }
     if (payload.type === "chat_voice_error") {
       if (payload.requestId) {
         const pending = pendingStateRequests.get(payload.requestId);
@@ -3786,6 +4119,16 @@ function setup(ctx) {
         pending.reject(new Error("The active chat changed before the Decision connection check completed."));
       }
       pendingDecisionStatusRequests.clear();
+      for (const pending of pendingLlmConnectionRequests.values()) {
+        clearTimeout(pending.timer);
+        pending.reject(new Error("The active chat changed before LLM connections loaded."));
+      }
+      pendingLlmConnectionRequests.clear();
+      for (const pending of pendingTagPlacementRequests.values()) {
+        clearTimeout(pending.timer);
+        pending.reject(new Error("The active chat changed before vocal tag placement completed."));
+      }
+      pendingTagPlacementRequests.clear();
       stopPlayback();
       flushSave();
       dirty = false;
@@ -3884,6 +4227,16 @@ function setup(ctx) {
       pending.reject(new Error("Chat Voice was closed."));
     }
     pendingDecisionStatusRequests.clear();
+    for (const pending of pendingLlmConnectionRequests.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(new Error("Chat Voice was closed."));
+    }
+    pendingLlmConnectionRequests.clear();
+    for (const pending of pendingTagPlacementRequests.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(new Error("Chat Voice was closed."));
+    }
+    pendingTagPlacementRequests.clear();
     for (const pending of pendingStateRequests.values()) {
       clearTimeout(pending.timer);
       pending.reject(new Error("Chat Voice was closed."));
@@ -3909,6 +4262,7 @@ function setup(ctx) {
     if (llmSettingsSaveTimer) {
       clearTimeout(llmSettingsSaveTimer);
       void saveLlmParsingPreferences(speakerParsingMode);
+      void saveTtsTagPreferences(ttsTagStyle, ttsTagPlacement, tagLlmConnectionId, tagLlmModel);
     }
     if (advancedSettingsSaveTimer) {
       clearTimeout(advancedSettingsSaveTimer);
@@ -3921,6 +4275,10 @@ function setup(ctx) {
     }
     skippedTrackerTagsInput.destroy();
     speakerParsingPicker.destroy();
+    ttsTagPicker.destroy();
+    ttsTagPlacementPicker.destroy();
+    tagLlmConnectionPicker.destroy();
+    tagLlmModelInput.destroy();
     playbackBufferInput.removeEventListener("change", onPlaybackBufferInput);
     concurrentGenerationInput.removeEventListener("change", onConcurrentGenerationInput);
     rateLimitWaitInput.removeEventListener("change", onRateLimitWaitInput);
