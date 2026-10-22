@@ -2073,6 +2073,7 @@ export function setup(ctx: SpindleFrontendContext) {
       id: string
       text: string
       emotions: string[]
+      styles: string[]
       sounds: string[]
       pauses: Array<'short' | 'long'>
     }>,
@@ -2494,6 +2495,7 @@ export function setup(ctx: SpindleFrontendContext) {
       const tagSources = new Map<string, {
         text: string
         emotions: string[]
+        styles: string[]
         sounds: string[]
         pauses: Array<'short' | 'long'>
       }>()
@@ -2509,6 +2511,7 @@ export function setup(ctx: SpindleFrontendContext) {
           tagSources.set(segment.ttsTag.id, {
             text: segment.ttsTag.baseText ?? segment.ttsText ?? segment.text,
             emotions: segment.ttsTag.emotions,
+            styles: segment.ttsTag.styles,
             sounds: segment.ttsTag.sounds,
             pauses: segment.ttsTag.pauses,
           })
@@ -2525,6 +2528,7 @@ export function setup(ctx: SpindleFrontendContext) {
             `${playbackChat.id}\u0000${messageId}\u0000${preferences.ttsTagStyle}\u0000${preferences.tagLlmConnectionId}`
               + `\u0000${preferences.tagLlmModel}\u0000${placement.id}`
               + `\u0000${JSON.stringify(source.emotions)}`
+              + `\u0000${JSON.stringify(source.styles)}`
               + `\u0000${JSON.stringify(source.sounds)}`
               + `\u0000${JSON.stringify(source.pauses)}`
               + `\u0000${source.text}`,
@@ -2540,6 +2544,7 @@ export function setup(ctx: SpindleFrontendContext) {
           }
           appendSpeakerDebugLog(
             `TTS tag placement [${placement.id}] emotions=${JSON.stringify(source.emotions)}, `
+              + `styles=${JSON.stringify(source.styles)}, `
               + `sounds=${JSON.stringify(source.sounds)}, `
               + `pauses=${JSON.stringify(source.pauses)} via ${origin}: `
               + JSON.stringify(placement.text.length > 180
@@ -2563,12 +2568,14 @@ export function setup(ctx: SpindleFrontendContext) {
         const keyFor = (id: string, source: {
           text: string
           emotions: string[]
+          styles: string[]
           sounds: string[]
           pauses: Array<'short' | 'long'>
         }) => (
           `${playbackChat.id}\u0000${messageId}\u0000${placementStyle}\u0000${preferences.tagLlmConnectionId}`
             + `\u0000${preferences.tagLlmModel}\u0000${id}`
             + `\u0000${JSON.stringify(source.emotions)}`
+            + `\u0000${JSON.stringify(source.styles)}`
             + `\u0000${JSON.stringify(source.sounds)}`
             + `\u0000${JSON.stringify(source.pauses)}`
             + `\u0000${source.text}`
@@ -2590,6 +2597,7 @@ export function setup(ctx: SpindleFrontendContext) {
             id,
             text: source.text,
             emotions: source.emotions,
+            styles: source.styles,
             sounds: source.sounds,
             pauses: source.pauses,
           }))
@@ -2597,6 +2605,7 @@ export function setup(ctx: SpindleFrontendContext) {
           id: string
           text: string
           emotions: string[]
+          styles: string[]
           sounds: string[]
           pauses: Array<'short' | 'long'>
         }>> = []

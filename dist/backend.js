@@ -65,6 +65,7 @@ function readParsedMessages(value) {
       const ttsTag = isRecord(segment.ttsTag) && typeof segment.ttsTag.id === "string" && Array.isArray(segment.ttsTag.emotions) && (segment.ttsTag.source === "jev" || segment.ttsTag.source === "llm") ? {
         id: segment.ttsTag.id.slice(0, 64),
         emotions: segment.ttsTag.emotions.filter((value2) => typeof value2 === "string").map((value2) => normalizeTtsTagName(value2)).filter((value2) => !!value2 && ttsTagCategory(value2) === "emotion").slice(0, 2),
+        styles: (Array.isArray(segment.ttsTag.styles) ? segment.ttsTag.styles : []).filter((value2) => typeof value2 === "string").map((value2) => normalizeTtsTagName(value2)).filter((value2) => !!value2 && ttsTagCategory(value2) === "style").slice(0, 1),
         sounds: (Array.isArray(segment.ttsTag.sounds) ? segment.ttsTag.sounds : []).filter((value2) => typeof value2 === "string").map((value2) => normalizeTtsTagName(value2)).filter((value2) => !!value2 && ttsTagCategory(value2) === "sound").slice(0, 2),
         pauses: (Array.isArray(segment.ttsTag.pauses) ? segment.ttsTag.pauses : []).filter((value2) => value2 === "short" || value2 === "long").slice(0, 2),
         source: segment.ttsTag.source,
@@ -1429,9 +1430,20 @@ var TTS_PAUSE_OPTIONS = [
   { value: "short", label: "Short pause", description: "A brief dramatic pause." },
   { value: "long", label: "Long pause", description: "An extended dramatic pause." }
 ];
+var TTS_STYLE_OPTIONS = [
+  { value: "whispering", description: "Hushed and breathy." },
+  { value: "soft voice", description: "Quiet and gentle." },
+  { value: "low voice", description: "A deeper register." },
+  { value: "loud voice", description: "Raised volume without shouting." },
+  { value: "shouting", description: "Full-volume shouting." },
+  { value: "screaming", description: "Panicked or extreme volume." }
+];
+var TTS_STYLE_LIKE_SOUNDS = /* @__PURE__ */ new Set(["whispers", "shout", "scream"]);
+var TTS_FISH_SOUND_OPTIONS = TTS_TAG_OPTIONS.filter((option) => !TTS_STYLE_LIKE_SOUNDS.has(option.value));
 var TTS_EMOTION_NAMES = new Set(TTS_EMOTION_OPTIONS.map((option) => option.value));
 var TTS_SOUND_NAMES = new Set(TTS_TAG_OPTIONS.map((option) => option.value));
 var TTS_PAUSE_NAMES = new Set(TTS_PAUSE_OPTIONS.map((option) => option.value));
+var TTS_STYLE_NAMES = new Set(TTS_STYLE_OPTIONS.map((option) => option.value));
 var TTS_TAG_ALIASES = /* @__PURE__ */ new Map([
   // Sound aliases.
   ["laughter", "laugh"],
@@ -1455,26 +1467,33 @@ var TTS_TAG_ALIASES = /* @__PURE__ */ new Map([
   ["moans", "moan"],
   ["pants", "pant"],
   ["panting", "pant"],
-  ["whisper", "whispers"],
-  ["whispering", "whispers"],
+  ["whisper", "whispering"],
+  ["whispering", "whispering"],
   ["shouts", "shout"],
-  ["shouting", "shout"],
+  ["shouting", "shouting"],
+  ["screaming", "screaming"],
   ["cries", "cry"],
+  ["crying", "cry"],
   ["crying loudly", "cry"],
   ["sobs", "sob"],
   ["sobbing", "sob"],
   ["screams", "scream"],
-  ["screaming", "scream"],
   ["shrieks", "shriek"],
   ["snorts", "snort"],
   ["breaths", "breath"],
+  ["inhale", "breath"],
   ["exhale", "exhales"],
   ["coughs", "cough"],
   ["clear throat", "throat-clearing"],
+  ["clears throat", "throat-clearing"],
   ["sneezes", "sneeze"],
   ["yawns", "yawn"],
   ["yawning", "yawn"],
   ["snoring", "snore"],
+  // Style aliases.
+  ["soft", "soft voice"],
+  ["loud", "loud voice"],
+  ["low", "low voice"],
   // Pause aliases.
   ["break", "short"],
   ["short pause", "short"],
@@ -1493,23 +1512,27 @@ var TTS_TAG_ALIASES = /* @__PURE__ */ new Map([
 var TTS_TAG_NAMES = /* @__PURE__ */ new Set([
   ...TTS_EMOTION_NAMES,
   ...TTS_SOUND_NAMES,
-  ...TTS_PAUSE_NAMES
+  ...TTS_PAUSE_NAMES,
+  ...TTS_STYLE_NAMES
 ]);
 var TTS_FISH_SOUND_MAP = {
   laugh: "laughing",
   chuckle: "chuckling",
   sob: "sobbing",
-  cry: "crying loudly",
-  sigh: "sighing",
-  groan: "groaning",
+  cry: "crying",
+  sigh: "sigh",
+  groan: "groan",
   pant: "panting",
-  gasp: "gasping",
+  gasp: "gasp",
   yawn: "yawning",
   snore: "snoring",
-  "throat-clearing": "clear throat",
+  "throat-clearing": "clears throat",
   whispers: "whispering",
   shout: "shouting",
-  scream: "screaming"
+  scream: "screaming",
+  breath: "inhale",
+  "heavy breath": "panting",
+  exhales: "exhale"
 };
 var TTS_TAG_TOKEN_RE = /\[\s*([a-z][a-z -]*?)\s*\]|<\s*([a-z][a-z -]*?)\s*>/giu;
 function normalizeTtsTagName(value) {
@@ -1521,13 +1544,20 @@ function ttsTagCategory(value) {
   const tag = normalizeTtsTagName(value);
   if (!tag) return null;
   if (TTS_EMOTION_NAMES.has(tag)) return "emotion";
+  if (TTS_STYLE_NAMES.has(tag)) return "style";
   if (TTS_PAUSE_NAMES.has(tag)) return "pause";
   return "sound";
 }
 function formatTtsTag(tag, style) {
   const canonical = normalizeTtsTagName(tag) ?? tag;
   const category = ttsTagCategory(canonical);
+  if (category === "style") {
+    return `[${canonical}]`;
+  }
   if (category === "pause") {
+    if (style === "fish") {
+      return canonical === "long" ? "[long pause]" : "[short pause]";
+    }
     return canonical === "long" ? "[long-break]" : "[break]";
   }
   if (category === "sound" && style === "fish") {
@@ -1560,6 +1590,10 @@ function validateTtsSpeechPlacement(original, tagged, request, style) {
     request.emotions.map((value) => normalizeTtsTagName(value)).filter((value) => !!value && ttsTagCategory(value) === "emotion")
   )].slice(0, 2);
   if (emotions.length === 0) return false;
+  const styles = [...new Set(
+    request.styles.map((value) => normalizeTtsTagName(value)).filter((value) => !!value && ttsTagCategory(value) === "style")
+  )].slice(0, 1);
+  if (styles.length !== request.styles.length) return false;
   const sounds = request.sounds.map((value) => normalizeTtsTagName(value)).filter((value) => !!value && ttsTagCategory(value) === "sound");
   if (sounds.length !== request.sounds.length || sounds.length > 2) return false;
   const pauses = request.pauses.map((value) => normalizeTtsTagName(value)).filter((value) => !!value && ttsTagCategory(value) === "pause");
@@ -1567,7 +1601,7 @@ function validateTtsSpeechPlacement(original, tagged, request, style) {
   const normalizedOriginal = stripTtsTags(original).replace(/\s+/gu, " ").trim();
   const normalizedTagged = stripTtsTags(tagged).replace(/\s+/gu, " ").trim();
   if (normalizedOriginal !== normalizedTagged) return false;
-  const emotionPrefix = emotions.map((emotion) => formatTtsTag(emotion, style)).join(" ");
+  const emotionPrefix = [...emotions, ...styles].map((tag) => formatTtsTag(tag, style)).join(" ");
   if (!tagged.trimStart().startsWith(emotionPrefix)) return false;
   const originalTags = /* @__PURE__ */ new Map();
   const taggedTags = /* @__PURE__ */ new Map();
@@ -1585,7 +1619,7 @@ function validateTtsSpeechPlacement(original, tagged, request, style) {
   const names = /* @__PURE__ */ new Set([...originalTags.keys(), ...taggedTags.keys(), ...expected.keys()]);
   for (const name of names) {
     const delta = (taggedTags.get(name) ?? 0) - (originalTags.get(name) ?? 0);
-    if (ttsTagCategory(name) === "emotion") {
+    if (ttsTagCategory(name) === "emotion" || ttsTagCategory(name) === "style") {
       if (delta !== 0) return false;
     } else if (delta !== (expected.get(name) ?? 0)) {
       return false;
@@ -1632,14 +1666,18 @@ function insertTtsTag(text, token, charIndex) {
 var TTS_NO_TAG_OPTION = "no_tag";
 var TTS_NO_PAUSE_OPTION = "no_pause";
 var TTS_NO_EMOTION_OPTION = "no_emotion";
+var TTS_NO_STYLE_OPTION = "no_style";
 function ttsEmotionCriteria(options) {
   return Object.fromEntries(options.map((option) => [option.value, option.description]));
 }
-function ttsSoundCriteria() {
+function ttsSoundCriteria(options) {
   return Object.fromEntries([
-    ...TTS_TAG_OPTIONS.map((option) => [option.value, option.description]),
+    ...options.map((option) => [option.value, option.description]),
     [TTS_NO_TAG_OPTION, "No momentary sound effect. Most lines should choose this."]
   ]);
+}
+function ttsStyleCriteria() {
+  return Object.fromEntries(TTS_STYLE_OPTIONS.map((option) => [option.value, option.description]));
 }
 function ttsPauseCriteria() {
   return Object.fromEntries([
@@ -1647,7 +1685,7 @@ function ttsPauseCriteria() {
     [TTS_NO_PAUSE_OPTION, "No inserted pause. Most lines should choose this."]
   ]);
 }
-function buildTtsTagPlan(plan, speechIds, emotionOptions = TTS_AUTO_EMOTION_OPTIONS) {
+function buildTtsTagPlan(plan, speechIds, emotionOptions = TTS_AUTO_EMOTION_OPTIONS, style = "gemini") {
   const allowed = speechIds ? new Set(speechIds) : null;
   const speeches = plan.state.speeches.filter((speech) => !allowed || allowed.has(speech.id)).map((speech) => ({
     id: speech.id,
@@ -1657,7 +1695,10 @@ function buildTtsTagPlan(plan, speechIds, emotionOptions = TTS_AUTO_EMOTION_OPTI
     narrativeAfter: speech.narrativeAfter
   }));
   const emotionCriteria = ttsEmotionCriteria(emotionOptions);
-  const soundCriteria = ttsSoundCriteria();
+  const soundCriteria = ttsSoundCriteria(
+    style === "fish" ? TTS_FISH_SOUND_OPTIONS : TTS_TAG_OPTIONS
+  );
+  const styleCriteria = ttsStyleCriteria();
   const pauseCriteria = ttsPauseCriteria();
   const questions = {};
   const positions = {};
@@ -1676,6 +1717,16 @@ function buildTtsTagPlan(plan, speechIds, emotionOptions = TTS_AUTO_EMOTION_OPTI
         [TTS_NO_EMOTION_OPTION]: "No distinct secondary emotion. Most lines should choose this."
       }
     };
+    if (style === "fish") {
+      questions[`style_${speech.id}`] = {
+        type: "choice",
+        instructions: `Does quotation ${speech.id} have a sustained voice style that should lead the speech? Choose no_style unless a whisper, soft/loud/low voice, shout, or scream clearly applies to the whole quotation. Do not use this for a momentary sound.`,
+        criteria: {
+          ...styleCriteria,
+          [TTS_NO_STYLE_OPTION]: "No sustained voice style. Most lines should choose this."
+        }
+      };
+    }
     questions[`tag_${speech.id}`] = {
       type: "choice",
       instructions: `Does quotation ${speech.id} contain one momentary sound effect that should be performed? Use the quotation and its surrounding narration. Most quotations need none; choose no_tag unless the sound is unmistakable. Never use ambient sound, sustained mood, or hesitation.`,
@@ -1728,7 +1779,7 @@ function clearTagChoice(answer, thresholds, category) {
   const runnerUp = ranked.find(([option]) => option !== answer.choice)?.[1] ?? 0;
   const confidence = answer.confidence;
   const margin = probability - runnerUp;
-  const tag = answer.choice === TTS_NO_TAG_OPTION || answer.choice === TTS_NO_PAUSE_OPTION || answer.choice === TTS_NO_EMOTION_OPTION ? null : normalizeTtsTagName(answer.choice);
+  const tag = answer.choice === TTS_NO_TAG_OPTION || answer.choice === TTS_NO_PAUSE_OPTION || answer.choice === TTS_NO_EMOTION_OPTION || answer.choice === TTS_NO_STYLE_OPTION ? null : normalizeTtsTagName(answer.choice);
   if (!tag || ttsTagCategory(tag) !== category || probability < thresholds.probability || confidence < thresholds.confidence || margin < thresholds.margin) {
     return { tag: null, probability, confidence, margin };
   }
@@ -1764,11 +1815,36 @@ function resolvePositionChoice(answer, options, thresholds, fallback) {
 function removeTtsTagsByCategory(text, category) {
   return replaceTtsTags(text, (tag, match) => ttsTagCategory(tag) === category ? "" : match);
 }
+function renderLeadingCues(body, prefix, repeatPerSentence) {
+  if (!body) return prefix;
+  if (!repeatPerSentence) return `${prefix} ${body}`;
+  const rendered = [];
+  for (const sentence of body.split(/(?<=[.!?…])\s+/u).filter(Boolean)) {
+    const words = stripTtsTags(sentence).replace(/\s+/gu, " ").trim();
+    if (!words && rendered.length > 0) {
+      rendered[rendered.length - 1] += ` ${sentence}`;
+    } else {
+      rendered.push(words ? `${prefix} ${sentence}` : sentence);
+    }
+  }
+  return rendered.join(" ");
+}
+function applyLeadingTtsCues(text, emotions, styles, style) {
+  const normalized = normalizeTtsTags(text, style);
+  const body = style === "fish" ? removeTtsTagsByCategory(removeTtsTagsByCategory(normalized, "emotion"), "style") : normalized;
+  const prefix = [...emotions, ...styles].map((tag) => formatTtsTag(tag, style)).join(" ");
+  return renderLeadingCues(
+    body.replace(/[ \t]+/gu, " ").trim(),
+    prefix,
+    style === "fish"
+  );
+}
 function resolveTtsTagAnswers(plan, answers, style, thresholds = TTS_TAG_THRESHOLDS, positionThresholds = TTS_TAG_POSITION_THRESHOLDS) {
   const selections = /* @__PURE__ */ new Map();
   for (const speech of plan.state.speeches) {
     const emotionChoice = resolveEmotionChoice(answers[`emotion_${speech.id}`]);
     const emotion2Choice = clearTagChoice(answers[`emotion2_${speech.id}`], thresholds, "emotion");
+    const styleChoice = style === "fish" ? clearTagChoice(answers[`style_${speech.id}`], thresholds, "style") : { tag: null, probability: 0, confidence: 0, margin: 0 };
     const soundChoice = clearTagChoice(answers[`tag_${speech.id}`], thresholds, "sound");
     const sound2Choice = clearTagChoice(answers[`tag2_${speech.id}`], thresholds, "sound");
     const pauseChoice = clearTagChoice(answers[`pause_${speech.id}`], thresholds, "pause");
@@ -1800,6 +1876,13 @@ function resolveTtsTagAnswers(plan, answers, style, thresholds = TTS_TAG_THRESHO
     } else if (emotions.length === 1 && emotion2Choice.tag && !emotions.includes(emotion2Choice.tag)) {
       emotions.push(emotion2Choice.tag);
     }
+    const existingStyles = style === "fish" ? [...new Set(
+      existingTags.filter((tag) => ttsTagCategory(tag) === "style")
+    )].slice(0, 1) : [];
+    const styles = [...existingStyles];
+    if (style === "fish" && styles.length === 0 && styleChoice.tag) {
+      styles.push(styleChoice.tag);
+    }
     const sounds = [...new Set(
       existingTags.filter((tag) => ttsTagCategory(tag) === "sound")
     )].slice(0, 2);
@@ -1819,12 +1902,16 @@ function resolveTtsTagAnswers(plan, answers, style, thresholds = TTS_TAG_THRESHO
       newPauses.push(pause);
     }
     const newPausePositions = newPauses.map((_, index) => index === 0 ? pausePosition.option : pausePositions[pausePositions.length - 1]);
-    const emotionPrefix = emotions.map((emotion) => formatTtsTag(emotion, style)).join(" ");
+    const leadingPrefix = [...emotions, ...styles].map((tag) => formatTtsTag(tag, style)).join(" ");
+    const removeLeadingCues = (text) => {
+      const withoutEmotions = removeTtsTagsByCategory(text, "emotion");
+      return style === "fish" ? removeTtsTagsByCategory(withoutEmotions, "style") : withoutEmotions;
+    };
     const baseBody = normalizeTtsTags(
-      removeTtsTagsByCategory(speech.text, "emotion"),
+      removeLeadingCues(speech.text),
       style
     ).replace(/[ \t]+/gu, " ").trim();
-    const baseText = baseBody ? `${emotionPrefix} ${baseBody}` : emotionPrefix;
+    const baseText = baseBody ? `${leadingPrefix} ${baseBody}` : leadingPrefix;
     const insertions = [];
     newSounds.forEach((sound, index) => insertions.push({
       token: formatTtsTag(sound, style),
@@ -1839,13 +1926,14 @@ function resolveTtsTagAnswers(plan, answers, style, thresholds = TTS_TAG_THRESHO
       fallback = insertTtsTag(fallback, insertion.token, insertion.charIndex);
     }
     const fallbackBody = normalizeTtsTags(
-      removeTtsTagsByCategory(fallback, "emotion"),
+      removeLeadingCues(fallback),
       style
     ).replace(/[ \t]+/gu, " ").trim();
-    const ttsText = fallbackBody ? `${emotionPrefix} ${fallbackBody}` : emotionPrefix;
+    const ttsText = renderLeadingCues(fallbackBody, leadingPrefix, style === "fish");
     selections.set(speech.id, {
       speechId: speech.id,
       emotions,
+      styles,
       sounds: newSounds,
       pauses: newPauses,
       soundPositions: newSoundPositions.map((option) => option.id),
@@ -1857,6 +1945,9 @@ function resolveTtsTagAnswers(plan, answers, style, thresholds = TTS_TAG_THRESHO
       emotionMargin: emotionChoice.margin,
       emotion2Probability: emotion2Choice.probability,
       emotion2Confidence: emotion2Choice.confidence,
+      styleProbability: styleChoice.probability,
+      styleConfidence: styleChoice.confidence,
+      styleMargin: styleChoice.margin,
       soundProbability: soundChoice.probability,
       soundConfidence: soundChoice.confidence,
       soundMargin: soundChoice.margin,
@@ -1897,6 +1988,10 @@ function applyTtsTagSelections(segments, plan, selections, includeDebug) {
       `tts-emotion-margin:${selection.emotionMargin.toFixed(3)}`,
       `tts-emotion2-probability:${selection.emotion2Probability.toFixed(3)}`,
       `tts-emotion2-confidence:${selection.emotion2Confidence.toFixed(3)}`,
+      `tts-styles:${JSON.stringify(selection.styles)}`,
+      `tts-style-probability:${selection.styleProbability.toFixed(3)}`,
+      `tts-style-confidence:${selection.styleConfidence.toFixed(3)}`,
+      `tts-style-margin:${selection.styleMargin.toFixed(3)}`,
       `tts-sounds:${JSON.stringify(selection.sounds)}`,
       `tts-sound-probability:${selection.soundProbability.toFixed(3)}`,
       `tts-sound-confidence:${selection.soundConfidence.toFixed(3)}`,
@@ -1925,6 +2020,7 @@ function applyTtsTagSelections(segments, plan, selections, includeDebug) {
       ttsTag: {
         id: selection.speechId,
         emotions: selection.emotions,
+        styles: selection.styles,
         sounds: selection.sounds,
         pauses: selection.pauses,
         source: "jev",
@@ -1943,7 +2039,7 @@ var SPEAKER_DECISION_THRESHOLDS = {
   discourse: { probability: 0.6, confidence: 0.55, margin: 0.2 },
   override: { probability: 0.7, confidence: 0.65, margin: 0.25 }
 };
-var TTS_TAG_SCHEMA = "tts-tags-3";
+var TTS_TAG_SCHEMA = "tts-tags-4";
 var SPEAKER_DECISION_SCHEMA = {
   classifier: "jev-3",
   discourse: "discourse-1",
@@ -3388,7 +3484,10 @@ async function evaluateTtsTagSelections(plan, style, userId) {
     for (const selection of resolved.values()) selection.fallback = true;
   };
   if (!hasCapability) {
-    markFallback(resolveChunk(buildTtsTagPlan(plan), {}));
+    markFallback(resolveChunk(
+      buildTtsTagPlan(plan, void 0, TTS_AUTO_EMOTION_OPTIONS, style),
+      {}
+    ));
     return {
       selections,
       failed: true,
@@ -3396,7 +3495,7 @@ async function evaluateTtsTagSelections(plan, style, userId) {
     };
   }
   const evaluateIds = async (ids, emotionOptions = TTS_AUTO_EMOTION_OPTIONS) => {
-    const tagPlan = buildTtsTagPlan(plan, ids, emotionOptions);
+    const tagPlan = buildTtsTagPlan(plan, ids, emotionOptions, style);
     const result = await spindle.decisions.evaluate({
       state: tagPlan.state,
       questions: tagPlan.questions,
@@ -3431,7 +3530,10 @@ async function evaluateTtsTagSelections(plan, style, userId) {
           return true;
         } catch (compactError) {
           failure = compactError instanceof Error ? compactError.message : String(compactError);
-          markFallback(resolveChunk(buildTtsTagPlan(plan, ids), {}));
+          markFallback(resolveChunk(
+            buildTtsTagPlan(plan, ids, TTS_COMPACT_EMOTION_OPTIONS, style),
+            {}
+          ));
           return false;
         }
       }
@@ -3447,7 +3549,10 @@ async function evaluateTtsTagSelections(plan, style, userId) {
             return true;
           } catch (compactError) {
             failure = compactError instanceof Error ? compactError.message : String(compactError);
-            markFallback(resolveChunk(buildTtsTagPlan(plan, [id]), {}));
+            markFallback(resolveChunk(
+              buildTtsTagPlan(plan, [id], TTS_COMPACT_EMOTION_OPTIONS, style),
+              {}
+            ));
             return false;
           }
         }
@@ -3470,7 +3575,7 @@ async function evaluateTtsTagSelections(plan, style, userId) {
 }
 var TTS_TAG_PLACEMENT_PROMPT = `You place already-chosen performance cues inside quoted dialogue for a text-to-speech engine.
 Return JSON only: {"speeches":[{"id":"speech id","text":"the speech with the cues inserted"}]}.
-Each input speech already starts with one or two emotion cues in square brackets. Preserve those emotion cues exactly at the start.
+Each input speech begins with its emotion cues and any Fish S2 style cues in square brackets, and may repeat them at later sentence starts. Preserve every emotion and style cue in place.
 For every input speech, insert every provided sound cue and every provided pause cue exactly once, at the intended moment for each.
 Do not add, remove, or change any other character, word, punctuation mark, or whitespace. Preserve every existing cue in the text.
 Never choose different cues and never add an emotion. If a cue cannot be placed naturally, return the original text unchanged.
@@ -3494,6 +3599,7 @@ async function placeTtsTags(payload, userId) {
           speeches: payload.items.map((item) => ({
             id: item.id,
             text: item.text,
+            styleTags: item.styles.map((styleTag) => formatTtsTag(styleTag, payload.style)),
             soundTags: item.sounds.map((sound) => formatTtsTag(sound, payload.style)),
             pauseTags: item.pauses.map((pause) => formatTtsTag(pause, payload.style))
           }))
@@ -3527,10 +3633,13 @@ async function placeTtsTags(payload, userId) {
     const tagged = outputs.get(item.id);
     if (!tagged || !validateTtsSpeechPlacement(item.text, tagged, {
       emotions: item.emotions,
+      styles: item.styles,
       sounds: item.sounds,
       pauses: item.pauses
     }, payload.style)) continue;
-    placements.push({ id: item.id, text: normalizeTtsTags(tagged, payload.style) });
+    const normalized = normalizeTtsTags(tagged, payload.style);
+    const text2 = payload.style === "fish" ? applyLeadingTtsCues(normalized, item.emotions, item.styles, payload.style) : normalized;
+    placements.push({ id: item.id, text: text2 });
   }
   return placements;
 }
@@ -3540,7 +3649,7 @@ async function applyTtsTags(segments, plan, style, selections, includeDebug) {
     const result = await selections;
     const applied = applyTtsTagSelections(
       segments,
-      buildTtsTagPlan(plan),
+      buildTtsTagPlan(plan, void 0, TTS_AUTO_EMOTION_OPTIONS, style),
       result.selections,
       includeDebug
     );

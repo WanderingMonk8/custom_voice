@@ -2,6 +2,7 @@ import {
   addScannedFirstNameAliases,
   addUnconfiguredDialogueSpeakers,
   applyConfigToMetadata,
+  applyLeadingTtsCues,
   assessSpeakerDiscourseEscalation,
   applyTtsTagSelections,
   buildSpeakerDecisionPlan,
@@ -104,6 +105,7 @@ type FrontendMessage =
         id: string
         text: string
         emotions: string[]
+        styles: string[]
         sounds: string[]
         pauses: Array<'short' | 'long'>
       }>
@@ -434,7 +436,10 @@ async function evaluateTtsTagSelections(
     for (const selection of resolved.values()) selection.fallback = true
   }
   if (!hasCapability) {
-    markFallback(resolveChunk(buildTtsTagPlan(plan), {}))
+    markFallback(resolveChunk(
+      buildTtsTagPlan(plan, undefined, TTS_AUTO_EMOTION_OPTIONS, style),
+      {},
+    ))
     return {
       selections,
       failed: true,
@@ -445,7 +450,7 @@ async function evaluateTtsTagSelections(
     ids: string[],
     emotionOptions: readonly TtsTagOption[] = TTS_AUTO_EMOTION_OPTIONS,
   ) => {
-    const tagPlan = buildTtsTagPlan(plan, ids, emotionOptions)
+    const tagPlan = buildTtsTagPlan(plan, ids, emotionOptions, style)
     const result = await spindle.decisions.evaluate({
       state: tagPlan.state,
       questions: tagPlan.questions,
@@ -480,7 +485,10 @@ async function evaluateTtsTagSelections(
           return true
         } catch (compactError) {
           failure = compactError instanceof Error ? compactError.message : String(compactError)
-          markFallback(resolveChunk(buildTtsTagPlan(plan, ids), {}))
+          markFallback(resolveChunk(
+            buildTtsTagPlan(plan, ids, TTS_COMPACT_EMOTION_OPTIONS, style),
+            {},
+          ))
           return false
         }
       }
@@ -496,7 +504,10 @@ async function evaluateTtsTagSelections(
             return true
           } catch (compactError) {
             failure = compactError instanceof Error ? compactError.message : String(compactError)
-            markFallback(resolveChunk(buildTtsTagPlan(plan, [id]), {}))
+            markFallback(resolveChunk(
+              buildTtsTagPlan(plan, [id], TTS_COMPACT_EMOTION_OPTIONS, style),
+              {},
+            ))
             return false
           }
         }
@@ -520,7 +531,7 @@ async function evaluateTtsTagSelections(
 
 const TTS_TAG_PLACEMENT_PROMPT = `You place already-chosen performance cues inside quoted dialogue for a text-to-speech engine.
 Return JSON only: {"speeches":[{"id":"speech id","text":"the speech with the cues inserted"}]}.
-Each input speech already starts with one or two emotion cues in square brackets. Preserve those emotion cues exactly at the start.
+Each input speech begins with its emotion cues and any Fish S2 style cues in square brackets, and may repeat them at later sentence starts. Preserve every emotion and style cue in place.
 For every input speech, insert every provided sound cue and every provided pause cue exactly once, at the intended moment for each.
 Do not add, remove, or change any other character, word, punctuation mark, or whitespace. Preserve every existing cue in the text.
 Never choose different cues and never add an emotion. If a cue cannot be placed naturally, return the original text unchanged.
@@ -548,6 +559,7 @@ async function placeTtsTags(
           speeches: payload.items.map(item => ({
             id: item.id,
             text: item.text,
+            styleTags: item.styles.map(styleTag => formatTtsTag(styleTag, payload.style)),
             soundTags: item.sounds.map(sound => formatTtsTag(sound, payload.style)),
             pauseTags: item.pauses.map(pause => formatTtsTag(pause, payload.style)),
           })),
@@ -583,10 +595,15 @@ async function placeTtsTags(
     const tagged = outputs.get(item.id)
     if (!tagged || !validateTtsSpeechPlacement(item.text, tagged, {
       emotions: item.emotions,
+      styles: item.styles,
       sounds: item.sounds,
       pauses: item.pauses,
     }, payload.style)) continue
-    placements.push({ id: item.id, text: normalizeTtsTags(tagged, payload.style) })
+    const normalized = normalizeTtsTags(tagged, payload.style)
+    const text = payload.style === 'fish'
+      ? applyLeadingTtsCues(normalized, item.emotions, item.styles, payload.style)
+      : normalized
+    placements.push({ id: item.id, text })
   }
   return placements
 }
@@ -603,7 +620,7 @@ async function applyTtsTags(
     const result = await selections
     const applied = applyTtsTagSelections(
       segments,
-      buildTtsTagPlan(plan),
+      buildTtsTagPlan(plan, undefined, TTS_AUTO_EMOTION_OPTIONS, style),
       result.selections,
       includeDebug,
     )

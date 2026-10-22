@@ -18,10 +18,13 @@ the leading emotion is sent as an inline bracket cue instead.
 1. **Structure plan.** `buildSpeakerDecisionPlan` supplies the message,
    quotations, and surrounding narration. The same structure is used by Jev
    speaker assignment and by the tag pass.
-2. **Jev tag ranking.** `buildTtsTagPlan` issues eight questions per speech:
+2. **Jev tag ranking.** `buildTtsTagPlan` issues eight questions per speech for
+   Gemini, and nine for Fish S2:
    - mandatory primary emotion from the 24 basic emotions; no threshold, with
      `calm` as the neutral fallback
    - optional secondary basic emotion
+   - Fish-only optional sustained voice style (whispering, soft/loud/low voice,
+     shouting, screaming)
    - optional primary momentary sound
    - optional secondary momentary sound
    - fallback primary-sound boundary
@@ -78,11 +81,19 @@ LLM placement never runs as one call for the whole message:
   emotion may be added above the same strict thresholds. Existing cues using
   any of the 49 documented Fish emotions are preserved, moved/normalized to the
   start, and capped at two.
-- **Sound:** up to two, rendered with Fish's documented forms where they differ,
-  such as `[laughing]`, `[sighing]`, and `[gasping]`. Existing sounds count
-  toward the cap; duplicates are skipped.
-- **Pause:** up to two, using `[break]` or `[long-break]`. Existing pauses count
-  toward the cap.
+- **Fish S2 style:** an optional sustained voice style is placed with the
+  emotion at the start, never sent to the placement LLM. Fish sound cues use
+  the S2 well-tested forms, including `[sigh]`, `[gasp]`, `[groan]`,
+  `[laughing]`, `[crying]`, `[inhale]`, `[exhale]`, and `[clears throat]`.
+  Pauses use `[short pause]` and `[long pause]`.
+- **Fish S2 scoping:** because S2 cues apply until the next cue or sentence end,
+  the leading emotion/style prefix is repeated at each sentence start. This also
+  restores the base delivery after a reaction or pause in the previous sentence.
+  Gemini keeps its existing single-prefix behavior.
+- **Sound:** up to two, rendered with Fish's documented forms where they differ.
+  Existing sounds count toward the cap; duplicates are skipped.
+- **Pause:** up to two, using the provider-specific pause form. Existing pauses
+  count toward the cap.
 - Existing angle-bracket cues are normalized to bracket cues.
 
 ## Settings
@@ -114,8 +125,8 @@ the deterministic parse cache.
 
 With **Speaker assignment debug** enabled, each speech's debug path includes
 the leading emotions, primary/secondary emotion probabilities, confidence and
-margin, sound and pause probabilities, margins, boundaries, and the resulting
-`tts-text`. The speech
+margin, Fish style probabilities, sound and pause probabilities, margins,
+boundaries, and the resulting `tts-text`. The speech
 list also shows a truncated `tts-tagged` line. LLM placement adds its
 style/connection/model settings, cache hits, chunk start/finish/failure events,
 the first-chunk timeout, and each applied placement text. The synthesis plan
