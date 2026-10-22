@@ -117,6 +117,12 @@ export interface TtsTagPlacement {
   source: 'jev' | 'llm'
   /** Emotion-bearing text before new sound/pause insertion, used for LLM placement. */
   baseText?: string
+  /** True when a mid-speech modulation point is present in baseText. */
+  modulation?: boolean
+  /** Jev position option ID for the modulation point. */
+  modulationPoint?: string
+  /** Character offset of the modulation point in the original speech. */
+  modulationCharIndex?: number
   /** Surrounding narration used when generating a custom Fish emotion tag. */
   narrativeBefore?: string
   narrativeAfter?: string
@@ -496,6 +502,18 @@ function readParsedMessages(value: unknown): Record<string, CachedMessageParse> 
             ...(typeof segment.ttsTag.baseText === 'string'
               ? { baseText: segment.ttsTag.baseText.trim().slice(0, 20_000) }
               : {}),
+            ...(segment.ttsTag.modulation === true
+              ? { modulation: true }
+              : {}),
+            ...(segment.ttsTag.modulation === true
+              && typeof segment.ttsTag.modulationPoint === 'string'
+              ? { modulationPoint: segment.ttsTag.modulationPoint.trim().slice(0, 64) }
+              : {}),
+            ...(segment.ttsTag.modulation === true
+              && typeof segment.ttsTag.modulationCharIndex === 'number'
+              && Number.isInteger(segment.ttsTag.modulationCharIndex)
+              ? { modulationCharIndex: segment.ttsTag.modulationCharIndex }
+              : {}),
             ...(typeof segment.ttsTag.narrativeBefore === 'string'
               ? { narrativeBefore: segment.ttsTag.narrativeBefore.trim().slice(0, 20_000) }
               : {}),
@@ -514,6 +532,7 @@ function readParsedMessages(value: unknown): Record<string, CachedMessageParse> 
             || ttsTag.styles.length > 0
             || ttsTag.sounds.length > 0
             || ttsTag.pauses.length > 0
+            || ttsTag.modulation === true
           ) ? { ttsTag } : {}),
         })
       }
@@ -2227,6 +2246,13 @@ export const TTS_TAG_POSITION_THRESHOLDS: TtsTagThresholds = {
 }
 
 /**
+ * Internal marker used only between Jev and the Fish placement LLM. It is
+ * replaced by the generated modulation tag, or removed on fallback, before
+ * any text reaches TTS.
+ */
+export const TTS_MODULATION_MARKER = '[modulationmarker]'
+
+/**
  * The primary emotion is mandatory, but a weak winner falls back to calm
  * instead of forcing an arbitrary expression onto the line.
  */
@@ -2573,8 +2599,22 @@ export function validateTtsSpeechPlacement(
     .filter((value): value is string => !!value && ttsTagCategory(value) === 'pause')
   if (pauses.length !== request.pauses.length || pauses.length > 2) return false
 
-  const normalizedOriginal = stripTtsTags(original).replace(/\s+/gu, ' ').trim()
-  const normalizedTagged = stripTtsTags(tagged).replace(/\s+/gu, ' ').trim()
+  const originalMarkerCount = original.split(TTS_MODULATION_MARKER).length - 1
+  const taggedMarkerCount = tagged.split(TTS_MODULATION_MARKER).length - 1
+  if (originalMarkerCount > 1 || originalMarkerCount !== taggedMarkerCount) return false
+  if (originalMarkerCount === 1) {
+    const originalBeforeMarker = stripTtsTags(original.split(TTS_MODULATION_MARKER)[0])
+      .replace(/\s+/gu, ' ')
+      .trim()
+    const taggedBeforeMarker = stripTtsTags(tagged.split(TTS_MODULATION_MARKER)[0])
+      .replace(/\s+/gu, ' ')
+      .trim()
+    if (originalBeforeMarker !== taggedBeforeMarker) return false
+  }
+  const originalWithoutMarker = original.split(TTS_MODULATION_MARKER).join(' ')
+  const taggedWithoutMarker = tagged.split(TTS_MODULATION_MARKER).join(' ')
+  const normalizedOriginal = stripTtsTags(originalWithoutMarker).replace(/\s+/gu, ' ').trim()
+  const normalizedTagged = stripTtsTags(taggedWithoutMarker).replace(/\s+/gu, ' ').trim()
   if (normalizedOriginal !== normalizedTagged) return false
   const emotionPrefix = [...emotions, ...styles]
     .map(tag => formatTtsTag(tag, style))
@@ -2683,6 +2723,57 @@ function insertTtsTag(text: string, token: string, charIndex: number): string {
   return `${before} ${token} ${after}`
 }
 
+const TTS_MODULATION_MAX_POSITIONS = 8
+const TTS_MODULATION_MIN_BEFORE_WORDS = 2
+const TTS_MODULATION_MIN_REMAINDER_WORDS = 4
+
+function ttsWordCount(text: string): number {
+  return text.trim().split(/\s+/u).filter(Boolean).length
+}
+
+function ttsPositionDescription(text: string, charIndex: number): string {
+  const snippet = text.slice(charIndex, charIndex + 48).trim()
+  return `Just before "${snippet}${snippet.length >= 48 ? '…' : ''}".`
+}
+
+/**
+ * Mid-speech modulation can occur inside a sentence, so unlike sound/pause
+ * placement this offers clause boundaries and a few evenly spaced word
+ * boundaries. Start/end and points with too little context are excluded.
+ */
+function ttsModulationPositionOptions(text: string): TtsTagPositionOption[] {
+  const candidates: number[] = []
+  const add = (charIndex: number) => {
+    if (charIndex <= 0 || charIndex >= text.length) return
+    if (ttsWordCount(stripTtsTags(text.slice(0, charIndex))) < TTS_MODULATION_MIN_BEFORE_WORDS) return
+    if (ttsWordCount(stripTtsTags(text.slice(charIndex))) < TTS_MODULATION_MIN_REMAINDER_WORDS) return
+    if (!candidates.includes(charIndex)) candidates.push(charIndex)
+  }
+
+  for (const match of text.matchAll(/[,.!?;:…—–]+["'”’)]*\s+/gu)) {
+    if (match.index === undefined) continue
+    add(match.index + match[0].length)
+  }
+
+  const words = [...text.matchAll(/\S+/gu)]
+  for (let index = 6; index < words.length - TTS_MODULATION_MIN_REMAINDER_WORDS; index += 6) {
+    const charIndex = words[index].index
+    if (charIndex !== undefined) add(charIndex)
+  }
+
+  candidates.sort((left, right) => left - right)
+  const selected = candidates.length <= TTS_MODULATION_MAX_POSITIONS
+    ? candidates
+    : Array.from({ length: TTS_MODULATION_MAX_POSITIONS }, (_, index) => (
+        candidates[Math.floor(index * (candidates.length - 1) / (TTS_MODULATION_MAX_POSITIONS - 1))]
+      )).filter((charIndex, index, values) => values.indexOf(charIndex) === index)
+  return selected.map((charIndex, index) => ({
+    id: `m${index + 1}`,
+    charIndex,
+    description: ttsPositionDescription(text, charIndex),
+  }))
+}
+
 export interface TtsTagPlan {
   state: {
     messageRole: 'assistant' | 'user'
@@ -2700,12 +2791,16 @@ export interface TtsTagPlan {
   positions: Record<string, TtsTagPositionOption[]>
   /** Pause position options per speech. */
   pausePositions: Record<string, TtsTagPositionOption[]>
+  /** Optional mid-speech modulation position options per speech. */
+  modulationPositions: Record<string, TtsTagPositionOption[]>
 }
 
 const TTS_NO_TAG_OPTION = 'no_tag'
 const TTS_NO_PAUSE_OPTION = 'no_pause'
 const TTS_NO_EMOTION_OPTION = 'no_emotion'
 const TTS_NO_STYLE_OPTION = 'no_style'
+const TTS_MODULATION_OPTION = 'modulation'
+const TTS_NO_MODULATION_OPTION = 'no_modulation'
 
 function ttsEmotionCriteria(options: readonly TtsTagOption[]): Record<string, string> {
   return Object.fromEntries(options.map(option => [option.value, option.description]))
@@ -2732,12 +2827,15 @@ function ttsPauseCriteria(): Record<string, string> {
 /**
  * Build the batched tag questions. Every speech gets a mandatory emotion, an
  * optional sound, and an optional pause, plus fallback placement boundaries.
+ * Fish S2 with LLM placement also gets an optional mid-speech modulation and
+ * its position when the speech is long enough to have a useful remainder.
  */
 export function buildTtsTagPlan(
   plan: SpeakerDecisionPlan,
   speechIds?: readonly string[],
   emotionOptions: readonly TtsTagOption[] = TTS_AUTO_EMOTION_OPTIONS,
   style: Exclude<TtsTagStyle, 'off'> = 'gemini',
+  enableModulation = false,
 ): TtsTagPlan {
   const allowed = speechIds ? new Set(speechIds) : null
   const speeches = plan.state.speeches
@@ -2761,6 +2859,7 @@ export function buildTtsTagPlan(
   const questions: SpeakerDecisionPlan['questions'] = {}
   const positions: Record<string, TtsTagPositionOption[]> = {}
   const pausePositions: Record<string, TtsTagPositionOption[]> = {}
+  const modulationPositions: Record<string, TtsTagPositionOption[]> = {}
   for (const speech of speeches) {
     if (style !== 'gemini38') {
       questions[`emotion_${speech.id}`] = {
@@ -2785,6 +2884,25 @@ export function buildTtsTagPlan(
           ...styleCriteria,
           [TTS_NO_STYLE_OPTION]: 'No sustained voice style. Most lines should choose this.',
         },
+      }
+      if (enableModulation) {
+        const modulationOptions = ttsModulationPositionOptions(speech.text)
+        if (modulationOptions.length > 0) {
+          modulationPositions[speech.id] = modulationOptions
+          questions[`modulation_${speech.id}`] = {
+            type: 'choice',
+            instructions: `Does quotation ${speech.id} have a clear internal emotional turn that should change delivery before the quotation ends? Choose modulation only when the emotion genuinely shifts and the new delivery should continue to the end. Ignore momentary sounds, ordinary punctuation, and small intensity changes.`,
+            criteria: {
+              modulation: 'A clear, sustained emotional turn inside the quotation.',
+              no_modulation: 'No clear internal emotional turn. Most lines should choose this.',
+            },
+          }
+          questions[`modulationpos_${speech.id}`] = {
+            type: 'choice',
+            instructions: `If quotation ${speech.id} receives a modulation, where should the new emotion begin? Choose the boundary closest to the emotional turn.`,
+            criteria: Object.fromEntries(modulationOptions.map(option => [option.id, option.description])),
+          }
+        }
       }
     }
     questions[`tag_${speech.id}`] = {
@@ -2830,6 +2948,7 @@ export function buildTtsTagPlan(
     questions,
     positions,
     pausePositions,
+    modulationPositions,
   }
 }
 
@@ -2845,6 +2964,12 @@ export interface TtsTagSelection {
   pauses: Array<'short' | 'long'>
   soundPositions: string[]
   pausePositions: string[]
+  /** True when Jev selected a mid-speech modulation. */
+  modulation: boolean
+  /** Jev position option ID for the modulation point, when active. */
+  modulationPoint: string | null
+  /** Character offset of the modulation point in the original speech. */
+  modulationCharIndex: number | null
   /** Emotion-bearing text without new sound/pause; used by the placement LLM. */
   baseText: string
   /** Full deterministic fallback text with the provider-supported leading cues. */
@@ -2873,6 +2998,10 @@ export interface TtsTagSelection {
   pause2Confidence: number
   pause2Margin: number
   pausePositionConfidence: number
+  modulationProbability: number
+  modulationConfidence: number
+  modulationMargin: number
+  modulationPositionConfidence: number
   existingTags: string[]
   /** True when this speech used the neutral fallback because its batch failed. */
   fallback?: boolean
@@ -2907,6 +3036,51 @@ function clearTagChoice(
     return { tag: null, probability, confidence, margin }
   }
   return { tag, probability, confidence, margin }
+}
+
+function clearModulationChoice(
+  answer: SpeakerDecisionChoice | undefined,
+  thresholds: TtsTagThresholds,
+): { active: boolean; probability: number; confidence: number; margin: number } {
+  if (!answer) return { active: false, probability: 0, confidence: 0, margin: 0 }
+  const ranked = Object.entries(answer.probabilities)
+    .filter((entry): entry is [string, number] => Number.isFinite(entry[1]))
+    .sort((left, right) => right[1] - left[1])
+  const probability = answer.probabilities[answer.choice] ?? 0
+  const runnerUp = ranked.find(([option]) => option !== answer.choice)?.[1] ?? 0
+  const margin = probability - runnerUp
+  return {
+    active: answer.choice === TTS_MODULATION_OPTION
+      && probability >= thresholds.probability
+      && answer.confidence >= thresholds.confidence
+      && margin >= thresholds.margin,
+    probability,
+    confidence: answer.confidence,
+    margin,
+  }
+}
+
+function resolveModulationPosition(
+  answer: SpeakerDecisionChoice | undefined,
+  options: TtsTagPositionOption[],
+  thresholds: TtsTagThresholds,
+): { option: TtsTagPositionOption | null; confidence: number } {
+  if (!answer || options.length === 0) return { option: null, confidence: 0 }
+  const ranked = Object.entries(answer.probabilities)
+    .filter((entry): entry is [string, number] => Number.isFinite(entry[1]))
+    .sort((left, right) => right[1] - left[1])
+  const probability = answer.probabilities[answer.choice] ?? 0
+  const runnerUp = ranked.find(([option]) => option !== answer.choice)?.[1] ?? 0
+  const selected = options.find(option => option.id === answer.choice) ?? null
+  if (
+    !selected
+    || probability < thresholds.probability
+    || answer.confidence < thresholds.confidence
+    || probability - runnerUp < thresholds.margin
+  ) {
+    return { option: null, confidence: answer.confidence }
+  }
+  return { option: selected, confidence: answer.confidence }
 }
 
 function resolveEmotionChoice(
@@ -3003,7 +3177,7 @@ export function applyLeadingTtsCues(
   styles: readonly string[],
   style: Exclude<TtsTagStyle, 'off'>,
 ): string {
-  const normalized = normalizeTtsTags(text, style)
+  const normalized = normalizeTtsTags(stripTtsModulationMarker(text), style)
   const body = style === 'fish' || style === 'gemini38'
     ? removeTtsTagsByCategory(removeTtsTagsByCategory(normalized, 'emotion'), 'style')
     : normalized
@@ -3038,6 +3212,11 @@ export function normalizeCustomTtsEmotionTag(value: string): string | null {
   return tag
 }
 
+/** Remove the internal modulation marker before text can reach TTS. */
+export function stripTtsModulationMarker(text: string): string {
+  return text.split(TTS_MODULATION_MARKER).join('')
+}
+
 /** Replace the fixed leading emotion with a validated Fish S2 custom cue. */
 export function applyCustomTtsEmotionCues(
   text: string,
@@ -3045,7 +3224,7 @@ export function applyCustomTtsEmotionCues(
   styles: readonly string[],
   style: Exclude<TtsTagStyle, 'off'>,
 ): string {
-  const normalized = normalizeTtsTags(text, style)
+  const normalized = normalizeTtsTags(stripTtsModulationMarker(text), style)
   const body = style === 'fish'
     ? removeTtsTagsByCategory(removeTtsTagsByCategory(normalized, 'emotion'), 'style')
     : normalized
@@ -3057,6 +3236,71 @@ export function applyCustomTtsEmotionCues(
     prefix,
     style === 'fish',
   )
+}
+
+/**
+ * Replace the leading Fish cue and insert a second free-form cue at the Jev
+ * modulation point. The modulation remains active at later sentence starts,
+ * matching Fish S2's sentence-scoped cue behavior.
+ */
+export function applyCustomTtsEmotionCuesWithModulation(
+  text: string,
+  customTag: string,
+  styles: readonly string[],
+  modulationTag: string,
+  style: Exclude<TtsTagStyle, 'off'>,
+): string {
+  const normalized = normalizeTtsTags(text, style)
+  const body = style === 'fish'
+    ? removeTtsTagsByCategory(removeTtsTagsByCategory(normalized, 'emotion'), 'style')
+    : normalized
+  const stylePrefix = styles.map(tag => formatTtsTag(tag, style)).filter(Boolean).join(' ')
+  const leadingPrefix = [formatTtsTag(customTag, style), stylePrefix].filter(Boolean).join(' ')
+  const modulationPrefix = [formatTtsTag(modulationTag, style), stylePrefix].filter(Boolean).join(' ')
+  const rendered: string[] = []
+  let activePrefix = leadingPrefix
+  const cleanBody = body.replace(/[ \t]+/gu, ' ').trim()
+
+  for (const sentence of cleanBody.split(/(?<=[.!?…])\s+/u).filter(Boolean)) {
+    const markerIndex = sentence.indexOf(TTS_MODULATION_MARKER)
+    const sentenceWords = stripTtsTags(
+      sentence.split(TTS_MODULATION_MARKER).join(' '),
+    ).replace(/\s+/gu, ' ').trim()
+    if (!sentenceWords) {
+      if (rendered.length > 0) rendered[rendered.length - 1] += ` ${sentence}`
+      else rendered.push(sentence)
+      continue
+    }
+    if (markerIndex < 0) {
+      rendered.push(activePrefix ? `${activePrefix} ${sentence}` : sentence)
+      continue
+    }
+
+    const before = sentence.slice(0, markerIndex).trim()
+    const after = sentence.slice(markerIndex + TTS_MODULATION_MARKER.length).trim()
+    const beforeWords = stripTtsTags(before).replace(/\s+/gu, ' ').trim()
+    const afterWords = stripTtsTags(after).replace(/\s+/gu, ' ').trim()
+    if (!afterWords) {
+      const withoutMarker = stripTtsModulationMarker(sentence).trim()
+      rendered.push(activePrefix ? `${activePrefix} ${withoutMarker}` : withoutMarker)
+      continue
+    }
+    if (!beforeWords) {
+      rendered.push(
+        [before, modulationPrefix, after].filter(Boolean).join(' ').replace(/\s+/gu, ' ').trim(),
+      )
+    } else {
+      rendered.push(
+        [activePrefix, before, modulationPrefix, after]
+          .filter(Boolean)
+          .join(' ')
+          .replace(/\s+/gu, ' ')
+          .trim(),
+      )
+    }
+    activePrefix = modulationPrefix
+  }
+  return rendered.join(' ')
 }
 
 /**
@@ -3082,6 +3326,19 @@ export function resolveTtsTagAnswers(
     const sound2Choice = clearTagChoice(answers[`tag2_${speech.id}`], thresholds, 'sound')
     const pauseChoice = clearTagChoice(answers[`pause_${speech.id}`], thresholds, 'pause')
     const pause2Choice = clearTagChoice(answers[`pause2_${speech.id}`], thresholds, 'pause')
+    const modulationOptions = plan.modulationPositions[speech.id] ?? []
+    const modulationChoice = clearModulationChoice(
+      answers[`modulation_${speech.id}`],
+      thresholds,
+    )
+    const modulationPosition = modulationChoice.active
+      ? resolveModulationPosition(
+          answers[`modulationpos_${speech.id}`],
+          modulationOptions,
+          positionThresholds,
+        )
+      : { option: null, confidence: 0 }
+    const modulation = modulationChoice.active && modulationPosition.option !== null
     const soundPositions = plan.positions[speech.id]
       ?? [{ id: 'start', charIndex: 0, description: '' }]
     const pausePositions = plan.pausePositions[speech.id] ?? soundPositions
@@ -3166,8 +3423,11 @@ export function resolveTtsTagAnswers(
         ? removeTtsTagsByCategory(withoutEmotions, 'style')
         : withoutEmotions
     }
+    const baseSource = modulation && modulationPosition.option
+      ? insertTtsTag(speech.text, TTS_MODULATION_MARKER, modulationPosition.option.charIndex)
+      : speech.text
     const baseBody = normalizeTtsTags(
-      removeLeadingCues(speech.text),
+      removeLeadingCues(baseSource),
       style,
     ).replace(/[ \t]+/gu, ' ').trim()
     const baseText = leadingPrefix
@@ -3201,6 +3461,9 @@ export function resolveTtsTagAnswers(
       pauses: newPauses,
       soundPositions: newSoundPositions.map(option => option.id),
       pausePositions: newPausePositions.map(option => option.id),
+      modulation,
+      modulationPoint: modulation ? modulationPosition.option?.id ?? null : null,
+      modulationCharIndex: modulation ? modulationPosition.option?.charIndex ?? null : null,
       baseText,
       ttsText,
       narrativeBefore: speech.narrativeBefore,
@@ -3227,6 +3490,10 @@ export function resolveTtsTagAnswers(
       pause2Confidence: pause2Choice.confidence,
       pause2Margin: pause2Choice.margin,
       pausePositionConfidence: pausePosition.confidence,
+      modulationProbability: modulationChoice.probability,
+      modulationConfidence: modulationChoice.confidence,
+      modulationMargin: modulationChoice.margin,
+      modulationPositionConfidence: modulationPosition.confidence,
       existingTags,
     })
   }
@@ -3287,6 +3554,13 @@ export function applyTtsTagSelections(
           `tts-pause2-margin:${selection.pause2Margin.toFixed(3)}`,
           `tts-pause-positions:${JSON.stringify(selection.pausePositions)}`,
           `tts-pause-position-confidence:${selection.pausePositionConfidence.toFixed(3)}`,
+          `tts-modulation:${selection.modulation}`,
+          `tts-modulation-probability:${selection.modulationProbability.toFixed(3)}`,
+          `tts-modulation-confidence:${selection.modulationConfidence.toFixed(3)}`,
+          `tts-modulation-margin:${selection.modulationMargin.toFixed(3)}`,
+          `tts-modulation-point:${JSON.stringify(selection.modulationPoint)}`,
+          `tts-modulation-char-index:${selection.modulationCharIndex ?? 'null'}`,
+          `tts-modulation-position-confidence:${selection.modulationPositionConfidence.toFixed(3)}`,
           `tts-tag-source:jev`,
           ...(selection.fallback ? ['tts-tag-evaluation:neutral-fallback'] : []),
           `tts-text:${selection.ttsText}`,
@@ -3303,6 +3577,11 @@ export function applyTtsTagSelections(
         pauses: selection.pauses,
         source: 'jev' as const,
         baseText: selection.baseText,
+        modulation: selection.modulation,
+        ...(selection.modulationPoint ? { modulationPoint: selection.modulationPoint } : {}),
+        ...(selection.modulationCharIndex !== null
+          ? { modulationCharIndex: selection.modulationCharIndex }
+          : {}),
         narrativeBefore: selection.narrativeBefore,
         narrativeAfter: selection.narrativeAfter,
       },
@@ -3337,7 +3616,7 @@ export const SPEAKER_DECISION_THRESHOLDS: Record<'local' | 'discourse' | 'overri
   override: { probability: 0.7, confidence: 0.65, margin: 0.25 },
 }
 
-export const TTS_TAG_SCHEMA = 'tts-tags-5'
+export const TTS_TAG_SCHEMA = 'tts-tags-6'
 
 /** Bump a version whenever a stage changes the output stored in the cache. */
 export const SPEAKER_DECISION_SCHEMA = {

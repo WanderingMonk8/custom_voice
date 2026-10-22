@@ -245,7 +245,7 @@ interface LlmConnectionsPayload {
 interface TagPlacementPayload {
   type: 'chat_voice_tag_placement'
   requestId: string
-  placements: Array<{ id: string; text: string; emotionTag?: string }>
+  placements: Array<{ id: string; text: string; emotionTag?: string; modulationTag?: string }>
   error?: string
 }
 
@@ -1298,7 +1298,12 @@ export function setup(ctx: SpindleFrontendContext) {
     timer: ReturnType<typeof setTimeout>
   }>()
   const pendingTagPlacementRequests = new Map<string, {
-    resolve: (placements: Array<{ id: string; text: string; emotionTag?: string }>) => void
+    resolve: (placements: Array<{
+      id: string
+      text: string
+      emotionTag?: string
+      modulationTag?: string
+    }>) => void
     reject: (error: Error) => void
     timer: ReturnType<typeof setTimeout>
   }>()
@@ -2078,10 +2083,13 @@ export function setup(ctx: SpindleFrontendContext) {
       styles: string[]
       sounds: string[]
       pauses: Array<'short' | 'long'>
+      modulation: boolean
+      modulationPoint?: string
+      modulationCharIndex?: number
       narrativeBefore: string
       narrativeAfter: string
     }>,
-  ): Promise<Array<{ id: string; text: string; emotionTag?: string }>> {
+  ): Promise<Array<{ id: string; text: string; emotionTag?: string; modulationTag?: string }>> {
     const requestId = `tag-placement-${Date.now().toString(36)}-${++tagPlacementRequestSequence}`
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -2116,7 +2124,9 @@ export function setup(ctx: SpindleFrontendContext) {
   function updateTtsTagControls(): void {
     ttsTagHint.textContent = ttsTagStyle === 'gemini38'
       ? 'Gemini 3.8 uses angle-bracket vocal events and pauses. Sustained emotion and style require speech_metadata, which the current TTS request does not expose.'
-      : 'Every speech gets one or two leading emotions. Up to two sounds and two pauses may be added; all cues for a speech share the same grouped placement request.'
+      : ttsTagStyle === 'fish' && ttsTagPlacement === 'llm'
+        ? 'Every speech gets one or two leading emotions. Fish can also select one mid-speech modulation; up to two sounds and two pauses may be added. All cues for a speech share the grouped placement request.'
+        : 'Every speech gets one or two leading emotions. Up to two sounds and two pauses may be added; all cues for a speech share the same grouped placement request.'
     const tagEnabled = ttsTagStyle !== 'off'
     const llmEnabled = tagEnabled && ttsTagPlacement === 'llm'
     ttsTagPlacementPicker.update({
@@ -2505,6 +2515,9 @@ export function setup(ctx: SpindleFrontendContext) {
         styles: string[]
         sounds: string[]
         pauses: Array<'short' | 'long'>
+        modulation: boolean
+        modulationPoint?: string
+        modulationCharIndex?: number
         narrativeBefore: string
         narrativeAfter: string
       }>()
@@ -2527,13 +2540,20 @@ export function setup(ctx: SpindleFrontendContext) {
             styles: segment.ttsTag.styles,
             sounds: segment.ttsTag.sounds,
             pauses: segment.ttsTag.pauses,
+            modulation: segment.ttsTag.modulation === true,
+            ...(segment.ttsTag.modulationPoint
+              ? { modulationPoint: segment.ttsTag.modulationPoint }
+              : {}),
+            ...(segment.ttsTag.modulationCharIndex !== undefined
+              ? { modulationCharIndex: segment.ttsTag.modulationCharIndex }
+              : {}),
             narrativeBefore: segment.ttsTag.narrativeBefore ?? '',
             narrativeAfter: segment.ttsTag.narrativeAfter ?? '',
           })
         }
       }
       const applyTagPlacements = (
-        placements: Array<{ id: string; text: string; emotionTag?: string }>,
+        placements: Array<{ id: string; text: string; emotionTag?: string; modulationTag?: string }>,
         origin: 'cache' | 'llm',
       ) => {
         for (const placement of placements) {
@@ -2546,6 +2566,9 @@ export function setup(ctx: SpindleFrontendContext) {
               + `\u0000${JSON.stringify(source.styles)}`
               + `\u0000${JSON.stringify(source.sounds)}`
               + `\u0000${JSON.stringify(source.pauses)}`
+              + `\u0000${source.modulation ? '1' : '0'}`
+              + `\u0000${source.modulationPoint ?? ''}`
+              + `\u0000${source.modulationCharIndex ?? ''}`
               + `\u0000${source.text}`
               + `\u0000${source.narrativeBefore}\u0000${source.narrativeAfter}`,
             placement.text,
@@ -2562,8 +2585,16 @@ export function setup(ctx: SpindleFrontendContext) {
             `TTS tag placement [${placement.id}] emotions=${JSON.stringify(source.emotions)}, `
               + `styles=${JSON.stringify(source.styles)}, `
               + `sounds=${JSON.stringify(source.sounds)}, `
-              + `pauses=${JSON.stringify(source.pauses)}`
-              + `${placement.emotionTag ? `, custom=${JSON.stringify(placement.emotionTag)}` : ''} `
+              + `pauses=${JSON.stringify(source.pauses)}, `
+              + `modulation=${source.modulation}`
+              + `${source.modulationPoint ? ` at ${source.modulationPoint}` : ''}`
+              + `${source.modulationCharIndex !== undefined
+                ? ` char=${source.modulationCharIndex}`
+                : ''}`
+              + `${placement.emotionTag ? `, custom=${JSON.stringify(placement.emotionTag)}` : ''}`
+              + `${placement.modulationTag
+                ? `, modulationTag=${JSON.stringify(placement.modulationTag)}`
+                : ''} `
               + `via ${origin}: `
               + JSON.stringify(placement.text.length > 180
                 ? `${placement.text.slice(0, 177)}...`
@@ -2589,6 +2620,9 @@ export function setup(ctx: SpindleFrontendContext) {
           styles: string[]
           sounds: string[]
           pauses: Array<'short' | 'long'>
+          modulation: boolean
+          modulationPoint?: string
+          modulationCharIndex?: number
           narrativeBefore: string
           narrativeAfter: string
         }) => (
@@ -2598,6 +2632,9 @@ export function setup(ctx: SpindleFrontendContext) {
             + `\u0000${JSON.stringify(source.styles)}`
             + `\u0000${JSON.stringify(source.sounds)}`
             + `\u0000${JSON.stringify(source.pauses)}`
+            + `\u0000${source.modulation ? '1' : '0'}`
+            + `\u0000${source.modulationPoint ?? ''}`
+            + `\u0000${source.modulationCharIndex ?? ''}`
             + `\u0000${source.text}`
             + `\u0000${source.narrativeBefore}\u0000${source.narrativeAfter}`
         )
@@ -2621,6 +2658,11 @@ export function setup(ctx: SpindleFrontendContext) {
             styles: source.styles,
             sounds: source.sounds,
             pauses: source.pauses,
+            modulation: source.modulation,
+            ...(source.modulationPoint ? { modulationPoint: source.modulationPoint } : {}),
+            ...(source.modulationCharIndex !== undefined
+              ? { modulationCharIndex: source.modulationCharIndex }
+              : {}),
             narrativeBefore: source.narrativeBefore,
             narrativeAfter: source.narrativeAfter,
           }))
@@ -2631,6 +2673,9 @@ export function setup(ctx: SpindleFrontendContext) {
           styles: string[]
           sounds: string[]
           pauses: Array<'short' | 'long'>
+          modulation: boolean
+          modulationPoint?: string
+          modulationCharIndex?: number
           narrativeBefore: string
           narrativeAfter: string
         }>> = []
