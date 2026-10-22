@@ -2494,7 +2494,10 @@ export function setup(ctx: SpindleFrontendContext) {
           tagSources.set(segment.ttsTag.id, { text: segment.text, tag: segment.ttsTag.tag })
         }
       }
-      const applyTagPlacements = (placements: Array<{ id: string; text: string }>) => {
+      const applyTagPlacements = (
+        placements: Array<{ id: string; text: string }>,
+        origin: 'cache' | 'llm',
+      ) => {
         for (const placement of placements) {
           const source = tagSources.get(placement.id)
           if (!source) continue
@@ -2511,6 +2514,12 @@ export function setup(ctx: SpindleFrontendContext) {
             segment.ttsText = placement.text
             segment.ttsTag = { ...segment.ttsTag, source: 'llm' }
           }
+          appendSpeakerDebugLog(
+            `TTS tag placement [${placement.id}] ${source.tag} via ${origin}: `
+              + JSON.stringify(placement.text.length > 180
+                ? `${placement.text.slice(0, 177)}...`
+                : placement.text),
+          )
         }
       }
       if (
@@ -2519,6 +2528,12 @@ export function setup(ctx: SpindleFrontendContext) {
         && tagSources.size > 0
       ) {
         const placementStyle = preferences.ttsTagStyle as 'gemini' | 'fish'
+        appendSpeakerDebugLog(
+          `\nTTS tag placement: style=${placementStyle}, mode=llm, `
+            + `speeches=${tagSources.size}, `
+            + `connection=${JSON.stringify(preferences.tagLlmConnectionId || '<active>')}, `
+            + `model=${JSON.stringify(preferences.tagLlmModel || '<connection default>')}`,
+        )
         const keyFor = (id: string, tag: string, text: string) => (
           `${playbackChat.id}\u0000${messageId}\u0000${placementStyle}\u0000${preferences.tagLlmConnectionId}`
             + `\u0000${preferences.tagLlmModel}\u0000${id}\u0000${tag}\u0000${text}`
@@ -2528,7 +2543,12 @@ export function setup(ctx: SpindleFrontendContext) {
           const cached = tagPlacementCache.get(keyFor(id, source.tag, source.text))
           if (cached) cachedPlacements.push({ id, text: cached })
         }
-        if (cachedPlacements.length > 0) applyTagPlacements(cachedPlacements)
+        if (cachedPlacements.length > 0) {
+          appendSpeakerDebugLog(
+            `TTS tag placement cache hits: ${cachedPlacements.length}/${tagSources.size}.`,
+          )
+          applyTagPlacements(cachedPlacements, 'cache')
+        }
         const items = [...tagSources.entries()]
           .filter(([id, source]) => !tagPlacementCache.has(keyFor(id, source.tag, source.text)))
           .map(([id, source]) => ({ id, text: source.text, tag: source.tag }))
@@ -2537,6 +2557,14 @@ export function setup(ctx: SpindleFrontendContext) {
           chunks.push(items.slice(index, index + 4))
         }
         if (chunks.length > 0) {
+          appendSpeakerDebugLog(
+            `TTS tag placement chunks: ${chunks.length} pending `
+              + `(first chunk ${chunks[0].length} speeches, later chunks of up to 4).`,
+          )
+          let firstSettled = false
+          appendSpeakerDebugLog(
+            `TTS tag placement chunk 1/${chunks.length} started with ${chunks[0].length} speeches.`,
+          )
           const firstPlacement = requestTagPlacements(
             message.content,
             placementStyle,
@@ -2544,9 +2572,20 @@ export function setup(ctx: SpindleFrontendContext) {
             preferences.tagLlmModel,
             chunks[0],
           ).then((placements) => {
-            applyTagPlacements(placements)
+            firstSettled = true
+            appendSpeakerDebugLog(
+              `TTS tag placement chunk 1/${chunks.length} resolved with `
+                + `${placements.length}/${chunks[0].length} placements.`,
+            )
+            applyTagPlacements(placements, 'llm')
             return placements
           }).catch((error) => {
+            firstSettled = true
+            appendSpeakerDebugLog(
+              `TTS tag placement chunk 1/${chunks.length} failed; `
+                + `deterministic Jev placement remains: `
+                + `${error instanceof Error ? error.message : String(error)}`,
+            )
             console.warn('[Chat Voice] First vocal tag placement chunk failed.', error)
             return []
           })
@@ -2555,9 +2594,24 @@ export function setup(ctx: SpindleFrontendContext) {
             firstPlacement,
             new Promise<void>(resolve => setTimeout(resolve, 8_000)),
           ])
+          if (!firstSettled) {
+            appendSpeakerDebugLog(
+              'TTS tag placement chunk 1 is still pending after 8s; '
+                + 'starting playback with deterministic Jev placement for unresolved segments.',
+            )
+          }
           void (async () => {
+            let chunkNumber = 2
             for (const chunk of chunks.slice(1)) {
-              if (playback.controller.signal.aborted) return
+              if (playback.controller.signal.aborted) {
+                appendSpeakerDebugLog(
+                  `TTS tag placement chunk ${chunkNumber}/${chunks.length} skipped because playback stopped.`,
+                )
+                return
+              }
+              appendSpeakerDebugLog(
+                `TTS tag placement chunk ${chunkNumber}/${chunks.length} started with ${chunk.length} speeches.`,
+              )
               try {
                 const placements = await requestTagPlacements(
                   message.content,
@@ -2566,10 +2620,20 @@ export function setup(ctx: SpindleFrontendContext) {
                   preferences.tagLlmModel,
                   chunk,
                 )
-                applyTagPlacements(placements)
+                appendSpeakerDebugLog(
+                  `TTS tag placement chunk ${chunkNumber}/${chunks.length} resolved with `
+                    + `${placements.length}/${chunk.length} placements.`,
+                )
+                applyTagPlacements(placements, 'llm')
               } catch (error) {
+                appendSpeakerDebugLog(
+                  `TTS tag placement chunk ${chunkNumber}/${chunks.length} failed; `
+                    + `deterministic Jev placement remains: `
+                    + `${error instanceof Error ? error.message : String(error)}`,
+                )
                 console.warn('[Chat Voice] Vocal tag placement chunk failed.', error)
               }
+              chunkNumber += 1
             }
           })()
         }

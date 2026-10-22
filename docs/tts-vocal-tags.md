@@ -84,6 +84,8 @@ the deterministic parse cache.
 
 With **Speaker assignment debug** enabled, each speech's debug path includes
 `tts-tag`, probability/confidence/margin, placement boundary, and the resulting
-`tts-text`. The speech list also shows a truncated `tts-tagged` line. The
-synthesis plan shows the final text used for each request, including placements
-that arrived before that request started.
+`tts-text`. The speech list also shows a truncated `tts-tagged` line. LLM
+placement adds its style/connection/model settings, cache hits, chunk
+start/finish/failure events, the first-chunk timeout, and each applied
+placement text. The synthesis plan shows the final text used for each request,
+including placements that arrived before that request started.

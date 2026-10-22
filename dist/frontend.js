@@ -3135,7 +3135,7 @@ function setup(ctx) {
           tagSources.set(segment.ttsTag.id, { text: segment.text, tag: segment.ttsTag.tag });
         }
       }
-      const applyTagPlacements = (placements) => {
+      const applyTagPlacements = (placements, origin) => {
         for (const placement of placements) {
           const source = tagSources.get(placement.id);
           if (!source) continue;
@@ -3151,23 +3151,42 @@ function setup(ctx) {
             segment.ttsText = placement.text;
             segment.ttsTag = { ...segment.ttsTag, source: "llm" };
           }
+          appendSpeakerDebugLog(
+            `TTS tag placement [${placement.id}] ${source.tag} via ${origin}: ` + JSON.stringify(placement.text.length > 180 ? `${placement.text.slice(0, 177)}...` : placement.text)
+          );
         }
       };
       if (preferences.ttsTagStyle !== "off" && preferences.ttsTagPlacement === "llm" && tagSources.size > 0) {
         const placementStyle = preferences.ttsTagStyle;
+        appendSpeakerDebugLog(
+          `
+TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size}, connection=${JSON.stringify(preferences.tagLlmConnectionId || "<active>")}, model=${JSON.stringify(preferences.tagLlmModel || "<connection default>")}`
+        );
         const keyFor = (id, tag, text) => `${playbackChat.id}\0${messageId}\0${placementStyle}\0${preferences.tagLlmConnectionId}\0${preferences.tagLlmModel}\0${id}\0${tag}\0${text}`;
         const cachedPlacements = [];
         for (const [id, source] of tagSources) {
           const cached = tagPlacementCache.get(keyFor(id, source.tag, source.text));
           if (cached) cachedPlacements.push({ id, text: cached });
         }
-        if (cachedPlacements.length > 0) applyTagPlacements(cachedPlacements);
+        if (cachedPlacements.length > 0) {
+          appendSpeakerDebugLog(
+            `TTS tag placement cache hits: ${cachedPlacements.length}/${tagSources.size}.`
+          );
+          applyTagPlacements(cachedPlacements, "cache");
+        }
         const items = [...tagSources.entries()].filter(([id, source]) => !tagPlacementCache.has(keyFor(id, source.tag, source.text))).map(([id, source]) => ({ id, text: source.text, tag: source.tag }));
         const chunks = [];
         for (let index = 0; index < items.length; index += 4) {
           chunks.push(items.slice(index, index + 4));
         }
         if (chunks.length > 0) {
+          appendSpeakerDebugLog(
+            `TTS tag placement chunks: ${chunks.length} pending (first chunk ${chunks[0].length} speeches, later chunks of up to 4).`
+          );
+          let firstSettled = false;
+          appendSpeakerDebugLog(
+            `TTS tag placement chunk 1/${chunks.length} started with ${chunks[0].length} speeches.`
+          );
           const firstPlacement = requestTagPlacements(
             message.content,
             placementStyle,
@@ -3175,9 +3194,17 @@ function setup(ctx) {
             preferences.tagLlmModel,
             chunks[0]
           ).then((placements) => {
-            applyTagPlacements(placements);
+            firstSettled = true;
+            appendSpeakerDebugLog(
+              `TTS tag placement chunk 1/${chunks.length} resolved with ${placements.length}/${chunks[0].length} placements.`
+            );
+            applyTagPlacements(placements, "llm");
             return placements;
           }).catch((error) => {
+            firstSettled = true;
+            appendSpeakerDebugLog(
+              `TTS tag placement chunk 1/${chunks.length} failed; deterministic Jev placement remains: ${error instanceof Error ? error.message : String(error)}`
+            );
             console.warn("[Chat Voice] First vocal tag placement chunk failed.", error);
             return [];
           });
@@ -3186,9 +3213,23 @@ function setup(ctx) {
             firstPlacement,
             new Promise((resolve) => setTimeout(resolve, 8e3))
           ]);
+          if (!firstSettled) {
+            appendSpeakerDebugLog(
+              "TTS tag placement chunk 1 is still pending after 8s; starting playback with deterministic Jev placement for unresolved segments."
+            );
+          }
           void (async () => {
+            let chunkNumber = 2;
             for (const chunk of chunks.slice(1)) {
-              if (playback.controller.signal.aborted) return;
+              if (playback.controller.signal.aborted) {
+                appendSpeakerDebugLog(
+                  `TTS tag placement chunk ${chunkNumber}/${chunks.length} skipped because playback stopped.`
+                );
+                return;
+              }
+              appendSpeakerDebugLog(
+                `TTS tag placement chunk ${chunkNumber}/${chunks.length} started with ${chunk.length} speeches.`
+              );
               try {
                 const placements = await requestTagPlacements(
                   message.content,
@@ -3197,10 +3238,17 @@ function setup(ctx) {
                   preferences.tagLlmModel,
                   chunk
                 );
-                applyTagPlacements(placements);
+                appendSpeakerDebugLog(
+                  `TTS tag placement chunk ${chunkNumber}/${chunks.length} resolved with ${placements.length}/${chunk.length} placements.`
+                );
+                applyTagPlacements(placements, "llm");
               } catch (error) {
+                appendSpeakerDebugLog(
+                  `TTS tag placement chunk ${chunkNumber}/${chunks.length} failed; deterministic Jev placement remains: ${error instanceof Error ? error.message : String(error)}`
+                );
                 console.warn("[Chat Voice] Vocal tag placement chunk failed.", error);
               }
+              chunkNumber += 1;
             }
           })();
         }
