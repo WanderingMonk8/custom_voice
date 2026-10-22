@@ -1341,6 +1341,48 @@ var TTS_EMOTION_OPTIONS = [
   { value: "determined", description: "Resolved and decided." },
   { value: "resigned", description: "Accepting defeat." }
 ];
+var TTS_AUTO_EMOTION_VALUES = /* @__PURE__ */ new Set([
+  "happy",
+  "sad",
+  "angry",
+  "excited",
+  "calm",
+  "nervous",
+  "confident",
+  "surprised",
+  "satisfied",
+  "delighted",
+  "scared",
+  "worried",
+  "upset",
+  "frustrated",
+  "depressed",
+  "empathetic",
+  "embarrassed",
+  "disgusted",
+  "moved",
+  "proud",
+  "relaxed",
+  "grateful",
+  "curious",
+  "sarcastic"
+]);
+var TTS_AUTO_EMOTION_OPTIONS = TTS_EMOTION_OPTIONS.filter((option) => TTS_AUTO_EMOTION_VALUES.has(option.value));
+var TTS_COMPACT_EMOTION_VALUES = /* @__PURE__ */ new Set([
+  "happy",
+  "sad",
+  "angry",
+  "excited",
+  "calm",
+  "nervous",
+  "scared",
+  "worried",
+  "moved",
+  "frustrated",
+  "confident",
+  "surprised"
+]);
+var TTS_COMPACT_EMOTION_OPTIONS = TTS_EMOTION_OPTIONS.filter((option) => TTS_COMPACT_EMOTION_VALUES.has(option.value));
 var TTS_TAG_OPTIONS = [
   { value: "laugh", description: "A brief laugh." },
   { value: "chuckle", description: "A soft, low laugh." },
@@ -1585,8 +1627,8 @@ function insertTtsTag(text, token, charIndex) {
 var TTS_NO_TAG_OPTION = "no_tag";
 var TTS_NO_PAUSE_OPTION = "no_pause";
 var TTS_NO_EMOTION_OPTION = "no_emotion";
-function ttsEmotionCriteria() {
-  return Object.fromEntries(TTS_EMOTION_OPTIONS.map((option) => [option.value, option.description]));
+function ttsEmotionCriteria(options) {
+  return Object.fromEntries(options.map((option) => [option.value, option.description]));
 }
 function ttsSoundCriteria() {
   return Object.fromEntries([
@@ -1600,7 +1642,7 @@ function ttsPauseCriteria() {
     [TTS_NO_PAUSE_OPTION, "No inserted pause. Most lines should choose this."]
   ]);
 }
-function buildTtsTagPlan(plan, speechIds) {
+function buildTtsTagPlan(plan, speechIds, emotionOptions = TTS_AUTO_EMOTION_OPTIONS) {
   const allowed = speechIds ? new Set(speechIds) : null;
   const speeches = plan.state.speeches.filter((speech) => !allowed || allowed.has(speech.id)).map((speech) => ({
     id: speech.id,
@@ -1609,7 +1651,7 @@ function buildTtsTagPlan(plan, speechIds) {
     narrativeBefore: speech.narrativeBefore,
     narrativeAfter: speech.narrativeAfter
   }));
-  const emotionCriteria = ttsEmotionCriteria();
+  const emotionCriteria = ttsEmotionCriteria(emotionOptions);
   const soundCriteria = ttsSoundCriteria();
   const pauseCriteria = ttsPauseCriteria();
   const questions = {};
@@ -1866,6 +1908,7 @@ function applyTtsTagSelections(segments, plan, selections, includeDebug) {
       `tts-pause-positions:${JSON.stringify(selection.pausePositions)}`,
       `tts-pause-position-confidence:${selection.pausePositionConfidence.toFixed(3)}`,
       `tts-tag-source:jev`,
+      ...selection.fallback ? ["tts-tag-evaluation:neutral-fallback"] : [],
       `tts-text:${selection.ttsText}`
     ] : segment.debugPath;
     return {
@@ -3327,20 +3370,25 @@ async function evaluateTtsTagSelections(plan, style, userId) {
   let failed = false;
   let failure = "";
   const resolveChunk = (tagPlan, answers) => {
-    for (const [id, selection] of resolveTtsTagAnswers(tagPlan, answers, style)) {
+    const resolved = resolveTtsTagAnswers(tagPlan, answers, style);
+    for (const [id, selection] of resolved) {
       selections.set(id, selection);
     }
+    return resolved;
+  };
+  const markFallback = (resolved) => {
+    for (const selection of resolved.values()) selection.fallback = true;
   };
   if (!hasCapability) {
-    resolveChunk(buildTtsTagPlan(plan), {});
+    markFallback(resolveChunk(buildTtsTagPlan(plan), {}));
     return {
       selections,
       failed: true,
       error: "Decision capability unavailable"
     };
   }
-  const evaluateIds = async (ids) => {
-    const tagPlan = buildTtsTagPlan(plan, ids);
+  const evaluateIds = async (ids, emotionOptions = TTS_AUTO_EMOTION_OPTIONS) => {
+    const tagPlan = buildTtsTagPlan(plan, ids, emotionOptions);
     const result = await spindle.decisions.evaluate({
       state: tagPlan.state,
       questions: tagPlan.questions,
@@ -3369,8 +3417,15 @@ async function evaluateTtsTagSelections(plan, style, userId) {
       failure = error instanceof Error ? error.message : String(error);
       spindle.log.warn(`[Chat Voice] TTS tag batch failed; retrying speeches individually: ${failure}`);
       if (ids.length === 1) {
-        resolveChunk(buildTtsTagPlan(plan, ids), {});
-        return false;
+        try {
+          const compact = await evaluateIds(ids, TTS_COMPACT_EMOTION_OPTIONS);
+          resolveChunk(compact.tagPlan, compact.answers);
+          return true;
+        } catch (compactError) {
+          failure = compactError instanceof Error ? compactError.message : String(compactError);
+          markFallback(resolveChunk(buildTtsTagPlan(plan, ids), {}));
+          return false;
+        }
       }
       const results = await Promise.all(ids.map(async (id) => {
         try {
@@ -3378,9 +3433,15 @@ async function evaluateTtsTagSelections(plan, style, userId) {
           resolveChunk(result.tagPlan, result.answers);
           return true;
         } catch (retryError) {
-          failure = retryError instanceof Error ? retryError.message : String(retryError);
-          resolveChunk(buildTtsTagPlan(plan, [id]), {});
-          return false;
+          try {
+            const compact = await evaluateIds([id], TTS_COMPACT_EMOTION_OPTIONS);
+            resolveChunk(compact.tagPlan, compact.answers);
+            return true;
+          } catch (compactError) {
+            failure = compactError instanceof Error ? compactError.message : String(compactError);
+            markFallback(resolveChunk(buildTtsTagPlan(plan, [id]), {}));
+            return false;
+          }
         }
       }));
       return results.every(Boolean);
@@ -3475,14 +3536,17 @@ async function applyTtsTags(segments, plan, style, selections, includeDebug) {
       result.selections,
       includeDebug
     );
-    const withDebug = result.failed && includeDebug ? applied.map((segment) => segment.debugPath ? {
-      ...segment,
-      debugPath: [
-        ...segment.debugPath,
-        `tts-tag-evaluation:failed (${result.error ?? "undefined error"})`,
-        "tts-tag-evaluation:neutral-fallback"
-      ]
-    } : segment) : applied;
+    const withDebug = result.failed && includeDebug ? applied.map((segment) => {
+      const selection = segment.ttsTag ? result.selections.get(segment.ttsTag.id) : void 0;
+      if (!selection?.fallback || !segment.debugPath) return segment;
+      return {
+        ...segment,
+        debugPath: [
+          ...segment.debugPath,
+          `tts-tag-evaluation:failed (${result.error ?? "undefined error"})`
+        ]
+      };
+    }) : applied;
     return {
       segments: withDebug,
       tagFailed: result.failed,

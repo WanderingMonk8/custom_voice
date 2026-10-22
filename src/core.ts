@@ -2266,6 +2266,28 @@ export const TTS_EMOTION_OPTIONS: readonly TtsTagOption[] = [
   { value: 'resigned', description: 'Accepting defeat.' },
 ] as const
 
+/**
+ * The 24 basic emotions are the automatic Jev menu. Keeping the menu smaller
+ * lets the Decision provider return a complete distribution that sums to one.
+ * Existing cues using any of the 49 documented emotions are still recognized.
+ */
+const TTS_AUTO_EMOTION_VALUES = new Set([
+  'happy', 'sad', 'angry', 'excited', 'calm', 'nervous', 'confident', 'surprised',
+  'satisfied', 'delighted', 'scared', 'worried', 'upset', 'frustrated', 'depressed',
+  'empathetic', 'embarrassed', 'disgusted', 'moved', 'proud', 'relaxed', 'grateful',
+  'curious', 'sarcastic',
+])
+export const TTS_AUTO_EMOTION_OPTIONS: readonly TtsTagOption[] = TTS_EMOTION_OPTIONS
+  .filter(option => TTS_AUTO_EMOTION_VALUES.has(option.value))
+
+/** Last-resort menu used only when the basic menu still fails validation. */
+const TTS_COMPACT_EMOTION_VALUES = new Set([
+  'happy', 'sad', 'angry', 'excited', 'calm', 'nervous',
+  'scared', 'worried', 'moved', 'frustrated', 'confident', 'surprised',
+])
+export const TTS_COMPACT_EMOTION_OPTIONS: readonly TtsTagOption[] = TTS_EMOTION_OPTIONS
+  .filter(option => TTS_COMPACT_EMOTION_VALUES.has(option.value))
+
 /** Optional momentary sound effects. */
 export const TTS_TAG_OPTIONS: readonly TtsTagOption[] = [
   { value: 'laugh', description: 'A brief laugh.' },
@@ -2599,8 +2621,8 @@ const TTS_NO_TAG_OPTION = 'no_tag'
 const TTS_NO_PAUSE_OPTION = 'no_pause'
 const TTS_NO_EMOTION_OPTION = 'no_emotion'
 
-function ttsEmotionCriteria(): Record<string, string> {
-  return Object.fromEntries(TTS_EMOTION_OPTIONS.map(option => [option.value, option.description]))
+function ttsEmotionCriteria(options: readonly TtsTagOption[]): Record<string, string> {
+  return Object.fromEntries(options.map(option => [option.value, option.description]))
 }
 
 function ttsSoundCriteria(): Record<string, string> {
@@ -2624,6 +2646,7 @@ function ttsPauseCriteria(): Record<string, string> {
 export function buildTtsTagPlan(
   plan: SpeakerDecisionPlan,
   speechIds?: readonly string[],
+  emotionOptions: readonly TtsTagOption[] = TTS_AUTO_EMOTION_OPTIONS,
 ): TtsTagPlan {
   const allowed = speechIds ? new Set(speechIds) : null
   const speeches = plan.state.speeches
@@ -2635,7 +2658,7 @@ export function buildTtsTagPlan(
       narrativeBefore: speech.narrativeBefore,
       narrativeAfter: speech.narrativeAfter,
     }))
-  const emotionCriteria = ttsEmotionCriteria()
+  const emotionCriteria = ttsEmotionCriteria(emotionOptions)
   const soundCriteria = ttsSoundCriteria()
   const pauseCriteria = ttsPauseCriteria()
   const questions: SpeakerDecisionPlan['questions'] = {}
@@ -2734,6 +2757,8 @@ export interface TtsTagSelection {
   pause2Margin: number
   pausePositionConfidence: number
   existingTags: string[]
+  /** True when this speech used the neutral fallback because its batch failed. */
+  fallback?: boolean
 }
 
 function clearTagChoice(
@@ -3012,6 +3037,7 @@ export function applyTtsTagSelections(
           `tts-pause-positions:${JSON.stringify(selection.pausePositions)}`,
           `tts-pause-position-confidence:${selection.pausePositionConfidence.toFixed(3)}`,
           `tts-tag-source:jev`,
+          ...(selection.fallback ? ['tts-tag-evaluation:neutral-fallback'] : []),
           `tts-text:${selection.ttsText}`,
         ]
       : segment.debugPath

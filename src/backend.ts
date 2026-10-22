@@ -27,6 +27,8 @@ import {
   speakersForMessageRole,
   SPEAKER_DECISION_SCHEMA,
   TTS_TAG_SCHEMA,
+  TTS_AUTO_EMOTION_OPTIONS,
+  TTS_COMPACT_EMOTION_OPTIONS,
   validateTtsSpeechPlacement,
   USER_SPEAKER_ID,
   type CharacterLike,
@@ -37,6 +39,7 @@ import {
   type SpeakerDiscourseAssessment,
   type TtsTagSelection,
   type TtsTagStyle,
+  type TtsTagOption,
 } from './core'
 
 declare const spindle: import('lumiverse-spindle-types').SpindleAPI
@@ -421,20 +424,28 @@ async function evaluateTtsTagSelections(
     tagPlan: ReturnType<typeof buildTtsTagPlan>,
     answers: Record<string, SpeakerDecisionChoice>,
   ) => {
-    for (const [id, selection] of resolveTtsTagAnswers(tagPlan, answers, style)) {
+    const resolved = resolveTtsTagAnswers(tagPlan, answers, style)
+    for (const [id, selection] of resolved) {
       selections.set(id, selection)
     }
+    return resolved
+  }
+  const markFallback = (resolved: Map<string, TtsTagSelection>) => {
+    for (const selection of resolved.values()) selection.fallback = true
   }
   if (!hasCapability) {
-    resolveChunk(buildTtsTagPlan(plan), {})
+    markFallback(resolveChunk(buildTtsTagPlan(plan), {}))
     return {
       selections,
       failed: true,
       error: 'Decision capability unavailable',
     }
   }
-  const evaluateIds = async (ids: string[]) => {
-    const tagPlan = buildTtsTagPlan(plan, ids)
+  const evaluateIds = async (
+    ids: string[],
+    emotionOptions: readonly TtsTagOption[] = TTS_AUTO_EMOTION_OPTIONS,
+  ) => {
+    const tagPlan = buildTtsTagPlan(plan, ids, emotionOptions)
     const result = await spindle.decisions.evaluate({
       state: tagPlan.state,
       questions: tagPlan.questions,
@@ -463,8 +474,15 @@ async function evaluateTtsTagSelections(
       failure = error instanceof Error ? error.message : String(error)
       spindle.log.warn(`[Chat Voice] TTS tag batch failed; retrying speeches individually: ${failure}`)
       if (ids.length === 1) {
-        resolveChunk(buildTtsTagPlan(plan, ids), {})
-        return false
+        try {
+          const compact = await evaluateIds(ids, TTS_COMPACT_EMOTION_OPTIONS)
+          resolveChunk(compact.tagPlan, compact.answers)
+          return true
+        } catch (compactError) {
+          failure = compactError instanceof Error ? compactError.message : String(compactError)
+          markFallback(resolveChunk(buildTtsTagPlan(plan, ids), {}))
+          return false
+        }
       }
       const results = await Promise.all(ids.map(async id => {
         try {
@@ -472,9 +490,15 @@ async function evaluateTtsTagSelections(
           resolveChunk(result.tagPlan, result.answers)
           return true
         } catch (retryError) {
-          failure = retryError instanceof Error ? retryError.message : String(retryError)
-          resolveChunk(buildTtsTagPlan(plan, [id]), {})
-          return false
+          try {
+            const compact = await evaluateIds([id], TTS_COMPACT_EMOTION_OPTIONS)
+            resolveChunk(compact.tagPlan, compact.answers)
+            return true
+          } catch (compactError) {
+            failure = compactError instanceof Error ? compactError.message : String(compactError)
+            markFallback(resolveChunk(buildTtsTagPlan(plan, [id]), {}))
+            return false
+          }
         }
       }))
       return results.every(Boolean)
@@ -584,16 +608,19 @@ async function applyTtsTags(
       includeDebug,
     )
     const withDebug = result.failed && includeDebug
-      ? applied.map(segment => segment.debugPath
-        ? {
+      ? applied.map(segment => {
+          const selection = segment.ttsTag
+            ? result.selections.get(segment.ttsTag.id)
+            : undefined
+          if (!selection?.fallback || !segment.debugPath) return segment
+          return {
             ...segment,
             debugPath: [
               ...segment.debugPath,
               `tts-tag-evaluation:failed (${result.error ?? 'undefined error'})`,
-              'tts-tag-evaluation:neutral-fallback',
             ],
           }
-        : segment)
+        })
       : applied
     return {
       segments: withDebug,

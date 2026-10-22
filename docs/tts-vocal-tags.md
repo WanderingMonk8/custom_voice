@@ -19,8 +19,9 @@ the leading emotion is sent as an inline bracket cue instead.
    quotations, and surrounding narration. The same structure is used by Jev
    speaker assignment and by the tag pass.
 2. **Jev tag ranking.** `buildTtsTagPlan` issues eight questions per speech:
-   - mandatory primary emotion; no threshold, with `calm` as the neutral fallback
-   - optional secondary emotion
+   - mandatory primary emotion from the 24 basic emotions; no threshold, with
+     `calm` as the neutral fallback
+   - optional secondary basic emotion
    - optional primary momentary sound
    - optional secondary momentary sound
    - fallback primary-sound boundary
@@ -71,10 +72,11 @@ LLM placement never runs as one call for the whole message:
 
 ## Tag behavior
 
-- **Emotion:** one of the 49 documented Fish emotions at the start. A second
-  compatible emotion may be added above the same strict thresholds. Existing
-  emotions are preserved and moved/normalized to the start; up to two are kept.
-  Neutral delivery falls back to `calm`.
+- **Emotion:** the automatic Jev menu uses the 24 basic emotions, always at the
+  start. A second compatible basic emotion may be added above the same strict
+  thresholds. Existing cues using any of the 49 documented Fish emotions are
+  preserved, moved/normalized to the start, and capped at two. Neutral delivery
+  falls back to `calm`.
 - **Sound:** up to two, rendered with Fish's documented forms where they differ,
   such as `[laughing]`, `[sighing]`, and `[gasping]`. Existing sounds count
   toward the cap; duplicates are skipped.
@@ -100,8 +102,9 @@ the deterministic parse cache.
 
 - No Decision connection: existing recognized cues are normalized and the
   emotion falls back to `calm`; no optional sound or pause is chosen.
-- Tag evaluation failure: the parse continues with local/deterministic speaker
-  assignment and existing cues only.
+- Tag evaluation failure, a rejected probability distribution, or an invalid
+  batch: retry the affected speeches individually, then with the compact
+  12-emotion menu, then fall back to `calm` for that speech.
 - Placement RPC failure, timeout, or validation failure: the deterministic
   Jev placement remains in place.
 - Messages with no quoted speech receive no tags.

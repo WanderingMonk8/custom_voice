@@ -1151,7 +1151,7 @@ test('builds emotion, sound, and pause questions per speech', () => {
   const emotion2Question = tagPlan.questions.emotion2_s0
   assert.ok(emotion2Question)
   assert.ok(emotion2Question.criteria.no_emotion)
-  assert.ok(emotion2Question.criteria.hopeful)
+  assert.ok(emotion2Question.criteria.nervous)
   const tagQuestion = tagPlan.questions.tag_s0
   assert.ok(tagQuestion)
   assert.ok(tagQuestion.criteria.no_tag)
@@ -1227,8 +1227,8 @@ test('supports a second emotion, sound, and pause in one selection', () => {
       confidence: 0.9,
     },
     emotion2_s0: {
-      choice: 'hopeful',
-      probabilities: { hopeful: 0.8, no_emotion: 0.2 },
+      choice: 'moved',
+      probabilities: { moved: 0.8, no_emotion: 0.2 },
       confidence: 0.9,
     },
     tag_s0: {
@@ -1262,12 +1262,12 @@ test('supports a second emotion, sound, and pause in one selection', () => {
       confidence: 0.9,
     },
   }, 'gemini').get('s0')
-  assert.deepEqual(selection?.emotions, ['happy', 'hopeful'])
+  assert.deepEqual(selection?.emotions, ['happy', 'moved'])
   assert.deepEqual(selection?.sounds, ['gasp', 'sigh'])
   assert.deepEqual(selection?.pauses, ['short', 'long'])
   assert.deepEqual(selection?.soundPositions, ['b1', 'end'])
   assert.deepEqual(selection?.pausePositions, ['b1', 'end'])
-  assert.ok(selection?.ttsText.startsWith('[happy] [hopeful] '))
+  assert.ok(selection?.ttsText.startsWith('[happy] [moved] '))
   assert.ok(selection?.ttsText.includes('[gasp]'))
   assert.ok(selection?.ttsText.includes('[sigh]'))
   assert.ok(selection?.ttsText.includes('[break]'))
@@ -1411,9 +1411,9 @@ test('normalizes both providers to brackets and validates grouped placement', ()
   )
   assert.equal(
     validateTtsSpeechPlacement(
-      '[happy] [hopeful] Wait. You heard.',
-      '[happy] [hopeful] Wait. [gasp] You [sigh] [break] heard. [long-break]',
-      { emotions: ['happy', 'hopeful'], sounds: ['gasp', 'sigh'], pauses: ['short', 'long'] },
+      '[happy] [moved] Wait. You heard.',
+      '[happy] [moved] Wait. [gasp] You [sigh] [break] heard. [long-break]',
+      { emotions: ['happy', 'moved'], sounds: ['gasp', 'sigh'], pauses: ['short', 'long'] },
       'gemini',
     ),
     true,

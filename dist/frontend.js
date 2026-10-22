@@ -1097,6 +1097,48 @@ var TTS_EMOTION_OPTIONS = [
   { value: "determined", description: "Resolved and decided." },
   { value: "resigned", description: "Accepting defeat." }
 ];
+var TTS_AUTO_EMOTION_VALUES = /* @__PURE__ */ new Set([
+  "happy",
+  "sad",
+  "angry",
+  "excited",
+  "calm",
+  "nervous",
+  "confident",
+  "surprised",
+  "satisfied",
+  "delighted",
+  "scared",
+  "worried",
+  "upset",
+  "frustrated",
+  "depressed",
+  "empathetic",
+  "embarrassed",
+  "disgusted",
+  "moved",
+  "proud",
+  "relaxed",
+  "grateful",
+  "curious",
+  "sarcastic"
+]);
+var TTS_AUTO_EMOTION_OPTIONS = TTS_EMOTION_OPTIONS.filter((option) => TTS_AUTO_EMOTION_VALUES.has(option.value));
+var TTS_COMPACT_EMOTION_VALUES = /* @__PURE__ */ new Set([
+  "happy",
+  "sad",
+  "angry",
+  "excited",
+  "calm",
+  "nervous",
+  "scared",
+  "worried",
+  "moved",
+  "frustrated",
+  "confident",
+  "surprised"
+]);
+var TTS_COMPACT_EMOTION_OPTIONS = TTS_EMOTION_OPTIONS.filter((option) => TTS_COMPACT_EMOTION_VALUES.has(option.value));
 var TTS_TAG_OPTIONS = [
   { value: "laugh", description: "A brief laugh." },
   { value: "chuckle", description: "A soft, low laugh." },
