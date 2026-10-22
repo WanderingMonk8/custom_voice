@@ -509,7 +509,12 @@ function readParsedMessages(value: unknown): Record<string, CachedMessageParse> 
           text,
           speakerId: speakerId?.slice(0, 256) ?? null,
           ...(ttsText ? { ttsText } : {}),
-          ...(ttsTag && ttsTag.emotions.length > 0 ? { ttsTag } : {}),
+          ...(ttsTag && (
+            ttsTag.emotions.length > 0
+            || ttsTag.styles.length > 0
+            || ttsTag.sounds.length > 0
+            || ttsTag.pauses.length > 0
+          ) ? { ttsTag } : {}),
         })
       }
     }
@@ -2201,7 +2206,7 @@ export function buildSpeakerDecisionPlan(
   return plan
 }
 
-export type TtsTagStyle = 'off' | 'gemini' | 'fish'
+export type TtsTagStyle = 'off' | 'gemini' | 'gemini38' | 'fish'
 
 export interface TtsTagThresholds {
   probability: number
@@ -2237,8 +2242,9 @@ export interface TtsTagOption {
 }
 
 /**
- * Sentence-level emotions. Fish S2 documents this vocabulary directly; Gemini
- * accepts the same bracket cues as natural-language style descriptors.
+ * Sentence-level emotions. Fish S2 documents this vocabulary directly; legacy
+ * Gemini accepts the same square-bracket cues as natural-language style
+ * descriptors. Gemini 3.8 has no inline emotion cue.
  */
 export const TTS_EMOTION_OPTIONS: readonly TtsTagOption[] = [
   { value: 'happy', description: 'Cheerful, upbeat.' },
@@ -2380,6 +2386,10 @@ const TTS_STYLE_LIKE_SOUNDS = new Set(['whispers', 'shout', 'scream'])
 export const TTS_FISH_SOUND_OPTIONS: readonly TtsTagOption[] = TTS_TAG_OPTIONS
   .filter(option => !TTS_STYLE_LIKE_SOUNDS.has(option.value))
 
+/** Gemini 3.8 documents these vocal events; snore is not in its tag list. */
+export const TTS_GEMINI38_SOUND_OPTIONS: readonly TtsTagOption[] = TTS_TAG_OPTIONS
+  .filter(option => option.value !== 'snore')
+
 const TTS_EMOTION_NAMES = new Set(TTS_EMOTION_OPTIONS.map(option => option.value))
 const TTS_SOUND_NAMES = new Set(TTS_TAG_OPTIONS.map(option => option.value))
 const TTS_PAUSE_NAMES = new Set<string>(TTS_PAUSE_OPTIONS.map(option => option.value))
@@ -2458,12 +2468,19 @@ export function ttsTagCategory(value: string): TtsTagCategory | null {
 }
 
 /**
- * Both providers use bracket cues. Fish S2 uses its well-tested forms and
- * leading voice styles; Gemini keeps the existing inline cue formatting.
+ * Fish S2 and the legacy Gemini path use bracket cues. Gemini 3.8 uses
+ * angle-bracket vocal events and pauses, and has no inline emotion/style cue.
  */
 export function formatTtsTag(tag: string, style: Exclude<TtsTagStyle, 'off'>): string {
   const canonical = normalizeTtsTagName(tag) ?? tag
   const category = ttsTagCategory(canonical)
+  if (style === 'gemini38') {
+    if (category === 'emotion' || category === 'style' || canonical === 'snore') return ''
+    if (category === 'pause') {
+      return canonical === 'long' ? '<long pause>' : '<short pause>'
+    }
+    return `<${canonical}>`
+  }
   if (category === 'style') {
     return `[${canonical}]`
   }
@@ -2540,7 +2557,7 @@ export function validateTtsSpeechPlacement(
       .map(value => normalizeTtsTagName(value))
       .filter((value): value is string => !!value && ttsTagCategory(value) === 'emotion'),
   )].slice(0, 2)
-  if (emotions.length === 0) return false
+  if (emotions.length === 0 && style !== 'gemini38') return false
   const styles = [...new Set(
     request.styles
       .map(value => normalizeTtsTagName(value))
@@ -2561,8 +2578,9 @@ export function validateTtsSpeechPlacement(
   if (normalizedOriginal !== normalizedTagged) return false
   const emotionPrefix = [...emotions, ...styles]
     .map(tag => formatTtsTag(tag, style))
+    .filter(Boolean)
     .join(' ')
-  if (!tagged.trimStart().startsWith(emotionPrefix)) return false
+  if (emotionPrefix && !tagged.trimStart().startsWith(emotionPrefix)) return false
 
   const originalTags = new Map<string, number>()
   const taggedTags = new Map<string, number>()
@@ -2732,27 +2750,32 @@ export function buildTtsTagPlan(
       narrativeAfter: speech.narrativeAfter,
     }))
   const emotionCriteria = ttsEmotionCriteria(emotionOptions)
-  const soundCriteria = ttsSoundCriteria(
-    style === 'fish' ? TTS_FISH_SOUND_OPTIONS : TTS_TAG_OPTIONS,
-  )
+  const soundOptions = style === 'fish'
+    ? TTS_FISH_SOUND_OPTIONS
+    : style === 'gemini38'
+      ? TTS_GEMINI38_SOUND_OPTIONS
+      : TTS_TAG_OPTIONS
+  const soundCriteria = ttsSoundCriteria(soundOptions)
   const styleCriteria = ttsStyleCriteria()
   const pauseCriteria = ttsPauseCriteria()
   const questions: SpeakerDecisionPlan['questions'] = {}
   const positions: Record<string, TtsTagPositionOption[]> = {}
   const pausePositions: Record<string, TtsTagPositionOption[]> = {}
   for (const speech of speeches) {
-    questions[`emotion_${speech.id}`] = {
-      type: 'choice',
-      instructions: `Which emotion best describes how quotation ${speech.id} is delivered? Use the quotation and its surrounding narration. Every quotation receives exactly one primary emotion; choose calm for neutral delivery.`,
-      criteria: emotionCriteria,
-    }
-    questions[`emotion2_${speech.id}`] = {
-      type: 'choice',
-      instructions: `Is there a distinct secondary emotion layered into quotation ${speech.id}? Choose no_emotion unless a second emotion is clearly present and compatible with the primary.`,
-      criteria: {
-        ...emotionCriteria,
-        [TTS_NO_EMOTION_OPTION]: 'No distinct secondary emotion. Most lines should choose this.',
-      },
+    if (style !== 'gemini38') {
+      questions[`emotion_${speech.id}`] = {
+        type: 'choice',
+        instructions: `Which emotion best describes how quotation ${speech.id} is delivered? Use the quotation and its surrounding narration. Every quotation receives exactly one primary emotion; choose calm for neutral delivery.`,
+        criteria: emotionCriteria,
+      }
+      questions[`emotion2_${speech.id}`] = {
+        type: 'choice',
+        instructions: `Is there a distinct secondary emotion layered into quotation ${speech.id}? Choose no_emotion unless a second emotion is clearly present and compatible with the primary.`,
+        criteria: {
+          ...emotionCriteria,
+          [TTS_NO_EMOTION_OPTION]: 'No distinct secondary emotion. Most lines should choose this.',
+        },
+      }
     }
     if (style === 'fish') {
       questions[`style_${speech.id}`] = {
@@ -2824,7 +2847,7 @@ export interface TtsTagSelection {
   pausePositions: string[]
   /** Emotion-bearing text without new sound/pause; used by the placement LLM. */
   baseText: string
-  /** Full deterministic fallback text, always with the leading emotions. */
+  /** Full deterministic fallback text with the provider-supported leading cues. */
   ttsText: string
   narrativeBefore: string
   narrativeAfter: string
@@ -2955,14 +2978,14 @@ function renderLeadingCues(
   repeatPerSentence: boolean,
 ): string {
   if (!body) return prefix
-  if (!repeatPerSentence) return `${prefix} ${body}`
+  if (!repeatPerSentence) return prefix ? `${prefix} ${body}` : body
   const rendered: string[] = []
   for (const sentence of body.split(/(?<=[.!?…])\s+/u).filter(Boolean)) {
     const words = stripTtsTags(sentence).replace(/\s+/gu, ' ').trim()
     if (!words && rendered.length > 0) {
       rendered[rendered.length - 1] += ` ${sentence}`
     } else {
-      rendered.push(words ? `${prefix} ${sentence}` : sentence)
+      rendered.push(words && prefix ? `${prefix} ${sentence}` : sentence)
     }
   }
   return rendered.join(' ')
@@ -2971,7 +2994,8 @@ function renderLeadingCues(
 /**
  * Rebuild the Fish leading cues after placement. The placement LLM receives
  * only the first prefix, which keeps its output small; this restores the
- * sentence-level S2 scoping deterministically.
+ * sentence-level S2 scoping deterministically. Gemini 3.8 uses this to strip
+ * unsupported emotion/style cues while keeping its angle-bracket events.
  */
 export function applyLeadingTtsCues(
   text: string,
@@ -2980,11 +3004,12 @@ export function applyLeadingTtsCues(
   style: Exclude<TtsTagStyle, 'off'>,
 ): string {
   const normalized = normalizeTtsTags(text, style)
-  const body = style === 'fish'
+  const body = style === 'fish' || style === 'gemini38'
     ? removeTtsTagsByCategory(removeTtsTagsByCategory(normalized, 'emotion'), 'style')
     : normalized
   const prefix = [...emotions, ...styles]
     .map(tag => formatTtsTag(tag, style))
+    .filter(Boolean)
     .join(' ')
   return renderLeadingCues(
     body.replace(/[ \t]+/gu, ' ').trim(),
@@ -3074,21 +3099,24 @@ export function resolveTtsTagAnswers(
     )
 
     const existingTags = extractTtsTags(speech.text)
-    const existingEmotions = [...new Set(
-      existingTags.filter(tag => ttsTagCategory(tag) === 'emotion'),
-    )].slice(0, 2)
-    const emotions = [...existingEmotions]
-    if (emotions.length === 0) {
-      emotions.push(emotionChoice.emotion)
-      if (emotion2Choice.tag && !emotions.includes(emotion2Choice.tag)) {
+    const emotions: string[] = []
+    if (style !== 'gemini38') {
+      const existingEmotions = [...new Set(
+        existingTags.filter(tag => ttsTagCategory(tag) === 'emotion'),
+      )].slice(0, 2)
+      emotions.push(...existingEmotions)
+      if (emotions.length === 0) {
+        emotions.push(emotionChoice.emotion)
+        if (emotion2Choice.tag && !emotions.includes(emotion2Choice.tag)) {
+          emotions.push(emotion2Choice.tag)
+        }
+      } else if (
+        emotions.length === 1
+        && emotion2Choice.tag
+        && !emotions.includes(emotion2Choice.tag)
+      ) {
         emotions.push(emotion2Choice.tag)
       }
-    } else if (
-      emotions.length === 1
-      && emotion2Choice.tag
-      && !emotions.includes(emotion2Choice.tag)
-    ) {
-      emotions.push(emotion2Choice.tag)
     }
 
     const existingStyles = style === 'fish'
@@ -3130,10 +3158,11 @@ export function resolveTtsTagAnswers(
 
     const leadingPrefix = [...emotions, ...styles]
       .map(tag => formatTtsTag(tag, style))
+      .filter(Boolean)
       .join(' ')
     const removeLeadingCues = (text: string) => {
       const withoutEmotions = removeTtsTagsByCategory(text, 'emotion')
-      return style === 'fish'
+      return style === 'fish' || style === 'gemini38'
         ? removeTtsTagsByCategory(withoutEmotions, 'style')
         : withoutEmotions
     }
@@ -3141,7 +3170,9 @@ export function resolveTtsTagAnswers(
       removeLeadingCues(speech.text),
       style,
     ).replace(/[ \t]+/gu, ' ').trim()
-    const baseText = baseBody ? `${leadingPrefix} ${baseBody}` : leadingPrefix
+    const baseText = leadingPrefix
+      ? (baseBody ? `${leadingPrefix} ${baseBody}` : leadingPrefix)
+      : baseBody
 
     const insertions: Array<{ token: string; charIndex: number }> = []
     newSounds.forEach((sound, index) => insertions.push({

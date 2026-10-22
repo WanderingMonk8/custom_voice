@@ -1190,6 +1190,7 @@ var TTS_STYLE_OPTIONS = [
 ];
 var TTS_STYLE_LIKE_SOUNDS = /* @__PURE__ */ new Set(["whispers", "shout", "scream"]);
 var TTS_FISH_SOUND_OPTIONS = TTS_TAG_OPTIONS.filter((option) => !TTS_STYLE_LIKE_SOUNDS.has(option.value));
+var TTS_GEMINI38_SOUND_OPTIONS = TTS_TAG_OPTIONS.filter((option) => option.value !== "snore");
 var TTS_EMOTION_NAMES = new Set(TTS_EMOTION_OPTIONS.map((option) => option.value));
 var TTS_SOUND_NAMES = new Set(TTS_TAG_OPTIONS.map((option) => option.value));
 var TTS_PAUSE_NAMES = new Set(TTS_PAUSE_OPTIONS.map((option) => option.value));
@@ -1489,7 +1490,7 @@ async function loadPlaybackPreferences() {
   const speed = typeof row.value?.ttsSpeed === "number" ? row.value.ttsSpeed : 1;
   const volume = typeof row.value?.ttsVolume === "number" ? row.value.ttsVolume : 1;
   const speakerParsingMode = row.value?.chatVoiceSpeakerParsingMode === "off" ? "off" : "ambiguous";
-  const ttsTagStyle = row.value?.chatVoiceTtsTagStyle === "gemini" || row.value?.chatVoiceTtsTagStyle === "fish" ? row.value.chatVoiceTtsTagStyle : "off";
+  const ttsTagStyle = row.value?.chatVoiceTtsTagStyle === "gemini" || row.value?.chatVoiceTtsTagStyle === "gemini38" || row.value?.chatVoiceTtsTagStyle === "fish" ? row.value.chatVoiceTtsTagStyle : "off";
   const ttsTagPlacement = row.value?.chatVoiceTtsTagPlacement === "llm" ? "llm" : "jev";
   return {
     speed: Math.min(4, Math.max(0.25, speed)),
@@ -2384,6 +2385,7 @@ function setup(ctx) {
     options: [
       { value: "off", label: "Off", sublabel: "Do not add inline vocal tags" },
       { value: "gemini", label: "Gemini", sublabel: "Bracketed cues, for example [happy] and [gasp]" },
+      { value: "gemini38", label: "Gemini 3.8", sublabel: "Angle-bracket events, for example <sigh> and <short pause>" },
       { value: "fish", label: "Fish S2", sublabel: "Fish cues, for example [happy] and [laughing]" }
     ],
     ariaLabel: "TTS vocal tag style",
@@ -2758,7 +2760,7 @@ function setup(ctx) {
     const lines = [
       `Message ${messageId} (${isUserMessage ? "user" : "assistant"})`,
       `Parsing mode: ${parsingMode === "off" ? "local parser only" : "Jev with local fallback"}`,
-      `TTS tags: ${ttsTagStyle === "off" ? "off" : `${ttsTagStyle} (${ttsTagPlacement === "llm" ? "LLM placement" : "Jev placement"})`}`,
+      `TTS tags: ${ttsTagStyle === "off" ? "off" : `${ttsTagStyle === "gemini38" ? "Gemini 3.8" : ttsTagStyle} (${ttsTagPlacement === "llm" ? "LLM placement" : "Jev placement"})`}`,
       ...speakerPipelineHeader(finalSegments, parsingMode, review),
       `Default speaker: ${speakerDebugName(defaultSpeakerId, parserSpeakers)}`,
       `Parser roster: ${parserSpeakers.map((speaker) => `${speaker.name} [${speaker.id}]`).join(", ") || "(empty)"}`,
@@ -2903,6 +2905,7 @@ function setup(ctx) {
     return options;
   }
   function updateTtsTagControls() {
+    ttsTagHint.textContent = ttsTagStyle === "gemini38" ? "Gemini 3.8 uses angle-bracket vocal events and pauses. Sustained emotion and style require speech_metadata, which the current TTS request does not expose." : "Every speech gets one or two leading emotions. Up to two sounds and two pauses may be added; all cues for a speech share the same grouped placement request.";
     const tagEnabled = ttsTagStyle !== "off";
     const llmEnabled = tagEnabled && ttsTagPlacement === "llm";
     ttsTagPlacementPicker.update({
@@ -2921,7 +2924,7 @@ function setup(ctx) {
     });
   }
   function onTtsTagStyleChanged(value) {
-    ttsTagStyle = value === "gemini" || value === "fish" ? value : "off";
+    ttsTagStyle = value === "gemini" || value === "gemini38" || value === "fish" ? value : "off";
     ttsTagPicker.update({ value: ttsTagStyle });
     updateTtsTagControls();
     scheduleLlmSettingsSave();
