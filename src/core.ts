@@ -2205,6 +2205,16 @@ export const TTS_TAG_POSITION_THRESHOLDS: TtsTagThresholds = {
   margin: 0.1,
 }
 
+/**
+ * The primary emotion is mandatory, but a weak winner falls back to calm
+ * instead of forcing an arbitrary expression onto the line.
+ */
+export const TTS_EMOTION_THRESHOLDS: TtsTagThresholds = {
+  probability: 0.4,
+  confidence: 0.35,
+  margin: 0.1,
+}
+
 export interface TtsTagOption {
   value: string
   description: string
@@ -2265,6 +2275,28 @@ export const TTS_EMOTION_OPTIONS: readonly TtsTagOption[] = [
   { value: 'determined', description: 'Resolved and decided.' },
   { value: 'resigned', description: 'Accepting defeat.' },
 ] as const
+
+/**
+ * The 24 basic emotions are the automatic Jev menu. Keeping the menu smaller
+ * lets the Decision provider return a complete distribution that sums to one.
+ * Existing cues using any of the 49 documented emotions are still recognized.
+ */
+const TTS_AUTO_EMOTION_VALUES = new Set([
+  'happy', 'sad', 'angry', 'excited', 'calm', 'nervous', 'confident', 'surprised',
+  'satisfied', 'delighted', 'scared', 'worried', 'upset', 'frustrated', 'depressed',
+  'empathetic', 'embarrassed', 'disgusted', 'moved', 'proud', 'relaxed', 'grateful',
+  'curious', 'sarcastic',
+])
+export const TTS_AUTO_EMOTION_OPTIONS: readonly TtsTagOption[] = TTS_EMOTION_OPTIONS
+  .filter(option => TTS_AUTO_EMOTION_VALUES.has(option.value))
+
+/** Last-resort menu used only when the basic menu still fails validation. */
+const TTS_COMPACT_EMOTION_VALUES = new Set([
+  'happy', 'sad', 'angry', 'excited', 'calm', 'nervous',
+  'scared', 'worried', 'moved', 'frustrated', 'confident', 'surprised',
+])
+export const TTS_COMPACT_EMOTION_OPTIONS: readonly TtsTagOption[] = TTS_EMOTION_OPTIONS
+  .filter(option => TTS_COMPACT_EMOTION_VALUES.has(option.value))
 
 /** Optional momentary sound effects. */
 export const TTS_TAG_OPTIONS: readonly TtsTagOption[] = [
@@ -2599,8 +2631,8 @@ const TTS_NO_TAG_OPTION = 'no_tag'
 const TTS_NO_PAUSE_OPTION = 'no_pause'
 const TTS_NO_EMOTION_OPTION = 'no_emotion'
 
-function ttsEmotionCriteria(): Record<string, string> {
-  return Object.fromEntries(TTS_EMOTION_OPTIONS.map(option => [option.value, option.description]))
+function ttsEmotionCriteria(options: readonly TtsTagOption[]): Record<string, string> {
+  return Object.fromEntries(options.map(option => [option.value, option.description]))
 }
 
 function ttsSoundCriteria(): Record<string, string> {
@@ -2624,6 +2656,7 @@ function ttsPauseCriteria(): Record<string, string> {
 export function buildTtsTagPlan(
   plan: SpeakerDecisionPlan,
   speechIds?: readonly string[],
+  emotionOptions: readonly TtsTagOption[] = TTS_AUTO_EMOTION_OPTIONS,
 ): TtsTagPlan {
   const allowed = speechIds ? new Set(speechIds) : null
   const speeches = plan.state.speeches
@@ -2635,7 +2668,7 @@ export function buildTtsTagPlan(
       narrativeBefore: speech.narrativeBefore,
       narrativeAfter: speech.narrativeAfter,
     }))
-  const emotionCriteria = ttsEmotionCriteria()
+  const emotionCriteria = ttsEmotionCriteria(emotionOptions)
   const soundCriteria = ttsSoundCriteria()
   const pauseCriteria = ttsPauseCriteria()
   const questions: SpeakerDecisionPlan['questions'] = {}
@@ -2717,6 +2750,7 @@ export interface TtsTagSelection {
   ttsText: string
   emotionProbability: number
   emotionConfidence: number
+  emotionMargin: number
   emotion2Probability: number
   emotion2Confidence: number
   soundProbability: number
@@ -2734,6 +2768,8 @@ export interface TtsTagSelection {
   pause2Margin: number
   pausePositionConfidence: number
   existingTags: string[]
+  /** True when this speech used the neutral fallback because its batch failed. */
+  fallback?: boolean
 }
 
 function clearTagChoice(
@@ -2768,22 +2804,29 @@ function clearTagChoice(
 
 function resolveEmotionChoice(
   answer: SpeakerDecisionChoice | undefined,
-): { emotion: string; probability: number; confidence: number } {
-  if (!answer) return { emotion: 'calm', probability: 0, confidence: 0 }
+): { emotion: string; probability: number; confidence: number; margin: number } {
+  if (!answer) return { emotion: 'calm', probability: 0, confidence: 0, margin: 0 }
   const ranked = Object.entries(answer.probabilities)
     .filter((entry): entry is [string, number] => Number.isFinite(entry[1]))
     .sort((left, right) => right[1] - left[1])
   const selected = normalizeTtsTagName(answer.choice)
-  const emotion = selected && ttsTagCategory(selected) === 'emotion'
+  const chosen = selected && ttsTagCategory(selected) === 'emotion'
     ? selected
     : ranked.map(([name]) => normalizeTtsTagName(name))
         .find((name): name is string => !!name && ttsTagCategory(name) === 'emotion')
       ?? 'calm'
-  return {
-    emotion,
-    probability: answer.probabilities[answer.choice] ?? 0,
-    confidence: answer.confidence,
-  }
+  const probability = answer.probabilities[chosen] ?? 0
+  const runnerUp = ranked.find(([name]) => (
+    normalizeTtsTagName(name) !== chosen
+  ))?.[1] ?? 0
+  const confidence = answer.confidence
+  const margin = probability - runnerUp
+  const emotion = (
+    probability >= TTS_EMOTION_THRESHOLDS.probability
+    && confidence >= TTS_EMOTION_THRESHOLDS.confidence
+    && margin >= TTS_EMOTION_THRESHOLDS.margin
+  ) ? chosen : 'calm'
+  return { emotion, probability, confidence, margin }
 }
 
 function resolvePositionChoice(
@@ -2940,6 +2983,7 @@ export function resolveTtsTagAnswers(
       ttsText,
       emotionProbability: emotionChoice.probability,
       emotionConfidence: emotionChoice.confidence,
+      emotionMargin: emotionChoice.margin,
       emotion2Probability: emotion2Choice.probability,
       emotion2Confidence: emotion2Choice.confidence,
       soundProbability: soundChoice.probability,
@@ -2991,6 +3035,7 @@ export function applyTtsTagSelections(
           `tts-emotions:${JSON.stringify(selection.emotions)}`,
           `tts-emotion-probability:${selection.emotionProbability.toFixed(3)}`,
           `tts-emotion-confidence:${selection.emotionConfidence.toFixed(3)}`,
+          `tts-emotion-margin:${selection.emotionMargin.toFixed(3)}`,
           `tts-emotion2-probability:${selection.emotion2Probability.toFixed(3)}`,
           `tts-emotion2-confidence:${selection.emotion2Confidence.toFixed(3)}`,
           `tts-sounds:${JSON.stringify(selection.sounds)}`,
@@ -3012,6 +3057,7 @@ export function applyTtsTagSelections(
           `tts-pause-positions:${JSON.stringify(selection.pausePositions)}`,
           `tts-pause-position-confidence:${selection.pausePositionConfidence.toFixed(3)}`,
           `tts-tag-source:jev`,
+          ...(selection.fallback ? ['tts-tag-evaluation:neutral-fallback'] : []),
           `tts-text:${selection.ttsText}`,
         ]
       : segment.debugPath

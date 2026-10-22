@@ -19,8 +19,9 @@ the leading emotion is sent as an inline bracket cue instead.
    quotations, and surrounding narration. The same structure is used by Jev
    speaker assignment and by the tag pass.
 2. **Jev tag ranking.** `buildTtsTagPlan` issues eight questions per speech:
-   - mandatory primary emotion; no threshold, with `calm` as the neutral fallback
-   - optional secondary emotion
+   - mandatory primary emotion from the 24 basic emotions; no threshold, with
+     `calm` as the neutral fallback
+   - optional secondary basic emotion
    - optional primary momentary sound
    - optional secondary momentary sound
    - fallback primary-sound boundary
@@ -28,13 +29,15 @@ the leading emotion is sent as an inline bracket cue instead.
    - optional secondary short/long pause
    - fallback primary-pause boundary
    The tag evaluation runs in parallel with the Jev speaker decision and is
-   independent of the LLM placement setting. Tag evaluation is chunked at 30
-   speeches per Decision call to stay under the 256-question limit.
+   independent of the LLM placement setting. Tag evaluation is grouped two
+   speeches per Decision call; a failed batch is retried one speech at a time.
+   This keeps the probability output within the model's response limit.
 3. **Thresholds.** Sound and pause are applied only when all three gates pass:
    - winner probability >= 0.65
    - answer confidence >= 0.60
    - winner minus runner-up >= 0.20
-   The fallback boundaries use 0.50/0.50/0.10. Emotion is always applied.
+   The fallback boundaries use 0.50/0.50/0.10. Emotion is mandatory, but a
+   weak primary winner falls back to `calm` below 0.40/0.35/0.10.
 4. **Deterministic text.** `resolveTtsTagAnswers` collects up to two leading
    emotions, normalizes existing cues, and inserts up to two new sounds and two
    new pauses at their fallback boundaries. Existing cues count toward the caps.
@@ -70,10 +73,11 @@ LLM placement never runs as one call for the whole message:
 
 ## Tag behavior
 
-- **Emotion:** one of the 49 documented Fish emotions at the start. A second
-  compatible emotion may be added above the same strict thresholds. Existing
-  emotions are preserved and moved/normalized to the start; up to two are kept.
-  Neutral delivery falls back to `calm`.
+- **Emotion:** the automatic Jev menu uses the 24 basic emotions, always at the
+  start. A weak primary winner falls back to `calm`. A second compatible basic
+  emotion may be added above the same strict thresholds. Existing cues using
+  any of the 49 documented Fish emotions are preserved, moved/normalized to the
+  start, and capped at two.
 - **Sound:** up to two, rendered with Fish's documented forms where they differ,
   such as `[laughing]`, `[sighing]`, and `[gasping]`. Existing sounds count
   toward the cap; duplicates are skipped.
@@ -99,8 +103,9 @@ the deterministic parse cache.
 
 - No Decision connection: existing recognized cues are normalized and the
   emotion falls back to `calm`; no optional sound or pause is chosen.
-- Tag evaluation failure: the parse continues with local/deterministic speaker
-  assignment and existing cues only.
+- Tag evaluation failure, a rejected probability distribution, or an invalid
+  batch: retry the affected speeches individually, then with the compact
+  12-emotion menu, then fall back to `calm` for that speech.
 - Placement RPC failure, timeout, or validation failure: the deterministic
   Jev placement remains in place.
 - Messages with no quoted speech receive no tags.
@@ -108,8 +113,9 @@ the deterministic parse cache.
 ## Diagnostics
 
 With **Speaker assignment debug** enabled, each speech's debug path includes
-the leading emotions, primary/secondary emotion probabilities, sound and pause
-probabilities, margins, boundaries, and the resulting `tts-text`. The speech
+the leading emotions, primary/secondary emotion probabilities, confidence and
+margin, sound and pause probabilities, margins, boundaries, and the resulting
+`tts-text`. The speech
 list also shows a truncated `tts-tagged` line. LLM placement adds its
 style/connection/model settings, cache hits, chunk start/finish/failure events,
 the first-chunk timeout, and each applied placement text. The synthesis plan

@@ -1290,6 +1290,11 @@ var TTS_TAG_POSITION_THRESHOLDS = {
   confidence: 0.5,
   margin: 0.1
 };
+var TTS_EMOTION_THRESHOLDS = {
+  probability: 0.4,
+  confidence: 0.35,
+  margin: 0.1
+};
 var TTS_EMOTION_OPTIONS = [
   { value: "happy", description: "Cheerful, upbeat." },
   { value: "sad", description: "Melancholic, downcast." },
@@ -1341,6 +1346,48 @@ var TTS_EMOTION_OPTIONS = [
   { value: "determined", description: "Resolved and decided." },
   { value: "resigned", description: "Accepting defeat." }
 ];
+var TTS_AUTO_EMOTION_VALUES = /* @__PURE__ */ new Set([
+  "happy",
+  "sad",
+  "angry",
+  "excited",
+  "calm",
+  "nervous",
+  "confident",
+  "surprised",
+  "satisfied",
+  "delighted",
+  "scared",
+  "worried",
+  "upset",
+  "frustrated",
+  "depressed",
+  "empathetic",
+  "embarrassed",
+  "disgusted",
+  "moved",
+  "proud",
+  "relaxed",
+  "grateful",
+  "curious",
+  "sarcastic"
+]);
+var TTS_AUTO_EMOTION_OPTIONS = TTS_EMOTION_OPTIONS.filter((option) => TTS_AUTO_EMOTION_VALUES.has(option.value));
+var TTS_COMPACT_EMOTION_VALUES = /* @__PURE__ */ new Set([
+  "happy",
+  "sad",
+  "angry",
+  "excited",
+  "calm",
+  "nervous",
+  "scared",
+  "worried",
+  "moved",
+  "frustrated",
+  "confident",
+  "surprised"
+]);
+var TTS_COMPACT_EMOTION_OPTIONS = TTS_EMOTION_OPTIONS.filter((option) => TTS_COMPACT_EMOTION_VALUES.has(option.value));
 var TTS_TAG_OPTIONS = [
   { value: "laugh", description: "A brief laugh." },
   { value: "chuckle", description: "A soft, low laugh." },
@@ -1585,8 +1632,8 @@ function insertTtsTag(text, token, charIndex) {
 var TTS_NO_TAG_OPTION = "no_tag";
 var TTS_NO_PAUSE_OPTION = "no_pause";
 var TTS_NO_EMOTION_OPTION = "no_emotion";
-function ttsEmotionCriteria() {
-  return Object.fromEntries(TTS_EMOTION_OPTIONS.map((option) => [option.value, option.description]));
+function ttsEmotionCriteria(options) {
+  return Object.fromEntries(options.map((option) => [option.value, option.description]));
 }
 function ttsSoundCriteria() {
   return Object.fromEntries([
@@ -1600,7 +1647,7 @@ function ttsPauseCriteria() {
     [TTS_NO_PAUSE_OPTION, "No inserted pause. Most lines should choose this."]
   ]);
 }
-function buildTtsTagPlan(plan, speechIds) {
+function buildTtsTagPlan(plan, speechIds, emotionOptions = TTS_AUTO_EMOTION_OPTIONS) {
   const allowed = speechIds ? new Set(speechIds) : null;
   const speeches = plan.state.speeches.filter((speech) => !allowed || allowed.has(speech.id)).map((speech) => ({
     id: speech.id,
@@ -1609,7 +1656,7 @@ function buildTtsTagPlan(plan, speechIds) {
     narrativeBefore: speech.narrativeBefore,
     narrativeAfter: speech.narrativeAfter
   }));
-  const emotionCriteria = ttsEmotionCriteria();
+  const emotionCriteria = ttsEmotionCriteria(emotionOptions);
   const soundCriteria = ttsSoundCriteria();
   const pauseCriteria = ttsPauseCriteria();
   const questions = {};
@@ -1688,15 +1735,16 @@ function clearTagChoice(answer, thresholds, category) {
   return { tag, probability, confidence, margin };
 }
 function resolveEmotionChoice(answer) {
-  if (!answer) return { emotion: "calm", probability: 0, confidence: 0 };
+  if (!answer) return { emotion: "calm", probability: 0, confidence: 0, margin: 0 };
   const ranked = Object.entries(answer.probabilities).filter((entry) => Number.isFinite(entry[1])).sort((left, right) => right[1] - left[1]);
   const selected = normalizeTtsTagName(answer.choice);
-  const emotion = selected && ttsTagCategory(selected) === "emotion" ? selected : ranked.map(([name]) => normalizeTtsTagName(name)).find((name) => !!name && ttsTagCategory(name) === "emotion") ?? "calm";
-  return {
-    emotion,
-    probability: answer.probabilities[answer.choice] ?? 0,
-    confidence: answer.confidence
-  };
+  const chosen = selected && ttsTagCategory(selected) === "emotion" ? selected : ranked.map(([name]) => normalizeTtsTagName(name)).find((name) => !!name && ttsTagCategory(name) === "emotion") ?? "calm";
+  const probability = answer.probabilities[chosen] ?? 0;
+  const runnerUp = ranked.find(([name]) => normalizeTtsTagName(name) !== chosen)?.[1] ?? 0;
+  const confidence = answer.confidence;
+  const margin = probability - runnerUp;
+  const emotion = probability >= TTS_EMOTION_THRESHOLDS.probability && confidence >= TTS_EMOTION_THRESHOLDS.confidence && margin >= TTS_EMOTION_THRESHOLDS.margin ? chosen : "calm";
+  return { emotion, probability, confidence, margin };
 }
 function resolvePositionChoice(answer, options, thresholds, fallback) {
   if (!answer) return { option: fallback, probability: 0, confidence: 0 };
@@ -1806,6 +1854,7 @@ function resolveTtsTagAnswers(plan, answers, style, thresholds = TTS_TAG_THRESHO
       ttsText,
       emotionProbability: emotionChoice.probability,
       emotionConfidence: emotionChoice.confidence,
+      emotionMargin: emotionChoice.margin,
       emotion2Probability: emotion2Choice.probability,
       emotion2Confidence: emotion2Choice.confidence,
       soundProbability: soundChoice.probability,
@@ -1845,6 +1894,7 @@ function applyTtsTagSelections(segments, plan, selections, includeDebug) {
       `tts-emotions:${JSON.stringify(selection.emotions)}`,
       `tts-emotion-probability:${selection.emotionProbability.toFixed(3)}`,
       `tts-emotion-confidence:${selection.emotionConfidence.toFixed(3)}`,
+      `tts-emotion-margin:${selection.emotionMargin.toFixed(3)}`,
       `tts-emotion2-probability:${selection.emotion2Probability.toFixed(3)}`,
       `tts-emotion2-confidence:${selection.emotion2Confidence.toFixed(3)}`,
       `tts-sounds:${JSON.stringify(selection.sounds)}`,
@@ -1866,6 +1916,7 @@ function applyTtsTagSelections(segments, plan, selections, includeDebug) {
       `tts-pause-positions:${JSON.stringify(selection.pausePositions)}`,
       `tts-pause-position-confidence:${selection.pausePositionConfidence.toFixed(3)}`,
       `tts-tag-source:jev`,
+      ...selection.fallback ? ["tts-tag-evaluation:neutral-fallback"] : [],
       `tts-text:${selection.ttsText}`
     ] : segment.debugPath;
     return {
@@ -3319,48 +3370,103 @@ async function evaluateTtsTagSelections(plan, style, userId) {
   const selections = /* @__PURE__ */ new Map();
   if (plan.state.speeches.length === 0) return { selections, failed: false };
   const hasCapability = (spindle.host.capabilities["decisions-v1"] ?? 0) >= 1;
-  const chunkSize = 30;
+  const chunkSize = 2;
   const chunks = [];
   for (let index = 0; index < plan.state.speeches.length; index += chunkSize) {
     chunks.push(plan.state.speeches.slice(index, index + chunkSize).map((speech) => speech.id));
   }
   let failed = false;
+  let failure = "";
   const resolveChunk = (tagPlan, answers) => {
-    for (const [id, selection] of resolveTtsTagAnswers(tagPlan, answers, style)) {
+    const resolved = resolveTtsTagAnswers(tagPlan, answers, style);
+    for (const [id, selection] of resolved) {
       selections.set(id, selection);
     }
+    return resolved;
+  };
+  const markFallback = (resolved) => {
+    for (const selection of resolved.values()) selection.fallback = true;
   };
   if (!hasCapability) {
-    resolveChunk(buildTtsTagPlan(plan), {});
-    return { selections, failed: true };
+    markFallback(resolveChunk(buildTtsTagPlan(plan), {}));
+    return {
+      selections,
+      failed: true,
+      error: "Decision capability unavailable"
+    };
   }
-  await Promise.all(chunks.map(async (ids) => {
-    const tagPlan = buildTtsTagPlan(plan, ids);
-    try {
-      const result = await spindle.decisions.evaluate({
-        state: tagPlan.state,
-        questions: tagPlan.questions,
-        ...userId ? { userId } : {}
-      });
-      const answers = {};
-      for (const [questionId, answer] of Object.entries(result.answers)) {
-        if (answer.type !== "choice") continue;
-        answers[questionId] = {
-          choice: answer.choice,
-          probabilities: answer.probabilities,
-          confidence: answer.confidence
-        };
-      }
-      resolveChunk(tagPlan, answers);
-    } catch (error) {
-      failed = true;
-      spindle.log.warn(
-        `[Chat Voice] TTS tag classification failed; keeping existing tags only: ${error instanceof Error ? error.message : String(error)}`
-      );
-      resolveChunk(tagPlan, {});
+  const evaluateIds = async (ids, emotionOptions = TTS_AUTO_EMOTION_OPTIONS) => {
+    const tagPlan = buildTtsTagPlan(plan, ids, emotionOptions);
+    const result = await spindle.decisions.evaluate({
+      state: tagPlan.state,
+      questions: tagPlan.questions,
+      ...userId ? { userId } : {}
+    });
+    const answers = {};
+    for (const [questionId, answer] of Object.entries(result.answers)) {
+      if (answer.type !== "choice") continue;
+      answers[questionId] = {
+        choice: answer.choice,
+        probabilities: answer.probabilities,
+        confidence: answer.confidence
+      };
     }
-  }));
-  return { selections, failed };
+    if (Object.keys(answers).length === 0) {
+      throw new Error("Decision returned no choice answers");
+    }
+    return { tagPlan, answers };
+  };
+  const evaluateChunk = async (ids) => {
+    try {
+      const result = await evaluateIds(ids);
+      resolveChunk(result.tagPlan, result.answers);
+      return true;
+    } catch (error) {
+      failure = error instanceof Error ? error.message : String(error);
+      spindle.log.warn(`[Chat Voice] TTS tag batch failed; retrying speeches individually: ${failure}`);
+      if (ids.length === 1) {
+        try {
+          const compact = await evaluateIds(ids, TTS_COMPACT_EMOTION_OPTIONS);
+          resolveChunk(compact.tagPlan, compact.answers);
+          return true;
+        } catch (compactError) {
+          failure = compactError instanceof Error ? compactError.message : String(compactError);
+          markFallback(resolveChunk(buildTtsTagPlan(plan, ids), {}));
+          return false;
+        }
+      }
+      const results = await Promise.all(ids.map(async (id) => {
+        try {
+          const result = await evaluateIds([id]);
+          resolveChunk(result.tagPlan, result.answers);
+          return true;
+        } catch (retryError) {
+          try {
+            const compact = await evaluateIds([id], TTS_COMPACT_EMOTION_OPTIONS);
+            resolveChunk(compact.tagPlan, compact.answers);
+            return true;
+          } catch (compactError) {
+            failure = compactError instanceof Error ? compactError.message : String(compactError);
+            markFallback(resolveChunk(buildTtsTagPlan(plan, [id]), {}));
+            return false;
+          }
+        }
+      }));
+      return results.every(Boolean);
+    }
+  };
+  const concurrency = 6;
+  for (let index = 0; index < chunks.length; index += concurrency) {
+    const results = await Promise.all(
+      chunks.slice(index, index + concurrency).map(evaluateChunk)
+    );
+    if (results.some((result) => !result)) failed = true;
+  }
+  return {
+    selections,
+    failed,
+    ...failed ? { error: failure || "TTS tag classification failed" } : {}
+  };
 }
 var TTS_TAG_PLACEMENT_PROMPT = `You place already-chosen performance cues inside quoted dialogue for a text-to-speech engine.
 Return JSON only: {"speeches":[{"id":"speech id","text":"the speech with the cues inserted"}]}.
@@ -3432,20 +3538,34 @@ async function applyTtsTags(segments, plan, style, selections, includeDebug) {
   if (style === "off" || !plan || !selections) return { segments, tagFailed: false };
   try {
     const result = await selections;
+    const applied = applyTtsTagSelections(
+      segments,
+      buildTtsTagPlan(plan),
+      result.selections,
+      includeDebug
+    );
+    const withDebug = result.failed && includeDebug ? applied.map((segment) => {
+      const selection = segment.ttsTag ? result.selections.get(segment.ttsTag.id) : void 0;
+      if (!selection?.fallback || !segment.debugPath) return segment;
+      return {
+        ...segment,
+        debugPath: [
+          ...segment.debugPath,
+          `tts-tag-evaluation:failed (${result.error ?? "undefined error"})`
+        ]
+      };
+    }) : applied;
     return {
-      segments: applyTtsTagSelections(
-        segments,
-        buildTtsTagPlan(plan),
-        result.selections,
-        includeDebug
-      ),
-      tagFailed: result.failed
+      segments: withDebug,
+      tagFailed: result.failed,
+      ...result.error ? { tagError: result.error } : {}
     };
   } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
     spindle.log.warn(
-      `[Chat Voice] TTS tag application failed; using untagged speech: ${error instanceof Error ? error.message : String(error)}`
+      `[Chat Voice] TTS tag application failed; using untagged speech: ${message}`
     );
-    return { segments, tagFailed: true };
+    return { segments, tagFailed: true, tagError: message };
   }
 }
 var CARD_PARSER_PROMPT = `Extract the speaking cast represented by roleplay character cards.
