@@ -3,6 +3,7 @@ import {
   addUnconfiguredDialogueSpeakers,
   applyConfigToMetadata,
   applyCustomTtsEmotionCues,
+  applyCustomTtsEmotionCuesWithModulation,
   applyLeadingTtsCues,
   assessSpeakerDiscourseEscalation,
   applyTtsTagSelections,
@@ -29,9 +30,11 @@ import {
   speakerAliases,
   speakersForMessageRole,
   SPEAKER_DECISION_SCHEMA,
+  TTS_MODULATION_MARKER,
   TTS_TAG_SCHEMA,
   TTS_AUTO_EMOTION_OPTIONS,
   TTS_COMPACT_EMOTION_OPTIONS,
+  stripTtsModulationMarker,
   validateTtsSpeechPlacement,
   USER_SPEAKER_ID,
   type CharacterLike,
@@ -110,6 +113,9 @@ type FrontendMessage =
         styles: string[]
         sounds: string[]
         pauses: Array<'short' | 'long'>
+        modulation: boolean
+        modulationPoint?: string
+        modulationCharIndex?: number
         narrativeBefore: string
         narrativeAfter: string
       }>
@@ -413,13 +419,15 @@ async function evaluateTtsTagSelections(
   plan: SpeakerDecisionPlan,
   style: Exclude<TtsTagStyle, 'off'>,
   userId?: string,
+  enableModulation = false,
 ): Promise<TtsTagSelectionResult> {
   const selections = new Map<string, TtsTagSelection>()
   if (plan.state.speeches.length === 0) return { selections, failed: false }
   const hasCapability = (spindle.host.capabilities['decisions-v1'] ?? 0) >= 1
-  // Decision responses include a probability for every option. Keep each
-  // request small enough that the model can return all eight questions.
-  const chunkSize = 2
+  // Decision responses include a probability for every option. Modulation adds
+  // two questions and a larger position menu, so Fish evaluates one speech per
+  // request; other styles keep the existing two-speech batch.
+  const chunkSize = enableModulation ? 1 : 2
   const chunks: string[][] = []
   for (let index = 0; index < plan.state.speeches.length; index += chunkSize) {
     chunks.push(plan.state.speeches.slice(index, index + chunkSize).map(speech => speech.id))
@@ -441,7 +449,7 @@ async function evaluateTtsTagSelections(
   }
   if (!hasCapability) {
     markFallback(resolveChunk(
-      buildTtsTagPlan(plan, undefined, TTS_AUTO_EMOTION_OPTIONS, style),
+      buildTtsTagPlan(plan, undefined, TTS_AUTO_EMOTION_OPTIONS, style, enableModulation),
       {},
     ))
     return {
@@ -454,7 +462,7 @@ async function evaluateTtsTagSelections(
     ids: string[],
     emotionOptions: readonly TtsTagOption[] = TTS_AUTO_EMOTION_OPTIONS,
   ) => {
-    const tagPlan = buildTtsTagPlan(plan, ids, emotionOptions, style)
+    const tagPlan = buildTtsTagPlan(plan, ids, emotionOptions, style, enableModulation)
     const result = await spindle.decisions.evaluate({
       state: tagPlan.state,
       questions: tagPlan.questions,
@@ -490,7 +498,7 @@ async function evaluateTtsTagSelections(
         } catch (compactError) {
           failure = compactError instanceof Error ? compactError.message : String(compactError)
           markFallback(resolveChunk(
-            buildTtsTagPlan(plan, ids, TTS_COMPACT_EMOTION_OPTIONS, style),
+            buildTtsTagPlan(plan, ids, TTS_COMPACT_EMOTION_OPTIONS, style, enableModulation),
             {},
           ))
           return false
@@ -509,7 +517,7 @@ async function evaluateTtsTagSelections(
           } catch (compactError) {
             failure = compactError instanceof Error ? compactError.message : String(compactError)
             markFallback(resolveChunk(
-              buildTtsTagPlan(plan, [id], TTS_COMPACT_EMOTION_OPTIONS, style),
+              buildTtsTagPlan(plan, [id], TTS_COMPACT_EMOTION_OPTIONS, style, enableModulation),
               {},
             ))
             return false
@@ -534,8 +542,9 @@ async function evaluateTtsTagSelections(
 }
 
 const TTS_TAG_PLACEMENT_PROMPT = `You place already-chosen performance cues inside quoted dialogue for a text-to-speech engine.
-Return JSON only: {"speeches":[{"id":"speech id","text":"the speech with the cues inserted","emotionTag":"optional custom emotion"}]}.
+Return JSON only: {"speeches":[{"id":"speech id","text":"the speech with the cues inserted","emotionTag":"optional custom emotion","modulationTag":"optional remainder emotion"}]}.
 Each input speech may begin with leading cues and may repeat them at later sentence starts. Preserve every existing cue in place.
+If an input speech contains the exact marker [modulationmarker], preserve that marker exactly once.
 For every input speech, insert every provided sound cue and every provided pause cue exactly once, at the intended moment for each.
 Do not add, remove, or change any other character, word, punctuation mark, or whitespace. Preserve every existing cue in the text.
 Never choose different cues and never add an emotion or style to text. If a cue cannot be placed naturally, return the original text unchanged.
@@ -549,15 +558,20 @@ const TTS_TAG_FORMAT_PROMPTS: Record<Exclude<TtsTagStyle, 'off'>, string> = {
 
 const TTS_CUSTOM_EMOTION_PROMPT = `For every listed speech, use the leading fixed emotion and the narrativeBefore/narrativeAfter context to write one custom Fish S2 emotion cue in emotionTag. It must be fewer than 10 words, describe delivery only, never quote dialogue or narrate events, and never include brackets, quotes, sound effects, pauses, or a second sentence. Refine the fixed emotion; do not contradict it. Do not repeat the separate style cue; that style is already provided. Return the tag text without brackets. Do not insert it into the text field. If no useful refinement is possible, repeat the fixed emotion or leave emotionTag empty.`
 
+const TTS_MODULATION_PROMPT = `If a listed speech contains the exact marker [modulationmarker], preserve it exactly once and return one modulationTag for the text after the marker. The tag must be fewer than 10 words, describe the sustained delivery for the remainder only, continue naturally from the leading emotion, remain compatible with any style cue, and never quote dialogue or narrate events. It must not include brackets, quotes, sound effects, pauses, or a second sentence. Return the tag text without brackets. Do not insert it into the text field. If no useful modulation is possible, leave modulationTag empty.`
+
 async function placeTtsTags(
   payload: Extract<FrontendMessage, { type: 'chat_voice_place_tags' }>,
   userId?: string,
-): Promise<Array<{ id: string; text: string; emotionTag?: string }>> {
+): Promise<Array<{ id: string; text: string; emotionTag?: string; modulationTag?: string }>> {
   if (payload.items.length === 0) return []
+  const hasModulation = payload.items.some(item => item.modulation)
   const systemContent = [
     TTS_TAG_PLACEMENT_PROMPT,
     TTS_TAG_FORMAT_PROMPTS[payload.style],
-    ...(payload.style === 'fish' ? [TTS_CUSTOM_EMOTION_PROMPT] : []),
+    ...(payload.style === 'fish'
+      ? [TTS_CUSTOM_EMOTION_PROMPT, ...(hasModulation ? [TTS_MODULATION_PROMPT] : [])]
+      : []),
   ].join('\n')
   const response = await spindle.generate.quiet({
     type: 'quiet',
@@ -581,6 +595,18 @@ async function placeTtsTags(
             styleTags: item.styles.map(styleTag => formatTtsTag(styleTag, payload.style)),
             soundTags: item.sounds.map(sound => formatTtsTag(sound, payload.style)),
             pauseTags: item.pauses.map(pause => formatTtsTag(pause, payload.style)),
+            modulation: item.modulation,
+            ...(item.modulation
+              ? {
+                  modulationPoint: item.modulationPoint,
+                  modulationBefore: item.text.split(TTS_MODULATION_MARKER)[0].trim(),
+                  modulationRemainder: item.text
+                    .split(TTS_MODULATION_MARKER)
+                    .slice(1)
+                    .join(' ')
+                    .trim(),
+                }
+              : {}),
           })),
         }),
       },
@@ -604,15 +630,32 @@ async function placeTtsTags(
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return []
   const speeches = (parsed as { speeches?: unknown }).speeches
   if (!Array.isArray(speeches)) return []
-  const outputs = new Map<string, { text: string; emotionTag?: string }>()
-  for (const speech of speeches as Array<{ id?: unknown; text?: unknown; emotionTag?: unknown }>) {
+  const outputs = new Map<string, {
+    text: string
+    emotionTag?: string
+    modulationTag?: string
+  }>()
+  for (const speech of speeches as Array<{
+    id?: unknown
+    text?: unknown
+    emotionTag?: unknown
+    modulationTag?: unknown
+  }>) {
     if (!speech || typeof speech.id !== 'string' || typeof speech.text !== 'string') continue
     outputs.set(speech.id, {
       text: speech.text,
       ...(typeof speech.emotionTag === 'string' ? { emotionTag: speech.emotionTag } : {}),
+      ...(typeof speech.modulationTag === 'string'
+        ? { modulationTag: speech.modulationTag }
+        : {}),
     })
   }
-  const placements: Array<{ id: string; text: string; emotionTag?: string }> = []
+  const placements: Array<{
+    id: string
+    text: string
+    emotionTag?: string
+    modulationTag?: string
+  }> = []
   for (const item of payload.items) {
     const output = outputs.get(item.id)
     if (!output || !validateTtsSpeechPlacement(item.text, output.text, {
@@ -625,15 +668,36 @@ async function placeTtsTags(
     const customTag = payload.style === 'fish' && output.emotionTag
       ? normalizeCustomTtsEmotionTag(output.emotionTag)
       : null
+    const modulationTag = payload.style === 'fish' && output.modulationTag
+      ? normalizeCustomTtsEmotionTag(output.modulationTag)
+      : null
+    const effectiveModulation = customTag
+      && modulationTag
+      && modulationTag !== customTag
+      && normalized.includes(TTS_MODULATION_MARKER)
+      ? modulationTag
+      : null
+    const prepared = effectiveModulation
+      ? normalized
+      : stripTtsModulationMarker(normalized)
     const text = payload.style === 'fish'
       ? customTag
-        ? applyCustomTtsEmotionCues(normalized, customTag, item.styles, payload.style)
-        : applyLeadingTtsCues(normalized, item.emotions, item.styles, payload.style)
-      : normalized
+        ? effectiveModulation
+          ? applyCustomTtsEmotionCuesWithModulation(
+              prepared,
+              customTag,
+              item.styles,
+              effectiveModulation,
+              payload.style,
+            )
+          : applyCustomTtsEmotionCues(prepared, customTag, item.styles, payload.style)
+        : applyLeadingTtsCues(prepared, item.emotions, item.styles, payload.style)
+      : prepared
     placements.push({
       id: item.id,
       text,
       ...(customTag ? { emotionTag: customTag } : {}),
+      ...(effectiveModulation ? { modulationTag: effectiveModulation } : {}),
     })
   }
   return placements
@@ -858,6 +922,7 @@ function queueSpeakerParse(
       || payload.tagStyle === 'fish'
       ? payload.tagStyle
       : 'off'
+    const enableModulation = tagStyle === 'fish' && payload.tagPlacement === 'llm'
     const structurePlan = (payload.mode !== 'off' || tagStyle !== 'off')
       ? buildSpeakerDecisionPlan(
           message.content ?? '',
@@ -885,6 +950,7 @@ function queueSpeakerParse(
           narrative: SPEAKER_DECISION_SCHEMA.narrative,
           thresholds: SPEAKER_DECISION_SCHEMA.thresholds,
           tagStyle,
+          tagPlacement: payload.tagPlacement,
           tagSchema: TTS_TAG_SCHEMA,
           content: message.content ?? '',
           role: message.is_user ? 'user' : 'assistant',
@@ -910,7 +976,7 @@ function queueSpeakerParse(
           return
         }
         const tagSelectionsPromise = tagStyle !== 'off'
-          ? evaluateTtsTagSelections(decisionPlan, tagStyle, userId)
+          ? evaluateTtsTagSelections(decisionPlan, tagStyle, userId, enableModulation)
           : null
         try {
           const result = await spindle.decisions.evaluate({
@@ -1026,7 +1092,7 @@ function queueSpeakerParse(
     }
     const fallbackSegments = appendSpeakerDebugReason(deterministic, decisionFallbackReason, payload.debug)
     const fallbackTagSelectionsPromise = tagStyle !== 'off' && structurePlan
-      ? evaluateTtsTagSelections(structurePlan, tagStyle, userId)
+      ? evaluateTtsTagSelections(structurePlan, tagStyle, userId, enableModulation)
       : null
     sendSpeakerParse({
       requestId: payload.requestId,

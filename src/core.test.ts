@@ -7,6 +7,7 @@ import {
   mergeScannedCardCast,
   applyConfigToMetadata,
   applyCustomTtsEmotionCues,
+  applyCustomTtsEmotionCuesWithModulation,
   applyLeadingTtsCues,
   applyTtsTagSelections,
   assessSpeakerDiscourseEscalation,
@@ -55,6 +56,7 @@ import {
   shouldPersistMessageAudio,
   rollingRequestWindowDelay,
   SPEAKER_DECISION_THRESHOLDS,
+  TTS_MODULATION_MARKER,
   stripSkippedTrackerBlocks,
   stripTtsTags,
   unconfiguredSpeakerId,
@@ -1202,6 +1204,96 @@ test('adds a Fish style question and repeats leading cues per sentence', () => {
   assert.equal(selection?.ttsText, '[moved] [whispering] Wait. [moved] [whispering] You heard that too?')
 })
 
+test('adds Fish modulation questions and marks the selected mid-speech point', () => {
+  const content = ['Narration.', '', `"I thought you were gone, but you came back. I can't believe it."`].join('\n')
+  const plan = buildSpeakerDecisionPlan(content, [{ id: 'alice', name: 'Alice' }], false)
+  const tagPlan = buildTtsTagPlan(plan, undefined, undefined, 'fish', true)
+  assert.ok(tagPlan.questions.modulation_s0)
+  assert.ok(tagPlan.questions.modulationpos_s0)
+  assert.ok(tagPlan.modulationPositions.s0?.length)
+  assert.equal(Object.keys(tagPlan.questions).length, 11)
+
+  const selection = resolveTtsTagAnswers(tagPlan, {
+    emotion_s0: {
+      choice: 'moved',
+      probabilities: { moved: 0.9, calm: 0.1 },
+      confidence: 0.9,
+    },
+    modulation_s0: {
+      choice: 'modulation',
+      probabilities: { modulation: 0.9, no_modulation: 0.1 },
+      confidence: 0.9,
+    },
+    modulationpos_s0: {
+      choice: 'm1',
+      probabilities: { m1: 0.9, m2: 0.1 },
+      confidence: 0.9,
+    },
+  }, 'fish').get('s0')
+  assert.equal(selection?.modulation, true)
+  assert.equal(selection?.modulationPoint, 'm1')
+  assert.ok(selection?.baseText.includes(TTS_MODULATION_MARKER))
+  assert.ok(!selection?.ttsText.includes(TTS_MODULATION_MARKER))
+
+  const weak = resolveTtsTagAnswers(tagPlan, {
+    modulation_s0: {
+      choice: 'modulation',
+      probabilities: { modulation: 0.4, no_modulation: 0.6 },
+      confidence: 0.4,
+    },
+    modulationpos_s0: {
+      choice: 'm1',
+      probabilities: { m1: 0.9, m2: 0.1 },
+      confidence: 0.9,
+    },
+  }, 'fish').get('s0')
+  assert.equal(weak?.modulation, false)
+  assert.ok(!weak?.baseText.includes(TTS_MODULATION_MARKER))
+})
+
+test('carries a Fish modulation through later sentences', () => {
+  assert.equal(
+    applyCustomTtsEmotionCuesWithModulation(
+      '[moved] [whispering] Wait. [gasp] You heard [modulationmarker] that too? It changes everything.',
+      'quietly relieved',
+      ['whispering'],
+      'desperate but controlled',
+      'fish',
+    ),
+    '[quietly relieved] [whispering] Wait. [quietly relieved] [whispering] [gasp] You heard [desperate but controlled] [whispering] that too? [desperate but controlled] [whispering] It changes everything.',
+  )
+})
+
+test('validates a Fish modulation marker without treating it as spoken text', () => {
+  assert.equal(
+    validateTtsSpeechPlacement(
+      '[moved] Wait. [modulationmarker] You heard.',
+      '[moved] Wait. [modulationmarker] You heard. [gasp]',
+      { emotions: ['moved'], styles: [], sounds: ['gasp'], pauses: [] },
+      'fish',
+    ),
+    true,
+  )
+  assert.equal(
+    validateTtsSpeechPlacement(
+      '[moved] Wait. [modulationmarker] You heard.',
+      '[moved] Wait. You heard. [gasp]',
+      { emotions: ['moved'], styles: [], sounds: ['gasp'], pauses: [] },
+      'fish',
+    ),
+    false,
+  )
+  assert.equal(
+    validateTtsSpeechPlacement(
+      '[moved] Wait. [modulationmarker] You heard.',
+      '[moved] Wait. You [modulationmarker] heard. [gasp]',
+      { emotions: ['moved'], styles: [], sounds: ['gasp'], pauses: [] },
+      'fish',
+    ),
+    false,
+  )
+})
+
 test('formats Gemini 3.8 vocal events and omits unsupported emotion/style cues', () => {
   assert.equal(formatTtsTag('sigh', 'gemini38'), '<sigh>')
   assert.equal(formatTtsTag('short', 'gemini38'), '<short pause>')
@@ -2279,6 +2371,49 @@ test('restores cached Gemini 3.8 event metadata without leading emotions', () =>
     source: 'jev',
     baseText: 'Wait.',
   })
+})
+
+test('restores cached Fish modulation metadata', () => {
+  const metadata = applyConfigToMetadata({}, {
+    version: 7,
+    messageLimit: 20,
+    connectionId: '',
+    narratorVoice: '',
+    userVoice: '',
+    useGlobalNarratorVoice: true,
+    useGlobalUserVoice: true,
+    characterVoices: {},
+    detectedCharacters: [],
+    managedCharacterIds: [],
+    parsedMessages: {
+      message1: {
+        contentHash: hashMessageContent('Alice said, "Wait. You heard that."'),
+        segments: [{
+          text: 'Wait. You heard that.',
+          speakerId: npcSpeakerId('Alice'),
+          ttsText: '[moved] [whispering] Wait. [desperate] [whispering] You heard that.',
+          ttsTag: {
+            id: 's0',
+            emotions: ['moved'],
+            styles: ['whispering'],
+            sounds: [],
+            pauses: [],
+            source: 'jev',
+            baseText: `[moved] [whispering] Wait. ${TTS_MODULATION_MARKER} You heard that.`,
+            modulation: true,
+            modulationPoint: 'm1',
+            modulationCharIndex: 16,
+          },
+        }],
+      },
+    },
+  })
+  const restored = readConfig(metadata, ['alice'])
+  const restoredTag = restored.parsedMessages.message1.segments[0].ttsTag
+  assert.equal(restoredTag?.modulation, true)
+  assert.equal(restoredTag?.modulationPoint, 'm1')
+  assert.equal(restoredTag?.modulationCharIndex, 16)
+  assert.ok(restoredTag?.baseText?.includes(TTS_MODULATION_MARKER))
 })
 
 test('validates fenced LLM segmentation and rejects unknown message IDs', () => {

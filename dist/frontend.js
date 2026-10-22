@@ -2905,7 +2905,7 @@ function setup(ctx) {
     return options;
   }
   function updateTtsTagControls() {
-    ttsTagHint.textContent = ttsTagStyle === "gemini38" ? "Gemini 3.8 uses angle-bracket vocal events and pauses. Sustained emotion and style require speech_metadata, which the current TTS request does not expose." : "Every speech gets one or two leading emotions. Up to two sounds and two pauses may be added; all cues for a speech share the same grouped placement request.";
+    ttsTagHint.textContent = ttsTagStyle === "gemini38" ? "Gemini 3.8 uses angle-bracket vocal events and pauses. Sustained emotion and style require speech_metadata, which the current TTS request does not expose." : ttsTagStyle === "fish" && ttsTagPlacement === "llm" ? "Every speech gets one or two leading emotions. Fish can also select one mid-speech modulation; up to two sounds and two pauses may be added. All cues for a speech share the grouped placement request." : "Every speech gets one or two leading emotions. Up to two sounds and two pauses may be added; all cues for a speech share the same grouped placement request.";
     const tagEnabled = ttsTagStyle !== "off";
     const llmEnabled = tagEnabled && ttsTagPlacement === "llm";
     ttsTagPlacementPicker.update({
@@ -3256,6 +3256,9 @@ function setup(ctx) {
             styles: segment.ttsTag.styles,
             sounds: segment.ttsTag.sounds,
             pauses: segment.ttsTag.pauses,
+            modulation: segment.ttsTag.modulation === true,
+            ...segment.ttsTag.modulationPoint ? { modulationPoint: segment.ttsTag.modulationPoint } : {},
+            ...segment.ttsTag.modulationCharIndex !== void 0 ? { modulationCharIndex: segment.ttsTag.modulationCharIndex } : {},
             narrativeBefore: segment.ttsTag.narrativeBefore ?? "",
             narrativeAfter: segment.ttsTag.narrativeAfter ?? ""
           });
@@ -3266,7 +3269,7 @@ function setup(ctx) {
           const source = tagSources.get(placement.id);
           if (!source) continue;
           tagPlacementCache.set(
-            `${playbackChat.id}\0${messageId}\0${preferences.ttsTagStyle}\0${preferences.tagLlmConnectionId}\0${preferences.tagLlmModel}\0${placement.id}\0${JSON.stringify(source.emotions)}\0${JSON.stringify(source.styles)}\0${JSON.stringify(source.sounds)}\0${JSON.stringify(source.pauses)}\0${source.text}\0${source.narrativeBefore}\0${source.narrativeAfter}`,
+            `${playbackChat.id}\0${messageId}\0${preferences.ttsTagStyle}\0${preferences.tagLlmConnectionId}\0${preferences.tagLlmModel}\0${placement.id}\0${JSON.stringify(source.emotions)}\0${JSON.stringify(source.styles)}\0${JSON.stringify(source.sounds)}\0${JSON.stringify(source.pauses)}\0${source.modulation ? "1" : "0"}\0${source.modulationPoint ?? ""}\0${source.modulationCharIndex ?? ""}\0${source.text}\0${source.narrativeBefore}\0${source.narrativeAfter}`,
             placement.text
           );
           for (const index of tagIndexes.get(placement.id) ?? []) {
@@ -3278,7 +3281,7 @@ function setup(ctx) {
             segment.ttsTag = { ...segment.ttsTag, source: "llm" };
           }
           appendSpeakerDebugLog(
-            `TTS tag placement [${placement.id}] emotions=${JSON.stringify(source.emotions)}, styles=${JSON.stringify(source.styles)}, sounds=${JSON.stringify(source.sounds)}, pauses=${JSON.stringify(source.pauses)}${placement.emotionTag ? `, custom=${JSON.stringify(placement.emotionTag)}` : ""} via ${origin}: ` + JSON.stringify(placement.text.length > 180 ? `${placement.text.slice(0, 177)}...` : placement.text)
+            `TTS tag placement [${placement.id}] emotions=${JSON.stringify(source.emotions)}, styles=${JSON.stringify(source.styles)}, sounds=${JSON.stringify(source.sounds)}, pauses=${JSON.stringify(source.pauses)}, modulation=${source.modulation}${source.modulationPoint ? ` at ${source.modulationPoint}` : ""}${source.modulationCharIndex !== void 0 ? ` char=${source.modulationCharIndex}` : ""}${placement.emotionTag ? `, custom=${JSON.stringify(placement.emotionTag)}` : ""}${placement.modulationTag ? `, modulationTag=${JSON.stringify(placement.modulationTag)}` : ""} via ${origin}: ` + JSON.stringify(placement.text.length > 180 ? `${placement.text.slice(0, 177)}...` : placement.text)
           );
         }
       };
@@ -3288,7 +3291,7 @@ function setup(ctx) {
           `
 TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size}, connection=${JSON.stringify(preferences.tagLlmConnectionId || "<active>")}, model=${JSON.stringify(preferences.tagLlmModel || "<connection default>")}`
         );
-        const keyFor = (id, source) => `${playbackChat.id}\0${messageId}\0${placementStyle}\0${preferences.tagLlmConnectionId}\0${preferences.tagLlmModel}\0${id}\0${JSON.stringify(source.emotions)}\0${JSON.stringify(source.styles)}\0${JSON.stringify(source.sounds)}\0${JSON.stringify(source.pauses)}\0${source.text}\0${source.narrativeBefore}\0${source.narrativeAfter}`;
+        const keyFor = (id, source) => `${playbackChat.id}\0${messageId}\0${placementStyle}\0${preferences.tagLlmConnectionId}\0${preferences.tagLlmModel}\0${id}\0${JSON.stringify(source.emotions)}\0${JSON.stringify(source.styles)}\0${JSON.stringify(source.sounds)}\0${JSON.stringify(source.pauses)}\0${source.modulation ? "1" : "0"}\0${source.modulationPoint ?? ""}\0${source.modulationCharIndex ?? ""}\0${source.text}\0${source.narrativeBefore}\0${source.narrativeAfter}`;
         const cachedPlacements = [];
         for (const [id, source] of tagSources) {
           const cached = tagPlacementCache.get(keyFor(id, source));
@@ -3307,6 +3310,9 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
           styles: source.styles,
           sounds: source.sounds,
           pauses: source.pauses,
+          modulation: source.modulation,
+          ...source.modulationPoint ? { modulationPoint: source.modulationPoint } : {},
+          ...source.modulationCharIndex !== void 0 ? { modulationCharIndex: source.modulationCharIndex } : {},
           narrativeBefore: source.narrativeBefore,
           narrativeAfter: source.narrativeAfter
         }));
