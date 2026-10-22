@@ -1290,6 +1290,11 @@ var TTS_TAG_POSITION_THRESHOLDS = {
   confidence: 0.5,
   margin: 0.1
 };
+var TTS_EMOTION_THRESHOLDS = {
+  probability: 0.4,
+  confidence: 0.35,
+  margin: 0.1
+};
 var TTS_EMOTION_OPTIONS = [
   { value: "happy", description: "Cheerful, upbeat." },
   { value: "sad", description: "Melancholic, downcast." },
@@ -1730,15 +1735,16 @@ function clearTagChoice(answer, thresholds, category) {
   return { tag, probability, confidence, margin };
 }
 function resolveEmotionChoice(answer) {
-  if (!answer) return { emotion: "calm", probability: 0, confidence: 0 };
+  if (!answer) return { emotion: "calm", probability: 0, confidence: 0, margin: 0 };
   const ranked = Object.entries(answer.probabilities).filter((entry) => Number.isFinite(entry[1])).sort((left, right) => right[1] - left[1]);
   const selected = normalizeTtsTagName(answer.choice);
-  const emotion = selected && ttsTagCategory(selected) === "emotion" ? selected : ranked.map(([name]) => normalizeTtsTagName(name)).find((name) => !!name && ttsTagCategory(name) === "emotion") ?? "calm";
-  return {
-    emotion,
-    probability: answer.probabilities[answer.choice] ?? 0,
-    confidence: answer.confidence
-  };
+  const chosen = selected && ttsTagCategory(selected) === "emotion" ? selected : ranked.map(([name]) => normalizeTtsTagName(name)).find((name) => !!name && ttsTagCategory(name) === "emotion") ?? "calm";
+  const probability = answer.probabilities[chosen] ?? 0;
+  const runnerUp = ranked.find(([name]) => normalizeTtsTagName(name) !== chosen)?.[1] ?? 0;
+  const confidence = answer.confidence;
+  const margin = probability - runnerUp;
+  const emotion = probability >= TTS_EMOTION_THRESHOLDS.probability && confidence >= TTS_EMOTION_THRESHOLDS.confidence && margin >= TTS_EMOTION_THRESHOLDS.margin ? chosen : "calm";
+  return { emotion, probability, confidence, margin };
 }
 function resolvePositionChoice(answer, options, thresholds, fallback) {
   if (!answer) return { option: fallback, probability: 0, confidence: 0 };
@@ -1848,6 +1854,7 @@ function resolveTtsTagAnswers(plan, answers, style, thresholds = TTS_TAG_THRESHO
       ttsText,
       emotionProbability: emotionChoice.probability,
       emotionConfidence: emotionChoice.confidence,
+      emotionMargin: emotionChoice.margin,
       emotion2Probability: emotion2Choice.probability,
       emotion2Confidence: emotion2Choice.confidence,
       soundProbability: soundChoice.probability,
@@ -1887,6 +1894,7 @@ function applyTtsTagSelections(segments, plan, selections, includeDebug) {
       `tts-emotions:${JSON.stringify(selection.emotions)}`,
       `tts-emotion-probability:${selection.emotionProbability.toFixed(3)}`,
       `tts-emotion-confidence:${selection.emotionConfidence.toFixed(3)}`,
+      `tts-emotion-margin:${selection.emotionMargin.toFixed(3)}`,
       `tts-emotion2-probability:${selection.emotion2Probability.toFixed(3)}`,
       `tts-emotion2-confidence:${selection.emotion2Confidence.toFixed(3)}`,
       `tts-sounds:${JSON.stringify(selection.sounds)}`,

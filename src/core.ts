@@ -2205,6 +2205,16 @@ export const TTS_TAG_POSITION_THRESHOLDS: TtsTagThresholds = {
   margin: 0.1,
 }
 
+/**
+ * The primary emotion is mandatory, but a weak winner falls back to calm
+ * instead of forcing an arbitrary expression onto the line.
+ */
+export const TTS_EMOTION_THRESHOLDS: TtsTagThresholds = {
+  probability: 0.4,
+  confidence: 0.35,
+  margin: 0.1,
+}
+
 export interface TtsTagOption {
   value: string
   description: string
@@ -2740,6 +2750,7 @@ export interface TtsTagSelection {
   ttsText: string
   emotionProbability: number
   emotionConfidence: number
+  emotionMargin: number
   emotion2Probability: number
   emotion2Confidence: number
   soundProbability: number
@@ -2793,22 +2804,29 @@ function clearTagChoice(
 
 function resolveEmotionChoice(
   answer: SpeakerDecisionChoice | undefined,
-): { emotion: string; probability: number; confidence: number } {
-  if (!answer) return { emotion: 'calm', probability: 0, confidence: 0 }
+): { emotion: string; probability: number; confidence: number; margin: number } {
+  if (!answer) return { emotion: 'calm', probability: 0, confidence: 0, margin: 0 }
   const ranked = Object.entries(answer.probabilities)
     .filter((entry): entry is [string, number] => Number.isFinite(entry[1]))
     .sort((left, right) => right[1] - left[1])
   const selected = normalizeTtsTagName(answer.choice)
-  const emotion = selected && ttsTagCategory(selected) === 'emotion'
+  const chosen = selected && ttsTagCategory(selected) === 'emotion'
     ? selected
     : ranked.map(([name]) => normalizeTtsTagName(name))
         .find((name): name is string => !!name && ttsTagCategory(name) === 'emotion')
       ?? 'calm'
-  return {
-    emotion,
-    probability: answer.probabilities[answer.choice] ?? 0,
-    confidence: answer.confidence,
-  }
+  const probability = answer.probabilities[chosen] ?? 0
+  const runnerUp = ranked.find(([name]) => (
+    normalizeTtsTagName(name) !== chosen
+  ))?.[1] ?? 0
+  const confidence = answer.confidence
+  const margin = probability - runnerUp
+  const emotion = (
+    probability >= TTS_EMOTION_THRESHOLDS.probability
+    && confidence >= TTS_EMOTION_THRESHOLDS.confidence
+    && margin >= TTS_EMOTION_THRESHOLDS.margin
+  ) ? chosen : 'calm'
+  return { emotion, probability, confidence, margin }
 }
 
 function resolvePositionChoice(
@@ -2965,6 +2983,7 @@ export function resolveTtsTagAnswers(
       ttsText,
       emotionProbability: emotionChoice.probability,
       emotionConfidence: emotionChoice.confidence,
+      emotionMargin: emotionChoice.margin,
       emotion2Probability: emotion2Choice.probability,
       emotion2Confidence: emotion2Choice.confidence,
       soundProbability: soundChoice.probability,
@@ -3016,6 +3035,7 @@ export function applyTtsTagSelections(
           `tts-emotions:${JSON.stringify(selection.emotions)}`,
           `tts-emotion-probability:${selection.emotionProbability.toFixed(3)}`,
           `tts-emotion-confidence:${selection.emotionConfidence.toFixed(3)}`,
+          `tts-emotion-margin:${selection.emotionMargin.toFixed(3)}`,
           `tts-emotion2-probability:${selection.emotion2Probability.toFixed(3)}`,
           `tts-emotion2-confidence:${selection.emotion2Confidence.toFixed(3)}`,
           `tts-sounds:${JSON.stringify(selection.sounds)}`,

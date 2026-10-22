@@ -36,7 +36,8 @@ the leading emotion is sent as an inline bracket cue instead.
    - winner probability >= 0.65
    - answer confidence >= 0.60
    - winner minus runner-up >= 0.20
-   The fallback boundaries use 0.50/0.50/0.10. Emotion is always applied.
+   The fallback boundaries use 0.50/0.50/0.10. Emotion is mandatory, but a
+   weak primary winner falls back to `calm` below 0.40/0.35/0.10.
 4. **Deterministic text.** `resolveTtsTagAnswers` collects up to two leading
    emotions, normalizes existing cues, and inserts up to two new sounds and two
    new pauses at their fallback boundaries. Existing cues count toward the caps.
@@ -73,10 +74,10 @@ LLM placement never runs as one call for the whole message:
 ## Tag behavior
 
 - **Emotion:** the automatic Jev menu uses the 24 basic emotions, always at the
-  start. A second compatible basic emotion may be added above the same strict
-  thresholds. Existing cues using any of the 49 documented Fish emotions are
-  preserved, moved/normalized to the start, and capped at two. Neutral delivery
-  falls back to `calm`.
+  start. A weak primary winner falls back to `calm`. A second compatible basic
+  emotion may be added above the same strict thresholds. Existing cues using
+  any of the 49 documented Fish emotions are preserved, moved/normalized to the
+  start, and capped at two.
 - **Sound:** up to two, rendered with Fish's documented forms where they differ,
   such as `[laughing]`, `[sighing]`, and `[gasping]`. Existing sounds count
   toward the cap; duplicates are skipped.
@@ -112,8 +113,9 @@ the deterministic parse cache.
 ## Diagnostics
 
 With **Speaker assignment debug** enabled, each speech's debug path includes
-the leading emotions, primary/secondary emotion probabilities, sound and pause
-probabilities, margins, boundaries, and the resulting `tts-text`. The speech
+the leading emotions, primary/secondary emotion probabilities, confidence and
+margin, sound and pause probabilities, margins, boundaries, and the resulting
+`tts-text`. The speech
 list also shows a truncated `tts-tagged` line. LLM placement adds its
 style/connection/model settings, cache hits, chunk start/finish/failure events,
 the first-chunk timeout, and each applied placement text. The synthesis plan

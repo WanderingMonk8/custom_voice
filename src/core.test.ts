@@ -1274,6 +1274,23 @@ test('supports a second emotion, sound, and pause in one selection', () => {
   assert.ok(selection?.ttsText.includes('[long-break]'))
 })
 
+test('falls back to calm when the primary emotion is a weak winner', () => {
+  const content = ['Narration.', '', '"Wait. You heard that too?"'].join('\n')
+  const plan = buildSpeakerDecisionPlan(content, [{ id: 'alice', name: 'Alice' }], false)
+  const tagPlan = buildTtsTagPlan(plan)
+  const selection = resolveTtsTagAnswers(tagPlan, {
+    emotion_s0: {
+      choice: 'happy',
+      probabilities: { happy: 0.32, calm: 0.24, nervous: 0.2 },
+      confidence: 0.28,
+    },
+  }, 'gemini').get('s0')
+  assert.deepEqual(selection?.emotions, ['calm'])
+  assert.equal(selection?.emotionProbability, 0.32)
+  assert.equal(selection?.emotionConfidence, 0.28)
+  assert.equal(selection?.ttsText, '[calm] Wait. You heard that too?')
+})
+
 test('suppresses optional cues below the strong thresholds but keeps emotion', () => {
   const content = ['Narration.', '', '"Wait. You heard that too?"'].join('\n')
   const plan = buildSpeakerDecisionPlan(content, [{ id: 'alice', name: 'Alice' }], false)
