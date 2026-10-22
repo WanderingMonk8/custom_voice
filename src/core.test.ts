@@ -6,6 +6,8 @@ import {
   addUnconfiguredDialogueSpeakers,
   mergeScannedCardCast,
   applyConfigToMetadata,
+  applyCustomTtsEmotionCues,
+  applyLeadingTtsCues,
   applyTtsTagSelections,
   assessSpeakerDiscourseEscalation,
   buildSpeakerDecisionPlan,
@@ -23,6 +25,7 @@ import {
   hasNamedSpeakerSubject,
   mergeVoicePlan,
   normalizeTtsTags,
+  normalizeCustomTtsEmotionTag,
   npcSpeakerId,
   needsLlmSpeakerReview,
   parseCardCast,
@@ -1172,6 +1175,74 @@ test('builds emotion, sound, and pause questions per speech', () => {
   assert.equal(Object.keys(tagPlan.questions).length, 8)
 })
 
+test('adds a Fish style question and repeats leading cues per sentence', () => {
+  const content = ['Narration.', '', '"Wait. You heard that too?"'].join('\n')
+  const plan = buildSpeakerDecisionPlan(content, [{ id: 'alice', name: 'Alice' }], false)
+  const tagPlan = buildTtsTagPlan(plan, undefined, undefined, 'fish')
+  assert.ok(tagPlan.questions.style_s0)
+  assert.ok(tagPlan.questions.style_s0?.criteria.whispering)
+  assert.equal(Object.keys(tagPlan.questions).length, 9)
+
+  const selection = resolveTtsTagAnswers(tagPlan, {
+    emotion_s0: {
+      choice: 'moved',
+      probabilities: { moved: 0.9, calm: 0.1 },
+      confidence: 0.9,
+    },
+    style_s0: {
+      choice: 'whispering',
+      probabilities: { whispering: 0.9, no_style: 0.1 },
+      confidence: 0.9,
+    },
+  }, 'fish').get('s0')
+  assert.deepEqual(selection?.emotions, ['moved'])
+  assert.deepEqual(selection?.styles, ['whispering'])
+  assert.equal(selection?.baseText, '[moved] [whispering] Wait. You heard that too?')
+  assert.equal(selection?.ttsText, '[moved] [whispering] Wait. [moved] [whispering] You heard that too?')
+})
+
+test('rebuilds Fish leading cues after placement', () => {
+  assert.equal(
+    applyLeadingTtsCues(
+      '[moved] [whispering] Wait. [gasp] You heard that too?',
+      ['moved'],
+      ['whispering'],
+      'fish',
+    ),
+    '[moved] [whispering] Wait. [moved] [whispering] [gasp] You heard that too?',
+  )
+})
+
+test('validates and applies custom Fish emotion tags', () => {
+  assert.equal(
+    normalizeCustomTtsEmotionTag('[quietly relieved but guarded]'),
+    'quietly relieved but guarded',
+  )
+  assert.equal(
+    normalizeCustomTtsEmotionTag('one two three four five six seven eight nine ten eleven'),
+    null,
+  )
+  assert.equal(
+    normalizeCustomTtsEmotionTag('one two three four five six seven eight nine ten'),
+    null,
+  )
+  assert.equal(
+    normalizeCustomTtsEmotionTag('one two three four five six seven eight nine'),
+    'one two three four five six seven eight nine',
+  )
+  assert.equal(normalizeCustomTtsEmotionTag('[gasp]'), null)
+  assert.equal(normalizeCustomTtsEmotionTag('line one\nline two'), null)
+  assert.equal(
+    applyCustomTtsEmotionCues(
+      '[moved] [whispering] Wait. You heard that too?',
+      'quietly relieved but guarded',
+      ['whispering'],
+      'fish',
+    ),
+    '[quietly relieved but guarded] [whispering] Wait. [quietly relieved but guarded] [whispering] You heard that too?',
+  )
+})
+
 test('prepends emotion and places sound and pause together', () => {
   const content = ['Narration.', '', '"Wait. You heard that too?"'].join('\n')
   const plan = buildSpeakerDecisionPlan(content, [{ id: 'alice', name: 'Alice' }], false)
@@ -1213,7 +1284,7 @@ test('prepends emotion and places sound and pause together', () => {
   assert.equal(selection?.ttsText, '[happy] Wait. [gasp] You heard that too? [break]')
 
   const fish = resolveTtsTagAnswers(tagPlan, answers, 'fish').get('s0')
-  assert.equal(fish?.ttsText, '[happy] Wait. [gasping] You heard that too? [break]')
+  assert.equal(fish?.ttsText, '[happy] Wait. [happy] [gasp] You heard that too? [short pause]')
 })
 
 test('supports a second emotion, sound, and pause in one selection', () => {
@@ -1397,7 +1468,7 @@ test('keeps an existing leading emotion ahead of an inserted sound', () => {
 
 test('normalizes both providers to brackets and validates grouped placement', () => {
   assert.equal(normalizeTtsTags('[gasp] <sigh> [unknown]', 'gemini'), '[gasp] [sigh] [unknown]')
-  assert.equal(normalizeTtsTags('<gasp> [sigh]', 'fish'), '[gasping] [sighing]')
+  assert.equal(normalizeTtsTags('<gasp> [sigh]', 'fish'), '[gasp] [sigh]')
   assert.equal(stripTtsTags('Wait. [gasp] You <sigh> heard.'), 'Wait.  You  heard.')
   assert.equal(validateTtsTagPlacement('Wait. You heard.', 'Wait. [gasp] You heard.', 'gasp'), true)
   assert.equal(validateTtsTagPlacement('Wait. You heard.', 'Wait. You heard.', 'gasp'), false)
@@ -1407,6 +1478,7 @@ test('normalizes both providers to brackets and validates grouped placement', ()
   const original = '[happy] Wait. You heard.'
   const request = {
     emotions: ['happy'],
+    styles: [],
     sounds: ['gasp'],
     pauses: ['short' as const],
   }
@@ -1430,7 +1502,7 @@ test('normalizes both providers to brackets and validates grouped placement', ()
     validateTtsSpeechPlacement(
       '[happy] [moved] Wait. You heard.',
       '[happy] [moved] Wait. [gasp] You [sigh] [break] heard. [long-break]',
-      { emotions: ['happy', 'moved'], sounds: ['gasp', 'sigh'], pauses: ['short', 'long'] },
+      { emotions: ['happy', 'moved'], styles: [], sounds: ['gasp', 'sigh'], pauses: ['short', 'long'] },
       'gemini',
     ),
     true,

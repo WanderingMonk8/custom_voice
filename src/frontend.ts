@@ -245,7 +245,7 @@ interface LlmConnectionsPayload {
 interface TagPlacementPayload {
   type: 'chat_voice_tag_placement'
   requestId: string
-  placements: Array<{ id: string; text: string }>
+  placements: Array<{ id: string; text: string; emotionTag?: string }>
   error?: string
 }
 
@@ -1297,7 +1297,7 @@ export function setup(ctx: SpindleFrontendContext) {
     timer: ReturnType<typeof setTimeout>
   }>()
   const pendingTagPlacementRequests = new Map<string, {
-    resolve: (placements: Array<{ id: string; text: string }>) => void
+    resolve: (placements: Array<{ id: string; text: string; emotionTag?: string }>) => void
     reject: (error: Error) => void
     timer: ReturnType<typeof setTimeout>
   }>()
@@ -2073,10 +2073,13 @@ export function setup(ctx: SpindleFrontendContext) {
       id: string
       text: string
       emotions: string[]
+      styles: string[]
       sounds: string[]
       pauses: Array<'short' | 'long'>
+      narrativeBefore: string
+      narrativeAfter: string
     }>,
-  ): Promise<Array<{ id: string; text: string }>> {
+  ): Promise<Array<{ id: string; text: string; emotionTag?: string }>> {
     const requestId = `tag-placement-${Date.now().toString(36)}-${++tagPlacementRequestSequence}`
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -2494,8 +2497,11 @@ export function setup(ctx: SpindleFrontendContext) {
       const tagSources = new Map<string, {
         text: string
         emotions: string[]
+        styles: string[]
         sounds: string[]
         pauses: Array<'short' | 'long'>
+        narrativeBefore: string
+        narrativeAfter: string
       }>()
       for (const segment of segments) {
         // Multi-paragraph speeches are split into separate TTS requests. Keep
@@ -2503,19 +2509,26 @@ export function setup(ctx: SpindleFrontendContext) {
         // result is not duplicated across every paragraph.
         if (
           segment.ttsTag
-          && (segment.ttsTag.sounds.length > 0 || segment.ttsTag.pauses.length > 0)
+          && (
+            preferences.ttsTagStyle === 'fish'
+            || segment.ttsTag.sounds.length > 0
+            || segment.ttsTag.pauses.length > 0
+          )
           && !/\n\s*\n/u.test(segment.text.trim())
         ) {
           tagSources.set(segment.ttsTag.id, {
             text: segment.ttsTag.baseText ?? segment.ttsText ?? segment.text,
             emotions: segment.ttsTag.emotions,
+            styles: segment.ttsTag.styles,
             sounds: segment.ttsTag.sounds,
             pauses: segment.ttsTag.pauses,
+            narrativeBefore: segment.ttsTag.narrativeBefore ?? '',
+            narrativeAfter: segment.ttsTag.narrativeAfter ?? '',
           })
         }
       }
       const applyTagPlacements = (
-        placements: Array<{ id: string; text: string }>,
+        placements: Array<{ id: string; text: string; emotionTag?: string }>,
         origin: 'cache' | 'llm',
       ) => {
         for (const placement of placements) {
@@ -2525,9 +2538,11 @@ export function setup(ctx: SpindleFrontendContext) {
             `${playbackChat.id}\u0000${messageId}\u0000${preferences.ttsTagStyle}\u0000${preferences.tagLlmConnectionId}`
               + `\u0000${preferences.tagLlmModel}\u0000${placement.id}`
               + `\u0000${JSON.stringify(source.emotions)}`
+              + `\u0000${JSON.stringify(source.styles)}`
               + `\u0000${JSON.stringify(source.sounds)}`
               + `\u0000${JSON.stringify(source.pauses)}`
-              + `\u0000${source.text}`,
+              + `\u0000${source.text}`
+              + `\u0000${source.narrativeBefore}\u0000${source.narrativeAfter}`,
             placement.text,
           )
           for (const index of tagIndexes.get(placement.id) ?? []) {
@@ -2540,8 +2555,11 @@ export function setup(ctx: SpindleFrontendContext) {
           }
           appendSpeakerDebugLog(
             `TTS tag placement [${placement.id}] emotions=${JSON.stringify(source.emotions)}, `
+              + `styles=${JSON.stringify(source.styles)}, `
               + `sounds=${JSON.stringify(source.sounds)}, `
-              + `pauses=${JSON.stringify(source.pauses)} via ${origin}: `
+              + `pauses=${JSON.stringify(source.pauses)}`
+              + `${placement.emotionTag ? `, custom=${JSON.stringify(placement.emotionTag)}` : ''} `
+              + `via ${origin}: `
               + JSON.stringify(placement.text.length > 180
                 ? `${placement.text.slice(0, 177)}...`
                 : placement.text),
@@ -2563,15 +2581,20 @@ export function setup(ctx: SpindleFrontendContext) {
         const keyFor = (id: string, source: {
           text: string
           emotions: string[]
+          styles: string[]
           sounds: string[]
           pauses: Array<'short' | 'long'>
+          narrativeBefore: string
+          narrativeAfter: string
         }) => (
           `${playbackChat.id}\u0000${messageId}\u0000${placementStyle}\u0000${preferences.tagLlmConnectionId}`
             + `\u0000${preferences.tagLlmModel}\u0000${id}`
             + `\u0000${JSON.stringify(source.emotions)}`
+            + `\u0000${JSON.stringify(source.styles)}`
             + `\u0000${JSON.stringify(source.sounds)}`
             + `\u0000${JSON.stringify(source.pauses)}`
             + `\u0000${source.text}`
+            + `\u0000${source.narrativeBefore}\u0000${source.narrativeAfter}`
         )
         const cachedPlacements: Array<{ id: string; text: string }> = []
         for (const [id, source] of tagSources) {
@@ -2590,15 +2613,21 @@ export function setup(ctx: SpindleFrontendContext) {
             id,
             text: source.text,
             emotions: source.emotions,
+            styles: source.styles,
             sounds: source.sounds,
             pauses: source.pauses,
+            narrativeBefore: source.narrativeBefore,
+            narrativeAfter: source.narrativeAfter,
           }))
         const chunks: Array<Array<{
           id: string
           text: string
           emotions: string[]
+          styles: string[]
           sounds: string[]
           pauses: Array<'short' | 'long'>
+          narrativeBefore: string
+          narrativeAfter: string
         }>> = []
         for (let index = 0; index < items.length; index += 4) {
           chunks.push(items.slice(index, index + 4))

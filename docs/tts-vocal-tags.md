@@ -18,10 +18,13 @@ the leading emotion is sent as an inline bracket cue instead.
 1. **Structure plan.** `buildSpeakerDecisionPlan` supplies the message,
    quotations, and surrounding narration. The same structure is used by Jev
    speaker assignment and by the tag pass.
-2. **Jev tag ranking.** `buildTtsTagPlan` issues eight questions per speech:
+2. **Jev tag ranking.** `buildTtsTagPlan` issues eight questions per speech for
+   Gemini, and nine for Fish S2:
    - mandatory primary emotion from the 24 basic emotions; no threshold, with
      `calm` as the neutral fallback
    - optional secondary basic emotion
+   - Fish-only optional sustained voice style (whispering, soft/loud/low voice,
+     shouting, screaming)
    - optional primary momentary sound
    - optional secondary momentary sound
    - fallback primary-sound boundary
@@ -45,20 +48,27 @@ the leading emotion is sent as an inline bracket cue instead.
    plus the full `ttsText` fallback and `ttsTag` metadata. The message text and
    ordinary `text` field are unchanged.
 5. **Grouped LLM placement.** When `LLM exact placement` is selected, one item
-   per speech carries all selected sounds and pauses together. The backend
-   validates that the LLM preserved the leading emotions, every word, and every
-   existing cue, and added only the requested sounds and pauses, each exactly
-   once. Invalid or missing results fall back to the deterministic placement.
+   per speech carries all selected sounds and pauses together. For Fish S2,
+   every single-paragraph speech is included even when it has no sound or pause,
+   because the same call also requests a custom emotion cue. The LLM returns
+   that cue separately as `emotionTag`; it is never inserted into the returned
+   text. The backend validates the text for sound/pause placement, validates the
+   custom cue (fewer than 10 words, no brackets or line breaks), then replaces
+   the fixed leading emotion in `ttsText`. The fixed Jev emotion remains in
+   `ttsTag` metadata and remains the fallback. Gemini keeps the fixed emotion
+   and only uses the call for sound/pause placement.
 
 ## Chunking
 
 LLM placement never runs as one call for the whole message:
 
-- Speeches needing sound or pause placement are grouped into chunks of four.
-- Emotion-only speeches do not enter the placement pipeline and do not block
-  playback.
-- The first placement chunk is requested before synthesis and awaited for at
-  most eight seconds. This is the only blocking placement work.
+- Fish S2 groups all single-paragraph speeches into chunks of four because every
+  speech needs a custom emotion cue. Gemini groups only speeches that need sound
+  or pause placement.
+- Multi-paragraph speeches keep deterministic placement because a speech-level
+  result cannot be split safely across paragraph requests.
+- The first chunk is requested before synthesis and awaited for at most eight
+  seconds. This is the only blocking placement work.
 - The remaining chunks start immediately after that first wait resolves or
   times out, and continue resolving sequentially while playback runs.
 - A plan entry is updated when its chunk returns. If a segment has already
@@ -78,11 +88,23 @@ LLM placement never runs as one call for the whole message:
   emotion may be added above the same strict thresholds. Existing cues using
   any of the 49 documented Fish emotions are preserved, moved/normalized to the
   start, and capped at two.
-- **Sound:** up to two, rendered with Fish's documented forms where they differ,
-  such as `[laughing]`, `[sighing]`, and `[gasping]`. Existing sounds count
-  toward the cap; duplicates are skipped.
-- **Pause:** up to two, using `[break]` or `[long-break]`. Existing pauses count
-  toward the cap.
+- **Fish S2 custom emotion:** when LLM placement is enabled, the placement LLM
+  refines the fixed Jev winner using the speech and its surrounding narration.
+  The custom cue replaces the fixed tag in `ttsText` but the fixed tag remains
+  in metadata and is restored if the custom cue is missing or invalid.
+- **Fish S2 style:** an optional sustained voice style is placed with the
+  emotion at the start, never sent to the placement LLM. Fish sound cues use
+  the S2 well-tested forms, including `[sigh]`, `[gasp]`, `[groan]`,
+  `[laughing]`, `[crying]`, `[inhale]`, `[exhale]`, and `[clears throat]`.
+  Pauses use `[short pause]` and `[long pause]`.
+- **Fish S2 scoping:** because S2 cues apply until the next cue or sentence end,
+  the leading emotion/style prefix is repeated at each sentence start. This also
+  restores the base delivery after a reaction or pause in the previous sentence.
+  Gemini keeps its existing single-prefix behavior.
+- **Sound:** up to two, rendered with Fish's documented forms where they differ.
+  Existing sounds count toward the cap; duplicates are skipped.
+- **Pause:** up to two, using the provider-specific pause form. Existing pauses
+  count toward the cap.
 - Existing angle-bracket cues are normalized to bracket cues.
 
 ## Settings
@@ -108,16 +130,19 @@ the deterministic parse cache.
   12-emotion menu, then fall back to `calm` for that speech.
 - Placement RPC failure, timeout, or validation failure: the deterministic
   Jev placement remains in place.
+- Missing, malformed, or too-long Fish custom emotion tag: the fixed Jev emotion
+  remains in place.
 - Messages with no quoted speech receive no tags.
 
 ## Diagnostics
 
 With **Speaker assignment debug** enabled, each speech's debug path includes
 the leading emotions, primary/secondary emotion probabilities, confidence and
-margin, sound and pause probabilities, margins, boundaries, and the resulting
-`tts-text`. The speech
+margin, Fish style probabilities, sound and pause probabilities, margins,
+boundaries, and the resulting `tts-text`. The speech
 list also shows a truncated `tts-tagged` line. LLM placement adds its
 style/connection/model settings, cache hits, chunk start/finish/failure events,
-the first-chunk timeout, and each applied placement text. The synthesis plan
+the first-chunk timeout, the custom Fish emotion cue when used, and each applied
+placement text. The synthesis plan
 shows the final text used for each request, including placements that arrived
 before that request started.

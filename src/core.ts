@@ -108,6 +108,8 @@ export interface TtsTagPlacement {
   id: string
   /** Leading emotions, always rendered at the start. At most two. */
   emotions: string[]
+  /** Leading Fish S2 voice styles, rendered at the start. */
+  styles: string[]
   /** New sound cues to place. Existing sounds stay in baseText. At most two total. */
   sounds: string[]
   /** New pause cues to place. Existing pauses stay in baseText. At most two total. */
@@ -115,6 +117,9 @@ export interface TtsTagPlacement {
   source: 'jev' | 'llm'
   /** Emotion-bearing text before new sound/pause insertion, used for LLM placement. */
   baseText?: string
+  /** Surrounding narration used when generating a custom Fish emotion tag. */
+  narrativeBefore?: string
+  narrativeAfter?: string
 }
 
 export interface PlaybackSegment {
@@ -474,6 +479,11 @@ function readParsedMessages(value: unknown): Record<string, CachedMessageParse> 
               .map(value => normalizeTtsTagName(value))
               .filter((value): value is string => !!value && ttsTagCategory(value) === 'emotion')
               .slice(0, 2),
+            styles: (Array.isArray(segment.ttsTag.styles) ? segment.ttsTag.styles : [])
+              .filter((value): value is string => typeof value === 'string')
+              .map(value => normalizeTtsTagName(value))
+              .filter((value): value is string => !!value && ttsTagCategory(value) === 'style')
+              .slice(0, 1),
             sounds: (Array.isArray(segment.ttsTag.sounds) ? segment.ttsTag.sounds : [])
               .filter((value): value is string => typeof value === 'string')
               .map(value => normalizeTtsTagName(value))
@@ -485,6 +495,12 @@ function readParsedMessages(value: unknown): Record<string, CachedMessageParse> 
             source: segment.ttsTag.source as 'jev' | 'llm',
             ...(typeof segment.ttsTag.baseText === 'string'
               ? { baseText: segment.ttsTag.baseText.trim().slice(0, 20_000) }
+              : {}),
+            ...(typeof segment.ttsTag.narrativeBefore === 'string'
+              ? { narrativeBefore: segment.ttsTag.narrativeBefore.trim().slice(0, 20_000) }
+              : {}),
+            ...(typeof segment.ttsTag.narrativeAfter === 'string'
+              ? { narrativeAfter: segment.ttsTag.narrativeAfter.trim().slice(0, 20_000) }
               : {}),
           }
         : null
@@ -2348,9 +2364,26 @@ export const TTS_PAUSE_OPTIONS: readonly TtsPauseOption[] = [
   { value: 'long', label: 'Long pause', description: 'An extended dramatic pause.' },
 ] as const
 
+/** Fish S2 leading voice-style cues. These apply to the speech, not one word. */
+export const TTS_STYLE_OPTIONS: readonly TtsTagOption[] = [
+  { value: 'whispering', description: 'Hushed and breathy.' },
+  { value: 'soft voice', description: 'Quiet and gentle.' },
+  { value: 'low voice', description: 'A deeper register.' },
+  { value: 'loud voice', description: 'Raised volume without shouting.' },
+  { value: 'shouting', description: 'Full-volume shouting.' },
+  { value: 'screaming', description: 'Panicked or extreme volume.' },
+] as const
+
+/** Styles that must lead the speech instead of being placed as momentary sounds. */
+const TTS_STYLE_LIKE_SOUNDS = new Set(['whispers', 'shout', 'scream'])
+
+export const TTS_FISH_SOUND_OPTIONS: readonly TtsTagOption[] = TTS_TAG_OPTIONS
+  .filter(option => !TTS_STYLE_LIKE_SOUNDS.has(option.value))
+
 const TTS_EMOTION_NAMES = new Set(TTS_EMOTION_OPTIONS.map(option => option.value))
 const TTS_SOUND_NAMES = new Set(TTS_TAG_OPTIONS.map(option => option.value))
 const TTS_PAUSE_NAMES = new Set<string>(TTS_PAUSE_OPTIONS.map(option => option.value))
+const TTS_STYLE_NAMES = new Set(TTS_STYLE_OPTIONS.map(option => option.value))
 const TTS_TAG_ALIASES = new Map<string, string>([
   // Sound aliases.
   ['laughter', 'laugh'], ['laughs', 'laugh'], ['laughing', 'laugh'],
@@ -2359,12 +2392,16 @@ const TTS_TAG_ALIASES = new Map<string, string>([
   ['gasps', 'gasp'], ['gasping', 'gasp'], ['sighs', 'sigh'], ['sighing', 'sigh'],
   ['groans', 'groan'], ['groaning', 'groan'], ['grunts', 'grunt'], ['growls', 'growl'],
   ['hisses', 'hiss'], ['moans', 'moan'], ['pants', 'pant'], ['panting', 'pant'],
-  ['whisper', 'whispers'], ['whispering', 'whispers'], ['shouts', 'shout'], ['shouting', 'shout'],
-  ['cries', 'cry'], ['crying loudly', 'cry'], ['sobs', 'sob'], ['sobbing', 'sob'],
-  ['screams', 'scream'], ['screaming', 'scream'], ['shrieks', 'shriek'],
-  ['snorts', 'snort'], ['breaths', 'breath'], ['exhale', 'exhales'],
-  ['coughs', 'cough'], ['clear throat', 'throat-clearing'], ['sneezes', 'sneeze'],
-  ['yawns', 'yawn'], ['yawning', 'yawn'], ['snoring', 'snore'],
+  ['whisper', 'whispering'], ['whispering', 'whispering'],
+  ['shouts', 'shout'], ['shouting', 'shouting'], ['screaming', 'screaming'],
+  ['cries', 'cry'], ['crying', 'cry'], ['crying loudly', 'cry'],
+  ['sobs', 'sob'], ['sobbing', 'sob'],
+  ['screams', 'scream'], ['shrieks', 'shriek'],
+  ['snorts', 'snort'], ['breaths', 'breath'], ['inhale', 'breath'], ['exhale', 'exhales'],
+  ['coughs', 'cough'], ['clear throat', 'throat-clearing'], ['clears throat', 'throat-clearing'],
+  ['sneezes', 'sneeze'], ['yawns', 'yawn'], ['yawning', 'yawn'], ['snoring', 'snore'],
+  // Style aliases.
+  ['soft', 'soft voice'], ['loud', 'loud voice'], ['low', 'low voice'],
   // Pause aliases.
   ['break', 'short'], ['short pause', 'short'],
   ['long-break', 'long'], ['long pause', 'long'],
@@ -2378,28 +2415,32 @@ const TTS_TAG_NAMES = new Set<string>([
   ...TTS_EMOTION_NAMES,
   ...TTS_SOUND_NAMES,
   ...TTS_PAUSE_NAMES,
+  ...TTS_STYLE_NAMES,
 ])
 
 const TTS_FISH_SOUND_MAP: Record<string, string> = {
   laugh: 'laughing',
   chuckle: 'chuckling',
   sob: 'sobbing',
-  cry: 'crying loudly',
-  sigh: 'sighing',
-  groan: 'groaning',
+  cry: 'crying',
+  sigh: 'sigh',
+  groan: 'groan',
   pant: 'panting',
-  gasp: 'gasping',
+  gasp: 'gasp',
   yawn: 'yawning',
   snore: 'snoring',
-  'throat-clearing': 'clear throat',
+  'throat-clearing': 'clears throat',
   whispers: 'whispering',
   shout: 'shouting',
   scream: 'screaming',
+  breath: 'inhale',
+  'heavy breath': 'panting',
+  exhales: 'exhale',
 }
 
 const TTS_TAG_TOKEN_RE = /\[\s*([a-z][a-z -]*?)\s*\]|<\s*([a-z][a-z -]*?)\s*>/giu
 
-export type TtsTagCategory = 'emotion' | 'sound' | 'pause'
+export type TtsTagCategory = 'emotion' | 'style' | 'sound' | 'pause'
 
 export function normalizeTtsTagName(value: string): string | null {
   const tag = value.trim().toLowerCase()
@@ -2411,18 +2452,25 @@ export function ttsTagCategory(value: string): TtsTagCategory | null {
   const tag = normalizeTtsTagName(value)
   if (!tag) return null
   if (TTS_EMOTION_NAMES.has(tag)) return 'emotion'
+  if (TTS_STYLE_NAMES.has(tag)) return 'style'
   if (TTS_PAUSE_NAMES.has(tag)) return 'pause'
   return 'sound'
 }
 
 /**
- * Both providers use bracket cues. Fish uses its documented sound vocabulary;
- * Gemini accepts the same bracket descriptors as natural-language cues.
+ * Both providers use bracket cues. Fish S2 uses its well-tested forms and
+ * leading voice styles; Gemini keeps the existing inline cue formatting.
  */
 export function formatTtsTag(tag: string, style: Exclude<TtsTagStyle, 'off'>): string {
   const canonical = normalizeTtsTagName(tag) ?? tag
   const category = ttsTagCategory(canonical)
+  if (category === 'style') {
+    return `[${canonical}]`
+  }
   if (category === 'pause') {
+    if (style === 'fish') {
+      return canonical === 'long' ? '[long pause]' : '[short pause]'
+    }
     return canonical === 'long' ? '[long-break]' : '[break]'
   }
   if (category === 'sound' && style === 'fish') {
@@ -2476,6 +2524,7 @@ export function countTtsTag(text: string, tag: string): number {
  */
 export interface TtsSpeechPlacementRequest {
   emotions: string[]
+  styles: string[]
   sounds: string[]
   pauses: Array<'short' | 'long'>
 }
@@ -2492,6 +2541,12 @@ export function validateTtsSpeechPlacement(
       .filter((value): value is string => !!value && ttsTagCategory(value) === 'emotion'),
   )].slice(0, 2)
   if (emotions.length === 0) return false
+  const styles = [...new Set(
+    request.styles
+      .map(value => normalizeTtsTagName(value))
+      .filter((value): value is string => !!value && ttsTagCategory(value) === 'style'),
+  )].slice(0, 1)
+  if (styles.length !== request.styles.length) return false
   const sounds = request.sounds
     .map(value => normalizeTtsTagName(value))
     .filter((value): value is string => !!value && ttsTagCategory(value) === 'sound')
@@ -2504,7 +2559,9 @@ export function validateTtsSpeechPlacement(
   const normalizedOriginal = stripTtsTags(original).replace(/\s+/gu, ' ').trim()
   const normalizedTagged = stripTtsTags(tagged).replace(/\s+/gu, ' ').trim()
   if (normalizedOriginal !== normalizedTagged) return false
-  const emotionPrefix = emotions.map(emotion => formatTtsTag(emotion, style)).join(' ')
+  const emotionPrefix = [...emotions, ...styles]
+    .map(tag => formatTtsTag(tag, style))
+    .join(' ')
   if (!tagged.trimStart().startsWith(emotionPrefix)) return false
 
   const originalTags = new Map<string, number>()
@@ -2523,7 +2580,7 @@ export function validateTtsSpeechPlacement(
   const names = new Set([...originalTags.keys(), ...taggedTags.keys(), ...expected.keys()])
   for (const name of names) {
     const delta = (taggedTags.get(name) ?? 0) - (originalTags.get(name) ?? 0)
-    if (ttsTagCategory(name) === 'emotion') {
+    if (ttsTagCategory(name) === 'emotion' || ttsTagCategory(name) === 'style') {
       if (delta !== 0) return false
     } else if (delta !== (expected.get(name) ?? 0)) {
       return false
@@ -2630,16 +2687,21 @@ export interface TtsTagPlan {
 const TTS_NO_TAG_OPTION = 'no_tag'
 const TTS_NO_PAUSE_OPTION = 'no_pause'
 const TTS_NO_EMOTION_OPTION = 'no_emotion'
+const TTS_NO_STYLE_OPTION = 'no_style'
 
 function ttsEmotionCriteria(options: readonly TtsTagOption[]): Record<string, string> {
   return Object.fromEntries(options.map(option => [option.value, option.description]))
 }
 
-function ttsSoundCriteria(): Record<string, string> {
+function ttsSoundCriteria(options: readonly TtsTagOption[]): Record<string, string> {
   return Object.fromEntries([
-    ...TTS_TAG_OPTIONS.map(option => [option.value, option.description]),
+    ...options.map(option => [option.value, option.description]),
     [TTS_NO_TAG_OPTION, 'No momentary sound effect. Most lines should choose this.'],
   ])
+}
+
+function ttsStyleCriteria(): Record<string, string> {
+  return Object.fromEntries(TTS_STYLE_OPTIONS.map(option => [option.value, option.description]))
 }
 
 function ttsPauseCriteria(): Record<string, string> {
@@ -2657,6 +2719,7 @@ export function buildTtsTagPlan(
   plan: SpeakerDecisionPlan,
   speechIds?: readonly string[],
   emotionOptions: readonly TtsTagOption[] = TTS_AUTO_EMOTION_OPTIONS,
+  style: Exclude<TtsTagStyle, 'off'> = 'gemini',
 ): TtsTagPlan {
   const allowed = speechIds ? new Set(speechIds) : null
   const speeches = plan.state.speeches
@@ -2669,7 +2732,10 @@ export function buildTtsTagPlan(
       narrativeAfter: speech.narrativeAfter,
     }))
   const emotionCriteria = ttsEmotionCriteria(emotionOptions)
-  const soundCriteria = ttsSoundCriteria()
+  const soundCriteria = ttsSoundCriteria(
+    style === 'fish' ? TTS_FISH_SOUND_OPTIONS : TTS_TAG_OPTIONS,
+  )
+  const styleCriteria = ttsStyleCriteria()
   const pauseCriteria = ttsPauseCriteria()
   const questions: SpeakerDecisionPlan['questions'] = {}
   const positions: Record<string, TtsTagPositionOption[]> = {}
@@ -2687,6 +2753,16 @@ export function buildTtsTagPlan(
         ...emotionCriteria,
         [TTS_NO_EMOTION_OPTION]: 'No distinct secondary emotion. Most lines should choose this.',
       },
+    }
+    if (style === 'fish') {
+      questions[`style_${speech.id}`] = {
+        type: 'choice',
+        instructions: `Does quotation ${speech.id} have a sustained voice style that should lead the speech? Choose no_style unless a whisper, soft/loud/low voice, shout, or scream clearly applies to the whole quotation. Do not use this for a momentary sound.`,
+        criteria: {
+          ...styleCriteria,
+          [TTS_NO_STYLE_OPTION]: 'No sustained voice style. Most lines should choose this.',
+        },
+      }
     }
     questions[`tag_${speech.id}`] = {
       type: 'choice',
@@ -2738,6 +2814,8 @@ export interface TtsTagSelection {
   speechId: string
   /** Leading emotions, including existing ones. At most two. */
   emotions: string[]
+  /** Leading Fish S2 voice styles. At most one. */
+  styles: string[]
   /** New sound cues to place. At most two total including existing sounds. */
   sounds: string[]
   /** New pause cues to place. At most two total including existing pauses. */
@@ -2748,11 +2826,16 @@ export interface TtsTagSelection {
   baseText: string
   /** Full deterministic fallback text, always with the leading emotions. */
   ttsText: string
+  narrativeBefore: string
+  narrativeAfter: string
   emotionProbability: number
   emotionConfidence: number
   emotionMargin: number
   emotion2Probability: number
   emotion2Confidence: number
+  styleProbability: number
+  styleConfidence: number
+  styleMargin: number
   soundProbability: number
   soundConfidence: number
   soundMargin: number
@@ -2788,6 +2871,7 @@ function clearTagChoice(
   const tag = answer.choice === TTS_NO_TAG_OPTION
     || answer.choice === TTS_NO_PAUSE_OPTION
     || answer.choice === TTS_NO_EMOTION_OPTION
+    || answer.choice === TTS_NO_STYLE_OPTION
     ? null
     : normalizeTtsTagName(answer.choice)
   if (
@@ -2865,6 +2949,91 @@ function removeTtsTagsByCategory(
   ))
 }
 
+function renderLeadingCues(
+  body: string,
+  prefix: string,
+  repeatPerSentence: boolean,
+): string {
+  if (!body) return prefix
+  if (!repeatPerSentence) return `${prefix} ${body}`
+  const rendered: string[] = []
+  for (const sentence of body.split(/(?<=[.!?…])\s+/u).filter(Boolean)) {
+    const words = stripTtsTags(sentence).replace(/\s+/gu, ' ').trim()
+    if (!words && rendered.length > 0) {
+      rendered[rendered.length - 1] += ` ${sentence}`
+    } else {
+      rendered.push(words ? `${prefix} ${sentence}` : sentence)
+    }
+  }
+  return rendered.join(' ')
+}
+
+/**
+ * Rebuild the Fish leading cues after placement. The placement LLM receives
+ * only the first prefix, which keeps its output small; this restores the
+ * sentence-level S2 scoping deterministically.
+ */
+export function applyLeadingTtsCues(
+  text: string,
+  emotions: readonly string[],
+  styles: readonly string[],
+  style: Exclude<TtsTagStyle, 'off'>,
+): string {
+  const normalized = normalizeTtsTags(text, style)
+  const body = style === 'fish'
+    ? removeTtsTagsByCategory(removeTtsTagsByCategory(normalized, 'emotion'), 'style')
+    : normalized
+  const prefix = [...emotions, ...styles]
+    .map(tag => formatTtsTag(tag, style))
+    .join(' ')
+  return renderLeadingCues(
+    body.replace(/[ \t]+/gu, ' ').trim(),
+    prefix,
+    style === 'fish',
+  )
+}
+
+const CUSTOM_EMOTION_MAX_WORDS = 9
+const CUSTOM_EMOTION_MAX_CHARS = 80
+
+/** Validate a free-form Fish S2 emotion cue before using it in place of the fixed tag. */
+export function normalizeCustomTtsEmotionTag(value: string): string | null {
+  let tag = value.trim()
+  if (!tag) return null
+  if (tag.startsWith('[') && tag.endsWith(']')) {
+    tag = tag.slice(1, -1).trim()
+  }
+  if (!tag || tag.includes('[') || tag.includes(']') || /["“”\r\n]/u.test(tag)) return null
+  tag = tag.replace(/\s+/gu, ' ').trim()
+  if (tag.length === 0 || tag.length > CUSTOM_EMOTION_MAX_CHARS) return null
+  const words = tag.split(' ').filter(Boolean)
+  if (words.length < 1 || words.length > CUSTOM_EMOTION_MAX_WORDS) return null
+  const canonical = normalizeTtsTagName(tag)
+  if (canonical && ttsTagCategory(canonical) !== 'emotion') return null
+  return tag
+}
+
+/** Replace the fixed leading emotion with a validated Fish S2 custom cue. */
+export function applyCustomTtsEmotionCues(
+  text: string,
+  customTag: string,
+  styles: readonly string[],
+  style: Exclude<TtsTagStyle, 'off'>,
+): string {
+  const normalized = normalizeTtsTags(text, style)
+  const body = style === 'fish'
+    ? removeTtsTagsByCategory(removeTtsTagsByCategory(normalized, 'emotion'), 'style')
+    : normalized
+  const prefix = [formatTtsTag(customTag, style), ...styles.map(tag => formatTtsTag(tag, style))]
+    .filter(Boolean)
+    .join(' ')
+  return renderLeadingCues(
+    body.replace(/[ \t]+/gu, ' ').trim(),
+    prefix,
+    style === 'fish',
+  )
+}
+
 /**
  * Normalize tag answers into a leading emotion plus optional sound and pause.
  * Every speech gets a selection so the deterministic fallback always has an
@@ -2881,6 +3050,9 @@ export function resolveTtsTagAnswers(
   for (const speech of plan.state.speeches) {
     const emotionChoice = resolveEmotionChoice(answers[`emotion_${speech.id}`])
     const emotion2Choice = clearTagChoice(answers[`emotion2_${speech.id}`], thresholds, 'emotion')
+    const styleChoice = style === 'fish'
+      ? clearTagChoice(answers[`style_${speech.id}`], thresholds, 'style')
+      : { tag: null, probability: 0, confidence: 0, margin: 0 }
     const soundChoice = clearTagChoice(answers[`tag_${speech.id}`], thresholds, 'sound')
     const sound2Choice = clearTagChoice(answers[`tag2_${speech.id}`], thresholds, 'sound')
     const pauseChoice = clearTagChoice(answers[`pause_${speech.id}`], thresholds, 'pause')
@@ -2919,6 +3091,16 @@ export function resolveTtsTagAnswers(
       emotions.push(emotion2Choice.tag)
     }
 
+    const existingStyles = style === 'fish'
+      ? [...new Set(
+          existingTags.filter(tag => ttsTagCategory(tag) === 'style'),
+        )].slice(0, 1)
+      : []
+    const styles = [...existingStyles]
+    if (style === 'fish' && styles.length === 0 && styleChoice.tag) {
+      styles.push(styleChoice.tag)
+    }
+
     const sounds = [...new Set(
       existingTags.filter(tag => ttsTagCategory(tag) === 'sound'),
     )].slice(0, 2)
@@ -2946,12 +3128,20 @@ export function resolveTtsTagAnswers(
       index === 0 ? pausePosition.option : pausePositions[pausePositions.length - 1]
     ))
 
-    const emotionPrefix = emotions.map(emotion => formatTtsTag(emotion, style)).join(' ')
+    const leadingPrefix = [...emotions, ...styles]
+      .map(tag => formatTtsTag(tag, style))
+      .join(' ')
+    const removeLeadingCues = (text: string) => {
+      const withoutEmotions = removeTtsTagsByCategory(text, 'emotion')
+      return style === 'fish'
+        ? removeTtsTagsByCategory(withoutEmotions, 'style')
+        : withoutEmotions
+    }
     const baseBody = normalizeTtsTags(
-      removeTtsTagsByCategory(speech.text, 'emotion'),
+      removeLeadingCues(speech.text),
       style,
     ).replace(/[ \t]+/gu, ' ').trim()
-    const baseText = baseBody ? `${emotionPrefix} ${baseBody}` : emotionPrefix
+    const baseText = baseBody ? `${leadingPrefix} ${baseBody}` : leadingPrefix
 
     const insertions: Array<{ token: string; charIndex: number }> = []
     newSounds.forEach((sound, index) => insertions.push({
@@ -2967,25 +3157,31 @@ export function resolveTtsTagAnswers(
       fallback = insertTtsTag(fallback, insertion.token, insertion.charIndex)
     }
     const fallbackBody = normalizeTtsTags(
-      removeTtsTagsByCategory(fallback, 'emotion'),
+      removeLeadingCues(fallback),
       style,
     ).replace(/[ \t]+/gu, ' ').trim()
-    const ttsText = fallbackBody ? `${emotionPrefix} ${fallbackBody}` : emotionPrefix
+    const ttsText = renderLeadingCues(fallbackBody, leadingPrefix, style === 'fish')
 
     selections.set(speech.id, {
       speechId: speech.id,
       emotions,
+      styles,
       sounds: newSounds,
       pauses: newPauses,
       soundPositions: newSoundPositions.map(option => option.id),
       pausePositions: newPausePositions.map(option => option.id),
       baseText,
       ttsText,
+      narrativeBefore: speech.narrativeBefore,
+      narrativeAfter: speech.narrativeAfter,
       emotionProbability: emotionChoice.probability,
       emotionConfidence: emotionChoice.confidence,
       emotionMargin: emotionChoice.margin,
       emotion2Probability: emotion2Choice.probability,
       emotion2Confidence: emotion2Choice.confidence,
+      styleProbability: styleChoice.probability,
+      styleConfidence: styleChoice.confidence,
+      styleMargin: styleChoice.margin,
       soundProbability: soundChoice.probability,
       soundConfidence: soundChoice.confidence,
       soundMargin: soundChoice.margin,
@@ -3038,6 +3234,10 @@ export function applyTtsTagSelections(
           `tts-emotion-margin:${selection.emotionMargin.toFixed(3)}`,
           `tts-emotion2-probability:${selection.emotion2Probability.toFixed(3)}`,
           `tts-emotion2-confidence:${selection.emotion2Confidence.toFixed(3)}`,
+          `tts-styles:${JSON.stringify(selection.styles)}`,
+          `tts-style-probability:${selection.styleProbability.toFixed(3)}`,
+          `tts-style-confidence:${selection.styleConfidence.toFixed(3)}`,
+          `tts-style-margin:${selection.styleMargin.toFixed(3)}`,
           `tts-sounds:${JSON.stringify(selection.sounds)}`,
           `tts-sound-probability:${selection.soundProbability.toFixed(3)}`,
           `tts-sound-confidence:${selection.soundConfidence.toFixed(3)}`,
@@ -3067,10 +3267,13 @@ export function applyTtsTagSelections(
       ttsTag: {
         id: selection.speechId,
         emotions: selection.emotions,
+        styles: selection.styles,
         sounds: selection.sounds,
         pauses: selection.pauses,
         source: 'jev' as const,
         baseText: selection.baseText,
+        narrativeBefore: selection.narrativeBefore,
+        narrativeAfter: selection.narrativeAfter,
       },
       ...(debugPath ? { debugPath } : {}),
     }
@@ -3103,7 +3306,7 @@ export const SPEAKER_DECISION_THRESHOLDS: Record<'local' | 'discourse' | 'overri
   override: { probability: 0.7, confidence: 0.65, margin: 0.25 },
 }
 
-export const TTS_TAG_SCHEMA = 'tts-tags-3'
+export const TTS_TAG_SCHEMA = 'tts-tags-5'
 
 /** Bump a version whenever a stage changes the output stored in the cache. */
 export const SPEAKER_DECISION_SCHEMA = {
