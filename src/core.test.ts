@@ -20,6 +20,7 @@ import {
   encodeConcatenatedWav,
   evaluateSpeakerDecisionAnswer,
   expiredSavedAudioRecords,
+  formatTtsTag,
   hashMessageContent,
   hasNamedSpeakerMention,
   hasNamedSpeakerSubject,
@@ -1201,6 +1202,30 @@ test('adds a Fish style question and repeats leading cues per sentence', () => {
   assert.equal(selection?.ttsText, '[moved] [whispering] Wait. [moved] [whispering] You heard that too?')
 })
 
+test('formats Gemini 3.8 vocal events and omits unsupported emotion/style cues', () => {
+  assert.equal(formatTtsTag('sigh', 'gemini38'), '<sigh>')
+  assert.equal(formatTtsTag('short', 'gemini38'), '<short pause>')
+  assert.equal(formatTtsTag('long', 'gemini38'), '<long pause>')
+  assert.equal(formatTtsTag('happy', 'gemini38'), '')
+  assert.equal(formatTtsTag('whispering', 'gemini38'), '')
+  assert.equal(formatTtsTag('snore', 'gemini38'), '')
+  assert.equal(
+    normalizeTtsTags('[happy] [whispering] Wait. [gasp] [break]', 'gemini38')
+      .replace(/\s+/gu, ' ')
+      .trim(),
+    'Wait. <gasp> <short pause>',
+  )
+  assert.equal(
+    applyLeadingTtsCues(
+      '[happy] [whispering] Wait. [gasp] You heard.',
+      ['happy'],
+      ['whispering'],
+      'gemini38',
+    ),
+    'Wait. <gasp> You heard.',
+  )
+})
+
 test('rebuilds Fish leading cues after placement', () => {
   assert.equal(
     applyLeadingTtsCues(
@@ -1285,6 +1310,23 @@ test('prepends emotion and places sound and pause together', () => {
 
   const fish = resolveTtsTagAnswers(tagPlan, answers, 'fish').get('s0')
   assert.equal(fish?.ttsText, '[happy] Wait. [happy] [gasp] You heard that too? [short pause]')
+
+  const gemini38Plan = buildTtsTagPlan(plan, undefined, undefined, 'gemini38')
+  assert.equal(gemini38Plan.questions.emotion_s0, undefined)
+  assert.equal(gemini38Plan.questions.emotion2_s0, undefined)
+  assert.equal(gemini38Plan.questions.style_s0, undefined)
+  assert.equal(Object.keys(gemini38Plan.questions).length, 6)
+  const gemini38 = resolveTtsTagAnswers(gemini38Plan, answers, 'gemini38').get('s0')
+  assert.deepEqual(gemini38?.emotions, [])
+  assert.deepEqual(gemini38?.styles, [])
+  assert.deepEqual(gemini38?.sounds, ['gasp'])
+  assert.deepEqual(gemini38?.pauses, ['short'])
+  assert.equal(gemini38?.baseText, 'Wait. You heard that too?')
+  assert.equal(gemini38?.ttsText, 'Wait. <gasp> You heard that too? <short pause>')
+  assert.equal(
+    resolveTtsTagAnswers(gemini38Plan, {}, 'gemini38').get('s0')?.ttsText,
+    'Wait. You heard that too?',
+  )
 })
 
 test('supports a second emotion, sound, and pause in one selection', () => {
@@ -1504,6 +1546,15 @@ test('normalizes both providers to brackets and validates grouped placement', ()
       '[happy] [moved] Wait. [gasp] You [sigh] [break] heard. [long-break]',
       { emotions: ['happy', 'moved'], styles: [], sounds: ['gasp', 'sigh'], pauses: ['short', 'long'] },
       'gemini',
+    ),
+    true,
+  )
+  assert.equal(
+    validateTtsSpeechPlacement(
+      'Wait. You heard.',
+      'Wait. <gasp> You heard. <short pause>',
+      { emotions: [], styles: [], sounds: ['gasp'], pauses: ['short'] },
+      'gemini38',
     ),
     true,
   )
@@ -2183,6 +2234,51 @@ test('persists manual scan results for loading without rescanning messages', () 
   assert.deepEqual(restored.detectedCharacters, [{ id: 'alice', name: 'Alice', messageCount: 7 }])
   assert.equal(restored.characterVoices.alice, 'voice-a')
   assert.deepEqual(restored.parsedMessages, metadata.chat_voice && (metadata.chat_voice as ChatVoiceConfig).parsedMessages)
+})
+
+test('restores cached Gemini 3.8 event metadata without leading emotions', () => {
+  const metadata = applyConfigToMetadata({}, {
+    version: 7,
+    messageLimit: 20,
+    connectionId: '',
+    narratorVoice: '',
+    userVoice: '',
+    useGlobalNarratorVoice: true,
+    useGlobalUserVoice: true,
+    characterVoices: {},
+    detectedCharacters: [],
+    managedCharacterIds: [],
+    parsedMessages: {
+      message1: {
+        contentHash: hashMessageContent('Alice said, "Wait."'),
+        segments: [{
+          text: 'Wait.',
+          speakerId: npcSpeakerId('Alice'),
+          ttsText: 'Wait. <gasp>',
+          ttsTag: {
+            id: 's0',
+            emotions: [],
+            styles: [],
+            sounds: ['gasp'],
+            pauses: [],
+            source: 'jev',
+            baseText: 'Wait.',
+          },
+        }],
+      },
+    },
+  })
+  const restored = readConfig(metadata, ['alice'])
+  assert.equal(restored.parsedMessages.message1.segments[0].ttsText, 'Wait. <gasp>')
+  assert.deepEqual(restored.parsedMessages.message1.segments[0].ttsTag, {
+    id: 's0',
+    emotions: [],
+    styles: [],
+    sounds: ['gasp'],
+    pauses: [],
+    source: 'jev',
+    baseText: 'Wait.',
+  })
 })
 
 test('validates fenced LLM segmentation and rejects unknown message IDs', () => {

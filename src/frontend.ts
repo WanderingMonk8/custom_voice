@@ -302,7 +302,7 @@ interface PlaybackPreferences {
   savedAudioLimit: number
   skippedTrackerTags: string
   speakerParsingMode: 'off' | 'ambiguous'
-  ttsTagStyle: 'off' | 'gemini' | 'fish'
+  ttsTagStyle: 'off' | 'gemini' | 'gemini38' | 'fish'
   ttsTagPlacement: 'jev' | 'llm'
   tagLlmConnectionId: string
   tagLlmModel: string
@@ -380,6 +380,7 @@ async function loadPlaybackPreferences(): Promise<PlaybackPreferences> {
     ? 'off'
     : 'ambiguous'
   const ttsTagStyle = row.value?.chatVoiceTtsTagStyle === 'gemini'
+    || row.value?.chatVoiceTtsTagStyle === 'gemini38'
     || row.value?.chatVoiceTtsTagStyle === 'fish'
     ? row.value.chatVoiceTtsTagStyle
     : 'off'
@@ -485,7 +486,7 @@ function saveLlmParsingPreferences(
 }
 
 function saveTtsTagPreferences(
-  style: 'off' | 'gemini' | 'fish',
+  style: 'off' | 'gemini' | 'gemini38' | 'fish',
   placement: 'jev' | 'llm',
   connectionId: string,
   model: string,
@@ -1179,7 +1180,7 @@ export function setup(ctx: SpindleFrontendContext) {
   let savingSkippedTrackerTags = false
   let skippedTrackerTagsSaveTimer: ReturnType<typeof setTimeout> | null = null
   let speakerParsingMode: 'off' | 'ambiguous' = 'ambiguous'
-  let ttsTagStyle: 'off' | 'gemini' | 'fish' = 'off'
+  let ttsTagStyle: 'off' | 'gemini' | 'gemini38' | 'fish' = 'off'
   let ttsTagPlacement: 'jev' | 'llm' = 'jev'
   let tagLlmConnectionId = ''
   let tagLlmModel = ''
@@ -1434,6 +1435,7 @@ export function setup(ctx: SpindleFrontendContext) {
     options: [
       { value: 'off', label: 'Off', sublabel: 'Do not add inline vocal tags' },
       { value: 'gemini', label: 'Gemini', sublabel: 'Bracketed cues, for example [happy] and [gasp]' },
+      { value: 'gemini38', label: 'Gemini 3.8', sublabel: 'Angle-bracket events, for example <sigh> and <short pause>' },
       { value: 'fish', label: 'Fish S2', sublabel: 'Fish cues, for example [happy] and [laughing]' },
     ],
     ariaLabel: 'TTS vocal tag style',
@@ -1920,7 +1922,7 @@ export function setup(ctx: SpindleFrontendContext) {
       `Parsing mode: ${parsingMode === 'off' ? 'local parser only' : 'Jev with local fallback'}`,
       `TTS tags: ${ttsTagStyle === 'off'
         ? 'off'
-        : `${ttsTagStyle} (${ttsTagPlacement === 'llm' ? 'LLM placement' : 'Jev placement'})`}`,
+        : `${ttsTagStyle === 'gemini38' ? 'Gemini 3.8' : ttsTagStyle} (${ttsTagPlacement === 'llm' ? 'LLM placement' : 'Jev placement'})`}`,
       ...speakerPipelineHeader(finalSegments, parsingMode, review),
       `Default speaker: ${speakerDebugName(defaultSpeakerId, parserSpeakers)}`,
       `Parser roster: ${parserSpeakers.map(speaker => `${speaker.name} [${speaker.id}]`).join(', ') || '(empty)'}`,
@@ -2112,6 +2114,9 @@ export function setup(ctx: SpindleFrontendContext) {
   }
 
   function updateTtsTagControls(): void {
+    ttsTagHint.textContent = ttsTagStyle === 'gemini38'
+      ? 'Gemini 3.8 uses angle-bracket vocal events and pauses. Sustained emotion and style require speech_metadata, which the current TTS request does not expose.'
+      : 'Every speech gets one or two leading emotions. Up to two sounds and two pauses may be added; all cues for a speech share the same grouped placement request.'
     const tagEnabled = ttsTagStyle !== 'off'
     const llmEnabled = tagEnabled && ttsTagPlacement === 'llm'
     ttsTagPlacementPicker.update({
@@ -2133,7 +2138,7 @@ export function setup(ctx: SpindleFrontendContext) {
   }
 
   function onTtsTagStyleChanged(value: string): void {
-    ttsTagStyle = value === 'gemini' || value === 'fish' ? value : 'off'
+    ttsTagStyle = value === 'gemini' || value === 'gemini38' || value === 'fish' ? value : 'off'
     ttsTagPicker.update({ value: ttsTagStyle })
     updateTtsTagControls()
     scheduleLlmSettingsSave()
@@ -2571,7 +2576,7 @@ export function setup(ctx: SpindleFrontendContext) {
         && preferences.ttsTagPlacement === 'llm'
         && tagSources.size > 0
       ) {
-        const placementStyle = preferences.ttsTagStyle as 'gemini' | 'fish'
+        const placementStyle = preferences.ttsTagStyle as 'gemini' | 'gemini38' | 'fish'
         appendSpeakerDebugLog(
           `\nTTS tag placement: style=${placementStyle}, mode=llm, `
             + `speeches=${tagSources.size}, `

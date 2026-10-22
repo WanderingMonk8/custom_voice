@@ -3,15 +3,18 @@
 ## Objective
 
 Add controlled inline acting to the speech sent to TTS without changing the
-message. Every quoted speech receives a leading emotion cue. Jev may also add
-one momentary sound and one short or long pause. Cues are inserted only inside
-quoted speech, never into narration.
+message. Gemini and Fish S2 receive a leading emotion cue; Gemini 3.8 uses only
+documented vocal events and pauses. Jev may add one or two momentary sounds and
+one or two short or long pauses. Cues are inserted only inside quoted speech,
+never into narration.
 
-Both providers now use square-bracket cues. Gemini documents bracket cues such
-as `[laughs]`, `[sigh]`, `[uhm]`, and `[extremely fast]`; Fish S2 documents
-`[happy]`, sound effects, and `[break]` / `[long-break]`. Gemini's separate
-prompt-level emotion control is not exposed by the extension's TTS request, so
-the leading emotion is sent as an inline bracket cue instead.
+Legacy Gemini and Fish S2 use square-bracket cues. Gemini documents bracket cues
+such as `[laughs]`, `[sigh]`, `[uhm]`, and `[extremely fast]`; Fish S2 documents
+`[happy]`, sound effects, and `[break]` / `[long-break]`. Gemini 3.8 instead uses
+angle-bracket vocal events such as `<sigh>`, `<gasp>`, and `<short pause>`. Its
+sustained emotion/style control is a separate `speech_metadata` field that the
+extension's TTS request does not expose, so Gemini 3.8 receives no inline
+emotion or style cue.
 
 ## Pipeline
 
@@ -19,10 +22,10 @@ the leading emotion is sent as an inline bracket cue instead.
    quotations, and surrounding narration. The same structure is used by Jev
    speaker assignment and by the tag pass.
 2. **Jev tag ranking.** `buildTtsTagPlan` issues eight questions per speech for
-   Gemini, and nine for Fish S2:
-   - mandatory primary emotion from the 24 basic emotions; no threshold, with
-     `calm` as the neutral fallback
-   - optional secondary basic emotion
+   legacy Gemini, nine for Fish S2, and six for Gemini 3.8:
+   - Gemini/Fish only: mandatory primary emotion from the 24 basic emotions; no
+     threshold, with `calm` as the neutral fallback
+   - Gemini/Fish only: optional secondary basic emotion
    - Fish-only optional sustained voice style (whispering, soft/loud/low voice,
      shouting, screaming)
    - optional primary momentary sound
@@ -31,6 +34,8 @@ the leading emotion is sent as an inline bracket cue instead.
    - optional primary short/long pause
    - optional secondary short/long pause
    - fallback primary-pause boundary
+   Gemini 3.8 skips the emotion and style questions because those cues cannot be
+   expressed through its inline event syntax.
    The tag evaluation runs in parallel with the Jev speaker decision and is
    independent of the LLM placement setting. Tag evaluation is grouped two
    speeches per Decision call; a failed batch is retried one speech at a time.
@@ -39,14 +44,16 @@ the leading emotion is sent as an inline bracket cue instead.
    - winner probability >= 0.65
    - answer confidence >= 0.60
    - winner minus runner-up >= 0.20
-   The fallback boundaries use 0.50/0.50/0.10. Emotion is mandatory, but a
-   weak primary winner falls back to `calm` below 0.40/0.35/0.10.
+   The fallback boundaries use 0.50/0.50/0.10. Emotion is mandatory for Gemini
+   and Fish, but a weak primary winner falls back to `calm` below
+   0.40/0.35/0.10. Gemini 3.8 has no emotion question.
 4. **Deterministic text.** `resolveTtsTagAnswers` collects up to two leading
-   emotions, normalizes existing cues, and inserts up to two new sounds and two
-   new pauses at their fallback boundaries. Existing cues count toward the caps.
-   It records `baseText` (emotions but no new sound/pause) for the placement LLM,
-   plus the full `ttsText` fallback and `ttsTag` metadata. The message text and
-   ordinary `text` field are unchanged.
+   emotions for Gemini/Fish, normalizes existing cues, and inserts up to two new
+   sounds and two new pauses at their fallback boundaries. Existing cues count
+   toward the caps. Gemini 3.8 skips the leading emotions and emits only its
+   angle-bracket sounds and pauses. It records `baseText` (leading cues but no
+   new sound/pause) for the placement LLM, plus the full `ttsText` fallback and
+   `ttsTag` metadata. The message text and ordinary `text` field are unchanged.
 5. **Grouped LLM placement.** When `LLM exact placement` is selected, one item
    per speech carries all selected sounds and pauses together. For Fish S2,
    every single-paragraph speech is included even when it has no sound or pause,
@@ -55,16 +62,17 @@ the leading emotion is sent as an inline bracket cue instead.
    text. The backend validates the text for sound/pause placement, validates the
    custom cue (fewer than 10 words, no brackets or line breaks), then replaces
    the fixed leading emotion in `ttsText`. The fixed Jev emotion remains in
-   `ttsTag` metadata and remains the fallback. Gemini keeps the fixed emotion
-   and only uses the call for sound/pause placement.
+   `ttsTag` metadata and remains the fallback. Legacy Gemini keeps the fixed
+   emotion and only uses the call for sound/pause placement. Gemini 3.8 has no
+   leading emotion and uses the call only for its angle-bracket sounds/pauses.
 
 ## Chunking
 
 LLM placement never runs as one call for the whole message:
 
 - Fish S2 groups all single-paragraph speeches into chunks of four because every
-  speech needs a custom emotion cue. Gemini groups only speeches that need sound
-  or pause placement.
+  speech needs a custom emotion cue. Legacy Gemini and Gemini 3.8 group only
+  speeches that need sound or pause placement.
 - Multi-paragraph speeches keep deterministic placement because a speech-level
   result cannot be split safely across paragraph requests.
 - The first chunk is requested before synthesis and awaited for at most eight
@@ -83,11 +91,12 @@ LLM placement never runs as one call for the whole message:
 
 ## Tag behavior
 
-- **Emotion:** the automatic Jev menu uses the 24 basic emotions, always at the
-  start. A weak primary winner falls back to `calm`. A second compatible basic
-  emotion may be added above the same strict thresholds. Existing cues using
-  any of the 49 documented Fish emotions are preserved, moved/normalized to the
-  start, and capped at two.
+- **Emotion:** legacy Gemini and Fish S2 use the automatic Jev menu with the 24
+  basic emotions, always at the start. A weak primary winner falls back to
+  `calm`. A second compatible basic emotion may be added above the same strict
+  thresholds. Existing cues using any of the 49 documented Fish emotions are
+  preserved, moved/normalized to the start, and capped at two. Gemini 3.8 does
+  not receive inline emotions.
 - **Fish S2 custom emotion:** when LLM placement is enabled, the placement LLM
   refines the fixed Jev winner using the speech and its surrounding narration.
   The custom cue replaces the fixed tag in `ttsText` but the fixed tag remains
@@ -97,20 +106,30 @@ LLM placement never runs as one call for the whole message:
   the S2 well-tested forms, including `[sigh]`, `[gasp]`, `[groan]`,
   `[laughing]`, `[crying]`, `[inhale]`, `[exhale]`, and `[clears throat]`.
   Pauses use `[short pause]` and `[long pause]`.
+- **Gemini 3.8 events:** sounds use its documented angle-bracket forms, including
+  `<sigh>`, `<gasp>`, `<laugh>`, `<cry>`, `<breath>`, and `<throat-clearing>`.
+  Pauses use `<short pause>` and `<long pause>`. Sustained emotion, custom
+  emotion, style, and volume are not inserted because Gemini 3.8 requires
+  `speech_metadata.style` for those, and the current TTS request has no field
+  for it.
 - **Fish S2 scoping:** because S2 cues apply until the next cue or sentence end,
   the leading emotion/style prefix is repeated at each sentence start. This also
   restores the base delivery after a reaction or pause in the previous sentence.
-  Gemini keeps its existing single-prefix behavior.
-- **Sound:** up to two, rendered with Fish's documented forms where they differ.
-  Existing sounds count toward the cap; duplicates are skipped.
+  Legacy Gemini keeps its existing single-prefix behavior. Gemini 3.8 has no
+  leading prefix.
+- **Sound:** up to two, rendered with the selected provider's documented forms
+  where they differ. Existing sounds count toward the cap; duplicates are
+  skipped.
 - **Pause:** up to two, using the provider-specific pause form. Existing pauses
   count toward the cap.
-- Existing angle-bracket cues are normalized to bracket cues.
+- Existing cues are normalized to the selected provider's bracket type. Gemini
+  3.8 uses angle brackets; legacy Gemini and Fish S2 use square brackets.
 
 ## Settings
 
-- **TTS vocal tags**: Off (default), Gemini, or Fish S2. Both use bracket cues;
-  Fish uses its documented sound vocabulary.
+- **TTS vocal tags**: Off (default), Gemini, Gemini 3.8, or Fish S2. Legacy
+  Gemini and Fish S2 use square-bracket cues; Gemini 3.8 uses angle-bracket
+  vocal events and pauses.
 - **Vocal tag placement**: Jev sentence boundaries or LLM exact placement.
 - **Vocal tag LLM connection**: optional Lumiverse LLM connection. Empty uses
   the active/default connection.
@@ -124,10 +143,12 @@ the deterministic parse cache.
 ## Failure behavior
 
 - No Decision connection: existing recognized cues are normalized and the
-  emotion falls back to `calm`; no optional sound or pause is chosen.
+  Gemini/Fish emotion falls back to `calm`; no optional sound or pause is chosen.
+  Gemini 3.8 has no emotion fallback and simply keeps any existing vocal events.
 - Tag evaluation failure, a rejected probability distribution, or an invalid
   batch: retry the affected speeches individually, then with the compact
-  12-emotion menu, then fall back to `calm` for that speech.
+  12-emotion menu, then fall back to `calm` for that Gemini/Fish speech. Gemini
+  3.8 simply keeps any existing vocal events.
 - Placement RPC failure, timeout, or validation failure: the deterministic
   Jev placement remains in place.
 - Missing, malformed, or too-long Fish custom emotion tag: the fixed Jev emotion
@@ -137,9 +158,9 @@ the deterministic parse cache.
 ## Diagnostics
 
 With **Speaker assignment debug** enabled, each speech's debug path includes
-the leading emotions, primary/secondary emotion probabilities, confidence and
-margin, Fish style probabilities, sound and pause probabilities, margins,
-boundaries, and the resulting `tts-text`. The speech
+the leading emotions when supported, primary/secondary emotion probabilities,
+confidence and margin, Fish style probabilities, sound and pause probabilities,
+margins, boundaries, and the resulting `tts-text`. The speech
 list also shows a truncated `tts-tagged` line. LLM placement adds its
 style/connection/model settings, cache hits, chunk start/finish/failure events,
 the first-chunk timeout, the custom Fish emotion cue when used, and each applied

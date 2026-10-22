@@ -535,12 +535,17 @@ async function evaluateTtsTagSelections(
 
 const TTS_TAG_PLACEMENT_PROMPT = `You place already-chosen performance cues inside quoted dialogue for a text-to-speech engine.
 Return JSON only: {"speeches":[{"id":"speech id","text":"the speech with the cues inserted","emotionTag":"optional custom emotion"}]}.
-Each input speech begins with its emotion cues and any Fish S2 style cues in square brackets, and may repeat them at later sentence starts. Preserve every emotion and style cue in place.
+Each input speech may begin with leading cues and may repeat them at later sentence starts. Preserve every existing cue in place.
 For every input speech, insert every provided sound cue and every provided pause cue exactly once, at the intended moment for each.
 Do not add, remove, or change any other character, word, punctuation mark, or whitespace. Preserve every existing cue in the text.
 Never choose different cues and never add an emotion or style to text. If a cue cannot be placed naturally, return the original text unchanged.
-Use square-bracket cues only, for example [happy], [gasp], [short pause], and [long pause].
 The complete message is context only; tag only the listed speeches.`
+
+const TTS_TAG_FORMAT_PROMPTS: Record<Exclude<TtsTagStyle, 'off'>, string> = {
+  gemini: 'Use square-bracket cues only, for example [gasp], [break], and [long-break].',
+  gemini38: 'Use angle-bracket cues only, for example <gasp>, <short pause>, and <long pause>. Never use square brackets.',
+  fish: 'Use square-bracket cues only, for example [gasp], [short pause], and [long pause].',
+}
 
 const TTS_CUSTOM_EMOTION_PROMPT = `For every listed speech, use the leading fixed emotion and the narrativeBefore/narrativeAfter context to write one custom Fish S2 emotion cue in emotionTag. It must be fewer than 10 words, describe delivery only, never quote dialogue or narrate events, and never include brackets, quotes, sound effects, pauses, or a second sentence. Refine the fixed emotion; do not contradict it. Do not repeat the separate style cue; that style is already provided. Return the tag text without brackets. Do not insert it into the text field. If no useful refinement is possible, repeat the fixed emotion or leave emotionTag empty.`
 
@@ -549,9 +554,11 @@ async function placeTtsTags(
   userId?: string,
 ): Promise<Array<{ id: string; text: string; emotionTag?: string }>> {
   if (payload.items.length === 0) return []
-  const systemContent = payload.style === 'fish'
-    ? `${TTS_TAG_PLACEMENT_PROMPT}\n${TTS_CUSTOM_EMOTION_PROMPT}`
-    : TTS_TAG_PLACEMENT_PROMPT
+  const systemContent = [
+    TTS_TAG_PLACEMENT_PROMPT,
+    TTS_TAG_FORMAT_PROMPTS[payload.style],
+    ...(payload.style === 'fish' ? [TTS_CUSTOM_EMOTION_PROMPT] : []),
+  ].join('\n')
   const response = await spindle.generate.quiet({
     type: 'quiet',
     userId,
@@ -846,7 +853,9 @@ function queueSpeakerParse(
       payload.debug,
     )
     const hasDecisionCapability = (spindle.host.capabilities['decisions-v1'] ?? 0) >= 1
-    const tagStyle: TtsTagStyle = payload.tagStyle === 'gemini' || payload.tagStyle === 'fish'
+    const tagStyle: TtsTagStyle = payload.tagStyle === 'gemini'
+      || payload.tagStyle === 'gemini38'
+      || payload.tagStyle === 'fish'
       ? payload.tagStyle
       : 'off'
     const structurePlan = (payload.mode !== 'off' || tagStyle !== 'off')
