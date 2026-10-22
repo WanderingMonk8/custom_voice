@@ -19,7 +19,8 @@ A [Lumiverse Spindle](https://docs.lumiverse.chat/) extension that detects chara
 - When quotations lack a coherent current identity, locally uses the immediately preceding assistant speaker to resolve identity-free or conflicting narrative candidates; explicit current attribution and conflicting pronoun speakers disable this fallback.
 - Routes Lumiverse's native message TTS button through ordered multi-voice playback.
 - Overrides the matching native context-menu action instead of adding duplicate playback controls.
-- Merges adjacent same-voice passages within each paragraph, splits multi-paragraph passages into smaller requests, and dynamically adjusts generation concurrency from median length and short-segment density to reduce gaps without bursting short requests.
+- Splits playback into paragraph-sized TTS requests, including separate requests for consecutive same-speaker paragraphs, and dynamically adjusts generation concurrency from median length and short-segment density to reduce gaps without bursting short requests.
+- Adds one or two leading emotion cues to every speech, plus up to two thresholded sound cues and two pause cues, using bracketed Gemini/Fish-compatible tags. Emotion is placed deterministically at the start; all sound and pause placement for a speech is grouped into one chunked LLM request. Tags are injected only into the speech sent to TTS, never into the message.
 - Paces request starts and automatically pauses and resumes unfinished generation when a TTS provider responds with HTTP 429. It honors `Retry-After`, keeps completed segments, and uses a configurable cumulative rate-limit wait budget.
 - Automatically balances differing TTS voice levels with silence-gated RMS analysis, a rolling profile for each voice, ±6 dB gain limits, and a -1 dBFS peak ceiling.
 - Uses Lumiverse's selected TTS connection, falling back to the profile marked as the default, when a chat has no saved connection.
@@ -27,7 +28,7 @@ A [Lumiverse Spindle](https://docs.lumiverse.chat/) extension that detects chara
 - When enabled, saves the exact synthesized custom-voice segments as a native Lumiverse audio attachment for the active message swipe, with a browser-generated WAV fallback when the server cannot mux their source formats.
 - When saving is enabled, continues bounded background synthesis and saves the complete recording even when audible playback is stopped early.
 - Removes HTML/escaped tags and Markdown emphasis markers before sending readable text to TTS.
-- Provides a global, autosaved list of tracker tag names whose tags and enclosed contents are removed before playback generation.
+- Provides a global, autosaved list of tracker tag names or full asymmetric tag pairs whose tags and enclosed contents are removed before playback generation.
 - Automatically excludes well-formed HTML comments (`<!-- ... -->`) from playback and speaker detection.
 - Alternates short unattributed dialogue turns after two speakers have been confidently established, including chains preceded by same-speaker continuation paragraphs.
 - Optionally reviews ambiguous—or all—dialogue with an LLM, using a selectable Lumiverse connection and optional custom model override. Results are cached per message and safely fall back to local parsing.
@@ -57,12 +58,13 @@ The compiled frontend and backend bundles are committed under `dist/`, so users 
 1. Open a chat.
 2. Select **Voice** in the Lumiverse drawer.
 3. Click **Scan** to read the active character card and save its speaking cast.
-4. Optionally enter comma-separated tag names under **Skipped tracker tags**, such as `tracker, status, o_scene`. These global exclusions remove both the opening/closing tags and everything enclosed by them before TTS generation. Previously saved paired-tag entries remain compatible.
+4. Optionally enter comma-separated tag names under **Skipped tracker tags**, such as `tracker, status, o_scene`. For asymmetric tags, enter the full pair, such as `<o_ledger></o_l>`. These global exclusions remove both the opening/closing tags and everything enclosed by them before TTS generation. Previously saved paired-tag entries remain compatible.
 5. Global **Jev speaker assignment** defaults to **On** and uses the account's default Lumiverse Decision connection. Switch it off to use only the local parser. The On option is available only when Lumiverse has at least one Decision model connection; without one it stays Off.
-6. Choose one TTS connection for the chat.
-7. Enter the narrator voice and a voice for each detected character. Add characters manually, or rename and delete any roster entry as needed. Separate aliases with `/` (for example, `Scott / The sergeant`) to route every name to the same voice; use the rename button to add aliases later without losing the assigned voice.
-8. Optionally enable **Save generated audio** to attach completed recordings to messages across every chat. This global setting is off by default. Set **Maximum saved recordings** to control global retention (default: 50); the oldest extension-created attachments are removed first.
-9. Use Lumiverse's normal **Play with TTS** button or context-menu action to play the message with all configured voices.
+6. Optionally enable **TTS vocal tags** and choose **Gemini** or **Fish S2**. Every quoted speech receives one leading emotion cue, with an optional second emotion; Jev may add up to two sounds and two short/long pauses above strict strength thresholds. Both providers use bracket cues, for example `[happy]`, `[gasp]`, `[break]`, and `[long-break]`. Choose **LLM exact placement** to place all of a speech’s sounds and pauses together at the exact words; otherwise Jev uses sentence boundaries. Emotions never need the placement LLM. Placement is resolved in small chunks while playback proceeds.
+7. Choose one TTS connection for the chat.
+8. Enter the narrator voice and a voice for each detected character. Add characters manually, or rename and delete any roster entry as needed. Separate aliases with `/` (for example, `Scott / The sergeant`) to route every name to the same voice; use the rename button to add aliases later without losing the assigned voice.
+9. Optionally enable **Save generated audio** to attach completed recordings to messages across every chat. This global setting is off by default. Set **Maximum saved recordings** to control global retention (default: 50); the oldest extension-created attachments are removed first.
+10. Use Lumiverse's normal **Play with TTS** button or context-menu action to play the message with all configured voices.
 
 The collapsed **Advanced settings** section at the bottom of the drawer controls how many synthesized segments are buffered before playback starts (default: 2), the maximum generation concurrency (default: 4), and the cumulative rate-limit wait budget in seconds (default: 60, maximum: 3600). Every message starts at concurrency 1. A six-segment window keeps concurrency at 1 when it contains at least three short segments or has a short median, and only increases toward the configured maximum after two consecutive all-long windows. Any HTTP 429 keeps the rest of that message at concurrency 1. A longer wait budget lets interrupted generation keep retrying for longer. Voice-volume normalization is always active. Normalized saved recordings use assembled PCM WAV audio and may consume more storage.
 

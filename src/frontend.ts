@@ -227,6 +227,28 @@ interface DecisionStatusPayload extends DecisionConnectionStatus {
   requestId?: string
 }
 
+interface LlmConnection {
+  id: string
+  name: string
+  provider: string
+  model: string
+  is_default: boolean
+}
+
+interface LlmConnectionsPayload {
+  type: 'chat_voice_llm_connections'
+  requestId: string
+  connections: LlmConnection[]
+  error?: string
+}
+
+interface TagPlacementPayload {
+  type: 'chat_voice_tag_placement'
+  requestId: string
+  placements: Array<{ id: string; text: string }>
+  error?: string
+}
+
 /** Result of asking the backend for reviewed speaker assignments. */
 interface SpeakerParseReview {
   segments: PlaybackSegment[]
@@ -280,6 +302,10 @@ interface PlaybackPreferences {
   savedAudioLimit: number
   skippedTrackerTags: string
   speakerParsingMode: 'off' | 'ambiguous'
+  ttsTagStyle: 'off' | 'gemini' | 'fish'
+  ttsTagPlacement: 'jev' | 'llm'
+  tagLlmConnectionId: string
+  tagLlmModel: string
   playbackBufferSegments: number
   concurrentGenerations: number
   rateLimitWaitSeconds: number
@@ -336,6 +362,10 @@ async function loadPlaybackPreferences(): Promise<PlaybackPreferences> {
     savedAudioLimit: DEFAULT_SAVED_AUDIO_LIMIT,
     skippedTrackerTags: '',
     speakerParsingMode: 'ambiguous',
+    ttsTagStyle: 'off',
+    ttsTagPlacement: 'jev',
+    tagLlmConnectionId: '',
+    tagLlmModel: '',
     playbackBufferSegments: DEFAULT_PLAYBACK_BUFFER_SEGMENTS,
     concurrentGenerations: DEFAULT_CONCURRENT_GENERATIONS,
     rateLimitWaitSeconds: DEFAULT_RATE_LIMIT_WAIT_SECONDS,
@@ -349,6 +379,11 @@ async function loadPlaybackPreferences(): Promise<PlaybackPreferences> {
   const speakerParsingMode = row.value?.chatVoiceSpeakerParsingMode === 'off'
     ? 'off'
     : 'ambiguous'
+  const ttsTagStyle = row.value?.chatVoiceTtsTagStyle === 'gemini'
+    || row.value?.chatVoiceTtsTagStyle === 'fish'
+    ? row.value.chatVoiceTtsTagStyle
+    : 'off'
+  const ttsTagPlacement = row.value?.chatVoiceTtsTagPlacement === 'llm' ? 'llm' : 'jev'
   return {
     speed: Math.min(4, Math.max(0.25, speed)),
     volume: Math.min(1, Math.max(0, volume)),
@@ -361,6 +396,14 @@ async function loadPlaybackPreferences(): Promise<PlaybackPreferences> {
       ? row.value.chatVoiceSkippedTrackerTags.slice(0, 4_000)
       : '',
     speakerParsingMode,
+    ttsTagStyle,
+    ttsTagPlacement,
+    tagLlmConnectionId: typeof row.value?.chatVoiceTagLlmConnectionId === 'string'
+      ? row.value.chatVoiceTagLlmConnectionId.trim().slice(0, 128)
+      : '',
+    tagLlmModel: typeof row.value?.chatVoiceTagLlmModel === 'string'
+      ? row.value.chatVoiceTagLlmModel.trim().slice(0, 256)
+      : '',
     playbackBufferSegments: clampIntegerSetting(
       row.value?.chatVoicePlaybackBufferSegments,
       DEFAULT_PLAYBACK_BUFFER_SEGMENTS,
@@ -438,6 +481,21 @@ function saveLlmParsingPreferences(
   return updateVoiceSettings(current => ({
     ...current,
     chatVoiceSpeakerParsingMode: mode,
+  }))
+}
+
+function saveTtsTagPreferences(
+  style: 'off' | 'gemini' | 'fish',
+  placement: 'jev' | 'llm',
+  connectionId: string,
+  model: string,
+): Promise<void> {
+  return updateVoiceSettings(current => ({
+    ...current,
+    chatVoiceTtsTagStyle: style,
+    chatVoiceTtsTagPlacement: placement,
+    chatVoiceTagLlmConnectionId: connectionId.trim().slice(0, 128),
+    chatVoiceTagLlmModel: model.trim().slice(0, 256),
   }))
 }
 
@@ -973,6 +1031,10 @@ export function setup(ctx: SpindleFrontendContext) {
   scanRow.append(scanButton)
   const skippedTagsField = createField('Skipped tracker tags (global)')
   const speakerParsingField = createField('Jev speaker assignment (global)')
+  const ttsTagField = createField('TTS vocal tags (global)')
+  const ttsTagPlacementField = createField('Vocal tag placement')
+  const tagLlmConnectionField = createField('Vocal tag LLM connection')
+  const tagLlmModelField = createField('Vocal tag model (optional)')
   const narratorField = createField('Narrator voice')
   const userVoiceField = createField('User voice')
 
@@ -1044,6 +1106,10 @@ export function setup(ctx: SpindleFrontendContext) {
     scanField.field,
     skippedTagsField.field,
     speakerParsingField.field,
+    ttsTagField.field,
+    ttsTagPlacementField.field,
+    tagLlmConnectionField.field,
+    tagLlmModelField.field,
     narratorField.field,
     userVoiceField.field,
     routingHint,
@@ -1113,6 +1179,12 @@ export function setup(ctx: SpindleFrontendContext) {
   let savingSkippedTrackerTags = false
   let skippedTrackerTagsSaveTimer: ReturnType<typeof setTimeout> | null = null
   let speakerParsingMode: 'off' | 'ambiguous' = 'ambiguous'
+  let ttsTagStyle: 'off' | 'gemini' | 'fish' = 'off'
+  let ttsTagPlacement: 'jev' | 'llm' = 'jev'
+  let tagLlmConnectionId = ''
+  let tagLlmModel = ''
+  let llmConnections: LlmConnection[] = []
+  const tagPlacementCache = new Map<string, string>()
   let decisionConnectionsKnown = false
   let decisionConnectionAvailable = false
   let decisionConnectionName = ''
@@ -1219,10 +1291,22 @@ export function setup(ctx: SpindleFrontendContext) {
     reject: (error: Error) => void
     timer: ReturnType<typeof setTimeout>
   }>()
+  const pendingLlmConnectionRequests = new Map<string, {
+    resolve: (connections: LlmConnection[]) => void
+    reject: (error: Error) => void
+    timer: ReturnType<typeof setTimeout>
+  }>()
+  const pendingTagPlacementRequests = new Map<string, {
+    resolve: (placements: Array<{ id: string; text: string }>) => void
+    reject: (error: Error) => void
+    timer: ReturnType<typeof setTimeout>
+  }>()
   let messageRequestSequence = 0
   let stateRequestSequence = 0
   let speakerParseRequestSequence = 0
   let decisionStatusRequestSequence = 0
+  let llmConnectionRequestSequence = 0
+  let tagPlacementRequestSequence = 0
 
   const setStatus = (message: string, state: 'normal' | 'saved' | 'error' = 'normal') => {
     status.textContent = message
@@ -1316,11 +1400,15 @@ export function setup(ctx: SpindleFrontendContext) {
 
   const skippedTrackerTagsInput = ctx.components.mountTextArea(skippedTagsField.slot, {
     value: '',
-    placeholder: 'tracker, status, o_scene',
+    placeholder: 'tracker, status, <o_ledger></o_l>',
     rows: 3,
-    ariaLabel: 'Tracker tag names to skip globally',
+    ariaLabel: 'Tracker tag names or full asymmetric tag pairs to skip globally',
     onChange: () => scheduleSkippedTrackerTagsSave(),
   })
+  const skippedTagsHint = document.createElement('div')
+  skippedTagsHint.className = 'chat-voice-hint'
+  skippedTagsHint.textContent = 'Enter tag names, or full pairs for asymmetric tags such as <o_ledger></o_l>.'
+  skippedTagsField.slot.append(skippedTagsHint)
 
   const speakerParsingPicker = ctx.components.mountSelect(speakerParsingField.slot, {
     value: 'ambiguous',
@@ -1340,6 +1428,52 @@ export function setup(ctx: SpindleFrontendContext) {
   speakerParsingHint.className = 'chat-voice-hint'
   speakerParsingHint.hidden = true
   speakerParsingField.slot.append(speakerParsingHint)
+
+  const ttsTagPicker = ctx.components.mountSelect(ttsTagField.slot, {
+    value: 'off',
+    options: [
+      { value: 'off', label: 'Off', sublabel: 'Do not add inline vocal tags' },
+      { value: 'gemini', label: 'Gemini', sublabel: 'Bracketed cues, for example [happy] and [gasp]' },
+      { value: 'fish', label: 'Fish S2', sublabel: 'Fish cues, for example [happy] and [laughing]' },
+    ],
+    ariaLabel: 'TTS vocal tag style',
+    onChange: value => onTtsTagStyleChanged(value),
+  })
+  const ttsTagHint = document.createElement('div')
+  ttsTagHint.className = 'chat-voice-hint'
+  ttsTagHint.textContent = 'Every speech gets one or two leading emotions. Up to two sounds and two pauses may be added; all cues for a speech share the same grouped placement request.'
+  ttsTagField.slot.append(ttsTagHint)
+
+  const ttsTagPlacementPicker = ctx.components.mountSelect(ttsTagPlacementField.slot, {
+    value: 'jev',
+    options: [
+      { value: 'jev', label: 'Jev sentence boundaries', sublabel: 'Fast, approximate placement' },
+      { value: 'llm', label: 'LLM exact placement', sublabel: 'Place each chosen tag at the exact word' },
+    ],
+    ariaLabel: 'Vocal tag placement',
+    onChange: value => onTtsTagPlacementChanged(value),
+  })
+
+  const tagLlmConnectionPicker = ctx.components.mountSelect(tagLlmConnectionField.slot, {
+    value: '',
+    options: [],
+    placeholder: 'Use the active Lumiverse LLM connection',
+    searchPlaceholder: 'Search LLM connections…',
+    emptyMessage: 'No LLM connections found.',
+    clearable: true,
+    clearLabel: 'Use the active LLM connection',
+    ariaLabel: 'Vocal tag LLM connection',
+    disabled: true,
+    onChange: value => onTagLlmConnectionChanged(value),
+  })
+
+  const tagLlmModelInput = ctx.components.mountTextInput(tagLlmModelField.slot, {
+    value: '',
+    placeholder: 'Use the connection model or enter a model name',
+    ariaLabel: 'Vocal tag model',
+    disabled: true,
+    onChange: value => onTagLlmModelChanged(value),
+  })
 
   function createNumberInput(value: number, maximum: number, ariaLabel: string): HTMLInputElement {
     const input = document.createElement('input')
@@ -1551,6 +1685,10 @@ export function setup(ctx: SpindleFrontendContext) {
         messageId,
         requestId,
         mode: preferences.speakerParsingMode,
+        tagStyle: preferences.ttsTagStyle,
+        tagPlacement: preferences.ttsTagPlacement,
+        tagLlmConnectionId: preferences.tagLlmConnectionId,
+        tagLlmModel: preferences.tagLlmModel,
         skippedTrackerTags: preferences.skippedTrackerTags,
         debug: preferences.speakerAssignmentDebug,
       })
@@ -1780,6 +1918,9 @@ export function setup(ctx: SpindleFrontendContext) {
     const lines = [
       `Message ${messageId} (${isUserMessage ? 'user' : 'assistant'})`,
       `Parsing mode: ${parsingMode === 'off' ? 'local parser only' : 'Jev with local fallback'}`,
+      `TTS tags: ${ttsTagStyle === 'off'
+        ? 'off'
+        : `${ttsTagStyle} (${ttsTagPlacement === 'llm' ? 'LLM placement' : 'Jev placement'})`}`,
       ...speakerPipelineHeader(finalSegments, parsingMode, review),
       `Default speaker: ${speakerDebugName(defaultSpeakerId, parserSpeakers)}`,
       `Parser roster: ${parserSpeakers.map(speaker => `${speaker.name} [${speaker.id}]`).join(', ') || '(empty)'}`,
@@ -1820,6 +1961,11 @@ export function setup(ctx: SpindleFrontendContext) {
         ...((segment.debugPath ?? local?.debugPath ?? ['parser-trace:unavailable']).map(step => `  ${step}`)),
         `  ${describeBackendReview(localSpeaker, rawSpeakerId, parsingMode, review)}`,
         `  source:${isSpeech ? speakerSourceDetail(segment, source, parsingMode, review) : 'narrator'}`,
+        ...(segment.ttsText && segment.ttsText !== segment.text
+          ? [`  tts-tagged:${JSON.stringify(segment.ttsText.length > 180
+              ? `${segment.ttsText.slice(0, 177)}...`
+              : segment.ttsText)}`]
+          : []),
         `  ${aliasPath}`,
         `  final-speaker:${speakerDebugName(mappedSpeakerId, configuredSpeakers)}`,
         `  ${voicePath}`,
@@ -1904,6 +2050,108 @@ export function setup(ctx: SpindleFrontendContext) {
         : ''
     speakerParsingHint.textContent = warning
     speakerParsingHint.hidden = warning === ''
+  }
+
+  function requestLlmConnections(): Promise<LlmConnection[]> {
+    const requestId = `llm-connections-${Date.now().toString(36)}-${++llmConnectionRequestSequence}`
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        pendingLlmConnectionRequests.delete(requestId)
+        reject(new Error('Timed out while loading Lumiverse LLM connections.'))
+      }, 15_000)
+      pendingLlmConnectionRequests.set(requestId, { resolve, reject, timer })
+      ctx.sendToBackend({ type: 'chat_voice_list_llm_connections', requestId })
+    })
+  }
+
+  function requestTagPlacements(
+    message: string,
+    style: Exclude<PlaybackPreferences['ttsTagStyle'], 'off'>,
+    connectionId: string,
+    model: string,
+    items: Array<{
+      id: string
+      text: string
+      emotions: string[]
+      sounds: string[]
+      pauses: Array<'short' | 'long'>
+    }>,
+  ): Promise<Array<{ id: string; text: string }>> {
+    const requestId = `tag-placement-${Date.now().toString(36)}-${++tagPlacementRequestSequence}`
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        pendingTagPlacementRequests.delete(requestId)
+        reject(new Error('Timed out while placing TTS vocal tags.'))
+      }, 60_000)
+      pendingTagPlacementRequests.set(requestId, { resolve, reject, timer })
+      ctx.sendToBackend({
+        type: 'chat_voice_place_tags',
+        requestId,
+        message,
+        style,
+        connectionId,
+        model,
+        items,
+      })
+    })
+  }
+
+  function llmConnectionOptions(selectedId = '') {
+    const options = llmConnections.map(connection => ({
+      value: connection.id,
+      label: connection.name,
+      sublabel: `${connection.provider}${connection.model ? ` · ${connection.model}` : ''}`,
+    }))
+    if (selectedId && !llmConnections.some(connection => connection.id === selectedId)) {
+      options.unshift({ value: selectedId, label: 'Missing connection', sublabel: selectedId })
+    }
+    return options
+  }
+
+  function updateTtsTagControls(): void {
+    const tagEnabled = ttsTagStyle !== 'off'
+    const llmEnabled = tagEnabled && ttsTagPlacement === 'llm'
+    ttsTagPlacementPicker.update({
+      value: ttsTagPlacement,
+      disabled: !tagEnabled,
+    })
+    tagLlmConnectionPicker.update({
+      value: tagLlmConnectionId,
+      options: llmConnectionOptions(tagLlmConnectionId),
+      disabled: !llmEnabled,
+      placeholder: llmConnections.length
+        ? 'Use the active Lumiverse LLM connection'
+        : 'No LLM connections found; the active connection will be used',
+    })
+    tagLlmModelInput.update({
+      value: tagLlmModel,
+      disabled: !llmEnabled,
+    })
+  }
+
+  function onTtsTagStyleChanged(value: string): void {
+    ttsTagStyle = value === 'gemini' || value === 'fish' ? value : 'off'
+    ttsTagPicker.update({ value: ttsTagStyle })
+    updateTtsTagControls()
+    scheduleLlmSettingsSave()
+  }
+
+  function onTtsTagPlacementChanged(value: string): void {
+    ttsTagPlacement = value === 'llm' ? 'llm' : 'jev'
+    ttsTagPlacementPicker.update({ value: ttsTagPlacement })
+    updateTtsTagControls()
+    scheduleLlmSettingsSave()
+  }
+
+  function onTagLlmConnectionChanged(value: string): void {
+    tagLlmConnectionId = value.trim().slice(0, 128)
+    updateTtsTagControls()
+    scheduleLlmSettingsSave()
+  }
+
+  function onTagLlmModelChanged(value: string): void {
+    tagLlmModel = value.trim().slice(0, 256)
+    scheduleLlmSettingsSave()
   }
 
   function refreshLocalState(): void {
@@ -2101,6 +2349,10 @@ export function setup(ctx: SpindleFrontendContext) {
     const preferences = await loadPlaybackPreferences()
     if (llmSettingsSaveTimer || savingLlmSettings) {
       preferences.speakerParsingMode = speakerParsingMode
+      preferences.ttsTagStyle = ttsTagStyle
+      preferences.ttsTagPlacement = ttsTagPlacement
+      preferences.tagLlmConnectionId = tagLlmConnectionId
+      preferences.tagLlmModel = tagLlmModel
     }
     if (advancedSettingsSaveTimer || savingAdvancedSettings) {
       preferences.playbackBufferSegments = playbackBufferSegments
@@ -2186,7 +2438,13 @@ export function setup(ctx: SpindleFrontendContext) {
         preferences.speakerAssignmentDebug,
       )
       let review: SpeakerParseReview = { segments: localSegments, usedLlm: null, failed: false }
-      if (preferences.speakerParsingMode !== 'off') setStatus('Classifying dialogue speakers with Jev…')
+      if (preferences.speakerParsingMode !== 'off' || preferences.ttsTagStyle !== 'off') {
+        setStatus(
+          preferences.speakerParsingMode !== 'off'
+            ? 'Classifying dialogue speakers with Jev…'
+            : 'Adding TTS vocal tags…',
+        )
+      }
       try {
         review = await requestSpeakerReviewedSegments(playbackChat.id, messageId, preferences)
       } catch (error) {
@@ -2220,8 +2478,213 @@ export function setup(ctx: SpindleFrontendContext) {
           config.narratorVoice,
           config.userVoice,
         )
-        return { text: segment.text, voice }
+        return {
+          text: segment.ttsText ?? segment.text,
+          voice,
+          ...(segment.ttsTag ? { tagId: segment.ttsTag.id } : {}),
+        }
       }))
+      const tagIndexes = new Map<string, number[]>()
+      plan.forEach((entry, index) => {
+        if (!entry.tagId) return
+        const indexes = tagIndexes.get(entry.tagId) ?? []
+        indexes.push(index)
+        tagIndexes.set(entry.tagId, indexes)
+      })
+      const tagSources = new Map<string, {
+        text: string
+        emotions: string[]
+        sounds: string[]
+        pauses: Array<'short' | 'long'>
+      }>()
+      for (const segment of segments) {
+        // Multi-paragraph speeches are split into separate TTS requests. Keep
+        // the deterministic placement there so one speech-level placement
+        // result is not duplicated across every paragraph.
+        if (
+          segment.ttsTag
+          && (segment.ttsTag.sounds.length > 0 || segment.ttsTag.pauses.length > 0)
+          && !/\n\s*\n/u.test(segment.text.trim())
+        ) {
+          tagSources.set(segment.ttsTag.id, {
+            text: segment.ttsTag.baseText ?? segment.ttsText ?? segment.text,
+            emotions: segment.ttsTag.emotions,
+            sounds: segment.ttsTag.sounds,
+            pauses: segment.ttsTag.pauses,
+          })
+        }
+      }
+      const applyTagPlacements = (
+        placements: Array<{ id: string; text: string }>,
+        origin: 'cache' | 'llm',
+      ) => {
+        for (const placement of placements) {
+          const source = tagSources.get(placement.id)
+          if (!source) continue
+          tagPlacementCache.set(
+            `${playbackChat.id}\u0000${messageId}\u0000${preferences.ttsTagStyle}\u0000${preferences.tagLlmConnectionId}`
+              + `\u0000${preferences.tagLlmModel}\u0000${placement.id}`
+              + `\u0000${JSON.stringify(source.emotions)}`
+              + `\u0000${JSON.stringify(source.sounds)}`
+              + `\u0000${JSON.stringify(source.pauses)}`
+              + `\u0000${source.text}`,
+            placement.text,
+          )
+          for (const index of tagIndexes.get(placement.id) ?? []) {
+            plan[index] = { ...plan[index], text: placement.text }
+          }
+          for (const segment of segments) {
+            if (segment.ttsTag?.id !== placement.id) continue
+            segment.ttsText = placement.text
+            segment.ttsTag = { ...segment.ttsTag, source: 'llm' }
+          }
+          appendSpeakerDebugLog(
+            `TTS tag placement [${placement.id}] emotions=${JSON.stringify(source.emotions)}, `
+              + `sounds=${JSON.stringify(source.sounds)}, `
+              + `pauses=${JSON.stringify(source.pauses)} via ${origin}: `
+              + JSON.stringify(placement.text.length > 180
+                ? `${placement.text.slice(0, 177)}...`
+                : placement.text),
+          )
+        }
+      }
+      if (
+        preferences.ttsTagStyle !== 'off'
+        && preferences.ttsTagPlacement === 'llm'
+        && tagSources.size > 0
+      ) {
+        const placementStyle = preferences.ttsTagStyle as 'gemini' | 'fish'
+        appendSpeakerDebugLog(
+          `\nTTS tag placement: style=${placementStyle}, mode=llm, `
+            + `speeches=${tagSources.size}, `
+            + `connection=${JSON.stringify(preferences.tagLlmConnectionId || '<active>')}, `
+            + `model=${JSON.stringify(preferences.tagLlmModel || '<connection default>')}`,
+        )
+        const keyFor = (id: string, source: {
+          text: string
+          emotions: string[]
+          sounds: string[]
+          pauses: Array<'short' | 'long'>
+        }) => (
+          `${playbackChat.id}\u0000${messageId}\u0000${placementStyle}\u0000${preferences.tagLlmConnectionId}`
+            + `\u0000${preferences.tagLlmModel}\u0000${id}`
+            + `\u0000${JSON.stringify(source.emotions)}`
+            + `\u0000${JSON.stringify(source.sounds)}`
+            + `\u0000${JSON.stringify(source.pauses)}`
+            + `\u0000${source.text}`
+        )
+        const cachedPlacements: Array<{ id: string; text: string }> = []
+        for (const [id, source] of tagSources) {
+          const cached = tagPlacementCache.get(keyFor(id, source))
+          if (cached) cachedPlacements.push({ id, text: cached })
+        }
+        if (cachedPlacements.length > 0) {
+          appendSpeakerDebugLog(
+            `TTS tag placement cache hits: ${cachedPlacements.length}/${tagSources.size}.`,
+          )
+          applyTagPlacements(cachedPlacements, 'cache')
+        }
+        const items = [...tagSources.entries()]
+          .filter(([id, source]) => !tagPlacementCache.has(keyFor(id, source)))
+          .map(([id, source]) => ({
+            id,
+            text: source.text,
+            emotions: source.emotions,
+            sounds: source.sounds,
+            pauses: source.pauses,
+          }))
+        const chunks: Array<Array<{
+          id: string
+          text: string
+          emotions: string[]
+          sounds: string[]
+          pauses: Array<'short' | 'long'>
+        }>> = []
+        for (let index = 0; index < items.length; index += 4) {
+          chunks.push(items.slice(index, index + 4))
+        }
+        if (chunks.length > 0) {
+          appendSpeakerDebugLog(
+            `TTS tag placement chunks: ${chunks.length} pending `
+              + `(first chunk ${chunks[0].length} speeches, later chunks of up to 4).`,
+          )
+          let firstSettled = false
+          appendSpeakerDebugLog(
+            `TTS tag placement chunk 1/${chunks.length} started with ${chunks[0].length} speeches.`,
+          )
+          const firstPlacement = requestTagPlacements(
+            message.content,
+            placementStyle,
+            preferences.tagLlmConnectionId,
+            preferences.tagLlmModel,
+            chunks[0],
+          ).then((placements) => {
+            firstSettled = true
+            appendSpeakerDebugLog(
+              `TTS tag placement chunk 1/${chunks.length} resolved with `
+                + `${placements.length}/${chunks[0].length} placements.`,
+            )
+            applyTagPlacements(placements, 'llm')
+            return placements
+          }).catch((error) => {
+            firstSettled = true
+            appendSpeakerDebugLog(
+              `TTS tag placement chunk 1/${chunks.length} failed; `
+                + `deterministic Jev placement remains: `
+                + `${error instanceof Error ? error.message : String(error)}`,
+            )
+            console.warn('[Chat Voice] First vocal tag placement chunk failed.', error)
+            return []
+          })
+          setStatus('Placing vocal tags…')
+          await Promise.race([
+            firstPlacement,
+            new Promise<void>(resolve => setTimeout(resolve, 8_000)),
+          ])
+          if (!firstSettled) {
+            appendSpeakerDebugLog(
+              'TTS tag placement chunk 1 is still pending after 8s; '
+                + 'starting playback with deterministic Jev placement for unresolved segments.',
+            )
+          }
+          void (async () => {
+            let chunkNumber = 2
+            for (const chunk of chunks.slice(1)) {
+              if (playback.controller.signal.aborted) {
+                appendSpeakerDebugLog(
+                  `TTS tag placement chunk ${chunkNumber}/${chunks.length} skipped because playback stopped.`,
+                )
+                return
+              }
+              appendSpeakerDebugLog(
+                `TTS tag placement chunk ${chunkNumber}/${chunks.length} started with ${chunk.length} speeches.`,
+              )
+              try {
+                const placements = await requestTagPlacements(
+                  message.content,
+                  placementStyle,
+                  preferences.tagLlmConnectionId,
+                  preferences.tagLlmModel,
+                  chunk,
+                )
+                appendSpeakerDebugLog(
+                  `TTS tag placement chunk ${chunkNumber}/${chunks.length} resolved with `
+                    + `${placements.length}/${chunk.length} placements.`,
+                )
+                applyTagPlacements(placements, 'llm')
+              } catch (error) {
+                appendSpeakerDebugLog(
+                  `TTS tag placement chunk ${chunkNumber}/${chunks.length} failed; `
+                    + `deterministic Jev placement remains: `
+                    + `${error instanceof Error ? error.message : String(error)}`,
+                )
+                console.warn('[Chat Voice] Vocal tag placement chunk failed.', error)
+              }
+              chunkNumber += 1
+            }
+          })()
+        }
+      }
       if (plan.length === 0) throw new Error('This message has no playable narration or dialogue.')
       if (preferences.speakerAssignmentDebug) {
         appendSpeakerDebugLog('\nSynthesis plan')
@@ -2729,12 +3192,18 @@ export function setup(ctx: SpindleFrontendContext) {
 
   async function loadConnections() {
     try {
-      const [loadedConnections, preferences] = await Promise.all([
+      const [loadedConnections, loadedLlmConnections, preferences] = await Promise.all([
         listAllTtsConnections(),
+        requestLlmConnections().catch((error) => {
+          console.warn('[Chat Voice] Could not load Lumiverse LLM connections.', error)
+          return [] as LlmConnection[]
+        }),
         loadPlaybackPreferences(),
         refreshDecisionStatus(),
       ])
       connections = loadedConnections
+      llmConnections = loadedLlmConnections
+      updateTtsTagControls()
       if (!narratorGlobalSaveTimer && !savingNarratorGlobalVoice) {
         defaultNarratorVoice = preferences.defaultNarratorVoice
       }
@@ -2766,7 +3235,13 @@ export function setup(ctx: SpindleFrontendContext) {
       }
       if (!savingLlmSettings && !llmSettingsSaveTimer) {
         speakerParsingMode = preferences.speakerParsingMode
+        ttsTagStyle = preferences.ttsTagStyle
+        ttsTagPlacement = preferences.ttsTagPlacement
+        tagLlmConnectionId = preferences.tagLlmConnectionId
+        tagLlmModel = preferences.tagLlmModel
         speakerParsingPicker.update({ value: speakerParsingMode })
+        ttsTagPicker.update({ value: ttsTagStyle })
+        updateTtsTagControls()
       }
       if (
         !savingLlmSettings
@@ -2851,25 +3326,27 @@ export function setup(ctx: SpindleFrontendContext) {
 
   async function persistLlmSettings(): Promise<void> {
     savingLlmSettings = true
+    let forcedOff = false
     try {
       if (speakerParsingMode === 'ambiguous') {
         const status = await refreshDecisionStatus()
         if (!status?.available || !status.hasConnection) {
           speakerParsingMode = 'off'
           speakerParsingPicker.update({ value: 'off' })
-          await saveLlmParsingPreferences('off')
-          setStatus(
-            'Jev speaker assignment was turned off because no Decision model connection is configured.',
-            'error',
-          )
-          return
+          forcedOff = true
         }
       }
-      setStatus('Saving global Jev speaker-assignment setting…')
+      setStatus('Saving global speaker and tag settings…')
       await saveLlmParsingPreferences(speakerParsingMode)
-      setStatus('Jev speaker-assignment setting saved globally.', 'saved')
+      await saveTtsTagPreferences(ttsTagStyle, ttsTagPlacement, tagLlmConnectionId, tagLlmModel)
+      setStatus(
+        forcedOff
+          ? 'Jev speaker assignment was turned off because no Decision model connection is configured.'
+          : 'Speaker and tag settings saved globally.',
+        forcedOff ? 'error' : 'saved',
+      )
     } catch (error) {
-      setStatus(error instanceof Error ? error.message : 'Could not save Jev speaker-assignment setting.', 'error')
+      setStatus(error instanceof Error ? error.message : 'Could not save speaker and tag settings.', 'error')
     } finally {
       savingLlmSettings = false
     }
@@ -3113,6 +3590,8 @@ export function setup(ctx: SpindleFrontendContext) {
       | MessagePayload
       | ParsedMessagePayload
       | DecisionStatusPayload
+      | LlmConnectionsPayload
+      | TagPlacementPayload
     if (payload.type === 'chat_voice_message') {
       const pending = pendingMessageRequests.get(payload.requestId)
       if (!pending) return
@@ -3144,6 +3623,24 @@ export function setup(ctx: SpindleFrontendContext) {
         hasConnection: payload.hasConnection,
         defaultConnectionName: payload.defaultConnectionName ?? null,
       })
+      return
+    }
+    if (payload.type === 'chat_voice_llm_connections') {
+      const pending = pendingLlmConnectionRequests.get(payload.requestId)
+      if (!pending) return
+      clearTimeout(pending.timer)
+      pendingLlmConnectionRequests.delete(payload.requestId)
+      if (payload.error) pending.reject(new Error(payload.error))
+      else pending.resolve(payload.connections)
+      return
+    }
+    if (payload.type === 'chat_voice_tag_placement') {
+      const pending = pendingTagPlacementRequests.get(payload.requestId)
+      if (!pending) return
+      clearTimeout(pending.timer)
+      pendingTagPlacementRequests.delete(payload.requestId)
+      if (payload.error) pending.reject(new Error(payload.error))
+      else pending.resolve(payload.placements)
       return
     }
     if (payload.type === 'chat_voice_error') {
@@ -3202,6 +3699,16 @@ export function setup(ctx: SpindleFrontendContext) {
         pending.reject(new Error('The active chat changed before the Decision connection check completed.'))
       }
       pendingDecisionStatusRequests.clear()
+      for (const pending of pendingLlmConnectionRequests.values()) {
+        clearTimeout(pending.timer)
+        pending.reject(new Error('The active chat changed before LLM connections loaded.'))
+      }
+      pendingLlmConnectionRequests.clear()
+      for (const pending of pendingTagPlacementRequests.values()) {
+        clearTimeout(pending.timer)
+        pending.reject(new Error('The active chat changed before vocal tag placement completed.'))
+      }
+      pendingTagPlacementRequests.clear()
       stopPlayback()
       flushSave()
       dirty = false
@@ -3308,6 +3815,16 @@ export function setup(ctx: SpindleFrontendContext) {
       pending.reject(new Error('Chat Voice was closed.'))
     }
     pendingDecisionStatusRequests.clear()
+    for (const pending of pendingLlmConnectionRequests.values()) {
+      clearTimeout(pending.timer)
+      pending.reject(new Error('Chat Voice was closed.'))
+    }
+    pendingLlmConnectionRequests.clear()
+    for (const pending of pendingTagPlacementRequests.values()) {
+      clearTimeout(pending.timer)
+      pending.reject(new Error('Chat Voice was closed.'))
+    }
+    pendingTagPlacementRequests.clear()
     for (const pending of pendingStateRequests.values()) {
       clearTimeout(pending.timer)
       pending.reject(new Error('Chat Voice was closed.'))
@@ -3333,6 +3850,7 @@ export function setup(ctx: SpindleFrontendContext) {
     if (llmSettingsSaveTimer) {
       clearTimeout(llmSettingsSaveTimer)
       void saveLlmParsingPreferences(speakerParsingMode)
+      void saveTtsTagPreferences(ttsTagStyle, ttsTagPlacement, tagLlmConnectionId, tagLlmModel)
     }
     if (advancedSettingsSaveTimer) {
       clearTimeout(advancedSettingsSaveTimer)
@@ -3345,6 +3863,10 @@ export function setup(ctx: SpindleFrontendContext) {
     }
     skippedTrackerTagsInput.destroy()
     speakerParsingPicker.destroy()
+    ttsTagPicker.destroy()
+    ttsTagPlacementPicker.destroy()
+    tagLlmConnectionPicker.destroy()
+    tagLlmModelInput.destroy()
     playbackBufferInput.removeEventListener('change', onPlaybackBufferInput)
     concurrentGenerationInput.removeEventListener('change', onConcurrentGenerationInput)
     rateLimitWaitInput.removeEventListener('change', onRateLimitWaitInput)
