@@ -1148,22 +1148,28 @@ test('builds emotion, sound, and pause questions per speech', () => {
   assert.ok(emotionQuestion)
   assert.ok(emotionQuestion.criteria.happy)
   assert.ok(emotionQuestion.criteria.calm)
+  const emotion2Question = tagPlan.questions.emotion2_s0
+  assert.ok(emotion2Question)
+  assert.ok(emotion2Question.criteria.no_emotion)
+  assert.ok(emotion2Question.criteria.hopeful)
   const tagQuestion = tagPlan.questions.tag_s0
   assert.ok(tagQuestion)
   assert.ok(tagQuestion.criteria.no_tag)
   assert.ok(tagQuestion.criteria.gasp)
+  assert.ok(tagPlan.questions.tag2_s0?.criteria.sigh)
   const pauseQuestion = tagPlan.questions.pause_s0
   assert.ok(pauseQuestion)
   assert.ok(pauseQuestion.criteria.no_pause)
   assert.ok(pauseQuestion.criteria.short)
   assert.ok(pauseQuestion.criteria.long)
+  assert.ok(tagPlan.questions.pause2_s0?.criteria.long)
   const positionQuestion = tagPlan.questions.tagpos_s0
   assert.ok(positionQuestion)
   assert.ok(positionQuestion.criteria.start)
   assert.ok(positionQuestion.criteria.end)
   assert.ok(positionQuestion.criteria.b1)
   assert.ok(tagPlan.questions.pausepos_s0?.criteria.b1)
-  assert.equal(Object.keys(tagPlan.questions).length, 5)
+  assert.equal(Object.keys(tagPlan.questions).length, 8)
 })
 
 test('prepends emotion and places sound and pause together', () => {
@@ -1199,15 +1205,73 @@ test('prepends emotion and places sound and pause together', () => {
   }
 
   const selection = resolveTtsTagAnswers(tagPlan, answers, 'gemini').get('s0')
-  assert.equal(selection?.emotion, 'happy')
-  assert.equal(selection?.soundTag, 'gasp')
-  assert.equal(selection?.soundPosition, 'b1')
-  assert.equal(selection?.pause, 'short')
+  assert.deepEqual(selection?.emotions, ['happy'])
+  assert.deepEqual(selection?.sounds, ['gasp'])
+  assert.deepEqual(selection?.soundPositions, ['b1'])
+  assert.deepEqual(selection?.pauses, ['short'])
   assert.equal(selection?.baseText, '[happy] Wait. You heard that too?')
   assert.equal(selection?.ttsText, '[happy] Wait. [gasp] You heard that too? [break]')
 
   const fish = resolveTtsTagAnswers(tagPlan, answers, 'fish').get('s0')
   assert.equal(fish?.ttsText, '[happy] Wait. [gasping] You heard that too? [break]')
+})
+
+test('supports a second emotion, sound, and pause in one selection', () => {
+  const content = ['Narration.', '', '"Wait. You heard that too?"'].join('\n')
+  const plan = buildSpeakerDecisionPlan(content, [{ id: 'alice', name: 'Alice' }], false)
+  const tagPlan = buildTtsTagPlan(plan)
+  const selection = resolveTtsTagAnswers(tagPlan, {
+    emotion_s0: {
+      choice: 'happy',
+      probabilities: { happy: 0.8, calm: 0.2 },
+      confidence: 0.9,
+    },
+    emotion2_s0: {
+      choice: 'hopeful',
+      probabilities: { hopeful: 0.8, no_emotion: 0.2 },
+      confidence: 0.9,
+    },
+    tag_s0: {
+      choice: 'gasp',
+      probabilities: { gasp: 0.8, no_tag: 0.2 },
+      confidence: 0.9,
+    },
+    tag2_s0: {
+      choice: 'sigh',
+      probabilities: { sigh: 0.8, no_tag: 0.2 },
+      confidence: 0.9,
+    },
+    tagpos_s0: {
+      choice: 'b1',
+      probabilities: { start: 0.1, b1: 0.8, end: 0.1 },
+      confidence: 0.9,
+    },
+    pause_s0: {
+      choice: 'short',
+      probabilities: { short: 0.8, no_pause: 0.2 },
+      confidence: 0.9,
+    },
+    pause2_s0: {
+      choice: 'long',
+      probabilities: { long: 0.8, no_pause: 0.2 },
+      confidence: 0.9,
+    },
+    pausepos_s0: {
+      choice: 'b1',
+      probabilities: { start: 0.1, b1: 0.8, end: 0.1 },
+      confidence: 0.9,
+    },
+  }, 'gemini').get('s0')
+  assert.deepEqual(selection?.emotions, ['happy', 'hopeful'])
+  assert.deepEqual(selection?.sounds, ['gasp', 'sigh'])
+  assert.deepEqual(selection?.pauses, ['short', 'long'])
+  assert.deepEqual(selection?.soundPositions, ['b1', 'end'])
+  assert.deepEqual(selection?.pausePositions, ['b1', 'end'])
+  assert.ok(selection?.ttsText.startsWith('[happy] [hopeful] '))
+  assert.ok(selection?.ttsText.includes('[gasp]'))
+  assert.ok(selection?.ttsText.includes('[sigh]'))
+  assert.ok(selection?.ttsText.includes('[break]'))
+  assert.ok(selection?.ttsText.includes('[long-break]'))
 })
 
 test('suppresses optional cues below the strong thresholds but keeps emotion', () => {
@@ -1227,9 +1291,9 @@ test('suppresses optional cues below the strong thresholds but keeps emotion', (
       confidence: 0.9,
     },
   }, 'gemini').get('s0')
-  assert.equal(weak?.emotion, 'calm')
-  assert.equal(weak?.soundTag, null)
-  assert.equal(weak?.pause, null)
+  assert.deepEqual(weak?.emotions, ['calm'])
+  assert.deepEqual(weak?.sounds, [])
+  assert.deepEqual(weak?.pauses, [])
   assert.equal(weak?.ttsText, '[calm] Wait. You heard that too?')
 
   const noTag = resolveTtsTagAnswers(tagPlan, {
@@ -1244,8 +1308,8 @@ test('suppresses optional cues below the strong thresholds but keeps emotion', (
       confidence: 0.9,
     },
   }, 'gemini').get('s0')
-  assert.equal(noTag?.soundTag, null)
-  assert.equal(noTag?.pause, null)
+  assert.deepEqual(noTag?.sounds, [])
+  assert.deepEqual(noTag?.pauses, [])
 })
 
 test('preserves existing tags, normalizes style, and can add another sound', () => {
@@ -1271,6 +1335,7 @@ test('preserves existing tags, normalizes style, and can add another sound', () 
     },
   }, 'gemini').get('s0')
   assert.equal(added?.ttsText, '[sad] No. [sigh] Fine. [gasp]')
+  assert.deepEqual(added?.sounds, ['gasp'])
 
   const same = resolveTtsTagAnswers(tagPlan, {
     emotion_s0: {
@@ -1284,8 +1349,7 @@ test('preserves existing tags, normalizes style, and can add another sound', () 
       confidence: 0.9,
     },
   }, 'gemini').get('s0')
-  assert.equal(same?.soundTag, null)
-  assert.equal(same?.skippedExistingSound, true)
+  assert.deepEqual(same?.sounds, [])
   assert.equal(same?.ttsText, '[sad] No. [sigh] Fine.')
 })
 
@@ -1310,7 +1374,7 @@ test('keeps an existing leading emotion ahead of an inserted sound', () => {
       confidence: 0.9,
     },
   }, 'gemini').get('s0')
-  assert.equal(selection?.emotion, 'sad')
+  assert.deepEqual(selection?.emotions, ['sad'])
   assert.equal(selection?.ttsText, '[sad] [gasp] Wait.')
 })
 
@@ -1324,7 +1388,11 @@ test('normalizes both providers to brackets and validates grouped placement', ()
   assert.equal(validateTtsTagPlacement('Wait. You heard.', 'Wait. [gasp] You heard!', 'gasp'), false)
 
   const original = '[happy] Wait. You heard.'
-  const request = { emotion: 'happy', sound: 'gasp', pause: 'short' as const }
+  const request = {
+    emotions: ['happy'],
+    sounds: ['gasp'],
+    pauses: ['short' as const],
+  }
   assert.equal(
     validateTtsSpeechPlacement(original, '[happy] Wait. [gasp] You [break] heard.', request, 'gemini'),
     true,
@@ -1340,6 +1408,15 @@ test('normalizes both providers to brackets and validates grouped placement', ()
   assert.equal(
     validateTtsSpeechPlacement(original, '[happy] Wait. [sigh] You [break] heard.', request, 'gemini'),
     false,
+  )
+  assert.equal(
+    validateTtsSpeechPlacement(
+      '[happy] [hopeful] Wait. You heard.',
+      '[happy] [hopeful] Wait. [gasp] You [sigh] [break] heard. [long-break]',
+      { emotions: ['happy', 'hopeful'], sounds: ['gasp', 'sigh'], pauses: ['short', 'long'] },
+      'gemini',
+    ),
+    true,
   )
 })
 
@@ -1374,9 +1451,9 @@ test('attaches emotion, sound, and pause text without changing narration', () =>
   const speech = tagged.find(segment => segment.text === 'Wait.')
   assert.equal(speech?.text, 'Wait.')
   assert.equal(speech?.ttsText, '[happy] [gasp] Wait. [long-break]')
-  assert.equal(speech?.ttsTag?.emotion, 'happy')
-  assert.equal(speech?.ttsTag?.sound, 'gasp')
-  assert.equal(speech?.ttsTag?.pause, 'long')
+  assert.deepEqual(speech?.ttsTag?.emotions, ['happy'])
+  assert.deepEqual(speech?.ttsTag?.sounds, ['gasp'])
+  assert.deepEqual(speech?.ttsTag?.pauses, ['long'])
   assert.equal(tagged.find(segment => segment.text === 'Narration.')?.ttsText, undefined)
 })
 

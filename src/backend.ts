@@ -100,9 +100,9 @@ type FrontendMessage =
       items: Array<{
         id: string
         text: string
-        emotion: string
-        sound: string | null
-        pause: 'short' | 'long' | null
+        emotions: string[]
+        sounds: string[]
+        pauses: Array<'short' | 'long'>
       }>
     }
   | {
@@ -407,7 +407,7 @@ async function evaluateTtsTagSelections(
   const selections = new Map<string, TtsTagSelection>()
   if (plan.state.speeches.length === 0) return { selections, failed: false }
   const hasCapability = (spindle.host.capabilities['decisions-v1'] ?? 0) >= 1
-  const chunkSize = 50
+  const chunkSize = 30
   const chunks: string[][] = []
   for (let index = 0; index < plan.state.speeches.length; index += chunkSize) {
     chunks.push(plan.state.speeches.slice(index, index + chunkSize).map(speech => speech.id))
@@ -456,10 +456,10 @@ async function evaluateTtsTagSelections(
 
 const TTS_TAG_PLACEMENT_PROMPT = `You place already-chosen performance cues inside quoted dialogue for a text-to-speech engine.
 Return JSON only: {"speeches":[{"id":"speech id","text":"the speech with the cues inserted"}]}.
-Each input speech already starts with its emotion cue in square brackets. Preserve that emotion cue exactly at the start.
-For every input speech, insert the provided sound cue and the provided pause cue when present, each exactly once, inside the speech at the exact intended moment.
+Each input speech already starts with one or two emotion cues in square brackets. Preserve those emotion cues exactly at the start.
+For every input speech, insert every provided sound cue and every provided pause cue exactly once, at the intended moment for each.
 Do not add, remove, or change any other character, word, punctuation mark, or whitespace. Preserve every existing cue in the text.
-Never choose different cues, never add a second sound or pause, and never add an emotion. If a cue cannot be placed naturally, return the original text unchanged.
+Never choose different cues and never add an emotion. If a cue cannot be placed naturally, return the original text unchanged.
 Use square-bracket cues only, for example [happy], [gasp], [break], and [long-break].
 The complete message is context only; tag only the listed speeches.`
 
@@ -484,8 +484,8 @@ async function placeTtsTags(
           speeches: payload.items.map(item => ({
             id: item.id,
             text: item.text,
-            soundTag: item.sound ? formatTtsTag(item.sound, payload.style) : null,
-            pauseTag: item.pause ? formatTtsTag(item.pause, payload.style) : null,
+            soundTags: item.sounds.map(sound => formatTtsTag(sound, payload.style)),
+            pauseTags: item.pauses.map(pause => formatTtsTag(pause, payload.style)),
           })),
         }),
       },
@@ -518,9 +518,9 @@ async function placeTtsTags(
   for (const item of payload.items) {
     const tagged = outputs.get(item.id)
     if (!tagged || !validateTtsSpeechPlacement(item.text, tagged, {
-      emotion: item.emotion,
-      sound: item.sound,
-      pause: item.pause,
+      emotions: item.emotions,
+      sounds: item.sounds,
+      pauses: item.pauses,
     }, payload.style)) continue
     placements.push({ id: item.id, text: normalizeTtsTags(tagged, payload.style) })
   }

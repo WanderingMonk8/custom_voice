@@ -1441,7 +1441,7 @@ export function setup(ctx: SpindleFrontendContext) {
   })
   const ttsTagHint = document.createElement('div')
   ttsTagHint.className = 'chat-voice-hint'
-  ttsTagHint.textContent = 'Every speech gets a leading emotion tag. Optional sound and pause cues are placed in one grouped request per speech; existing tags are preserved.'
+  ttsTagHint.textContent = 'Every speech gets one or two leading emotions. Up to two sounds and two pauses may be added; all cues for a speech share the same grouped placement request.'
   ttsTagField.slot.append(ttsTagHint)
 
   const ttsTagPlacementPicker = ctx.components.mountSelect(ttsTagPlacementField.slot, {
@@ -2072,9 +2072,9 @@ export function setup(ctx: SpindleFrontendContext) {
     items: Array<{
       id: string
       text: string
-      emotion: string
-      sound: string | null
-      pause: 'short' | 'long' | null
+      emotions: string[]
+      sounds: string[]
+      pauses: Array<'short' | 'long'>
     }>,
   ): Promise<Array<{ id: string; text: string }>> {
     const requestId = `tag-placement-${Date.now().toString(36)}-${++tagPlacementRequestSequence}`
@@ -2493,9 +2493,9 @@ export function setup(ctx: SpindleFrontendContext) {
       })
       const tagSources = new Map<string, {
         text: string
-        emotion: string
-        sound: string | null
-        pause: 'short' | 'long' | null
+        emotions: string[]
+        sounds: string[]
+        pauses: Array<'short' | 'long'>
       }>()
       for (const segment of segments) {
         // Multi-paragraph speeches are split into separate TTS requests. Keep
@@ -2503,14 +2503,14 @@ export function setup(ctx: SpindleFrontendContext) {
         // result is not duplicated across every paragraph.
         if (
           segment.ttsTag
-          && (segment.ttsTag.sound || segment.ttsTag.pause)
+          && (segment.ttsTag.sounds.length > 0 || segment.ttsTag.pauses.length > 0)
           && !/\n\s*\n/u.test(segment.text.trim())
         ) {
           tagSources.set(segment.ttsTag.id, {
             text: segment.ttsTag.baseText ?? segment.ttsText ?? segment.text,
-            emotion: segment.ttsTag.emotion,
-            sound: segment.ttsTag.sound,
-            pause: segment.ttsTag.pause,
+            emotions: segment.ttsTag.emotions,
+            sounds: segment.ttsTag.sounds,
+            pauses: segment.ttsTag.pauses,
           })
         }
       }
@@ -2523,8 +2523,11 @@ export function setup(ctx: SpindleFrontendContext) {
           if (!source) continue
           tagPlacementCache.set(
             `${playbackChat.id}\u0000${messageId}\u0000${preferences.ttsTagStyle}\u0000${preferences.tagLlmConnectionId}`
-              + `\u0000${preferences.tagLlmModel}\u0000${placement.id}\u0000${source.emotion}`
-              + `\u0000${source.sound ?? ''}\u0000${source.pause ?? ''}\u0000${source.text}`,
+              + `\u0000${preferences.tagLlmModel}\u0000${placement.id}`
+              + `\u0000${JSON.stringify(source.emotions)}`
+              + `\u0000${JSON.stringify(source.sounds)}`
+              + `\u0000${JSON.stringify(source.pauses)}`
+              + `\u0000${source.text}`,
             placement.text,
           )
           for (const index of tagIndexes.get(placement.id) ?? []) {
@@ -2536,9 +2539,9 @@ export function setup(ctx: SpindleFrontendContext) {
             segment.ttsTag = { ...segment.ttsTag, source: 'llm' }
           }
           appendSpeakerDebugLog(
-            `TTS tag placement [${placement.id}] emotion=${source.emotion}, `
-              + `sound=${source.sound ?? 'none'}, pause=${source.pause ?? 'none'} `
-              + `via ${origin}: `
+            `TTS tag placement [${placement.id}] emotions=${JSON.stringify(source.emotions)}, `
+              + `sounds=${JSON.stringify(source.sounds)}, `
+              + `pauses=${JSON.stringify(source.pauses)} via ${origin}: `
               + JSON.stringify(placement.text.length > 180
                 ? `${placement.text.slice(0, 177)}...`
                 : placement.text),
@@ -2559,13 +2562,16 @@ export function setup(ctx: SpindleFrontendContext) {
         )
         const keyFor = (id: string, source: {
           text: string
-          emotion: string
-          sound: string | null
-          pause: 'short' | 'long' | null
+          emotions: string[]
+          sounds: string[]
+          pauses: Array<'short' | 'long'>
         }) => (
           `${playbackChat.id}\u0000${messageId}\u0000${placementStyle}\u0000${preferences.tagLlmConnectionId}`
-            + `\u0000${preferences.tagLlmModel}\u0000${id}\u0000${source.emotion}`
-            + `\u0000${source.sound ?? ''}\u0000${source.pause ?? ''}\u0000${source.text}`
+            + `\u0000${preferences.tagLlmModel}\u0000${id}`
+            + `\u0000${JSON.stringify(source.emotions)}`
+            + `\u0000${JSON.stringify(source.sounds)}`
+            + `\u0000${JSON.stringify(source.pauses)}`
+            + `\u0000${source.text}`
         )
         const cachedPlacements: Array<{ id: string; text: string }> = []
         for (const [id, source] of tagSources) {
@@ -2583,16 +2589,16 @@ export function setup(ctx: SpindleFrontendContext) {
           .map(([id, source]) => ({
             id,
             text: source.text,
-            emotion: source.emotion,
-            sound: source.sound,
-            pause: source.pause,
+            emotions: source.emotions,
+            sounds: source.sounds,
+            pauses: source.pauses,
           }))
         const chunks: Array<Array<{
           id: string
           text: string
-          emotion: string
-          sound: string | null
-          pause: 'short' | 'long' | null
+          emotions: string[]
+          sounds: string[]
+          pauses: Array<'short' | 'long'>
         }>> = []
         for (let index = 0; index < items.length; index += 4) {
           chunks.push(items.slice(index, index + 4))

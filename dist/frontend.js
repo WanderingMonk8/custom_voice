@@ -2337,7 +2337,7 @@ function setup(ctx) {
   });
   const ttsTagHint = document.createElement("div");
   ttsTagHint.className = "chat-voice-hint";
-  ttsTagHint.textContent = "Every speech gets a leading emotion tag. Optional sound and pause cues are placed in one grouped request per speech; existing tags are preserved.";
+  ttsTagHint.textContent = "Every speech gets one or two leading emotions. Up to two sounds and two pauses may be added; all cues for a speech share the same grouped placement request.";
   ttsTagField.slot.append(ttsTagHint);
   const ttsTagPlacementPicker = ctx.components.mountSelect(ttsTagPlacementField.slot, {
     value: "jev",
@@ -3192,12 +3192,12 @@ function setup(ctx) {
       });
       const tagSources = /* @__PURE__ */ new Map();
       for (const segment of segments) {
-        if (segment.ttsTag && (segment.ttsTag.sound || segment.ttsTag.pause) && !/\n\s*\n/u.test(segment.text.trim())) {
+        if (segment.ttsTag && (segment.ttsTag.sounds.length > 0 || segment.ttsTag.pauses.length > 0) && !/\n\s*\n/u.test(segment.text.trim())) {
           tagSources.set(segment.ttsTag.id, {
             text: segment.ttsTag.baseText ?? segment.ttsText ?? segment.text,
-            emotion: segment.ttsTag.emotion,
-            sound: segment.ttsTag.sound,
-            pause: segment.ttsTag.pause
+            emotions: segment.ttsTag.emotions,
+            sounds: segment.ttsTag.sounds,
+            pauses: segment.ttsTag.pauses
           });
         }
       }
@@ -3206,7 +3206,7 @@ function setup(ctx) {
           const source = tagSources.get(placement.id);
           if (!source) continue;
           tagPlacementCache.set(
-            `${playbackChat.id}\0${messageId}\0${preferences.ttsTagStyle}\0${preferences.tagLlmConnectionId}\0${preferences.tagLlmModel}\0${placement.id}\0${source.emotion}\0${source.sound ?? ""}\0${source.pause ?? ""}\0${source.text}`,
+            `${playbackChat.id}\0${messageId}\0${preferences.ttsTagStyle}\0${preferences.tagLlmConnectionId}\0${preferences.tagLlmModel}\0${placement.id}\0${JSON.stringify(source.emotions)}\0${JSON.stringify(source.sounds)}\0${JSON.stringify(source.pauses)}\0${source.text}`,
             placement.text
           );
           for (const index of tagIndexes.get(placement.id) ?? []) {
@@ -3218,7 +3218,7 @@ function setup(ctx) {
             segment.ttsTag = { ...segment.ttsTag, source: "llm" };
           }
           appendSpeakerDebugLog(
-            `TTS tag placement [${placement.id}] emotion=${source.emotion}, sound=${source.sound ?? "none"}, pause=${source.pause ?? "none"} via ${origin}: ` + JSON.stringify(placement.text.length > 180 ? `${placement.text.slice(0, 177)}...` : placement.text)
+            `TTS tag placement [${placement.id}] emotions=${JSON.stringify(source.emotions)}, sounds=${JSON.stringify(source.sounds)}, pauses=${JSON.stringify(source.pauses)} via ${origin}: ` + JSON.stringify(placement.text.length > 180 ? `${placement.text.slice(0, 177)}...` : placement.text)
           );
         }
       };
@@ -3228,7 +3228,7 @@ function setup(ctx) {
           `
 TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size}, connection=${JSON.stringify(preferences.tagLlmConnectionId || "<active>")}, model=${JSON.stringify(preferences.tagLlmModel || "<connection default>")}`
         );
-        const keyFor = (id, source) => `${playbackChat.id}\0${messageId}\0${placementStyle}\0${preferences.tagLlmConnectionId}\0${preferences.tagLlmModel}\0${id}\0${source.emotion}\0${source.sound ?? ""}\0${source.pause ?? ""}\0${source.text}`;
+        const keyFor = (id, source) => `${playbackChat.id}\0${messageId}\0${placementStyle}\0${preferences.tagLlmConnectionId}\0${preferences.tagLlmModel}\0${id}\0${JSON.stringify(source.emotions)}\0${JSON.stringify(source.sounds)}\0${JSON.stringify(source.pauses)}\0${source.text}`;
         const cachedPlacements = [];
         for (const [id, source] of tagSources) {
           const cached = tagPlacementCache.get(keyFor(id, source));
@@ -3243,9 +3243,9 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
         const items = [...tagSources.entries()].filter(([id, source]) => !tagPlacementCache.has(keyFor(id, source))).map(([id, source]) => ({
           id,
           text: source.text,
-          emotion: source.emotion,
-          sound: source.sound,
-          pause: source.pause
+          emotions: source.emotions,
+          sounds: source.sounds,
+          pauses: source.pauses
         }));
         const chunks = [];
         for (let index = 0; index < items.length; index += 4) {
