@@ -6,6 +6,7 @@ import {
   addUnconfiguredDialogueSpeakers,
   mergeScannedCardCast,
   applyConfigToMetadata,
+  applyCustomTtsEmotionCues,
   applyLeadingTtsCues,
   applyTtsTagSelections,
   assessSpeakerDiscourseEscalation,
@@ -24,6 +25,7 @@ import {
   hasNamedSpeakerSubject,
   mergeVoicePlan,
   normalizeTtsTags,
+  normalizeCustomTtsEmotionTag,
   npcSpeakerId,
   needsLlmSpeakerReview,
   parseCardCast,
@@ -1208,6 +1210,36 @@ test('rebuilds Fish leading cues after placement', () => {
       'fish',
     ),
     '[moved] [whispering] Wait. [moved] [whispering] [gasp] You heard that too?',
+  )
+})
+
+test('validates and applies custom Fish emotion tags', () => {
+  assert.equal(
+    normalizeCustomTtsEmotionTag('[quietly relieved but guarded]'),
+    'quietly relieved but guarded',
+  )
+  assert.equal(
+    normalizeCustomTtsEmotionTag('one two three four five six seven eight nine ten eleven'),
+    null,
+  )
+  assert.equal(
+    normalizeCustomTtsEmotionTag('one two three four five six seven eight nine ten'),
+    null,
+  )
+  assert.equal(
+    normalizeCustomTtsEmotionTag('one two three four five six seven eight nine'),
+    'one two three four five six seven eight nine',
+  )
+  assert.equal(normalizeCustomTtsEmotionTag('[gasp]'), null)
+  assert.equal(normalizeCustomTtsEmotionTag('line one\nline two'), null)
+  assert.equal(
+    applyCustomTtsEmotionCues(
+      '[moved] [whispering] Wait. You heard that too?',
+      'quietly relieved but guarded',
+      ['whispering'],
+      'fish',
+    ),
+    '[quietly relieved but guarded] [whispering] Wait. [quietly relieved but guarded] [whispering] You heard that too?',
   )
 })
 

@@ -117,6 +117,9 @@ export interface TtsTagPlacement {
   source: 'jev' | 'llm'
   /** Emotion-bearing text before new sound/pause insertion, used for LLM placement. */
   baseText?: string
+  /** Surrounding narration used when generating a custom Fish emotion tag. */
+  narrativeBefore?: string
+  narrativeAfter?: string
 }
 
 export interface PlaybackSegment {
@@ -492,6 +495,12 @@ function readParsedMessages(value: unknown): Record<string, CachedMessageParse> 
             source: segment.ttsTag.source as 'jev' | 'llm',
             ...(typeof segment.ttsTag.baseText === 'string'
               ? { baseText: segment.ttsTag.baseText.trim().slice(0, 20_000) }
+              : {}),
+            ...(typeof segment.ttsTag.narrativeBefore === 'string'
+              ? { narrativeBefore: segment.ttsTag.narrativeBefore.trim().slice(0, 20_000) }
+              : {}),
+            ...(typeof segment.ttsTag.narrativeAfter === 'string'
+              ? { narrativeAfter: segment.ttsTag.narrativeAfter.trim().slice(0, 20_000) }
               : {}),
           }
         : null
@@ -2817,6 +2826,8 @@ export interface TtsTagSelection {
   baseText: string
   /** Full deterministic fallback text, always with the leading emotions. */
   ttsText: string
+  narrativeBefore: string
+  narrativeAfter: string
   emotionProbability: number
   emotionConfidence: number
   emotionMargin: number
@@ -2982,6 +2993,47 @@ export function applyLeadingTtsCues(
   )
 }
 
+const CUSTOM_EMOTION_MAX_WORDS = 9
+const CUSTOM_EMOTION_MAX_CHARS = 80
+
+/** Validate a free-form Fish S2 emotion cue before using it in place of the fixed tag. */
+export function normalizeCustomTtsEmotionTag(value: string): string | null {
+  let tag = value.trim()
+  if (!tag) return null
+  if (tag.startsWith('[') && tag.endsWith(']')) {
+    tag = tag.slice(1, -1).trim()
+  }
+  if (!tag || tag.includes('[') || tag.includes(']') || /["“”\r\n]/u.test(tag)) return null
+  tag = tag.replace(/\s+/gu, ' ').trim()
+  if (tag.length === 0 || tag.length > CUSTOM_EMOTION_MAX_CHARS) return null
+  const words = tag.split(' ').filter(Boolean)
+  if (words.length < 1 || words.length > CUSTOM_EMOTION_MAX_WORDS) return null
+  const canonical = normalizeTtsTagName(tag)
+  if (canonical && ttsTagCategory(canonical) !== 'emotion') return null
+  return tag
+}
+
+/** Replace the fixed leading emotion with a validated Fish S2 custom cue. */
+export function applyCustomTtsEmotionCues(
+  text: string,
+  customTag: string,
+  styles: readonly string[],
+  style: Exclude<TtsTagStyle, 'off'>,
+): string {
+  const normalized = normalizeTtsTags(text, style)
+  const body = style === 'fish'
+    ? removeTtsTagsByCategory(removeTtsTagsByCategory(normalized, 'emotion'), 'style')
+    : normalized
+  const prefix = [formatTtsTag(customTag, style), ...styles.map(tag => formatTtsTag(tag, style))]
+    .filter(Boolean)
+    .join(' ')
+  return renderLeadingCues(
+    body.replace(/[ \t]+/gu, ' ').trim(),
+    prefix,
+    style === 'fish',
+  )
+}
+
 /**
  * Normalize tag answers into a leading emotion plus optional sound and pause.
  * Every speech gets a selection so the deterministic fallback always has an
@@ -3120,6 +3172,8 @@ export function resolveTtsTagAnswers(
       pausePositions: newPausePositions.map(option => option.id),
       baseText,
       ttsText,
+      narrativeBefore: speech.narrativeBefore,
+      narrativeAfter: speech.narrativeAfter,
       emotionProbability: emotionChoice.probability,
       emotionConfidence: emotionChoice.confidence,
       emotionMargin: emotionChoice.margin,
@@ -3218,6 +3272,8 @@ export function applyTtsTagSelections(
         pauses: selection.pauses,
         source: 'jev' as const,
         baseText: selection.baseText,
+        narrativeBefore: selection.narrativeBefore,
+        narrativeAfter: selection.narrativeAfter,
       },
       ...(debugPath ? { debugPath } : {}),
     }
@@ -3250,7 +3306,7 @@ export const SPEAKER_DECISION_THRESHOLDS: Record<'local' | 'discourse' | 'overri
   override: { probability: 0.7, confidence: 0.65, margin: 0.25 },
 }
 
-export const TTS_TAG_SCHEMA = 'tts-tags-4'
+export const TTS_TAG_SCHEMA = 'tts-tags-5'
 
 /** Bump a version whenever a stage changes the output stored in the cache. */
 export const SPEAKER_DECISION_SCHEMA = {
