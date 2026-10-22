@@ -57,6 +57,7 @@ import {
   UNCAST_SPEAKER_ID,
   USER_SPEAKER_ID,
   upsertSavedAudioRecord,
+  validateTtsSpeechPlacement,
   validateTtsTagPlacement,
   type ChatVoiceConfig,
   type SpeakerDecisionChoice,
@@ -1137,29 +1138,44 @@ test('keeps separate paragraphs as independently generated voice segments', () =
   ])
 })
 
-test('builds one vocal tag ranking and one placement question per speech', () => {
+test('builds emotion, sound, and pause questions per speech', () => {
   const content = ['Narration.', '', '"Wait. You heard that too?"'].join('\n')
   const plan = buildSpeakerDecisionPlan(content, [{ id: 'alice', name: 'Alice' }], false)
   const tagPlan = buildTtsTagPlan(plan)
 
   assert.equal(tagPlan.state.speeches.length, 1)
+  const emotionQuestion = tagPlan.questions.emotion_s0
+  assert.ok(emotionQuestion)
+  assert.ok(emotionQuestion.criteria.happy)
+  assert.ok(emotionQuestion.criteria.calm)
   const tagQuestion = tagPlan.questions.tag_s0
   assert.ok(tagQuestion)
   assert.ok(tagQuestion.criteria.no_tag)
   assert.ok(tagQuestion.criteria.gasp)
+  const pauseQuestion = tagPlan.questions.pause_s0
+  assert.ok(pauseQuestion)
+  assert.ok(pauseQuestion.criteria.no_pause)
+  assert.ok(pauseQuestion.criteria.short)
+  assert.ok(pauseQuestion.criteria.long)
   const positionQuestion = tagPlan.questions.tagpos_s0
   assert.ok(positionQuestion)
   assert.ok(positionQuestion.criteria.start)
   assert.ok(positionQuestion.criteria.end)
   assert.ok(positionQuestion.criteria.b1)
-  assert.equal(Object.keys(tagPlan.questions).length, 2)
+  assert.ok(tagPlan.questions.pausepos_s0?.criteria.b1)
+  assert.equal(Object.keys(tagPlan.questions).length, 5)
 })
 
-test('selects one thresholded tag and inserts it at the chosen boundary', () => {
+test('prepends emotion and places sound and pause together', () => {
   const content = ['Narration.', '', '"Wait. You heard that too?"'].join('\n')
   const plan = buildSpeakerDecisionPlan(content, [{ id: 'alice', name: 'Alice' }], false)
   const tagPlan = buildTtsTagPlan(plan)
   const answers = {
+    emotion_s0: {
+      choice: 'happy',
+      probabilities: { happy: 0.8, calm: 0.2 },
+      confidence: 0.9,
+    },
     tag_s0: {
       choice: 'gasp',
       probabilities: { gasp: 0.9, no_tag: 0.1 },
@@ -1170,18 +1186,31 @@ test('selects one thresholded tag and inserts it at the chosen boundary', () => 
       probabilities: { start: 0.1, b1: 0.8, end: 0.1 },
       confidence: 0.9,
     },
+    pause_s0: {
+      choice: 'short',
+      probabilities: { short: 0.8, no_pause: 0.2 },
+      confidence: 0.9,
+    },
+    pausepos_s0: {
+      choice: 'end',
+      probabilities: { start: 0.1, b1: 0.1, end: 0.8 },
+      confidence: 0.9,
+    },
   }
 
   const selection = resolveTtsTagAnswers(tagPlan, answers, 'gemini').get('s0')
-  assert.equal(selection?.tag, 'gasp')
-  assert.equal(selection?.position, 'b1')
-  assert.equal(selection?.ttsText, 'Wait. <gasp> You heard that too?')
+  assert.equal(selection?.emotion, 'happy')
+  assert.equal(selection?.soundTag, 'gasp')
+  assert.equal(selection?.soundPosition, 'b1')
+  assert.equal(selection?.pause, 'short')
+  assert.equal(selection?.baseText, '[happy] Wait. You heard that too?')
+  assert.equal(selection?.ttsText, '[happy] Wait. [gasp] You heard that too? [break]')
 
   const fish = resolveTtsTagAnswers(tagPlan, answers, 'fish').get('s0')
-  assert.equal(fish?.ttsText, 'Wait. [gasp] You heard that too?')
+  assert.equal(fish?.ttsText, '[happy] Wait. [gasping] You heard that too? [break]')
 })
 
-test('suppresses tags below the strong-emotion thresholds', () => {
+test('suppresses optional cues below the strong thresholds but keeps emotion', () => {
   const content = ['Narration.', '', '"Wait. You heard that too?"'].join('\n')
   const plan = buildSpeakerDecisionPlan(content, [{ id: 'alice', name: 'Alice' }], false)
   const tagPlan = buildTtsTagPlan(plan)
@@ -1192,9 +1221,16 @@ test('suppresses tags below the strong-emotion thresholds', () => {
       probabilities: { gasp: 0.6, no_tag: 0.4 },
       confidence: 0.9,
     },
+    pause_s0: {
+      choice: 'long',
+      probabilities: { long: 0.55, no_pause: 0.45 },
+      confidence: 0.9,
+    },
   }, 'gemini').get('s0')
-  assert.equal(weak?.tag, null)
-  assert.equal(weak?.ttsText, null)
+  assert.equal(weak?.emotion, 'calm')
+  assert.equal(weak?.soundTag, null)
+  assert.equal(weak?.pause, null)
+  assert.equal(weak?.ttsText, '[calm] Wait. You heard that too?')
 
   const noTag = resolveTtsTagAnswers(tagPlan, {
     tag_s0: {
@@ -1202,16 +1238,27 @@ test('suppresses tags below the strong-emotion thresholds', () => {
       probabilities: { no_tag: 0.9, gasp: 0.1 },
       confidence: 0.9,
     },
+    pause_s0: {
+      choice: 'no_pause',
+      probabilities: { no_pause: 0.9, short: 0.1 },
+      confidence: 0.9,
+    },
   }, 'gemini').get('s0')
-  assert.equal(noTag?.tag, null)
+  assert.equal(noTag?.soundTag, null)
+  assert.equal(noTag?.pause, null)
 })
 
-test('preserves existing tags, normalizes style, and can add a second tag', () => {
+test('preserves existing tags, normalizes style, and can add another sound', () => {
   const content = '"No. [sigh] Fine."'
   const plan = buildSpeakerDecisionPlan(content, [{ id: 'alice', name: 'Alice' }], false)
   const tagPlan = buildTtsTagPlan(plan)
 
   const added = resolveTtsTagAnswers(tagPlan, {
+    emotion_s0: {
+      choice: 'sad',
+      probabilities: { sad: 0.9, calm: 0.1 },
+      confidence: 0.9,
+    },
     tag_s0: {
       choice: 'gasp',
       probabilities: { gasp: 0.9, no_tag: 0.1 },
@@ -1223,38 +1270,102 @@ test('preserves existing tags, normalizes style, and can add a second tag', () =
       confidence: 0.9,
     },
   }, 'gemini').get('s0')
-  assert.equal(added?.ttsText, 'No. <sigh> Fine. <gasp>')
+  assert.equal(added?.ttsText, '[sad] No. [sigh] Fine. [gasp]')
 
   const same = resolveTtsTagAnswers(tagPlan, {
+    emotion_s0: {
+      choice: 'sad',
+      probabilities: { sad: 0.9, calm: 0.1 },
+      confidence: 0.9,
+    },
     tag_s0: {
       choice: 'sigh',
       probabilities: { sigh: 0.9, no_tag: 0.1 },
       confidence: 0.9,
     },
   }, 'gemini').get('s0')
-  assert.equal(same?.tag, null)
-  assert.equal(same?.skippedExisting, true)
-  assert.equal(same?.ttsText, 'No. <sigh> Fine.')
+  assert.equal(same?.soundTag, null)
+  assert.equal(same?.skippedExistingSound, true)
+  assert.equal(same?.ttsText, '[sad] No. [sigh] Fine.')
 })
 
-test('normalizes provider tag styles and validates exact LLM placement', () => {
-  assert.equal(normalizeTtsTags('[gasp] <sigh> [unknown]', 'gemini'), '<gasp> <sigh> [unknown]')
-  assert.equal(normalizeTtsTags('<gasp> [sigh]', 'fish'), '[gasp] [sigh]')
+test('keeps an existing leading emotion ahead of an inserted sound', () => {
+  const content = '"[sad] Wait."'
+  const plan = buildSpeakerDecisionPlan(content, [{ id: 'alice', name: 'Alice' }], false)
+  const tagPlan = buildTtsTagPlan(plan)
+  const selection = resolveTtsTagAnswers(tagPlan, {
+    emotion_s0: {
+      choice: 'sad',
+      probabilities: { sad: 0.9, calm: 0.1 },
+      confidence: 0.9,
+    },
+    tag_s0: {
+      choice: 'gasp',
+      probabilities: { gasp: 0.9, no_tag: 0.1 },
+      confidence: 0.9,
+    },
+    tagpos_s0: {
+      choice: 'start',
+      probabilities: { start: 0.9, end: 0.1 },
+      confidence: 0.9,
+    },
+  }, 'gemini').get('s0')
+  assert.equal(selection?.emotion, 'sad')
+  assert.equal(selection?.ttsText, '[sad] [gasp] Wait.')
+})
+
+test('normalizes both providers to brackets and validates grouped placement', () => {
+  assert.equal(normalizeTtsTags('[gasp] <sigh> [unknown]', 'gemini'), '[gasp] [sigh] [unknown]')
+  assert.equal(normalizeTtsTags('<gasp> [sigh]', 'fish'), '[gasping] [sighing]')
   assert.equal(stripTtsTags('Wait. [gasp] You <sigh> heard.'), 'Wait.  You  heard.')
-  assert.equal(validateTtsTagPlacement('Wait. You heard.', 'Wait. <gasp> You heard.', 'gasp'), true)
+  assert.equal(validateTtsTagPlacement('Wait. You heard.', 'Wait. [gasp] You heard.', 'gasp'), true)
   assert.equal(validateTtsTagPlacement('Wait. You heard.', 'Wait. You heard.', 'gasp'), false)
-  assert.equal(validateTtsTagPlacement('Wait. You heard.', 'Wait. <sigh> You heard.', 'gasp'), false)
-  assert.equal(validateTtsTagPlacement('Wait. You heard.', 'Wait. <gasp> You heard!', 'gasp'), false)
+  assert.equal(validateTtsTagPlacement('Wait. You heard.', 'Wait. [sigh] You heard.', 'gasp'), false)
+  assert.equal(validateTtsTagPlacement('Wait. You heard.', 'Wait. [gasp] You heard!', 'gasp'), false)
+
+  const original = '[happy] Wait. You heard.'
+  const request = { emotion: 'happy', sound: 'gasp', pause: 'short' as const }
+  assert.equal(
+    validateTtsSpeechPlacement(original, '[happy] Wait. [gasp] You [break] heard.', request, 'gemini'),
+    true,
+  )
+  assert.equal(
+    validateTtsSpeechPlacement(original, '[happy] Wait. [gasp] You heard.', request, 'gemini'),
+    false,
+  )
+  assert.equal(
+    validateTtsSpeechPlacement(original, '[sad] Wait. [gasp] You [break] heard.', request, 'gemini'),
+    false,
+  )
+  assert.equal(
+    validateTtsSpeechPlacement(original, '[happy] Wait. [sigh] You [break] heard.', request, 'gemini'),
+    false,
+  )
 })
 
-test('attaches tagged text to speech segments without changing narration', () => {
+test('attaches emotion, sound, and pause text without changing narration', () => {
   const content = ['Narration.', '', '"Wait."', '', '"No."'].join('\n')
   const plan = buildSpeakerDecisionPlan(content, [{ id: 'alice', name: 'Alice' }], false)
   const tagPlan = buildTtsTagPlan(plan)
   const selections = resolveTtsTagAnswers(tagPlan, {
+    emotion_s0: {
+      choice: 'happy',
+      probabilities: { happy: 0.9, calm: 0.1 },
+      confidence: 0.9,
+    },
     tag_s0: {
       choice: 'gasp',
       probabilities: { gasp: 0.9, no_tag: 0.1 },
+      confidence: 0.9,
+    },
+    pause_s0: {
+      choice: 'long',
+      probabilities: { long: 0.9, no_pause: 0.1 },
+      confidence: 0.9,
+    },
+    pausepos_s0: {
+      choice: 'end',
+      probabilities: { start: 0.1, end: 0.8, b1: 0.1 },
       confidence: 0.9,
     },
   }, 'gemini')
@@ -1262,8 +1373,10 @@ test('attaches tagged text to speech segments without changing narration', () =>
   const tagged = applyTtsTagSelections(segments, tagPlan, selections, true)
   const speech = tagged.find(segment => segment.text === 'Wait.')
   assert.equal(speech?.text, 'Wait.')
-  assert.equal(speech?.ttsText, '<gasp> Wait.')
-  assert.equal(speech?.ttsTag?.tag, 'gasp')
+  assert.equal(speech?.ttsText, '[happy] [gasp] Wait. [long-break]')
+  assert.equal(speech?.ttsTag?.emotion, 'happy')
+  assert.equal(speech?.ttsTag?.sound, 'gasp')
+  assert.equal(speech?.ttsTag?.pause, 'long')
   assert.equal(tagged.find(segment => segment.text === 'Narration.')?.ttsText, undefined)
 })
 

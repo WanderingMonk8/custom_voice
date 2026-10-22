@@ -1046,6 +1046,57 @@ var TURN_RELATION_CRITERIA = {
   [TURN_OTHER_OPTION]: "A different participant addresses someone else in the scene, a third party, or an off-scene channel.",
   [TURN_UNCLEAR_OPTION]: "The text does not establish whether the speaker continues or changes."
 };
+var TTS_EMOTION_OPTIONS = [
+  { value: "happy", description: "Cheerful, upbeat." },
+  { value: "sad", description: "Melancholic, downcast." },
+  { value: "angry", description: "Frustrated or aggressive." },
+  { value: "excited", description: "Energetic and enthusiastic." },
+  { value: "calm", description: "Peaceful and relaxed." },
+  { value: "nervous", description: "Anxious and uncertain." },
+  { value: "confident", description: "Assertive and self-assured." },
+  { value: "surprised", description: "Shocked or amazed." },
+  { value: "satisfied", description: "Content and pleased." },
+  { value: "delighted", description: "Very pleased and joyful." },
+  { value: "scared", description: "Frightened or fearful." },
+  { value: "worried", description: "Concerned and troubled." },
+  { value: "upset", description: "Disturbed or distressed." },
+  { value: "frustrated", description: "Annoyed or exasperated." },
+  { value: "depressed", description: "Very sad and hopeless." },
+  { value: "empathetic", description: "Understanding and caring." },
+  { value: "embarrassed", description: "Ashamed or awkward." },
+  { value: "disgusted", description: "Repelled or revolted." },
+  { value: "moved", description: "Emotionally touched." },
+  { value: "proud", description: "Accomplished and pleased." },
+  { value: "relaxed", description: "At ease and casual." },
+  { value: "grateful", description: "Thankful and appreciative." },
+  { value: "curious", description: "Inquisitive and interested." },
+  { value: "sarcastic", description: "Ironic or mocking." },
+  { value: "disdainful", description: "Contemptuous or scornful." },
+  { value: "unhappy", description: "Discontent or dissatisfied." },
+  { value: "anxious", description: "Very worried and uneasy." },
+  { value: "hysterical", description: "Uncontrollably emotional." },
+  { value: "indifferent", description: "Uncaring or neutral." },
+  { value: "uncertain", description: "Doubtful or unsure." },
+  { value: "doubtful", description: "Skeptical or questioning." },
+  { value: "confused", description: "Puzzled or perplexed." },
+  { value: "disappointed", description: "Let down or dissatisfied." },
+  { value: "regretful", description: "Sorry or remorseful." },
+  { value: "guilty", description: "Culpable or responsible." },
+  { value: "ashamed", description: "Deeply embarrassed." },
+  { value: "jealous", description: "Envious or resentful." },
+  { value: "envious", description: "Wanting what others have." },
+  { value: "hopeful", description: "Optimistic about the future." },
+  { value: "optimistic", description: "Positive outlook." },
+  { value: "pessimistic", description: "Negative outlook." },
+  { value: "nostalgic", description: "Longing for the past." },
+  { value: "lonely", description: "Isolated or alone." },
+  { value: "bored", description: "Uninterested or weary." },
+  { value: "contemptuous", description: "Showing contempt." },
+  { value: "sympathetic", description: "Showing sympathy." },
+  { value: "compassionate", description: "Showing deep care." },
+  { value: "determined", description: "Resolved and decided." },
+  { value: "resigned", description: "Accepting defeat." }
+];
 var TTS_TAG_OPTIONS = [
   { value: "laugh", description: "A brief laugh." },
   { value: "chuckle", description: "A soft, low laugh." },
@@ -1081,10 +1132,20 @@ var TTS_TAG_OPTIONS = [
   { value: "throat-clearing", description: "A throat-clearing sound." },
   { value: "sneeze", description: "A sneeze." },
   { value: "yawn", description: "A yawn." },
-  { value: "short pause", description: "A brief pause." },
-  { value: "long pause", description: "A longer pause." }
+  { value: "snore", description: "A sleeping snore." }
 ];
-var TTS_TAG_NAMES = new Set(TTS_TAG_OPTIONS.map((option) => option.value));
+var TTS_PAUSE_OPTIONS = [
+  { value: "short", label: "Short pause", description: "A brief dramatic pause." },
+  { value: "long", label: "Long pause", description: "An extended dramatic pause." }
+];
+var TTS_EMOTION_NAMES = new Set(TTS_EMOTION_OPTIONS.map((option) => option.value));
+var TTS_SOUND_NAMES = new Set(TTS_TAG_OPTIONS.map((option) => option.value));
+var TTS_PAUSE_NAMES = new Set(TTS_PAUSE_OPTIONS.map((option) => option.value));
+var TTS_TAG_NAMES = /* @__PURE__ */ new Set([
+  ...TTS_EMOTION_NAMES,
+  ...TTS_SOUND_NAMES,
+  ...TTS_PAUSE_NAMES
+]);
 var SPEAKER_TURN_SWITCH_PATTERN = /\b(?:(?:another|a second|a third|a new|the other)\s+(?:voice|woman|man|person|speaker|figure|kid|girl|boy)|(?:someone|somebody)\s+(?:else\s+)?(?:says|said|asks|asked|replies|replied|answers|answered|calls|called|whispers|whispered|shouts|shouted)|(?:a|another)\s+voice\s+(?:from|behind|near|across)|from (?:across the room|the (?:hallway|doorway|next room|other room|shadows)))\b/iu;
 var NARRATIVE_SPEECH_VERB_PATTERN = new RegExp(
   `\\b(?:${SPEECH_VERBS}|blurt(?:s|ed)|laugh(?:s|ed)|mutter(?:s|ed)|hiss(?:es|ed)|snap(?:s|ped))\\b`,
@@ -2268,15 +2329,15 @@ function setup(ctx) {
     value: "off",
     options: [
       { value: "off", label: "Off", sublabel: "Do not add inline vocal tags" },
-      { value: "gemini", label: "Gemini", sublabel: "Angle brackets, for example <gasp>" },
-      { value: "fish", label: "Fish", sublabel: "Square brackets, for example [gasp]" }
+      { value: "gemini", label: "Gemini", sublabel: "Bracketed cues, for example [happy] and [gasp]" },
+      { value: "fish", label: "Fish S2", sublabel: "Fish cues, for example [happy] and [laughing]" }
     ],
     ariaLabel: "TTS vocal tag style",
     onChange: (value) => onTtsTagStyleChanged(value)
   });
   const ttsTagHint = document.createElement("div");
   ttsTagHint.className = "chat-voice-hint";
-  ttsTagHint.textContent = "Tags are inserted only into quoted speech, never into the message. One new tag per speech; existing tags are preserved.";
+  ttsTagHint.textContent = "Every speech gets a leading emotion tag. Optional sound and pause cues are placed in one grouped request per speech; existing tags are preserved.";
   ttsTagField.slot.append(ttsTagHint);
   const ttsTagPlacementPicker = ctx.components.mountSelect(ttsTagPlacementField.slot, {
     value: "jev",
@@ -3131,8 +3192,13 @@ function setup(ctx) {
       });
       const tagSources = /* @__PURE__ */ new Map();
       for (const segment of segments) {
-        if (segment.ttsTag && !/\n\s*\n/u.test(segment.text.trim())) {
-          tagSources.set(segment.ttsTag.id, { text: segment.text, tag: segment.ttsTag.tag });
+        if (segment.ttsTag && (segment.ttsTag.sound || segment.ttsTag.pause) && !/\n\s*\n/u.test(segment.text.trim())) {
+          tagSources.set(segment.ttsTag.id, {
+            text: segment.ttsTag.baseText ?? segment.ttsText ?? segment.text,
+            emotion: segment.ttsTag.emotion,
+            sound: segment.ttsTag.sound,
+            pause: segment.ttsTag.pause
+          });
         }
       }
       const applyTagPlacements = (placements, origin) => {
@@ -3140,7 +3206,7 @@ function setup(ctx) {
           const source = tagSources.get(placement.id);
           if (!source) continue;
           tagPlacementCache.set(
-            `${playbackChat.id}\0${messageId}\0${preferences.ttsTagStyle}\0${preferences.tagLlmConnectionId}\0${preferences.tagLlmModel}\0${placement.id}\0${source.tag}\0${source.text}`,
+            `${playbackChat.id}\0${messageId}\0${preferences.ttsTagStyle}\0${preferences.tagLlmConnectionId}\0${preferences.tagLlmModel}\0${placement.id}\0${source.emotion}\0${source.sound ?? ""}\0${source.pause ?? ""}\0${source.text}`,
             placement.text
           );
           for (const index of tagIndexes.get(placement.id) ?? []) {
@@ -3152,7 +3218,7 @@ function setup(ctx) {
             segment.ttsTag = { ...segment.ttsTag, source: "llm" };
           }
           appendSpeakerDebugLog(
-            `TTS tag placement [${placement.id}] ${source.tag} via ${origin}: ` + JSON.stringify(placement.text.length > 180 ? `${placement.text.slice(0, 177)}...` : placement.text)
+            `TTS tag placement [${placement.id}] emotion=${source.emotion}, sound=${source.sound ?? "none"}, pause=${source.pause ?? "none"} via ${origin}: ` + JSON.stringify(placement.text.length > 180 ? `${placement.text.slice(0, 177)}...` : placement.text)
           );
         }
       };
@@ -3162,10 +3228,10 @@ function setup(ctx) {
           `
 TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size}, connection=${JSON.stringify(preferences.tagLlmConnectionId || "<active>")}, model=${JSON.stringify(preferences.tagLlmModel || "<connection default>")}`
         );
-        const keyFor = (id, tag, text) => `${playbackChat.id}\0${messageId}\0${placementStyle}\0${preferences.tagLlmConnectionId}\0${preferences.tagLlmModel}\0${id}\0${tag}\0${text}`;
+        const keyFor = (id, source) => `${playbackChat.id}\0${messageId}\0${placementStyle}\0${preferences.tagLlmConnectionId}\0${preferences.tagLlmModel}\0${id}\0${source.emotion}\0${source.sound ?? ""}\0${source.pause ?? ""}\0${source.text}`;
         const cachedPlacements = [];
         for (const [id, source] of tagSources) {
-          const cached = tagPlacementCache.get(keyFor(id, source.tag, source.text));
+          const cached = tagPlacementCache.get(keyFor(id, source));
           if (cached) cachedPlacements.push({ id, text: cached });
         }
         if (cachedPlacements.length > 0) {
@@ -3174,7 +3240,13 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
           );
           applyTagPlacements(cachedPlacements, "cache");
         }
-        const items = [...tagSources.entries()].filter(([id, source]) => !tagPlacementCache.has(keyFor(id, source.tag, source.text))).map(([id, source]) => ({ id, text: source.text, tag: source.tag }));
+        const items = [...tagSources.entries()].filter(([id, source]) => !tagPlacementCache.has(keyFor(id, source))).map(([id, source]) => ({
+          id,
+          text: source.text,
+          emotion: source.emotion,
+          sound: source.sound,
+          pause: source.pause
+        }));
         const chunks = [];
         for (let index = 0; index < items.length; index += 4) {
           chunks.push(items.slice(index, index + 4));

@@ -9,6 +9,7 @@ import {
   clampMessageLimit,
   eligibleCardFallbackSpeakerId,
   extractGenerationText,
+  formatTtsTag,
   hashMessageContent,
   hasNamedSpeakerSubject,
   normalizeSpeakerName,
@@ -26,7 +27,7 @@ import {
   speakersForMessageRole,
   SPEAKER_DECISION_SCHEMA,
   TTS_TAG_SCHEMA,
-  validateTtsTagPlacement,
+  validateTtsSpeechPlacement,
   USER_SPEAKER_ID,
   type CharacterLike,
   type ChatVoiceConfig,
@@ -96,7 +97,13 @@ type FrontendMessage =
       style: Exclude<TtsTagStyle, 'off'>
       connectionId: string
       model: string
-      items: Array<{ id: string; text: string; tag: string }>
+      items: Array<{
+        id: string
+        text: string
+        emotion: string
+        sound: string | null
+        pause: 'short' | 'long' | null
+      }>
     }
   | {
       type: 'chat_voice_save'
@@ -400,7 +407,7 @@ async function evaluateTtsTagSelections(
   const selections = new Map<string, TtsTagSelection>()
   if (plan.state.speeches.length === 0) return { selections, failed: false }
   const hasCapability = (spindle.host.capabilities['decisions-v1'] ?? 0) >= 1
-  const chunkSize = 100
+  const chunkSize = 50
   const chunks: string[][] = []
   for (let index = 0; index < plan.state.speeches.length; index += chunkSize) {
     chunks.push(plan.state.speeches.slice(index, index + chunkSize).map(speech => speech.id))
@@ -447,12 +454,13 @@ async function evaluateTtsTagSelections(
   return { selections, failed }
 }
 
-const TTS_TAG_PLACEMENT_PROMPT = `You place an already-chosen vocal tag inside quoted dialogue for a text-to-speech engine.
-Return JSON only: {"speeches":[{"id":"speech id","text":"the speech with the tag inserted"}]}.
-For every input speech, insert the provided tag exactly once, inside the speech, at the exact moment the vocal sound occurs.
-Do not add, remove, or change any other character, word, punctuation mark, or whitespace. Preserve every existing tag in the text.
-Never choose a different tag or add a second tag. If the tag cannot be placed naturally, return the original text unchanged.
-Use only this tag style: STYLE_DESCRIPTION.
+const TTS_TAG_PLACEMENT_PROMPT = `You place already-chosen performance cues inside quoted dialogue for a text-to-speech engine.
+Return JSON only: {"speeches":[{"id":"speech id","text":"the speech with the cues inserted"}]}.
+Each input speech already starts with its emotion cue in square brackets. Preserve that emotion cue exactly at the start.
+For every input speech, insert the provided sound cue and the provided pause cue when present, each exactly once, inside the speech at the exact intended moment.
+Do not add, remove, or change any other character, word, punctuation mark, or whitespace. Preserve every existing cue in the text.
+Never choose different cues, never add a second sound or pause, and never add an emotion. If a cue cannot be placed naturally, return the original text unchanged.
+Use square-bracket cues only, for example [happy], [gasp], [break], and [long-break].
 The complete message is context only; tag only the listed speeches.`
 
 async function placeTtsTags(
@@ -460,9 +468,6 @@ async function placeTtsTags(
   userId?: string,
 ): Promise<Array<{ id: string; text: string }>> {
   if (payload.items.length === 0) return []
-  const styleDescription = payload.style === 'gemini'
-    ? 'angle brackets, for example <gasp>'
-    : 'square brackets, for example [gasp]'
   const response = await spindle.generate.quiet({
     type: 'quiet',
     userId,
@@ -470,7 +475,7 @@ async function placeTtsTags(
     messages: [
       {
         role: 'system',
-        content: TTS_TAG_PLACEMENT_PROMPT.replace('STYLE_DESCRIPTION', styleDescription),
+        content: TTS_TAG_PLACEMENT_PROMPT,
       },
       {
         role: 'user',
@@ -479,7 +484,8 @@ async function placeTtsTags(
           speeches: payload.items.map(item => ({
             id: item.id,
             text: item.text,
-            tag: item.tag,
+            soundTag: item.sound ? formatTtsTag(item.sound, payload.style) : null,
+            pauseTag: item.pause ? formatTtsTag(item.pause, payload.style) : null,
           })),
         }),
       },
@@ -511,7 +517,11 @@ async function placeTtsTags(
   const placements: Array<{ id: string; text: string }> = []
   for (const item of payload.items) {
     const tagged = outputs.get(item.id)
-    if (!tagged || !validateTtsTagPlacement(item.text, tagged, item.tag)) continue
+    if (!tagged || !validateTtsSpeechPlacement(item.text, tagged, {
+      emotion: item.emotion,
+      sound: item.sound,
+      pause: item.pause,
+    }, payload.style)) continue
     placements.push({ id: item.id, text: normalizeTtsTags(tagged, payload.style) })
   }
   return placements

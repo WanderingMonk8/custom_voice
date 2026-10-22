@@ -2,47 +2,55 @@
 
 ## Objective
 
-Add a small, controlled amount of inline vocal acting to the speech sent to
-TTS without changing the message. A tag is a momentary sound such as
-`<gasp>` (Gemini) or `[gasp]` (Fish); it is not a sustained speaker emotion
-instruction. Tags are inserted only inside quoted speech, never into
-narration.
+Add controlled inline acting to the speech sent to TTS without changing the
+message. Every quoted speech receives a leading emotion cue. Jev may also add
+one momentary sound and one short or long pause. Cues are inserted only inside
+quoted speech, never into narration.
+
+Both providers now use square-bracket cues. Gemini documents bracket cues such
+as `[laughs]`, `[sigh]`, `[uhm]`, and `[extremely fast]`; Fish S2 documents
+`[happy]`, sound effects, and `[break]` / `[long-break]`. Gemini's separate
+prompt-level emotion control is not exposed by the extension's TTS request, so
+the leading emotion is sent as an inline bracket cue instead.
 
 ## Pipeline
 
 1. **Structure plan.** `buildSpeakerDecisionPlan` supplies the message,
    quotations, and surrounding narration. The same structure is used by Jev
    speaker assignment and by the tag pass.
-2. **Jev tag ranking.** `buildTtsTagPlan` issues one ranking question per
-   speech with the full tag menu plus `no_tag`. It also issues one placement
-   question per speech for the fallback sentence boundary. The tag evaluation
-   runs in parallel with the Jev speaker decision and is independent of the LLM
-   placement setting.
-3. **Thresholds.** A tag is applied only when all three gates pass:
+2. **Jev tag ranking.** `buildTtsTagPlan` issues five questions per speech:
+   - mandatory emotion; no threshold, with `calm` as the neutral fallback
+   - optional momentary sound
+   - fallback sound boundary
+   - optional short/long pause
+   - fallback pause boundary
+   The tag evaluation runs in parallel with the Jev speaker decision and is
+   independent of the LLM placement setting.
+3. **Thresholds.** Sound and pause are applied only when all three gates pass:
    - winner probability >= 0.65
    - answer confidence >= 0.60
    - winner minus runner-up >= 0.20
-   The placement boundary uses 0.50/0.50/0.10. A failed gate means no new tag.
-   Most speeches should resolve to `no_tag`.
-4. **Deterministic insertion.** `resolveTtsTagAnswers` normalizes any existing
-   recognized tags to the chosen provider style, inserts the selected tag at
-   the chosen sentence boundary, and records `ttsText` plus `ttsTag` metadata.
-   If the same tag is already present, the duplicate is skipped but the
-   existing tag is normalized. The message text and the ordinary `text` field
-   are unchanged.
-5. **LLM placement.** When `LLM exact placement` is selected, the frontend
-   sends only the chosen tag and its speech to the placement LLM. The backend
-   validates that the LLM preserved every word and existing tag and added the
-   requested tag exactly once. Invalid or missing results fall back to the
-   deterministic Jev placement.
+   The fallback boundaries use 0.50/0.50/0.10. Emotion is always applied.
+4. **Deterministic text.** `resolveTtsTagAnswers` normalizes existing cues,
+   prepends the selected emotion, and inserts the optional sound and pause at
+   their fallback boundaries. It records `baseText` (emotion but no new
+   sound/pause) for the placement LLM, plus the full `ttsText` fallback and
+   `ttsTag` metadata. The message text and ordinary `text` field are unchanged.
+5. **Grouped LLM placement.** When `LLM exact placement` is selected, one item
+   per speech carries both the selected sound and pause. The backend validates
+   that the LLM preserved the leading emotion, every word, and every existing
+   cue, and added only the requested sound and pause, each exactly once.
+   Invalid or missing results fall back to the deterministic placement.
 
 ## Chunking
 
 LLM placement never runs as one call for the whole message:
 
-- Tagged speeches are grouped into chunks of four.
-- The first chunk is requested before synthesis and awaited for at most eight
-  seconds. This is the only blocking placement work.
+- Speeches needing sound or pause placement are grouped into chunks of four.
+- Emotion-only speeches do not enter the placement pipeline and do not block
+  playback.
+- The first placement chunk is requested before synthesis and awaited for at
+  most eight seconds. This is the only blocking placement work.
 - The remaining chunks start immediately after that first wait resolves or
   times out, and continue resolving sequentially while playback runs.
 - A plan entry is updated when its chunk returns. If a segment has already
@@ -50,15 +58,27 @@ LLM placement never runs as one call for the whole message:
   segments that have not started use the exact placement.
 - The first-chunk timeout is a latency bound, not an error. A slow first chunk
   can still arrive later and update segments that have not started.
-- Chunk results are cached per message, speech, tag, style, connection, and
-  model for the session, so replaying a message avoids repeat placement calls.
-- Multi-paragraph speeches keep deterministic placement because a
-  speech-level placement result cannot be split safely across paragraph-sized
-  TTS requests.
+- Chunk results are cached per message, speech, emotion, sound, pause, style,
+  connection, and model for the session.
+- Multi-paragraph speeches keep deterministic placement because a speech-level
+  placement result cannot be split safely across paragraph-sized TTS requests.
+
+## Tag behavior
+
+- **Emotion:** one of the 49 documented Fish emotions, always at the start.
+  Existing emotions are preserved and moved/normalized to the start. Neutral
+  delivery falls back to `calm`.
+- **Sound:** the existing sound vocabulary, rendered with Fish's documented
+  forms where they differ, such as `[laughing]`, `[sighing]`, and `[gasping]`.
+  Existing sounds are preserved; a second different sound may be added.
+- **Pause:** `[break]` or `[long-break]`. Existing pauses are preserved and a
+  duplicate pause is skipped.
+- Existing angle-bracket cues are normalized to bracket cues.
 
 ## Settings
 
-- **TTS vocal tags**: Off (default), Gemini `<tag>`, or Fish `[tag]`.
+- **TTS vocal tags**: Off (default), Gemini, or Fish S2. Both use bracket cues;
+  Fish uses its documented sound vocabulary.
 - **Vocal tag placement**: Jev sentence boundaries or LLM exact placement.
 - **Vocal tag LLM connection**: optional Lumiverse LLM connection. Empty uses
   the active/default connection.
@@ -71,21 +91,21 @@ the deterministic parse cache.
 
 ## Failure behavior
 
-- No Decision connection: existing recognized tags are normalized, but no new
-  tags are chosen.
+- No Decision connection: existing recognized cues are normalized and the
+  emotion falls back to `calm`; no optional sound or pause is chosen.
 - Tag evaluation failure: the parse continues with local/deterministic speaker
-  assignment and existing tags only.
+  assignment and existing cues only.
 - Placement RPC failure, timeout, or validation failure: the deterministic
   Jev placement remains in place.
-- Messages with no quoted speech, or with only a single speech under the
-  thresholds, receive no tags.
+- Messages with no quoted speech receive no tags.
 
 ## Diagnostics
 
 With **Speaker assignment debug** enabled, each speech's debug path includes
-`tts-tag`, probability/confidence/margin, placement boundary, and the resulting
-`tts-text`. The speech list also shows a truncated `tts-tagged` line. LLM
-placement adds its style/connection/model settings, cache hits, chunk
-start/finish/failure events, the first-chunk timeout, and each applied
-placement text. The synthesis plan shows the final text used for each request,
-including placements that arrived before that request started.
+`tts-emotion`, sound probability/confidence/margin and boundary, pause
+probability/confidence/margin and boundary, and the resulting `tts-text`. The
+speech list also shows a truncated `tts-tagged` line. LLM placement adds its
+style/connection/model settings, cache hits, chunk start/finish/failure events,
+the first-chunk timeout, and each applied placement text. The synthesis plan
+shows the final text used for each request, including placements that arrived
+before that request started.
