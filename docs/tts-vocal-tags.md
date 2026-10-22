@@ -28,8 +28,9 @@ the leading emotion is sent as an inline bracket cue instead.
    - optional secondary short/long pause
    - fallback primary-pause boundary
    The tag evaluation runs in parallel with the Jev speaker decision and is
-   independent of the LLM placement setting. Tag evaluation is chunked at 30
-   speeches per Decision call to stay under the 256-question limit.
+   independent of the LLM placement setting. Tag evaluation is grouped two
+   speeches per Decision call; a failed batch is retried one speech at a time.
+   This keeps the probability output within the model's response limit.
 3. **Thresholds.** Sound and pause are applied only when all three gates pass:
    - winner probability >= 0.65
    - answer confidence >= 0.60

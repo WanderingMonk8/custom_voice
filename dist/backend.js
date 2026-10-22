@@ -3319,12 +3319,13 @@ async function evaluateTtsTagSelections(plan, style, userId) {
   const selections = /* @__PURE__ */ new Map();
   if (plan.state.speeches.length === 0) return { selections, failed: false };
   const hasCapability = (spindle.host.capabilities["decisions-v1"] ?? 0) >= 1;
-  const chunkSize = 30;
+  const chunkSize = 2;
   const chunks = [];
   for (let index = 0; index < plan.state.speeches.length; index += chunkSize) {
     chunks.push(plan.state.speeches.slice(index, index + chunkSize).map((speech) => speech.id));
   }
   let failed = false;
+  let failure = "";
   const resolveChunk = (tagPlan, answers) => {
     for (const [id, selection] of resolveTtsTagAnswers(tagPlan, answers, style)) {
       selections.set(id, selection);
@@ -3332,35 +3333,71 @@ async function evaluateTtsTagSelections(plan, style, userId) {
   };
   if (!hasCapability) {
     resolveChunk(buildTtsTagPlan(plan), {});
-    return { selections, failed: true };
+    return {
+      selections,
+      failed: true,
+      error: "Decision capability unavailable"
+    };
   }
-  await Promise.all(chunks.map(async (ids) => {
+  const evaluateIds = async (ids) => {
     const tagPlan = buildTtsTagPlan(plan, ids);
-    try {
-      const result = await spindle.decisions.evaluate({
-        state: tagPlan.state,
-        questions: tagPlan.questions,
-        ...userId ? { userId } : {}
-      });
-      const answers = {};
-      for (const [questionId, answer] of Object.entries(result.answers)) {
-        if (answer.type !== "choice") continue;
-        answers[questionId] = {
-          choice: answer.choice,
-          probabilities: answer.probabilities,
-          confidence: answer.confidence
-        };
-      }
-      resolveChunk(tagPlan, answers);
-    } catch (error) {
-      failed = true;
-      spindle.log.warn(
-        `[Chat Voice] TTS tag classification failed; keeping existing tags only: ${error instanceof Error ? error.message : String(error)}`
-      );
-      resolveChunk(tagPlan, {});
+    const result = await spindle.decisions.evaluate({
+      state: tagPlan.state,
+      questions: tagPlan.questions,
+      ...userId ? { userId } : {}
+    });
+    const answers = {};
+    for (const [questionId, answer] of Object.entries(result.answers)) {
+      if (answer.type !== "choice") continue;
+      answers[questionId] = {
+        choice: answer.choice,
+        probabilities: answer.probabilities,
+        confidence: answer.confidence
+      };
     }
-  }));
-  return { selections, failed };
+    if (Object.keys(answers).length === 0) {
+      throw new Error("Decision returned no choice answers");
+    }
+    return { tagPlan, answers };
+  };
+  const evaluateChunk = async (ids) => {
+    try {
+      const result = await evaluateIds(ids);
+      resolveChunk(result.tagPlan, result.answers);
+      return true;
+    } catch (error) {
+      failure = error instanceof Error ? error.message : String(error);
+      spindle.log.warn(`[Chat Voice] TTS tag batch failed; retrying speeches individually: ${failure}`);
+      if (ids.length === 1) {
+        resolveChunk(buildTtsTagPlan(plan, ids), {});
+        return false;
+      }
+      const results = await Promise.all(ids.map(async (id) => {
+        try {
+          const result = await evaluateIds([id]);
+          resolveChunk(result.tagPlan, result.answers);
+          return true;
+        } catch (retryError) {
+          failure = retryError instanceof Error ? retryError.message : String(retryError);
+          resolveChunk(buildTtsTagPlan(plan, [id]), {});
+          return false;
+        }
+      }));
+      return results.every(Boolean);
+    }
+  };
+  const concurrency = 6;
+  for (let index = 0; index < chunks.length; index += concurrency) {
+    const results = await Promise.all(
+      chunks.slice(index, index + concurrency).map(evaluateChunk)
+    );
+    if (results.some((result) => !result)) failed = true;
+  }
+  return {
+    selections,
+    failed,
+    ...failed ? { error: failure || "TTS tag classification failed" } : {}
+  };
 }
 var TTS_TAG_PLACEMENT_PROMPT = `You place already-chosen performance cues inside quoted dialogue for a text-to-speech engine.
 Return JSON only: {"speeches":[{"id":"speech id","text":"the speech with the cues inserted"}]}.
@@ -3432,20 +3469,31 @@ async function applyTtsTags(segments, plan, style, selections, includeDebug) {
   if (style === "off" || !plan || !selections) return { segments, tagFailed: false };
   try {
     const result = await selections;
+    const applied = applyTtsTagSelections(
+      segments,
+      buildTtsTagPlan(plan),
+      result.selections,
+      includeDebug
+    );
+    const withDebug = result.failed && includeDebug ? applied.map((segment) => segment.debugPath ? {
+      ...segment,
+      debugPath: [
+        ...segment.debugPath,
+        `tts-tag-evaluation:failed (${result.error ?? "undefined error"})`,
+        "tts-tag-evaluation:neutral-fallback"
+      ]
+    } : segment) : applied;
     return {
-      segments: applyTtsTagSelections(
-        segments,
-        buildTtsTagPlan(plan),
-        result.selections,
-        includeDebug
-      ),
-      tagFailed: result.failed
+      segments: withDebug,
+      tagFailed: result.failed,
+      ...result.error ? { tagError: result.error } : {}
     };
   } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
     spindle.log.warn(
-      `[Chat Voice] TTS tag application failed; using untagged speech: ${error instanceof Error ? error.message : String(error)}`
+      `[Chat Voice] TTS tag application failed; using untagged speech: ${message}`
     );
-    return { segments, tagFailed: true };
+    return { segments, tagFailed: true, tagError: message };
   }
 }
 var CARD_PARSER_PROMPT = `Extract the speaking cast represented by roleplay character cards.
