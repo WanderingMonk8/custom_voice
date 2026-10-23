@@ -2213,6 +2213,8 @@ function setup(ctx) {
   let tagLlmConnectionId = "";
   let tagLlmModel = "";
   let llmConnections = [];
+  let tagLlmModelConnectionId = "";
+  let tagLlmModelComboboxEnabled = false;
   const tagPlacementCache = /* @__PURE__ */ new Map();
   let decisionConnectionsKnown = false;
   let decisionConnectionAvailable = false;
@@ -2434,10 +2436,14 @@ function setup(ctx) {
     disabled: true,
     onChange: (value) => onTagLlmConnectionChanged(value)
   });
-  const tagLlmModelInput = ctx.components.mountTextInput(tagLlmModelField.slot, {
+  const tagLlmModelInput = ctx.components.mountModelCombobox(tagLlmModelField.slot, {
     value: "",
-    placeholder: "Use the connection model or enter a model name",
-    ariaLabel: "Vocal tag model",
+    connection: { kind: "llm" },
+    appearance: "standard",
+    placeholder: "Use the connection model or search available models",
+    emptyMessage: "No models reported for this connection.",
+    loadingMessage: "Loading models for this connection\u2026",
+    browseHint: "Search models available to the selected connection.",
     disabled: true,
     onChange: (value) => onTagLlmModelChanged(value)
   });
@@ -2936,10 +2942,21 @@ function setup(ctx) {
       disabled: !llmEnabled,
       placeholder: llmConnections.length ? "Use the active Lumiverse LLM connection" : "No LLM connections found; the active connection will be used"
     });
+    const modelConnectionId = tagLlmConnectionId || llmConnections.find(
+      (connection) => connection.is_default
+    )?.id || llmConnections[0]?.id || "";
     tagLlmModelInput.update({
       value: tagLlmModel,
-      disabled: !llmEnabled
+      disabled: !llmEnabled,
+      connection: modelConnectionId ? { kind: "llm", id: modelConnectionId } : { kind: "llm" },
+      refreshKey: modelConnectionId || "active",
+      placeholder: modelConnectionId ? "Use the connection model or search available models" : "Use the active connection model or search available models"
     });
+    const connectionChanged = tagLlmModelConnectionId !== modelConnectionId;
+    const becameEnabled = llmEnabled && !tagLlmModelComboboxEnabled;
+    tagLlmModelConnectionId = modelConnectionId;
+    tagLlmModelComboboxEnabled = llmEnabled;
+    if (llmEnabled && (connectionChanged || becameEnabled)) tagLlmModelInput.refresh();
   }
   function onTtsTagStyleChanged(value) {
     ttsTagStyle = value === "gemini" || value === "gemini38" || value === "fish" ? value : "off";

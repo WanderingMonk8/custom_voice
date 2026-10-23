@@ -1202,6 +1202,9 @@ export function setup(ctx: SpindleFrontendContext) {
   let tagLlmConnectionId = ''
   let tagLlmModel = ''
   let llmConnections: LlmConnection[] = []
+  /** Connection the vocal-tag model combobox is currently bound to. */
+  let tagLlmModelConnectionId = ''
+  let tagLlmModelComboboxEnabled = false
   const tagPlacementCache = new Map<string, string>()
   let decisionConnectionsKnown = false
   let decisionConnectionAvailable = false
@@ -1491,10 +1494,14 @@ export function setup(ctx: SpindleFrontendContext) {
     onChange: value => onTagLlmConnectionChanged(value),
   })
 
-  const tagLlmModelInput = ctx.components.mountTextInput(tagLlmModelField.slot, {
+  const tagLlmModelInput = ctx.components.mountModelCombobox(tagLlmModelField.slot, {
     value: '',
-    placeholder: 'Use the connection model or enter a model name',
-    ariaLabel: 'Vocal tag model',
+    connection: { kind: 'llm' },
+    appearance: 'standard',
+    placeholder: 'Use the connection model or search available models',
+    emptyMessage: 'No models reported for this connection.',
+    loadingMessage: 'Loading models for this connection…',
+    browseHint: 'Search models available to the selected connection.',
     disabled: true,
     onChange: value => onTagLlmModelChanged(value),
   })
@@ -2158,10 +2165,27 @@ export function setup(ctx: SpindleFrontendContext) {
         ? 'Use the active Lumiverse LLM connection'
         : 'No LLM connections found; the active connection will be used',
     })
+    const modelConnectionId = tagLlmConnectionId || llmConnections.find(
+      connection => connection.is_default,
+    )?.id || llmConnections[0]?.id || ''
     tagLlmModelInput.update({
       value: tagLlmModel,
       disabled: !llmEnabled,
+      connection: modelConnectionId
+        ? { kind: 'llm', id: modelConnectionId }
+        : { kind: 'llm' },
+      refreshKey: modelConnectionId || 'active',
+      placeholder: modelConnectionId
+        ? 'Use the connection model or search available models'
+        : 'Use the active connection model or search available models',
     })
+    // Reload the catalog only when the bound connection changes or the picker
+    // becomes enabled, so unrelated control updates do not refetch models.
+    const connectionChanged = tagLlmModelConnectionId !== modelConnectionId
+    const becameEnabled = llmEnabled && !tagLlmModelComboboxEnabled
+    tagLlmModelConnectionId = modelConnectionId
+    tagLlmModelComboboxEnabled = llmEnabled
+    if (llmEnabled && (connectionChanged || becameEnabled)) tagLlmModelInput.refresh()
   }
 
   function onTtsTagStyleChanged(value: string): void {

@@ -156,8 +156,10 @@ LLM placement never runs as one call for the whole message:
   Fish modulation is available only with **LLM exact placement**.
 - **Vocal tag LLM connection**: optional Lumiverse LLM connection. Empty uses
   the active/default connection.
-- **Vocal tag model**: optional model override. Empty uses the connection's
-  model.
+- **Vocal tag model**: optional model override. The field is a searchable model
+  picker bound to the selected vocal-tag LLM connection, so it lists the models
+  that connection reports from Lumiverse rather than requiring a typed name.
+  Empty uses the connection's model.
 
 The tag style and placement mode invalidate the cached speaker parse, because
 the cached `ttsText` and modulation metadata depend on them. Placement
