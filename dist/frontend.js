@@ -3172,6 +3172,7 @@ function setup(ctx) {
       setStatus("Choose a TTS connection before playing.", "error");
       return;
     }
+    const connectionProfileVoice = (connections.find((connection) => connection.id === connectionId)?.voice ?? "").trim();
     if (preferences.speakerAssignmentDebug) {
       const profile = connections.find((connection) => connection.id === connectionId);
       appendSpeakerDebugLog(
@@ -3266,21 +3267,29 @@ function setup(ctx) {
         preferences.speakerParsingMode,
         review
       );
+      let explicitVoiceCount = 0;
+      let connectionVoiceFallbacks = 0;
       const plan = mergeVoicePlan(segments.map((segment) => {
         const speakerId = segment.speakerId ? aliases.get(segment.speakerId) ?? segment.speakerId : null;
-        const voice = playbackVoiceForSpeaker(
+        const configuredVoice = playbackVoiceForSpeaker(
           speakerId,
           message.is_user,
           config.characterVoices,
           config.narratorVoice,
           config.userVoice
         );
+        const voice = configuredVoice || connectionProfileVoice;
+        if (configuredVoice) explicitVoiceCount += 1;
+        else if (connectionProfileVoice) connectionVoiceFallbacks += 1;
         return {
           text: segment.ttsText ?? segment.text,
           voice,
           ...segment.ttsTag ? { tagId: segment.ttsTag.id } : {}
         };
       }));
+      appendSpeakerDebugLog(
+        `TTS voice resolution: explicit=${explicitVoiceCount}, connectionDefaultFallback=${connectionVoiceFallbacks}${connectionVoiceFallbacks > 0 ? ` (explicit default voice ${JSON.stringify(connectionProfileVoice || "<connection default>")})` : ""}.`
+      );
       const tagIndexes = /* @__PURE__ */ new Map();
       plan.forEach((entry, index) => {
         if (!entry.tagId) return;
