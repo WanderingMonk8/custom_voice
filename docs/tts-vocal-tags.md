@@ -156,8 +156,10 @@ LLM placement never runs as one call for the whole message:
   Fish modulation is available only with **LLM exact placement**.
 - **Vocal tag LLM connection**: optional Lumiverse LLM connection. Empty uses
   the active/default connection.
-- **Vocal tag model**: optional model override. Empty uses the connection's
-  model.
+- **Vocal tag model**: optional model override. The field is a searchable model
+  picker bound to the selected vocal-tag LLM connection, so it lists the models
+  that connection reports from Lumiverse rather than requiring a typed name.
+  Empty uses the connection's model.
 
 The tag style and placement mode invalidate the cached speaker parse, because
 the cached `ttsText` and modulation metadata depend on them. Placement
@@ -194,4 +196,7 @@ style/connection/model settings, cache hits, chunk start/finish/failure events,
 the first-chunk timeout, the custom Fish emotion cue and modulation cue when
 used, the modulation point used for the cache key, and each applied placement
 text. The synthesis plan shows the final text used for each request, including
-placements that arrived before that request started.
+placements that arrived before that request started. Playback diagnostics also
+record the selected TTS connection's provider/model/default voice, each dispatch's
+voice and text hash, and a short fingerprint of the returned audio so a voice
+routing mismatch can be compared across replays.

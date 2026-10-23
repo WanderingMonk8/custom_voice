@@ -170,6 +170,14 @@ function expiredSavedAudioRecords(records, limit) {
   const overflow = Math.max(0, records.length - clampSavedAudioLimit(limit));
   return [...records].sort((left, right) => left.savedAt - right.savedAt).slice(0, overflow);
 }
+function hashMessageContent(content) {
+  let hash = 2166136261;
+  for (let index = 0; index < content.length; index++) {
+    hash ^= content.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return `${content.length.toString(36)}-${(hash >>> 0).toString(36)}`;
+}
 function normalizeSpeakerName(value) {
   return value.normalize("NFKC").trim().replace(/\s+/g, " ");
 }
@@ -1431,6 +1439,15 @@ var NORMALIZATION_PROFILE_WEIGHT = 0.75;
 var NORMALIZATION_MIN_GAIN = 10 ** (-6 / 20);
 var NORMALIZATION_MAX_GAIN = 10 ** (6 / 20);
 var NORMALIZATION_PEAK_CEILING = 10 ** (-1 / 20);
+function fingerprintAudio(data) {
+  const bytes = new Uint8Array(data);
+  let hash = 2166136261;
+  for (const byte of bytes) {
+    hash ^= byte;
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(16).padStart(8, "0");
+}
 function clampIntegerSetting(value, fallback, maximum) {
   const numeric = typeof value === "number" ? value : Number(value);
   if (!Number.isFinite(numeric)) return fallback;
@@ -1794,7 +1811,8 @@ async function synthesizeVoiceSegment(connectionId, text, voice, speed, signal, 
       if (!rateLimitBudget.recovering) rateLimitBudget.consecutiveResponses = 0;
       return {
         data: audioData,
-        mime: response.headers.get("content-type") || "audio/mpeg"
+        mime: response.headers.get("content-type") || "audio/mpeg",
+        fingerprint: fingerprintAudio(audioData)
       };
     }
     if (response.status === 429) {
@@ -2195,6 +2213,8 @@ function setup(ctx) {
   let tagLlmConnectionId = "";
   let tagLlmModel = "";
   let llmConnections = [];
+  let tagLlmModelConnectionId = "";
+  let tagLlmModelComboboxEnabled = false;
   const tagPlacementCache = /* @__PURE__ */ new Map();
   let decisionConnectionsKnown = false;
   let decisionConnectionAvailable = false;
@@ -2416,10 +2436,14 @@ function setup(ctx) {
     disabled: true,
     onChange: (value) => onTagLlmConnectionChanged(value)
   });
-  const tagLlmModelInput = ctx.components.mountTextInput(tagLlmModelField.slot, {
+  const tagLlmModelInput = ctx.components.mountModelCombobox(tagLlmModelField.slot, {
     value: "",
-    placeholder: "Use the connection model or enter a model name",
-    ariaLabel: "Vocal tag model",
+    connection: { kind: "llm" },
+    appearance: "standard",
+    placeholder: "Use the connection model or search available models",
+    emptyMessage: "No models reported for this connection.",
+    loadingMessage: "Loading models for this connection\u2026",
+    browseHint: "Search models available to the selected connection.",
     disabled: true,
     onChange: (value) => onTagLlmModelChanged(value)
   });
@@ -2918,10 +2942,21 @@ function setup(ctx) {
       disabled: !llmEnabled,
       placeholder: llmConnections.length ? "Use the active Lumiverse LLM connection" : "No LLM connections found; the active connection will be used"
     });
+    const modelConnectionId = tagLlmConnectionId || llmConnections.find(
+      (connection) => connection.is_default
+    )?.id || llmConnections[0]?.id || "";
     tagLlmModelInput.update({
       value: tagLlmModel,
-      disabled: !llmEnabled
+      disabled: !llmEnabled,
+      connection: modelConnectionId ? { kind: "llm", id: modelConnectionId } : { kind: "llm" },
+      refreshKey: modelConnectionId || "active",
+      placeholder: modelConnectionId ? "Use the connection model or search available models" : "Use the active connection model or search available models"
     });
+    const connectionChanged = tagLlmModelConnectionId !== modelConnectionId;
+    const becameEnabled = llmEnabled && !tagLlmModelComboboxEnabled;
+    tagLlmModelConnectionId = modelConnectionId;
+    tagLlmModelComboboxEnabled = llmEnabled;
+    if (llmEnabled && (connectionChanged || becameEnabled)) tagLlmModelInput.refresh();
   }
   function onTtsTagStyleChanged(value) {
     ttsTagStyle = value === "gemini" || value === "gemini38" || value === "fish" ? value : "off";
@@ -3136,6 +3171,12 @@ function setup(ctx) {
     if (!connectionId) {
       setStatus("Choose a TTS connection before playing.", "error");
       return;
+    }
+    if (preferences.speakerAssignmentDebug) {
+      const profile = connections.find((connection) => connection.id === connectionId);
+      appendSpeakerDebugLog(
+        `TTS connection profile: id=${JSON.stringify(connectionId)}, provider=${JSON.stringify(profile?.provider ?? "")}, model=${JSON.stringify(profile?.model ?? "")}, defaultVoice=${JSON.stringify(profile?.voice ?? "")}, narratorVoice=${JSON.stringify(config.narratorVoice || "<connection default>")}, userVoice=${JSON.stringify(config.userVoice || "<none>")}`
+      );
     }
     const contextClass = window.AudioContext ?? window.webkitAudioContext;
     if (!contextClass) {
@@ -3430,35 +3471,42 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
           appendSpeakerDebugLog(
             `Synthesis request [${index + 1}] started with voice=${JSON.stringify(plan[index].voice || "<connection default>")}.`
           );
-          const segment = await runSynthesisTask(() => synthesizeVoiceSegment(
-            connectionId,
-            plan[index].text,
-            plan[index].voice,
-            preferences.speed,
-            synthesisController.signal,
-            sharedSynthesisPacer,
-            rateLimitBudget,
-            connectionVoiceGates.get(connectionId) ?? (() => {
-              const gate = new ConnectionVoiceGate();
-              connectionVoiceGates.set(connectionId, gate);
-              return gate;
-            })(),
-            (delayMs, cumulativeWaitMs) => {
-              rateLimitedForRemainder = true;
-              adaptiveConcurrency = 1;
-              shortConcurrencyCooldown = 0;
-              longWindowStreak = 0;
-              adaptiveSynthesisLimits.set(adaptiveLimitToken, 1);
-              drainSynthesisQueue();
-              if (ctx.getActiveChat().chatId === playbackChat.id && (!activePlayback || activePlayback === playback)) {
-                setStatus(
-                  `Rate limited; resuming in ${Math.max(1, Math.ceil(delayMs / 1e3))}s\u2026 (${Math.ceil(cumulativeWaitMs / 1e3)}s of ${preferences.rateLimitWaitSeconds}s wait budget)`
-                );
+          const segment = await runSynthesisTask(() => {
+            const text = plan[index].text;
+            const voice = plan[index].voice;
+            appendSpeakerDebugLog(
+              `Synthesis dispatch [${index + 1}] voice=${JSON.stringify(voice || "<connection default>")}, textHash=${hashMessageContent(text)}, chars=${text.length}.`
+            );
+            return synthesizeVoiceSegment(
+              connectionId,
+              text,
+              voice,
+              preferences.speed,
+              synthesisController.signal,
+              sharedSynthesisPacer,
+              rateLimitBudget,
+              connectionVoiceGates.get(connectionId) ?? (() => {
+                const gate = new ConnectionVoiceGate();
+                connectionVoiceGates.set(connectionId, gate);
+                return gate;
+              })(),
+              (delayMs, cumulativeWaitMs) => {
+                rateLimitedForRemainder = true;
+                adaptiveConcurrency = 1;
+                shortConcurrencyCooldown = 0;
+                longWindowStreak = 0;
+                adaptiveSynthesisLimits.set(adaptiveLimitToken, 1);
+                drainSynthesisQueue();
+                if (ctx.getActiveChat().chatId === playbackChat.id && (!activePlayback || activePlayback === playback)) {
+                  setStatus(
+                    `Rate limited; resuming in ${Math.max(1, Math.ceil(delayMs / 1e3))}s\u2026 (${Math.ceil(cumulativeWaitMs / 1e3)}s of ${preferences.rateLimitWaitSeconds}s wait budget)`
+                  );
+                }
               }
-            }
-          ), activePlayback === playback && !playback.playbackStopped);
+            );
+          }, activePlayback === playback && !playback.playbackStopped);
           appendSpeakerDebugLog(
-            `Synthesis request [${index + 1}] completed with voice=${JSON.stringify(plan[index].voice || "<connection default>")} (${segment.data.byteLength} bytes, ${segment.mime}).`
+            `Synthesis request [${index + 1}] completed with voice=${JSON.stringify(plan[index].voice || "<connection default>")} (${segment.data.byteLength} bytes, ${segment.mime}, fingerprint=${segment.fingerprint ?? "<none>"}).`
           );
           return { ok: true, segment };
         } catch (error) {

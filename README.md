@@ -31,7 +31,7 @@ A [Lumiverse Spindle](https://docs.lumiverse.chat/) extension that detects chara
 - Provides a global, autosaved list of tracker tag names or full asymmetric tag pairs whose tags and enclosed contents are removed before playback generation.
 - Automatically excludes well-formed HTML comments (`<!-- ... -->`) from playback and speaker detection.
 - Alternates short unattributed dialogue turns after two speakers have been confidently established, including chains preceded by same-speaker continuation paragraphs.
-- Optionally reviews ambiguous—or all—dialogue with an LLM, using a selectable Lumiverse connection and optional custom model override. Results are cached per message and safely fall back to local parsing.
+- Optionally reviews ambiguous—or all—dialogue with an LLM, using a selectable Lumiverse connection and an optional searchable model override drawn from that connection's available models. Results are cached per message and safely fall back to local parsing.
 - Auto-saves every setting to the current chat.
 - Saves the detected cast and reloads it with the correct settings whenever the active chat changes.
 - Keeps active-chat settings and playback requests isolated between multiple open Lumiverse browser tabs.
