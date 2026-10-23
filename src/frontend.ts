@@ -10,6 +10,7 @@ import {
   eligibleCardFallbackSpeakerId,
   encodeConcatenatedWav,
   expiredSavedAudioRecords,
+  hashMessageContent,
   mergeVoicePlan,
   npcSpeakerId,
   normalizeSpeakerName,
@@ -34,6 +35,8 @@ interface TtsConnection {
   id: string
   name: string
   provider?: string
+  model?: string
+  voice?: string
   is_default?: boolean
 }
 
@@ -158,6 +161,17 @@ const NORMALIZATION_MIN_GAIN = 10 ** (-6 / 20)
 const NORMALIZATION_MAX_GAIN = 10 ** (6 / 20)
 const NORMALIZATION_PEAK_CEILING = 10 ** (-1 / 20)
 
+/** Stable short fingerprint for comparing generated audio in debug logs. */
+function fingerprintAudio(data: ArrayBuffer): string {
+  const bytes = new Uint8Array(data)
+  let hash = 0x811c9dc5
+  for (const byte of bytes) {
+    hash ^= byte
+    hash = Math.imul(hash, 0x01000193)
+  }
+  return (hash >>> 0).toString(16).padStart(8, '0')
+}
+
 interface DetectedCharacterState {
   id: string
   name: string
@@ -270,6 +284,8 @@ interface PlaybackMessage {
 interface SynthesizedVoiceSegment {
   data: ArrayBuffer
   mime: string
+  /** Short content fingerprint used only for diagnostics across replays. */
+  fingerprint?: string
   decodedBuffer?: AudioBuffer
   normalizationGain?: number
 }
@@ -760,6 +776,7 @@ async function synthesizeVoiceSegment(
       return {
         data: audioData!,
         mime: response.headers.get('content-type') || 'audio/mpeg',
+        fingerprint: fingerprintAudio(audioData!),
       }
     }
     if (response.status === 429) {
@@ -2391,6 +2408,17 @@ export function setup(ctx: SpindleFrontendContext) {
       setStatus('Choose a TTS connection before playing.', 'error')
       return
     }
+    if (preferences.speakerAssignmentDebug) {
+      const profile = connections.find(connection => connection.id === connectionId)
+      appendSpeakerDebugLog(
+        `TTS connection profile: id=${JSON.stringify(connectionId)}, `
+          + `provider=${JSON.stringify(profile?.provider ?? '')}, `
+          + `model=${JSON.stringify(profile?.model ?? '')}, `
+          + `defaultVoice=${JSON.stringify(profile?.voice ?? '')}, `
+          + `narratorVoice=${JSON.stringify(config.narratorVoice || '<connection default>')}, `
+          + `userVoice=${JSON.stringify(config.userVoice || '<none>')}`,
+      )
+    }
     const contextClass = window.AudioContext
       ?? (window as typeof window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext
     if (!contextClass) {
@@ -2804,36 +2832,45 @@ export function setup(ctx: SpindleFrontendContext) {
           appendSpeakerDebugLog(
             `Synthesis request [${index + 1}] started with voice=${JSON.stringify(plan[index].voice || '<connection default>')}.`,
           )
-          const segment = await runSynthesisTask(() => synthesizeVoiceSegment(
-            connectionId,
-            plan[index].text,
-            plan[index].voice,
-            preferences.speed,
-            synthesisController.signal,
-            sharedSynthesisPacer,
-            rateLimitBudget,
-            connectionVoiceGates.get(connectionId) ?? (() => {
-              const gate = new ConnectionVoiceGate()
-              connectionVoiceGates.set(connectionId, gate)
-              return gate
-            })(),
-            (delayMs, cumulativeWaitMs) => {
-              rateLimitedForRemainder = true
-              adaptiveConcurrency = 1
-              shortConcurrencyCooldown = 0
-              longWindowStreak = 0
-              adaptiveSynthesisLimits.set(adaptiveLimitToken, 1)
-              drainSynthesisQueue()
-              if (ctx.getActiveChat().chatId === playbackChat.id && (!activePlayback || activePlayback === playback)) {
+          const segment = await runSynthesisTask(() => {
+            const text = plan[index].text
+            const voice = plan[index].voice
+            appendSpeakerDebugLog(
+              `Synthesis dispatch [${index + 1}] voice=${JSON.stringify(voice || '<connection default>')}, `
+                + `textHash=${hashMessageContent(text)}, chars=${text.length}.`,
+            )
+            return synthesizeVoiceSegment(
+              connectionId,
+              text,
+              voice,
+              preferences.speed,
+              synthesisController.signal,
+              sharedSynthesisPacer,
+              rateLimitBudget,
+              connectionVoiceGates.get(connectionId) ?? (() => {
+                const gate = new ConnectionVoiceGate()
+                connectionVoiceGates.set(connectionId, gate)
+                return gate
+              })(),
+              (delayMs, cumulativeWaitMs) => {
+                rateLimitedForRemainder = true
+                adaptiveConcurrency = 1
+                shortConcurrencyCooldown = 0
+                longWindowStreak = 0
+                adaptiveSynthesisLimits.set(adaptiveLimitToken, 1)
+                drainSynthesisQueue()
+                if (ctx.getActiveChat().chatId === playbackChat.id && (!activePlayback || activePlayback === playback)) {
                 setStatus(
                   `Rate limited; resuming in ${Math.max(1, Math.ceil(delayMs / 1_000))}s… `
                   + `(${Math.ceil(cumulativeWaitMs / 1_000)}s of ${preferences.rateLimitWaitSeconds}s wait budget)`,
                 )
               }
             },
-          ), activePlayback === playback && !playback.playbackStopped)
+          )
+        }, activePlayback === playback && !playback.playbackStopped)
           appendSpeakerDebugLog(
-            `Synthesis request [${index + 1}] completed with voice=${JSON.stringify(plan[index].voice || '<connection default>')} (${segment.data.byteLength} bytes, ${segment.mime}).`,
+            `Synthesis request [${index + 1}] completed with voice=${JSON.stringify(plan[index].voice || '<connection default>')} `
+              + `(${segment.data.byteLength} bytes, ${segment.mime}, fingerprint=${segment.fingerprint ?? '<none>'}).`,
           )
           return { ok: true, segment }
         } catch (error) {

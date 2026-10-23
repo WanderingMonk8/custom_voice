@@ -194,4 +194,7 @@ style/connection/model settings, cache hits, chunk start/finish/failure events,
 the first-chunk timeout, the custom Fish emotion cue and modulation cue when
 used, the modulation point used for the cache key, and each applied placement
 text. The synthesis plan shows the final text used for each request, including
-placements that arrived before that request started.
+placements that arrived before that request started. Playback diagnostics also
+record the selected TTS connection's provider/model/default voice, each dispatch's
+voice and text hash, and a short fingerprint of the returned audio so a voice
+routing mismatch can be compared across replays.
