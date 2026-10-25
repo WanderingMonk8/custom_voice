@@ -197,6 +197,16 @@ the first-chunk timeout, the custom Fish emotion cue and modulation cue when
 used, the modulation point used for the cache key, and each applied placement
 text. The synthesis plan shows the final text used for each request, including
 placements that arrived before that request started. Playback diagnostics also
-record the selected TTS connection's provider/model/default voice, each dispatch's
-voice and text hash, and a short fingerprint of the returned audio so a voice
-routing mismatch can be compared across replays.
+record the selected TTS connection's provider/model/default voice, the
+explicit-versus-fallback voice count for the message, each dispatch's voice and
+text hash, and a short fingerprint of the returned audio so a voice routing
+mismatch can be compared across replays.
+
+## Voice resolution
+
+Every synthesis request sends an explicit voice. Speaker mapping resolves in
+this order: the character voice, the narrator voice for narration, the user
+voice for the user persona, then the connection profile's default voice. The
+final step is sent as an explicit value rather than an omitted field, because a
+provider that applies voice through mutable connection state can otherwise
+reuse the last voice set by another playback or chat.
