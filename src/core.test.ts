@@ -13,6 +13,7 @@ import {
   assessSpeakerDiscourseEscalation,
   buildSpeakerDecisionPlan,
   buildTtsTagPlan,
+  bufferAwareGenerationConcurrency,
   clampMessageLimit,
   clampSavedAudioLimit,
   detectCharacters,
@@ -26,6 +27,7 @@ import {
   hasNamedSpeakerMention,
   hasNamedSpeakerSubject,
   mergeVoicePlan,
+  normalizeSpeechBoundaryDashes,
   normalizeTtsTags,
   normalizeCustomTtsEmotionTag,
   npcSpeakerId,
@@ -1089,6 +1091,18 @@ test('keeps frequently switching voice windows at one request', () => {
   )
 })
 
+test('raises synthesis concurrency while the playback buffer is under target', () => {
+  assert.equal(bufferAwareGenerationConcurrency(1, 4, 0, 2, 1), 2)
+  assert.equal(bufferAwareGenerationConcurrency(2, 4, 1, 2, 1), 3)
+  assert.equal(bufferAwareGenerationConcurrency(3, 4, 0, 2, 1), 4)
+})
+
+test('returns to the adaptive baseline when buffered and serializes after rate limiting', () => {
+  assert.equal(bufferAwareGenerationConcurrency(3, 4, 2, 2, 1), 1)
+  assert.equal(bufferAwareGenerationConcurrency(3, 4, 0, 2, 3, true), 1)
+  assert.equal(bufferAwareGenerationConcurrency(1, 1, 0, 2, 1), 1)
+})
+
 test('paces synthesis starts inside a rolling request window', () => {
   assert.equal(rollingRequestWindowDelay([1_000, 2_000, 3_000], 4_000, 4, 60_000), 0)
   assert.equal(rollingRequestWindowDelay([1_000, 2_000, 3_000, 4_000], 5_000, 4, 60_000), 56_000)
@@ -1680,6 +1694,21 @@ test('normalizes both providers to brackets and validates grouped placement', ()
       'gemini38',
     ),
     true,
+  )
+})
+
+test('removes leading speech dashes without changing internal or trailing dashes', () => {
+  assert.equal(
+    normalizeSpeechBoundaryDashes('[confident] —sorry about that. [confident] No, I am here—'),
+    '[confident] sorry about that. [confident] No, I am here—',
+  )
+  assert.equal(
+    normalizeSpeechBoundaryDashes('—Wait — I need to explain–'),
+    'Wait — I need to explain–',
+  )
+  assert.equal(
+    normalizeSpeechBoundaryDashes('<soft> – Give me a moment.'),
+    '<soft> Give me a moment.',
   )
 })
 

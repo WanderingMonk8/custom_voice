@@ -271,6 +271,33 @@ export function adaptiveGenerationConcurrency(
   return { concurrency: safeCurrent, shortCooldown: 0, longWindowStreak: 0 }
 }
 
+/**
+ * Raise synthesis concurrency only while playback is at risk of exhausting its
+ * ready-audio buffer. The ordinary adaptive result remains authoritative once
+ * enough segments are available, and rate limiting always forces serialization.
+ */
+export function bufferAwareGenerationConcurrency(
+  current: number,
+  configuredMaximum: number,
+  readyAhead: number,
+  targetBuffer: number,
+  adaptiveBaseline: number,
+  rateLimited = false,
+  maximum = 10,
+): number {
+  if (rateLimited) return 1
+  const ceiling = Math.min(
+    Math.max(1, Math.round(maximum)),
+    Math.max(1, Math.round(configuredMaximum)),
+  )
+  const safeCurrent = Math.min(ceiling, Math.max(1, Math.round(current)))
+  const safeBaseline = Math.min(ceiling, Math.max(1, Math.round(adaptiveBaseline)))
+  const ready = Math.max(0, Math.round(readyAhead))
+  const target = Math.max(1, Math.round(targetBuffer))
+  if (ready >= target || ceiling === 1) return safeBaseline
+  return Math.min(ceiling, Math.max(2, safeCurrent + 1))
+}
+
 /** Combine decoded audio into one PCM WAV so the host does not need FFmpeg to save it. */
 export function encodeConcatenatedWav(segments: PcmAudioSegment[]): ArrayBuffer {
   const usable = segments.filter(segment => (
@@ -362,6 +389,18 @@ export function mergeVoicePlan(segments: VoicePlanSegment[]): VoicePlanSegment[]
 }
 
 export const DEFAULT_MAX_TTS_SEGMENT_CHARS = 360
+
+/**
+ * Remove prose punctuation that marks dialogue as entering mid-turn. Some TTS
+ * providers treat a leading em/en dash as an instruction to clip the adjacent
+ * words, especially when it follows a vocal cue. Keep internal and trailing
+ * dashes intact because they carry useful spoken phrasing and cutoff behavior.
+ */
+export function normalizeSpeechBoundaryDashes(text: string): string {
+  return text
+    .replace(/^((?:\s*(?:\[[^\]\r\n]+\]|<[^>\r\n]+>))*\s*)[—–]\s*/u, '$1')
+    .trim()
+}
 
 /**
  * Break oversized, already paragraph-scoped TTS jobs near natural pauses.
