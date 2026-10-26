@@ -391,15 +391,14 @@ export function mergeVoicePlan(segments: VoicePlanSegment[]): VoicePlanSegment[]
 export const DEFAULT_MAX_TTS_SEGMENT_CHARS = 360
 
 /**
- * Remove prose punctuation that marks dialogue as entering or leaving mid-turn.
- * Some TTS providers treat a boundary em/en dash as an instruction to clip the
- * adjacent words, especially when it follows a leading vocal cue. Keep internal
- * dashes intact because they still carry useful spoken phrasing.
+ * Remove prose punctuation that marks dialogue as entering mid-turn. Some TTS
+ * providers treat a leading em/en dash as an instruction to clip the adjacent
+ * words, especially when it follows a vocal cue. Keep internal and trailing
+ * dashes intact because they carry useful spoken phrasing and cutoff behavior.
  */
 export function normalizeSpeechBoundaryDashes(text: string): string {
   return text
     .replace(/^((?:\s*(?:\[[^\]\r\n]+\]|<[^>\r\n]+>))*\s*)[—–]\s*/u, '$1')
-    .replace(/\s*[—–]\s*$/u, '')
     .trim()
 }
 

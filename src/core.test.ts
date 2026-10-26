@@ -1697,14 +1697,14 @@ test('normalizes both providers to brackets and validates grouped placement', ()
   )
 })
 
-test('removes speech-boundary dashes without changing internal dashes', () => {
+test('removes leading speech dashes without changing internal or trailing dashes', () => {
   assert.equal(
     normalizeSpeechBoundaryDashes('[confident] —sorry about that. [confident] No, I am here—'),
-    '[confident] sorry about that. [confident] No, I am here',
+    '[confident] sorry about that. [confident] No, I am here—',
   )
   assert.equal(
     normalizeSpeechBoundaryDashes('—Wait — I need to explain–'),
-    'Wait — I need to explain',
+    'Wait — I need to explain–',
   )
   assert.equal(
     normalizeSpeechBoundaryDashes('<soft> – Give me a moment.'),
