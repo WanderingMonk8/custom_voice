@@ -148,6 +148,9 @@ function mergeVoicePlan(segments) {
   return result;
 }
 var DEFAULT_MAX_TTS_SEGMENT_CHARS = 360;
+function normalizeSpeechBoundaryDashes(text) {
+  return text.replace(/^((?:\s*(?:\[[^\]\r\n]+\]|<[^>\r\n]+>))*\s*)[—–]\s*/u, "$1").replace(/\s*[—–]\s*$/u, "").trim();
+}
 function splitLargeVoicePlanSegments(segments, maximumChars = DEFAULT_MAX_TTS_SEGMENT_CHARS) {
   const limit = Math.max(80, Math.round(maximumChars));
   const result = [];
@@ -3340,7 +3343,7 @@ function setup(ctx) {
         if (configuredVoice) explicitVoiceCount += 1;
         else if (connectionProfileVoice) connectionVoiceFallbacks += 1;
         return {
-          text: segment.ttsText ?? segment.text,
+          text: speakerId ? normalizeSpeechBoundaryDashes(segment.ttsText ?? segment.text) : segment.ttsText ?? segment.text,
           voice,
           ...segment.ttsTag ? { tagId: segment.ttsTag.id } : {}
         };
@@ -3388,7 +3391,7 @@ function setup(ctx) {
             continue;
           }
           for (const index of tagIndexes.get(placement.id) ?? []) {
-            plan[index] = { ...plan[index], text: placement.text };
+            plan[index] = { ...plan[index], text: normalizeSpeechBoundaryDashes(placement.text) };
           }
           for (const segment of segments) {
             if (segment.ttsTag?.id !== placement.id) continue;

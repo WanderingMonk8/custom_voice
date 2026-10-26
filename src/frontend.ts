@@ -14,6 +14,7 @@ import {
   hashMessageContent,
   mergeVoicePlan,
   npcSpeakerId,
+  normalizeSpeechBoundaryDashes,
   normalizeSpeakerName,
   parseRosterVoiceSegments,
   playbackVoiceForSpeaker,
@@ -2563,7 +2564,9 @@ export function setup(ctx: SpindleFrontendContext) {
         if (configuredVoice) explicitVoiceCount += 1
         else if (connectionProfileVoice) connectionVoiceFallbacks += 1
         return {
-          text: segment.ttsText ?? segment.text,
+          text: speakerId
+            ? normalizeSpeechBoundaryDashes(segment.ttsText ?? segment.text)
+            : segment.ttsText ?? segment.text,
           voice,
           ...(segment.ttsTag ? { tagId: segment.ttsTag.id } : {}),
         }
@@ -2655,7 +2658,7 @@ export function setup(ctx: SpindleFrontendContext) {
             continue
           }
           for (const index of tagIndexes.get(placement.id) ?? []) {
-            plan[index] = { ...plan[index], text: placement.text }
+            plan[index] = { ...plan[index], text: normalizeSpeechBoundaryDashes(placement.text) }
           }
           for (const segment of segments) {
             if (segment.ttsTag?.id !== placement.id) continue

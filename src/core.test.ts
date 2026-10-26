@@ -27,6 +27,7 @@ import {
   hasNamedSpeakerMention,
   hasNamedSpeakerSubject,
   mergeVoicePlan,
+  normalizeSpeechBoundaryDashes,
   normalizeTtsTags,
   normalizeCustomTtsEmotionTag,
   npcSpeakerId,
@@ -1693,6 +1694,21 @@ test('normalizes both providers to brackets and validates grouped placement', ()
       'gemini38',
     ),
     true,
+  )
+})
+
+test('removes speech-boundary dashes without changing internal dashes', () => {
+  assert.equal(
+    normalizeSpeechBoundaryDashes('[confident] —sorry about that. [confident] No, I am here—'),
+    '[confident] sorry about that. [confident] No, I am here',
+  )
+  assert.equal(
+    normalizeSpeechBoundaryDashes('—Wait — I need to explain–'),
+    'Wait — I need to explain',
+  )
+  assert.equal(
+    normalizeSpeechBoundaryDashes('<soft> – Give me a moment.'),
+    '<soft> Give me a moment.',
   )
 })
 
