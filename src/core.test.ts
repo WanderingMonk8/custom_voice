@@ -13,6 +13,7 @@ import {
   assessSpeakerDiscourseEscalation,
   buildSpeakerDecisionPlan,
   buildTtsTagPlan,
+  bufferAwareGenerationConcurrency,
   clampMessageLimit,
   clampSavedAudioLimit,
   detectCharacters,
@@ -1087,6 +1088,18 @@ test('keeps frequently switching voice windows at one request', () => {
     adaptiveGenerationConcurrency(3, 4, [420, 460, 500, 440, 480, 520], 0, 0, 10, 4),
     { concurrency: 1, shortCooldown: 6, longWindowStreak: 0 },
   )
+})
+
+test('raises synthesis concurrency while the playback buffer is under target', () => {
+  assert.equal(bufferAwareGenerationConcurrency(1, 4, 0, 2, 1), 2)
+  assert.equal(bufferAwareGenerationConcurrency(2, 4, 1, 2, 1), 3)
+  assert.equal(bufferAwareGenerationConcurrency(3, 4, 0, 2, 1), 4)
+})
+
+test('returns to the adaptive baseline when buffered and serializes after rate limiting', () => {
+  assert.equal(bufferAwareGenerationConcurrency(3, 4, 2, 2, 1), 1)
+  assert.equal(bufferAwareGenerationConcurrency(3, 4, 0, 2, 3, true), 1)
+  assert.equal(bufferAwareGenerationConcurrency(1, 1, 0, 2, 1), 1)
 })
 
 test('paces synthesis starts inside a rolling request window', () => {

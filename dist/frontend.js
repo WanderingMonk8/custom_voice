@@ -66,6 +66,19 @@ function adaptiveGenerationConcurrency(current, configuredMaximum, segmentLength
   }
   return { concurrency: safeCurrent, shortCooldown: 0, longWindowStreak: 0 };
 }
+function bufferAwareGenerationConcurrency(current, configuredMaximum, readyAhead, targetBuffer, adaptiveBaseline, rateLimited = false, maximum = 10) {
+  if (rateLimited) return 1;
+  const ceiling = Math.min(
+    Math.max(1, Math.round(maximum)),
+    Math.max(1, Math.round(configuredMaximum))
+  );
+  const safeCurrent = Math.min(ceiling, Math.max(1, Math.round(current)));
+  const safeBaseline = Math.min(ceiling, Math.max(1, Math.round(adaptiveBaseline)));
+  const ready = Math.max(0, Math.round(readyAhead));
+  const target = Math.max(1, Math.round(targetBuffer));
+  if (ready >= target || ceiling === 1) return safeBaseline;
+  return Math.min(ceiling, Math.max(2, safeCurrent + 1));
+}
 function encodeConcatenatedWav(segments) {
   const usable = segments.filter((segment) => Number.isFinite(segment.sampleRate) && segment.sampleRate > 0 && segment.channels.length > 0 && segment.channels.some((channel) => channel.length > 0));
   if (usable.length === 0) throw new Error("No decoded audio is available to save.");
@@ -3589,6 +3602,13 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
       const prepared = plan.map(() => new Promise((resolve) => {
         preparedResolvers.push(resolve);
       }));
+      const synthesizedIndexes = /* @__PURE__ */ new Set();
+      let playbackCursor = 0;
+      const readySynthesisAhead = () => {
+        let index = playbackCursor;
+        while (synthesizedIndexes.has(index)) index += 1;
+        return index - playbackCursor;
+      };
       let synthesisCursor = 0;
       let localSynthesisTasks = 0;
       const initialAdaptiveState = adaptiveGenerationConcurrency(
@@ -3600,15 +3620,27 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
         MAX_CONCURRENT_GENERATIONS,
         plan.slice(1, 6).filter((segment, index) => segment.voice !== plan[index]?.voice).length
       );
-      adaptiveConcurrency = initialAdaptiveState.concurrency;
+      adaptiveConcurrency = bufferAwareGenerationConcurrency(
+        adaptiveConcurrency,
+        preferences.concurrentGenerations,
+        readySynthesisAhead(),
+        preferences.playbackBufferSegments,
+        initialAdaptiveState.concurrency,
+        rateLimitedForRemainder,
+        MAX_CONCURRENT_GENERATIONS
+      );
       shortConcurrencyCooldown = initialAdaptiveState.shortCooldown;
       longWindowStreak = initialAdaptiveState.longWindowStreak;
       adaptiveSynthesisLimits.set(adaptiveLimitToken, adaptiveConcurrency);
+      appendSpeakerDebugLog(
+        `Initial synthesis concurrency=${adaptiveConcurrency}, readyAhead=${readySynthesisAhead()}, bufferTarget=${preferences.playbackBufferSegments}, configuredMax=${preferences.concurrentGenerations}.`
+      );
       const scheduleSynthesis = () => {
         while (localSynthesisTasks < adaptiveConcurrency && synthesisCursor < plan.length) {
           const index = synthesisCursor++;
           localSynthesisTasks += 1;
           void prepare(index).then((result) => {
+            if (result.ok) synthesizedIndexes.add(index);
             preparedResolvers[index](result);
           }).finally(() => {
             localSynthesisTasks -= 1;
@@ -3622,7 +3654,21 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
                 MAX_CONCURRENT_GENERATIONS,
                 plan.slice(index + 2, Math.min(plan.length, index + 7)).filter((segment, offset) => segment.voice !== plan[index + 1 + offset]?.voice).length
               );
-              adaptiveConcurrency = nextState.concurrency;
+              const previousConcurrency = adaptiveConcurrency;
+              adaptiveConcurrency = bufferAwareGenerationConcurrency(
+                adaptiveConcurrency,
+                preferences.concurrentGenerations,
+                readySynthesisAhead(),
+                preferences.playbackBufferSegments,
+                nextState.concurrency,
+                rateLimitedForRemainder,
+                MAX_CONCURRENT_GENERATIONS
+              );
+              if (adaptiveConcurrency !== previousConcurrency) {
+                appendSpeakerDebugLog(
+                  `Synthesis concurrency ${previousConcurrency}->${adaptiveConcurrency} after request ${index + 1}; readyAhead=${readySynthesisAhead()}, bufferTarget=${preferences.playbackBufferSegments}.`
+                );
+              }
               shortConcurrencyCooldown = nextState.shortCooldown;
               longWindowStreak = nextState.longWindowStreak;
               adaptiveSynthesisLimits.set(adaptiveLimitToken, adaptiveConcurrency);
@@ -3743,12 +3789,35 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
       for (let index = 0; index < plan.length; index += 1) {
         const current = await processed[index];
         if (!current.ok) throw current.error;
+        playbackCursor = index + 1;
+        if (synthesisCursor < plan.length || localSynthesisTasks > 0) {
+          const pressuredConcurrency = bufferAwareGenerationConcurrency(
+            adaptiveConcurrency,
+            preferences.concurrentGenerations,
+            readySynthesisAhead(),
+            preferences.playbackBufferSegments,
+            adaptiveConcurrency,
+            rateLimitedForRemainder,
+            MAX_CONCURRENT_GENERATIONS
+          );
+          if (pressuredConcurrency !== adaptiveConcurrency) {
+            appendSpeakerDebugLog(
+              `Synthesis concurrency ${adaptiveConcurrency}->${pressuredConcurrency} at playback ${index + 1}; readyAhead=${readySynthesisAhead()}, bufferTarget=${preferences.playbackBufferSegments}.`
+            );
+            adaptiveConcurrency = pressuredConcurrency;
+            adaptiveSynthesisLimits.set(adaptiveLimitToken, adaptiveConcurrency);
+            drainSynthesisQueue();
+            scheduleSynthesis();
+          }
+        }
         appendSpeakerDebugLog(
           `Playback [${index + 1}] using voice=${JSON.stringify(plan[index].voice || "<connection default>")}.`
         );
         setStatus(`Playing ${index + 1} of ${plan.length} voice segment${plan.length === 1 ? "" : "s"}\u2026`);
         await playDecodedBuffer(playback, current.segment, preferences.volume);
       }
+      adaptiveSynthesisLimits.delete(adaptiveLimitToken);
+      drainSynthesisQueue();
       playback.playbackFinished = true;
       playback.finishAudible();
       if (activePlayback === playback) {

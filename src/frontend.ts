@@ -5,6 +5,7 @@ import type {
 import {
   adaptiveGenerationConcurrency,
   addUnconfiguredDialogueSpeakers,
+  bufferAwareGenerationConcurrency,
   clampSavedAudioLimit,
   DEFAULT_SAVED_AUDIO_LIMIT,
   eligibleCardFallbackSpeakerId,
@@ -2946,6 +2947,13 @@ export function setup(ctx: SpindleFrontendContext) {
       const prepared = plan.map(() => new Promise<PreparedSegment>((resolve) => {
         preparedResolvers.push(resolve)
       }))
+      const synthesizedIndexes = new Set<number>()
+      let playbackCursor = 0
+      const readySynthesisAhead = () => {
+        let index = playbackCursor
+        while (synthesizedIndexes.has(index)) index += 1
+        return index - playbackCursor
+      }
       let synthesisCursor = 0
       let localSynthesisTasks = 0
       const initialAdaptiveState = adaptiveGenerationConcurrency(
@@ -2959,15 +2967,28 @@ export function setup(ctx: SpindleFrontendContext) {
           segment.voice !== plan[index]?.voice
         )).length,
       )
-      adaptiveConcurrency = initialAdaptiveState.concurrency
+      adaptiveConcurrency = bufferAwareGenerationConcurrency(
+        adaptiveConcurrency,
+        preferences.concurrentGenerations,
+        readySynthesisAhead(),
+        preferences.playbackBufferSegments,
+        initialAdaptiveState.concurrency,
+        rateLimitedForRemainder,
+        MAX_CONCURRENT_GENERATIONS,
+      )
       shortConcurrencyCooldown = initialAdaptiveState.shortCooldown
       longWindowStreak = initialAdaptiveState.longWindowStreak
       adaptiveSynthesisLimits.set(adaptiveLimitToken, adaptiveConcurrency)
+      appendSpeakerDebugLog(
+        `Initial synthesis concurrency=${adaptiveConcurrency}, readyAhead=${readySynthesisAhead()}, `
+          + `bufferTarget=${preferences.playbackBufferSegments}, configuredMax=${preferences.concurrentGenerations}.`,
+      )
       const scheduleSynthesis = () => {
         while (localSynthesisTasks < adaptiveConcurrency && synthesisCursor < plan.length) {
           const index = synthesisCursor++
           localSynthesisTasks += 1
           void prepare(index).then(result => {
+            if (result.ok) synthesizedIndexes.add(index)
             preparedResolvers[index](result)
           }).finally(() => {
             localSynthesisTasks -= 1
@@ -2986,7 +3007,22 @@ export function setup(ctx: SpindleFrontendContext) {
                   .filter((segment, offset) => segment.voice !== plan[index + 1 + offset]?.voice)
                   .length,
               )
-              adaptiveConcurrency = nextState.concurrency
+              const previousConcurrency = adaptiveConcurrency
+              adaptiveConcurrency = bufferAwareGenerationConcurrency(
+                adaptiveConcurrency,
+                preferences.concurrentGenerations,
+                readySynthesisAhead(),
+                preferences.playbackBufferSegments,
+                nextState.concurrency,
+                rateLimitedForRemainder,
+                MAX_CONCURRENT_GENERATIONS,
+              )
+              if (adaptiveConcurrency !== previousConcurrency) {
+                appendSpeakerDebugLog(
+                  `Synthesis concurrency ${previousConcurrency}->${adaptiveConcurrency} after request ${index + 1}; `
+                    + `readyAhead=${readySynthesisAhead()}, bufferTarget=${preferences.playbackBufferSegments}.`,
+                )
+              }
               shortConcurrencyCooldown = nextState.shortCooldown
               longWindowStreak = nextState.longWindowStreak
               adaptiveSynthesisLimits.set(adaptiveLimitToken, adaptiveConcurrency)
@@ -3120,12 +3156,36 @@ export function setup(ctx: SpindleFrontendContext) {
       for (let index = 0; index < plan.length; index += 1) {
         const current = await processed[index]
         if (!current.ok) throw current.error
+        playbackCursor = index + 1
+        if (synthesisCursor < plan.length || localSynthesisTasks > 0) {
+          const pressuredConcurrency = bufferAwareGenerationConcurrency(
+            adaptiveConcurrency,
+            preferences.concurrentGenerations,
+            readySynthesisAhead(),
+            preferences.playbackBufferSegments,
+            adaptiveConcurrency,
+            rateLimitedForRemainder,
+            MAX_CONCURRENT_GENERATIONS,
+          )
+          if (pressuredConcurrency !== adaptiveConcurrency) {
+            appendSpeakerDebugLog(
+              `Synthesis concurrency ${adaptiveConcurrency}->${pressuredConcurrency} at playback ${index + 1}; `
+                + `readyAhead=${readySynthesisAhead()}, bufferTarget=${preferences.playbackBufferSegments}.`,
+            )
+            adaptiveConcurrency = pressuredConcurrency
+            adaptiveSynthesisLimits.set(adaptiveLimitToken, adaptiveConcurrency)
+            drainSynthesisQueue()
+            scheduleSynthesis()
+          }
+        }
         appendSpeakerDebugLog(
           `Playback [${index + 1}] using voice=${JSON.stringify(plan[index].voice || '<connection default>')}.`,
         )
         setStatus(`Playing ${index + 1} of ${plan.length} voice segment${plan.length === 1 ? '' : 's'}…`)
         await playDecodedBuffer(playback, current.segment, preferences.volume)
       }
+      adaptiveSynthesisLimits.delete(adaptiveLimitToken)
+      drainSynthesisQueue()
       playback.playbackFinished = true
       playback.finishAudible()
       if (activePlayback === playback) {
