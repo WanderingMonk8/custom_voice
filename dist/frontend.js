@@ -134,6 +134,51 @@ function mergeVoicePlan(segments) {
   }
   return result;
 }
+var DEFAULT_MAX_TTS_SEGMENT_CHARS = 360;
+function splitLargeVoicePlanSegments(segments, maximumChars = DEFAULT_MAX_TTS_SEGMENT_CHARS) {
+  const limit = Math.max(80, Math.round(maximumChars));
+  const result = [];
+  for (const segment of segments) {
+    let remaining = segment.text.trim();
+    while (remaining.length > limit) {
+      const window2 = remaining.slice(0, limit + 1);
+      const sentenceBreaks = [];
+      const clauseBreaks = [];
+      const wordBreaks = [];
+      let bracketDepth = 0;
+      for (let index = 0; index < window2.length; index += 1) {
+        const character = window2[index];
+        if (character === "[") bracketDepth += 1;
+        else if (character === "]" && bracketDepth > 0) bracketDepth -= 1;
+        if (bracketDepth > 0 || !/\s/u.test(character)) continue;
+        wordBreaks.push(index);
+        let previousIndex = index - 1;
+        while (previousIndex >= 0 && /["”’')\]]/u.test(window2[previousIndex])) previousIndex -= 1;
+        const previous = window2[previousIndex] ?? "";
+        if (/[.!?…]/u.test(previous)) sentenceBreaks.push(index);
+        else if (/[,;:—–]/u.test(previous)) clauseBreaks.push(index);
+      }
+      const latestAtOrAfter = (candidates, minimum) => [...candidates].reverse().find((position) => position >= minimum);
+      const splitAt = latestAtOrAfter(sentenceBreaks, Math.floor(limit * 0.35)) ?? latestAtOrAfter(clauseBreaks, Math.floor(limit * 0.55)) ?? latestAtOrAfter(wordBreaks, Math.floor(limit * 0.7)) ?? wordBreaks.at(-1) ?? limit;
+      const text = remaining.slice(0, splitAt).trim();
+      if (!text) break;
+      result.push({
+        text,
+        voice: segment.voice,
+        ...segment.tagId ? { tagId: segment.tagId } : {}
+      });
+      remaining = remaining.slice(splitAt).trim();
+    }
+    if (remaining) {
+      result.push({
+        text: remaining,
+        voice: segment.voice,
+        ...segment.tagId ? { tagId: segment.tagId } : {}
+      });
+    }
+  }
+  return result;
+}
 function isRecord(value) {
   return !!value && typeof value === "object" && !Array.isArray(value);
 }
@@ -3443,6 +3488,13 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
             }
           })();
         }
+      }
+      const splitPlan = splitLargeVoicePlanSegments(plan);
+      if (splitPlan.length !== plan.length) {
+        appendSpeakerDebugLog(
+          `Split ${plan.length} paragraph-level TTS job${plan.length === 1 ? "" : "s"} into ${splitPlan.length} latency-sized segments.`
+        );
+        plan.splice(0, plan.length, ...splitPlan);
       }
       if (plan.length === 0) throw new Error("This message has no playable narration or dialogue.");
       if (preferences.speakerAssignmentDebug) {

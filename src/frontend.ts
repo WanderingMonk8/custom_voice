@@ -23,6 +23,7 @@ import {
   speakerAliases,
   speakerAliasIdLookup,
   speakersForMessageRole,
+  splitLargeVoicePlanSegments,
   shouldPersistMessageAudio,
   UNCAST_SPEAKER_ID,
   USER_SPEAKER_ID,
@@ -2834,6 +2835,14 @@ export function setup(ctx: SpindleFrontendContext) {
             }
           })()
         }
+      }
+      const splitPlan = splitLargeVoicePlanSegments(plan)
+      if (splitPlan.length !== plan.length) {
+        appendSpeakerDebugLog(
+          `Split ${plan.length} paragraph-level TTS job${plan.length === 1 ? '' : 's'} into `
+            + `${splitPlan.length} latency-sized segments.`,
+        )
+        plan.splice(0, plan.length, ...splitPlan)
       }
       if (plan.length === 0) throw new Error('This message has no playable narration or dialogue.')
       if (preferences.speakerAssignmentDebug) {
