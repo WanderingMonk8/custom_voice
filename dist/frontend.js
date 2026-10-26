@@ -3343,6 +3343,7 @@ function setup(ctx) {
         tagIndexes.set(entry.tagId, indexes);
       });
       const tagSources = /* @__PURE__ */ new Map();
+      let synthesisPlanFrozen = false;
       for (const segment of segments) {
         if (segment.ttsTag && (preferences.ttsTagStyle === "fish" || segment.ttsTag.sounds.length > 0 || segment.ttsTag.pauses.length > 0) && !/\n\s*\n/u.test(segment.text.trim())) {
           tagSources.set(segment.ttsTag.id, {
@@ -3367,6 +3368,12 @@ function setup(ctx) {
             `${playbackChat.id}\0${messageId}\0${preferences.ttsTagStyle}\0${preferences.tagLlmConnectionId}\0${preferences.tagLlmModel}\0${placement.id}\0${JSON.stringify(source.emotions)}\0${JSON.stringify(source.styles)}\0${JSON.stringify(source.sounds)}\0${JSON.stringify(source.pauses)}\0${source.modulation ? "1" : "0"}\0${source.modulationPoint ?? ""}\0${source.modulationCharIndex ?? ""}\0${source.text}\0${source.narrativeBefore}\0${source.narrativeAfter}`,
             placement.text
           );
+          if (synthesisPlanFrozen) {
+            appendSpeakerDebugLog(
+              `TTS tag placement [${placement.id}] arrived after synthesis-plan freeze; cached for the next playback without changing the active plan.`
+            );
+            continue;
+          }
           for (const index of tagIndexes.get(placement.id) ?? []) {
             plan[index] = { ...plan[index], text: placement.text };
           }
@@ -3489,6 +3496,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
           })();
         }
       }
+      synthesisPlanFrozen = true;
       const splitPlan = splitLargeVoicePlanSegments(plan);
       if (splitPlan.length !== plan.length) {
         appendSpeakerDebugLog(
