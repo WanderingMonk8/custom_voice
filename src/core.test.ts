@@ -54,6 +54,7 @@ import {
   speakerReviewQuoteIndexes,
   speakersForMessageRole,
   shouldPersistMessageAudio,
+  splitLargeVoicePlanSegments,
   rollingRequestWindowDelay,
   SPEAKER_DECISION_THRESHOLDS,
   TTS_MODULATION_MARKER,
@@ -1142,6 +1143,36 @@ test('keeps separate paragraphs as independently generated voice segments', () =
     { text: 'Second paragraph.', voice: 'narrator' },
     { text: 'Third paragraph.', voice: 'narrator' },
   ])
+})
+
+test('splits oversized paragraph jobs at sentence boundaries', () => {
+  const sentences = [
+    'The first sentence carries enough detail to make a useful synthesis chunk without feeling abrupt.',
+    'The second sentence likewise supplies enough words to form another naturally bounded request.',
+    'The final sentence closes the paragraph cleanly.',
+  ]
+  const result = splitLargeVoicePlanSegments([
+    { text: sentences.join(' '), voice: 'narrator', tagId: 'speech-1' },
+  ], 120)
+
+  assert.deepEqual(result, sentences.map(text => ({ text, voice: 'narrator', tagId: 'speech-1' })))
+})
+
+test('falls back to safe word boundaries for long sentences and preserves plan metadata', () => {
+  const text = Array.from({ length: 45 }, (_, index) => `word${index}`).join(' ')
+  const result = splitLargeVoicePlanSegments([{ text, voice: 'ruby', tagId: 'speech-2' }], 100)
+
+  assert.ok(result.length > 1)
+  assert.ok(result.every(segment => segment.text.length <= 100))
+  assert.ok(result.every(segment => segment.voice === 'ruby' && segment.tagId === 'speech-2'))
+  assert.equal(result.map(segment => segment.text).join(' '), text)
+})
+
+test('leaves ordinary synthesis jobs unchanged', () => {
+  assert.deepEqual(
+    splitLargeVoicePlanSegments([{ text: 'A short paragraph.', voice: 'alice' }]),
+    [{ text: 'A short paragraph.', voice: 'alice' }],
+  )
 })
 
 test('builds emotion, sound, and pause questions per speech', () => {

@@ -23,6 +23,7 @@ import {
   speakerAliases,
   speakerAliasIdLookup,
   speakersForMessageRole,
+  splitLargeVoicePlanSegments,
   shouldPersistMessageAudio,
   UNCAST_SPEAKER_ID,
   USER_SPEAKER_ID,
@@ -2592,6 +2593,7 @@ export function setup(ctx: SpindleFrontendContext) {
         narrativeBefore: string
         narrativeAfter: string
       }>()
+      let synthesisPlanFrozen = false
       for (const segment of segments) {
         // Multi-paragraph speeches are split into separate TTS requests. Keep
         // the deterministic placement there so one speech-level placement
@@ -2644,6 +2646,13 @@ export function setup(ctx: SpindleFrontendContext) {
               + `\u0000${source.narrativeBefore}\u0000${source.narrativeAfter}`,
             placement.text,
           )
+          if (synthesisPlanFrozen) {
+            appendSpeakerDebugLog(
+              `TTS tag placement [${placement.id}] arrived after synthesis-plan freeze; `
+                + 'cached for the next playback without changing the active plan.',
+            )
+            continue
+          }
           for (const index of tagIndexes.get(placement.id) ?? []) {
             plan[index] = { ...plan[index], text: placement.text }
           }
@@ -2834,6 +2843,15 @@ export function setup(ctx: SpindleFrontendContext) {
             }
           })()
         }
+      }
+      synthesisPlanFrozen = true
+      const splitPlan = splitLargeVoicePlanSegments(plan)
+      if (splitPlan.length !== plan.length) {
+        appendSpeakerDebugLog(
+          `Split ${plan.length} paragraph-level TTS job${plan.length === 1 ? '' : 's'} into `
+            + `${splitPlan.length} latency-sized segments.`,
+        )
+        plan.splice(0, plan.length, ...splitPlan)
       }
       if (plan.length === 0) throw new Error('This message has no playable narration or dialogue.')
       if (preferences.speakerAssignmentDebug) {
