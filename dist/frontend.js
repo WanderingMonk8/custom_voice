@@ -362,8 +362,8 @@ var INTRODUCTORY_PREPOSITIONAL_PHRASE_PATTERN = new RegExp(
 function unconfiguredSpeakerId(name) {
   return `unconfigured:${normalizeSpeakerName(name).toLowerCase()}`;
 }
-function addUnconfiguredDialogueSpeakers(content, speakers) {
-  const preparedContent = preparePlaybackContent(content);
+function addUnconfiguredDialogueSpeakers(content, speakers, skippedTrackerTagPairs = "") {
+  const preparedContent = preparePlaybackContent(content, skippedTrackerTagPairs);
   const result = [...speakers];
   const knownAliases = new Set(result.flatMap((speaker) => speakerAliases(speaker.name).map((alias) => alias.toLowerCase())));
   const addCandidate = (rawName, explicitlyAttributed = false) => {
@@ -3279,7 +3279,8 @@ function setup(ctx) {
           playbackChat.characters,
           message.is_user,
           message.name
-        )
+        ),
+        preferences.skippedTrackerTags
       );
       const defaultSpeakerId = message.is_user ? USER_SPEAKER_ID : eligibleCardFallbackSpeakerId(
         message.content,
@@ -3447,7 +3448,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
             `TTS tag placement chunk 1/${chunks.length} started with ${chunks[0].length} speeches.`
           );
           const firstPlacement = requestTagPlacements(
-            message.content,
+            preparePlaybackContent(message.content, preferences.skippedTrackerTags),
             placementStyle,
             preferences.tagLlmConnectionId,
             preferences.tagLlmModel,
@@ -3491,7 +3492,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
               );
               try {
                 const placements = await requestTagPlacements(
-                  message.content,
+                  preparePlaybackContent(message.content, preferences.skippedTrackerTags),
                   placementStyle,
                   preferences.tagLlmConnectionId,
                   preferences.tagLlmModel,
