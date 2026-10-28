@@ -19,6 +19,7 @@ import {
   parseRosterVoiceSegments,
   playbackVoiceForSpeaker,
   preferredCardSpeakerId,
+  preparePlaybackContent,
   readSavedAudioHistory,
   reducedRequestWindowLimit,
   rollingRequestWindowDelay,
@@ -2495,6 +2496,7 @@ export function setup(ctx: SpindleFrontendContext) {
           message.is_user,
           message.name,
         ),
+        preferences.skippedTrackerTags,
       )
       const defaultSpeakerId = message.is_user
         ? USER_SPEAKER_ID
@@ -2776,7 +2778,7 @@ export function setup(ctx: SpindleFrontendContext) {
             `TTS tag placement chunk 1/${chunks.length} started with ${chunks[0].length} speeches.`,
           )
           const firstPlacement = requestTagPlacements(
-            message.content,
+            preparePlaybackContent(message.content, preferences.skippedTrackerTags),
             placementStyle,
             preferences.tagLlmConnectionId,
             preferences.tagLlmModel,
@@ -2824,7 +2826,7 @@ export function setup(ctx: SpindleFrontendContext) {
               )
               try {
                 const placements = await requestTagPlacements(
-                  message.content,
+                  preparePlaybackContent(message.content, preferences.skippedTrackerTags),
                   placementStyle,
                   preferences.tagLlmConnectionId,
                   preferences.tagLlmModel,

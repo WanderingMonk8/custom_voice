@@ -2032,6 +2032,35 @@ test('routes clear unconfigured dialogue subjects through connection-default voi
   assert.equal(playbackVoiceForSpeaker(segments[1].speakerId, false, {}, '', 'user-voice'), '')
 })
 
+test('excludes skipped tracker identities from speaker discovery and Jev context', () => {
+  const content = [
+    'She opens her sketchbook.',
+    '“The eyes are wrong.”',
+    '<sola_hud digest="morning"><thought_engine>',
+    'Sola says, “What is your goal?”',
+    'Sola says, “How do you feel?”',
+    '</thought_engine></sola_hud>',
+    '<chatterbox><sola_text>Sola says, “Another thought.”</sola_text></chatterbox>',
+  ].join('\n\n')
+  const configured = [{ id: 'jayden', name: 'Jayden Flynn / Jayden' }]
+  const skipped = 'sola_hud, chatterbox'
+  const speakers = addUnconfiguredDialogueSpeakers(content, configured, skipped)
+  const plan = buildSpeakerDecisionPlan(content, speakers, false, skipped)
+
+  assert.deepEqual(speakers, configured)
+  assert.equal(eligibleCardFallbackSpeakerId(content, 'jayden', speakers, skipped), 'jayden')
+  assert.deepEqual(plan.state.speakers.map(speaker => speaker.id), ['jayden'])
+  assert.equal(plan.state.speeches.length, 1)
+  assert.doesNotMatch(JSON.stringify(plan.state), /Sola|goal|Another thought/u)
+  assert.deepEqual(
+    parseRosterVoiceSegments(content, 'jayden', speakers, skipped)
+      .filter(segment => segment.speakerId !== null)
+      .map(segment => segment.speakerId),
+    ['jayden'],
+  )
+  assert.ok(addUnconfiguredDialogueSpeakers(content, configured).some(speaker => speaker.name === 'Sola'))
+})
+
 test('does not mistake capitalized narrative words for unconfigured speakers', () => {
   const content = [
     'Across the room, she closes the window.',

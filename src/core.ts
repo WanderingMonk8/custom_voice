@@ -931,8 +931,9 @@ export function unconfiguredSpeakerId(name: string): string {
 export function addUnconfiguredDialogueSpeakers(
   content: string,
   speakers: CharacterLike[],
+  skippedTrackerTagPairs = '',
 ): CharacterLike[] {
-  const preparedContent = preparePlaybackContent(content)
+  const preparedContent = preparePlaybackContent(content, skippedTrackerTagPairs)
   const result = [...speakers]
   const knownAliases = new Set(result.flatMap(speaker => (
     speakerAliases(speaker.name).map(alias => alias.toLowerCase())
@@ -3720,7 +3721,7 @@ export const TTS_TAG_SCHEMA = 'tts-tags-6'
 
 /** Bump a version whenever a stage changes the output stored in the cache. */
 export const SPEAKER_DECISION_SCHEMA = {
-  classifier: 'jev-3',
+  classifier: 'jev-4',
   discourse: 'discourse-1',
   hardBoundary: 'boundary-1',
   turns: 'turn-1',

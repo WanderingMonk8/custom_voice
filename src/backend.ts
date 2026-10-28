@@ -850,6 +850,7 @@ function queueSpeakerParse(
     const speakers: CharacterLike[] = addUnconfiguredDialogueSpeakers(
       message.content ?? '',
       configuredSpeakers,
+      skippedTrackerTags,
     )
     const namedSpeakerSubject = hasNamedSpeakerSubject(
       message.content ?? '',
@@ -882,7 +883,7 @@ function queueSpeakerParse(
         const previous = messages[index]
         if (previous.is_user) continue
         const previousSpeakers = searchForLastClearIdentity
-          ? addUnconfiguredDialogueSpeakers(previous.content ?? '', speakers)
+          ? addUnconfiguredDialogueSpeakers(previous.content ?? '', speakers, skippedTrackerTags)
           : speakers
         const candidate = previousAssistantSpeakerFallback(
           message.content ?? '',

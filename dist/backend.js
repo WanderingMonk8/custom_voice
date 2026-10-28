@@ -325,8 +325,8 @@ var INTRODUCTORY_PREPOSITIONAL_PHRASE_PATTERN = new RegExp(
 function unconfiguredSpeakerId(name) {
   return `unconfigured:${normalizeSpeakerName(name).toLowerCase()}`;
 }
-function addUnconfiguredDialogueSpeakers(content, speakers) {
-  const preparedContent = preparePlaybackContent(content);
+function addUnconfiguredDialogueSpeakers(content, speakers, skippedTrackerTagPairs = "") {
+  const preparedContent = preparePlaybackContent(content, skippedTrackerTagPairs);
   const result = [...speakers];
   const knownAliases = new Set(result.flatMap((speaker) => speakerAliases(speaker.name).map((alias) => alias.toLowerCase())));
   const addCandidate = (rawName, explicitlyAttributed = false) => {
@@ -2258,7 +2258,7 @@ var SPEAKER_DECISION_THRESHOLDS = {
 };
 var TTS_TAG_SCHEMA = "tts-tags-6";
 var SPEAKER_DECISION_SCHEMA = {
-  classifier: "jev-3",
+  classifier: "jev-4",
   discourse: "discourse-1",
   hardBoundary: "boundary-1",
   turns: "turn-1",
@@ -4018,7 +4018,8 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
     const messageIndex = messages.findIndex((item) => item.id === payload.messageId);
     const speakers = addUnconfiguredDialogueSpeakers(
       message.content ?? "",
-      configuredSpeakers
+      configuredSpeakers,
+      skippedTrackerTags
     );
     const namedSpeakerSubject = hasNamedSpeakerSubject(
       message.content ?? "",
@@ -4042,7 +4043,7 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
       for (let index = messageIndex - 1; index >= 0; index--) {
         const previous = messages[index];
         if (previous.is_user) continue;
-        const previousSpeakers = searchForLastClearIdentity ? addUnconfiguredDialogueSpeakers(previous.content ?? "", speakers) : speakers;
+        const previousSpeakers = searchForLastClearIdentity ? addUnconfiguredDialogueSpeakers(previous.content ?? "", speakers, skippedTrackerTags) : speakers;
         const candidate = previousAssistantSpeakerFallback(
           message.content ?? "",
           previous.content ?? "",
