@@ -5,12 +5,12 @@ var UNCAST_SPEAKER_ID = "__chat_voice_uncast__";
 var DEFAULT_MESSAGE_LIMIT = 20;
 var MIN_MESSAGE_LIMIT = 1;
 var MAX_MESSAGE_LIMIT = 500;
-function speakersForMessageRole(speakers, isUserMessage, userName = "User") {
+function speakersForMessageRole(speakers, _isUserMessage, userName = "User") {
   const nonUserSpeakers = speakers.filter((speaker) => speaker.id !== USER_SPEAKER_ID);
-  return isUserMessage ? [
+  return [
     ...nonUserSpeakers,
     { id: USER_SPEAKER_ID, name: normalizeSpeakerName(userName) || "User" }
-  ] : nonUserSpeakers;
+  ];
 }
 function isRecord(value) {
   return !!value && typeof value === "object" && !Array.isArray(value);
@@ -1189,7 +1189,7 @@ function speakerDecisionCriteria(stateSpeakers) {
   return Object.fromEntries([
     ...stateSpeakers.map((speaker) => [
       speaker.option,
-      `${speaker.name}, including these aliases: ${speaker.aliases.join(", ")}`
+      speaker.id === USER_SPEAKER_ID ? `The user persona (${speaker.name}; aliases: ${speaker.aliases.join(", ")}). Select only when the text supports this identity; other unnamed people may be uncast.` : `${speaker.name}, including these aliases: ${speaker.aliases.join(", ")}`
     ]),
     [DECISION_UNCAST_OPTION, "A specific character present in the text who is not one of the known speakers."],
     [DECISION_UNCLEAR_OPTION, "The text does not establish a reliable character identity."]
@@ -2316,7 +2316,7 @@ var SPEAKER_DECISION_THRESHOLDS = {
 };
 var TTS_TAG_SCHEMA = "tts-tags-7";
 var SPEAKER_DECISION_SCHEMA = {
-  classifier: "jev-4",
+  classifier: "jev-5",
   discourse: "discourse-1",
   hardBoundary: "boundary-1",
   turns: "turn-1",

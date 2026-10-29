@@ -87,16 +87,14 @@ export interface CharacterLike {
 
 export function speakersForMessageRole<T extends CharacterLike>(
   speakers: T[],
-  isUserMessage: boolean,
+  _isUserMessage: boolean,
   userName = 'User',
 ): Array<T | CharacterLike> {
   const nonUserSpeakers = speakers.filter(speaker => speaker.id !== USER_SPEAKER_ID)
-  return isUserMessage
-    ? [
-        ...nonUserSpeakers,
-        { id: USER_SPEAKER_ID, name: normalizeSpeakerName(userName) || 'User' },
-      ]
-    : nonUserSpeakers
+  return [
+    ...nonUserSpeakers,
+    { id: USER_SPEAKER_ID, name: normalizeSpeakerName(userName) || 'User' },
+  ]
 }
 
 export interface DetectedCharacter extends CharacterLike {
@@ -172,7 +170,7 @@ export function playbackVoiceForSpeaker(
   narratorVoice: string,
   userVoice: string,
 ): string {
-  if (speakerId === USER_SPEAKER_ID) return isUserMessage ? userVoice : ''
+  if (speakerId === USER_SPEAKER_ID) return userVoice
   if (speakerId) return characterVoices[speakerId] || ''
   return narratorVoice
 }
@@ -2214,7 +2212,9 @@ function speakerDecisionCriteria(
   return Object.fromEntries([
     ...stateSpeakers.map(speaker => [
       speaker.option,
-      `${speaker.name}, including these aliases: ${speaker.aliases.join(', ')}`,
+      speaker.id === USER_SPEAKER_ID
+        ? `The user persona (${speaker.name}; aliases: ${speaker.aliases.join(', ')}). Select only when the text supports this identity; other unnamed people may be uncast.`
+        : `${speaker.name}, including these aliases: ${speaker.aliases.join(', ')}`,
     ]),
     [DECISION_UNCAST_OPTION, 'A specific character present in the text who is not one of the known speakers.'],
     [DECISION_UNCLEAR_OPTION, 'The text does not establish a reliable character identity.'],
@@ -3794,7 +3794,7 @@ export const TTS_TAG_SCHEMA = 'tts-tags-7'
 
 /** Bump a version whenever a stage changes the output stored in the cache. */
 export const SPEAKER_DECISION_SCHEMA = {
-  classifier: 'jev-4',
+  classifier: 'jev-5',
   discourse: 'discourse-1',
   hardBoundary: 'boundary-1',
   turns: 'turn-1',

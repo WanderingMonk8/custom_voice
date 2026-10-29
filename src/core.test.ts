@@ -2015,24 +2015,68 @@ test('uses the user role as the default speaker for unattributed user dialogue',
   )
 })
 
-test('only exposes the dedicated user speaker while parsing user messages', () => {
+test('exposes the dedicated user speaker for both message roles', () => {
   const cast = [{ id: 'card', name: 'Card Character' }]
 
-  assert.deepEqual(speakersForMessageRole(cast, false, 'Ken'), cast)
+  assert.deepEqual(speakersForMessageRole(cast, false, 'Ken'), [
+    ...cast,
+    { id: USER_SPEAKER_ID, name: 'Ken' },
+  ])
   assert.deepEqual(speakersForMessageRole(cast, true, 'Ken'), [
     ...cast,
     { id: USER_SPEAKER_ID, name: 'Ken' },
   ])
 })
 
-test('uses the connection default for unset NPCs and stray user assignments in assistant messages', () => {
+test('uses the user voice for the user persona and the connection default for unset NPCs', () => {
   const voices = { configured: 'character-voice', unset: '' }
 
   assert.equal(playbackVoiceForSpeaker('configured', false, voices, 'narrator', 'user-voice'), 'character-voice')
   assert.equal(playbackVoiceForSpeaker('unset', false, voices, 'narrator', 'user-voice'), '')
-  assert.equal(playbackVoiceForSpeaker(USER_SPEAKER_ID, false, voices, 'narrator', 'user-voice'), '')
+  assert.equal(playbackVoiceForSpeaker(USER_SPEAKER_ID, false, voices, 'narrator', 'user-voice'), 'user-voice')
   assert.equal(playbackVoiceForSpeaker(USER_SPEAKER_ID, true, voices, 'narrator', 'user-voice'), 'user-voice')
   assert.equal(playbackVoiceForSpeaker(null, false, voices, 'narrator', 'user-voice'), 'narrator')
+})
+
+test('Jev can assign an assistant-message exchange to the user without claiming uncast dialogue', () => {
+  const content = [
+    'Mira catches her breath. "Mmh."',
+    'He waits. "How is it, my love?"',
+    'Her answer is small and honest: "It is a lot."',
+    'The clerk says, "Next."',
+  ].join('\n\n')
+  const speakers = speakersForMessageRole([{ id: 'mira', name: 'Mira' }], false, 'Ken')
+  const plan = buildSpeakerDecisionPlan(content, speakers, false)
+  const mira = decisionOption(plan, 'mira')
+  const user = decisionOption(plan, USER_SPEAKER_ID)
+  assert.match(plan.questions.speech_s1.criteria[user], /user persona/u)
+  const resolved = resolveSpeakerDecisionSegments(content, plan, {
+    speech_s0: confidentDecision(mira),
+    speech_s1: confidentDecision(user),
+    speech_s2: confidentDecision(mira),
+    speech_s3: confidentDecision(DECISION_UNCAST_CRITERION),
+  }, speakers, { isUserMessage: false, cardSpeakerId: 'mira', historicalSpeakerId: null })
+  assert.equal(resolved.find(segment => segment.text === 'How is it, my love?')?.speakerId, USER_SPEAKER_ID)
+  assert.equal(resolved.find(segment => segment.text === 'Next.')?.speakerId, UNCAST_SPEAKER_ID)
+  assert.equal(playbackVoiceForSpeaker(USER_SPEAKER_ID, false, {}, 'narrator', 'user-voice'), 'user-voice')
+  assert.equal(playbackVoiceForSpeaker(UNCAST_SPEAKER_ID, false, {}, 'narrator', 'user-voice'), '')
+  assert.equal(playbackVoiceForSpeaker(null, false, {}, 'narrator', 'user-voice'), 'narrator')
+})
+
+test('assistant speech explicitly attributed to the user uses the user identity', () => {
+  const speakers = speakersForMessageRole([{ id: 'mira', name: 'Mira' }], false, 'Ken')
+  const segments = parseRosterVoiceSegments('Ken says, "Hello."', null, speakers)
+  assert.equal(segments.find(segment => segment.text === 'Hello.')?.speakerId, USER_SPEAKER_ID)
+})
+
+test('adding a user candidate does not make them the fallback for nameless assistant dialogue', () => {
+  const speakers = speakersForMessageRole([{ id: 'mira', name: 'Mira' }], false, 'Ken')
+  const content = 'She looks up. "Hello."'
+  const plan = buildSpeakerDecisionPlan(content, speakers, false)
+  const result = resolveSpeakerDecisionSegments(content, plan, {}, speakers, {
+    isUserMessage: false, cardSpeakerId: 'mira', historicalSpeakerId: null,
+  })
+  assert.equal(result.find(segment => segment.text === 'Hello.')?.speakerId, 'mira')
 })
 
 test('routes clear unconfigured dialogue subjects through connection-default voices', () => {

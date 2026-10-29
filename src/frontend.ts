@@ -2494,7 +2494,7 @@ export function setup(ctx: SpindleFrontendContext) {
         speakersForMessageRole(
           playbackChat.characters,
           message.is_user,
-          message.name,
+          message.is_user ? message.name : 'User',
         ),
         preferences.skippedTrackerTags,
       )
