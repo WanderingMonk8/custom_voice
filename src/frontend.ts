@@ -1530,6 +1530,35 @@ export function setup(ctx: SpindleFrontendContext) {
     },
   })
 
+  function createRoleFavoritePicker(role: 'narrator' | 'user'): HTMLSelectElement {
+    const picker = document.createElement('select')
+    picker.className = 'chat-voice-favorite-select'
+    picker.style.marginTop = '7px'
+    picker.setAttribute('aria-label', `Favorite voice for ${role}`)
+    picker.disabled = true
+    picker.addEventListener('change', () => {
+      const voice = picker.value
+      if (!voice || !activeChat) return
+      const input = role === 'narrator' ? narratorInput : userVoiceInput
+      input.update({ value: voice })
+      picker.value = ''
+      if (role === 'narrator') {
+        if (useGlobalNarratorVoice) { defaultNarratorVoice = voice; scheduleGlobalRoleVoiceSave('narrator') }
+        else { localNarratorVoice = voice; markChanged() }
+      } else {
+        if (useGlobalUserVoice) { defaultUserVoice = voice; scheduleGlobalRoleVoiceSave('user') }
+        else { localUserVoice = voice; markChanged() }
+      }
+    })
+    return picker
+  }
+  const narratorFavoritePicker = createRoleFavoritePicker('narrator')
+  const userFavoritePicker = createRoleFavoritePicker('user')
+  narratorField.slot.appendChild(narratorFavoritePicker)
+  userVoiceField.slot.appendChild(userFavoritePicker)
+  favoritePickers.add(narratorFavoritePicker)
+  favoritePickers.add(userFavoritePicker)
+
   const skippedTrackerTagsInput = ctx.components.mountTextArea(skippedTagsField.slot, {
     value: '',
     placeholder: 'tracker, status, <o_ledger></o_l>',
@@ -3696,12 +3725,15 @@ export function setup(ctx: SpindleFrontendContext) {
     for (const input of characterInputs.values()) input.destroy()
     characterInputs.clear()
     favoritePickers.clear()
+    favoritePickers.add(narratorFavoritePicker)
+    favoritePickers.add(userFavoritePicker)
     characterList.replaceChildren()
     if (characters.length === 0) {
       const empty = document.createElement('div')
       empty.className = 'chat-voice-empty'
       empty.textContent = 'No saved characters yet. Click Scan to read the active character card.'
       characterList.appendChild(empty)
+      updateFavoritePickers()
       return
     }
 
