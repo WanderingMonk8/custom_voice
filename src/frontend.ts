@@ -5,6 +5,7 @@ import type {
 import {
   adaptiveGenerationConcurrency,
   addUnconfiguredDialogueSpeakers,
+  addFavoriteVoice,
   bufferAwareGenerationConcurrency,
   collectUncastVoiceGroups,
   availableUncastVoices,
@@ -1186,7 +1187,12 @@ export function setup(ctx: SpindleFrontendContext) {
   favoriteList.setAttribute('role', 'region')
   favoriteList.setAttribute('aria-label', 'Favorite voices')
   favoriteList.tabIndex = 0
-  favoritesSection.append(favoriteForm, favoriteList)
+  const favoriteError = document.createElement('div')
+  favoriteError.className = 'chat-voice-status'
+  favoriteError.dataset.state = 'error'
+  favoriteError.setAttribute('role', 'alert')
+  favoriteError.hidden = true
+  favoritesSection.append(favoriteForm, favoriteError, favoriteList)
   const status = document.createElement('div')
   status.className = 'chat-voice-status'
   status.setAttribute('role', 'status')
@@ -3561,19 +3567,26 @@ export function setup(ctx: SpindleFrontendContext) {
     }
   }
 
-  async function saveFavoriteVoices(next: FavoriteVoice[]): Promise<boolean> {
+  async function saveFavoriteVoices(next: FavoriteVoice[], adding?: FavoriteVoice): Promise<boolean> {
     if (favoritesSaving) return false
     favoritesSaving = true
     favoriteAdd.disabled = true
     try {
-      await updateVoiceSettings(current => ({ ...current, chatVoiceFavoriteVoices: next }))
-      favoriteVoices = next
+      let savedVoices = next
+      await updateVoiceSettings(current => {
+        if (adding) savedVoices = addFavoriteVoice(readFavoriteVoices(current.chatVoiceFavoriteVoices), adding)
+        return { ...current, chatVoiceFavoriteVoices: savedVoices }
+      })
+      favoriteVoices = savedVoices
+      favoriteError.hidden = true
       renderFavoriteVoices()
       updateFavoritePickers()
       setStatus('Favorite voices saved globally.', 'saved')
       return true
     } catch (error) {
-      setStatus(error instanceof Error ? error.message : 'Could not save favorite voices.', 'error')
+      const message = error instanceof Error ? error.message : 'Could not save favorite voices.'
+      if (adding) { favoriteError.textContent = message; favoriteError.hidden = false }
+      setStatus(message, 'error')
       return false
     } finally {
       favoritesSaving = false
@@ -3663,12 +3676,19 @@ export function setup(ctx: SpindleFrontendContext) {
 
   favoriteAdd.addEventListener('click', () => {
     const id = favoriteId.value.trim().slice(0, 512)
-    if (!id) { setStatus('Enter a voice ID to add a favorite.', 'error'); return }
-    if (favoriteVoices.length >= 500) { setStatus('The favorites list is limited to 500 voices.', 'error'); return }
-    if (favoriteVoices.some(voice => voice.id === id)) { setStatus('That voice ID is already a favorite.', 'error'); return }
     const category = favoriteCategory.value === 'male' || favoriteCategory.value === 'female'
       ? favoriteCategory.value : 'unspecified'
-    void saveFavoriteVoices([...favoriteVoices, { id, name: favoriteName.value.trim().slice(0, 128), category, description: favoriteDescription.value.trim().slice(0, 500) }])
+    const voice: FavoriteVoice = { id, name: favoriteName.value.trim().slice(0, 128), category, description: favoriteDescription.value.trim().slice(0, 500) }
+    let next: FavoriteVoice[]
+    try { next = addFavoriteVoice(favoriteVoices, voice) } catch (error) {
+      const message = error instanceof Error ? error.message : 'Could not add favorite voice.'
+      favoriteError.textContent = message
+      favoriteError.hidden = false
+      favoriteId.focus()
+      return
+    }
+    favoriteError.hidden = true
+    void saveFavoriteVoices(next, voice)
       .then(saved => { if (saved) { favoriteName.value = ''; favoriteId.value = ''; favoriteDescription.value = '' } })
   })
 

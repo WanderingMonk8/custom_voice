@@ -23,6 +23,13 @@ function readFavoriteVoices(value) {
   }
   return result;
 }
+function addFavoriteVoice(existing, voice) {
+  const id = voice.id.trim().slice(0, 512);
+  if (!id) throw new Error("Enter a voice ID to add a favorite.");
+  if (existing.some((item) => item.id === id)) throw new Error("That voice ID is already a favorite.");
+  if (existing.length >= 500) throw new Error("The favorites list is limited to 500 voices.");
+  return [...existing, { ...voice, id }];
+}
 var GHOST_VOICE_LIFETIME_MESSAGES = 10;
 function collectUncastVoiceGroups(segments) {
   const groups = [];
@@ -2298,7 +2305,12 @@ function setup(ctx) {
   favoriteList.setAttribute("role", "region");
   favoriteList.setAttribute("aria-label", "Favorite voices");
   favoriteList.tabIndex = 0;
-  favoritesSection.append(favoriteForm, favoriteList);
+  const favoriteError = document.createElement("div");
+  favoriteError.className = "chat-voice-status";
+  favoriteError.dataset.state = "error";
+  favoriteError.setAttribute("role", "alert");
+  favoriteError.hidden = true;
+  favoritesSection.append(favoriteForm, favoriteError, favoriteList);
   const status = document.createElement("div");
   status.className = "chat-voice-status";
   status.setAttribute("role", "status");
@@ -4227,19 +4239,29 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
       setStatus(error instanceof Error ? `Voice preview failed: ${error.message}` : "Voice preview failed.", "error");
     }
   }
-  async function saveFavoriteVoices(next) {
+  async function saveFavoriteVoices(next, adding) {
     if (favoritesSaving) return false;
     favoritesSaving = true;
     favoriteAdd.disabled = true;
     try {
-      await updateVoiceSettings((current) => ({ ...current, chatVoiceFavoriteVoices: next }));
-      favoriteVoices = next;
+      let savedVoices = next;
+      await updateVoiceSettings((current) => {
+        if (adding) savedVoices = addFavoriteVoice(readFavoriteVoices(current.chatVoiceFavoriteVoices), adding);
+        return { ...current, chatVoiceFavoriteVoices: savedVoices };
+      });
+      favoriteVoices = savedVoices;
+      favoriteError.hidden = true;
       renderFavoriteVoices();
       updateFavoritePickers();
       setStatus("Favorite voices saved globally.", "saved");
       return true;
     } catch (error) {
-      setStatus(error instanceof Error ? error.message : "Could not save favorite voices.", "error");
+      const message = error instanceof Error ? error.message : "Could not save favorite voices.";
+      if (adding) {
+        favoriteError.textContent = message;
+        favoriteError.hidden = false;
+      }
+      setStatus(message, "error");
       return false;
     } finally {
       favoritesSaving = false;
@@ -4331,20 +4353,20 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
   }
   favoriteAdd.addEventListener("click", () => {
     const id = favoriteId.value.trim().slice(0, 512);
-    if (!id) {
-      setStatus("Enter a voice ID to add a favorite.", "error");
-      return;
-    }
-    if (favoriteVoices.length >= 500) {
-      setStatus("The favorites list is limited to 500 voices.", "error");
-      return;
-    }
-    if (favoriteVoices.some((voice) => voice.id === id)) {
-      setStatus("That voice ID is already a favorite.", "error");
-      return;
-    }
     const category = favoriteCategory.value === "male" || favoriteCategory.value === "female" ? favoriteCategory.value : "unspecified";
-    void saveFavoriteVoices([...favoriteVoices, { id, name: favoriteName.value.trim().slice(0, 128), category, description: favoriteDescription.value.trim().slice(0, 500) }]).then((saved) => {
+    const voice = { id, name: favoriteName.value.trim().slice(0, 128), category, description: favoriteDescription.value.trim().slice(0, 500) };
+    let next;
+    try {
+      next = addFavoriteVoice(favoriteVoices, voice);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Could not add favorite voice.";
+      favoriteError.textContent = message;
+      favoriteError.hidden = false;
+      favoriteId.focus();
+      return;
+    }
+    favoriteError.hidden = true;
+    void saveFavoriteVoices(next, voice).then((saved) => {
       if (saved) {
         favoriteName.value = "";
         favoriteId.value = "";

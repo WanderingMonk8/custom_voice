@@ -4,6 +4,7 @@ import {
   adaptiveGenerationConcurrency,
   addScannedFirstNameAliases,
   addUnconfiguredDialogueSpeakers,
+  addFavoriteVoice,
   mergeScannedCardCast,
   applyConfigToMetadata,
   applyCustomTtsEmotionCues,
@@ -1930,6 +1931,14 @@ test('validates favorite voice IDs and classifications', () => {
     { id: 'voice-3', name: '', category: 'unspecified', description: '' },
   ])
   assert.deepEqual(readFavoriteVoices(null), [])
+})
+
+test('rejects duplicate favorite voice IDs even if names differ or whitespace is present', () => {
+  const existing = readFavoriteVoices([{ id: 'Voice-1', name: 'First' }])
+  const duplicate = { id: ' Voice-1 ', name: 'Another', category: 'male' as const, description: '' }
+  assert.throws(() => addFavoriteVoice(existing, duplicate), /already a favorite/u)
+  assert.deepEqual(existing.map(voice => voice.name), ['First'])
+  assert.equal(addFavoriteVoice(existing, { ...duplicate, id: 'voice-1' }).length, 2)
 })
 
 test('matches uncast voice groups without using cast voices or crossing gender categories', () => {
