@@ -48,6 +48,7 @@ import {
   reducedRequestWindowLimit,
   readConfig,
   readSavedAudioHistory,
+  readFavoriteVoices,
   resolveSpeakerDecisionSegments,
   resolveSpeakerDiscourseAnswers,
   resolveTtsTagAnswers,
@@ -1909,6 +1910,21 @@ test('clamps the configurable message window', () => {
   assert.equal(clampMessageLimit(0), 1)
   assert.equal(clampMessageLimit(20.4), 20)
   assert.equal(clampMessageLimit(999), 500)
+})
+
+test('validates favorite voice IDs and classifications', () => {
+  assert.deepEqual(readFavoriteVoices([
+    { id: ' voice-1 ', name: ' Alice ', category: 'female' },
+    { id: 'voice-2', name: 'Bob', category: 'male' },
+    { id: 'voice-3', category: 'other' },
+    { id: 'voice-1', name: 'Duplicate', category: 'male' },
+    { id: ' ' }, null,
+  ]), [
+    { id: 'voice-1', name: 'Alice', category: 'female' },
+    { id: 'voice-2', name: 'Bob', category: 'male' },
+    { id: 'voice-3', name: '', category: 'unspecified' },
+  ])
+  assert.deepEqual(readFavoriteVoices(null), [])
 })
 
 test('defaults and clamps the global saved audio limit', () => {

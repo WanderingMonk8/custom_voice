@@ -7,6 +7,33 @@ export const MAX_MESSAGE_LIMIT = 500
 export const DEFAULT_SAVED_AUDIO_LIMIT = 50
 export const MAX_SAVED_AUDIO_LIMIT = 10_000
 
+export interface FavoriteVoice {
+  id: string
+  name: string
+  category: 'male' | 'female' | 'unspecified'
+}
+
+/** Validate globally saved favorites without changing the case of provider IDs. */
+export function readFavoriteVoices(value: unknown): FavoriteVoice[] {
+  if (!Array.isArray(value)) return []
+  const seen = new Set<string>()
+  const result: FavoriteVoice[] = []
+  for (const item of value.slice(0, 500)) {
+    if (!item || typeof item !== 'object') continue
+    const row = item as Record<string, unknown>
+    if (typeof row.id !== 'string') continue
+    const id = row.id.trim().slice(0, 512)
+    if (!id || seen.has(id)) continue
+    seen.add(id)
+    result.push({
+      id,
+      name: typeof row.name === 'string' ? row.name.trim().slice(0, 128) : '',
+      category: row.category === 'male' || row.category === 'female' ? row.category : 'unspecified',
+    })
+  }
+  return result
+}
+
 export interface SavedAudioRecord {
   chatId: string
   messageId: string

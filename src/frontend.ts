@@ -21,6 +21,7 @@ import {
   preferredCardSpeakerId,
   preparePlaybackContent,
   readSavedAudioHistory,
+  readFavoriteVoices,
   reducedRequestWindowLimit,
   rollingRequestWindowDelay,
   speakerAliases,
@@ -32,6 +33,7 @@ import {
   USER_SPEAKER_ID,
   upsertSavedAudioRecord,
   type PlaybackSegment,
+  type FavoriteVoice,
   type SavedAudioRecord,
 } from './core'
 
@@ -332,6 +334,7 @@ interface PlaybackPreferences {
   speakerAssignmentDebug: boolean
   defaultNarratorVoice: string
   defaultUserVoice: string
+  favoriteVoices: FavoriteVoice[]
 }
 
 function clampIntegerSetting(value: unknown, fallback: number, maximum: number): number {
@@ -392,6 +395,7 @@ async function loadPlaybackPreferences(): Promise<PlaybackPreferences> {
     speakerAssignmentDebug: false,
     defaultNarratorVoice: '',
     defaultUserVoice: '',
+    favoriteVoices: [],
   }
   const row = await response.json() as { value?: Record<string, unknown> }
   const speed = typeof row.value?.ttsSpeed === 'number' ? row.value.ttsSpeed : 1
@@ -447,6 +451,7 @@ async function loadPlaybackPreferences(): Promise<PlaybackPreferences> {
     defaultUserVoice: typeof row.value?.chatVoiceDefaultUserVoice === 'string'
       ? row.value.chatVoiceDefaultUserVoice.trim().slice(0, 512)
       : '',
+    favoriteVoices: readFavoriteVoices(row.value?.chatVoiceFavoriteVoices),
   }
 }
 
@@ -949,6 +954,18 @@ export function setup(ctx: SpindleFrontendContext) {
       border:1px dashed var(--lumiverse-border); border-radius:var(--lumiverse-radius);
     }
     .chat-voice-add-row { display:grid; grid-template-columns:minmax(0, 1fr) auto; gap:8px; }
+    .chat-voice-favorites { display:flex; flex-direction:column; gap:8px; }
+    .chat-voice-favorite-form { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+    .chat-voice-favorite-form input, .chat-voice-favorite-select, .chat-voice-favorite-form select {
+      min-width:0; width:100%; box-sizing:border-box; min-height:36px; padding:7px 9px;
+      border:1px solid var(--lumiverse-border); border-radius:var(--lumiverse-radius);
+      background:var(--lumiverse-bg-secondary, #222); color:var(--lumiverse-text); font:inherit; font-size:12px;
+    }
+    .chat-voice-favorite-row { display:flex; flex-wrap:wrap; align-items:center; gap:8px; }
+    .chat-voice-favorite-copy { flex:1 1 100px; min-width:0; overflow-wrap:anywhere; color:var(--lumiverse-text); font-size:12px; }
+    .chat-voice-favorite-copy small { display:block; color:var(--lumiverse-text-muted); }
+    .chat-voice-preview-button { min-height:28px; padding:0 8px; border:1px solid var(--lumiverse-border);
+      border-radius:6px; background:var(--lumiverse-fill-subtle); color:var(--lumiverse-text); font:inherit; font-size:11px; cursor:pointer; }
     .chat-voice-add-button, .chat-voice-rename-button, .chat-voice-delete-button {
       border:1px solid var(--lumiverse-border); border-radius:6px; background:var(--lumiverse-fill-subtle);
       color:var(--lumiverse-text); font:inherit; cursor:pointer;
@@ -1108,6 +1125,36 @@ export function setup(ctx: SpindleFrontendContext) {
   characterTitle.textContent = 'Detected voices'
   const characterList = document.createElement('div')
   characterList.className = 'chat-voice-character-list'
+  const favoritesTitle = document.createElement('div')
+  favoritesTitle.className = 'chat-voice-section-title'
+  favoritesTitle.textContent = 'Favorite voices'
+  const favoritesSection = document.createElement('div')
+  favoritesSection.className = 'chat-voice-favorites'
+  const favoriteForm = document.createElement('div')
+  favoriteForm.className = 'chat-voice-favorite-form'
+  const favoriteName = document.createElement('input')
+  favoriteName.placeholder = 'Name (optional)'
+  favoriteName.setAttribute('aria-label', 'Favorite voice name')
+  const favoriteId = document.createElement('input')
+  favoriteId.placeholder = 'Voice ID'
+  favoriteId.maxLength = 512
+  favoriteId.setAttribute('aria-label', 'Favorite voice ID')
+  const favoriteCategory = document.createElement('select')
+  favoriteCategory.setAttribute('aria-label', 'Favorite voice classification')
+  for (const [value, label] of [['unspecified', 'Unspecified'], ['female', 'Female'], ['male', 'Male']]) {
+    const option = document.createElement('option')
+    option.value = value
+    option.textContent = label
+    favoriteCategory.appendChild(option)
+  }
+  const favoriteAdd = document.createElement('button')
+  favoriteAdd.type = 'button'
+  favoriteAdd.className = 'chat-voice-add-button'
+  favoriteAdd.textContent = 'Add favorite'
+  favoriteForm.append(favoriteName, favoriteId, favoriteCategory, favoriteAdd)
+  const favoriteList = document.createElement('div')
+  favoriteList.className = 'chat-voice-favorites'
+  favoritesSection.append(favoriteForm, favoriteList)
   const status = document.createElement('div')
   status.className = 'chat-voice-status'
   status.setAttribute('role', 'status')
@@ -1135,6 +1182,8 @@ export function setup(ctx: SpindleFrontendContext) {
     narratorField.field,
     userVoiceField.field,
     routingHint,
+    favoritesTitle,
+    favoritesSection,
     addNpcField.field,
     characterTitle,
     characterList,
@@ -1184,6 +1233,12 @@ export function setup(ctx: SpindleFrontendContext) {
   let lumiverseConnectionId = ''
   let defaultNarratorVoice = ''
   let defaultUserVoice = ''
+  let favoriteVoices: FavoriteVoice[] = []
+  let favoritesSaving = false
+  let previewController: AbortController | null = null
+  let previewAudio: HTMLAudioElement | null = null
+  let previewUrl: string | null = null
+  const favoritePickers = new Set<HTMLSelectElement>()
   let localNarratorVoice = ''
   let localUserVoice = ''
   let useGlobalNarratorVoice = true
@@ -3324,9 +3379,173 @@ export function setup(ctx: SpindleFrontendContext) {
   addNpcButton.addEventListener('click', onAddNpc)
   addNpcInputSlot.addEventListener('keydown', onAddNpcKeyDown)
 
+  function updateFavoritePickers(): void {
+    for (const picker of favoritePickers) {
+      picker.replaceChildren()
+      const placeholder = document.createElement('option')
+      placeholder.value = ''
+      placeholder.textContent = favoriteVoices.length ? 'Choose a favorite voice…' : 'No favorite voices yet'
+      picker.appendChild(placeholder)
+      for (const [category, label] of [['female', 'Female'], ['male', 'Male'], ['unspecified', 'Unspecified']] as const) {
+        const entries = favoriteVoices.filter(voice => voice.category === category)
+        if (!entries.length) continue
+        const group = document.createElement('optgroup')
+        group.label = label
+        for (const voice of entries) {
+          const option = document.createElement('option')
+          option.value = voice.id
+          option.textContent = voice.name ? `${voice.name} (${voice.id})` : voice.id
+          group.appendChild(option)
+        }
+        picker.appendChild(group)
+      }
+      picker.disabled = !activeChat || favoriteVoices.length === 0
+    }
+  }
+
+  function stopVoicePreview(): void {
+    previewController?.abort()
+    previewController = null
+    if (previewAudio) {
+      previewAudio.pause()
+      previewAudio.removeAttribute('src')
+      previewAudio.load()
+      previewAudio = null
+    }
+    if (previewUrl) URL.revokeObjectURL(previewUrl)
+    previewUrl = null
+  }
+
+  async function previewFavoriteVoice(voice: FavoriteVoice): Promise<void> {
+    const connectionId = connectionPicker.getValue() || lumiverseConnectionId
+    if (!connectionId) {
+      setStatus('Choose a TTS connection to preview a voice.', 'error')
+      return
+    }
+    stopVoicePreview()
+    const controller = new AbortController()
+    previewController = controller
+    setStatus(`Generating preview for ${voice.name || voice.id}…`)
+    const budget: RateLimitBudget = {
+      blockedUntil: 0, cumulativeWaitMs: 0, consecutiveResponses: 0,
+      maximumWaitMs: rateLimitWaitSeconds * 1_000, recovering: false, recoveryTail: Promise.resolve(),
+    }
+    const gate = connectionVoiceGates.get(connectionId) ?? new ConnectionVoiceGate()
+    connectionVoiceGates.set(connectionId, gate)
+    try {
+      const segment = await runSynthesisTask(() => synthesizeVoiceSegment(
+        connectionId, 'Hello. This is a preview of my voice.', voice.id, 1,
+        controller.signal, sharedSynthesisPacer, budget, gate,
+        delay => setStatus(`Preview rate limited; retrying in ${Math.ceil(delay / 1_000)}s…`),
+      ), true)
+      if (controller.signal.aborted || previewController !== controller) return
+      previewUrl = URL.createObjectURL(new Blob([segment.data], { type: segment.mime }))
+      const audio = new Audio(previewUrl)
+      previewAudio = audio
+      audio.onended = () => {
+        if (previewAudio === audio) {
+          stopVoicePreview()
+          setStatus('Voice preview finished.', 'saved')
+        }
+      }
+      await audio.play()
+      if (previewController === controller) setStatus(`Playing preview for ${voice.name || voice.id}.`)
+    } catch (error) {
+      if (controller.signal.aborted) return
+      stopVoicePreview()
+      setStatus(error instanceof Error ? `Voice preview failed: ${error.message}` : 'Voice preview failed.', 'error')
+    }
+  }
+
+  async function saveFavoriteVoices(next: FavoriteVoice[]): Promise<boolean> {
+    if (favoritesSaving) return false
+    favoritesSaving = true
+    favoriteAdd.disabled = true
+    try {
+      await updateVoiceSettings(current => ({ ...current, chatVoiceFavoriteVoices: next }))
+      favoriteVoices = next
+      renderFavoriteVoices()
+      updateFavoritePickers()
+      setStatus('Favorite voices saved globally.', 'saved')
+      return true
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : 'Could not save favorite voices.', 'error')
+      return false
+    } finally {
+      favoritesSaving = false
+      favoriteAdd.disabled = false
+    }
+  }
+
+  function renderFavoriteVoices(): void {
+    favoriteList.replaceChildren()
+    if (!favoriteVoices.length) {
+      const empty = document.createElement('div')
+      empty.className = 'chat-voice-hint'
+      empty.textContent = 'Add voice IDs to reuse them in any chat.'
+      favoriteList.appendChild(empty)
+      return
+    }
+    for (const voice of favoriteVoices) {
+      const row = document.createElement('div')
+      row.className = 'chat-voice-favorite-row'
+      const copy = document.createElement('span')
+      copy.className = 'chat-voice-favorite-copy'
+      copy.textContent = voice.name || voice.id
+      const details = document.createElement('small')
+      details.textContent = voice.name ? voice.id : ''
+      copy.appendChild(details)
+      const category = document.createElement('select')
+      category.className = 'chat-voice-favorite-select'
+      category.style.width = 'auto'
+      category.setAttribute('aria-label', `Classification for ${voice.name || voice.id}`)
+      for (const [value, label] of [['unspecified', 'Unspecified'], ['female', 'Female'], ['male', 'Male']]) {
+        const option = document.createElement('option')
+        option.value = value
+        option.textContent = label
+        category.appendChild(option)
+      }
+      category.value = voice.category
+      category.addEventListener('change', () => {
+        const nextCategory = category.value === 'male' || category.value === 'female'
+          ? category.value : 'unspecified'
+        category.disabled = true
+        void saveFavoriteVoices(favoriteVoices.map(item => item.id === voice.id
+          ? { ...item, category: nextCategory } : item))
+          .then(saved => { if (!saved) { category.value = voice.category; category.disabled = false } })
+      })
+      const preview = document.createElement('button')
+      preview.type = 'button'
+      preview.className = 'chat-voice-preview-button'
+      preview.textContent = 'Preview'
+      preview.setAttribute('aria-label', `Preview ${voice.name || voice.id}`)
+      preview.addEventListener('click', () => { void previewFavoriteVoice(voice) })
+      const remove = document.createElement('button')
+      remove.type = 'button'
+      remove.className = 'chat-voice-delete-button'
+      remove.textContent = '×'
+      remove.setAttribute('aria-label', `Remove favorite ${voice.name || voice.id}`)
+      remove.addEventListener('click', () => { void saveFavoriteVoices(favoriteVoices.filter(item => item.id !== voice.id)) })
+      row.append(copy, category, preview, remove)
+      favoriteList.appendChild(row)
+    }
+  }
+
+  favoriteAdd.addEventListener('click', () => {
+    const id = favoriteId.value.trim().slice(0, 512)
+    if (!id) { setStatus('Enter a voice ID to add a favorite.', 'error'); return }
+    if (favoriteVoices.length >= 500) { setStatus('The favorites list is limited to 500 voices.', 'error'); return }
+    if (favoriteVoices.some(voice => voice.id === id)) { setStatus('That voice ID is already a favorite.', 'error'); return }
+    const category = favoriteCategory.value === 'male' || favoriteCategory.value === 'female'
+      ? favoriteCategory.value : 'unspecified'
+    void saveFavoriteVoices([...favoriteVoices, { id, name: favoriteName.value.trim().slice(0, 128), category }])
+      .then(saved => { if (saved) { favoriteName.value = ''; favoriteId.value = '' } })
+  })
+
   function renderCharacters(characters: DetectedCharacterState[]) {
     for (const input of characterInputs.values()) input.destroy()
     characterInputs.clear()
+    favoritePickers.clear()
     characterList.replaceChildren()
     if (characters.length === 0) {
       const empty = document.createElement('div')
@@ -3384,8 +3603,11 @@ export function setup(ctx: SpindleFrontendContext) {
         meta.append(rename, remove)
       }
       const slot = document.createElement('div')
+      const picker = document.createElement('select')
+      picker.className = 'chat-voice-favorite-select'
+      picker.setAttribute('aria-label', `Favorite voice for ${character.name}`)
       heading.append(name, meta)
-      card.append(heading, slot)
+      card.append(heading, slot, picker)
       characterList.appendChild(card)
       const input = ctx.components.mountTextInput(slot, {
         value: character.voice,
@@ -3395,7 +3617,15 @@ export function setup(ctx: SpindleFrontendContext) {
         onChange: () => markChanged(),
       })
       characterInputs.set(character.id, input)
+      picker.addEventListener('change', () => {
+        if (!picker.value) return
+        input.update({ value: picker.value })
+        picker.value = ''
+        markChanged()
+      })
+      favoritePickers.add(picker)
     }
+    updateFavoritePickers()
   }
 
   function renderState(next: ActiveChatState | null) {
@@ -3445,6 +3675,11 @@ export function setup(ctx: SpindleFrontendContext) {
       ])
       connections = loadedConnections
       llmConnections = loadedLlmConnections
+      if (!favoritesSaving) {
+        favoriteVoices = preferences.favoriteVoices
+        renderFavoriteVoices()
+        updateFavoritePickers()
+      }
       updateTtsTagControls()
       if (!narratorGlobalSaveTimer && !savingNarratorGlobalVoice) {
         defaultNarratorVoice = preferences.defaultNarratorVoice
@@ -4032,6 +4267,7 @@ export function setup(ctx: SpindleFrontendContext) {
   refreshLocalState()
 
   return () => {
+    stopVoicePreview()
     stopPlayback()
     for (const controller of backgroundSynthesisControllers) controller.abort()
     backgroundSynthesisControllers.clear()
