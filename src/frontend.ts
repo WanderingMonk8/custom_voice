@@ -277,6 +277,7 @@ interface TagPlacementPayload {
 
 interface UncastMatchPayload {
   type: 'chat_voice_uncast_matches'
+  diagnostics?: string[]
   requestId: string
   assignments: UncastVoiceAssignment[]
   error?: string
@@ -1558,7 +1559,7 @@ export function setup(ctx: SpindleFrontendContext) {
     for (const [display, input] of [[narratorVoiceDisplay, narratorInput], [userVoiceDisplay, userVoiceInput]] as const) {
       const voiceId = input.getValue().trim()
       display.textContent = favoriteVoices.find(voice => voice.id === voiceId)?.name || voiceId || 'Connection default voice'
-      display.title = voiceId ? `Voice ID: ${voiceId}. Double-click to edit.` : 'Double-click to enter a voice ID.'
+      display.title = voiceId ? `Voice ID: ${voiceId}. Click to edit.` : 'Click to enter a voice ID.'
       display.disabled = !activeChat
     }
   }
@@ -1577,7 +1578,7 @@ export function setup(ctx: SpindleFrontendContext) {
       display.hidden = false
       updateRoleVoiceDisplays()
     }
-    display.addEventListener('dblclick', begin)
+    display.addEventListener('click', begin)
     display.addEventListener('keydown', event => {
       if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); begin() }
     })
@@ -3613,7 +3614,7 @@ export function setup(ctx: SpindleFrontendContext) {
       const voiceId = characterInputs.get(id)?.getValue().trim() ?? ''
       const favorite = favoriteVoices.find(voice => voice.id === voiceId)
       display.textContent = favorite?.name || voiceId || 'Connection default voice'
-      display.title = voiceId ? `Voice ID: ${voiceId}. Double-click to edit.` : 'Double-click to enter a voice ID.'
+      display.title = voiceId ? `Voice ID: ${voiceId}. Click to edit.` : 'Click to enter a voice ID.'
     }
   }
 
@@ -3894,7 +3895,7 @@ export function setup(ctx: SpindleFrontendContext) {
         voiceDisplay.hidden = false
         updateCharacterVoiceDisplays()
       }
-      voiceDisplay.addEventListener('dblclick', beginEditing)
+      voiceDisplay.addEventListener('click', beginEditing)
       voiceDisplay.addEventListener('keydown', event => {
         if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); beginEditing() }
       })
@@ -4380,7 +4381,10 @@ export function setup(ctx: SpindleFrontendContext) {
       clearTimeout(pending.timer)
       pendingUncastRequests.delete(payload.requestId)
       if (payload.error) pending.reject(new Error(payload.error))
-      else pending.resolve(payload.assignments)
+      else {
+        for (const line of payload.diagnostics ?? []) appendSpeakerDebugLog(`Uncast matching: ${line}`)
+        pending.resolve(payload.assignments)
+      }
       return
     }
     if (payload.type === 'chat_voice_message') {

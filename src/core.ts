@@ -126,6 +126,13 @@ export function buildUncastVoiceDecision(groups: UncastVoiceGroup[], voices: Fav
         ...Object.fromEntries(ghosts.map((ghost, index) => [`ghost_${index}`, `Previously seen character ${ghost.speakerId}; context: ${ghost.context}`])),
         ...Object.fromEntries(earlier.map(previous => [`group_${previous.id}`, `Earlier character ${previous.id}; context: ${previous.context.join(' ').slice(0, 2_000)}`])) },
     }
+    for (const previous of earlier.slice(-8)) {
+      questions[`same_${group.id}_${previous.id}`] = {
+        type: 'choice',
+        instructions: `Compare ${group.id} and ${previous.id} across the entire scene. Are these speeches clearly from the same individual? Treat references to the same role as evidence, and distinguish different people with the same role.`,
+        criteria: { same: 'The two groups clearly belong to the same individual.', different_or_unclear: 'They are different people, or the evidence is insufficient.' },
+      }
+    }
     if (!voices.length) continue
     questions[`voice_${group.id}`] = {
       type: 'choice', instructions: `Rank the available voices by how well their descriptions suit character ${group.id}. Consider the full scene and all dialogue and context belonging to this same individual, including other character groups when clearly the same person. Choose no_match if no voice is suitable.`,
@@ -142,44 +149,55 @@ export function resolveUncastVoiceDecisions(
   ghosts: GhostVoice[] = [], reserved: readonly string[] = [], messageId = '',
 ): UncastVoiceAssignment[] {
   const used = new Set<string>(reserved.filter(Boolean))
-  const ghostByGroup = new Map<string, GhostVoice>()
   const assignments: UncastVoiceAssignment[] = []
+  const roots = new Map<string, string>()
+  const linkedGhosts = new Map<string, GhostVoice>()
+  const strongChoice = (answer: SpeakerDecisionChoice | undefined): boolean => {
+    if (!answer || answer.choice === 'new_or_unclear') return false
+    const probability = answer.probabilities[answer.choice] ?? 0
+    const runnerUp = Math.max(0, ...Object.entries(answer.probabilities).filter(([key]) => key !== answer.choice).map(([, p]) => p))
+    return answer.confidence >= 0.8 && probability >= 0.8 && probability - runnerUp >= 0.25
+  }
+  // Resolve identity links before choosing voices, so later evidence can help
+  // the whole character even when the first group has no suitable match.
   for (const group of groups) {
-    const genderAnswer = answers[`gender_${group.id}`]
-    const gender = genderAnswer && (genderAnswer.choice === 'male' || genderAnswer.choice === 'female')
-      && genderAnswer.confidence >= 0.6 && (genderAnswer.probabilities[genderAnswer.choice] ?? 0) >= 0.6
-      ? genderAnswer.choice : 'unknown'
+    let root = group.id
     const occurrenceKey = messageId ? `${messageId}:${hashMessageContent(group.speeches.join('\n'))}` : ''
-    let ghost = ghosts.find(item => occurrenceKey && item.occurrenceKeys.includes(occurrenceKey))
+    const exact = ghosts.find(item => occurrenceKey && item.occurrenceKeys.includes(occurrenceKey))
       ?? (group.speakerId !== UNCAST_SPEAKER_ID ? ghosts.find(item => item.speakerId === group.speakerId) : undefined)
     const identity = answers[`identity_${group.id}`]
-    if (!ghost && identity && identity.choice !== 'new_or_unclear') {
-      const probability = identity.probabilities[identity.choice] ?? 0
-      const runnerUp = Math.max(0, ...Object.entries(identity.probabilities).filter(([key]) => key !== identity.choice).map(([, p]) => p))
-      if (identity.confidence >= 0.8 && probability >= 0.8 && probability - runnerUp >= 0.25) {
-        if (identity.choice.startsWith('ghost_')) ghost = ghosts[Number(identity.choice.slice(6))]
-        else if (identity.choice.startsWith('group_')) ghost = ghostByGroup.get(identity.choice.slice(6))
-      }
+    const previousGroups = groups.slice(0, groups.indexOf(group)).slice(-8)
+    const same = previousGroups.flatMap(previous => {
+      const answer = answers[`same_${group.id}_${previous.id}`]
+      return answer?.choice === 'same' && strongChoice(answer) ? [{ previous, probability: answer.probabilities.same ?? 0 }] : []
+    }).sort((a, b) => b.probability - a.probability)
+    if (same[0]) root = roots.get(same[0].previous.id) ?? root
+    else if (strongChoice(identity) && identity?.choice.startsWith('group_')) root = roots.get(identity.choice.slice(6)) ?? root
+    let ghost = exact
+    if (!ghost && strongChoice(identity) && identity?.choice.startsWith('ghost_')) ghost = ghosts[Number(identity.choice.slice(6))]
+    roots.set(group.id, root)
+    // A matching earlier group owns the voice, even if a previous replay
+    // cached a different voice for this individual turn.
+    if (ghost && !reserved.includes(ghost.voiceId) && !linkedGhosts.has(root)) linkedGhosts.set(root, ghost)
+  }
+  for (const root of new Set(roots.values())) {
+    const members = groups.filter(group => roots.get(group.id) === root)
+    const genderVotes = members.map(group => answers[`gender_${group.id}`]).filter(answer => answer && (answer.choice === 'male' || answer.choice === 'female') && answer.confidence >= 0.6 && (answer.probabilities[answer.choice] ?? 0) >= 0.6)
+    const genders = new Set(genderVotes.map(answer => answer.choice))
+    const gender = genders.size === 1 ? genderVotes[0].choice : 'unknown'
+    let ghost = linkedGhosts.get(root)
+    if (!ghost) {
+      const matches = members.map(group => answers[`voice_${group.id}`]).filter(answer => answer && answer.choice !== 'no_match')
+      const ranked = voices.flatMap((voice, index) => {
+        if (used.has(voice.id) || (gender !== 'unknown' && voice.category !== 'unspecified' && voice.category !== gender)) return []
+        const scores = matches.map(match => match.probabilities[`voice_${index}`] ?? 0).filter(score => Number.isFinite(score) && score > 0)
+        return scores.length ? [{ voice, score: scores.reduce((sum, score) => sum + score, 0) / scores.length, index }] : []
+      }).sort((a, b) => b.score - a.score || a.index - b.index)
+      if (!ranked[0]) continue
+      ghost = { id: `pending:${root}`, speakerId: members[0].speakerId, voiceId: ranked[0].voice.id, context: members.flatMap(group => group.context).join(' ').slice(0, 2_000), occurrenceKeys: [], lastSeenMessageId: messageId }
     }
-    if (ghost && !reserved.includes(ghost.voiceId)) {
-      used.add(ghost.voiceId)
-      ghostByGroup.set(group.id, ghost)
-      assignments.push({ groupId: group.id, voiceId: ghost.voiceId, gender, ghostId: ghost.id })
-      continue
-    }
-    const match = answers[`voice_${group.id}`]
-    if (!match || match.choice === 'no_match') continue
-    const ranked = voices.flatMap((voice, index) => {
-      if (used.has(voice.id) || (gender !== 'unknown' && voice.category !== 'unspecified' && voice.category !== gender)) return []
-      const probability = match.probabilities[`voice_${index}`] ?? 0
-      if (!Number.isFinite(probability) || probability <= 0) return []
-      return [{ voice, score: probability, index }]
-    }).sort((a, b) => b.score - a.score || a.index - b.index)
-    if (!ranked[0]) continue
-    used.add(ranked[0].voice.id)
-    const created: GhostVoice = { id: `pending:${group.id}`, speakerId: group.speakerId, voiceId: ranked[0].voice.id, context: group.context.join(' ').slice(0, 2_000), occurrenceKeys: [], lastSeenMessageId: messageId }
-    ghostByGroup.set(group.id, created)
-    assignments.push({ groupId: group.id, voiceId: ranked[0].voice.id, gender, ghostId: created.id })
+    used.add(ghost.voiceId)
+    for (const group of members) assignments.push({ groupId: group.id, voiceId: ghost.voiceId, gender, ghostId: ghost.id })
   }
   return assignments
 }
