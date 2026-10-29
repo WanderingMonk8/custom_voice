@@ -36,7 +36,33 @@ export function readFavoriteVoices(value: unknown): FavoriteVoice[] {
   return result
 }
 
-export interface UncastVoiceGroup { id: string; speakerId: string; segmentIndexes: number[]; speeches: string[] }
+export interface UncastVoiceGroup { id: string; speakerId: string; segmentIndexes: number[]; speeches: string[]; context: string[] }
+export interface GhostVoice { id: string; speakerId: string; voiceId: string; context: string; occurrenceKeys: string[]; lastSeenMessageId: string }
+export const GHOST_VOICE_LIFETIME_MESSAGES = 10
+
+export function readGhostVoices(value: unknown): GhostVoice[] {
+  if (!Array.isArray(value)) return []
+  return value.slice(0, 200).flatMap(item => {
+    if (!item || typeof item !== 'object') return []
+    const row = item as Record<string, unknown>
+    if (typeof row.id !== 'string' || typeof row.speakerId !== 'string' || typeof row.voiceId !== 'string' || !row.id || !row.voiceId) return []
+    return [{ id: row.id.slice(0, 128), speakerId: row.speakerId.slice(0, 256), voiceId: row.voiceId.slice(0, 512),
+      context: typeof row.context === 'string' ? row.context.slice(0, 2_000) : '',
+      occurrenceKeys: Array.isArray(row.occurrenceKeys) ? row.occurrenceKeys.filter((key): key is string => typeof key === 'string').slice(-100) : [],
+      lastSeenMessageId: typeof row.lastSeenMessageId === 'string' ? row.lastSeenMessageId : '' }]
+  })
+}
+
+/** The caller supplies assistant-message IDs only, in chronological order. */
+export function activeGhostVoices(ghosts: GhostVoice[], assistantMessageIds: readonly string[], targetId: string, lifetime = GHOST_VOICE_LIFETIME_MESSAGES): GhostVoice[] {
+  const target = assistantMessageIds.indexOf(targetId)
+  if (target < 0) return []
+  return ghosts.filter(ghost => {
+    if (ghost.occurrenceKeys.some(key => key.startsWith(`${targetId}:`))) return true
+    const lastSeen = ghost.lastSeenMessageId ? assistantMessageIds.indexOf(ghost.lastSeenMessageId) : -1
+    return (lastSeen >= 0 || !ghost.lastSeenMessageId) && lastSeen <= target && target - lastSeen <= Math.max(1, lifetime)
+  })
+}
 
 /** Group named unconfigured speakers by identity; anonymous runs stay separate. */
 export function collectUncastVoiceGroups(segments: PlaybackSegment[]): UncastVoiceGroup[] {
@@ -51,13 +77,15 @@ export function collectUncastVoiceGroups(segments: PlaybackSegment[]): UncastVoi
     if (id !== UNCAST_SPEAKER_ID) anonymous = null
     let group: UncastVoiceGroup | null | undefined = id === UNCAST_SPEAKER_ID ? anonymous : named.get(id)
     if (!group) {
-      group = { id: `g${groups.length}`, speakerId: id, segmentIndexes: [], speeches: [] }
+      group = { id: `g${groups.length}`, speakerId: id, segmentIndexes: [], speeches: [], context: [] }
       groups.push(group)
       if (id === UNCAST_SPEAKER_ID) anonymous = group
       else { named.set(id, group); anonymous = null }
     }
     group.segmentIndexes.push(index)
     group.speeches.push(segment.text)
+    group.context.push([segments[index - 1]?.speakerId === null ? segments[index - 1].text : '', segment.text,
+      segments[index + 1]?.speakerId === null ? segments[index + 1].text : ''].filter(Boolean).join(' ').slice(0, 2_000))
   }
   return groups
 }
@@ -68,13 +96,12 @@ export function availableUncastVoices(favorites: FavoriteVoice[], used: readonly
   return favorites.filter(voice => !reserved.has(voice.id))
 }
 
-const UNCAST_VOICE_TRAITS = ['commanding', 'gentle', 'tired', 'warm', 'soft', 'deep', 'bright', 'rough', 'calm', 'youthful', 'mature', 'nervous', 'confident', 'gravelly', 'energetic', 'formal'] as const
-
 /** One decision call classifies each uncast group and ranks the available voice descriptions. */
-export function buildUncastVoiceDecision(groups: UncastVoiceGroup[], voices: FavoriteVoice[], message: string) {
+export function buildUncastVoiceDecision(groups: UncastVoiceGroup[], voices: FavoriteVoice[], message: string, ghosts: GhostVoice[] = []) {
   const state = {
     message,
-    characters: groups.map(group => ({ id: group.id, identity: group.speakerId, speeches: group.speeches })),
+    characters: groups.map(group => ({ id: group.id, identity: group.speakerId, speeches: group.speeches, context: group.context })),
+    ghosts: ghosts.map((ghost, index) => ({ option: `ghost_${index}`, identity: ghost.speakerId, context: ghost.context })),
     voices: voices.map((voice, index) => ({ option: `voice_${index}`, name: voice.name, category: voice.category, description: voice.description })),
   }
   const questions: Record<string, { type: 'choice'; instructions: string; criteria: Record<string, string> }> = {}
@@ -83,53 +110,67 @@ export function buildUncastVoiceDecision(groups: UncastVoiceGroup[], voices: Fav
       type: 'choice', instructions: `Identify the gender of character ${group.id} from the scene. Choose unknown when not established.`,
       criteria: { male: 'The character is male.', female: 'The character is female.', unknown: 'Gender is not established or is not male or female.' },
     }
-    const traitCriteria = Object.fromEntries(UNCAST_VOICE_TRAITS.map(trait => [trait, `The voice or delivery is ${trait}.`]))
-    questions[`trait_${group.id}`] = {
-      type: 'choice', instructions: `Choose the most useful voice characteristic for character ${group.id}, based on the scene.`,
-      criteria: { ...traitCriteria, unspecified: 'No characteristic is established.' },
+    const earlier = groups.slice(0, groups.indexOf(group))
+    if (ghosts.length || earlier.length) questions[`identity_${group.id}`] = {
+      type: 'choice', instructions: `Does character ${group.id} clearly represent the same individual as one prior character? Compare all contexts and dialogue, not just shared gender or voice. Select new_or_unclear unless the identity is clear.`,
+      criteria: { new_or_unclear: 'A new character, or identity cannot be reliably established.',
+        ...Object.fromEntries(ghosts.map((ghost, index) => [`ghost_${index}`, `Previously seen character ${ghost.speakerId}; context: ${ghost.context}`])),
+        ...Object.fromEntries(earlier.map(previous => [`group_${previous.id}`, `Earlier character ${previous.id}; context: ${previous.context.join(' ').slice(0, 2_000)}`])) },
     }
-    questions[`trait2_${group.id}`] = {
-      type: 'choice', instructions: `Choose another useful voice characteristic for character ${group.id}, or unspecified if none.`,
-      criteria: { ...traitCriteria, unspecified: 'No additional characteristic is established.' },
-    }
+    if (!voices.length) continue
     questions[`voice_${group.id}`] = {
-      type: 'choice', instructions: `Rank the available voices by how well their descriptions suit character ${group.id}. Use the character's voice and temperament in the scene. Choose no_match if no voice is suitable.`,
+      type: 'choice', instructions: `Rank the available voices by how well their descriptions suit character ${group.id}. Consider the full scene and all dialogue and context belonging to this same individual, including other character groups when clearly the same person. Choose no_match if no voice is suitable.`,
       criteria: { ...Object.fromEntries(state.voices.map(voice => [voice.option, `${voice.name || 'Unnamed voice'}; ${voice.category}; ${voice.description || 'No description provided.'}`])), no_match: 'No available voice is suitable.' },
     }
   }
   return { state, questions }
 }
 
-export interface UncastVoiceAssignment { groupId: string; voiceId: string; gender: string; traits: string[] }
+export interface UncastVoiceAssignment { groupId: string; voiceId: string; gender: string; ghostId?: string }
 
 export function resolveUncastVoiceDecisions(
   groups: UncastVoiceGroup[], voices: FavoriteVoice[], answers: Record<string, SpeakerDecisionChoice>,
+  ghosts: GhostVoice[] = [], reserved: readonly string[] = [], messageId = '',
 ): UncastVoiceAssignment[] {
-  const used = new Set<string>()
+  const used = new Set<string>(reserved.filter(Boolean))
+  const ghostByGroup = new Map<string, GhostVoice>()
   const assignments: UncastVoiceAssignment[] = []
   for (const group of groups) {
     const genderAnswer = answers[`gender_${group.id}`]
     const gender = genderAnswer && (genderAnswer.choice === 'male' || genderAnswer.choice === 'female')
       && genderAnswer.confidence >= 0.6 && (genderAnswer.probabilities[genderAnswer.choice] ?? 0) >= 0.6
       ? genderAnswer.choice : 'unknown'
-    const traits = [`trait_${group.id}`, `trait2_${group.id}`].flatMap(key => {
-      const answer = answers[key]
-      return answer && (UNCAST_VOICE_TRAITS as readonly string[]).includes(answer.choice)
-        && answer.confidence >= 0.5 && (answer.probabilities[answer.choice] ?? 0) >= 0.5 ? [answer.choice] : []
-    }).filter((trait, index, all) => all.indexOf(trait) === index)
+    const occurrenceKey = messageId ? `${messageId}:${hashMessageContent(group.speeches.join('\n'))}` : ''
+    let ghost = ghosts.find(item => occurrenceKey && item.occurrenceKeys.includes(occurrenceKey))
+      ?? (group.speakerId !== UNCAST_SPEAKER_ID ? ghosts.find(item => item.speakerId === group.speakerId) : undefined)
+    const identity = answers[`identity_${group.id}`]
+    if (!ghost && identity && identity.choice !== 'new_or_unclear') {
+      const probability = identity.probabilities[identity.choice] ?? 0
+      const runnerUp = Math.max(0, ...Object.entries(identity.probabilities).filter(([key]) => key !== identity.choice).map(([, p]) => p))
+      if (identity.confidence >= 0.8 && probability >= 0.8 && probability - runnerUp >= 0.25) {
+        if (identity.choice.startsWith('ghost_')) ghost = ghosts[Number(identity.choice.slice(6))]
+        else if (identity.choice.startsWith('group_')) ghost = ghostByGroup.get(identity.choice.slice(6))
+      }
+    }
+    if (ghost && !reserved.includes(ghost.voiceId)) {
+      used.add(ghost.voiceId)
+      ghostByGroup.set(group.id, ghost)
+      assignments.push({ groupId: group.id, voiceId: ghost.voiceId, gender, ghostId: ghost.id })
+      continue
+    }
     const match = answers[`voice_${group.id}`]
     if (!match || match.choice === 'no_match') continue
     const ranked = voices.flatMap((voice, index) => {
       if (used.has(voice.id) || (gender !== 'unknown' && voice.category !== 'unspecified' && voice.category !== gender)) return []
       const probability = match.probabilities[`voice_${index}`] ?? 0
       if (!Number.isFinite(probability) || probability <= 0) return []
-      const terms = new Set(voice.description.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? [])
-      const overlap = traits.filter(trait => terms.has(trait)).length
-      return [{ voice, score: probability + Math.min(0.2, overlap * 0.1), index }]
+      return [{ voice, score: probability, index }]
     }).sort((a, b) => b.score - a.score || a.index - b.index)
     if (!ranked[0]) continue
     used.add(ranked[0].voice.id)
-    assignments.push({ groupId: group.id, voiceId: ranked[0].voice.id, gender, traits })
+    const created: GhostVoice = { id: `pending:${group.id}`, speakerId: group.speakerId, voiceId: ranked[0].voice.id, context: group.context.join(' ').slice(0, 2_000), occurrenceKeys: [], lastSeenMessageId: messageId }
+    ghostByGroup.set(group.id, created)
+    assignments.push({ groupId: group.id, voiceId: ranked[0].voice.id, gender, ghostId: created.id })
   }
   return assignments
 }

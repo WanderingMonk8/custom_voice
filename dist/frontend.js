@@ -23,6 +23,7 @@ function readFavoriteVoices(value) {
   }
   return result;
 }
+var GHOST_VOICE_LIFETIME_MESSAGES = 10;
 function collectUncastVoiceGroups(segments) {
   const groups = [];
   const named = /* @__PURE__ */ new Map();
@@ -38,7 +39,7 @@ function collectUncastVoiceGroups(segments) {
     if (id !== UNCAST_SPEAKER_ID) anonymous = null;
     let group = id === UNCAST_SPEAKER_ID ? anonymous : named.get(id);
     if (!group) {
-      group = { id: `g${groups.length}`, speakerId: id, segmentIndexes: [], speeches: [] };
+      group = { id: `g${groups.length}`, speakerId: id, segmentIndexes: [], speeches: [], context: [] };
       groups.push(group);
       if (id === UNCAST_SPEAKER_ID) anonymous = group;
       else {
@@ -48,6 +49,11 @@ function collectUncastVoiceGroups(segments) {
     }
     group.segmentIndexes.push(index);
     group.speeches.push(segment.text);
+    group.context.push([
+      segments[index - 1]?.speakerId === null ? segments[index - 1].text : "",
+      segment.text,
+      segments[index + 1]?.speakerId === null ? segments[index + 1].text : ""
+    ].filter(Boolean).join(" ").slice(0, 2e3));
   }
   return groups;
 }
@@ -1612,6 +1618,7 @@ async function loadPlaybackPreferences() {
     playbackBufferSegments: DEFAULT_PLAYBACK_BUFFER_SEGMENTS,
     concurrentGenerations: DEFAULT_CONCURRENT_GENERATIONS,
     rateLimitWaitSeconds: DEFAULT_RATE_LIMIT_WAIT_SECONDS,
+    ghostVoiceLifetime: GHOST_VOICE_LIFETIME_MESSAGES,
     speakerAssignmentDebug: false,
     defaultNarratorVoice: "",
     defaultUserVoice: "",
@@ -1650,6 +1657,7 @@ async function loadPlaybackPreferences() {
       DEFAULT_RATE_LIMIT_WAIT_SECONDS,
       MAX_RATE_LIMIT_WAIT_SECONDS
     ),
+    ghostVoiceLifetime: clampIntegerSetting(row.value?.chatVoiceGhostVoiceLifetime, GHOST_VOICE_LIFETIME_MESSAGES, 1e3),
     speakerAssignmentDebug: row.value?.chatVoiceSpeakerAssignmentDebug === true,
     defaultNarratorVoice: typeof row.value?.chatVoiceDefaultNarratorVoice === "string" ? row.value.chatVoiceDefaultNarratorVoice.trim().slice(0, 512) : "",
     defaultUserVoice: typeof row.value?.chatVoiceDefaultUserVoice === "string" ? row.value.chatVoiceDefaultUserVoice.trim().slice(0, 512) : "",
@@ -1710,7 +1718,7 @@ function saveTtsTagPreferences(style, placement, connectionId, model) {
     chatVoiceTagLlmModel: model.trim().slice(0, 256)
   }));
 }
-function saveAdvancedPlaybackPreferences(bufferSegments, concurrentGenerations, rateLimitWaitSeconds, speakerAssignmentDebug) {
+function saveAdvancedPlaybackPreferences(bufferSegments, concurrentGenerations, rateLimitWaitSeconds, speakerAssignmentDebug, ghostVoiceLifetime) {
   return updateVoiceSettings((current) => ({
     ...current,
     chatVoicePlaybackBufferSegments: clampIntegerSetting(
@@ -1728,7 +1736,8 @@ function saveAdvancedPlaybackPreferences(bufferSegments, concurrentGenerations, 
       DEFAULT_RATE_LIMIT_WAIT_SECONDS,
       MAX_RATE_LIMIT_WAIT_SECONDS
     ),
-    chatVoiceSpeakerAssignmentDebug: speakerAssignmentDebug
+    chatVoiceSpeakerAssignmentDebug: speakerAssignmentDebug,
+    chatVoiceGhostVoiceLifetime: clampIntegerSetting(ghostVoiceLifetime, GHOST_VOICE_LIFETIME_MESSAGES, 1e3)
   }));
 }
 function saveDefaultRoleVoice(role, voice) {
@@ -2317,6 +2326,7 @@ function setup(ctx) {
   const playbackBufferField = createField("Playback buffer segments");
   const concurrentGenerationField = createField("Maximum concurrent generations");
   const rateLimitWaitField = createField("Rate-limit wait budget (seconds)");
+  const ghostLifetimeField = createField("Uncast voice lifetime (assistant messages)");
   const speakerDebugLabel = document.createElement("label");
   speakerDebugLabel.className = "chat-voice-toggle";
   const speakerDebugToggle = document.createElement("input");
@@ -2344,6 +2354,7 @@ function setup(ctx) {
     playbackBufferField.field,
     concurrentGenerationField.field,
     rateLimitWaitField.field,
+    ghostLifetimeField.field,
     speakerDebugLabel,
     speakerDebugOutput,
     advancedHint
@@ -2394,6 +2405,7 @@ function setup(ctx) {
   let playbackBufferSegments = DEFAULT_PLAYBACK_BUFFER_SEGMENTS;
   let concurrentGenerationLimit = DEFAULT_CONCURRENT_GENERATIONS;
   let rateLimitWaitSeconds = DEFAULT_RATE_LIMIT_WAIT_SECONDS;
+  let ghostVoiceLifetime = GHOST_VOICE_LIFETIME_MESSAGES;
   let speakerAssignmentDebug = false;
   let advancedSettingsSaveTimer = null;
   let savingAdvancedSettings = false;
@@ -2645,6 +2657,18 @@ function setup(ctx) {
     MAX_RATE_LIMIT_WAIT_SECONDS,
     "Rate-limit wait budget in seconds"
   );
+  const ghostLifetimeInput = createNumberInput(GHOST_VOICE_LIFETIME_MESSAGES, 1e3, "Uncast voice lifetime in assistant messages");
+  ghostLifetimeField.slot.appendChild(ghostLifetimeInput);
+  const ghostLifetimeHint = document.createElement("div");
+  ghostLifetimeHint.className = "chat-voice-hint";
+  ghostLifetimeHint.textContent = "Keep an uncast character\u2019s selected voice for this many assistant messages after they last spoke.";
+  ghostLifetimeField.slot.appendChild(ghostLifetimeHint);
+  const onGhostLifetimeInput = () => {
+    ghostVoiceLifetime = clampIntegerSetting(ghostLifetimeInput.valueAsNumber, GHOST_VOICE_LIFETIME_MESSAGES, 1e3);
+    ghostLifetimeInput.value = String(ghostVoiceLifetime);
+    scheduleAdvancedSettingsSave();
+  };
+  ghostLifetimeInput.addEventListener("change", onGhostLifetimeInput);
   playbackBufferField.slot.appendChild(playbackBufferInput);
   concurrentGenerationField.slot.appendChild(concurrentGenerationInput);
   rateLimitWaitField.slot.appendChild(rateLimitWaitInput);
@@ -2815,11 +2839,12 @@ function setup(ctx) {
         tagLlmConnectionId: preferences.tagLlmConnectionId,
         tagLlmModel: preferences.tagLlmModel,
         skippedTrackerTags: preferences.skippedTrackerTags,
+        ghostVoiceLifetime: preferences.ghostVoiceLifetime,
         debug: preferences.speakerAssignmentDebug
       });
     });
   }
-  function requestUncastVoiceMatches(message, groups, voices) {
+  function requestUncastVoiceMatches(chatId, messageId, message, groups, voices, reserved, lifetime) {
     const requestId = `uncast-${Date.now().toString(36)}-${++uncastRequestSequence}`;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -2827,7 +2852,7 @@ function setup(ctx) {
         reject(new Error("Uncast voice matching timed out."));
       }, 35e3);
       pendingUncastRequests.set(requestId, { resolve, reject, timer });
-      ctx.sendToBackend({ type: "chat_voice_match_uncast", requestId, message, groups, voices });
+      ctx.sendToBackend({ type: "chat_voice_match_uncast", requestId, chatId, messageId, message, groups, voices, reserved, lifetime });
     });
   }
   function speakerDebugName(speakerId, speakers) {
@@ -3342,6 +3367,7 @@ function setup(ctx) {
       preferences.playbackBufferSegments = playbackBufferSegments;
       preferences.concurrentGenerations = concurrentGenerationLimit;
       preferences.rateLimitWaitSeconds = rateLimitWaitSeconds;
+      preferences.ghostVoiceLifetime = ghostVoiceLifetime;
       preferences.speakerAssignmentDebug = speakerAssignmentDebug;
     } else {
       playbackBufferSegments = preferences.playbackBufferSegments;
@@ -3455,16 +3481,21 @@ function setup(ctx) {
         speakerId: segment.speakerId ? aliases.get(segment.speakerId) ?? segment.speakerId : null
       }));
       const uncastGroups = collectUncastVoiceGroups(matchingSegments);
-      const uncastVoices = availableUncastVoices(favoriteVoices, [
+      const reservedVoices = [
         ...Object.values(config.characterVoices),
         config.narratorVoice,
         config.userVoice,
         connectionProfileVoice
-      ]);
-      const uncastMatchPromise = uncastGroups.length && uncastVoices.length ? requestUncastVoiceMatches(
+      ];
+      const uncastVoices = availableUncastVoices(favoriteVoices, reservedVoices);
+      const uncastMatchPromise = uncastGroups.length ? requestUncastVoiceMatches(
+        playbackChat.id,
+        messageId,
         preparePlaybackContent(message.content, preferences.skippedTrackerTags),
         uncastGroups,
-        uncastVoices
+        uncastVoices,
+        reservedVoices,
+        preferences.ghostVoiceLifetime
       ).catch((error) => {
         appendSpeakerDebugLog(`Uncast voice matching failed; using connection default: ${error instanceof Error ? error.message : String(error)}`);
         return [];
@@ -3661,16 +3692,16 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
           })();
         }
       }
-      if (uncastGroups.length && uncastVoices.length) setStatus("Matching uncast characters to favorite voices\u2026");
+      if (uncastGroups.length) setStatus("Matching uncast characters to favorite voices\u2026");
       const uncastMatches = await uncastMatchPromise;
       if (playback.controller.signal.aborted) throw new DOMException("Playback stopped.", "AbortError");
       for (const match of uncastMatches) {
         const group = uncastGroups.find((item) => item.id === match.groupId);
-        if (!group || !uncastVoices.some((voice) => voice.id === match.voiceId)) continue;
+        if (!group || reservedVoices.includes(match.voiceId)) continue;
         for (const segmentIndex of group.segmentIndexes) {
           for (const index of segmentPlanIndexes[segmentIndex] ?? []) plan[index] = { ...plan[index], voice: match.voiceId };
         }
-        appendSpeakerDebugLog(`Uncast voice ${group.id}: gender=${match.gender}, traits=${match.traits.join(", ") || "unspecified"}, voice=${JSON.stringify(match.voiceId)}.`);
+        appendSpeakerDebugLog(`Uncast voice ${group.id}: gender=${match.gender}, ghost=${match.ghostId ?? "none"}, voice=${JSON.stringify(match.voiceId)}.`);
       }
       synthesisPlanFrozen = true;
       const splitPlan = splitLargeVoicePlanSegments(plan);
@@ -4496,10 +4527,12 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
         playbackBufferSegments = preferences.playbackBufferSegments;
         concurrentGenerationLimit = preferences.concurrentGenerations;
         rateLimitWaitSeconds = preferences.rateLimitWaitSeconds;
+        ghostVoiceLifetime = preferences.ghostVoiceLifetime;
         speakerAssignmentDebug = preferences.speakerAssignmentDebug;
         playbackBufferInput.value = String(playbackBufferSegments);
         concurrentGenerationInput.value = String(concurrentGenerationLimit);
         rateLimitWaitInput.value = String(rateLimitWaitSeconds);
+        ghostLifetimeInput.value = String(ghostVoiceLifetime);
         speakerDebugToggle.checked = speakerAssignmentDebug;
         speakerDebugOutput.hidden = !speakerAssignmentDebug;
       }
@@ -4622,7 +4655,8 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
         playbackBufferSegments,
         concurrentGenerationLimit,
         rateLimitWaitSeconds,
-        speakerAssignmentDebug
+        speakerAssignmentDebug,
+        ghostVoiceLifetime
       );
       setStatus("Advanced playback settings saved globally.", "saved");
     } catch (error) {
@@ -5055,7 +5089,8 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
         playbackBufferSegments,
         concurrentGenerationLimit,
         rateLimitWaitSeconds,
-        speakerAssignmentDebug
+        speakerAssignmentDebug,
+        ghostVoiceLifetime
       );
     }
     skippedTrackerTagsInput.destroy();
@@ -5067,6 +5102,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
     playbackBufferInput.removeEventListener("change", onPlaybackBufferInput);
     concurrentGenerationInput.removeEventListener("change", onConcurrentGenerationInput);
     rateLimitWaitInput.removeEventListener("change", onRateLimitWaitInput);
+    ghostLifetimeInput.removeEventListener("change", onGhostLifetimeInput);
     speakerDebugToggle.removeEventListener("change", onSpeakerDebugChanged);
     addNpcInput.destroy();
     addNpcButton.removeEventListener("click", onAddNpc);

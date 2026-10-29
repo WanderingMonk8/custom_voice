@@ -8,6 +8,7 @@ import {
   bufferAwareGenerationConcurrency,
   collectUncastVoiceGroups,
   availableUncastVoices,
+  GHOST_VOICE_LIFETIME_MESSAGES,
   clampSavedAudioLimit,
   DEFAULT_SAVED_AUDIO_LIMIT,
   eligibleCardFallbackSpeakerId,
@@ -342,6 +343,7 @@ interface PlaybackPreferences {
   playbackBufferSegments: number
   concurrentGenerations: number
   rateLimitWaitSeconds: number
+  ghostVoiceLifetime: number
   speakerAssignmentDebug: boolean
   defaultNarratorVoice: string
   defaultUserVoice: string
@@ -403,6 +405,7 @@ async function loadPlaybackPreferences(): Promise<PlaybackPreferences> {
     playbackBufferSegments: DEFAULT_PLAYBACK_BUFFER_SEGMENTS,
     concurrentGenerations: DEFAULT_CONCURRENT_GENERATIONS,
     rateLimitWaitSeconds: DEFAULT_RATE_LIMIT_WAIT_SECONDS,
+    ghostVoiceLifetime: GHOST_VOICE_LIFETIME_MESSAGES,
     speakerAssignmentDebug: false,
     defaultNarratorVoice: '',
     defaultUserVoice: '',
@@ -455,6 +458,7 @@ async function loadPlaybackPreferences(): Promise<PlaybackPreferences> {
       DEFAULT_RATE_LIMIT_WAIT_SECONDS,
       MAX_RATE_LIMIT_WAIT_SECONDS,
     ),
+    ghostVoiceLifetime: clampIntegerSetting(row.value?.chatVoiceGhostVoiceLifetime, GHOST_VOICE_LIFETIME_MESSAGES, 1000),
     speakerAssignmentDebug: row.value?.chatVoiceSpeakerAssignmentDebug === true,
     defaultNarratorVoice: typeof row.value?.chatVoiceDefaultNarratorVoice === 'string'
       ? row.value.chatVoiceDefaultNarratorVoice.trim().slice(0, 512)
@@ -541,6 +545,7 @@ function saveAdvancedPlaybackPreferences(
   concurrentGenerations: number,
   rateLimitWaitSeconds: number,
   speakerAssignmentDebug: boolean,
+  ghostVoiceLifetime: number,
 ): Promise<void> {
   return updateVoiceSettings(current => ({
     ...current,
@@ -560,6 +565,7 @@ function saveAdvancedPlaybackPreferences(
       MAX_RATE_LIMIT_WAIT_SECONDS,
     ),
     chatVoiceSpeakerAssignmentDebug: speakerAssignmentDebug,
+    chatVoiceGhostVoiceLifetime: clampIntegerSetting(ghostVoiceLifetime, GHOST_VOICE_LIFETIME_MESSAGES, 1000),
   }))
 }
 
@@ -1210,6 +1216,7 @@ export function setup(ctx: SpindleFrontendContext) {
   const playbackBufferField = createField('Playback buffer segments')
   const concurrentGenerationField = createField('Maximum concurrent generations')
   const rateLimitWaitField = createField('Rate-limit wait budget (seconds)')
+  const ghostLifetimeField = createField('Uncast voice lifetime (assistant messages)')
   const speakerDebugLabel = document.createElement('label')
   speakerDebugLabel.className = 'chat-voice-toggle'
   const speakerDebugToggle = document.createElement('input')
@@ -1237,6 +1244,7 @@ export function setup(ctx: SpindleFrontendContext) {
     playbackBufferField.field,
     concurrentGenerationField.field,
     rateLimitWaitField.field,
+    ghostLifetimeField.field,
     speakerDebugLabel,
     speakerDebugOutput,
     advancedHint,
@@ -1289,6 +1297,7 @@ export function setup(ctx: SpindleFrontendContext) {
   let playbackBufferSegments = DEFAULT_PLAYBACK_BUFFER_SEGMENTS
   let concurrentGenerationLimit = DEFAULT_CONCURRENT_GENERATIONS
   let rateLimitWaitSeconds = DEFAULT_RATE_LIMIT_WAIT_SECONDS
+  let ghostVoiceLifetime = GHOST_VOICE_LIFETIME_MESSAGES
   let speakerAssignmentDebug = false
   let advancedSettingsSaveTimer: ReturnType<typeof setTimeout> | null = null
   let savingAdvancedSettings = false
@@ -1614,6 +1623,18 @@ export function setup(ctx: SpindleFrontendContext) {
     MAX_RATE_LIMIT_WAIT_SECONDS,
     'Rate-limit wait budget in seconds',
   )
+  const ghostLifetimeInput = createNumberInput(GHOST_VOICE_LIFETIME_MESSAGES, 1000, 'Uncast voice lifetime in assistant messages')
+  ghostLifetimeField.slot.appendChild(ghostLifetimeInput)
+  const ghostLifetimeHint = document.createElement('div')
+  ghostLifetimeHint.className = 'chat-voice-hint'
+  ghostLifetimeHint.textContent = 'Keep an uncast character’s selected voice for this many assistant messages after they last spoke.'
+  ghostLifetimeField.slot.appendChild(ghostLifetimeHint)
+  const onGhostLifetimeInput = () => {
+    ghostVoiceLifetime = clampIntegerSetting(ghostLifetimeInput.valueAsNumber, GHOST_VOICE_LIFETIME_MESSAGES, 1000)
+    ghostLifetimeInput.value = String(ghostVoiceLifetime)
+    scheduleAdvancedSettingsSave()
+  }
+  ghostLifetimeInput.addEventListener('change', onGhostLifetimeInput)
   playbackBufferField.slot.appendChild(playbackBufferInput)
   concurrentGenerationField.slot.appendChild(concurrentGenerationInput)
   rateLimitWaitField.slot.appendChild(rateLimitWaitInput)
@@ -1801,12 +1822,13 @@ export function setup(ctx: SpindleFrontendContext) {
         tagLlmConnectionId: preferences.tagLlmConnectionId,
         tagLlmModel: preferences.tagLlmModel,
         skippedTrackerTags: preferences.skippedTrackerTags,
+        ghostVoiceLifetime: preferences.ghostVoiceLifetime,
         debug: preferences.speakerAssignmentDebug,
       })
     })
   }
 
-  function requestUncastVoiceMatches(message: string, groups: UncastVoiceGroup[], voices: FavoriteVoice[]): Promise<UncastVoiceAssignment[]> {
+  function requestUncastVoiceMatches(chatId: string, messageId: string, message: string, groups: UncastVoiceGroup[], voices: FavoriteVoice[], reserved: string[], lifetime: number): Promise<UncastVoiceAssignment[]> {
     const requestId = `uncast-${Date.now().toString(36)}-${++uncastRequestSequence}`
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -1814,7 +1836,7 @@ export function setup(ctx: SpindleFrontendContext) {
         reject(new Error('Uncast voice matching timed out.'))
       }, 35_000)
       pendingUncastRequests.set(requestId, { resolve, reject, timer })
-      ctx.sendToBackend({ type: 'chat_voice_match_uncast', requestId, message, groups, voices })
+      ctx.sendToBackend({ type: 'chat_voice_match_uncast', requestId, chatId, messageId, message, groups, voices, reserved, lifetime })
     })
   }
 
@@ -2509,6 +2531,7 @@ export function setup(ctx: SpindleFrontendContext) {
       preferences.playbackBufferSegments = playbackBufferSegments
       preferences.concurrentGenerations = concurrentGenerationLimit
       preferences.rateLimitWaitSeconds = rateLimitWaitSeconds
+      preferences.ghostVoiceLifetime = ghostVoiceLifetime
       preferences.speakerAssignmentDebug = speakerAssignmentDebug
     } else {
       playbackBufferSegments = preferences.playbackBufferSegments
@@ -2642,12 +2665,14 @@ export function setup(ctx: SpindleFrontendContext) {
         speakerId: segment.speakerId ? aliases.get(segment.speakerId) ?? segment.speakerId : null,
       }))
       const uncastGroups = collectUncastVoiceGroups(matchingSegments)
-      const uncastVoices = availableUncastVoices(favoriteVoices, [
+      const reservedVoices = [
         ...Object.values(config.characterVoices), config.narratorVoice, config.userVoice, connectionProfileVoice,
-      ])
-      const uncastMatchPromise = uncastGroups.length && uncastVoices.length
+      ]
+      const uncastVoices = availableUncastVoices(favoriteVoices, reservedVoices)
+      const uncastMatchPromise = uncastGroups.length
         ? requestUncastVoiceMatches(
-            preparePlaybackContent(message.content, preferences.skippedTrackerTags), uncastGroups, uncastVoices,
+            playbackChat.id, messageId, preparePlaybackContent(message.content, preferences.skippedTrackerTags),
+            uncastGroups, uncastVoices, reservedVoices, preferences.ghostVoiceLifetime,
           ).catch(error => {
             appendSpeakerDebugLog(`Uncast voice matching failed; using connection default: ${error instanceof Error ? error.message : String(error)}`)
             return [] as UncastVoiceAssignment[]
@@ -2962,16 +2987,16 @@ export function setup(ctx: SpindleFrontendContext) {
           })()
         }
       }
-      if (uncastGroups.length && uncastVoices.length) setStatus('Matching uncast characters to favorite voices…')
+      if (uncastGroups.length) setStatus('Matching uncast characters to favorite voices…')
       const uncastMatches = await uncastMatchPromise
       if (playback.controller.signal.aborted) throw new DOMException('Playback stopped.', 'AbortError')
       for (const match of uncastMatches) {
         const group = uncastGroups.find(item => item.id === match.groupId)
-        if (!group || !uncastVoices.some(voice => voice.id === match.voiceId)) continue
+        if (!group || reservedVoices.includes(match.voiceId)) continue
         for (const segmentIndex of group.segmentIndexes) {
           for (const index of segmentPlanIndexes[segmentIndex] ?? []) plan[index] = { ...plan[index], voice: match.voiceId }
         }
-        appendSpeakerDebugLog(`Uncast voice ${group.id}: gender=${match.gender}, traits=${match.traits.join(', ') || 'unspecified'}, voice=${JSON.stringify(match.voiceId)}.`)
+        appendSpeakerDebugLog(`Uncast voice ${group.id}: gender=${match.gender}, ghost=${match.ghostId ?? 'none'}, voice=${JSON.stringify(match.voiceId)}.`)
       }
       synthesisPlanFrozen = true
       const splitPlan = splitLargeVoicePlanSegments(plan)
@@ -3834,10 +3859,12 @@ export function setup(ctx: SpindleFrontendContext) {
         playbackBufferSegments = preferences.playbackBufferSegments
         concurrentGenerationLimit = preferences.concurrentGenerations
         rateLimitWaitSeconds = preferences.rateLimitWaitSeconds
+        ghostVoiceLifetime = preferences.ghostVoiceLifetime
         speakerAssignmentDebug = preferences.speakerAssignmentDebug
         playbackBufferInput.value = String(playbackBufferSegments)
         concurrentGenerationInput.value = String(concurrentGenerationLimit)
         rateLimitWaitInput.value = String(rateLimitWaitSeconds)
+        ghostLifetimeInput.value = String(ghostVoiceLifetime)
         speakerDebugToggle.checked = speakerAssignmentDebug
         speakerDebugOutput.hidden = !speakerAssignmentDebug
       }
@@ -3977,6 +4004,7 @@ export function setup(ctx: SpindleFrontendContext) {
         concurrentGenerationLimit,
         rateLimitWaitSeconds,
         speakerAssignmentDebug,
+        ghostVoiceLifetime,
       )
       setStatus('Advanced playback settings saved globally.', 'saved')
     } catch (error) {
@@ -4451,6 +4479,7 @@ export function setup(ctx: SpindleFrontendContext) {
         concurrentGenerationLimit,
         rateLimitWaitSeconds,
         speakerAssignmentDebug,
+        ghostVoiceLifetime,
       )
     }
     skippedTrackerTagsInput.destroy()
@@ -4462,6 +4491,7 @@ export function setup(ctx: SpindleFrontendContext) {
     playbackBufferInput.removeEventListener('change', onPlaybackBufferInput)
     concurrentGenerationInput.removeEventListener('change', onConcurrentGenerationInput)
     rateLimitWaitInput.removeEventListener('change', onRateLimitWaitInput)
+    ghostLifetimeInput.removeEventListener('change', onGhostLifetimeInput)
     speakerDebugToggle.removeEventListener('change', onSpeakerDebugChanged)
     addNpcInput.destroy()
     addNpcButton.removeEventListener('click', onAddNpc)
