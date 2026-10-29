@@ -277,6 +277,7 @@ interface TagPlacementPayload {
 
 interface UncastMatchPayload {
   type: 'chat_voice_uncast_matches'
+  diagnostics?: string[]
   requestId: string
   assignments: UncastVoiceAssignment[]
   error?: string
@@ -4380,7 +4381,10 @@ export function setup(ctx: SpindleFrontendContext) {
       clearTimeout(pending.timer)
       pendingUncastRequests.delete(payload.requestId)
       if (payload.error) pending.reject(new Error(payload.error))
-      else pending.resolve(payload.assignments)
+      else {
+        for (const line of payload.diagnostics ?? []) appendSpeakerDebugLog(`Uncast matching: ${line}`)
+        pending.resolve(payload.assignments)
+      }
       return
     }
     if (payload.type === 'chat_voice_message') {

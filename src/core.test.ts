@@ -2022,6 +2022,30 @@ test('links separate same-character runs to one ghost voice and gathers their lo
   assert.equal(result[1].ghostId, result[0].ghostId)
 })
 
+test('combines interrupted uncast groups before selecting their voice', () => {
+  const groups = collectUncastVoiceGroups([
+    { speakerId: null, text: 'The clerk speaks.' },
+    { speakerId: UNCAST_SPEAKER_ID, text: 'First.' },
+    { speakerId: 'watt', text: 'Answer.' },
+    { speakerId: null, text: 'The clerk responds.' },
+    { speakerId: UNCAST_SPEAKER_ID, text: 'Next.' },
+  ])
+  const voices = readFavoriteVoices([{ id: 'clerk', category: 'male' }])
+  const matches = resolveUncastVoiceDecisions(groups, voices, {
+    voice_g0: confidentDecision('no_match'),
+    identity_g1: confidentDecision('group_g0'),
+    gender_g1: confidentDecision('male'),
+    voice_g1: confidentDecision('voice_0'),
+  })
+  assert.deepEqual(matches.map(match => match.voiceId), ['clerk', 'clerk'])
+  assert.equal(matches[0].ghostId, matches[1].ghostId)
+  const weak = resolveUncastVoiceDecisions(groups, voices, {
+    identity_g1: { choice: 'group_g0', probabilities: { group_g0: 0.6, new_or_unclear: 0.4 }, confidence: 0.6 },
+    voice_g1: confidentDecision('voice_0'),
+  })
+  assert.deepEqual(weak.map(match => match.groupId), ['g1'])
+})
+
 test('defaults and clamps the global saved audio limit', () => {
   assert.equal(clampSavedAudioLimit(undefined), 50)
   assert.equal(clampSavedAudioLimit(0), 1)

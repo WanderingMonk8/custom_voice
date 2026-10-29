@@ -5028,7 +5028,10 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
       clearTimeout(pending.timer);
       pendingUncastRequests.delete(payload.requestId);
       if (payload.error) pending.reject(new Error(payload.error));
-      else pending.resolve(payload.assignments);
+      else {
+        for (const line of payload.diagnostics ?? []) appendSpeakerDebugLog(`Uncast matching: ${line}`);
+        pending.resolve(payload.assignments);
+      }
       return;
     }
     if (payload.type === "chat_voice_message") {

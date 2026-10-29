@@ -86,41 +86,46 @@ function buildUncastVoiceDecision(groups, voices, message, ghosts = []) {
 }
 function resolveUncastVoiceDecisions(groups, voices, answers, ghosts = [], reserved = [], messageId = "") {
   const used = new Set(reserved.filter(Boolean));
-  const ghostByGroup = /* @__PURE__ */ new Map();
   const assignments = [];
+  const roots = /* @__PURE__ */ new Map();
+  const linkedGhosts = /* @__PURE__ */ new Map();
+  const strongChoice = (answer) => {
+    if (!answer || answer.choice === "new_or_unclear") return false;
+    const probability = answer.probabilities[answer.choice] ?? 0;
+    const runnerUp = Math.max(0, ...Object.entries(answer.probabilities).filter(([key]) => key !== answer.choice).map(([, p]) => p));
+    return answer.confidence >= 0.8 && probability >= 0.8 && probability - runnerUp >= 0.25;
+  };
   for (const group of groups) {
-    const genderAnswer = answers[`gender_${group.id}`];
-    const gender = genderAnswer && (genderAnswer.choice === "male" || genderAnswer.choice === "female") && genderAnswer.confidence >= 0.6 && (genderAnswer.probabilities[genderAnswer.choice] ?? 0) >= 0.6 ? genderAnswer.choice : "unknown";
+    let root = group.id;
     const occurrenceKey = messageId ? `${messageId}:${hashMessageContent(group.speeches.join("\n"))}` : "";
-    let ghost = ghosts.find((item) => occurrenceKey && item.occurrenceKeys.includes(occurrenceKey)) ?? (group.speakerId !== UNCAST_SPEAKER_ID ? ghosts.find((item) => item.speakerId === group.speakerId) : void 0);
+    const exact = ghosts.find((item) => occurrenceKey && item.occurrenceKeys.includes(occurrenceKey)) ?? (group.speakerId !== UNCAST_SPEAKER_ID ? ghosts.find((item) => item.speakerId === group.speakerId) : void 0);
     const identity = answers[`identity_${group.id}`];
-    if (!ghost && identity && identity.choice !== "new_or_unclear") {
-      const probability = identity.probabilities[identity.choice] ?? 0;
-      const runnerUp = Math.max(0, ...Object.entries(identity.probabilities).filter(([key]) => key !== identity.choice).map(([, p]) => p));
-      if (identity.confidence >= 0.8 && probability >= 0.8 && probability - runnerUp >= 0.25) {
-        if (identity.choice.startsWith("ghost_")) ghost = ghosts[Number(identity.choice.slice(6))];
-        else if (identity.choice.startsWith("group_")) ghost = ghostByGroup.get(identity.choice.slice(6));
-      }
+    let ghost = exact;
+    if (!ghost && strongChoice(identity) && identity) {
+      if (identity.choice.startsWith("ghost_")) ghost = ghosts[Number(identity.choice.slice(6))];
+      else if (identity.choice.startsWith("group_")) root = roots.get(identity.choice.slice(6)) ?? root;
     }
-    if (ghost && !reserved.includes(ghost.voiceId)) {
-      used.add(ghost.voiceId);
-      ghostByGroup.set(group.id, ghost);
-      assignments.push({ groupId: group.id, voiceId: ghost.voiceId, gender, ghostId: ghost.id });
-      continue;
+    roots.set(group.id, root);
+    if (ghost && !reserved.includes(ghost.voiceId)) linkedGhosts.set(root, ghost);
+  }
+  for (const root of new Set(roots.values())) {
+    const members = groups.filter((group) => roots.get(group.id) === root);
+    const genderVotes = members.map((group) => answers[`gender_${group.id}`]).filter((answer) => answer && (answer.choice === "male" || answer.choice === "female") && answer.confidence >= 0.6 && (answer.probabilities[answer.choice] ?? 0) >= 0.6);
+    const genders = new Set(genderVotes.map((answer) => answer.choice));
+    const gender = genders.size === 1 ? genderVotes[0].choice : "unknown";
+    let ghost = linkedGhosts.get(root);
+    if (!ghost) {
+      const matches = members.map((group) => answers[`voice_${group.id}`]).filter((answer) => answer && answer.choice !== "no_match");
+      const ranked = voices.flatMap((voice, index) => {
+        if (used.has(voice.id) || gender !== "unknown" && voice.category !== "unspecified" && voice.category !== gender) return [];
+        const scores = matches.map((match) => match.probabilities[`voice_${index}`] ?? 0).filter((score) => Number.isFinite(score) && score > 0);
+        return scores.length ? [{ voice, score: scores.reduce((sum, score) => sum + score, 0) / scores.length, index }] : [];
+      }).sort((a, b) => b.score - a.score || a.index - b.index);
+      if (!ranked[0]) continue;
+      ghost = { id: `pending:${root}`, speakerId: members[0].speakerId, voiceId: ranked[0].voice.id, context: members.flatMap((group) => group.context).join(" ").slice(0, 2e3), occurrenceKeys: [], lastSeenMessageId: messageId };
     }
-    const match = answers[`voice_${group.id}`];
-    if (!match || match.choice === "no_match") continue;
-    const ranked = voices.flatMap((voice, index) => {
-      if (used.has(voice.id) || gender !== "unknown" && voice.category !== "unspecified" && voice.category !== gender) return [];
-      const probability = match.probabilities[`voice_${index}`] ?? 0;
-      if (!Number.isFinite(probability) || probability <= 0) return [];
-      return [{ voice, score: probability, index }];
-    }).sort((a, b) => b.score - a.score || a.index - b.index);
-    if (!ranked[0]) continue;
-    used.add(ranked[0].voice.id);
-    const created = { id: `pending:${group.id}`, speakerId: group.speakerId, voiceId: ranked[0].voice.id, context: group.context.join(" ").slice(0, 2e3), occurrenceKeys: [], lastSeenMessageId: messageId };
-    ghostByGroup.set(group.id, created);
-    assignments.push({ groupId: group.id, voiceId: ranked[0].voice.id, gender, ghostId: created.id });
+    used.add(ghost.voiceId);
+    for (const group of members) assignments.push({ groupId: group.id, voiceId: ghost.voiceId, gender, ghostId: ghost.id });
   }
   return assignments;
 }
@@ -4633,7 +4638,13 @@ spindle.onFrontendMessage(async (rawPayload, userId, frontendSessionId) => {
           if (assignments.length) {
             await saveGhostVoiceAssignments(payload.chatId, payload.messageId, assistantIds, groups, assignments, userId, anchor);
           }
-          sendFrontend({ type: "chat_voice_uncast_matches", requestId: payload.requestId, assignments }, userId, frontendSessionId);
+          const diagnostics = groups.map((group) => {
+            const identity = answers[`identity_${group.id}`];
+            const voice = answers[`voice_${group.id}`];
+            const assignment = assignments.find((item) => item.groupId === group.id);
+            return `${group.id} segments=${group.segmentIndexes.map((index) => index + 1).join(",")} identity=${identity ? `${identity.choice} confidence=${identity.confidence} probabilities=${JSON.stringify(identity.probabilities)}` : "none"} voice-choice=${voice ? `${voice.choice} confidence=${voice.confidence} probabilities=${JSON.stringify(voice.probabilities)}` : "none"} final=${assignment ? `${assignment.ghostId} / ${assignment.voiceId}` : "connection default"}`;
+          });
+          sendFrontend({ type: "chat_voice_uncast_matches", requestId: payload.requestId, assignments, diagnostics }, userId, frontendSessionId);
         }
       } catch (error) {
         sendFrontend({ type: "chat_voice_uncast_matches", requestId: payload.requestId, assignments: [], error: error instanceof Error ? error.message : "Could not match uncast voices." }, userId, frontendSessionId);
