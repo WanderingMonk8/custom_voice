@@ -5,6 +5,7 @@ import {
   applyCustomTtsEmotionCues,
   applyCustomTtsEmotionCuesWithModulation,
   applyLeadingTtsCues,
+  applyTtsSpeakerContinuity,
   assessSpeakerDiscourseEscalation,
   applyTtsTagSelections,
   buildSpeakerDecisionPlan,
@@ -716,7 +717,7 @@ async function applyTtsTags(
     const applied = applyTtsTagSelections(
       segments,
       buildTtsTagPlan(plan, undefined, TTS_AUTO_EMOTION_OPTIONS, style),
-      result.selections,
+      applyTtsSpeakerContinuity(segments, plan, result.selections, style),
       includeDebug,
     )
     const withDebug = result.failed && includeDebug

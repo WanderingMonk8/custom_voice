@@ -2191,6 +2191,7 @@ function applyTtsTagSelections(segments, plan, selections, includeDebug) {
       `tts-emotion-probability:${selection.emotionProbability.toFixed(3)}`,
       `tts-emotion-confidence:${selection.emotionConfidence.toFixed(3)}`,
       `tts-emotion-margin:${selection.emotionMargin.toFixed(3)}`,
+      ...selection.continuity ? [`tts-continuity:${selection.continuity}`] : [],
       `tts-emotion2-probability:${selection.emotion2Probability.toFixed(3)}`,
       `tts-emotion2-confidence:${selection.emotion2Confidence.toFixed(3)}`,
       `tts-styles:${JSON.stringify(selection.styles)}`,
@@ -2247,6 +2248,63 @@ function applyTtsTagSelections(segments, plan, selections, includeDebug) {
     };
   });
 }
+function applyTtsSpeakerContinuity(segments, plan, selections, style) {
+  const result = new Map(selections);
+  const quotes = playbackQuotes(plan.state.message);
+  const speechSegments = [];
+  let cursor = 0;
+  for (const speech of plan.state.speeches) {
+    while (cursor < segments.length && segments[cursor].text !== speech.text) cursor += 1;
+    if (cursor === segments.length) return result;
+    speechSegments.push(segments[cursor++]);
+  }
+  if (speechSegments.length !== plan.state.speeches.length || speechSegments.some((segment, index) => segment.text !== plan.state.speeches[index].text)) return result;
+  const history = /* @__PURE__ */ new Map();
+  for (let index = 0; index < plan.state.speeches.length; index++) {
+    const speech = plan.state.speeches[index];
+    const selection = result.get(speech.id);
+    const speaker = speechSegments[index].speakerId;
+    const bridge = narrationBridge(plan.state.message, quotes[index - 1], quotes[index]);
+    const boundary = SPEAKER_HARD_BOUNDARY_PATTERNS.find((item) => item.pattern.test(bridge));
+    if (boundary) history.clear();
+    if (!selection) continue;
+    if (!speaker || speaker === UNCAST_SPEAKER_ID) {
+      result.set(speech.id, { ...selection, continuity: "skipped: unresolved or uncast speaker" });
+      continue;
+    }
+    const previous = history.get(speaker);
+    const recent = previous && index - previous.index <= 3 ? previous : void 0;
+    const explicitEmotion = selection.existingTags.some((tag) => ttsTagCategory(tag) === "emotion");
+    const strong = !selection.fallback && selection.emotionProbability >= TTS_EMOTION_THRESHOLDS.probability && selection.emotionConfidence >= TTS_EMOTION_THRESHOLDS.confidence && selection.emotionMargin >= TTS_EMOTION_THRESHOLDS.margin;
+    let updated = selection;
+    if (style !== "gemini38" && recent && !explicitEmotion && !strong && selection.emotions.length === 1) {
+      const emotions = [recent.emotion];
+      const styles = style === "fish" && selection.fallback && selection.styles.length === 0 ? recent.styles : selection.styles;
+      const prefix = [...emotions, ...styles].map((tag) => formatTtsTag(tag, style)).filter(Boolean).join(" ");
+      const replaceLeading = (text, repeat) => {
+        const withoutEmotion = removeTtsTagsByCategory(text, "emotion");
+        const body = style === "fish" ? removeTtsTagsByCategory(withoutEmotion, "style") : withoutEmotion;
+        return renderLeadingCues(body.replace(/[ \t]+/gu, " ").trim(), prefix, repeat);
+      };
+      updated = {
+        ...selection,
+        emotions,
+        styles,
+        baseText: replaceLeading(selection.baseText, false),
+        ttsText: replaceLeading(selection.ttsText, style === "fish"),
+        continuity: `inherited ${recent.emotion} from ${recent.speechId} for ${speaker}; local emotion was weak`
+      };
+    } else {
+      const reason = boundary ? `reset at ${boundary.name}` : !recent && previous ? "prior emotion expired" : explicitEmotion ? "explicit emotion" : strong ? "strong local emotion" : "no recent reliable emotion";
+      updated = { ...selection, continuity: `${reason}; speaker=${speaker}, local=${selection.emotions.join("/") || "none"}` };
+    }
+    result.set(speech.id, updated);
+    if ((strong || explicitEmotion) && selection.emotions[0]) {
+      history.set(speaker, { emotion: selection.emotions[0], styles: selection.styles, index, speechId: speech.id });
+    }
+  }
+  return result;
+}
 function narrationBridge(message, previous, current) {
   if (!previous || !current || current.start <= previous.end) return "";
   return cleanPlaybackText(narrativeOnly(message.slice(previous.end, current.start)));
@@ -2256,7 +2314,7 @@ var SPEAKER_DECISION_THRESHOLDS = {
   discourse: { probability: 0.6, confidence: 0.55, margin: 0.2 },
   override: { probability: 0.7, confidence: 0.65, margin: 0.25 }
 };
-var TTS_TAG_SCHEMA = "tts-tags-6";
+var TTS_TAG_SCHEMA = "tts-tags-7";
 var SPEAKER_DECISION_SCHEMA = {
   classifier: "jev-4",
   discourse: "discourse-1",
@@ -3908,7 +3966,7 @@ async function applyTtsTags(segments, plan, style, selections, includeDebug) {
     const applied = applyTtsTagSelections(
       segments,
       buildTtsTagPlan(plan, void 0, TTS_AUTO_EMOTION_OPTIONS, style),
-      result.selections,
+      applyTtsSpeakerContinuity(segments, plan, result.selections, style),
       includeDebug
     );
     const withDebug = result.failed && includeDebug ? applied.map((segment) => {

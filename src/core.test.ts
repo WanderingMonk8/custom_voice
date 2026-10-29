@@ -9,6 +9,7 @@ import {
   applyCustomTtsEmotionCues,
   applyCustomTtsEmotionCuesWithModulation,
   applyLeadingTtsCues,
+  applyTtsSpeakerContinuity,
   applyTtsTagSelections,
   assessSpeakerDiscourseEscalation,
   buildSpeakerDecisionPlan,
@@ -1522,6 +1523,32 @@ test('supports a second emotion, sound, and pause in one selection', () => {
   assert.ok(selection?.ttsText.includes('[sigh]'))
   assert.ok(selection?.ttsText.includes('[break]'))
   assert.ok(selection?.ttsText.includes('[long-break]'))
+})
+
+test('smooths weak emotions per speaker while preserving confident shifts and scene boundaries', () => {
+  const content = '"First."\n\n"Reply."\n\n"Again."\n\n"Shift."\n\nHours later, she returns.\n\n"After."'
+  const plan = buildSpeakerDecisionPlan(content, [{ id: 'a', name: 'Alice' }, { id: 'b', name: 'Bob' }], false)
+  const tags = buildTtsTagPlan(plan, undefined, undefined, 'fish')
+  const selections = resolveTtsTagAnswers(tags, {
+    emotion_s0: { choice: 'excited', probabilities: { excited: 0.9, calm: 0.1 }, confidence: 0.9 },
+    emotion_s1: { choice: 'sad', probabilities: { sad: 0.9, calm: 0.1 }, confidence: 0.9 },
+    emotion_s2: { choice: 'calm', probabilities: { calm: 0.4, excited: 0.35 }, confidence: 0.3 },
+    emotion_s3: { choice: 'calm', probabilities: { calm: 0.9, excited: 0.1 }, confidence: 0.9 },
+  }, 'fish')
+  const segments = ['a', 'b', 'a', 'a', 'a'].map((speakerId, index) => ({
+    speakerId, text: plan.state.speeches[index].text,
+  }))
+  const result = applyTtsSpeakerContinuity(segments, plan, selections, 'fish')
+  assert.deepEqual(result.get('s1')?.emotions, ['sad'])
+  assert.deepEqual(result.get('s2')?.emotions, ['excited'])
+  assert.match(result.get('s2')?.ttsText ?? '', /^\[excited\]/u)
+  assert.deepEqual(result.get('s3')?.emotions, ['calm'])
+  assert.deepEqual(result.get('s4')?.emotions, ['calm'])
+  assert.match(result.get('s4')?.continuity ?? '', /reset at time-jump/u)
+  assert.deepEqual(result.get('s2')?.sounds, selections.get('s2')?.sounds)
+  assert.deepEqual(result.get('s2')?.pauses, selections.get('s2')?.pauses)
+  segments[2].speakerId = UNCAST_SPEAKER_ID
+  assert.deepEqual(applyTtsSpeakerContinuity(segments, plan, selections, 'fish').get('s2')?.emotions, ['calm'])
 })
 
 test('falls back to calm when the primary emotion is a weak winner', () => {
