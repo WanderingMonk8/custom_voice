@@ -2604,7 +2604,7 @@ function setup(ctx) {
     for (const [display, input] of [[narratorVoiceDisplay, narratorInput], [userVoiceDisplay, userVoiceInput]]) {
       const voiceId = input.getValue().trim();
       display.textContent = favoriteVoices.find((voice) => voice.id === voiceId)?.name || voiceId || "Connection default voice";
-      display.title = voiceId ? `Voice ID: ${voiceId}. Double-click to edit.` : "Double-click to enter a voice ID.";
+      display.title = voiceId ? `Voice ID: ${voiceId}. Click to edit.` : "Click to enter a voice ID.";
       display.disabled = !activeChat;
     }
   }
@@ -2622,7 +2622,7 @@ function setup(ctx) {
       display.hidden = false;
       updateRoleVoiceDisplays();
     };
-    display.addEventListener("dblclick", begin);
+    display.addEventListener("click", begin);
     display.addEventListener("keydown", (event) => {
       if (event.key === "Enter" || event.key === " ") {
         event.preventDefault();
@@ -4291,7 +4291,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
       const voiceId = characterInputs.get(id)?.getValue().trim() ?? "";
       const favorite = favoriteVoices.find((voice) => voice.id === voiceId);
       display.textContent = favorite?.name || voiceId || "Connection default voice";
-      display.title = voiceId ? `Voice ID: ${voiceId}. Double-click to edit.` : "Double-click to enter a voice ID.";
+      display.title = voiceId ? `Voice ID: ${voiceId}. Click to edit.` : "Click to enter a voice ID.";
     }
   }
   function stopVoicePreview() {
@@ -4589,7 +4589,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
         voiceDisplay.hidden = false;
         updateCharacterVoiceDisplays();
       };
-      voiceDisplay.addEventListener("dblclick", beginEditing);
+      voiceDisplay.addEventListener("click", beginEditing);
       voiceDisplay.addEventListener("keydown", (event) => {
         if (event.key === "Enter" || event.key === " ") {
           event.preventDefault();

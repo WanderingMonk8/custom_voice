@@ -1348,8 +1348,9 @@ spindle.onFrontendMessage(async (rawPayload: unknown, userId, frontendSessionId)
           const diagnostics = groups.map(group => {
             const identity = answers[`identity_${group.id}`]
             const voice = answers[`voice_${group.id}`]
+            const comparisons = Object.entries(answers).filter(([key]) => key.startsWith(`same_${group.id}_`)).map(([key, answer]) => `${key}=${answer.choice} confidence=${answer.confidence} probabilities=${JSON.stringify(answer.probabilities)}`).join(';') || 'none'
             const assignment = assignments.find(item => item.groupId === group.id)
-            return `${group.id} segments=${group.segmentIndexes.map(index => index + 1).join(',')} identity=${identity ? `${identity.choice} confidence=${identity.confidence} probabilities=${JSON.stringify(identity.probabilities)}` : 'none'} voice-choice=${voice ? `${voice.choice} confidence=${voice.confidence} probabilities=${JSON.stringify(voice.probabilities)}` : 'none'} final=${assignment ? `${assignment.ghostId} / ${assignment.voiceId}` : 'connection default'}`
+            return `${group.id} segments=${group.segmentIndexes.map(index => index + 1).join(',')} identity=${identity ? `${identity.choice} confidence=${identity.confidence} probabilities=${JSON.stringify(identity.probabilities)}` : 'none'} comparisons=${comparisons} voice-choice=${voice ? `${voice.choice} confidence=${voice.confidence} probabilities=${JSON.stringify(voice.probabilities)}` : 'none'} final=${assignment ? `${assignment.ghostId} / ${assignment.voiceId}` : 'connection default'}`
           })
           sendFrontend({ type: 'chat_voice_uncast_matches', requestId: payload.requestId, assignments, diagnostics }, userId, frontendSessionId)
         }

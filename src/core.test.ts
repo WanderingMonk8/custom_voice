@@ -1960,7 +1960,7 @@ test('matches uncast voice groups without using cast voices or crossing gender c
   const available = availableUncastVoices(voices, ['in-use'])
   assert.deepEqual(available.map(voice => voice.id), ['female', 'male'])
   const plan = buildUncastVoiceDecision(groups, available, 'Scene context')
-  assert.equal(Object.keys(plan.questions).length, 5)
+  assert.equal(Object.keys(plan.questions).length, 6)
   assert.ok(!Object.keys(plan.questions).some(key => key.startsWith('trait_')))
   assert.match(plan.questions.voice_g0.criteria.voice_0, /gentle warm/u)
   const matches = resolveUncastVoiceDecisions(groups, available, {
@@ -2044,6 +2044,19 @@ test('combines interrupted uncast groups before selecting their voice', () => {
     voice_g1: confidentDecision('voice_0'),
   })
   assert.deepEqual(weak.map(match => match.groupId), ['g1'])
+})
+
+test('strong pairwise identity links override conflicting cached turn voices', () => {
+  const groups = collectUncastVoiceGroups([
+    { speakerId: UNCAST_SPEAKER_ID, text: 'First.' },
+    { speakerId: 'watt', text: 'Answer.' },
+    { speakerId: UNCAST_SPEAKER_ID, text: 'Second.' },
+  ])
+  const ghosts = groups.map((group, index) => ({ id: `ghost-${index}`, speakerId: UNCAST_SPEAKER_ID, voiceId: `voice-${index}`, context: 'The clerk.', occurrenceKeys: [`message:${hashMessageContent(group.speeches.join('\n'))}`], lastSeenMessageId: 'message' }))
+  const answers = { same_g1_g0: confidentDecision('same') }
+  const matches = resolveUncastVoiceDecisions(groups, [], answers, ghosts, [], 'message')
+  assert.deepEqual(matches.map(match => match.voiceId), ['voice-0', 'voice-0'])
+  assert.match(buildUncastVoiceDecision(groups, [], 'The clerk and Watt.').questions.same_g1_g0.instructions, /same individual/u)
 })
 
 test('defaults and clamps the global saved audio limit', () => {

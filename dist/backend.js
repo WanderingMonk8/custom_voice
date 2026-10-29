@@ -75,6 +75,13 @@ function buildUncastVoiceDecision(groups, voices, message, ghosts = []) {
         ...Object.fromEntries(earlier.map((previous) => [`group_${previous.id}`, `Earlier character ${previous.id}; context: ${previous.context.join(" ").slice(0, 2e3)}`]))
       }
     };
+    for (const previous of earlier.slice(-8)) {
+      questions[`same_${group.id}_${previous.id}`] = {
+        type: "choice",
+        instructions: `Compare ${group.id} and ${previous.id} across the entire scene. Are these speeches clearly from the same individual? Treat references to the same role as evidence, and distinguish different people with the same role.`,
+        criteria: { same: "The two groups clearly belong to the same individual.", different_or_unclear: "They are different people, or the evidence is insufficient." }
+      };
+    }
     if (!voices.length) continue;
     questions[`voice_${group.id}`] = {
       type: "choice",
@@ -100,13 +107,17 @@ function resolveUncastVoiceDecisions(groups, voices, answers, ghosts = [], reser
     const occurrenceKey = messageId ? `${messageId}:${hashMessageContent(group.speeches.join("\n"))}` : "";
     const exact = ghosts.find((item) => occurrenceKey && item.occurrenceKeys.includes(occurrenceKey)) ?? (group.speakerId !== UNCAST_SPEAKER_ID ? ghosts.find((item) => item.speakerId === group.speakerId) : void 0);
     const identity = answers[`identity_${group.id}`];
+    const previousGroups = groups.slice(0, groups.indexOf(group)).slice(-8);
+    const same = previousGroups.flatMap((previous) => {
+      const answer = answers[`same_${group.id}_${previous.id}`];
+      return answer?.choice === "same" && strongChoice(answer) ? [{ previous, probability: answer.probabilities.same ?? 0 }] : [];
+    }).sort((a, b) => b.probability - a.probability);
+    if (same[0]) root = roots.get(same[0].previous.id) ?? root;
+    else if (strongChoice(identity) && identity?.choice.startsWith("group_")) root = roots.get(identity.choice.slice(6)) ?? root;
     let ghost = exact;
-    if (!ghost && strongChoice(identity) && identity) {
-      if (identity.choice.startsWith("ghost_")) ghost = ghosts[Number(identity.choice.slice(6))];
-      else if (identity.choice.startsWith("group_")) root = roots.get(identity.choice.slice(6)) ?? root;
-    }
+    if (!ghost && strongChoice(identity) && identity?.choice.startsWith("ghost_")) ghost = ghosts[Number(identity.choice.slice(6))];
     roots.set(group.id, root);
-    if (ghost && !reserved.includes(ghost.voiceId)) linkedGhosts.set(root, ghost);
+    if (ghost && !reserved.includes(ghost.voiceId) && !linkedGhosts.has(root)) linkedGhosts.set(root, ghost);
   }
   for (const root of new Set(roots.values())) {
     const members = groups.filter((group) => roots.get(group.id) === root);
@@ -4641,8 +4652,9 @@ spindle.onFrontendMessage(async (rawPayload, userId, frontendSessionId) => {
           const diagnostics = groups.map((group) => {
             const identity = answers[`identity_${group.id}`];
             const voice = answers[`voice_${group.id}`];
+            const comparisons = Object.entries(answers).filter(([key]) => key.startsWith(`same_${group.id}_`)).map(([key, answer]) => `${key}=${answer.choice} confidence=${answer.confidence} probabilities=${JSON.stringify(answer.probabilities)}`).join(";") || "none";
             const assignment = assignments.find((item) => item.groupId === group.id);
-            return `${group.id} segments=${group.segmentIndexes.map((index) => index + 1).join(",")} identity=${identity ? `${identity.choice} confidence=${identity.confidence} probabilities=${JSON.stringify(identity.probabilities)}` : "none"} voice-choice=${voice ? `${voice.choice} confidence=${voice.confidence} probabilities=${JSON.stringify(voice.probabilities)}` : "none"} final=${assignment ? `${assignment.ghostId} / ${assignment.voiceId}` : "connection default"}`;
+            return `${group.id} segments=${group.segmentIndexes.map((index) => index + 1).join(",")} identity=${identity ? `${identity.choice} confidence=${identity.confidence} probabilities=${JSON.stringify(identity.probabilities)}` : "none"} comparisons=${comparisons} voice-choice=${voice ? `${voice.choice} confidence=${voice.confidence} probabilities=${JSON.stringify(voice.probabilities)}` : "none"} final=${assignment ? `${assignment.ghostId} / ${assignment.voiceId}` : "connection default"}`;
           });
           sendFrontend({ type: "chat_voice_uncast_matches", requestId: payload.requestId, assignments, diagnostics }, userId, frontendSessionId);
         }
