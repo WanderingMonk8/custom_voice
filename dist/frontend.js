@@ -2551,13 +2551,29 @@ function setup(ctx) {
     disabled: true,
     onChange: () => markChanged()
   });
-  const narratorInput = ctx.components.mountTextInput(narratorField.slot, {
+  const narratorEditSlot = document.createElement("div");
+  const userEditSlot = document.createElement("div");
+  narratorEditSlot.hidden = true;
+  userEditSlot.hidden = true;
+  const narratorVoiceDisplay = document.createElement("button");
+  const userVoiceDisplay = document.createElement("button");
+  for (const [display, role] of [[narratorVoiceDisplay, "narrator"], [userVoiceDisplay, "user"]]) {
+    display.type = "button";
+    display.className = "chat-voice-selected-voice";
+    display.setAttribute("aria-label", `Selected ${role} voice; press Enter to edit voice ID`);
+    display.disabled = true;
+  }
+  narratorField.slot.append(narratorVoiceDisplay, narratorEditSlot);
+  userVoiceField.slot.append(userVoiceDisplay, userEditSlot);
+  let editingRoleVoice = null;
+  const narratorInput = ctx.components.mountTextInput(narratorEditSlot, {
     value: "",
     placeholder: "Enter the narrator voice name or ID",
     ariaLabel: "Narrator voice",
     disabled: true,
     onChange: () => {
       if (applyingState) return;
+      updateRoleVoiceDisplays();
       if (useGlobalNarratorVoice) {
         defaultNarratorVoice = narratorInput.getValue();
         scheduleGlobalRoleVoiceSave("narrator");
@@ -2567,13 +2583,14 @@ function setup(ctx) {
       }
     }
   });
-  const userVoiceInput = ctx.components.mountTextInput(userVoiceField.slot, {
+  const userVoiceInput = ctx.components.mountTextInput(userEditSlot, {
     value: "",
     placeholder: "Enter the user voice name or ID",
     ariaLabel: "User voice",
     disabled: true,
     onChange: () => {
       if (applyingState) return;
+      updateRoleVoiceDisplays();
       if (useGlobalUserVoice) {
         defaultUserVoice = userVoiceInput.getValue();
         scheduleGlobalRoleVoiceSave("user");
@@ -2583,6 +2600,50 @@ function setup(ctx) {
       }
     }
   });
+  function updateRoleVoiceDisplays() {
+    for (const [display, input] of [[narratorVoiceDisplay, narratorInput], [userVoiceDisplay, userVoiceInput]]) {
+      const voiceId = input.getValue().trim();
+      display.textContent = favoriteVoices.find((voice) => voice.id === voiceId)?.name || voiceId || "Connection default voice";
+      display.title = voiceId ? `Voice ID: ${voiceId}. Double-click to edit.` : "Double-click to enter a voice ID.";
+      display.disabled = !activeChat;
+    }
+  }
+  function bindRoleVoiceEditor(role, display, slot, input) {
+    const begin = () => {
+      if (!activeChat) return;
+      editingRoleVoice = role;
+      display.hidden = true;
+      slot.hidden = false;
+      input.focus();
+    };
+    const end = () => {
+      if (editingRoleVoice === role) editingRoleVoice = null;
+      slot.hidden = true;
+      display.hidden = false;
+      updateRoleVoiceDisplays();
+    };
+    display.addEventListener("dblclick", begin);
+    display.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        begin();
+      }
+    });
+    slot.addEventListener("focusout", (event) => {
+      if (event.relatedTarget && slot.contains(event.relatedTarget)) return;
+      end();
+    });
+    slot.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        input.blur();
+        end();
+        display.focus();
+      }
+    });
+  }
+  bindRoleVoiceEditor("narrator", narratorVoiceDisplay, narratorEditSlot, narratorInput);
+  bindRoleVoiceEditor("user", userVoiceDisplay, userEditSlot, userVoiceInput);
   function createRoleFavoritePicker(role) {
     const picker = document.createElement("select");
     picker.className = "chat-voice-favorite-select";
@@ -2594,6 +2655,7 @@ function setup(ctx) {
       if (!voice || !activeChat) return;
       const input = role === "narrator" ? narratorInput : userVoiceInput;
       input.update({ value: voice });
+      updateRoleVoiceDisplays();
       picker.value = "";
       if (role === "narrator") {
         if (useGlobalNarratorVoice) {
@@ -2822,6 +2884,7 @@ function setup(ctx) {
     if (role === "narrator") useGlobalNarratorVoice = checked;
     else useGlobalUserVoice = checked;
     input.update({ value: role === "narrator" ? checked ? defaultNarratorVoice : localNarratorVoice : checked ? defaultUserVoice : localUserVoice });
+    updateRoleVoiceDisplays();
     updateRoleDefaultControls();
     markChanged();
   }
@@ -4221,6 +4284,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
       picker.disabled = !activeChat || favoriteVoices.length === 0;
     }
     updateCharacterVoiceDisplays();
+    updateRoleVoiceDisplays();
   }
   function updateCharacterVoiceDisplays() {
     for (const [id, display] of characterVoiceDisplays) {
@@ -4558,7 +4622,15 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
   function renderState(next) {
     applyingState = true;
     const keepVoiceEditor = !!editingCharacterVoiceId && !!next && activeChat?.id === next.id;
+    const keepRoleEditor = !!editingRoleVoice && !!next && activeChat?.id === next.id;
     if (!keepVoiceEditor) editingCharacterVoiceId = null;
+    if (!keepRoleEditor) {
+      editingRoleVoice = null;
+      narratorEditSlot.hidden = true;
+      userEditSlot.hidden = true;
+      narratorVoiceDisplay.hidden = false;
+      userVoiceDisplay.hidden = false;
+    }
     activeChat = next;
     context.textContent = next ? `Active chat: ${next.name}` : "Open a chat to configure its voices.";
     const selectedConnectionId = next?.connectionId || lumiverseConnectionId;
@@ -4569,21 +4641,22 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
       disabled: !next || connections.length === 0
     });
     scanButton.disabled = !next || scanning;
-    localNarratorVoice = next?.narratorVoice ?? "";
-    localUserVoice = next?.userVoice ?? "";
+    if (!keepRoleEditor || editingRoleVoice !== "narrator") localNarratorVoice = next?.narratorVoice ?? "";
+    if (!keepRoleEditor || editingRoleVoice !== "user") localUserVoice = next?.userVoice ?? "";
     useGlobalNarratorVoice = next?.useGlobalNarratorVoice ?? true;
     useGlobalUserVoice = next?.useGlobalUserVoice ?? true;
-    narratorInput.update({
+    if (!keepRoleEditor || editingRoleVoice !== "narrator") narratorInput.update({
       value: next ? useGlobalNarratorVoice ? defaultNarratorVoice : localNarratorVoice : "",
       disabled: !next
     });
-    userVoiceInput.update({
+    if (!keepRoleEditor || editingRoleVoice !== "user") userVoiceInput.update({
       value: next ? useGlobalUserVoice ? defaultUserVoice : localUserVoice : "",
       disabled: !next
     });
     addNpcInput.update({ value: "", disabled: !next });
     addNpcButton.disabled = !next;
     if (!keepVoiceEditor) renderCharacters(next?.characters ?? []);
+    updateRoleVoiceDisplays();
     updateRoleDefaultControls();
     applyingState = false;
     if (!next) setStatus("Open a chat to edit its voices.");
@@ -4616,15 +4689,16 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
         defaultUserVoice = preferences.defaultUserVoice;
       }
       if (activeChat) {
-        narratorInput.update({
+        if (editingRoleVoice !== "narrator") narratorInput.update({
           value: useGlobalNarratorVoice ? defaultNarratorVoice : localNarratorVoice,
           disabled: false
         });
-        userVoiceInput.update({
+        if (editingRoleVoice !== "user") userVoiceInput.update({
           value: useGlobalUserVoice ? defaultUserVoice : localUserVoice,
           disabled: false
         });
       }
+      updateRoleVoiceDisplays();
       updateRoleDefaultControls();
       if (!savingAudioPreference) {
         saveGeneratedAudio = preferences.saveGeneratedAudio;
