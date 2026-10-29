@@ -9,6 +9,7 @@ import {
   assessSpeakerDiscourseEscalation,
   applyTtsTagSelections,
   buildSpeakerDecisionPlan,
+  buildUncastVoiceDecision,
   buildTtsTagPlan,
   clampMessageLimit,
   eligibleCardFallbackSpeakerId,
@@ -25,8 +26,10 @@ import {
   previousAssistantSpeakerFallback,
   mergeScannedCardCast,
   readConfig,
+  readFavoriteVoices,
   resolveSpeakerDecisionSegments,
   resolveTtsTagAnswers,
+  resolveUncastVoiceDecisions,
   speakerIdMatchingCardTitle,
   speakerAliases,
   speakersForMessageRole,
@@ -47,6 +50,8 @@ import {
   type TtsTagSelection,
   type TtsTagStyle,
   type TtsTagOption,
+  type FavoriteVoice,
+  type UncastVoiceGroup,
 } from './core'
 
 declare const spindle: import('lumiverse-spindle-types').SpindleAPI
@@ -87,6 +92,7 @@ type FrontendMessage =
   | { type: 'chat_voice_list_llm_connections'; requestId: string }
   | { type: 'chat_voice_scan'; chatId: string; messageLimit: number }
   | { type: 'chat_voice_get_message'; chatId: string; messageId: string; requestId: string }
+  | { type: 'chat_voice_match_uncast'; requestId: string; message: string; groups: UncastVoiceGroup[]; voices: FavoriteVoice[] }
   | {
       type: 'chat_voice_parse_message'
       chatId: string
@@ -1238,6 +1244,28 @@ spindle.onFrontendMessage(async (rawPayload: unknown, userId, frontendSessionId)
           connections: [],
           error: error instanceof Error ? error.message : 'Could not load LLM connections.',
         }, userId, frontendSessionId)
+      }
+    } else if (payload?.type === 'chat_voice_match_uncast') {
+      try {
+        const voices = readFavoriteVoices(payload.voices)
+        const groups = payload.groups.slice(0, 64).map(group => ({
+          id: group.id, speakerId: group.speakerId,
+          segmentIndexes: group.segmentIndexes.slice(0, 500),
+          speeches: group.speeches.slice(0, 20).map(speech => speech.slice(0, 2_000)),
+        }))
+        if (!groups.length || !voices.length) {
+          sendFrontend({ type: 'chat_voice_uncast_matches', requestId: payload.requestId, assignments: [] }, userId, frontendSessionId)
+        } else {
+          const plan = buildUncastVoiceDecision(groups, voices, payload.message.slice(0, 30_000))
+          const result = await spindle.decisions.evaluate({ state: plan.state, questions: plan.questions, ...(userId ? { userId } : {}) })
+          const answers: Record<string, SpeakerDecisionChoice> = {}
+          for (const [id, answer] of Object.entries(result.answers)) {
+            if (answer.type === 'choice') answers[id] = { choice: answer.choice, probabilities: answer.probabilities, confidence: answer.confidence }
+          }
+          sendFrontend({ type: 'chat_voice_uncast_matches', requestId: payload.requestId, assignments: resolveUncastVoiceDecisions(groups, voices, answers) }, userId, frontendSessionId)
+        }
+      } catch (error) {
+        sendFrontend({ type: 'chat_voice_uncast_matches', requestId: payload.requestId, assignments: [], error: error instanceof Error ? error.message : 'Could not match uncast voices.' }, userId, frontendSessionId)
       }
     } else if (payload?.type === 'chat_voice_place_tags') {
       try {

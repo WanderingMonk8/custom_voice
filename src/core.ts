@@ -11,6 +11,7 @@ export interface FavoriteVoice {
   id: string
   name: string
   category: 'male' | 'female' | 'unspecified'
+  description: string
 }
 
 /** Validate globally saved favorites without changing the case of provider IDs. */
@@ -29,9 +30,108 @@ export function readFavoriteVoices(value: unknown): FavoriteVoice[] {
       id,
       name: typeof row.name === 'string' ? row.name.trim().slice(0, 128) : '',
       category: row.category === 'male' || row.category === 'female' ? row.category : 'unspecified',
+      description: typeof row.description === 'string' ? row.description.trim().slice(0, 500) : '',
     })
   }
   return result
+}
+
+export interface UncastVoiceGroup { id: string; speakerId: string; segmentIndexes: number[]; speeches: string[] }
+
+/** Group named unconfigured speakers by identity; anonymous runs stay separate. */
+export function collectUncastVoiceGroups(segments: PlaybackSegment[]): UncastVoiceGroup[] {
+  const groups: UncastVoiceGroup[] = []
+  const named = new Map<string, UncastVoiceGroup>()
+  let anonymous: UncastVoiceGroup | null = null
+  for (let index = 0; index < segments.length; index++) {
+    const segment = segments[index]
+    const id = segment.speakerId
+    if (id === null) continue
+    if (id !== UNCAST_SPEAKER_ID && !id.startsWith('unconfigured:')) { anonymous = null; continue }
+    if (id !== UNCAST_SPEAKER_ID) anonymous = null
+    let group: UncastVoiceGroup | null | undefined = id === UNCAST_SPEAKER_ID ? anonymous : named.get(id)
+    if (!group) {
+      group = { id: `g${groups.length}`, speakerId: id, segmentIndexes: [], speeches: [] }
+      groups.push(group)
+      if (id === UNCAST_SPEAKER_ID) anonymous = group
+      else { named.set(id, group); anonymous = null }
+    }
+    group.segmentIndexes.push(index)
+    group.speeches.push(segment.text)
+  }
+  return groups
+}
+
+/** Only unassigned favorites may be used; unspecified categories remain eligible. */
+export function availableUncastVoices(favorites: FavoriteVoice[], used: readonly string[]): FavoriteVoice[] {
+  const reserved = new Set(used.map(voice => voice.trim()).filter(Boolean))
+  return favorites.filter(voice => !reserved.has(voice.id))
+}
+
+const UNCAST_VOICE_TRAITS = ['commanding', 'gentle', 'tired', 'warm', 'soft', 'deep', 'bright', 'rough', 'calm', 'youthful', 'mature', 'nervous', 'confident', 'gravelly', 'energetic', 'formal'] as const
+
+/** One decision call classifies each uncast group and ranks the available voice descriptions. */
+export function buildUncastVoiceDecision(groups: UncastVoiceGroup[], voices: FavoriteVoice[], message: string) {
+  const state = {
+    message,
+    characters: groups.map(group => ({ id: group.id, identity: group.speakerId, speeches: group.speeches })),
+    voices: voices.map((voice, index) => ({ option: `voice_${index}`, name: voice.name, category: voice.category, description: voice.description })),
+  }
+  const questions: Record<string, { type: 'choice'; instructions: string; criteria: Record<string, string> }> = {}
+  for (const group of groups) {
+    questions[`gender_${group.id}`] = {
+      type: 'choice', instructions: `Identify the gender of character ${group.id} from the scene. Choose unknown when not established.`,
+      criteria: { male: 'The character is male.', female: 'The character is female.', unknown: 'Gender is not established or is not male or female.' },
+    }
+    const traitCriteria = Object.fromEntries(UNCAST_VOICE_TRAITS.map(trait => [trait, `The voice or delivery is ${trait}.`]))
+    questions[`trait_${group.id}`] = {
+      type: 'choice', instructions: `Choose the most useful voice characteristic for character ${group.id}, based on the scene.`,
+      criteria: { ...traitCriteria, unspecified: 'No characteristic is established.' },
+    }
+    questions[`trait2_${group.id}`] = {
+      type: 'choice', instructions: `Choose another useful voice characteristic for character ${group.id}, or unspecified if none.`,
+      criteria: { ...traitCriteria, unspecified: 'No additional characteristic is established.' },
+    }
+    questions[`voice_${group.id}`] = {
+      type: 'choice', instructions: `Rank the available voices by how well their descriptions suit character ${group.id}. Use the character's voice and temperament in the scene. Choose no_match if no voice is suitable.`,
+      criteria: { ...Object.fromEntries(state.voices.map(voice => [voice.option, `${voice.name || 'Unnamed voice'}; ${voice.category}; ${voice.description || 'No description provided.'}`])), no_match: 'No available voice is suitable.' },
+    }
+  }
+  return { state, questions }
+}
+
+export interface UncastVoiceAssignment { groupId: string; voiceId: string; gender: string; traits: string[] }
+
+export function resolveUncastVoiceDecisions(
+  groups: UncastVoiceGroup[], voices: FavoriteVoice[], answers: Record<string, SpeakerDecisionChoice>,
+): UncastVoiceAssignment[] {
+  const used = new Set<string>()
+  const assignments: UncastVoiceAssignment[] = []
+  for (const group of groups) {
+    const genderAnswer = answers[`gender_${group.id}`]
+    const gender = genderAnswer && (genderAnswer.choice === 'male' || genderAnswer.choice === 'female')
+      && genderAnswer.confidence >= 0.6 && (genderAnswer.probabilities[genderAnswer.choice] ?? 0) >= 0.6
+      ? genderAnswer.choice : 'unknown'
+    const traits = [`trait_${group.id}`, `trait2_${group.id}`].flatMap(key => {
+      const answer = answers[key]
+      return answer && (UNCAST_VOICE_TRAITS as readonly string[]).includes(answer.choice)
+        && answer.confidence >= 0.5 && (answer.probabilities[answer.choice] ?? 0) >= 0.5 ? [answer.choice] : []
+    }).filter((trait, index, all) => all.indexOf(trait) === index)
+    const match = answers[`voice_${group.id}`]
+    if (!match || match.choice === 'no_match') continue
+    const ranked = voices.flatMap((voice, index) => {
+      if (used.has(voice.id) || (gender !== 'unknown' && voice.category !== 'unspecified' && voice.category !== gender)) return []
+      const probability = match.probabilities[`voice_${index}`] ?? 0
+      if (!Number.isFinite(probability) || probability <= 0) return []
+      const terms = new Set(voice.description.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? [])
+      const overlap = traits.filter(trait => terms.has(trait)).length
+      return [{ voice, score: probability + Math.min(0.2, overlap * 0.1), index }]
+    }).sort((a, b) => b.score - a.score || a.index - b.index)
+    if (!ranked[0]) continue
+    used.add(ranked[0].voice.id)
+    assignments.push({ groupId: group.id, voiceId: ranked[0].voice.id, gender, traits })
+  }
+  return assignments
 }
 
 export interface SavedAudioRecord {

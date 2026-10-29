@@ -5,6 +5,85 @@ var UNCAST_SPEAKER_ID = "__chat_voice_uncast__";
 var DEFAULT_MESSAGE_LIMIT = 20;
 var MIN_MESSAGE_LIMIT = 1;
 var MAX_MESSAGE_LIMIT = 500;
+function readFavoriteVoices(value) {
+  if (!Array.isArray(value)) return [];
+  const seen = /* @__PURE__ */ new Set();
+  const result = [];
+  for (const item of value.slice(0, 500)) {
+    if (!item || typeof item !== "object") continue;
+    const row = item;
+    if (typeof row.id !== "string") continue;
+    const id = row.id.trim().slice(0, 512);
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    result.push({
+      id,
+      name: typeof row.name === "string" ? row.name.trim().slice(0, 128) : "",
+      category: row.category === "male" || row.category === "female" ? row.category : "unspecified",
+      description: typeof row.description === "string" ? row.description.trim().slice(0, 500) : ""
+    });
+  }
+  return result;
+}
+var UNCAST_VOICE_TRAITS = ["commanding", "gentle", "tired", "warm", "soft", "deep", "bright", "rough", "calm", "youthful", "mature", "nervous", "confident", "gravelly", "energetic", "formal"];
+function buildUncastVoiceDecision(groups, voices, message) {
+  const state = {
+    message,
+    characters: groups.map((group) => ({ id: group.id, identity: group.speakerId, speeches: group.speeches })),
+    voices: voices.map((voice, index) => ({ option: `voice_${index}`, name: voice.name, category: voice.category, description: voice.description }))
+  };
+  const questions = {};
+  for (const group of groups) {
+    questions[`gender_${group.id}`] = {
+      type: "choice",
+      instructions: `Identify the gender of character ${group.id} from the scene. Choose unknown when not established.`,
+      criteria: { male: "The character is male.", female: "The character is female.", unknown: "Gender is not established or is not male or female." }
+    };
+    const traitCriteria = Object.fromEntries(UNCAST_VOICE_TRAITS.map((trait) => [trait, `The voice or delivery is ${trait}.`]));
+    questions[`trait_${group.id}`] = {
+      type: "choice",
+      instructions: `Choose the most useful voice characteristic for character ${group.id}, based on the scene.`,
+      criteria: { ...traitCriteria, unspecified: "No characteristic is established." }
+    };
+    questions[`trait2_${group.id}`] = {
+      type: "choice",
+      instructions: `Choose another useful voice characteristic for character ${group.id}, or unspecified if none.`,
+      criteria: { ...traitCriteria, unspecified: "No additional characteristic is established." }
+    };
+    questions[`voice_${group.id}`] = {
+      type: "choice",
+      instructions: `Rank the available voices by how well their descriptions suit character ${group.id}. Use the character's voice and temperament in the scene. Choose no_match if no voice is suitable.`,
+      criteria: { ...Object.fromEntries(state.voices.map((voice) => [voice.option, `${voice.name || "Unnamed voice"}; ${voice.category}; ${voice.description || "No description provided."}`])), no_match: "No available voice is suitable." }
+    };
+  }
+  return { state, questions };
+}
+function resolveUncastVoiceDecisions(groups, voices, answers) {
+  const used = /* @__PURE__ */ new Set();
+  const assignments = [];
+  for (const group of groups) {
+    const genderAnswer = answers[`gender_${group.id}`];
+    const gender = genderAnswer && (genderAnswer.choice === "male" || genderAnswer.choice === "female") && genderAnswer.confidence >= 0.6 && (genderAnswer.probabilities[genderAnswer.choice] ?? 0) >= 0.6 ? genderAnswer.choice : "unknown";
+    const traits = [`trait_${group.id}`, `trait2_${group.id}`].flatMap((key) => {
+      const answer = answers[key];
+      return answer && UNCAST_VOICE_TRAITS.includes(answer.choice) && answer.confidence >= 0.5 && (answer.probabilities[answer.choice] ?? 0) >= 0.5 ? [answer.choice] : [];
+    }).filter((trait, index, all) => all.indexOf(trait) === index);
+    const match = answers[`voice_${group.id}`];
+    if (!match || match.choice === "no_match") continue;
+    const ranked = voices.flatMap((voice, index) => {
+      if (used.has(voice.id) || gender !== "unknown" && voice.category !== "unspecified" && voice.category !== gender) return [];
+      const probability = match.probabilities[`voice_${index}`] ?? 0;
+      if (!Number.isFinite(probability) || probability <= 0) return [];
+      const terms = new Set(voice.description.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? []);
+      const overlap = traits.filter((trait) => terms.has(trait)).length;
+      return [{ voice, score: probability + Math.min(0.2, overlap * 0.1), index }];
+    }).sort((a, b) => b.score - a.score || a.index - b.index);
+    if (!ranked[0]) continue;
+    used.add(ranked[0].voice.id);
+    assignments.push({ groupId: group.id, voiceId: ranked[0].voice.id, gender, traits });
+  }
+  return assignments;
+}
 function speakersForMessageRole(speakers, _isUserMessage, userName = "User") {
   const nonUserSpeakers = speakers.filter((speaker) => speaker.id !== USER_SPEAKER_ID);
   return [
@@ -4421,6 +4500,29 @@ spindle.onFrontendMessage(async (rawPayload, userId, frontendSessionId) => {
           connections: [],
           error: error instanceof Error ? error.message : "Could not load LLM connections."
         }, userId, frontendSessionId);
+      }
+    } else if (payload?.type === "chat_voice_match_uncast") {
+      try {
+        const voices = readFavoriteVoices(payload.voices);
+        const groups = payload.groups.slice(0, 64).map((group) => ({
+          id: group.id,
+          speakerId: group.speakerId,
+          segmentIndexes: group.segmentIndexes.slice(0, 500),
+          speeches: group.speeches.slice(0, 20).map((speech) => speech.slice(0, 2e3))
+        }));
+        if (!groups.length || !voices.length) {
+          sendFrontend({ type: "chat_voice_uncast_matches", requestId: payload.requestId, assignments: [] }, userId, frontendSessionId);
+        } else {
+          const plan = buildUncastVoiceDecision(groups, voices, payload.message.slice(0, 3e4));
+          const result = await spindle.decisions.evaluate({ state: plan.state, questions: plan.questions, ...userId ? { userId } : {} });
+          const answers = {};
+          for (const [id, answer] of Object.entries(result.answers)) {
+            if (answer.type === "choice") answers[id] = { choice: answer.choice, probabilities: answer.probabilities, confidence: answer.confidence };
+          }
+          sendFrontend({ type: "chat_voice_uncast_matches", requestId: payload.requestId, assignments: resolveUncastVoiceDecisions(groups, voices, answers) }, userId, frontendSessionId);
+        }
+      } catch (error) {
+        sendFrontend({ type: "chat_voice_uncast_matches", requestId: payload.requestId, assignments: [], error: error instanceof Error ? error.message : "Could not match uncast voices." }, userId, frontendSessionId);
       }
     } else if (payload?.type === "chat_voice_place_tags") {
       try {

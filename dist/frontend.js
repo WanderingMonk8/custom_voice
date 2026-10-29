@@ -17,10 +17,43 @@ function readFavoriteVoices(value) {
     result.push({
       id,
       name: typeof row.name === "string" ? row.name.trim().slice(0, 128) : "",
-      category: row.category === "male" || row.category === "female" ? row.category : "unspecified"
+      category: row.category === "male" || row.category === "female" ? row.category : "unspecified",
+      description: typeof row.description === "string" ? row.description.trim().slice(0, 500) : ""
     });
   }
   return result;
+}
+function collectUncastVoiceGroups(segments) {
+  const groups = [];
+  const named = /* @__PURE__ */ new Map();
+  let anonymous = null;
+  for (let index = 0; index < segments.length; index++) {
+    const segment = segments[index];
+    const id = segment.speakerId;
+    if (id === null) continue;
+    if (id !== UNCAST_SPEAKER_ID && !id.startsWith("unconfigured:")) {
+      anonymous = null;
+      continue;
+    }
+    if (id !== UNCAST_SPEAKER_ID) anonymous = null;
+    let group = id === UNCAST_SPEAKER_ID ? anonymous : named.get(id);
+    if (!group) {
+      group = { id: `g${groups.length}`, speakerId: id, segmentIndexes: [], speeches: [] };
+      groups.push(group);
+      if (id === UNCAST_SPEAKER_ID) anonymous = group;
+      else {
+        named.set(id, group);
+        anonymous = null;
+      }
+    }
+    group.segmentIndexes.push(index);
+    group.speeches.push(segment.text);
+  }
+  return groups;
+}
+function availableUncastVoices(favorites, used) {
+  const reserved = new Set(used.map((voice) => voice.trim()).filter(Boolean));
+  return favorites.filter((voice) => !reserved.has(voice.id));
 }
 function speakersForMessageRole(speakers, _isUserMessage, userName = "User") {
   const nonUserSpeakers = speakers.filter((speaker) => speaker.id !== USER_SPEAKER_ID);
@@ -2226,6 +2259,10 @@ function setup(ctx) {
   favoriteId.placeholder = "Voice ID";
   favoriteId.maxLength = 512;
   favoriteId.setAttribute("aria-label", "Favorite voice ID");
+  const favoriteDescription = document.createElement("input");
+  favoriteDescription.placeholder = "Description (e.g. gentle, tired)";
+  favoriteDescription.maxLength = 500;
+  favoriteDescription.setAttribute("aria-label", "Favorite voice description");
   const favoriteCategory = document.createElement("select");
   favoriteCategory.setAttribute("aria-label", "Favorite voice classification");
   for (const [value, label] of [["unspecified", "Unspecified"], ["female", "Female"], ["male", "Male"]]) {
@@ -2238,7 +2275,7 @@ function setup(ctx) {
   favoriteAdd.type = "button";
   favoriteAdd.className = "chat-voice-add-button";
   favoriteAdd.textContent = "Add favorite";
-  favoriteForm.append(favoriteName, favoriteId, favoriteCategory, favoriteAdd);
+  favoriteForm.append(favoriteName, favoriteId, favoriteDescription, favoriteCategory, favoriteAdd);
   const favoriteList = document.createElement("div");
   favoriteList.className = "chat-voice-favorites";
   favoritesSection.append(favoriteForm, favoriteList);
@@ -2416,6 +2453,8 @@ function setup(ctx) {
   const pendingDecisionStatusRequests = /* @__PURE__ */ new Map();
   const pendingLlmConnectionRequests = /* @__PURE__ */ new Map();
   const pendingTagPlacementRequests = /* @__PURE__ */ new Map();
+  const pendingUncastRequests = /* @__PURE__ */ new Map();
+  let uncastRequestSequence = 0;
   let messageRequestSequence = 0;
   let stateRequestSequence = 0;
   let speakerParseRequestSequence = 0;
@@ -2778,6 +2817,17 @@ function setup(ctx) {
         skippedTrackerTags: preferences.skippedTrackerTags,
         debug: preferences.speakerAssignmentDebug
       });
+    });
+  }
+  function requestUncastVoiceMatches(message, groups, voices) {
+    const requestId = `uncast-${Date.now().toString(36)}-${++uncastRequestSequence}`;
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        pendingUncastRequests.delete(requestId);
+        reject(new Error("Uncast voice matching timed out."));
+      }, 35e3);
+      pendingUncastRequests.set(requestId, { resolve, reject, timer });
+      ctx.sendToBackend({ type: "chat_voice_match_uncast", requestId, message, groups, voices });
     });
   }
   function speakerDebugName(speakerId, speakers) {
@@ -3400,9 +3450,29 @@ function setup(ctx) {
         preferences.speakerParsingMode,
         review
       );
+      const matchingSegments = segments.map((segment) => ({
+        ...segment,
+        speakerId: segment.speakerId ? aliases.get(segment.speakerId) ?? segment.speakerId : null
+      }));
+      const uncastGroups = collectUncastVoiceGroups(matchingSegments);
+      const uncastVoices = availableUncastVoices(favoriteVoices, [
+        ...Object.values(config.characterVoices),
+        config.narratorVoice,
+        config.userVoice,
+        connectionProfileVoice
+      ]);
+      const uncastMatchPromise = uncastGroups.length && uncastVoices.length ? requestUncastVoiceMatches(
+        preparePlaybackContent(message.content, preferences.skippedTrackerTags),
+        uncastGroups,
+        uncastVoices
+      ).catch((error) => {
+        appendSpeakerDebugLog(`Uncast voice matching failed; using connection default: ${error instanceof Error ? error.message : String(error)}`);
+        return [];
+      }) : Promise.resolve([]);
       let explicitVoiceCount = 0;
       let connectionVoiceFallbacks = 0;
-      const plan = mergeVoicePlan(segments.map((segment) => {
+      const segmentPlanIndexes = [];
+      const rawPlan = segments.map((segment) => {
         const speakerId = segment.speakerId ? aliases.get(segment.speakerId) ?? segment.speakerId : null;
         const configuredVoice = playbackVoiceForSpeaker(
           speakerId,
@@ -3419,7 +3489,14 @@ function setup(ctx) {
           voice,
           ...segment.ttsTag ? { tagId: segment.ttsTag.id } : {}
         };
-      }));
+      });
+      const plan = mergeVoicePlan(rawPlan);
+      let planIndex = 0;
+      for (const item of rawPlan) {
+        const count = mergeVoicePlan([item]).length;
+        segmentPlanIndexes.push(Array.from({ length: count }, (_, offset) => planIndex + offset));
+        planIndex += count;
+      }
       appendSpeakerDebugLog(
         `TTS voice resolution: explicit=${explicitVoiceCount}, connectionDefaultFallback=${connectionVoiceFallbacks}${connectionVoiceFallbacks > 0 ? ` (explicit default voice ${JSON.stringify(connectionProfileVoice || "<connection default>")})` : ""}.`
       );
@@ -3583,6 +3660,17 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
             }
           })();
         }
+      }
+      if (uncastGroups.length && uncastVoices.length) setStatus("Matching uncast characters to favorite voices\u2026");
+      const uncastMatches = await uncastMatchPromise;
+      if (playback.controller.signal.aborted) throw new DOMException("Playback stopped.", "AbortError");
+      for (const match of uncastMatches) {
+        const group = uncastGroups.find((item) => item.id === match.groupId);
+        if (!group || !uncastVoices.some((voice) => voice.id === match.voiceId)) continue;
+        for (const segmentIndex of group.segmentIndexes) {
+          for (const index of segmentPlanIndexes[segmentIndex] ?? []) plan[index] = { ...plan[index], voice: match.voiceId };
+        }
+        appendSpeakerDebugLog(`Uncast voice ${group.id}: gender=${match.gender}, traits=${match.traits.join(", ") || "unspecified"}, voice=${JSON.stringify(match.voiceId)}.`);
       }
       synthesisPlanFrozen = true;
       const splitPlan = splitLargeVoicePlanSegments(plan);
@@ -4132,6 +4220,11 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
       copy.className = "chat-voice-favorite-copy";
       copy.textContent = voice.name || voice.id;
       copy.title = voice.id;
+      if (voice.description) {
+        const description = document.createElement("small");
+        description.textContent = voice.description;
+        copy.appendChild(description);
+      }
       const category = document.createElement("select");
       category.className = "chat-voice-favorite-select";
       category.style.width = "auto";
@@ -4172,6 +4265,16 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
         if (name === null) return;
         void saveFavoriteVoices(favoriteVoices.map((item) => item.id === voice.id ? { ...item, name: name.trim().slice(0, 128) } : item));
       });
+      const describe = document.createElement("button");
+      describe.type = "button";
+      describe.className = "chat-voice-preview-button";
+      describe.textContent = "Description";
+      describe.setAttribute("aria-label", `Edit description for ${voice.name || voice.id}`);
+      describe.addEventListener("click", () => {
+        const description = hostWindow.prompt("Describe the voice in a few terms.", voice.description);
+        if (description === null) return;
+        void saveFavoriteVoices(favoriteVoices.map((item) => item.id === voice.id ? { ...item, description: description.trim().slice(0, 500) } : item));
+      });
       const remove = document.createElement("button");
       remove.type = "button";
       remove.className = "chat-voice-delete-button";
@@ -4180,7 +4283,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
       remove.addEventListener("click", () => {
         void saveFavoriteVoices(favoriteVoices.filter((item) => item.id !== voice.id));
       });
-      row.append(copy, category, preview, rename, remove);
+      row.append(copy, category, preview, rename, describe, remove);
       favoriteList.appendChild(row);
     }
   }
@@ -4199,10 +4302,11 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
       return;
     }
     const category = favoriteCategory.value === "male" || favoriteCategory.value === "female" ? favoriteCategory.value : "unspecified";
-    void saveFavoriteVoices([...favoriteVoices, { id, name: favoriteName.value.trim().slice(0, 128), category }]).then((saved) => {
+    void saveFavoriteVoices([...favoriteVoices, { id, name: favoriteName.value.trim().slice(0, 128), category, description: favoriteDescription.value.trim().slice(0, 500) }]).then((saved) => {
       if (saved) {
         favoriteName.value = "";
         favoriteId.value = "";
+        favoriteDescription.value = "";
       }
     });
   });
@@ -4676,6 +4780,15 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
   hostWindow.requestAnimationFrame(updatePlaybackButtons);
   const unsubscribeBackend = ctx.onBackendMessage((rawPayload) => {
     const payload = rawPayload;
+    if (payload.type === "chat_voice_uncast_matches") {
+      const pending = pendingUncastRequests.get(payload.requestId);
+      if (!pending) return;
+      clearTimeout(pending.timer);
+      pendingUncastRequests.delete(payload.requestId);
+      if (payload.error) pending.reject(new Error(payload.error));
+      else pending.resolve(payload.assignments);
+      return;
+    }
     if (payload.type === "chat_voice_message") {
       const pending = pendingMessageRequests.get(payload.requestId);
       if (!pending) return;
@@ -4775,6 +4888,11 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
         pending.reject(new Error("The active chat changed before speaker review completed."));
       }
       pendingSpeakerParseRequests.clear();
+      for (const pending of pendingUncastRequests.values()) {
+        clearTimeout(pending.timer);
+        pending.reject(new Error("The active chat changed before uncast voice matching completed."));
+      }
+      pendingUncastRequests.clear();
       for (const pending of pendingDecisionStatusRequests.values()) {
         clearTimeout(pending.timer);
         pending.reject(new Error("The active chat changed before the Decision connection check completed."));
@@ -4884,6 +5002,11 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
       pending.reject(new Error("Chat Voice was closed."));
     }
     pendingSpeakerParseRequests.clear();
+    for (const pending of pendingUncastRequests.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(new Error("Chat Voice was closed."));
+    }
+    pendingUncastRequests.clear();
     for (const pending of pendingDecisionStatusRequests.values()) {
       clearTimeout(pending.timer);
       pending.reject(new Error("Chat Voice was closed."));

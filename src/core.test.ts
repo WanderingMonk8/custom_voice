@@ -15,6 +15,10 @@ import {
   buildSpeakerDecisionPlan,
   buildTtsTagPlan,
   bufferAwareGenerationConcurrency,
+  availableUncastVoices,
+  collectUncastVoiceGroups,
+  buildUncastVoiceDecision,
+  resolveUncastVoiceDecisions,
   clampMessageLimit,
   clampSavedAudioLimit,
   detectCharacters,
@@ -1914,17 +1918,52 @@ test('clamps the configurable message window', () => {
 
 test('validates favorite voice IDs and classifications', () => {
   assert.deepEqual(readFavoriteVoices([
-    { id: ' voice-1 ', name: ' Alice ', category: 'female' },
+    { id: ' voice-1 ', name: ' Alice ', category: 'female', description: ' warm and gentle ' },
     { id: 'voice-2', name: 'Bob', category: 'male' },
     { id: 'voice-3', category: 'other' },
     { id: 'voice-1', name: 'Duplicate', category: 'male' },
     { id: ' ' }, null,
   ]), [
-    { id: 'voice-1', name: 'Alice', category: 'female' },
-    { id: 'voice-2', name: 'Bob', category: 'male' },
-    { id: 'voice-3', name: '', category: 'unspecified' },
+    { id: 'voice-1', name: 'Alice', category: 'female', description: 'warm and gentle' },
+    { id: 'voice-2', name: 'Bob', category: 'male', description: '' },
+    { id: 'voice-3', name: '', category: 'unspecified', description: '' },
   ])
   assert.deepEqual(readFavoriteVoices(null), [])
+})
+
+test('matches uncast voice groups without using cast voices or crossing gender categories', () => {
+  const segments = [
+    { text: 'The clerk arrives.', speakerId: null },
+    { text: 'Hello.', speakerId: UNCAST_SPEAKER_ID },
+    { text: 'She waits.', speakerId: null },
+    { text: 'Come in.', speakerId: UNCAST_SPEAKER_ID },
+    { text: 'Thanks.', speakerId: 'mira' },
+    { text: 'Next.', speakerId: UNCAST_SPEAKER_ID },
+  ]
+  const groups = collectUncastVoiceGroups(segments)
+  assert.deepEqual(groups.map(group => group.segmentIndexes), [[1, 3], [5]])
+  const voices = readFavoriteVoices([
+    { id: 'in-use', category: 'female', description: 'gentle' },
+    { id: 'female', category: 'female', description: 'gentle warm' },
+    { id: 'male', category: 'male', description: 'commanding' },
+  ])
+  const available = availableUncastVoices(voices, ['in-use'])
+  assert.deepEqual(available.map(voice => voice.id), ['female', 'male'])
+  const plan = buildUncastVoiceDecision(groups, available, 'Scene context')
+  assert.equal(Object.keys(plan.questions).length, 8)
+  const matches = resolveUncastVoiceDecisions(groups, available, {
+    gender_g0: confidentDecision('female'), trait_g0: confidentDecision('gentle'),
+    voice_g0: { choice: 'voice_1', probabilities: { voice_0: 0.4, voice_1: 0.6 }, confidence: 0.8 },
+    gender_g1: confidentDecision('unknown'), trait_g1: confidentDecision('commanding'),
+    voice_g1: { choice: 'voice_0', probabilities: { voice_0: 0.6, voice_1: 0.4 }, confidence: 0.8 },
+  })
+  assert.deepEqual(matches.map(match => [match.voiceId, match.gender, match.traits]), [
+    ['female', 'female', ['gentle']], ['male', 'unknown', ['commanding']],
+  ])
+  assert.deepEqual(resolveUncastVoiceDecisions(groups, [], {}), [])
+  assert.deepEqual(resolveUncastVoiceDecisions(groups, available, {
+    voice_g0: confidentDecision('no_match'),
+  }), [])
 })
 
 test('defaults and clamps the global saved audio limit', () => {
