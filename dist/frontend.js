@@ -3,15 +3,15 @@ var USER_SPEAKER_ID = "__chat_voice_user__";
 var UNCAST_SPEAKER_ID = "__chat_voice_uncast__";
 var DEFAULT_SAVED_AUDIO_LIMIT = 50;
 var MAX_SAVED_AUDIO_LIMIT = 1e4;
-function speakersForMessageRole(speakers, isUserMessage, userName = "User") {
+function speakersForMessageRole(speakers, _isUserMessage, userName = "User") {
   const nonUserSpeakers = speakers.filter((speaker) => speaker.id !== USER_SPEAKER_ID);
-  return isUserMessage ? [
+  return [
     ...nonUserSpeakers,
     { id: USER_SPEAKER_ID, name: normalizeSpeakerName(userName) || "User" }
-  ] : nonUserSpeakers;
+  ];
 }
 function playbackVoiceForSpeaker(speakerId, isUserMessage, characterVoices, narratorVoice, userVoice) {
-  if (speakerId === USER_SPEAKER_ID) return isUserMessage ? userVoice : "";
+  if (speakerId === USER_SPEAKER_ID) return userVoice;
   if (speakerId) return characterVoices[speakerId] || "";
   return narratorVoice;
 }
@@ -3278,7 +3278,7 @@ function setup(ctx) {
         speakersForMessageRole(
           playbackChat.characters,
           message.is_user,
-          message.name
+          message.is_user ? message.name : "User"
         ),
         preferences.skippedTrackerTags
       );

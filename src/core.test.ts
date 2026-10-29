@@ -9,6 +9,7 @@ import {
   applyCustomTtsEmotionCues,
   applyCustomTtsEmotionCuesWithModulation,
   applyLeadingTtsCues,
+  applyTtsSpeakerContinuity,
   applyTtsTagSelections,
   assessSpeakerDiscourseEscalation,
   buildSpeakerDecisionPlan,
@@ -1524,6 +1525,32 @@ test('supports a second emotion, sound, and pause in one selection', () => {
   assert.ok(selection?.ttsText.includes('[long-break]'))
 })
 
+test('smooths weak emotions per speaker while preserving confident shifts and scene boundaries', () => {
+  const content = '"First."\n\n"Reply."\n\n"Again."\n\n"Shift."\n\nHours later, she returns.\n\n"After."'
+  const plan = buildSpeakerDecisionPlan(content, [{ id: 'a', name: 'Alice' }, { id: 'b', name: 'Bob' }], false)
+  const tags = buildTtsTagPlan(plan, undefined, undefined, 'fish')
+  const selections = resolveTtsTagAnswers(tags, {
+    emotion_s0: { choice: 'excited', probabilities: { excited: 0.9, calm: 0.1 }, confidence: 0.9 },
+    emotion_s1: { choice: 'sad', probabilities: { sad: 0.9, calm: 0.1 }, confidence: 0.9 },
+    emotion_s2: { choice: 'calm', probabilities: { calm: 0.4, excited: 0.35 }, confidence: 0.3 },
+    emotion_s3: { choice: 'calm', probabilities: { calm: 0.9, excited: 0.1 }, confidence: 0.9 },
+  }, 'fish')
+  const segments = ['a', 'b', 'a', 'a', 'a'].map((speakerId, index) => ({
+    speakerId, text: plan.state.speeches[index].text,
+  }))
+  const result = applyTtsSpeakerContinuity(segments, plan, selections, 'fish')
+  assert.deepEqual(result.get('s1')?.emotions, ['sad'])
+  assert.deepEqual(result.get('s2')?.emotions, ['excited'])
+  assert.match(result.get('s2')?.ttsText ?? '', /^\[excited\]/u)
+  assert.deepEqual(result.get('s3')?.emotions, ['calm'])
+  assert.deepEqual(result.get('s4')?.emotions, ['calm'])
+  assert.match(result.get('s4')?.continuity ?? '', /reset at time-jump/u)
+  assert.deepEqual(result.get('s2')?.sounds, selections.get('s2')?.sounds)
+  assert.deepEqual(result.get('s2')?.pauses, selections.get('s2')?.pauses)
+  segments[2].speakerId = UNCAST_SPEAKER_ID
+  assert.deepEqual(applyTtsSpeakerContinuity(segments, plan, selections, 'fish').get('s2')?.emotions, ['calm'])
+})
+
 test('falls back to calm when the primary emotion is a weak winner', () => {
   const content = ['Narration.', '', '"Wait. You heard that too?"'].join('\n')
   const plan = buildSpeakerDecisionPlan(content, [{ id: 'alice', name: 'Alice' }], false)
@@ -1988,24 +2015,68 @@ test('uses the user role as the default speaker for unattributed user dialogue',
   )
 })
 
-test('only exposes the dedicated user speaker while parsing user messages', () => {
+test('exposes the dedicated user speaker for both message roles', () => {
   const cast = [{ id: 'card', name: 'Card Character' }]
 
-  assert.deepEqual(speakersForMessageRole(cast, false, 'Ken'), cast)
+  assert.deepEqual(speakersForMessageRole(cast, false, 'Ken'), [
+    ...cast,
+    { id: USER_SPEAKER_ID, name: 'Ken' },
+  ])
   assert.deepEqual(speakersForMessageRole(cast, true, 'Ken'), [
     ...cast,
     { id: USER_SPEAKER_ID, name: 'Ken' },
   ])
 })
 
-test('uses the connection default for unset NPCs and stray user assignments in assistant messages', () => {
+test('uses the user voice for the user persona and the connection default for unset NPCs', () => {
   const voices = { configured: 'character-voice', unset: '' }
 
   assert.equal(playbackVoiceForSpeaker('configured', false, voices, 'narrator', 'user-voice'), 'character-voice')
   assert.equal(playbackVoiceForSpeaker('unset', false, voices, 'narrator', 'user-voice'), '')
-  assert.equal(playbackVoiceForSpeaker(USER_SPEAKER_ID, false, voices, 'narrator', 'user-voice'), '')
+  assert.equal(playbackVoiceForSpeaker(USER_SPEAKER_ID, false, voices, 'narrator', 'user-voice'), 'user-voice')
   assert.equal(playbackVoiceForSpeaker(USER_SPEAKER_ID, true, voices, 'narrator', 'user-voice'), 'user-voice')
   assert.equal(playbackVoiceForSpeaker(null, false, voices, 'narrator', 'user-voice'), 'narrator')
+})
+
+test('Jev can assign an assistant-message exchange to the user without claiming uncast dialogue', () => {
+  const content = [
+    'Mira catches her breath. "Mmh."',
+    'He waits. "How is it, my love?"',
+    'Her answer is small and honest: "It is a lot."',
+    'The clerk says, "Next."',
+  ].join('\n\n')
+  const speakers = speakersForMessageRole([{ id: 'mira', name: 'Mira' }], false, 'Ken')
+  const plan = buildSpeakerDecisionPlan(content, speakers, false)
+  const mira = decisionOption(plan, 'mira')
+  const user = decisionOption(plan, USER_SPEAKER_ID)
+  assert.match(plan.questions.speech_s1.criteria[user], /user persona/u)
+  const resolved = resolveSpeakerDecisionSegments(content, plan, {
+    speech_s0: confidentDecision(mira),
+    speech_s1: confidentDecision(user),
+    speech_s2: confidentDecision(mira),
+    speech_s3: confidentDecision(DECISION_UNCAST_CRITERION),
+  }, speakers, { isUserMessage: false, cardSpeakerId: 'mira', historicalSpeakerId: null })
+  assert.equal(resolved.find(segment => segment.text === 'How is it, my love?')?.speakerId, USER_SPEAKER_ID)
+  assert.equal(resolved.find(segment => segment.text === 'Next.')?.speakerId, UNCAST_SPEAKER_ID)
+  assert.equal(playbackVoiceForSpeaker(USER_SPEAKER_ID, false, {}, 'narrator', 'user-voice'), 'user-voice')
+  assert.equal(playbackVoiceForSpeaker(UNCAST_SPEAKER_ID, false, {}, 'narrator', 'user-voice'), '')
+  assert.equal(playbackVoiceForSpeaker(null, false, {}, 'narrator', 'user-voice'), 'narrator')
+})
+
+test('assistant speech explicitly attributed to the user uses the user identity', () => {
+  const speakers = speakersForMessageRole([{ id: 'mira', name: 'Mira' }], false, 'Ken')
+  const segments = parseRosterVoiceSegments('Ken says, "Hello."', null, speakers)
+  assert.equal(segments.find(segment => segment.text === 'Hello.')?.speakerId, USER_SPEAKER_ID)
+})
+
+test('adding a user candidate does not make them the fallback for nameless assistant dialogue', () => {
+  const speakers = speakersForMessageRole([{ id: 'mira', name: 'Mira' }], false, 'Ken')
+  const content = 'She looks up. "Hello."'
+  const plan = buildSpeakerDecisionPlan(content, speakers, false)
+  const result = resolveSpeakerDecisionSegments(content, plan, {}, speakers, {
+    isUserMessage: false, cardSpeakerId: 'mira', historicalSpeakerId: null,
+  })
+  assert.equal(result.find(segment => segment.text === 'Hello.')?.speakerId, 'mira')
 })
 
 test('routes clear unconfigured dialogue subjects through connection-default voices', () => {
