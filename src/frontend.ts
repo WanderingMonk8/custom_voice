@@ -971,6 +971,10 @@ export function setup(ctx: SpindleFrontendContext) {
     .chat-voice-character-meta { display:flex; align-items:center; gap:6px; }
     .chat-voice-character-name { color:var(--lumiverse-text); font-size:12px; font-weight:600; }
     .chat-voice-character-count { color:var(--lumiverse-text-muted); font-size:11px; white-space:nowrap; }
+    .chat-voice-selected-voice { width:100%; min-height:36px; padding:7px 9px; text-align:left;
+      border:1px solid var(--lumiverse-border); border-radius:var(--lumiverse-radius);
+      background:var(--lumiverse-fill-subtle); color:var(--lumiverse-text); font:inherit; font-size:12px;
+      cursor:text; overflow-wrap:anywhere; }
     .chat-voice-empty {
       padding:12px; text-align:center; color:var(--lumiverse-text-muted); font-size:12px;
       border:1px dashed var(--lumiverse-border); border-radius:var(--lumiverse-radius);
@@ -1384,6 +1388,8 @@ export function setup(ctx: SpindleFrontendContext) {
   }
   const inFlight = new Set<number>()
   const characterInputs = new Map<string, SpindleTextInputHandle>()
+  const characterVoiceDisplays = new Map<string, HTMLButtonElement>()
+  let editingCharacterVoiceId: string | null = null
   let lastContextMessageId: string | null = null
   const nativeButtonStates = new Map<HTMLButtonElement, {
     html: string
@@ -3540,6 +3546,16 @@ export function setup(ctx: SpindleFrontendContext) {
       }
       picker.disabled = !activeChat || favoriteVoices.length === 0
     }
+    updateCharacterVoiceDisplays()
+  }
+
+  function updateCharacterVoiceDisplays(): void {
+    for (const [id, display] of characterVoiceDisplays) {
+      const voiceId = characterInputs.get(id)?.getValue().trim() ?? ''
+      const favorite = favoriteVoices.find(voice => voice.id === voiceId)
+      display.textContent = favorite?.name || voiceId || 'Connection default voice'
+      display.title = voiceId ? `Voice ID: ${voiceId}. Double-click to edit.` : 'Double-click to enter a voice ID.'
+    }
   }
 
   function stopVoicePreview(): void {
@@ -3724,6 +3740,7 @@ export function setup(ctx: SpindleFrontendContext) {
   function renderCharacters(characters: DetectedCharacterState[]) {
     for (const input of characterInputs.values()) input.destroy()
     characterInputs.clear()
+    characterVoiceDisplays.clear()
     favoritePickers.clear()
     favoritePickers.add(narratorFavoritePicker)
     favoritePickers.add(userFavoritePicker)
@@ -3785,24 +3802,55 @@ export function setup(ctx: SpindleFrontendContext) {
         meta.append(rename, remove)
       }
       const slot = document.createElement('div')
+      slot.hidden = true
+      const voiceDisplay = document.createElement('button')
+      voiceDisplay.type = 'button'
+      voiceDisplay.className = 'chat-voice-selected-voice'
+      voiceDisplay.setAttribute('aria-label', `Selected voice for ${character.name}; press Enter to edit voice ID`)
       const picker = document.createElement('select')
       picker.className = 'chat-voice-favorite-select'
       picker.setAttribute('aria-label', `Favorite voice for ${character.name}`)
       heading.append(name, meta)
-      card.append(heading, slot, picker)
+      card.append(heading, voiceDisplay, slot, picker)
       characterList.appendChild(card)
       const input = ctx.components.mountTextInput(slot, {
         value: character.voice,
         placeholder: `Voice name or ID for ${character.name}`,
         ariaLabel: `Custom voice for ${character.name}`,
         disabled: !activeChat,
-        onChange: () => markChanged(),
+        onChange: () => { updateCharacterVoiceDisplays(); markChanged() },
       })
       characterInputs.set(character.id, input)
+      characterVoiceDisplays.set(character.id, voiceDisplay)
+      const beginEditing = () => {
+        if (!activeChat) return
+        editingCharacterVoiceId = character.id
+        voiceDisplay.hidden = true
+        slot.hidden = false
+        input.focus()
+      }
+      const endEditing = () => {
+        if (editingCharacterVoiceId === character.id) editingCharacterVoiceId = null
+        slot.hidden = true
+        voiceDisplay.hidden = false
+        updateCharacterVoiceDisplays()
+      }
+      voiceDisplay.addEventListener('dblclick', beginEditing)
+      voiceDisplay.addEventListener('keydown', event => {
+        if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); beginEditing() }
+      })
+      slot.addEventListener('focusout', event => {
+        if (event.relatedTarget && slot.contains(event.relatedTarget as Node)) return
+        endEditing()
+      })
+      slot.addEventListener('keydown', event => {
+        if (event.key === 'Enter') { event.preventDefault(); input.blur(); endEditing(); voiceDisplay.focus() }
+      })
       picker.addEventListener('change', () => {
         if (!picker.value) return
         input.update({ value: picker.value })
         picker.value = ''
+        updateCharacterVoiceDisplays()
         markChanged()
       })
       favoritePickers.add(picker)
@@ -3812,6 +3860,8 @@ export function setup(ctx: SpindleFrontendContext) {
 
   function renderState(next: ActiveChatState | null) {
     applyingState = true
+    const keepVoiceEditor = !!editingCharacterVoiceId && !!next && activeChat?.id === next.id
+    if (!keepVoiceEditor) editingCharacterVoiceId = null
     activeChat = next
     context.textContent = next ? `Active chat: ${next.name}` : 'Open a chat to configure its voices.'
     const selectedConnectionId = next?.connectionId || lumiverseConnectionId
@@ -3836,7 +3886,7 @@ export function setup(ctx: SpindleFrontendContext) {
     })
     addNpcInput.update({ value: '', disabled: !next })
     addNpcButton.disabled = !next
-    renderCharacters(next?.characters ?? [])
+    if (!keepVoiceEditor) renderCharacters(next?.characters ?? [])
     updateRoleDefaultControls()
     applyingState = false
     if (!next) setStatus('Open a chat to edit its voices.')
