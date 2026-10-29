@@ -2325,11 +2325,11 @@ function setup(ctx) {
     narratorField.field,
     userVoiceField.field,
     routingHint,
-    favoritesTitle,
-    favoritesSection,
     addNpcField.field,
     characterTitle,
     characterList,
+    favoritesTitle,
+    favoritesSection,
     status,
     advancedSection
   );

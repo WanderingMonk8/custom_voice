@@ -1214,11 +1214,11 @@ export function setup(ctx: SpindleFrontendContext) {
     narratorField.field,
     userVoiceField.field,
     routingHint,
-    favoritesTitle,
-    favoritesSection,
     addNpcField.field,
     characterTitle,
     characterList,
+    favoritesTitle,
+    favoritesSection,
     status,
     advancedSection,
   )
