@@ -4027,7 +4027,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
         for (const voice of entries) {
           const option = document.createElement("option");
           option.value = voice.id;
-          option.textContent = voice.name ? `${voice.name} (${voice.id})` : voice.id;
+          option.textContent = voice.name || voice.id;
           group.appendChild(option);
         }
         picker.appendChild(group);
@@ -4131,9 +4131,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
       const copy = document.createElement("span");
       copy.className = "chat-voice-favorite-copy";
       copy.textContent = voice.name || voice.id;
-      const details = document.createElement("small");
-      details.textContent = voice.name ? voice.id : "";
-      copy.appendChild(details);
+      copy.title = voice.id;
       const category = document.createElement("select");
       category.className = "chat-voice-favorite-select";
       category.style.width = "auto";
@@ -4163,6 +4161,17 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
       preview.addEventListener("click", () => {
         void previewFavoriteVoice(voice);
       });
+      const rename = document.createElement("button");
+      rename.type = "button";
+      rename.className = "chat-voice-rename-button";
+      rename.innerHTML = RENAME_ICON;
+      rename.title = `Rename favorite ${voice.name || voice.id}`;
+      rename.setAttribute("aria-label", rename.title);
+      rename.addEventListener("click", () => {
+        const name = hostWindow.prompt("Name this favorite voice. Leave blank to display its voice ID.", voice.name);
+        if (name === null) return;
+        void saveFavoriteVoices(favoriteVoices.map((item) => item.id === voice.id ? { ...item, name: name.trim().slice(0, 128) } : item));
+      });
       const remove = document.createElement("button");
       remove.type = "button";
       remove.className = "chat-voice-delete-button";
@@ -4171,7 +4180,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
       remove.addEventListener("click", () => {
         void saveFavoriteVoices(favoriteVoices.filter((item) => item.id !== voice.id));
       });
-      row.append(copy, category, preview, remove);
+      row.append(copy, category, preview, rename, remove);
       favoriteList.appendChild(row);
     }
   }
