@@ -956,7 +956,11 @@ export function setup(ctx: SpindleFrontendContext) {
     .chat-voice-section-title {
       margin:2px 0 0; color:var(--lumiverse-text); font-size:13px; font-weight:700;
     }
-    .chat-voice-character-list { display:flex; flex-direction:column; gap:10px; }
+    .chat-voice-character-list, .chat-voice-favorite-list {
+      display:flex; flex-direction:column; gap:10px; max-height:320px; overflow-y:auto;
+      box-sizing:border-box; padding:9px; border:1px solid var(--lumiverse-border);
+      border-radius:var(--lumiverse-radius); background:var(--lumiverse-fill-subtle);
+    }
     .chat-voice-character {
       display:flex; flex-direction:column; gap:7px; padding:11px;
       border:1px solid var(--lumiverse-border); border-radius:var(--lumiverse-radius);
@@ -978,7 +982,8 @@ export function setup(ctx: SpindleFrontendContext) {
       border:1px solid var(--lumiverse-border); border-radius:var(--lumiverse-radius);
       background:var(--lumiverse-bg-secondary, #222); color:var(--lumiverse-text); font:inherit; font-size:12px;
     }
-    .chat-voice-favorite-row { display:flex; flex-wrap:wrap; align-items:center; gap:8px; }
+    .chat-voice-favorite-row { display:flex; flex-wrap:wrap; align-items:center; gap:8px;
+      padding:8px; border:1px solid var(--lumiverse-border); border-radius:var(--lumiverse-radius); }
     .chat-voice-favorite-copy { flex:1 1 100px; min-width:0; overflow-wrap:anywhere; color:var(--lumiverse-text); font-size:12px; }
     .chat-voice-favorite-copy small { display:block; color:var(--lumiverse-text-muted); }
     .chat-voice-preview-button { min-height:28px; padding:0 8px; border:1px solid var(--lumiverse-border);
@@ -1142,6 +1147,9 @@ export function setup(ctx: SpindleFrontendContext) {
   characterTitle.textContent = 'Detected voices'
   const characterList = document.createElement('div')
   characterList.className = 'chat-voice-character-list'
+  characterList.setAttribute('role', 'region')
+  characterList.setAttribute('aria-label', 'Detected voices')
+  characterList.tabIndex = 0
   const favoritesTitle = document.createElement('div')
   favoritesTitle.className = 'chat-voice-section-title'
   favoritesTitle.textContent = 'Favorite voices'
@@ -1174,7 +1182,10 @@ export function setup(ctx: SpindleFrontendContext) {
   favoriteAdd.textContent = 'Add favorite'
   favoriteForm.append(favoriteName, favoriteId, favoriteDescription, favoriteCategory, favoriteAdd)
   const favoriteList = document.createElement('div')
-  favoriteList.className = 'chat-voice-favorites'
+  favoriteList.className = 'chat-voice-favorite-list'
+  favoriteList.setAttribute('role', 'region')
+  favoriteList.setAttribute('aria-label', 'Favorite voices')
+  favoriteList.tabIndex = 0
   favoritesSection.append(favoriteForm, favoriteList)
   const status = document.createElement('div')
   status.className = 'chat-voice-status'
