@@ -24,6 +24,8 @@ import {
   activeGhostVoices,
   collectUncastVoiceGroups,
   ghostCastAliases,
+  updateGhostConversationHistory,
+  uncastIdentityLabels,
   mergeGhostAliases,
   readGhostVoices,
   buildUncastVoiceDecision,
@@ -2278,6 +2280,33 @@ test('reviews a borderline cross-message match before creating another voice', (
   assert.equal(rejected[0].voiceId, 'another-voice')
   const weak = resolveUncastVoiceDecisions(groups, voices, { ...answers, review_ghost_g0_0: { choice: 'same', confidence: 0.6, probabilities: { same: 0.7, different_or_unclear: 0.3 } } }, [ghost], [], 'later', message)
   assert.equal(weak[0].voiceId, 'another-voice')
+})
+
+test('retains conversation exchanges and relationship labels for later ghost identity review', () => {
+  const ids = ['one', 'two', 'three', 'four']
+  const ghost = { id: 'mother', speakerId: UNCAST_SPEAKER_ID, voiceId: 'voice', context: '', occurrenceKeys: [], lastSeenMessageId: 'one', conversationHistory: [] as Array<{ messageId: string; text: string }> }
+  const first = `"Nine-fifteen, Tessa." Tessa holds the phone. "Mom, I heard you."`
+  const second = `Tessa listens to the phone. "Mom, I said I'm coming." "I'm on Maple, Tessa."`
+  const third = `Marisol arrives. Her daughter Tessa sees her. "Seven minutes."`
+  updateGhostConversationHistory(ghost, 'one', first, ids)
+  updateGhostConversationHistory(ghost, 'two', second, ids)
+  assert.deepEqual(ghost.conversationHistory.map(item => item.messageId), ['one', 'two'])
+  assert.match(ghost.conversationHistory[0].text, /Mom, I heard you/u)
+  const labels = uncastIdentityLabels(first, [])
+  assert.ok(labels.includes("tessa's mom"))
+  const groups = collectUncastVoiceGroups([{ speakerId: 'unconfigured:marisol', text: 'Seven minutes.' }])
+  const plan = buildUncastVoiceDecision(groups, [], third, [ghost])
+  assert.match(plan.questions.identity_g0.instructions, /person they address/u)
+  assert.equal(plan.state.ghosts[0].conversationHistory[1].text, second)
+  const assignment = resolveUncastVoiceDecisions(groups, [], { identity_g0: confidentDecision('ghost_0') }, [ghost], [], 'three', third, ids.slice(0, 2))
+  assert.equal(assignment[0]?.voiceId, 'voice')
+  assert.deepEqual(assignment[0]?.aliases, ['marisol'])
+  updateGhostConversationHistory(ghost, 'three', third, ids)
+  updateGhostConversationHistory(ghost, 'four', 'A later conversation.', ids)
+  updateGhostConversationHistory(ghost, 'one', first, ids)
+  assert.deepEqual(ghost.conversationHistory.map(item => item.messageId), ['two', 'three', 'four'])
+  const reloaded = readGhostVoices([ghost])[0]
+  assert.equal(reloaded.conversationHistory?.length, 3)
 })
 
 test('defaults and clamps the global saved audio limit', () => {

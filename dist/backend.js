@@ -41,9 +41,22 @@ function readGhostVoices(value) {
       context: typeof row.context === "string" ? row.context.slice(0, 2e3) : "",
       occurrenceKeys: Array.isArray(row.occurrenceKeys) ? row.occurrenceKeys.filter((key) => typeof key === "string").slice(-100) : [],
       lastSeenMessageId: typeof row.lastSeenMessageId === "string" ? row.lastSeenMessageId : "",
+      conversationHistory: Array.isArray(row.conversationHistory) ? row.conversationHistory.flatMap((entry) => {
+        if (!entry || typeof entry !== "object") return [];
+        const item2 = entry;
+        return typeof item2.messageId === "string" && typeof item2.text === "string" && item2.messageId && item2.text ? [{ messageId: item2.messageId.slice(0, 256), text: item2.text.slice(0, 6e3) }] : [];
+      }).slice(-3) : [],
       ...typeof row.createdAtMessageId === "string" && row.createdAtMessageId ? { createdAtMessageId: row.createdAtMessageId } : {}
     }];
   });
+}
+function updateGhostConversationHistory(ghost, messageId, message, assistantMessageIds) {
+  const text = message.trim().slice(0, 6e3);
+  if (!messageId || !text) return;
+  const entries = (ghost.conversationHistory ?? []).filter((item) => item.messageId !== messageId);
+  entries.push({ messageId, text });
+  entries.sort((a, b) => assistantMessageIds.indexOf(a.messageId) - assistantMessageIds.indexOf(b.messageId));
+  ghost.conversationHistory = entries.slice(-3);
 }
 function mergeGhostAliases(...sources) {
   const aliases = [];
@@ -90,6 +103,12 @@ function availableUncastVoices(favorites, used) {
 function uncastIdentityLabels(message, ghosts) {
   const labels = /* @__PURE__ */ new Set();
   for (const ghost of ghosts) for (const alias of ghostCastAliases(ghost)) labels.add(alias.toLowerCase());
+  const names = addUnconfiguredDialogueSpeakers(message, []).slice(0, 12).map((speaker) => speaker.name);
+  const relations = [...new Set([...message.matchAll(/\b(?:mom|mother|mum|dad|father|sister|brother|daughter|son|wife|husband|partner|parent|aunt|uncle|friend|boss|doctor|nurse|teacher|assistant)\b/giu)].map((match) => match[0].toLowerCase()))];
+  for (const name of names) for (const relation of relations) {
+    if (labels.size >= 60) break;
+    labels.add(`${name.toLowerCase()}'s ${relation}`);
+  }
   for (const match of message.matchAll(/\b(?:the|an?)\s+([a-z][a-z'-]{2,})(?:['?]s)?\b/giu)) {
     labels.add(`the ${match[1].toLowerCase().replace(/['?]s$/u, "")}`);
     if (labels.size >= 80) break;
@@ -101,7 +120,7 @@ function buildUncastVoiceDecision(groups, voices, message, ghosts = []) {
   const state = {
     message,
     characters: groups.map((group) => ({ id: group.id, identity: group.speakerId, speeches: group.speeches, context: group.context })),
-    ghosts: ghosts.map((ghost, index) => ({ option: `ghost_${index}`, identity: ghost.speakerId, label: ghost.label || null, aliases: ghostCastAliases(ghost), context: ghost.context })),
+    ghosts: ghosts.map((ghost, index) => ({ option: `ghost_${index}`, identity: ghost.speakerId, label: ghost.label || null, aliases: ghostCastAliases(ghost), context: ghost.context, conversationHistory: ghost.conversationHistory ?? [] })),
     voices: voices.map((voice, index) => ({ option: `voice_${index}`, name: voice.name, category: voice.category, description: voice.description }))
   };
   const questions = {};
@@ -119,7 +138,7 @@ function buildUncastVoiceDecision(groups, voices, message, ghosts = []) {
     const earlier = groups.slice(0, groups.indexOf(group));
     if (ghosts.length || earlier.length) questions[`identity_${group.id}`] = {
       type: "choice",
-      instructions: `Does character ${group.id} clearly represent the same individual as one prior character? Compare all contexts and dialogue, not just shared gender or voice. Select new_or_unclear unless the identity is clear.`,
+      instructions: `Does character ${group.id} clearly represent the same individual as one prior character? Compare the full current exchange and prior conversation history, including what others say to this person, relationships, and whether a phone call continues or the same caller arrives in person. Do not confuse a speaker with the person they address; consider scene changes and alternative callers. Shared gender, occupation, or voice alone is insufficient. Select new_or_unclear unless identity is clear.`,
       criteria: {
         new_or_unclear: "A new character, or identity cannot be reliably established.",
         ...Object.fromEntries(ghosts.map((ghost, index) => [`ghost_${index}`, `Previously seen character ${ghostCastAliases(ghost).join(" / ") || ghost.speakerId}; context: ${ghost.context}`])),
@@ -155,7 +174,7 @@ function buildUncastIdentityReview(groups, answers, message, ghosts = []) {
     if (candidate && identity && probability >= 0.6 && identity.confidence >= 0.5 && probability - runnerUp >= 0.2 && (probability < 0.8 || identity.confidence < 0.8 || probability - runnerUp < 0.25)) {
       questions[`review_ghost_${group.id}_${ghostChoice[1]}`] = {
         type: "choice",
-        instructions: `Compare the speaker in current group ${group.id} with the previously seen character ${candidate.label || candidate.speakerId}. Read the prior character's context and the full current scene. Confirm only if they are the same person; distinguish people speaking through a phone, people addressed, and people merely mentioned.`,
+        instructions: `Compare the speaker in current group ${group.id} with the previously seen character ${candidate.label || candidate.speakerId}. Read the prior character's conversation history and the full current scene, including other participants? dialogue, relationship clues, and continuity from phone to in-person. Confirm only if they are the same person; distinguish callers, people addressed, and people merely mentioned.`,
         criteria: { same: "The prior character and current speaker are clearly the same person.", different_or_unclear: "They differ or the evidence is insufficient." }
       };
     }
@@ -4346,7 +4365,7 @@ async function scanCardCast(cards, userId) {
   }
 }
 var saveQueues = /* @__PURE__ */ new Map();
-async function saveGhostVoiceAssignments(chatId, messageId, assistantIds, groups, assignments, userId, anchorId = messageId, reserved = [], lifetime = 10) {
+async function saveGhostVoiceAssignments(chatId, messageId, assistantIds, groups, assignments, userId, anchorId = messageId, reserved = [], lifetime = 10, conversation = "") {
   const queueKey = `${userId ?? "user"}:${chatId}`;
   const previous = saveQueues.get(queueKey) ?? Promise.resolve();
   const task = previous.catch(() => void 0).then(async () => {
@@ -4386,6 +4405,7 @@ async function saveGhostVoiceAssignments(chatId, messageId, assistantIds, groups
       accepted.push({ ...assignment, voiceId });
       if (!ghost.label && assignment.label) ghost.label = assignment.label;
       ghost.aliases = mergeGhostAliases(ghostCastAliases(ghost), assignment.aliases ?? []);
+      updateGhostConversationHistory(ghost, messageId, conversation, currentAssistantIds);
       const occurrence = `${messageId}:${hashMessageContent(group.speeches.join("\n"))}`;
       if (!ghost.occurrenceKeys.includes(occurrence)) ghost.occurrenceKeys = [...ghost.occurrenceKeys, occurrence].slice(-100);
       const previousIndex = assistantIds.indexOf(ghost.lastSeenMessageId);
@@ -4865,7 +4885,7 @@ spindle.onFrontendMessage(async (rawPayload, userId, frontendSessionId) => {
           let assignments = resolveUncastVoiceDecisions(groups, voices, answers, ghosts, payload.reserved, payload.messageId, payload.message.slice(0, 3e4), assistantIds.slice(0, Math.max(0, assistantIds.indexOf(anchor))));
           const proposedAssignments = assignments;
           if (assignments.length) {
-            assignments = await saveGhostVoiceAssignments(payload.chatId, payload.messageId, assistantIds, groups, assignments, userId, anchor, payload.reserved, lifetime);
+            assignments = await saveGhostVoiceAssignments(payload.chatId, payload.messageId, assistantIds, groups, assignments, userId, anchor, payload.reserved, lifetime, payload.message);
           }
           const diagnostics = groups.map((group) => {
             const identity = answers[`identity_${group.id}`];

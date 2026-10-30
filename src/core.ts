@@ -46,7 +46,7 @@ export function addFavoriteVoice(existing: FavoriteVoice[], voice: FavoriteVoice
 }
 
 export interface UncastVoiceGroup { id: string; speakerId: string; segmentIndexes: number[]; speeches: string[]; context: string[] }
-export interface GhostVoice { id: string; speakerId: string; voiceId: string; context: string; occurrenceKeys: string[]; lastSeenMessageId: string; label?: string; createdAtMessageId?: string; aliases?: string[] }
+export interface GhostVoice { id: string; speakerId: string; voiceId: string; context: string; occurrenceKeys: string[]; lastSeenMessageId: string; label?: string; createdAtMessageId?: string; aliases?: string[]; conversationHistory?: Array<{ messageId: string; text: string }> }
 export const GHOST_VOICE_LIFETIME_MESSAGES = 10
 
 export function readGhostVoices(value: unknown): GhostVoice[] {
@@ -61,8 +61,24 @@ export function readGhostVoices(value: unknown): GhostVoice[] {
       context: typeof row.context === 'string' ? row.context.slice(0, 2_000) : '',
       occurrenceKeys: Array.isArray(row.occurrenceKeys) ? row.occurrenceKeys.filter((key): key is string => typeof key === 'string').slice(-100) : [],
       lastSeenMessageId: typeof row.lastSeenMessageId === 'string' ? row.lastSeenMessageId : '',
+      conversationHistory: Array.isArray(row.conversationHistory) ? row.conversationHistory.flatMap(entry => {
+        if (!entry || typeof entry !== 'object') return []
+        const item = entry as Record<string, unknown>
+        return typeof item.messageId === 'string' && typeof item.text === 'string' && item.messageId && item.text
+          ? [{ messageId: item.messageId.slice(0, 256), text: item.text.slice(0, 6_000) }] : []
+      }).slice(-3) : [],
       ...(typeof row.createdAtMessageId === 'string' && row.createdAtMessageId ? { createdAtMessageId: row.createdAtMessageId } : {}) }]
   })
+}
+
+/** Preserve recent complete exchanges without moving an older replay to the present. */
+export function updateGhostConversationHistory(ghost: GhostVoice, messageId: string, message: string, assistantMessageIds: readonly string[]): void {
+  const text = message.trim().slice(0, 6_000)
+  if (!messageId || !text) return
+  const entries = (ghost.conversationHistory ?? []).filter(item => item.messageId !== messageId)
+  entries.push({ messageId, text })
+  entries.sort((a, b) => assistantMessageIds.indexOf(a.messageId) - assistantMessageIds.indexOf(b.messageId))
+  ghost.conversationHistory = entries.slice(-3)
 }
 
 /** Keep only unique, complete aliases within the regular cast name limit. */
@@ -154,6 +170,14 @@ export function availableUncastVoices(favorites: FavoriteVoice[], used: readonly
 export function uncastIdentityLabels(message: string, ghosts: GhostVoice[]): string[] {
   const labels = new Set<string>()
   for (const ghost of ghosts) for (const alias of ghostCastAliases(ghost)) labels.add(alias.toLowerCase())
+  // Offer relationship labels as candidates, not facts: Jev must establish
+  // which person speaks, who is addressed, and whose relationship it is.
+  const names = addUnconfiguredDialogueSpeakers(message, []).slice(0, 12).map(speaker => speaker.name)
+  const relations = [...new Set([...message.matchAll(/\b(?:mom|mother|mum|dad|father|sister|brother|daughter|son|wife|husband|partner|parent|aunt|uncle|friend|boss|doctor|nurse|teacher|assistant)\b/giu)].map(match => match[0].toLowerCase()))]
+  for (const name of names) for (const relation of relations) {
+    if (labels.size >= 60) break
+    labels.add(`${name.toLowerCase()}'s ${relation}`)
+  }
   for (const match of message.matchAll(/\b(?:the|an?)\s+([a-z][a-z'-]{2,})(?:['?]s)?\b/giu)) {
     labels.add(`the ${match[1].toLowerCase().replace(/['?]s$/u, '')}`)
     if (labels.size >= 80) break
@@ -167,7 +191,7 @@ export function buildUncastVoiceDecision(groups: UncastVoiceGroup[], voices: Fav
   const state = {
     message,
     characters: groups.map(group => ({ id: group.id, identity: group.speakerId, speeches: group.speeches, context: group.context })),
-    ghosts: ghosts.map((ghost, index) => ({ option: `ghost_${index}`, identity: ghost.speakerId, label: ghost.label || null, aliases: ghostCastAliases(ghost), context: ghost.context })),
+    ghosts: ghosts.map((ghost, index) => ({ option: `ghost_${index}`, identity: ghost.speakerId, label: ghost.label || null, aliases: ghostCastAliases(ghost), context: ghost.context, conversationHistory: ghost.conversationHistory ?? [] })),
     voices: voices.map((voice, index) => ({ option: `voice_${index}`, name: voice.name, category: voice.category, description: voice.description })),
   }
   const questions: Record<string, { type: 'choice'; instructions: string; criteria: Record<string, string> }> = {}
@@ -183,7 +207,7 @@ export function buildUncastVoiceDecision(groups: UncastVoiceGroup[], voices: Fav
     }
     const earlier = groups.slice(0, groups.indexOf(group))
     if (ghosts.length || earlier.length) questions[`identity_${group.id}`] = {
-      type: 'choice', instructions: `Does character ${group.id} clearly represent the same individual as one prior character? Compare all contexts and dialogue, not just shared gender or voice. Select new_or_unclear unless the identity is clear.`,
+      type: 'choice', instructions: `Does character ${group.id} clearly represent the same individual as one prior character? Compare the full current exchange and prior conversation history, including what others say to this person, relationships, and whether a phone call continues or the same caller arrives in person. Do not confuse a speaker with the person they address; consider scene changes and alternative callers. Shared gender, occupation, or voice alone is insufficient. Select new_or_unclear unless identity is clear.`,
       criteria: { new_or_unclear: 'A new character, or identity cannot be reliably established.',
         ...Object.fromEntries(ghosts.map((ghost, index) => [`ghost_${index}`, `Previously seen character ${ghostCastAliases(ghost).join(" / ") || ghost.speakerId}; context: ${ghost.context}`])),
         ...Object.fromEntries(earlier.map(previous => [`group_${previous.id}`, `Earlier character ${previous.id}; context: ${previous.context.join(' ').slice(0, 2_000)}`])) },
@@ -219,7 +243,7 @@ export function buildUncastIdentityReview(groups: UncastVoiceGroup[], answers: R
       && (probability < 0.8 || identity.confidence < 0.8 || probability - runnerUp < 0.25)) {
       questions[`review_ghost_${group.id}_${ghostChoice![1]}`] = {
         type: 'choice',
-        instructions: `Compare the speaker in current group ${group.id} with the previously seen character ${candidate.label || candidate.speakerId}. Read the prior character's context and the full current scene. Confirm only if they are the same person; distinguish people speaking through a phone, people addressed, and people merely mentioned.`,
+        instructions: `Compare the speaker in current group ${group.id} with the previously seen character ${candidate.label || candidate.speakerId}. Read the prior character's conversation history and the full current scene, including other participants? dialogue, relationship clues, and continuity from phone to in-person. Confirm only if they are the same person; distinguish callers, people addressed, and people merely mentioned.`,
         criteria: { same: 'The prior character and current speaker are clearly the same person.', different_or_unclear: 'They differ or the evidence is insufficient.' },
       }
     }

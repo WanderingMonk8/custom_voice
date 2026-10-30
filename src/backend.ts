@@ -24,6 +24,7 @@ import {
   hashMessageContent,
   ghostCastAliases,
   mergeGhostAliases,
+  updateGhostConversationHistory,
   hasNamedSpeakerSubject,
   normalizeSpeakerName,
   normalizeCustomTtsEmotionTag,
@@ -833,7 +834,7 @@ const saveQueues = new Map<string, Promise<void>>()
 async function saveGhostVoiceAssignments(
   chatId: string, messageId: string, assistantIds: string[], groups: UncastVoiceGroup[],
   assignments: ReturnType<typeof resolveUncastVoiceDecisions>, userId?: string,
-  anchorId = messageId, reserved: readonly string[] = [], lifetime = 10,
+  anchorId = messageId, reserved: readonly string[] = [], lifetime = 10, conversation = '',
 ): Promise<ReturnType<typeof resolveUncastVoiceDecisions>> {
   const queueKey = `${userId ?? 'user'}:${chatId}`
   const previous = saveQueues.get(queueKey) ?? Promise.resolve()
@@ -876,6 +877,7 @@ async function saveGhostVoiceAssignments(
       accepted.push({ ...assignment, voiceId })
       if (!ghost.label && assignment.label) ghost.label = assignment.label
       ghost.aliases = mergeGhostAliases(ghostCastAliases(ghost), assignment.aliases ?? [])
+      updateGhostConversationHistory(ghost, messageId, conversation, currentAssistantIds)
       const occurrence = `${messageId}:${hashMessageContent(group.speeches.join('\n'))}`
       if (!ghost.occurrenceKeys.includes(occurrence)) ghost.occurrenceKeys = [...ghost.occurrenceKeys, occurrence].slice(-100)
       const previousIndex = assistantIds.indexOf(ghost.lastSeenMessageId)
@@ -1412,7 +1414,7 @@ spindle.onFrontendMessage(async (rawPayload: unknown, userId, frontendSessionId)
           let assignments = resolveUncastVoiceDecisions(groups, voices, answers, ghosts, payload.reserved, payload.messageId, payload.message.slice(0, 30_000), assistantIds.slice(0, Math.max(0, assistantIds.indexOf(anchor))))
           const proposedAssignments = assignments
           if (assignments.length) {
-            assignments = await saveGhostVoiceAssignments(payload.chatId, payload.messageId, assistantIds, groups, assignments, userId, anchor, payload.reserved, lifetime)
+            assignments = await saveGhostVoiceAssignments(payload.chatId, payload.messageId, assistantIds, groups, assignments, userId, anchor, payload.reserved, lifetime, payload.message)
           }
           const diagnostics = groups.map(group => {
             const identity = answers[`identity_${group.id}`]
