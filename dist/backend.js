@@ -140,6 +140,33 @@ function buildUncastVoiceDecision(groups, voices, message, ghosts = []) {
   }
   return { state, questions };
 }
+function buildUncastIdentityReview(groups, answers, message, ghosts = []) {
+  const labels = uncastIdentityLabels(message, ghosts);
+  const questions = {};
+  for (const [index, group] of groups.entries()) {
+    const label = answers[`label_${group.id}`];
+    const labelIndex = label?.choice.match(/^label_(\d+)$/u);
+    const labelProbability = label ? label.probabilities[label.choice] ?? 0 : 0;
+    const labelRunnerUp = label ? Math.max(0, ...Object.entries(label.probabilities).filter(([key]) => key !== label.choice).map(([, probability]) => probability)) : 0;
+    const named = labelIndex && labels[Number(labelIndex[1])] && label && label.confidence >= 0.7 && labelProbability >= 0.7 && labelProbability - labelRunnerUp >= 0.25;
+    if (!named) continue;
+    for (const previous of groups.slice(0, index).slice(-8)) {
+      const pair = answers[`same_${group.id}_${previous.id}`];
+      const priorLabel = answers[`label_${previous.id}`];
+      const priorNamed = priorLabel?.choice.startsWith("label_") && priorLabel.confidence >= 0.7 && (priorLabel.probabilities[priorLabel.choice] ?? 0) >= 0.7;
+      const probability = pair?.probabilities.same ?? 0;
+      if (priorNamed || pair?.choice !== "same" || probability < 0.8 || pair.confidence < 0.6 || pair.confidence >= 0.8) continue;
+      questions[`review_same_${group.id}_${previous.id}`] = {
+        type: "choice",
+        instructions: `Review whether the speaker of the earlier group ${previous.id} is the same individual as ${group.id}, identified as ${labels[Number(labelIndex[1])]}. Read the entire scene, including intervening turns and narration. Shared occupation, gender, or similar voice alone is not enough.`,
+        criteria: { same: "The scene clearly establishes that both groups have the same speaker.", different_or_unclear: "The speakers differ or the evidence is insufficient." }
+      };
+      if (Object.keys(questions).length >= 16) break;
+    }
+    if (Object.keys(questions).length >= 16) break;
+  }
+  return { state: { message, characters: groups.map((group) => ({ id: group.id, identity: group.speakerId, speeches: group.speeches, context: group.context })) }, questions };
+}
 function resolveUncastVoiceDecisions(groups, voices, answers, ghosts = [], reserved = [], messageId = "", message = "", previousMessageIds = []) {
   const used = new Set(reserved.filter(Boolean));
   const assignments = [];
@@ -169,7 +196,8 @@ function resolveUncastVoiceDecisions(groups, voices, answers, ghosts = [], reser
     if (label) groupLabels.set(group.id, label);
     const previousGroups = groups.slice(0, groups.indexOf(group)).slice(-8);
     const same = previousGroups.flatMap((previous) => {
-      const answer = answers[`same_${group.id}_${previous.id}`];
+      const review = answers[`review_same_${group.id}_${previous.id}`];
+      const answer = review && strongChoice(review) ? review : answers[`same_${group.id}_${previous.id}`];
       return answer?.choice === "same" && strongChoice(answer) ? [{ previous, probability: answer.probabilities.same ?? 0 }] : [];
     }).sort((a, b) => b.probability - a.probability);
     if (same[0]) root = roots.get(same[0].previous.id) ?? root;
@@ -4743,6 +4771,19 @@ spindle.onFrontendMessage(async (rawPayload, userId, frontendSessionId) => {
             decisionError = error instanceof Error ? error.message : String(error);
             spindle.log.warn(`[Chat Voice] Uncast voice decision failed; using exact ghost matches only: ${decisionError}`);
           }
+          const review = buildUncastIdentityReview(groups, answers, payload.message.slice(0, 3e4), ghosts);
+          let reviewError = "";
+          if (Object.keys(review.questions).length) {
+            try {
+              const result = await spindle.decisions.evaluate({ state: review.state, questions: review.questions, ...userId ? { userId } : {} });
+              for (const [id, answer] of Object.entries(result.answers)) {
+                if (answer.type === "choice") answers[id] = { choice: answer.choice, probabilities: answer.probabilities, confidence: answer.confidence };
+              }
+            } catch (error) {
+              reviewError = error instanceof Error ? error.message : String(error);
+              spindle.log.warn(`[Chat Voice] Uncast identity review failed: ${reviewError}`);
+            }
+          }
           let assignments = resolveUncastVoiceDecisions(groups, voices, answers, ghosts, payload.reserved, payload.messageId, payload.message.slice(0, 3e4), assistantIds.slice(0, Math.max(0, assistantIds.indexOf(anchor))));
           const proposedAssignments = assignments;
           if (assignments.length) {
@@ -4752,12 +4793,12 @@ spindle.onFrontendMessage(async (rawPayload, userId, frontendSessionId) => {
             const identity = answers[`identity_${group.id}`];
             const label = answers[`label_${group.id}`];
             const voice = answers[`voice_${group.id}`];
-            const comparisons = Object.entries(answers).filter(([key]) => key.startsWith(`same_${group.id}_`)).map(([key, answer]) => `${key}=${answer.choice} confidence=${answer.confidence} probabilities=${JSON.stringify(answer.probabilities)}`).join(";") || "none";
+            const comparisons = Object.entries(answers).filter(([key]) => key.startsWith(`same_${group.id}_`) || key.startsWith(`review_same_${group.id}_`)).map(([key, answer]) => `${key}=${answer.choice} confidence=${answer.confidence} probabilities=${JSON.stringify(answer.probabilities)}`).join(";") || "none";
             const assignment = assignments.find((item) => item.groupId === group.id);
             const proposed = proposedAssignments.find((item) => item.groupId === group.id);
             return `${group.id} segments=${group.segmentIndexes.map((index) => index + 1).join(",")} identity=${identity ? `${identity.choice} confidence=${identity.confidence} probabilities=${JSON.stringify(identity.probabilities)}` : "none"} label=${label ? `${label.choice} confidence=${label.confidence} probabilities=${JSON.stringify(label.probabilities)}` : "none"} comparisons=${comparisons} proposed=${proposed ? `${proposed.ghostId} / ${proposed.voiceId} / ${proposed.gender}` : "none"} voice-choice=${voice ? `${voice.choice} confidence=${voice.confidence} probabilities=${JSON.stringify(voice.probabilities)}` : "none"} final=${assignment ? `${assignment.label || "unnamed"} / ${assignment.ghostId} / ${assignment.voiceId}` : "connection default"}`;
           });
-          diagnostics.unshift(`Available favorites=${voices.length}, historical ghosts=${ghosts.length}, current ghosts=${currentGhosts.length}${decisionError ? `; Jev failed: ${decisionError}` : ""}.`);
+          diagnostics.unshift(`Available favorites=${voices.length}, historical ghosts=${ghosts.length}, current ghosts=${currentGhosts.length}${decisionError ? `; Jev failed: ${decisionError}` : ""}; identity review questions=${Object.keys(review.questions).length}${reviewError ? `; review failed: ${reviewError}` : ""}.`);
           sendFrontend({ type: "chat_voice_uncast_matches", requestId: payload.requestId, assignments, diagnostics }, userId, frontendSessionId);
           if (assignments.length) await sendState(userId, void 0, payload.chatId, frontendSessionId);
         }

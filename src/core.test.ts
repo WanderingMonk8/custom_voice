@@ -25,6 +25,7 @@ import {
   mergeGhostAliases,
   readGhostVoices,
   buildUncastVoiceDecision,
+  buildUncastIdentityReview,
   resolveUncastVoiceDecisions,
   clampMessageLimit,
   clampSavedAudioLimit,
@@ -2175,6 +2176,35 @@ test('retains confirmed ghost aliases for matching and promotion', () => {
   assert.deepEqual(matches[0]?.aliases, ['the healer'])
   const ambiguous = resolveUncastVoiceDecisions(groups, [], {}, [ghost, { ...ghost, id: 'other', voiceId: 'another' }])
   assert.deepEqual(ambiguous, [])
+})
+
+test('reviews borderline opening dialogue against a later clearly labeled speaker', () => {
+  const groups = collectUncastVoiceGroups([
+    { speakerId: null, text: 'Two clerks work. The elder is speaking.' },
+    { speakerId: UNCAST_SPEAKER_ID, text: 'Carry the three to the oats column.' },
+    { speakerId: 'watt', text: 'We have the tally.' },
+    { speakerId: null, text: 'The clerk stops writing.' },
+    { speakerId: UNCAST_SPEAKER_ID, text: 'Brenner?s infantry vanguard.' },
+  ])
+  const message = 'The clerk stops writing. The clerk speaks.'
+  const voices = readFavoriteVoices([{ id: 'first' }, { id: 'second' }])
+  const labelChoice = Object.entries(buildUncastVoiceDecision(groups, voices, message).questions.label_g1.criteria).find(([, label]) => label === 'the clerk')?.[0]
+  assert.ok(labelChoice)
+  const answers = {
+    label_g1: confidentDecision(labelChoice),
+    same_g1_g0: { choice: 'same', probabilities: { same: 0.88, different_or_unclear: 0.12 }, confidence: 0.76 },
+    voice_g0: confidentDecision('voice_0'), voice_g1: confidentDecision('voice_1'),
+  }
+  const review = buildUncastIdentityReview(groups, answers, message)
+  assert.ok(review.questions.review_same_g1_g0)
+  assert.deepEqual(resolveUncastVoiceDecisions(groups, voices, answers).map(item => item.voiceId), ['first', 'second'])
+  const confirmed = resolveUncastVoiceDecisions(groups, voices, { ...answers, review_same_g1_g0: confidentDecision('same') })
+  assert.equal(confirmed[0].voiceId, confirmed[1].voiceId)
+  const rejected = resolveUncastVoiceDecisions(groups, voices, { ...answers, review_same_g1_g0: confidentDecision('different_or_unclear') })
+  assert.deepEqual(rejected.map(item => item.voiceId), ['first', 'second'])
+  const weak = resolveUncastVoiceDecisions(groups, voices, { ...answers, review_same_g1_g0: { choice: 'same', probabilities: { same: 0.65, different_or_unclear: 0.35 }, confidence: 0.6 } })
+  assert.deepEqual(weak.map(item => item.voiceId), ['first', 'second'])
+  assert.deepEqual(Object.keys(buildUncastIdentityReview(groups, { ...answers, same_g1_g0: confidentDecision('different_or_unclear') }, message).questions), [])
 })
 
 test('defaults and clamps the global saved audio limit', () => {

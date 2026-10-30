@@ -12,6 +12,7 @@ import {
   applyTtsTagSelections,
   buildSpeakerDecisionPlan,
   buildUncastVoiceDecision,
+  buildUncastIdentityReview,
   canReserveAutomaticVoice,
   buildTtsTagPlan,
   clampMessageLimit,
@@ -1376,6 +1377,19 @@ spindle.onFrontendMessage(async (rawPayload: unknown, userId, frontendSessionId)
             decisionError = error instanceof Error ? error.message : String(error)
             spindle.log.warn(`[Chat Voice] Uncast voice decision failed; using exact ghost matches only: ${decisionError}`)
           }
+          const review = buildUncastIdentityReview(groups, answers, payload.message.slice(0, 30_000), ghosts)
+          let reviewError = ''
+          if (Object.keys(review.questions).length) {
+            try {
+              const result = await spindle.decisions.evaluate({ state: review.state, questions: review.questions, ...(userId ? { userId } : {}) })
+              for (const [id, answer] of Object.entries(result.answers)) {
+                if (answer.type === 'choice') answers[id] = { choice: answer.choice, probabilities: answer.probabilities, confidence: answer.confidence }
+              }
+            } catch (error) {
+              reviewError = error instanceof Error ? error.message : String(error)
+              spindle.log.warn(`[Chat Voice] Uncast identity review failed: ${reviewError}`)
+            }
+          }
           let assignments = resolveUncastVoiceDecisions(groups, voices, answers, ghosts, payload.reserved, payload.messageId, payload.message.slice(0, 30_000), assistantIds.slice(0, Math.max(0, assistantIds.indexOf(anchor))))
           const proposedAssignments = assignments
           if (assignments.length) {
@@ -1385,12 +1399,12 @@ spindle.onFrontendMessage(async (rawPayload: unknown, userId, frontendSessionId)
             const identity = answers[`identity_${group.id}`]
             const label = answers[`label_${group.id}`]
             const voice = answers[`voice_${group.id}`]
-            const comparisons = Object.entries(answers).filter(([key]) => key.startsWith(`same_${group.id}_`)).map(([key, answer]) => `${key}=${answer.choice} confidence=${answer.confidence} probabilities=${JSON.stringify(answer.probabilities)}`).join(';') || 'none'
+            const comparisons = Object.entries(answers).filter(([key]) => key.startsWith(`same_${group.id}_`) || key.startsWith(`review_same_${group.id}_`)).map(([key, answer]) => `${key}=${answer.choice} confidence=${answer.confidence} probabilities=${JSON.stringify(answer.probabilities)}`).join(';') || 'none'
             const assignment = assignments.find(item => item.groupId === group.id)
             const proposed = proposedAssignments.find(item => item.groupId === group.id)
             return `${group.id} segments=${group.segmentIndexes.map(index => index + 1).join(',')} identity=${identity ? `${identity.choice} confidence=${identity.confidence} probabilities=${JSON.stringify(identity.probabilities)}` : 'none'} label=${label ? `${label.choice} confidence=${label.confidence} probabilities=${JSON.stringify(label.probabilities)}` : 'none'} comparisons=${comparisons} proposed=${proposed ? `${proposed.ghostId} / ${proposed.voiceId} / ${proposed.gender}` : 'none'} voice-choice=${voice ? `${voice.choice} confidence=${voice.confidence} probabilities=${JSON.stringify(voice.probabilities)}` : 'none'} final=${assignment ? `${assignment.label || 'unnamed'} / ${assignment.ghostId} / ${assignment.voiceId}` : 'connection default'}`
           })
-          diagnostics.unshift(`Available favorites=${voices.length}, historical ghosts=${ghosts.length}, current ghosts=${currentGhosts.length}${decisionError ? `; Jev failed: ${decisionError}` : ''}.`)
+          diagnostics.unshift(`Available favorites=${voices.length}, historical ghosts=${ghosts.length}, current ghosts=${currentGhosts.length}${decisionError ? `; Jev failed: ${decisionError}` : ''}; identity review questions=${Object.keys(review.questions).length}${reviewError ? `; review failed: ${reviewError}` : ''}.`)
           sendFrontend({ type: 'chat_voice_uncast_matches', requestId: payload.requestId, assignments, diagnostics }, userId, frontendSessionId)
           if (assignments.length) await sendState(userId, undefined, payload.chatId, frontendSessionId)
         }
