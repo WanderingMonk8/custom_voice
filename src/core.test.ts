@@ -14,6 +14,8 @@ import {
   applyTtsTagSelections,
   assessSpeakerDiscourseEscalation,
   buildSpeakerDecisionPlan,
+  buildAssistantUserSpeakerReview,
+  applyAssistantUserSpeakerReview,
   buildTtsTagPlan,
   bufferAwareGenerationConcurrency,
   availableUncastVoices,
@@ -2218,6 +2220,28 @@ test('automatic casting chooses the last compatible unused favorite', () => {
   assert.deepEqual(resolveUncastVoiceDecisions(groups, one, { voice_g0: confidentDecision('no_match'), gender_g0: confidentDecision('male') }), [])
   const questions = buildUncastVoiceDecision(groups, voices, 'A speaker says hello.').questions
   assert.equal('no_match' in questions.voice_g0.criteria, false)
+})
+
+test('reviews assistant dialogue attributed to the user when another named subject is present', () => {
+  const message = `"Nine-fifteen, Tessa." The voice crackles through the earpiece. Tessa's jaw stays clamped on the phone. Ken's hand rests on her hip.\n\n"Mom. Mom, I heard you."`
+  const speakers = addUnconfiguredDialogueSpeakers(message, [{ id: USER_SPEAKER_ID, name: 'Ken' }])
+  assert.equal(speakers.filter(speaker => speaker.name.toLowerCase() === 'ken').length, 1)
+  assert.ok(speakers.some(speaker => speaker.name === 'Tessa'))
+  const plan = buildSpeakerDecisionPlan(message, speakers, false)
+  const userOption = plan.state.speakers.find(speaker => speaker.id === USER_SPEAKER_ID)!.option
+  const tessaOption = plan.state.speakers.find(speaker => speaker.name === 'Tessa')!.option
+  const answers = { speech_s0: confidentDecision('uncast_character'), speech_s1: confidentDecision(userOption, 0.68, 0.57) }
+  const review = buildAssistantUserSpeakerReview(plan, answers)
+  assert.ok(review.questions.user_review_s1)
+  assert.equal(review.questions.user_review_s0, undefined)
+  applyAssistantUserSpeakerReview(plan, answers, { user_review_s1: confidentDecision(tessaOption) })
+  assert.equal(answers.speech_s1.choice, tessaOption)
+  assert.equal(resolveSpeakerDecisionSegments(message, plan, answers, speakers, { isUserMessage: false, cardSpeakerId: null, historicalSpeakerId: null }).filter(segment => segment.text.includes('Mom.'))[0]?.speakerId, 'unconfigured:tessa')
+  const weak = { speech_s1: confidentDecision(userOption, 0.68, 0.57) }
+  applyAssistantUserSpeakerReview(plan, weak, { user_review_s1: confidentDecision(tessaOption, 0.7, 0.65) })
+  assert.equal(weak.speech_s1.choice, userOption)
+  const userMessagePlan = buildSpeakerDecisionPlan(message, speakers, true)
+  assert.deepEqual(Object.keys(buildAssistantUserSpeakerReview(userMessagePlan, weak).questions), [])
 })
 
 test('defaults and clamps the global saved audio limit', () => {

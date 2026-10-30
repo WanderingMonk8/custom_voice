@@ -464,6 +464,8 @@ function addUnconfiguredDialogueSpeakers(content, speakers, skippedTrackerTagPai
     result.push({ id, name });
     for (const alias of aliases) knownAliases.add(alias.toLowerCase());
   };
+  const narrative = narrativeOnly(preparedContent);
+  for (const match of narrative.matchAll(/\b([\p{Lu}][\p{L}\p{M}-]{1,63})['\u2019]s\s+[\p{L}\p{M}-]+/gu)) addCandidate(match[1]);
   const paragraphs = playbackParagraphs(preparedContent);
   for (let paragraphIndex = 0; paragraphIndex < paragraphs.length; paragraphIndex += 1) {
     const paragraph = paragraphs[paragraphIndex];

@@ -591,6 +591,8 @@ function addUnconfiguredDialogueSpeakers(content, speakers, skippedTrackerTagPai
     result.push({ id, name });
     for (const alias of aliases) knownAliases.add(alias.toLowerCase());
   };
+  const narrative = narrativeOnly(preparedContent);
+  for (const match of narrative.matchAll(/\b([\p{Lu}][\p{L}\p{M}-]{1,63})['\u2019]s\s+[\p{L}\p{M}-]+/gu)) addCandidate(match[1]);
   const paragraphs = playbackParagraphs(preparedContent);
   for (let paragraphIndex = 0; paragraphIndex < paragraphs.length; paragraphIndex += 1) {
     const paragraph = paragraphs[paragraphIndex];
@@ -1527,6 +1529,36 @@ function buildSpeakerDecisionPlan(content, speakers, isUserMessage, skippedTrack
     plan.state.turnQuestionsOmitted = true;
   }
   return plan;
+}
+function buildAssistantUserSpeakerReview(plan, answers) {
+  const others = plan.state.speakers.filter((speaker) => speaker.id !== USER_SPEAKER_ID);
+  const questions = {};
+  if (plan.state.messageRole === "assistant" && others.length && hasNamedSpeakerSubject(plan.state.message, others)) {
+    const criteria = speakerDecisionCriteria(plan.state.speakers);
+    for (const speech of plan.state.speeches) {
+      const first = evaluateSpeakerDecisionAnswer(answers[`speech_${speech.id}`], plan.optionSpeakerIds);
+      if (first.identity !== USER_SPEAKER_ID) continue;
+      questions[`user_review_${speech.id}`] = {
+        type: "choice",
+        instructions: `Independently identify who actually speaks quotation ${speech.id}. Consider the full scene, pronouns, the active user persona's name and role, who is physically speaking versus listening or addressed, and dialogue on a phone or other channel. Select the user only if the scene supports that identity; choose an uncast person or unclear if appropriate.`,
+        criteria
+      };
+    }
+  }
+  return { state: plan.state, questions };
+}
+function applyAssistantUserSpeakerReview(plan, answers, reviewed) {
+  for (const speech of plan.state.speeches) {
+    const result = reviewed[`user_review_${speech.id}`];
+    if (!result) continue;
+    answers[`user_review_${speech.id}`] = result;
+    const evaluated = evaluateSpeakerDecisionAnswer(result, plan.optionSpeakerIds, { probability: 0.8, confidence: 0.8, margin: 0.25 });
+    if (plan.state.messageRole === "assistant" && evaluated.identity && evaluated.identity !== USER_SPEAKER_ID && evaluateSpeakerDecisionAnswer(answers[`speech_${speech.id}`], plan.optionSpeakerIds).identity === USER_SPEAKER_ID) {
+      answers[`user_review_original_${speech.id}`] = answers[`speech_${speech.id}`];
+      answers[`speech_${speech.id}`] = result;
+      answers[`user_review_applied_${speech.id}`] = result;
+    }
+  }
 }
 var TTS_TAG_THRESHOLDS = {
   probability: 0.65,
@@ -2558,7 +2590,7 @@ var SPEAKER_DECISION_THRESHOLDS = {
 };
 var TTS_TAG_SCHEMA = "tts-tags-7";
 var SPEAKER_DECISION_SCHEMA = {
-  classifier: "jev-5",
+  classifier: "jev-6-user-review",
   discourse: "discourse-1",
   hardBoundary: "boundary-1",
   turns: "turn-1",
@@ -3490,6 +3522,9 @@ function resolveSpeakerDecisionSegments(content, plan, answers, speakers, option
         debugPath: [
           `segment-type:speech (quote ${index + 1})`,
           ...decisionAnswerDebug("jev-speech", answer, plan.optionSpeakerIds),
+          ...decisionAnswerDebug("jev-user-review-original", answers[`user_review_original_${speech.id}`], plan.optionSpeakerIds),
+          ...decisionAnswerDebug("jev-user-review", answers[`user_review_${speech.id}`], plan.optionSpeakerIds),
+          ...answers[`user_review_applied_${speech.id}`] ? ["jev-user-review:strong alternative applied"] : [],
           ...decisionAnswerDebug(`jev-${speech?.paragraphId ?? "paragraph"}`, paragraphAnswer, plan.optionSpeakerIds),
           `jev-local-thresholds:${describeDecisionThresholds(SPEAKER_DECISION_THRESHOLDS.local)}`,
           ...index === 0 ? [`card-deference:${cardIdentity ? "eligible" : "blocked"} (${cardReason})`] : [],
@@ -3845,7 +3880,7 @@ async function buildState(chat, userId) {
   return {
     id: chat.id,
     name: chat.name,
-    castScanned: metadata.chat_voice_cast_scanned === true || config.detectedCharacters.length > 0,
+    castScanned: candidates.length === 0 || metadata.chat_voice_cast_scanned === true || config.detectedCharacters.length > 0,
     ghosts: readGhostVoices(metadata.chat_voice_ghost_cast),
     assistantMessageIds: messages.filter((message) => !message.is_user).map((message) => message.id),
     messageLimit: config.messageLimit,
@@ -4363,7 +4398,9 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
     const config = readConfig(chat.metadata ?? {}, cards.map((card) => card.id));
     const userAliases = [];
     const seenUserAliases = /* @__PURE__ */ new Set();
-    for (const item of messages) {
+    const activePersona = await spindle.personas.getActive(userId).catch(() => null);
+    const aliasSources = [...activePersona?.name ? [{ is_user: true, name: activePersona.name }] : [], ...messages];
+    for (const item of aliasSources) {
       if (!item.is_user) continue;
       const name = normalizeSpeakerName(item.name);
       if (!name) continue;
@@ -4513,6 +4550,21 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
               confidence: answer.confidence
             };
           }
+          const userReview = buildAssistantUserSpeakerReview(decisionPlan, answers);
+          let userReviewFailed = false;
+          if (Object.keys(userReview.questions).length) {
+            try {
+              const reviewResult = await spindle.decisions.evaluate({ state: userReview.state, questions: userReview.questions, ...userId ? { userId } : {} });
+              const reviewed = {};
+              for (const [id, answer] of Object.entries(reviewResult.answers)) {
+                if (answer.type === "choice") reviewed[id] = { choice: answer.choice, probabilities: answer.probabilities, confidence: answer.confidence };
+              }
+              applyAssistantUserSpeakerReview(decisionPlan, answers, reviewed);
+            } catch (error) {
+              userReviewFailed = true;
+              spindle.log.warn(`[Chat Voice] User speaker review failed; keeping original assignments: ${error instanceof Error ? error.message : String(error)}`);
+            }
+          }
           const { assessment: discourseAssessment, evaluation: discourse } = await reviewDiscourseEscalation(
             decisionPlan,
             answers,
@@ -4544,7 +4596,7 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
             payload.debug
           );
           const taggedSegments = tagResult.segments;
-          if (!tagResult.tagFailed) {
+          if (!tagResult.tagFailed && !userReviewFailed) {
             const nextConfig = {
               ...config,
               parsedMessages: {
@@ -4691,7 +4743,7 @@ function queueScan(payload, userId, frontendSessionId) {
       detectedCharacters: [...detected.values()],
       parsedMessages: {}
     };
-    const metadata = { ...applyConfigToMetadata(chat.metadata ?? {}, nextConfig), chat_voice_cast_scanned: true };
+    const metadata = { ...applyConfigToMetadata(chat.metadata ?? {}, nextConfig), chat_voice_cast_scanned: candidates.length > 0 };
     await spindle.chats.update(chat.id, { metadata }, userId);
     await sendState(userId, void 0, chat.id, frontendSessionId);
     sendFrontend({

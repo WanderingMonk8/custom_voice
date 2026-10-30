@@ -1273,6 +1273,10 @@ export function addUnconfiguredDialogueSpeakers(
     for (const alias of aliases) knownAliases.add(alias.toLowerCase())
   }
 
+  // Possessive subjects can establish an unconfigured person even when the
+  // name follows another sentence, as in a phone conversation's action beat.
+  const narrative = narrativeOnly(preparedContent)
+  for (const match of narrative.matchAll(/\b([\p{Lu}][\p{L}\p{M}-]{1,63})['\u2019]s\s+[\p{L}\p{M}-]+/gu)) addCandidate(match[1])
   const paragraphs = playbackParagraphs(preparedContent)
   for (let paragraphIndex = 0; paragraphIndex < paragraphs.length; paragraphIndex += 1) {
     const paragraph = paragraphs[paragraphIndex]
@@ -2640,6 +2644,41 @@ export function buildSpeakerDecisionPlan(
     plan.state.turnQuestionsOmitted = true
   }
   return plan
+}
+
+/** Reconsider assistant quotes attributed to the persona when another named subject is present. */
+export function buildAssistantUserSpeakerReview(plan: SpeakerDecisionPlan, answers: Record<string, SpeakerDecisionChoice>) {
+  const others = plan.state.speakers.filter(speaker => speaker.id !== USER_SPEAKER_ID)
+  const questions: SpeakerDecisionPlan['questions'] = {}
+  if (plan.state.messageRole === 'assistant' && others.length && hasNamedSpeakerSubject(plan.state.message, others)) {
+    const criteria = speakerDecisionCriteria(plan.state.speakers)
+    for (const speech of plan.state.speeches) {
+      const first = evaluateSpeakerDecisionAnswer(answers[`speech_${speech.id}`], plan.optionSpeakerIds)
+      if (first.identity !== USER_SPEAKER_ID) continue
+      questions[`user_review_${speech.id}`] = {
+        type: 'choice',
+        instructions: `Independently identify who actually speaks quotation ${speech.id}. Consider the full scene, pronouns, the active user persona's name and role, who is physically speaking versus listening or addressed, and dialogue on a phone or other channel. Select the user only if the scene supports that identity; choose an uncast person or unclear if appropriate.`,
+        criteria,
+      }
+    }
+  }
+  return { state: plan.state, questions }
+}
+
+/** Only a strong independent review may replace an assistant-message user assignment. */
+export function applyAssistantUserSpeakerReview(plan: SpeakerDecisionPlan, answers: Record<string, SpeakerDecisionChoice>, reviewed: Record<string, SpeakerDecisionChoice>): void {
+  for (const speech of plan.state.speeches) {
+    const result = reviewed[`user_review_${speech.id}`]
+    if (!result) continue
+    answers[`user_review_${speech.id}`] = result
+    const evaluated = evaluateSpeakerDecisionAnswer(result, plan.optionSpeakerIds, { probability: 0.8, confidence: 0.8, margin: 0.25 })
+    if (plan.state.messageRole === 'assistant' && evaluated.identity && evaluated.identity !== USER_SPEAKER_ID
+      && evaluateSpeakerDecisionAnswer(answers[`speech_${speech.id}`], plan.optionSpeakerIds).identity === USER_SPEAKER_ID) {
+      answers[`user_review_original_${speech.id}`] = answers[`speech_${speech.id}`]
+      answers[`speech_${speech.id}`] = result
+      answers[`user_review_applied_${speech.id}`] = result
+    }
+  }
 }
 
 export type TtsTagStyle = 'off' | 'gemini' | 'gemini38' | 'fish'
@@ -4110,7 +4149,7 @@ export const TTS_TAG_SCHEMA = 'tts-tags-7'
 
 /** Bump a version whenever a stage changes the output stored in the cache. */
 export const SPEAKER_DECISION_SCHEMA = {
-  classifier: 'jev-5',
+  classifier: 'jev-6-user-review',
   discourse: 'discourse-1',
   hardBoundary: 'boundary-1',
   turns: 'turn-1',
@@ -5505,6 +5544,9 @@ export function resolveSpeakerDecisionSegments(
         debugPath: [
           `segment-type:speech (quote ${index + 1})`,
           ...decisionAnswerDebug('jev-speech', answer, plan.optionSpeakerIds),
+          ...decisionAnswerDebug('jev-user-review-original', answers[`user_review_original_${speech.id}`], plan.optionSpeakerIds),
+          ...decisionAnswerDebug('jev-user-review', answers[`user_review_${speech.id}`], plan.optionSpeakerIds),
+          ...(answers[`user_review_applied_${speech.id}`] ? ['jev-user-review:strong alternative applied'] : []),
           ...decisionAnswerDebug(`jev-${speech?.paragraphId ?? 'paragraph'}`, paragraphAnswer, plan.optionSpeakerIds),
           `jev-local-thresholds:${describeDecisionThresholds(SPEAKER_DECISION_THRESHOLDS.local)}`,
           ...(index === 0

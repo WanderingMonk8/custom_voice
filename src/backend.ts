@@ -11,6 +11,8 @@ import {
   assessSpeakerDiscourseEscalation,
   applyTtsTagSelections,
   buildSpeakerDecisionPlan,
+  buildAssistantUserSpeakerReview,
+  applyAssistantUserSpeakerReview,
   buildUncastVoiceDecision,
   buildUncastIdentityReview,
   canReserveAutomaticVoice,
@@ -230,7 +232,7 @@ async function buildState(chat: ChatLike, userId?: string) {
   return {
     id: chat.id,
     name: chat.name,
-    castScanned: metadata.chat_voice_cast_scanned === true || config.detectedCharacters.length > 0,
+    castScanned: candidates.length === 0 || metadata.chat_voice_cast_scanned === true || config.detectedCharacters.length > 0,
     ghosts: readGhostVoices(metadata.chat_voice_ghost_cast),
     assistantMessageIds: messages.filter(message => !message.is_user).map(message => message.id),
     messageLimit: config.messageLimit,
@@ -916,7 +918,9 @@ function queueSpeakerParse(
     const config = readConfig(chat.metadata ?? {}, cards.map(card => card.id))
     const userAliases: string[] = []
     const seenUserAliases = new Set<string>()
-    for (const item of messages) {
+    const activePersona = await spindle.personas.getActive(userId).catch(() => null)
+    const aliasSources = [ ...(activePersona?.name ? [{ is_user: true, name: activePersona.name }] : []), ...messages ]
+    for (const item of aliasSources) {
       if (!item.is_user) continue
       const name = normalizeSpeakerName(item.name)
       if (!name) continue
@@ -1092,6 +1096,21 @@ function queueSpeakerParse(
               confidence: answer.confidence,
             }
           }
+          const userReview = buildAssistantUserSpeakerReview(decisionPlan, answers)
+          let userReviewFailed = false
+          if (Object.keys(userReview.questions).length) {
+            try {
+              const reviewResult = await spindle.decisions.evaluate({ state: userReview.state, questions: userReview.questions, ...(userId ? { userId } : {}) })
+              const reviewed: Record<string, SpeakerDecisionChoice> = {}
+              for (const [id, answer] of Object.entries(reviewResult.answers)) {
+                if (answer.type === 'choice') reviewed[id] = { choice: answer.choice, probabilities: answer.probabilities, confidence: answer.confidence }
+              }
+              applyAssistantUserSpeakerReview(decisionPlan, answers, reviewed)
+            } catch (error) {
+              userReviewFailed = true
+              spindle.log.warn(`[Chat Voice] User speaker review failed; keeping original assignments: ${error instanceof Error ? error.message : String(error)}`)
+            }
+          }
           const { assessment: discourseAssessment, evaluation: discourse } = await reviewDiscourseEscalation(
             decisionPlan,
             answers,
@@ -1123,7 +1142,7 @@ function queueSpeakerParse(
             payload.debug,
           )
           const taggedSegments = tagResult.segments
-          if (!tagResult.tagFailed) {
+          if (!tagResult.tagFailed && !userReviewFailed) {
             const nextConfig: ChatVoiceConfig = {
               ...config,
               parsedMessages: {
@@ -1287,7 +1306,7 @@ function queueScan(
       detectedCharacters: [...detected.values()],
       parsedMessages: {},
     }
-    const metadata = { ...applyConfigToMetadata(chat.metadata ?? {}, nextConfig), chat_voice_cast_scanned: true }
+    const metadata = { ...applyConfigToMetadata(chat.metadata ?? {}, nextConfig), chat_voice_cast_scanned: candidates.length > 0 }
     await spindle.chats.update(chat.id, { metadata }, userId)
 
     await sendState(userId, undefined, chat.id, frontendSessionId)
