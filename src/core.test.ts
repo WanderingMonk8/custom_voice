@@ -2136,6 +2136,22 @@ test('uncast voice matching excludes narration-only people and only groups actua
   assert.match(plan.questions.voice_g0.instructions, /Narration-only bystanders/u)
 })
 
+test('regeneration ranks only voices available against both historical and current ghosts', () => {
+  const ids = ['earlier', 'later']
+  const historical = { id: 'old', speakerId: UNCAST_SPEAKER_ID, voiceId: 'old-voice', context: '', occurrenceKeys: [], lastSeenMessageId: 'earlier' }
+  const current = { id: 'new', speakerId: UNCAST_SPEAKER_ID, voiceId: 'new-voice', context: '', occurrenceKeys: [], lastSeenMessageId: 'later' }
+  const ghosts = [historical, current]
+  const atMessage = activeGhostVoices(ghosts, ids, 'earlier')
+  const now = activeGhostVoices(ghosts, ids, 'later')
+  const favorites = readFavoriteVoices([{ id: 'old-voice' }, { id: 'new-voice' }, { id: 'free-voice' }])
+  const available = availableUncastVoices(favorites, [...atMessage, ...now].map(ghost => ghost.voiceId))
+  assert.deepEqual(available.map(voice => voice.id), ['free-voice'])
+  const groups = collectUncastVoiceGroups([{ speakerId: UNCAST_SPEAKER_ID, text: 'Hello again.' }])
+  const fresh = resolveUncastVoiceDecisions(groups, available, { voice_g0: confidentDecision('voice_0') }, [], [], 'earlier')
+  assert.equal(fresh[0]?.voiceId, 'free-voice')
+  assert.equal(fresh[0]?.ghostId, 'pending:g0')
+})
+
 test('defaults and clamps the global saved audio limit', () => {
   assert.equal(clampSavedAudioLimit(undefined), 50)
   assert.equal(clampSavedAudioLimit(0), 1)

@@ -59,6 +59,10 @@ function selectAutomaticVoice(voices, used, answer, gender) {
   if (answer.choice === "no_match") return "";
   return voices.map((voice, index) => ({ voice, probability: answer.probabilities[`voice_${index}`] ?? 0 })).filter((item) => !used.has(item.voice.id) && item.probability > 0 && (gender === "unknown" || item.voice.category === "unspecified" || item.voice.category === gender)).sort((a, b) => b.probability - a.probability)[0]?.voice.id ?? "";
 }
+function availableUncastVoices(favorites, used) {
+  const reserved = new Set(used.map((voice) => voice.trim()).filter(Boolean));
+  return favorites.filter((voice) => !reserved.has(voice.id));
+}
 function uncastIdentityLabels(message, ghosts) {
   const labels = /* @__PURE__ */ new Set();
   for (const ghost of ghosts) if (ghost.label) labels.add(ghost.label.toLowerCase());
@@ -4690,21 +4694,26 @@ spindle.onFrontendMessage(async (rawPayload, userId, frontendSessionId) => {
         const savedGhosts = readGhostVoices(chat.metadata?.chat_voice_ghost_cast);
         const lifetime = Number.isFinite(payload.lifetime) ? Math.min(1e3, Math.max(1, Math.round(payload.lifetime))) : 10;
         const ghosts = activeGhostVoices(savedGhosts, assistantIds, anchor, lifetime);
-        const voices = readFavoriteVoices(payload.voices).filter((voice) => !ghosts.some((ghost) => ghost.voiceId === voice.id));
+        const currentGhosts = activeGhostVoices(savedGhosts, assistantIds, assistantIds.at(-1) ?? anchor, lifetime);
+        const config = readConfig(chat.metadata ?? {}, chatMemberIds(chat));
+        const voices = availableUncastVoices(readFavoriteVoices(payload.voices), [...payload.reserved, config.narratorVoice, config.userVoice, ...Object.values(config.characterVoices), ...ghosts.map((ghost) => ghost.voiceId), ...currentGhosts.map((ghost) => ghost.voiceId)]);
         if (!groups.length || !voices.length && !ghosts.length) {
-          sendFrontend({ type: "chat_voice_uncast_matches", requestId: payload.requestId, assignments: [] }, userId, frontendSessionId);
+          sendFrontend({ type: "chat_voice_uncast_matches", requestId: payload.requestId, assignments: [], diagnostics: [`No matching request: groups=${groups.length}, availableFavorites=${voices.length}, historicalGhosts=${ghosts.length}, currentGhosts=${currentGhosts.length}.`] }, userId, frontendSessionId);
         } else {
           const plan = buildUncastVoiceDecision(groups, voices, payload.message.slice(0, 3e4), ghosts);
           const answers = {};
+          let decisionError = "";
           try {
             const result = await spindle.decisions.evaluate({ state: plan.state, questions: plan.questions, ...userId ? { userId } : {} });
             for (const [id, answer] of Object.entries(result.answers)) {
               if (answer.type === "choice") answers[id] = { choice: answer.choice, probabilities: answer.probabilities, confidence: answer.confidence };
             }
           } catch (error) {
-            spindle.log.warn(`[Chat Voice] Uncast voice decision failed; using exact ghost matches only: ${error instanceof Error ? error.message : String(error)}`);
+            decisionError = error instanceof Error ? error.message : String(error);
+            spindle.log.warn(`[Chat Voice] Uncast voice decision failed; using exact ghost matches only: ${decisionError}`);
           }
           let assignments = resolveUncastVoiceDecisions(groups, voices, answers, ghosts, payload.reserved, payload.messageId, payload.message.slice(0, 3e4), assistantIds.slice(0, Math.max(0, assistantIds.indexOf(anchor))));
+          const proposedAssignments = assignments;
           if (assignments.length) {
             assignments = await saveGhostVoiceAssignments(payload.chatId, payload.messageId, assistantIds, groups, assignments, userId, anchor, payload.reserved, lifetime);
           }
@@ -4714,8 +4723,10 @@ spindle.onFrontendMessage(async (rawPayload, userId, frontendSessionId) => {
             const voice = answers[`voice_${group.id}`];
             const comparisons = Object.entries(answers).filter(([key]) => key.startsWith(`same_${group.id}_`)).map(([key, answer]) => `${key}=${answer.choice} confidence=${answer.confidence} probabilities=${JSON.stringify(answer.probabilities)}`).join(";") || "none";
             const assignment = assignments.find((item) => item.groupId === group.id);
-            return `${group.id} segments=${group.segmentIndexes.map((index) => index + 1).join(",")} identity=${identity ? `${identity.choice} confidence=${identity.confidence} probabilities=${JSON.stringify(identity.probabilities)}` : "none"} label=${label ? `${label.choice} confidence=${label.confidence} probabilities=${JSON.stringify(label.probabilities)}` : "none"} comparisons=${comparisons} voice-choice=${voice ? `${voice.choice} confidence=${voice.confidence} probabilities=${JSON.stringify(voice.probabilities)}` : "none"} final=${assignment ? `${assignment.label || "unnamed"} / ${assignment.ghostId} / ${assignment.voiceId}` : "connection default"}`;
+            const proposed = proposedAssignments.find((item) => item.groupId === group.id);
+            return `${group.id} segments=${group.segmentIndexes.map((index) => index + 1).join(",")} identity=${identity ? `${identity.choice} confidence=${identity.confidence} probabilities=${JSON.stringify(identity.probabilities)}` : "none"} label=${label ? `${label.choice} confidence=${label.confidence} probabilities=${JSON.stringify(label.probabilities)}` : "none"} comparisons=${comparisons} proposed=${proposed ? `${proposed.ghostId} / ${proposed.voiceId} / ${proposed.gender}` : "none"} voice-choice=${voice ? `${voice.choice} confidence=${voice.confidence} probabilities=${JSON.stringify(voice.probabilities)}` : "none"} final=${assignment ? `${assignment.label || "unnamed"} / ${assignment.ghostId} / ${assignment.voiceId}` : "connection default"}`;
           });
+          diagnostics.unshift(`Available favorites=${voices.length}, historical ghosts=${ghosts.length}, current ghosts=${currentGhosts.length}${decisionError ? `; Jev failed: ${decisionError}` : ""}.`);
           sendFrontend({ type: "chat_voice_uncast_matches", requestId: payload.requestId, assignments, diagnostics }, userId, frontendSessionId);
           if (assignments.length) await sendState(userId, void 0, payload.chatId, frontendSessionId);
         }
