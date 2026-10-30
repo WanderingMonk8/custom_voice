@@ -209,6 +209,20 @@ export function buildUncastIdentityReview(groups: UncastVoiceGroup[], answers: R
   const labels = uncastIdentityLabels(message, ghosts)
   const questions: Record<string, { type: 'choice'; instructions: string; criteria: Record<string, string> }> = {}
   for (const [index, group] of groups.entries()) {
+    if (Object.keys(questions).length >= 16) break
+    const identity = answers[`identity_${group.id}`]
+    const ghostChoice = identity?.choice.match(/^ghost_(\d+)$/u)
+    const candidate = ghostChoice ? ghosts[Number(ghostChoice[1])] : undefined
+    const probability = identity ? identity.probabilities[identity.choice] ?? 0 : 0
+    const runnerUp = identity ? Math.max(0, ...Object.entries(identity.probabilities).filter(([key]) => key !== identity.choice).map(([, value]) => value)) : 0
+    if (candidate && identity && probability >= 0.6 && identity.confidence >= 0.5 && probability - runnerUp >= 0.2
+      && (probability < 0.8 || identity.confidence < 0.8 || probability - runnerUp < 0.25)) {
+      questions[`review_ghost_${group.id}_${ghostChoice![1]}`] = {
+        type: 'choice',
+        instructions: `Compare the speaker in current group ${group.id} with the previously seen character ${candidate.label || candidate.speakerId}. Read the prior character's context and the full current scene. Confirm only if they are the same person; distinguish people speaking through a phone, people addressed, and people merely mentioned.`,
+        criteria: { same: 'The prior character and current speaker are clearly the same person.', different_or_unclear: 'They differ or the evidence is insufficient.' },
+      }
+    }
     const label = answers[`label_${group.id}`]
     const labelIndex = label?.choice.match(/^label_(\d+)$/u)
     const labelProbability = label ? label.probabilities[label.choice] ?? 0 : 0
@@ -230,7 +244,7 @@ export function buildUncastIdentityReview(groups: UncastVoiceGroup[], answers: R
     }
     if (Object.keys(questions).length >= 16) break
   }
-  return { state: { message, characters: groups.map(group => ({ id: group.id, identity: group.speakerId, speeches: group.speeches, context: group.context })) }, questions }
+  return { state: { message, characters: groups.map(group => ({ id: group.id, identity: group.speakerId, speeches: group.speeches, context: group.context })), ghosts: ghosts.map((ghost, index) => ({ option: `ghost_${index}`, identity: ghost.speakerId, aliases: ghostCastAliases(ghost), context: ghost.context })) }, questions }
 }
 
 export interface UncastVoiceAssignment { groupId: string; voiceId: string; gender: string; ghostId?: string; label?: string; aliases?: string[] }
@@ -286,6 +300,11 @@ export function resolveUncastVoiceDecisions(
     const priorGhost = rankedGhosts[0]?.recent >= 0 && (rankedGhosts.length === 1 || rankedGhosts[0].recent > rankedGhosts[1].recent) ? rankedGhosts[0].item : undefined
     let ghost = namedGhosts.length === 1 ? namedGhosts[0] : priorGhost ?? exact
     if (!ghost && strongChoice(identity) && identity?.choice.startsWith('ghost_')) ghost = ghosts[Number(identity.choice.slice(6))]
+    if (!ghost && identity?.choice.startsWith('ghost_')) {
+      const ghostIndex = identity.choice.slice(6)
+      const review = answers[`review_ghost_${group.id}_${ghostIndex}`]
+      if (review?.choice === 'same' && strongChoice(review)) ghost = ghosts[Number(ghostIndex)]
+    }
     roots.set(group.id, root)
     if (label && !rootByLabel.has(label)) rootByLabel.set(label, root)
     // A matching earlier group owns the voice, even if a previous replay

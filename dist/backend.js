@@ -146,18 +146,31 @@ function buildUncastIdentityReview(groups, answers, message, ghosts = []) {
   const labels = uncastIdentityLabels(message, ghosts);
   const questions = {};
   for (const [index, group] of groups.entries()) {
+    if (Object.keys(questions).length >= 16) break;
+    const identity = answers[`identity_${group.id}`];
+    const ghostChoice = identity?.choice.match(/^ghost_(\d+)$/u);
+    const candidate = ghostChoice ? ghosts[Number(ghostChoice[1])] : void 0;
+    const probability = identity ? identity.probabilities[identity.choice] ?? 0 : 0;
+    const runnerUp = identity ? Math.max(0, ...Object.entries(identity.probabilities).filter(([key]) => key !== identity.choice).map(([, value]) => value)) : 0;
+    if (candidate && identity && probability >= 0.6 && identity.confidence >= 0.5 && probability - runnerUp >= 0.2 && (probability < 0.8 || identity.confidence < 0.8 || probability - runnerUp < 0.25)) {
+      questions[`review_ghost_${group.id}_${ghostChoice[1]}`] = {
+        type: "choice",
+        instructions: `Compare the speaker in current group ${group.id} with the previously seen character ${candidate.label || candidate.speakerId}. Read the prior character's context and the full current scene. Confirm only if they are the same person; distinguish people speaking through a phone, people addressed, and people merely mentioned.`,
+        criteria: { same: "The prior character and current speaker are clearly the same person.", different_or_unclear: "They differ or the evidence is insufficient." }
+      };
+    }
     const label = answers[`label_${group.id}`];
     const labelIndex = label?.choice.match(/^label_(\d+)$/u);
     const labelProbability = label ? label.probabilities[label.choice] ?? 0 : 0;
-    const labelRunnerUp = label ? Math.max(0, ...Object.entries(label.probabilities).filter(([key]) => key !== label.choice).map(([, probability]) => probability)) : 0;
+    const labelRunnerUp = label ? Math.max(0, ...Object.entries(label.probabilities).filter(([key]) => key !== label.choice).map(([, probability2]) => probability2)) : 0;
     const named = labelIndex && labels[Number(labelIndex[1])] && label && label.confidence >= 0.7 && labelProbability >= 0.7 && labelProbability - labelRunnerUp >= 0.25;
     if (!named) continue;
     for (const previous of groups.slice(0, index).slice(-8)) {
       const pair = answers[`same_${group.id}_${previous.id}`];
       const priorLabel = answers[`label_${previous.id}`];
       const priorNamed = priorLabel?.choice.startsWith("label_") && priorLabel.confidence >= 0.7 && (priorLabel.probabilities[priorLabel.choice] ?? 0) >= 0.7;
-      const probability = pair?.probabilities.same ?? 0;
-      if (priorNamed || pair?.choice !== "same" || probability < 0.8 || pair.confidence < 0.6 || pair.confidence >= 0.8) continue;
+      const probability2 = pair?.probabilities.same ?? 0;
+      if (priorNamed || pair?.choice !== "same" || probability2 < 0.8 || pair.confidence < 0.6 || pair.confidence >= 0.8) continue;
       questions[`review_same_${group.id}_${previous.id}`] = {
         type: "choice",
         instructions: `Review whether the speaker of the earlier group ${previous.id} is the same individual as ${group.id}, identified as ${labels[Number(labelIndex[1])]}. Read the entire scene, including intervening turns and narration. Shared occupation, gender, or similar voice alone is not enough.`,
@@ -167,7 +180,7 @@ function buildUncastIdentityReview(groups, answers, message, ghosts = []) {
     }
     if (Object.keys(questions).length >= 16) break;
   }
-  return { state: { message, characters: groups.map((group) => ({ id: group.id, identity: group.speakerId, speeches: group.speeches, context: group.context })) }, questions };
+  return { state: { message, characters: groups.map((group) => ({ id: group.id, identity: group.speakerId, speeches: group.speeches, context: group.context })), ghosts: ghosts.map((ghost, index) => ({ option: `ghost_${index}`, identity: ghost.speakerId, aliases: ghostCastAliases(ghost), context: ghost.context })) }, questions };
 }
 function resolveUncastVoiceDecisions(groups, voices, answers, ghosts = [], reserved = [], messageId = "", message = "", previousMessageIds = []) {
   const used = new Set(reserved.filter(Boolean));
@@ -213,6 +226,11 @@ function resolveUncastVoiceDecisions(groups, voices, answers, ghosts = [], reser
     const priorGhost = rankedGhosts[0]?.recent >= 0 && (rankedGhosts.length === 1 || rankedGhosts[0].recent > rankedGhosts[1].recent) ? rankedGhosts[0].item : void 0;
     let ghost = namedGhosts.length === 1 ? namedGhosts[0] : priorGhost ?? exact;
     if (!ghost && strongChoice(identity) && identity?.choice.startsWith("ghost_")) ghost = ghosts[Number(identity.choice.slice(6))];
+    if (!ghost && identity?.choice.startsWith("ghost_")) {
+      const ghostIndex = identity.choice.slice(6);
+      const review = answers[`review_ghost_${group.id}_${ghostIndex}`];
+      if (review?.choice === "same" && strongChoice(review)) ghost = ghosts[Number(ghostIndex)];
+    }
     roots.set(group.id, root);
     if (label && !rootByLabel.has(label)) rootByLabel.set(label, root);
     if (ghost && !reserved.includes(ghost.voiceId) && !linkedGhosts.has(root)) linkedGhosts.set(root, ghost);
@@ -4853,7 +4871,7 @@ spindle.onFrontendMessage(async (rawPayload, userId, frontendSessionId) => {
             const identity = answers[`identity_${group.id}`];
             const label = answers[`label_${group.id}`];
             const voice = answers[`voice_${group.id}`];
-            const comparisons = Object.entries(answers).filter(([key]) => key.startsWith(`same_${group.id}_`) || key.startsWith(`review_same_${group.id}_`)).map(([key, answer]) => `${key}=${answer.choice} confidence=${answer.confidence} probabilities=${JSON.stringify(answer.probabilities)}`).join(";") || "none";
+            const comparisons = Object.entries(answers).filter(([key]) => key.startsWith(`same_${group.id}_`) || key.startsWith(`review_same_${group.id}_`) || key.startsWith(`review_ghost_${group.id}_`)).map(([key, answer]) => `${key}=${answer.choice} confidence=${answer.confidence} probabilities=${JSON.stringify(answer.probabilities)}`).join(";") || "none";
             const assignment = assignments.find((item) => item.groupId === group.id);
             const proposed = proposedAssignments.find((item) => item.groupId === group.id);
             return `${group.id} segments=${group.segmentIndexes.map((index) => index + 1).join(",")} identity=${identity ? `${identity.choice} confidence=${identity.confidence} probabilities=${JSON.stringify(identity.probabilities)}` : "none"} label=${label ? `${label.choice} confidence=${label.confidence} probabilities=${JSON.stringify(label.probabilities)}` : "none"} comparisons=${comparisons} proposed=${proposed ? `${proposed.ghostId} / ${proposed.voiceId} / ${proposed.gender}` : "none"} voice-choice=${voice ? `${voice.choice} confidence=${voice.confidence} probabilities=${JSON.stringify(voice.probabilities)}` : "none"} final=${assignment ? `${assignment.label || "unnamed"} / ${assignment.ghostId} / ${assignment.voiceId}` : "connection default"}`;

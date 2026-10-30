@@ -2260,6 +2260,26 @@ test('discovers repeated named subjects and self-introductions for uncast voice 
   assert.deepEqual(singular, [])
 })
 
+test('reviews a borderline cross-message match before creating another voice', () => {
+  const ghost = { id: 'old', speakerId: UNCAST_SPEAKER_ID, voiceId: 'tessa-voice', context: 'Tessa introduces herself and answers her phone.', occurrenceKeys: [], lastSeenMessageId: 'earlier' }
+  const groups = collectUncastVoiceGroups([{ speakerId: 'unconfigured:tessa', text: 'Mom, I heard you.' }])
+  const message = "Tessa holds the phone. Her mother speaks on the other end."
+  const answers = { identity_g0: { choice: 'ghost_0', confidence: 0.58, probabilities: { ghost_0: 0.72, new_or_unclear: 0.25, group_g0: 0.03 } }, voice_g0: confidentDecision('voice_0') }
+  const voices = readFavoriteVoices([{ id: 'another-voice' }])
+  const plan = buildUncastIdentityReview(groups, answers, message, [ghost])
+  assert.ok(plan.questions.review_ghost_g0_0)
+  assert.match(plan.state.ghosts[0].context, /Tessa introduces/u)
+  assert.equal(resolveUncastVoiceDecisions(groups, voices, answers, [ghost], [], 'later', message)[0].voiceId, 'another-voice')
+  const confirmed = resolveUncastVoiceDecisions(groups, voices, { ...answers, review_ghost_g0_0: confidentDecision('same') }, [ghost], [], 'later', message)
+  assert.equal(confirmed[0].ghostId, 'old')
+  assert.equal(confirmed[0].voiceId, 'tessa-voice')
+  assert.deepEqual(confirmed[0].aliases, ['tessa'])
+  const rejected = resolveUncastVoiceDecisions(groups, voices, { ...answers, review_ghost_g0_0: confidentDecision('different_or_unclear') }, [ghost], [], 'later', message)
+  assert.equal(rejected[0].voiceId, 'another-voice')
+  const weak = resolveUncastVoiceDecisions(groups, voices, { ...answers, review_ghost_g0_0: { choice: 'same', confidence: 0.6, probabilities: { same: 0.7, different_or_unclear: 0.3 } } }, [ghost], [], 'later', message)
+  assert.equal(weak[0].voiceId, 'another-voice')
+})
+
 test('defaults and clamps the global saved audio limit', () => {
   assert.equal(clampSavedAudioLimit(undefined), 50)
   assert.equal(clampSavedAudioLimit(0), 1)
