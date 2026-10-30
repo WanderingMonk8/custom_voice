@@ -1361,7 +1361,7 @@ spindle.onFrontendMessage(async (rawPayload: unknown, userId, frontendSessionId)
         // remain available for identity matching, not as new voice choices.
         const currentGhosts = activeGhostVoices(savedGhosts, assistantIds, assistantIds.at(-1) ?? anchor, lifetime)
         const config = readConfig(chat.metadata ?? {}, chatMemberIds(chat))
-        const voices = availableUncastVoices(readFavoriteVoices(payload.voices), [...payload.reserved, config.narratorVoice, config.userVoice, ...Object.values(config.characterVoices), ...ghosts.map(ghost => ghost.voiceId), ...currentGhosts.map(ghost => ghost.voiceId)])
+        const voices = availableUncastVoices(readFavoriteVoices(payload.voices), [...payload.reserved, config.narratorVoice, config.userVoice, ...Object.values(config.characterVoices), ...ghosts.map(ghost => ghost.voiceId), ...currentGhosts.map(ghost => ghost.voiceId)]).slice(0, 254)
         if (!groups.length || (!voices.length && !ghosts.length)) {
           sendFrontend({ type: 'chat_voice_uncast_matches', requestId: payload.requestId, assignments: [], diagnostics: [`No matching request: groups=${groups.length}, availableFavorites=${voices.length}, historicalGhosts=${ghosts.length}, currentGhosts=${currentGhosts.length}.`] }, userId, frontendSessionId)
         } else {
@@ -1475,14 +1475,14 @@ spindle.onFrontendMessage(async (rawPayload: unknown, userId, frontendSessionId)
       ]
       const messageIds = (await spindle.chat.getMessages(chat.id) as Array<{ id: string; is_user: boolean }>).filter(message => !message.is_user).map(message => message.id)
       const activeGhosts = activeGhostVoices(readGhostVoices(chat.metadata?.chat_voice_ghost_cast), messageIds, messageIds.at(-1) ?? '', payload.ghostLifetime)
-      const voices = readFavoriteVoices(payload.voices).filter(voice => !payload.reserved.includes(voice.id) && !Object.values(config.characterVoices).includes(voice.id) && !activeGhosts.some(ghost => ghost.voiceId === voice.id))
+      const voices = readFavoriteVoices(payload.voices).filter(voice => !payload.reserved.includes(voice.id) && !Object.values(config.characterVoices).includes(voice.id) && !activeGhosts.some(ghost => ghost.voiceId === voice.id)).slice(0, 254)
       const selected: Record<string, string> = {}
       const diagnostics: string[] = [`roles=${roles.length}, favorites=${payload.voices.length}, available=${voices.length}, activeGhosts=${activeGhosts.length}`]
       if (roles.length && voices.length) {
         const questions: Record<string, { type: 'choice'; instructions: string; criteria: Record<string, string> }> = Object.fromEntries(roles.map((role, index) => [`role_${index}`, {
           type: 'choice' as const,
-          instructions: `Choose the best suitable voice for ${role.description}. Use descriptions, gender when established, and choose no_match if none fits.`,
-          criteria: { no_match: 'No voice is suitable.', ...Object.fromEntries(voices.map((voice, i) => [`voice_${i}`, `${voice.name || voice.id}; ${voice.category}; ${voice.description || 'No description provided'}`])) },
+          instructions: `Choose the best available voice for ${role.description}. Compare voice descriptions and gender when established.`,
+          criteria: { ...Object.fromEntries(voices.map((voice, i) => [`voice_${i}`, `${voice.name || voice.id}; ${voice.category}; ${voice.description || 'No description provided'}`])), ...(voices.length === 1 ? { no_match: 'No voice is suitable.' } : {}) },
         }]))
         roles.forEach((role, index) => {
           if (role.id !== 'narrator') questions[`gender_${index}`] = {

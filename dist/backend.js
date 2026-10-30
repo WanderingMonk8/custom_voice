@@ -78,8 +78,10 @@ function canReserveAutomaticVoice(voiceId, reserved, ghosts, existingGhostId = "
   return !!voiceId && !reserved.has(voiceId) && !ghosts.some((ghost) => ghost.voiceId === voiceId && ghost.id !== existingGhostId);
 }
 function selectAutomaticVoice(voices, used, answer, gender) {
+  const eligible = voices.map((voice, index) => ({ voice, probability: answer.probabilities[`voice_${index}`] ?? 0 })).filter((item) => !used.has(item.voice.id) && (gender === "unknown" || item.voice.category === "unspecified" || item.voice.category === gender));
+  if (eligible.length === 1) return eligible[0].voice.id;
   if (answer.choice === "no_match") return "";
-  return voices.map((voice, index) => ({ voice, probability: answer.probabilities[`voice_${index}`] ?? 0 })).filter((item) => !used.has(item.voice.id) && item.probability > 0 && (gender === "unknown" || item.voice.category === "unspecified" || item.voice.category === gender)).sort((a, b) => b.probability - a.probability)[0]?.voice.id ?? "";
+  return eligible.filter((item) => item.probability > 0).sort((a, b) => b.probability - a.probability)[0]?.voice.id ?? "";
 }
 function availableUncastVoices(favorites, used) {
   const reserved = new Set(used.map((voice) => voice.trim()).filter(Boolean));
@@ -134,8 +136,8 @@ function buildUncastVoiceDecision(groups, voices, message, ghosts = []) {
     if (!voices.length) continue;
     questions[`voice_${group.id}`] = {
       type: "choice",
-      instructions: `Rank the available voices for the person who actually speaks the quoted dialogue in ${group.id}. Narration-only bystanders and people merely addressed are not speakers. Use the full scene as context, including other character groups only when clearly the same speaker. Choose no_match if no voice is suitable.`,
-      criteria: { ...Object.fromEntries(state.voices.map((voice) => [voice.option, `${voice.name || "Unnamed voice"}; ${voice.category}; ${voice.description || "No description provided."}`])), no_match: "No available voice is suitable." }
+      instructions: `Rank the available voices for the person who actually speaks the quoted dialogue in ${group.id}. Narration-only bystanders and people merely addressed are not speakers. Use the full scene as context, including other character groups only when clearly the same speaker. Select the best available voice.`,
+      criteria: { ...Object.fromEntries(state.voices.map((voice) => [voice.option, `${voice.name || "Unnamed voice"}; ${voice.category}; ${voice.description || "No description provided."}`])), ...state.voices.length === 1 ? { no_match: "No suitable voice is available." } : {} }
     };
   }
   return { state, questions };
@@ -222,12 +224,14 @@ function resolveUncastVoiceDecisions(groups, voices, answers, ghosts = [], reser
     const gender = genders.size === 1 ? genderVotes[0].choice : "unknown";
     let ghost = linkedGhosts.get(root);
     if (!ghost) {
-      const matches = members.map((group) => answers[`voice_${group.id}`]).filter((answer) => answer && answer.choice !== "no_match");
-      const ranked = voices.flatMap((voice, index) => {
+      const matches = members.map((group) => answers[`voice_${group.id}`]).filter((answer) => !!answer);
+      const eligible = voices.flatMap((voice, index) => {
         if (used.has(voice.id) || gender !== "unknown" && voice.category !== "unspecified" && voice.category !== gender) return [];
         const scores = matches.map((match) => match.probabilities[`voice_${index}`] ?? 0).filter((score) => Number.isFinite(score) && score > 0);
-        return scores.length ? [{ voice, score: scores.reduce((sum, score) => sum + score, 0) / scores.length, index }] : [];
-      }).sort((a, b) => b.score - a.score || a.index - b.index);
+        return [{ voice, score: scores.length ? scores.reduce((sum, score) => sum + score, 0) / scores.length : 0, index }];
+      });
+      const ranked = eligible.filter((item) => item.score > 0).sort((a, b) => b.score - a.score || a.index - b.index);
+      if (!ranked.length && eligible.length === 1 && matches.length) ranked.push(eligible[0]);
       if (!ranked[0]) continue;
       ghost = { id: `pending:${root}`, speakerId: members[0].speakerId, voiceId: ranked[0].voice.id, context: members.flatMap((group) => group.context).join(" ").slice(0, 2e3), occurrenceKeys: [], lastSeenMessageId: messageId };
     }
@@ -4755,7 +4759,7 @@ spindle.onFrontendMessage(async (rawPayload, userId, frontendSessionId) => {
         const ghosts = activeGhostVoices(savedGhosts, assistantIds, anchor, lifetime);
         const currentGhosts = activeGhostVoices(savedGhosts, assistantIds, assistantIds.at(-1) ?? anchor, lifetime);
         const config = readConfig(chat.metadata ?? {}, chatMemberIds(chat));
-        const voices = availableUncastVoices(readFavoriteVoices(payload.voices), [...payload.reserved, config.narratorVoice, config.userVoice, ...Object.values(config.characterVoices), ...ghosts.map((ghost) => ghost.voiceId), ...currentGhosts.map((ghost) => ghost.voiceId)]);
+        const voices = availableUncastVoices(readFavoriteVoices(payload.voices), [...payload.reserved, config.narratorVoice, config.userVoice, ...Object.values(config.characterVoices), ...ghosts.map((ghost) => ghost.voiceId), ...currentGhosts.map((ghost) => ghost.voiceId)]).slice(0, 254);
         if (!groups.length || !voices.length && !ghosts.length) {
           sendFrontend({ type: "chat_voice_uncast_matches", requestId: payload.requestId, assignments: [], diagnostics: [`No matching request: groups=${groups.length}, availableFavorites=${voices.length}, historicalGhosts=${ghosts.length}, currentGhosts=${currentGhosts.length}.`] }, userId, frontendSessionId);
         } else {
@@ -4862,14 +4866,14 @@ spindle.onFrontendMessage(async (rawPayload, userId, frontendSessionId) => {
       ];
       const messageIds = (await spindle.chat.getMessages(chat.id)).filter((message) => !message.is_user).map((message) => message.id);
       const activeGhosts = activeGhostVoices(readGhostVoices(chat.metadata?.chat_voice_ghost_cast), messageIds, messageIds.at(-1) ?? "", payload.ghostLifetime);
-      const voices = readFavoriteVoices(payload.voices).filter((voice) => !payload.reserved.includes(voice.id) && !Object.values(config.characterVoices).includes(voice.id) && !activeGhosts.some((ghost) => ghost.voiceId === voice.id));
+      const voices = readFavoriteVoices(payload.voices).filter((voice) => !payload.reserved.includes(voice.id) && !Object.values(config.characterVoices).includes(voice.id) && !activeGhosts.some((ghost) => ghost.voiceId === voice.id)).slice(0, 254);
       const selected = {};
       const diagnostics = [`roles=${roles.length}, favorites=${payload.voices.length}, available=${voices.length}, activeGhosts=${activeGhosts.length}`];
       if (roles.length && voices.length) {
         const questions = Object.fromEntries(roles.map((role, index) => [`role_${index}`, {
           type: "choice",
-          instructions: `Choose the best suitable voice for ${role.description}. Use descriptions, gender when established, and choose no_match if none fits.`,
-          criteria: { no_match: "No voice is suitable.", ...Object.fromEntries(voices.map((voice, i) => [`voice_${i}`, `${voice.name || voice.id}; ${voice.category}; ${voice.description || "No description provided"}`])) }
+          instructions: `Choose the best available voice for ${role.description}. Compare voice descriptions and gender when established.`,
+          criteria: { ...Object.fromEntries(voices.map((voice, i) => [`voice_${i}`, `${voice.name || voice.id}; ${voice.category}; ${voice.description || "No description provided"}`])), ...voices.length === 1 ? { no_match: "No voice is suitable." } : {} }
         }]));
         roles.forEach((role, index) => {
           if (role.id !== "narrator") questions[`gender_${index}`] = {

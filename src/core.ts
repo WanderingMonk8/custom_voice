@@ -137,10 +137,11 @@ export function canReserveAutomaticVoice(voiceId: string, reserved: ReadonlySet<
 
 /** Select a suitable unused favorite from Jev's ranking, respecting known gender. */
 export function selectAutomaticVoice(voices: FavoriteVoice[], used: ReadonlySet<string>, answer: SpeakerDecisionChoice, gender: string): string {
+  const eligible = voices.map((voice, index) => ({ voice, probability: answer.probabilities[`voice_${index}`] ?? 0 }))
+    .filter(item => !used.has(item.voice.id) && (gender === 'unknown' || item.voice.category === 'unspecified' || item.voice.category === gender))
+  if (eligible.length === 1) return eligible[0].voice.id
   if (answer.choice === 'no_match') return ''
-  return voices.map((voice, index) => ({ voice, probability: answer.probabilities[`voice_${index}`] ?? 0 }))
-    .filter(item => !used.has(item.voice.id) && item.probability > 0 && (gender === 'unknown' || item.voice.category === 'unspecified' || item.voice.category === gender))
-    .sort((a, b) => b.probability - a.probability)[0]?.voice.id ?? ''
+  return eligible.filter(item => item.probability > 0).sort((a, b) => b.probability - a.probability)[0]?.voice.id ?? ''
 }
 
 /** Only unassigned favorites may be used; unspecified categories remain eligible. */
@@ -196,8 +197,8 @@ export function buildUncastVoiceDecision(groups: UncastVoiceGroup[], voices: Fav
     }
     if (!voices.length) continue
     questions[`voice_${group.id}`] = {
-      type: 'choice', instructions: `Rank the available voices for the person who actually speaks the quoted dialogue in ${group.id}. Narration-only bystanders and people merely addressed are not speakers. Use the full scene as context, including other character groups only when clearly the same speaker. Choose no_match if no voice is suitable.`,
-      criteria: { ...Object.fromEntries(state.voices.map(voice => [voice.option, `${voice.name || 'Unnamed voice'}; ${voice.category}; ${voice.description || 'No description provided.'}`])), no_match: 'No available voice is suitable.' },
+      type: 'choice', instructions: `Rank the available voices for the person who actually speaks the quoted dialogue in ${group.id}. Narration-only bystanders and people merely addressed are not speakers. Use the full scene as context, including other character groups only when clearly the same speaker. Select the best available voice.`,
+      criteria: { ...Object.fromEntries(state.voices.map(voice => [voice.option, `${voice.name || 'Unnamed voice'}; ${voice.category}; ${voice.description || 'No description provided.'}`])), ...(state.voices.length === 1 ? { no_match: 'No suitable voice is available.' } : {}) },
     }
   }
   return { state, questions }
@@ -298,12 +299,14 @@ export function resolveUncastVoiceDecisions(
     const gender = genders.size === 1 ? genderVotes[0].choice : 'unknown'
     let ghost = linkedGhosts.get(root)
     if (!ghost) {
-      const matches = members.map(group => answers[`voice_${group.id}`]).filter(answer => answer && answer.choice !== 'no_match')
-      const ranked = voices.flatMap((voice, index) => {
+      const matches = members.map(group => answers[`voice_${group.id}`]).filter((answer): answer is SpeakerDecisionChoice => !!answer)
+      const eligible = voices.flatMap((voice, index) => {
         if (used.has(voice.id) || (gender !== 'unknown' && voice.category !== 'unspecified' && voice.category !== gender)) return []
         const scores = matches.map(match => match.probabilities[`voice_${index}`] ?? 0).filter(score => Number.isFinite(score) && score > 0)
-        return scores.length ? [{ voice, score: scores.reduce((sum, score) => sum + score, 0) / scores.length, index }] : []
-      }).sort((a, b) => b.score - a.score || a.index - b.index)
+        return [{ voice, score: scores.length ? scores.reduce((sum, score) => sum + score, 0) / scores.length : 0, index }]
+      })
+      const ranked = eligible.filter(item => item.score > 0).sort((a, b) => b.score - a.score || a.index - b.index)
+      if (!ranked.length && eligible.length === 1 && matches.length) ranked.push(eligible[0])
       if (!ranked[0]) continue
       ghost = { id: `pending:${root}`, speakerId: members[0].speakerId, voiceId: ranked[0].voice.id, context: members.flatMap(group => group.context).join(' ').slice(0, 2_000), occurrenceKeys: [], lastSeenMessageId: messageId }
     }

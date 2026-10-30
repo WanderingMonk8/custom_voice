@@ -2207,6 +2207,19 @@ test('reviews borderline opening dialogue against a later clearly labeled speake
   assert.deepEqual(Object.keys(buildUncastIdentityReview(groups, { ...answers, same_g1_g0: confidentDecision('different_or_unclear') }, message).questions), [])
 })
 
+test('automatic casting chooses the last compatible unused favorite', () => {
+  const voices = readFavoriteVoices([{ id: 'already-used', category: 'female' }, { id: 'available', category: 'female' }, { id: 'male', category: 'male' }])
+  const answer = { choice: 'no_match', confidence: 0.5, probabilities: { no_match: 0.7, voice_0: 0.2, voice_1: 0.1, voice_2: 0 } }
+  assert.equal(selectAutomaticVoice(voices, new Set(['already-used']), answer, 'female'), 'available')
+  assert.equal(selectAutomaticVoice(voices, new Set(['already-used', 'available']), answer, 'female'), '')
+  const groups = collectUncastVoiceGroups([{ speakerId: UNCAST_SPEAKER_ID, text: 'Hello.' }])
+  const one = readFavoriteVoices([{ id: 'available', category: 'female' }])
+  assert.equal(resolveUncastVoiceDecisions(groups, one, { voice_g0: confidentDecision('no_match'), gender_g0: confidentDecision('female') })[0]?.voiceId, 'available')
+  assert.deepEqual(resolveUncastVoiceDecisions(groups, one, { voice_g0: confidentDecision('no_match'), gender_g0: confidentDecision('male') }), [])
+  const questions = buildUncastVoiceDecision(groups, voices, 'A speaker says hello.').questions
+  assert.equal('no_match' in questions.voice_g0.criteria, false)
+})
+
 test('defaults and clamps the global saved audio limit', () => {
   assert.equal(clampSavedAudioLimit(undefined), 50)
   assert.equal(clampSavedAudioLimit(0), 1)
