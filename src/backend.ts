@@ -857,6 +857,9 @@ async function saveGhostVoiceAssignments(
         }
       }
       let ghost = ghosts.find(item => item.id === ghostId)
+      // An existing ghost may have been deleted while Jev was matching. Do not
+      // recreate it from a stale result; only new pending identities may create one.
+      if (!ghost && !assignment.ghostId?.startsWith('pending:')) continue
       const voiceId = ghost?.voiceId ?? assignment.voiceId
       if (!canReserveAutomaticVoice(voiceId, unavailable, ghost ? activeGhosts.filter(item => item.id === ghostId) : activeGhosts, ghostId)) continue
       if (!ghost) {

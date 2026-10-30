@@ -4252,6 +4252,7 @@ async function saveGhostVoiceAssignments(chatId, messageId, assistantIds, groups
         }
       }
       let ghost = ghosts.find((item) => item.id === ghostId);
+      if (!ghost && !assignment.ghostId?.startsWith("pending:")) continue;
       const voiceId = ghost?.voiceId ?? assignment.voiceId;
       if (!canReserveAutomaticVoice(voiceId, unavailable, ghost ? activeGhosts.filter((item) => item.id === ghostId) : activeGhosts, ghostId)) continue;
       if (!ghost) {
