@@ -25,6 +25,7 @@ import {
   canReserveAutomaticVoice,
   selectAutomaticVoice,
   activeGhostVoices,
+  purgeExpiredGhostContexts,
   markGhostVoiceInvoked,
   collectUncastVoiceGroups,
   ghostCastAliases,
@@ -2176,6 +2177,19 @@ test('refreshes temporary voice expiry when used, including playback of older me
   assert.equal(activeGhostVoices([restored], ids, ids[23], 10).length, 0)
   assert.equal(activeGhostVoices([restored], ids, ids[11], 10).length, 0)
   assert.equal(activeGhostVoices([restored], ids, ids[0], 10).length, 1)
+})
+
+test('purges only expired temporary voice context using the latest assistant message', () => {
+  const ids = Array.from({ length: 13 }, (_, index) => `message-${index}`)
+  const expired = { id: 'old', speakerId: UNCAST_SPEAKER_ID, voiceId: 'old-voice', context: 'Old scene', conversationHistory: [{ messageId: ids[0], text: 'Old dialogue' }], occurrenceKeys: [], lastSeenMessageId: ids[0] }
+  const active = { id: 'active', speakerId: UNCAST_SPEAKER_ID, voiceId: 'active-voice', context: 'Recent scene', conversationHistory: [{ messageId: ids[11], text: 'Recent dialogue' }], occurrenceKeys: [], lastSeenMessageId: ids[11] }
+  assert.equal(purgeExpiredGhostContexts([expired, active], [], 10), false)
+  assert.equal(purgeExpiredGhostContexts([expired, active], ids, 10), true)
+  assert.equal(expired.context, '')
+  assert.deepEqual(expired.conversationHistory, [])
+  assert.equal(active.context, 'Recent scene')
+  assert.equal(active.conversationHistory.length, 1)
+  assert.equal(purgeExpiredGhostContexts([expired, active], ids, 10), false)
 })
 
 test('new ghosts from older regenerated messages appear until their creation lifetime expires', () => {

@@ -1353,6 +1353,7 @@ export function setup(ctx: SpindleFrontendContext) {
   let rateLimitWaitSeconds = DEFAULT_RATE_LIMIT_WAIT_SECONDS
   let autoVoiceCasting = true
   let ghostVoiceLifetime = GHOST_VOICE_LIFETIME_MESSAGES
+  let ghostLifetimeLoaded = false
   let speakerAssignmentDebug = false
   let advancedSettingsSaveTimer: ReturnType<typeof setTimeout> | null = null
   let savingAdvancedSettings = false
@@ -1781,6 +1782,7 @@ export function setup(ctx: SpindleFrontendContext) {
       else renderCharacters(activeChat.characters)
     }
     scheduleAdvancedSettingsSave()
+    refreshLocalState()
   }
   ghostLifetimeInput.addEventListener('change', onGhostLifetimeInput)
   playbackBufferField.slot.appendChild(playbackBufferInput)
@@ -2491,6 +2493,7 @@ export function setup(ctx: SpindleFrontendContext) {
     ctx.sendToBackend({
       type: 'chat_voice_refresh',
       chatId: ctx.getActiveChat().chatId,
+      ...(ghostLifetimeLoaded ? { ghostLifetime: ghostVoiceLifetime } : {}),
     })
   }
 
@@ -4235,6 +4238,8 @@ export function setup(ctx: SpindleFrontendContext) {
         concurrentGenerationLimit = preferences.concurrentGenerations
         rateLimitWaitSeconds = preferences.rateLimitWaitSeconds
         ghostVoiceLifetime = preferences.ghostVoiceLifetime
+        ghostLifetimeLoaded = true
+        refreshLocalState()
         autoVoiceCasting = preferences.autoVoiceCasting
         autoCastingToggle.checked = autoVoiceCasting
         speakerAssignmentDebug = preferences.speakerAssignmentDebug

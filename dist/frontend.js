@@ -2477,6 +2477,7 @@ function setup(ctx) {
   let rateLimitWaitSeconds = DEFAULT_RATE_LIMIT_WAIT_SECONDS;
   let autoVoiceCasting = true;
   let ghostVoiceLifetime = GHOST_VOICE_LIFETIME_MESSAGES;
+  let ghostLifetimeLoaded = false;
   let speakerAssignmentDebug = false;
   let advancedSettingsSaveTimer = null;
   let savingAdvancedSettings = false;
@@ -2845,6 +2846,7 @@ function setup(ctx) {
       else renderCharacters(activeChat.characters);
     }
     scheduleAdvancedSettingsSave();
+    refreshLocalState();
   };
   ghostLifetimeInput.addEventListener("change", onGhostLifetimeInput);
   playbackBufferField.slot.appendChild(playbackBufferInput);
@@ -3384,7 +3386,8 @@ function setup(ctx) {
   function refreshLocalState() {
     ctx.sendToBackend({
       type: "chat_voice_refresh",
-      chatId: ctx.getActiveChat().chatId
+      chatId: ctx.getActiveChat().chatId,
+      ...ghostLifetimeLoaded ? { ghostLifetime: ghostVoiceLifetime } : {}
     });
   }
   function requestLocalState() {
@@ -4951,6 +4954,8 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
         concurrentGenerationLimit = preferences.concurrentGenerations;
         rateLimitWaitSeconds = preferences.rateLimitWaitSeconds;
         ghostVoiceLifetime = preferences.ghostVoiceLifetime;
+        ghostLifetimeLoaded = true;
+        refreshLocalState();
         autoVoiceCasting = preferences.autoVoiceCasting;
         autoCastingToggle.checked = autoVoiceCasting;
         speakerAssignmentDebug = preferences.speakerAssignmentDebug;

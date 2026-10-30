@@ -123,6 +123,21 @@ export function activeGhostVoices(ghosts: GhostVoice[], assistantMessageIds: rea
   })
 }
 
+/** Discard stored scene context once a temporary voice is no longer active. */
+export function purgeExpiredGhostContexts(ghosts: GhostVoice[], assistantMessageIds: readonly string[], lifetime: number): boolean {
+  const head = assistantMessageIds.at(-1)
+  if (!head) return false
+  const active = new Set(activeGhostVoices(ghosts, assistantMessageIds, head, lifetime).map(ghost => ghost.id))
+  let changed = false
+  for (const ghost of ghosts) {
+    if (active.has(ghost.id) || (!ghost.context && !ghost.conversationHistory?.length)) continue
+    ghost.context = ''
+    ghost.conversationHistory = []
+    changed = true
+  }
+  return changed
+}
+
 /** Group named unconfigured speakers by identity; anonymous runs stay separate. */
 export function collectUncastVoiceGroups(segments: PlaybackSegment[]): UncastVoiceGroup[] {
   const groups: UncastVoiceGroup[] = []

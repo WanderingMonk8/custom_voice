@@ -93,6 +93,19 @@ function activeGhostVoices(ghosts, assistantMessageIds, targetId, lifetime = GHO
     return (activeSince >= 0 || !ghost.lastSeenMessageId) && activeSince <= target && target - activeSince <= Math.max(1, lifetime);
   });
 }
+function purgeExpiredGhostContexts(ghosts, assistantMessageIds, lifetime) {
+  const head = assistantMessageIds.at(-1);
+  if (!head) return false;
+  const active = new Set(activeGhostVoices(ghosts, assistantMessageIds, head, lifetime).map((ghost) => ghost.id));
+  let changed = false;
+  for (const ghost of ghosts) {
+    if (active.has(ghost.id) || !ghost.context && !ghost.conversationHistory?.length) continue;
+    ghost.context = "";
+    ghost.conversationHistory = [];
+    changed = true;
+  }
+  return changed;
+}
 function canReserveAutomaticVoice(voiceId, reserved, ghosts, existingGhostId = "") {
   return !!voiceId && !reserved.has(voiceId) && !ghosts.some((ghost) => ghost.voiceId === voiceId && ghost.id !== existingGhostId);
 }
@@ -4911,6 +4924,30 @@ spindle.onFrontendMessage(async (rawPayload, userId, frontendSessionId) => {
   const payload = rawPayload;
   try {
     if (payload?.type === "chat_voice_refresh") {
+      if (payload.chatId && Number.isFinite(payload.ghostLifetime)) {
+        const chatId = payload.chatId;
+        const lifetime = Math.min(1e3, Math.max(1, Math.round(payload.ghostLifetime)));
+        const queueKey = `${userId ?? "user"}:${chatId}`;
+        const previous = saveQueues.get(queueKey) ?? Promise.resolve();
+        const task = previous.catch(() => void 0).then(async () => {
+          const chat = await spindle.chats.get(chatId, userId);
+          if (!chat) return;
+          const metadata = chat.metadata ?? {};
+          const ghosts = readGhostVoices(metadata.chat_voice_ghost_cast);
+          if (!ghosts.some((ghost) => ghost.context || ghost.conversationHistory?.length)) return;
+          const messages = await spindle.chat.getMessages(chatId);
+          const ids = messages.filter((message) => !message.is_user).map((message) => message.id);
+          if (purgeExpiredGhostContexts(ghosts, ids, lifetime)) {
+            await spindle.chats.update(chatId, { metadata: { ...metadata, chat_voice_ghost_cast: ghosts } }, userId);
+          }
+        });
+        saveQueues.set(queueKey, task);
+        try {
+          await task;
+        } finally {
+          if (saveQueues.get(queueKey) === task) saveQueues.delete(queueKey);
+        }
+      }
       await sendState(userId, void 0, payload.chatId, frontendSessionId, payload.requestId);
     } else if (payload?.type === "chat_voice_decision_status") {
       sendFrontend({

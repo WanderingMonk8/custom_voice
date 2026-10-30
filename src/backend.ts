@@ -2,6 +2,7 @@ import {
   addScannedFirstNameAliases,
   addUnconfiguredDialogueSpeakers,
   activeGhostVoices,
+  purgeExpiredGhostContexts,
   markGhostVoiceInvoked,
   availableUncastVoices,
   applyConfigToMetadata,
@@ -103,7 +104,7 @@ interface CardPromptData {
 }
 
 type FrontendMessage =
-  | { type: 'chat_voice_refresh'; chatId?: string | null; requestId?: string }
+  | { type: 'chat_voice_refresh'; chatId?: string | null; requestId?: string; ghostLifetime?: number }
   | { type: 'chat_voice_decision_status'; requestId?: string }
   | { type: 'chat_voice_list_llm_connections'; requestId: string }
   | { type: 'chat_voice_scan'; chatId: string; messageLimit: number }
@@ -1359,6 +1360,26 @@ spindle.onFrontendMessage(async (rawPayload: unknown, userId, frontendSessionId)
   const payload = rawPayload as FrontendMessage
   try {
     if (payload?.type === 'chat_voice_refresh') {
+      if (payload.chatId && Number.isFinite(payload.ghostLifetime)) {
+        const chatId = payload.chatId
+        const lifetime = Math.min(1000, Math.max(1, Math.round(payload.ghostLifetime!)))
+        const queueKey = `${userId ?? 'user'}:${chatId}`
+        const previous = saveQueues.get(queueKey) ?? Promise.resolve()
+        const task = previous.catch(() => undefined).then(async () => {
+          const chat = await spindle.chats.get(chatId, userId) as ChatLike | null
+          if (!chat) return
+          const metadata = chat.metadata ?? {}
+          const ghosts = readGhostVoices(metadata.chat_voice_ghost_cast)
+          if (!ghosts.some(ghost => ghost.context || ghost.conversationHistory?.length)) return
+          const messages = await spindle.chat.getMessages(chatId) as Array<{ id: string; is_user: boolean }>
+          const ids = messages.filter(message => !message.is_user).map(message => message.id)
+          if (purgeExpiredGhostContexts(ghosts, ids, lifetime)) {
+            await spindle.chats.update(chatId, { metadata: { ...metadata, chat_voice_ghost_cast: ghosts } }, userId)
+          }
+        })
+        saveQueues.set(queueKey, task)
+        try { await task } finally { if (saveQueues.get(queueKey) === task) saveQueues.delete(queueKey) }
+      }
       await sendState(userId, undefined, payload.chatId, frontendSessionId, payload.requestId)
     } else if (payload?.type === 'chat_voice_decision_status') {
       sendFrontend({
