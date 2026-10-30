@@ -1277,6 +1277,14 @@ export function addUnconfiguredDialogueSpeakers(
   // name follows another sentence, as in a phone conversation's action beat.
   const narrative = narrativeOnly(preparedContent)
   for (const match of narrative.matchAll(/\b([\p{Lu}][\p{L}\p{M}-]{1,63})['\u2019]s\s+[\p{L}\p{M}-]+/gu)) addCandidate(match[1])
+  // Collect repeated proper-name subjects within a sentence, not just at a
+  // paragraph's beginning. These are candidates; Jev still attributes speech.
+  for (const match of narrative.matchAll(/\b(?:and|but|then)\s+([\p{Lu}][\p{L}\p{M}-]{1,63})\s+[\p{Ll}][\p{L}\p{M}-]+/gu)) addCandidate(match[1])
+  // A self-introduction supplies a candidate only when the same name also
+  // appears elsewhere; it does not by itself assign any quote to that person.
+  for (const quote of playbackQuotes(preparedContent)) {
+    for (const match of quote.text.matchAll(/\bI(?:'|\u2019)m\s+([\p{Lu}][\p{L}\p{M}-]{1,63})\b/gu)) addCandidate(match[1])
+  }
   const paragraphs = playbackParagraphs(preparedContent)
   for (let paragraphIndex = 0; paragraphIndex < paragraphs.length; paragraphIndex += 1) {
     const paragraph = paragraphs[paragraphIndex]
@@ -4149,7 +4157,7 @@ export const TTS_TAG_SCHEMA = 'tts-tags-7'
 
 /** Bump a version whenever a stage changes the output stored in the cache. */
 export const SPEAKER_DECISION_SCHEMA = {
-  classifier: 'jev-6-user-review',
+  classifier: 'jev-7-named-subjects',
   discourse: 'discourse-1',
   hardBoundary: 'boundary-1',
   turns: 'turn-1',

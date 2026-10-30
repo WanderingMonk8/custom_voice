@@ -2244,6 +2244,22 @@ test('reviews assistant dialogue attributed to the user when another named subje
   assert.deepEqual(Object.keys(buildAssistantUserSpeakerReview(userMessagePlan, weak).questions), [])
 })
 
+test('discovers repeated named subjects and self-introductions for uncast voice continuity', () => {
+  const message = `The earbud comes out against her thumb, and Tessa turns at the waist. A stream falls between Ken's feet.\n\n"Oh hey." She puts it away.\n\nTessa does not step back.\n\n"You live in there?" She smiles. "I'm Tessa. Two doors down."`
+  const speakers = addUnconfiguredDialogueSpeakers(message, [{ id: USER_SPEAKER_ID, name: 'Ken' }])
+  assert.ok(speakers.some(speaker => speaker.id === 'unconfigured:tessa'))
+  assert.equal(speakers.some(speaker => speaker.id === 'unconfigured:ken'), false)
+  const group = collectUncastVoiceGroups([{ speakerId: 'unconfigured:tessa', text: "I'm Tessa." }])
+  const oldGhost = { id: 'temporary', speakerId: UNCAST_SPEAKER_ID, voiceId: 'voice', context: 'Tessa turns. She introduces herself.', occurrenceKeys: [], lastSeenMessageId: 'previous' }
+  const linked = resolveUncastVoiceDecisions(group, [], { identity_g0: confidentDecision('ghost_0') }, [oldGhost])
+  assert.equal(linked[0]?.ghostId, 'temporary')
+  assert.deepEqual(linked[0]?.aliases, ['tessa'])
+  const weak = resolveUncastVoiceDecisions(group, [], { identity_g0: { choice: 'ghost_0', confidence: 0.5, probabilities: { ghost_0: 0.6, new_or_unclear: 0.4 } } }, [oldGhost])
+  assert.deepEqual(weak, [])
+  const singular = addUnconfiguredDialogueSpeakers('The lamp flickers. "I am waiting."', [])
+  assert.deepEqual(singular, [])
+})
+
 test('defaults and clamps the global saved audio limit', () => {
   assert.equal(clampSavedAudioLimit(undefined), 50)
   assert.equal(clampSavedAudioLimit(0), 1)
