@@ -847,6 +847,7 @@ async function saveGhostVoiceAssignments(
         ghost = { id: ghostId, speakerId: group.speakerId, voiceId: assignment.voiceId, context: '', occurrenceKeys: [], lastSeenMessageId: anchorId }
         ghosts.push(ghost)
       }
+      if (!ghost.label && assignment.label) ghost.label = assignment.label
       const occurrence = `${messageId}:${hashMessageContent(group.speeches.join('\n'))}`
       if (!ghost.occurrenceKeys.includes(occurrence)) ghost.occurrenceKeys = [...ghost.occurrenceKeys, occurrence].slice(-100)
       const previousIndex = assistantIds.indexOf(ghost.lastSeenMessageId)
@@ -1341,16 +1342,17 @@ spindle.onFrontendMessage(async (rawPayload: unknown, userId, frontendSessionId)
           } catch (error) {
             spindle.log.warn(`[Chat Voice] Uncast voice decision failed; using exact ghost matches only: ${error instanceof Error ? error.message : String(error)}`)
           }
-          const assignments = resolveUncastVoiceDecisions(groups, voices, answers, ghosts, payload.reserved, payload.messageId)
+          const assignments = resolveUncastVoiceDecisions(groups, voices, answers, ghosts, payload.reserved, payload.messageId, payload.message.slice(0, 30_000))
           if (assignments.length) {
             await saveGhostVoiceAssignments(payload.chatId, payload.messageId, assistantIds, groups, assignments, userId, anchor)
           }
           const diagnostics = groups.map(group => {
             const identity = answers[`identity_${group.id}`]
+            const label = answers[`label_${group.id}`]
             const voice = answers[`voice_${group.id}`]
             const comparisons = Object.entries(answers).filter(([key]) => key.startsWith(`same_${group.id}_`)).map(([key, answer]) => `${key}=${answer.choice} confidence=${answer.confidence} probabilities=${JSON.stringify(answer.probabilities)}`).join(';') || 'none'
             const assignment = assignments.find(item => item.groupId === group.id)
-            return `${group.id} segments=${group.segmentIndexes.map(index => index + 1).join(',')} identity=${identity ? `${identity.choice} confidence=${identity.confidence} probabilities=${JSON.stringify(identity.probabilities)}` : 'none'} comparisons=${comparisons} voice-choice=${voice ? `${voice.choice} confidence=${voice.confidence} probabilities=${JSON.stringify(voice.probabilities)}` : 'none'} final=${assignment ? `${assignment.ghostId} / ${assignment.voiceId}` : 'connection default'}`
+            return `${group.id} segments=${group.segmentIndexes.map(index => index + 1).join(',')} identity=${identity ? `${identity.choice} confidence=${identity.confidence} probabilities=${JSON.stringify(identity.probabilities)}` : 'none'} label=${label ? `${label.choice} confidence=${label.confidence} probabilities=${JSON.stringify(label.probabilities)}` : 'none'} comparisons=${comparisons} voice-choice=${voice ? `${voice.choice} confidence=${voice.confidence} probabilities=${JSON.stringify(voice.probabilities)}` : 'none'} final=${assignment ? `${assignment.label || 'unnamed'} / ${assignment.ghostId} / ${assignment.voiceId}` : 'connection default'}`
           })
           sendFrontend({ type: 'chat_voice_uncast_matches', requestId: payload.requestId, assignments, diagnostics }, userId, frontendSessionId)
         }
