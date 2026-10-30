@@ -11,6 +11,7 @@ import {
   applyTtsTagSelections,
   buildSpeakerDecisionPlan,
   buildUncastVoiceDecision,
+  canReserveAutomaticVoice,
   buildTtsTagPlan,
   clampMessageLimit,
   eligibleCardFallbackSpeakerId,
@@ -826,15 +827,21 @@ const saveQueues = new Map<string, Promise<void>>()
 async function saveGhostVoiceAssignments(
   chatId: string, messageId: string, assistantIds: string[], groups: UncastVoiceGroup[],
   assignments: ReturnType<typeof resolveUncastVoiceDecisions>, userId?: string,
-  anchorId = messageId,
-): Promise<void> {
+  anchorId = messageId, reserved: readonly string[] = [], lifetime = 10,
+): Promise<ReturnType<typeof resolveUncastVoiceDecisions>> {
   const queueKey = `${userId ?? 'user'}:${chatId}`
   const previous = saveQueues.get(queueKey) ?? Promise.resolve()
   const task = previous.catch(() => undefined).then(async () => {
     const chat = await spindle.chats.get(chatId, userId) as ChatLike | null
-    if (!chat) return
+    if (!chat) return []
     const metadata = chat.metadata ?? {}
     const ghosts = readGhostVoices(metadata.chat_voice_ghost_cast)
+    const currentMessages = await spindle.chat.getMessages(chatId) as Array<{ id: string; is_user: boolean }>
+    const currentAssistantIds = currentMessages.filter(message => !message.is_user).map(message => message.id)
+    const activeGhosts = activeGhostVoices(ghosts, currentAssistantIds, currentAssistantIds.at(-1) ?? anchorId, lifetime)
+    const config = readConfig(metadata, chatMemberIds(chat))
+    const unavailable = new Set([...reserved, config.narratorVoice, config.userVoice, ...Object.values(config.characterVoices)].filter(Boolean))
+    const accepted: ReturnType<typeof resolveUncastVoiceDecisions> = []
     const pendingIds = new Map<string, string>()
     for (const assignment of assignments) {
       const group = groups.find(item => item.id === assignment.groupId)
@@ -850,10 +857,14 @@ async function saveGhostVoiceAssignments(
         }
       }
       let ghost = ghosts.find(item => item.id === ghostId)
+      const voiceId = ghost?.voiceId ?? assignment.voiceId
+      if (!canReserveAutomaticVoice(voiceId, unavailable, ghost ? activeGhosts.filter(item => item.id === ghostId) : activeGhosts, ghostId)) continue
       if (!ghost) {
-        ghost = { id: ghostId, speakerId: group.speakerId, voiceId: assignment.voiceId, context: '', occurrenceKeys: [], lastSeenMessageId: anchorId }
+        ghost = { id: ghostId, speakerId: group.speakerId, voiceId, context: '', occurrenceKeys: [], lastSeenMessageId: anchorId }
         ghosts.push(ghost)
+        activeGhosts.push(ghost)
       }
+      accepted.push({ ...assignment, voiceId })
       if (!ghost.label && assignment.label) ghost.label = assignment.label
       const occurrence = `${messageId}:${hashMessageContent(group.speeches.join('\n'))}`
       if (!ghost.occurrenceKeys.includes(occurrence)) ghost.occurrenceKeys = [...ghost.occurrenceKeys, occurrence].slice(-100)
@@ -865,10 +876,12 @@ async function saveGhostVoiceAssignments(
         ghost.context = [priorContext, ...group.context].filter(Boolean).join(' ').slice(-2_000)
       }
     }
-    await spindle.chats.update(chatId, { metadata: { ...metadata, chat_voice_ghost_cast: ghosts.slice(-200) } }, userId)
+    if (accepted.length) await spindle.chats.update(chatId, { metadata: { ...metadata, chat_voice_ghost_cast: ghosts.slice(-200) } }, userId)
+    return accepted
   })
-  saveQueues.set(queueKey, task)
-  try { await task } finally { if (saveQueues.get(queueKey) === task) saveQueues.delete(queueKey) }
+  const queued = task.then(() => undefined, () => undefined)
+  saveQueues.set(queueKey, queued)
+  try { return await task } finally { if (saveQueues.get(queueKey) === queued) saveQueues.delete(queueKey) }
 }
 
 function queueSpeakerParse(
@@ -1349,9 +1362,9 @@ spindle.onFrontendMessage(async (rawPayload: unknown, userId, frontendSessionId)
           } catch (error) {
             spindle.log.warn(`[Chat Voice] Uncast voice decision failed; using exact ghost matches only: ${error instanceof Error ? error.message : String(error)}`)
           }
-          const assignments = resolveUncastVoiceDecisions(groups, voices, answers, ghosts, payload.reserved, payload.messageId, payload.message.slice(0, 30_000), assistantIds.slice(0, Math.max(0, assistantIds.indexOf(anchor))))
+          let assignments = resolveUncastVoiceDecisions(groups, voices, answers, ghosts, payload.reserved, payload.messageId, payload.message.slice(0, 30_000), assistantIds.slice(0, Math.max(0, assistantIds.indexOf(anchor))))
           if (assignments.length) {
-            await saveGhostVoiceAssignments(payload.chatId, payload.messageId, assistantIds, groups, assignments, userId, anchor)
+            assignments = await saveGhostVoiceAssignments(payload.chatId, payload.messageId, assistantIds, groups, assignments, userId, anchor, payload.reserved, lifetime)
           }
           const diagnostics = groups.map(group => {
             const identity = answers[`identity_${group.id}`]
@@ -1466,10 +1479,16 @@ spindle.onFrontendMessage(async (rawPayload: unknown, userId, frontendSessionId)
         if (!current) throw new Error('The chat is no longer available.')
         const next = readConfig(current.metadata ?? {}, chatMemberIds(current))
         const applied: Record<string, string> = {}
+        const currentMessages = await spindle.chat.getMessages(current.id) as Array<{ id: string; is_user: boolean }>
+        const currentIds = currentMessages.filter(message => !message.is_user).map(message => message.id)
+        const activeGhosts = activeGhostVoices(readGhostVoices(current.metadata?.chat_voice_ghost_cast), currentIds, currentIds.at(-1) ?? '', payload.ghostLifetime)
+        const used = new Set([...payload.reserved, next.narratorVoice, next.userVoice, ...Object.values(next.characterVoices), ...activeGhosts.map(ghost => ghost.voiceId)].filter(Boolean))
         for (const [id, voice] of Object.entries(selected)) {
+          if (used.has(voice)) continue
           if (id === 'narrator' && payload.narratorMissing && !next.narratorVoice) { next.narratorVoice = voice; next.useGlobalNarratorVoice = false; applied[id] = voice }
           else if (id === 'user' && payload.userMissing && !next.userVoice) { next.userVoice = voice; next.useGlobalUserVoice = false; applied[id] = voice }
           else if (id !== 'narrator' && id !== 'user' && next.detectedCharacters.some(character => character.id === id) && !next.characterVoices[id]) { next.characterVoices[id] = voice; applied[id] = voice }
+          if (applied[id]) used.add(voice)
         }
         if (Object.keys(applied).length) await spindle.chats.update(current.id, { metadata: applyConfigToMetadata(current.metadata ?? {}, next) }, userId)
         return applied

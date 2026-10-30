@@ -103,6 +103,11 @@ export function collectUncastVoiceGroups(segments: PlaybackSegment[]): UncastVoi
   return groups
 }
 
+/** Reserve a favorite only while it is unused; a character may keep its own voice. */
+export function canReserveAutomaticVoice(voiceId: string, reserved: ReadonlySet<string>, ghosts: readonly GhostVoice[], existingGhostId = ''): boolean {
+  return !!voiceId && !reserved.has(voiceId) && !ghosts.some(ghost => ghost.voiceId === voiceId && ghost.id !== existingGhostId)
+}
+
 /** Select a suitable unused favorite from Jev's ranking, respecting known gender. */
 export function selectAutomaticVoice(voices: FavoriteVoice[], used: ReadonlySet<string>, answer: SpeakerDecisionChoice, gender: string): string {
   if (answer.choice === 'no_match') return ''

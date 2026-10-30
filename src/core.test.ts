@@ -17,6 +17,7 @@ import {
   buildTtsTagPlan,
   bufferAwareGenerationConcurrency,
   availableUncastVoices,
+  canReserveAutomaticVoice,
   selectAutomaticVoice,
   activeGhostVoices,
   collectUncastVoiceGroups,
@@ -2109,6 +2110,16 @@ test('automatic casting respects reserved voices, gender, and no match', () => {
   assert.equal(selectAutomaticVoice(voices, new Set(['used']), answer, 'male'), 'male')
   assert.equal(selectAutomaticVoice(voices, new Set(['used']), answer, 'female'), 'female')
   assert.equal(selectAutomaticVoice(voices, new Set(), { ...answer, choice: 'no_match' }, 'unknown'), '')
+})
+
+test('automatic voice reservations reject exhausted voices and preserve existing ghost ownership', () => {
+  const ghost = { id: 'one', speakerId: UNCAST_SPEAKER_ID, voiceId: 'last-voice', context: '', occurrenceKeys: [], lastSeenMessageId: 'message' }
+  assert.equal(canReserveAutomaticVoice('last-voice', new Set(), [ghost]), false)
+  assert.equal(canReserveAutomaticVoice('last-voice', new Set(), [ghost], 'one'), true)
+  assert.equal(canReserveAutomaticVoice('last-voice', new Set(['last-voice']), [ghost], 'one'), false)
+  assert.equal(canReserveAutomaticVoice('', new Set(), []), false)
+  const voices = readFavoriteVoices([{ id: 'last-voice' }])
+  assert.equal(selectAutomaticVoice(voices, new Set(['last-voice']), confidentDecision('voice_0'), 'unknown'), '')
 })
 
 test('defaults and clamps the global saved audio limit', () => {

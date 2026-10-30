@@ -52,6 +52,9 @@ function activeGhostVoices(ghosts, assistantMessageIds, targetId, lifetime = GHO
     return (lastSeen >= 0 || !ghost.lastSeenMessageId) && lastSeen <= target && target - lastSeen <= Math.max(1, lifetime);
   });
 }
+function canReserveAutomaticVoice(voiceId, reserved, ghosts, existingGhostId = "") {
+  return !!voiceId && !reserved.has(voiceId) && !ghosts.some((ghost) => ghost.voiceId === voiceId && ghost.id !== existingGhostId);
+}
 function selectAutomaticVoice(voices, used, answer, gender) {
   if (answer.choice === "no_match") return "";
   return voices.map((voice, index) => ({ voice, probability: answer.probabilities[`voice_${index}`] ?? 0 })).filter((item) => !used.has(item.voice.id) && item.probability > 0 && (gender === "unknown" || item.voice.category === "unspecified" || item.voice.category === gender)).sort((a, b) => b.probability - a.probability)[0]?.voice.id ?? "";
@@ -4220,14 +4223,20 @@ async function scanCardCast(cards, userId) {
   }
 }
 var saveQueues = /* @__PURE__ */ new Map();
-async function saveGhostVoiceAssignments(chatId, messageId, assistantIds, groups, assignments, userId, anchorId = messageId) {
+async function saveGhostVoiceAssignments(chatId, messageId, assistantIds, groups, assignments, userId, anchorId = messageId, reserved = [], lifetime = 10) {
   const queueKey = `${userId ?? "user"}:${chatId}`;
   const previous = saveQueues.get(queueKey) ?? Promise.resolve();
   const task = previous.catch(() => void 0).then(async () => {
     const chat = await spindle.chats.get(chatId, userId);
-    if (!chat) return;
+    if (!chat) return [];
     const metadata = chat.metadata ?? {};
     const ghosts = readGhostVoices(metadata.chat_voice_ghost_cast);
+    const currentMessages = await spindle.chat.getMessages(chatId);
+    const currentAssistantIds = currentMessages.filter((message) => !message.is_user).map((message) => message.id);
+    const activeGhosts = activeGhostVoices(ghosts, currentAssistantIds, currentAssistantIds.at(-1) ?? anchorId, lifetime);
+    const config = readConfig(metadata, chatMemberIds(chat));
+    const unavailable = new Set([...reserved, config.narratorVoice, config.userVoice, ...Object.values(config.characterVoices)].filter(Boolean));
+    const accepted = [];
     const pendingIds = /* @__PURE__ */ new Map();
     for (const assignment of assignments) {
       const group = groups.find((item) => item.id === assignment.groupId);
@@ -4243,10 +4252,14 @@ async function saveGhostVoiceAssignments(chatId, messageId, assistantIds, groups
         }
       }
       let ghost = ghosts.find((item) => item.id === ghostId);
+      const voiceId = ghost?.voiceId ?? assignment.voiceId;
+      if (!canReserveAutomaticVoice(voiceId, unavailable, ghost ? activeGhosts.filter((item) => item.id === ghostId) : activeGhosts, ghostId)) continue;
       if (!ghost) {
-        ghost = { id: ghostId, speakerId: group.speakerId, voiceId: assignment.voiceId, context: "", occurrenceKeys: [], lastSeenMessageId: anchorId };
+        ghost = { id: ghostId, speakerId: group.speakerId, voiceId, context: "", occurrenceKeys: [], lastSeenMessageId: anchorId };
         ghosts.push(ghost);
+        activeGhosts.push(ghost);
       }
+      accepted.push({ ...assignment, voiceId });
       if (!ghost.label && assignment.label) ghost.label = assignment.label;
       const occurrence = `${messageId}:${hashMessageContent(group.speeches.join("\n"))}`;
       if (!ghost.occurrenceKeys.includes(occurrence)) ghost.occurrenceKeys = [...ghost.occurrenceKeys, occurrence].slice(-100);
@@ -4258,13 +4271,15 @@ async function saveGhostVoiceAssignments(chatId, messageId, assistantIds, groups
         ghost.context = [priorContext, ...group.context].filter(Boolean).join(" ").slice(-2e3);
       }
     }
-    await spindle.chats.update(chatId, { metadata: { ...metadata, chat_voice_ghost_cast: ghosts.slice(-200) } }, userId);
+    if (accepted.length) await spindle.chats.update(chatId, { metadata: { ...metadata, chat_voice_ghost_cast: ghosts.slice(-200) } }, userId);
+    return accepted;
   });
-  saveQueues.set(queueKey, task);
+  const queued = task.then(() => void 0, () => void 0);
+  saveQueues.set(queueKey, queued);
   try {
-    await task;
+    return await task;
   } finally {
-    if (saveQueues.get(queueKey) === task) saveQueues.delete(queueKey);
+    if (saveQueues.get(queueKey) === queued) saveQueues.delete(queueKey);
   }
 }
 function queueSpeakerParse(payload, userId, frontendSessionId) {
@@ -4688,9 +4703,9 @@ spindle.onFrontendMessage(async (rawPayload, userId, frontendSessionId) => {
           } catch (error) {
             spindle.log.warn(`[Chat Voice] Uncast voice decision failed; using exact ghost matches only: ${error instanceof Error ? error.message : String(error)}`);
           }
-          const assignments = resolveUncastVoiceDecisions(groups, voices, answers, ghosts, payload.reserved, payload.messageId, payload.message.slice(0, 3e4), assistantIds.slice(0, Math.max(0, assistantIds.indexOf(anchor))));
+          let assignments = resolveUncastVoiceDecisions(groups, voices, answers, ghosts, payload.reserved, payload.messageId, payload.message.slice(0, 3e4), assistantIds.slice(0, Math.max(0, assistantIds.indexOf(anchor))));
           if (assignments.length) {
-            await saveGhostVoiceAssignments(payload.chatId, payload.messageId, assistantIds, groups, assignments, userId, anchor);
+            assignments = await saveGhostVoiceAssignments(payload.chatId, payload.messageId, assistantIds, groups, assignments, userId, anchor, payload.reserved, lifetime);
           }
           const diagnostics = groups.map((group) => {
             const identity = answers[`identity_${group.id}`];
@@ -4798,7 +4813,12 @@ spindle.onFrontendMessage(async (rawPayload, userId, frontendSessionId) => {
         if (!current) throw new Error("The chat is no longer available.");
         const next = readConfig(current.metadata ?? {}, chatMemberIds(current));
         const applied2 = {};
+        const currentMessages = await spindle.chat.getMessages(current.id);
+        const currentIds = currentMessages.filter((message) => !message.is_user).map((message) => message.id);
+        const activeGhosts2 = activeGhostVoices(readGhostVoices(current.metadata?.chat_voice_ghost_cast), currentIds, currentIds.at(-1) ?? "", payload.ghostLifetime);
+        const used = new Set([...payload.reserved, next.narratorVoice, next.userVoice, ...Object.values(next.characterVoices), ...activeGhosts2.map((ghost) => ghost.voiceId)].filter(Boolean));
         for (const [id, voice] of Object.entries(selected)) {
+          if (used.has(voice)) continue;
           if (id === "narrator" && payload.narratorMissing && !next.narratorVoice) {
             next.narratorVoice = voice;
             next.useGlobalNarratorVoice = false;
@@ -4811,6 +4831,7 @@ spindle.onFrontendMessage(async (rawPayload, userId, frontendSessionId) => {
             next.characterVoices[id] = voice;
             applied2[id] = voice;
           }
+          if (applied2[id]) used.add(voice);
         }
         if (Object.keys(applied2).length) await spindle.chats.update(current.id, { metadata: applyConfigToMetadata(current.metadata ?? {}, next) }, userId);
         return applied2;
