@@ -52,6 +52,10 @@ function activeGhostVoices(ghosts, assistantMessageIds, targetId, lifetime = GHO
     return (lastSeen >= 0 || !ghost.lastSeenMessageId) && lastSeen <= target && target - lastSeen <= Math.max(1, lifetime);
   });
 }
+function selectAutomaticVoice(voices, used, answer, gender) {
+  if (answer.choice === "no_match") return "";
+  return voices.map((voice, index) => ({ voice, probability: answer.probabilities[`voice_${index}`] ?? 0 })).filter((item) => !used.has(item.voice.id) && item.probability > 0 && (gender === "unknown" || item.voice.category === "unspecified" || item.voice.category === gender)).sort((a, b) => b.probability - a.probability)[0]?.voice.id ?? "";
+}
 function uncastIdentityLabels(message, ghosts) {
   const labels = /* @__PURE__ */ new Set();
   for (const ghost of ghosts) if (ghost.label) labels.add(ghost.label.toLowerCase());
@@ -3768,9 +3772,13 @@ async function buildState(chat, userId) {
     const savedName = name || (id.startsWith("npc:") ? id.slice(4) : "");
     return character ? [{ ...character, name: savedName || character.name, messageCount }] : savedName ? [{ id, name: savedName, messageCount }] : [];
   });
+  const messages = await spindle.chat.getMessages(chat.id);
   return {
     id: chat.id,
     name: chat.name,
+    castScanned: metadata.chat_voice_cast_scanned === true || config.detectedCharacters.length > 0,
+    ghosts: readGhostVoices(metadata.chat_voice_ghost_cast),
+    assistantMessageIds: messages.filter((message) => !message.is_user).map((message) => message.id),
     messageLimit: config.messageLimit,
     connectionId: config.connectionId,
     narratorVoice: config.narratorVoice,
@@ -4600,7 +4608,7 @@ function queueScan(payload, userId, frontendSessionId) {
       detectedCharacters: [...detected.values()],
       parsedMessages: {}
     };
-    const metadata = applyConfigToMetadata(chat.metadata ?? {}, nextConfig);
+    const metadata = { ...applyConfigToMetadata(chat.metadata ?? {}, nextConfig), chat_voice_cast_scanned: true };
     await spindle.chats.update(chat.id, { metadata }, userId);
     await sendState(userId, void 0, chat.id, frontendSessionId);
     sendFrontend({
@@ -4693,6 +4701,7 @@ spindle.onFrontendMessage(async (rawPayload, userId, frontendSessionId) => {
             return `${group.id} segments=${group.segmentIndexes.map((index) => index + 1).join(",")} identity=${identity ? `${identity.choice} confidence=${identity.confidence} probabilities=${JSON.stringify(identity.probabilities)}` : "none"} label=${label ? `${label.choice} confidence=${label.confidence} probabilities=${JSON.stringify(label.probabilities)}` : "none"} comparisons=${comparisons} voice-choice=${voice ? `${voice.choice} confidence=${voice.confidence} probabilities=${JSON.stringify(voice.probabilities)}` : "none"} final=${assignment ? `${assignment.label || "unnamed"} / ${assignment.ghostId} / ${assignment.voiceId}` : "connection default"}`;
           });
           sendFrontend({ type: "chat_voice_uncast_matches", requestId: payload.requestId, assignments, diagnostics }, userId, frontendSessionId);
+          if (assignments.length) await sendState(userId, void 0, payload.chatId, frontendSessionId);
         }
       } catch (error) {
         sendFrontend({ type: "chat_voice_uncast_matches", requestId: payload.requestId, assignments: [], error: error instanceof Error ? error.message : "Could not match uncast voices." }, userId, frontendSessionId);
@@ -4741,6 +4750,117 @@ spindle.onFrontendMessage(async (rawPayload, userId, frontendSessionId) => {
           error: error instanceof Error ? error.message : "Could not load the message."
         }, userId, frontendSessionId);
       }
+    } else if (payload?.type === "chat_voice_auto_cast") {
+      const chat = await spindle.chats.get(payload.chatId, userId);
+      if (!chat) throw new Error("The chat is no longer available.");
+      const cards = await loadCharacters(chat, userId);
+      const config = readConfig(chat.metadata ?? {}, cards.map((card) => card.id));
+      const persona = await spindle.personas.getActive(userId).catch(() => null);
+      const roles = [
+        ...payload.narratorMissing ? [{ id: "narrator", description: "Narrator: a calm, measured, clear storytelling voice suited to extended narration." }] : [],
+        ...payload.userMissing && persona?.description ? [{ id: "user", description: `User persona ${persona.name}: ${persona.description}` }] : [],
+        ...config.detectedCharacters.filter((character) => !config.characterVoices[character.id]).map((character) => ({ id: character.id, description: `Character ${character.name}. Card context: ${cards.map((card) => `${card.name}: ${card.description} ${card.personality}`).join(" ").slice(0, 12e3)}` }))
+      ];
+      const messageIds = (await spindle.chat.getMessages(chat.id)).filter((message) => !message.is_user).map((message) => message.id);
+      const activeGhosts = activeGhostVoices(readGhostVoices(chat.metadata?.chat_voice_ghost_cast), messageIds, messageIds.at(-1) ?? "", payload.ghostLifetime);
+      const voices = readFavoriteVoices(payload.voices).filter((voice) => !payload.reserved.includes(voice.id) && !Object.values(config.characterVoices).includes(voice.id) && !activeGhosts.some((ghost) => ghost.voiceId === voice.id));
+      const selected = {};
+      if (roles.length && voices.length) {
+        const questions = Object.fromEntries(roles.map((role, index) => [`role_${index}`, {
+          type: "choice",
+          instructions: `Choose the best suitable voice for ${role.description}. Use descriptions, gender when established, and choose no_match if none fits.`,
+          criteria: { no_match: "No voice is suitable.", ...Object.fromEntries(voices.map((voice, i) => [`voice_${i}`, `${voice.name || voice.id}; ${voice.category}; ${voice.description || "No description provided"}`])) }
+        }]));
+        roles.forEach((role, index) => {
+          if (role.id !== "narrator") questions[`gender_${index}`] = {
+            type: "choice",
+            instructions: `Identify the gender of ${role.description}. Choose unknown unless established.`,
+            criteria: { male: "Male.", female: "Female.", unknown: "Not established or neither male nor female." }
+          };
+        });
+        const result = await spindle.decisions.evaluate({ state: { roles, voices: voices.map((voice) => ({ ...voice })) }, questions, ...userId ? { userId } : {} });
+        const used = /* @__PURE__ */ new Set();
+        for (let index = 0; index < roles.length; index++) {
+          const answer = result.answers[`role_${index}`];
+          if (!answer || answer.type !== "choice" || answer.choice === "no_match") continue;
+          const genderAnswer = result.answers[`gender_${index}`];
+          const gender = genderAnswer?.type === "choice" && (genderAnswer.choice === "male" || genderAnswer.choice === "female") && genderAnswer.confidence >= 0.6 && (genderAnswer.probabilities[genderAnswer.choice] ?? 0) >= 0.6 ? genderAnswer.choice : "unknown";
+          const voice = selectAutomaticVoice(voices, used, answer, gender);
+          if (!voice) continue;
+          selected[roles[index].id] = voice;
+          used.add(voice);
+        }
+      }
+      const queueKey = `${userId ?? "user"}:${payload.chatId}`;
+      const previous = saveQueues.get(queueKey) ?? Promise.resolve();
+      const task = previous.catch(() => void 0).then(async () => {
+        const current = await spindle.chats.get(payload.chatId, userId);
+        if (!current) throw new Error("The chat is no longer available.");
+        const next = readConfig(current.metadata ?? {}, chatMemberIds(current));
+        const applied2 = {};
+        for (const [id, voice] of Object.entries(selected)) {
+          if (id === "narrator" && payload.narratorMissing && !next.narratorVoice) {
+            next.narratorVoice = voice;
+            next.useGlobalNarratorVoice = false;
+            applied2[id] = voice;
+          } else if (id === "user" && payload.userMissing && !next.userVoice) {
+            next.userVoice = voice;
+            next.useGlobalUserVoice = false;
+            applied2[id] = voice;
+          } else if (id !== "narrator" && id !== "user" && next.detectedCharacters.some((character) => character.id === id) && !next.characterVoices[id]) {
+            next.characterVoices[id] = voice;
+            applied2[id] = voice;
+          }
+        }
+        if (Object.keys(applied2).length) await spindle.chats.update(current.id, { metadata: applyConfigToMetadata(current.metadata ?? {}, next) }, userId);
+        return applied2;
+      });
+      const queued = task.then(() => void 0, () => void 0);
+      saveQueues.set(queueKey, queued);
+      let applied;
+      try {
+        applied = await task;
+      } finally {
+        if (saveQueues.get(queueKey) === queued) saveQueues.delete(queueKey);
+      }
+      sendFrontend({ type: "chat_voice_auto_cast_result", requestId: payload.requestId, assignments: applied }, userId, frontendSessionId);
+      if (Object.keys(applied).length) await sendState(userId, void 0, payload.chatId, frontendSessionId);
+    } else if (payload?.type === "chat_voice_ghost_edit") {
+      const queueKey = `${userId ?? "user"}:${payload.chatId}`;
+      const previous = saveQueues.get(queueKey) ?? Promise.resolve();
+      const task = previous.catch(() => void 0).then(async () => {
+        const chat = await spindle.chats.get(payload.chatId, userId);
+        if (!chat) throw new Error("The chat is no longer available.");
+        const metadata = chat.metadata ?? {};
+        const ghosts = readGhostVoices(metadata.chat_voice_ghost_cast);
+        const ghost = ghosts.find((item) => item.id === payload.ghostId);
+        if (!ghost) throw new Error("This uncast character is no longer available.");
+        let updatedMetadata = { ...metadata };
+        if (payload.promote) {
+          const name = ghost.label || (ghost.speakerId.startsWith("unconfigured:") ? ghost.speakerId.slice(13) : "");
+          if (!name) throw new Error("This character needs a recognizable name before it can be added to the cast.");
+          const config = readConfig(metadata, chatMemberIds(chat));
+          const existing = config.detectedCharacters.find((character) => speakerAliases(character.name).some((alias) => alias.toLowerCase() === name.toLowerCase()));
+          const id = existing?.id ?? `npc:${name.toLowerCase()}`;
+          if (!existing) config.detectedCharacters.push({ id, name, messageCount: 0 });
+          if (!config.characterVoices[id]) config.characterVoices[id] = ghost.voiceId;
+          config.parsedMessages = {};
+          updatedMetadata = applyConfigToMetadata(updatedMetadata, config);
+          updatedMetadata.chat_voice_ghost_cast = ghosts.filter((item) => item.id !== ghost.id);
+        } else {
+          ghost.voiceId = typeof payload.voice === "string" ? payload.voice.trim().slice(0, 512) : ghost.voiceId;
+          if (!ghost.voiceId) throw new Error("Enter a voice ID for this uncast character.");
+          updatedMetadata.chat_voice_ghost_cast = ghosts;
+        }
+        await spindle.chats.update(chat.id, { metadata: updatedMetadata }, userId);
+      });
+      saveQueues.set(queueKey, task);
+      try {
+        await task;
+      } finally {
+        if (saveQueues.get(queueKey) === task) saveQueues.delete(queueKey);
+      }
+      await sendState(userId, void 0, payload.chatId, frontendSessionId);
     } else if (payload?.type === "chat_voice_scan") {
       await queueScan(payload, userId, frontendSessionId);
     } else if (payload?.type === "chat_voice_save") {
@@ -4752,7 +4872,7 @@ spindle.onFrontendMessage(async (rawPayload, userId, frontendSessionId) => {
       type: "chat_voice_error",
       error: message,
       clientRevision: payload?.type === "chat_voice_save" ? payload.clientRevision : void 0,
-      requestId: payload?.type === "chat_voice_refresh" ? payload.requestId : void 0
+      requestId: payload?.type === "chat_voice_refresh" || payload?.type === "chat_voice_auto_cast" ? payload.requestId : void 0
     }, userId, frontendSessionId);
   }
 });

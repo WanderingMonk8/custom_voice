@@ -3,6 +3,7 @@ import type {
   SpindleTextInputHandle,
 } from 'lumiverse-spindle-types'
 import {
+  activeGhostVoices,
   adaptiveGenerationConcurrency,
   addUnconfiguredDialogueSpeakers,
   addFavoriteVoice,
@@ -36,6 +37,7 @@ import {
   UNCAST_SPEAKER_ID,
   USER_SPEAKER_ID,
   upsertSavedAudioRecord,
+  type GhostVoice,
   type PlaybackSegment,
   type FavoriteVoice,
   type UncastVoiceGroup,
@@ -201,6 +203,9 @@ interface ActiveChatState {
   useGlobalNarratorVoice: boolean
   useGlobalUserVoice: boolean
   cardCharacterIds: string[]
+  castScanned: boolean
+  ghosts: GhostVoice[]
+  assistantMessageIds: string[]
   characters: DetectedCharacterState[]
 }
 
@@ -275,6 +280,8 @@ interface TagPlacementPayload {
   error?: string
 }
 
+interface AutoCastPayload { type: 'chat_voice_auto_cast_result'; requestId: string; assignments: Record<string, string> }
+
 interface UncastMatchPayload {
   type: 'chat_voice_uncast_matches'
   diagnostics?: string[]
@@ -346,6 +353,7 @@ interface PlaybackPreferences {
   concurrentGenerations: number
   rateLimitWaitSeconds: number
   ghostVoiceLifetime: number
+  autoVoiceCasting: boolean
   speakerAssignmentDebug: boolean
   defaultNarratorVoice: string
   defaultUserVoice: string
@@ -408,6 +416,7 @@ async function loadPlaybackPreferences(): Promise<PlaybackPreferences> {
     concurrentGenerations: DEFAULT_CONCURRENT_GENERATIONS,
     rateLimitWaitSeconds: DEFAULT_RATE_LIMIT_WAIT_SECONDS,
     ghostVoiceLifetime: GHOST_VOICE_LIFETIME_MESSAGES,
+    autoVoiceCasting: true,
     speakerAssignmentDebug: false,
     defaultNarratorVoice: '',
     defaultUserVoice: '',
@@ -461,6 +470,7 @@ async function loadPlaybackPreferences(): Promise<PlaybackPreferences> {
       MAX_RATE_LIMIT_WAIT_SECONDS,
     ),
     ghostVoiceLifetime: clampIntegerSetting(row.value?.chatVoiceGhostVoiceLifetime, GHOST_VOICE_LIFETIME_MESSAGES, 1000),
+    autoVoiceCasting: row.value?.chatVoiceAutoCasting !== false,
     speakerAssignmentDebug: row.value?.chatVoiceSpeakerAssignmentDebug === true,
     defaultNarratorVoice: typeof row.value?.chatVoiceDefaultNarratorVoice === 'string'
       ? row.value.chatVoiceDefaultNarratorVoice.trim().slice(0, 512)
@@ -548,6 +558,7 @@ function saveAdvancedPlaybackPreferences(
   rateLimitWaitSeconds: number,
   speakerAssignmentDebug: boolean,
   ghostVoiceLifetime: number,
+  autoVoiceCasting: boolean,
 ): Promise<void> {
   return updateVoiceSettings(current => ({
     ...current,
@@ -567,6 +578,7 @@ function saveAdvancedPlaybackPreferences(
       MAX_RATE_LIMIT_WAIT_SECONDS,
     ),
     chatVoiceSpeakerAssignmentDebug: speakerAssignmentDebug,
+    chatVoiceAutoCasting: autoVoiceCasting,
     chatVoiceGhostVoiceLifetime: clampIntegerSetting(ghostVoiceLifetime, GHOST_VOICE_LIFETIME_MESSAGES, 1000),
   }))
 }
@@ -1249,6 +1261,14 @@ export function setup(ctx: SpindleFrontendContext) {
   const concurrentGenerationField = createField('Maximum concurrent generations')
   const rateLimitWaitField = createField('Rate-limit wait budget (seconds)')
   const ghostLifetimeField = createField('Uncast voice lifetime (assistant messages)')
+  const autoCastingLabel = document.createElement('label')
+  autoCastingLabel.className = 'chat-voice-toggle'
+  const autoCastingToggle = document.createElement('input')
+  autoCastingToggle.type = 'checkbox'
+  autoCastingToggle.checked = true
+  const autoCastingText = document.createElement('span')
+  autoCastingText.textContent = 'Automatically cast voices'
+  autoCastingLabel.append(autoCastingToggle, autoCastingText)
   const speakerDebugLabel = document.createElement('label')
   speakerDebugLabel.className = 'chat-voice-toggle'
   const speakerDebugToggle = document.createElement('input')
@@ -1277,6 +1297,7 @@ export function setup(ctx: SpindleFrontendContext) {
     concurrentGenerationField.field,
     rateLimitWaitField.field,
     ghostLifetimeField.field,
+    autoCastingLabel,
     speakerDebugLabel,
     speakerDebugOutput,
     advancedHint,
@@ -1329,6 +1350,7 @@ export function setup(ctx: SpindleFrontendContext) {
   let playbackBufferSegments = DEFAULT_PLAYBACK_BUFFER_SEGMENTS
   let concurrentGenerationLimit = DEFAULT_CONCURRENT_GENERATIONS
   let rateLimitWaitSeconds = DEFAULT_RATE_LIMIT_WAIT_SECONDS
+  let autoVoiceCasting = true
   let ghostVoiceLifetime = GHOST_VOICE_LIFETIME_MESSAGES
   let speakerAssignmentDebug = false
   let advancedSettingsSaveTimer: ReturnType<typeof setTimeout> | null = null
@@ -1765,6 +1787,7 @@ export function setup(ctx: SpindleFrontendContext) {
   concurrentGenerationInput.addEventListener('change', onConcurrentGenerationInput)
   rateLimitWaitInput.addEventListener('change', onRateLimitWaitInput)
   speakerDebugToggle.addEventListener('change', onSpeakerDebugChanged)
+  autoCastingToggle.addEventListener('change', () => { autoVoiceCasting = autoCastingToggle.checked; scheduleAdvancedSettingsSave() })
 
   const addNpcInput = ctx.components.mountTextInput(addNpcInputSlot, {
     value: '', placeholder: 'NPC name / aliases', ariaLabel: 'NPC name and aliases to add', disabled: true,
@@ -1946,6 +1969,16 @@ export function setup(ctx: SpindleFrontendContext) {
         ghostVoiceLifetime: preferences.ghostVoiceLifetime,
         debug: preferences.speakerAssignmentDebug,
       })
+    })
+  }
+
+  const pendingAutoCast = new Map<string, { resolve: (assignments: Record<string, string>) => void; timer: ReturnType<typeof setTimeout> }>()
+  function requestAutoCast(chatId: string, voices: FavoriteVoice[], reserved: string[], narratorMissing: boolean, userMissing: boolean): Promise<Record<string, string>> {
+    const requestId = `auto-${Date.now().toString(36)}-${++uncastRequestSequence}`
+    return new Promise(resolve => {
+      const timer = setTimeout(() => { pendingAutoCast.delete(requestId); resolve({}) }, 35_000)
+      pendingAutoCast.set(requestId, { resolve, timer })
+      ctx.sendToBackend({ type: 'chat_voice_auto_cast', requestId, chatId, voices, reserved, narratorMissing, userMissing, ghostLifetime: ghostVoiceLifetime })
     })
   }
 
@@ -2653,6 +2686,7 @@ export function setup(ctx: SpindleFrontendContext) {
       preferences.concurrentGenerations = concurrentGenerationLimit
       preferences.rateLimitWaitSeconds = rateLimitWaitSeconds
       preferences.ghostVoiceLifetime = ghostVoiceLifetime
+      preferences.autoVoiceCasting = autoVoiceCasting
       preferences.speakerAssignmentDebug = speakerAssignmentDebug
     } else {
       playbackBufferSegments = preferences.playbackBufferSegments
@@ -2675,6 +2709,14 @@ export function setup(ctx: SpindleFrontendContext) {
     const connectionProfileVoice = (
       connections.find(connection => connection.id === connectionId)?.voice ?? ''
     ).trim()
+    if (preferences.autoVoiceCasting && favoriteVoices.length && (!config.narratorVoice || !config.userVoice || playbackChat.characters.some(character => !config.characterVoices[character.id]))) {
+      flushSave()
+      const assigned = await requestAutoCast(playbackChat.id, favoriteVoices, [connectionProfileVoice, config.narratorVoice, config.userVoice, ...Object.values(config.characterVoices)].filter(Boolean), !config.narratorVoice, !config.userVoice)
+      if (ctx.getActiveChat().chatId !== playbackChat.id) return
+      if (assigned.narrator && !config.narratorVoice) config.narratorVoice = assigned.narrator
+      if (assigned.user && !config.userVoice) config.userVoice = assigned.user
+      for (const [id, voice] of Object.entries(assigned)) if (id !== 'narrator' && id !== 'user' && !config.characterVoices[id]) config.characterVoices[id] = voice
+    }
     if (preferences.speakerAssignmentDebug) {
       const profile = connections.find(connection => connection.id === connectionId)
       appendSpeakerDebugLog(
@@ -2790,7 +2832,7 @@ export function setup(ctx: SpindleFrontendContext) {
         ...Object.values(config.characterVoices), config.narratorVoice, config.userVoice, connectionProfileVoice,
       ]
       const uncastVoices = availableUncastVoices(favoriteVoices, reservedVoices)
-      const uncastMatchPromise = uncastGroups.length
+      const uncastMatchPromise = preferences.autoVoiceCasting && uncastGroups.length
         ? requestUncastVoiceMatches(
             playbackChat.id, messageId, preparePlaybackContent(message.content, preferences.skippedTrackerTags),
             uncastGroups, uncastVoices, reservedVoices, preferences.ghostVoiceLifetime,
@@ -3556,7 +3598,7 @@ export function setup(ctx: SpindleFrontendContext) {
     const character = activeChat.characters.find(item => item.id === characterId)
     if (!character) return null
     const response = hostWindow.prompt(
-      'Rename this character or add aliases separated by “/”.',
+      'Rename this character or add aliases separated by â€œ/â€.',
       character.name,
     )
     if (response === null) return null
@@ -3823,7 +3865,8 @@ export function setup(ctx: SpindleFrontendContext) {
     favoritePickers.add(narratorFavoritePicker)
     favoritePickers.add(userFavoritePicker)
     characterList.replaceChildren()
-    if (characters.length === 0) {
+    const ghosts = activeChat ? activeGhostVoices(activeChat.ghosts ?? [], activeChat.assistantMessageIds ?? [], activeChat.assistantMessageIds?.at(-1) ?? '', ghostVoiceLifetime) : []
+    if (characters.length === 0 && ghosts.length === 0) {
       const empty = document.createElement('div')
       empty.className = 'chat-voice-empty'
       empty.textContent = 'No saved characters yet. Click Scan to read the active character card.'
@@ -3933,6 +3976,50 @@ export function setup(ctx: SpindleFrontendContext) {
       })
       favoritePickers.add(picker)
     }
+    for (const ghost of ghosts) {
+      const card = document.createElement('div')
+      card.className = 'chat-voice-character'
+      card.style.borderStyle = 'dashed'
+      const heading = document.createElement('div')
+      heading.className = 'chat-voice-character-heading'
+      const name = document.createElement('button')
+      name.type = 'button'
+      name.className = 'chat-voice-character-name'
+      name.style.background = 'transparent'
+      name.style.border = '0'
+      name.style.color = 'inherit'
+      name.textContent = ghost.label || (ghost.speakerId.startsWith('unconfigured:') ? ghost.speakerId.slice(13) : 'Unnamed character')
+      name.title = 'Double-click to add to the regular cast'
+      name.addEventListener('dblclick', () => {
+        if (!activeChat) return
+        flushSave()
+        ctx.sendToBackend({ type: 'chat_voice_ghost_edit', chatId: activeChat.id, ghostId: ghost.id, promote: true })
+      })
+      const badge = document.createElement('span')
+      badge.className = 'chat-voice-character-count'
+      badge.textContent = 'Temporary cast'
+      heading.append(name, badge)
+      const voice = document.createElement('input')
+      voice.className = 'chat-voice-favorite-select'
+      voice.value = ghost.voiceId
+      voice.title = favoriteVoices.find(item => item.id === ghost.voiceId)?.name || ghost.voiceId
+      const selectedName = document.createElement('div')
+      selectedName.className = 'chat-voice-hint'
+      selectedName.textContent = favoriteVoices.find(item => item.id === ghost.voiceId)?.name || ghost.voiceId
+      voice.setAttribute('aria-label', `Voice ID for ${name.textContent}`)
+      voice.addEventListener('change', () => {
+        if (activeChat && voice.value.trim()) ctx.sendToBackend({ type: 'chat_voice_ghost_edit', chatId: activeChat.id, ghostId: ghost.id, voice: voice.value })
+      })
+      const picker = document.createElement('select')
+      picker.className = 'chat-voice-favorite-select'
+      picker.setAttribute('aria-label', `Favorite voice for ${name.textContent}`)
+      picker.addEventListener('change', () => {
+        if (activeChat && picker.value) ctx.sendToBackend({ type: 'chat_voice_ghost_edit', chatId: activeChat.id, ghostId: ghost.id, voice: picker.value })
+      })
+      favoritePickers.add(picker)
+      card.append(heading, selectedName, voice, picker)
+      characterList.appendChild(card)
+    }
     updateFavoritePickers()
   }
 
@@ -3976,6 +4063,7 @@ export function setup(ctx: SpindleFrontendContext) {
     updateRoleVoiceDisplays()
     updateRoleDefaultControls()
     applyingState = false
+    if (next && !next.castScanned && !scanning) scanMessages()
     if (!next) setStatus('Open a chat to edit its voices.')
     else if (connections.length === 0) setStatus('Create a TTS connection in Lumiverse first.')
     else setStatus('All changes save automatically.', 'saved')
@@ -4061,6 +4149,8 @@ export function setup(ctx: SpindleFrontendContext) {
         concurrentGenerationLimit = preferences.concurrentGenerations
         rateLimitWaitSeconds = preferences.rateLimitWaitSeconds
         ghostVoiceLifetime = preferences.ghostVoiceLifetime
+        autoVoiceCasting = preferences.autoVoiceCasting
+        autoCastingToggle.checked = autoVoiceCasting
         speakerAssignmentDebug = preferences.speakerAssignmentDebug
         playbackBufferInput.value = String(playbackBufferSegments)
         concurrentGenerationInput.value = String(concurrentGenerationLimit)
@@ -4206,6 +4296,7 @@ export function setup(ctx: SpindleFrontendContext) {
         rateLimitWaitSeconds,
         speakerAssignmentDebug,
         ghostVoiceLifetime,
+        autoVoiceCasting,
       )
       setStatus('Advanced playback settings saved globally.', 'saved')
     } catch (error) {
@@ -4393,6 +4484,12 @@ export function setup(ctx: SpindleFrontendContext) {
       | LlmConnectionsPayload
       | TagPlacementPayload
       | UncastMatchPayload
+      | AutoCastPayload
+    if (payload.type === 'chat_voice_auto_cast_result') {
+      const pending = pendingAutoCast.get(payload.requestId)
+      if (pending) { clearTimeout(pending.timer); pendingAutoCast.delete(payload.requestId); pending.resolve(payload.assignments) }
+      return
+    }
     if (payload.type === 'chat_voice_uncast_matches') {
       const pending = pendingUncastRequests.get(payload.requestId)
       if (!pending) return
@@ -4457,6 +4554,10 @@ export function setup(ctx: SpindleFrontendContext) {
       return
     }
     if (payload.type === 'chat_voice_error') {
+      if (payload.requestId && pendingAutoCast.has(payload.requestId)) {
+        const pending = pendingAutoCast.get(payload.requestId)!
+        clearTimeout(pending.timer); pendingAutoCast.delete(payload.requestId); pending.resolve({})
+      }
       if (payload.requestId) {
         const pending = pendingStateRequests.get(payload.requestId)
         if (pending) {
@@ -4597,6 +4698,10 @@ export function setup(ctx: SpindleFrontendContext) {
     })
   })
 
+  const unsubscribeMessageRendered = ctx.events.on('CHARACTER_MESSAGE_RENDERED', () => {
+    if (activeChat?.id === ctx.getActiveChat().chatId) refreshLocalState()
+  })
+
   const unsubscribeActivate = tab.onActivate(() => {
     void loadConnections()
     void ensureQuotationRouting().catch(() => undefined)
@@ -4617,6 +4722,7 @@ export function setup(ctx: SpindleFrontendContext) {
     if (saveTimer) clearTimeout(saveTimer)
     unsubscribeActivate()
     unsubscribeChatSwitched()
+    unsubscribeMessageRendered()
     unsubscribeBackend()
     for (const input of characterInputs.values()) input.destroy()
     for (const pending of pendingMessageRequests.values()) {
@@ -4634,6 +4740,8 @@ export function setup(ctx: SpindleFrontendContext) {
       pending.reject(new Error('Chat Voice was closed.'))
     }
     pendingUncastRequests.clear()
+    for (const pending of pendingAutoCast.values()) { clearTimeout(pending.timer); pending.resolve({}) }
+    pendingAutoCast.clear()
     for (const pending of pendingDecisionStatusRequests.values()) {
       clearTimeout(pending.timer)
       pending.reject(new Error('Chat Voice was closed.'))
@@ -4684,6 +4792,7 @@ export function setup(ctx: SpindleFrontendContext) {
         rateLimitWaitSeconds,
         speakerAssignmentDebug,
         ghostVoiceLifetime,
+        autoVoiceCasting,
       )
     }
     skippedTrackerTagsInput.destroy()

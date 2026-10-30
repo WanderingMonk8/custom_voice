@@ -17,6 +17,7 @@ import {
   buildTtsTagPlan,
   bufferAwareGenerationConcurrency,
   availableUncastVoices,
+  selectAutomaticVoice,
   activeGhostVoices,
   collectUncastVoiceGroups,
   buildUncastVoiceDecision,
@@ -2100,6 +2101,14 @@ test('reviews uncast turns separately when a long narrative may introduce someon
     { speakerId: UNCAST_SPEAKER_ID, text: 'The clerk speaks.' },
   ])
   assert.deepEqual(groups.map(group => group.segmentIndexes), [[0], [2]])
+})
+
+test('automatic casting respects reserved voices, gender, and no match', () => {
+  const voices = readFavoriteVoices([{ id: 'used', category: 'male' }, { id: 'female', category: 'female' }, { id: 'male', category: 'male' }])
+  const answer = { choice: 'voice_0', confidence: 0.9, probabilities: { voice_0: 0.8, voice_1: 0.15, voice_2: 0.05, no_match: 0 } }
+  assert.equal(selectAutomaticVoice(voices, new Set(['used']), answer, 'male'), 'male')
+  assert.equal(selectAutomaticVoice(voices, new Set(['used']), answer, 'female'), 'female')
+  assert.equal(selectAutomaticVoice(voices, new Set(), { ...answer, choice: 'no_match' }, 'unknown'), '')
 })
 
 test('defaults and clamps the global saved audio limit', () => {

@@ -103,6 +103,14 @@ export function collectUncastVoiceGroups(segments: PlaybackSegment[]): UncastVoi
   return groups
 }
 
+/** Select a suitable unused favorite from Jev's ranking, respecting known gender. */
+export function selectAutomaticVoice(voices: FavoriteVoice[], used: ReadonlySet<string>, answer: SpeakerDecisionChoice, gender: string): string {
+  if (answer.choice === 'no_match') return ''
+  return voices.map((voice, index) => ({ voice, probability: answer.probabilities[`voice_${index}`] ?? 0 }))
+    .filter(item => !used.has(item.voice.id) && item.probability > 0 && (gender === 'unknown' || item.voice.category === 'unspecified' || item.voice.category === gender))
+    .sort((a, b) => b.probability - a.probability)[0]?.voice.id ?? ''
+}
+
 /** Only unassigned favorites may be used; unspecified categories remain eligible. */
 export function availableUncastVoices(favorites: FavoriteVoice[], used: readonly string[]): FavoriteVoice[] {
   const reserved = new Set(used.map(voice => voice.trim()).filter(Boolean))
