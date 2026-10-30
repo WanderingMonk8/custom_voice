@@ -4864,6 +4864,7 @@ spindle.onFrontendMessage(async (rawPayload, userId, frontendSessionId) => {
       const activeGhosts = activeGhostVoices(readGhostVoices(chat.metadata?.chat_voice_ghost_cast), messageIds, messageIds.at(-1) ?? "", payload.ghostLifetime);
       const voices = readFavoriteVoices(payload.voices).filter((voice) => !payload.reserved.includes(voice.id) && !Object.values(config.characterVoices).includes(voice.id) && !activeGhosts.some((ghost) => ghost.voiceId === voice.id));
       const selected = {};
+      const diagnostics = [`roles=${roles.length}, favorites=${payload.voices.length}, available=${voices.length}, activeGhosts=${activeGhosts.length}`];
       if (roles.length && voices.length) {
         const questions = Object.fromEntries(roles.map((role, index) => [`role_${index}`, {
           type: "choice",
@@ -4881,10 +4882,10 @@ spindle.onFrontendMessage(async (rawPayload, userId, frontendSessionId) => {
         const used = /* @__PURE__ */ new Set();
         for (let index = 0; index < roles.length; index++) {
           const answer = result.answers[`role_${index}`];
-          if (!answer || answer.type !== "choice" || answer.choice === "no_match") continue;
           const genderAnswer = result.answers[`gender_${index}`];
           const gender = genderAnswer?.type === "choice" && (genderAnswer.choice === "male" || genderAnswer.choice === "female") && genderAnswer.confidence >= 0.6 && (genderAnswer.probabilities[genderAnswer.choice] ?? 0) >= 0.6 ? genderAnswer.choice : "unknown";
-          const voice = selectAutomaticVoice(voices, used, answer, gender);
+          const voice = answer?.type === "choice" ? selectAutomaticVoice(voices, used, answer, gender) : "";
+          diagnostics.push(`${roles[index].id}: decision=${answer?.type === "choice" ? answer.choice : "missing"}, confidence=${answer?.type === "choice" ? answer.confidence : "n/a"}, gender=${gender}, selected=${voice || "none"}, probabilities=${answer?.type === "choice" ? JSON.stringify(answer.probabilities) : "{}"}, choices=${JSON.stringify(voices.map((item, i) => ({ option: `voice_${i}`, id: item.id, category: item.category })))}`);
           if (!voice) continue;
           selected[roles[index].id] = voice;
           used.add(voice);
@@ -4928,7 +4929,8 @@ spindle.onFrontendMessage(async (rawPayload, userId, frontendSessionId) => {
       } finally {
         if (saveQueues.get(queueKey) === queued) saveQueues.delete(queueKey);
       }
-      sendFrontend({ type: "chat_voice_auto_cast_result", requestId: payload.requestId, assignments: applied }, userId, frontendSessionId);
+      for (const [id, voice] of Object.entries(selected)) diagnostics.push(`${id}: proposed=${voice}, final=${applied[id] || "not applied (voice claimed or setting changed)"}`);
+      sendFrontend({ type: "chat_voice_auto_cast_result", requestId: payload.requestId, assignments: applied, diagnostics }, userId, frontendSessionId);
       if (Object.keys(applied).length) await sendState(userId, void 0, payload.chatId, frontendSessionId);
     } else if (payload?.type === "chat_voice_ghost_edit") {
       const queueKey = `${userId ?? "user"}:${payload.chatId}`;

@@ -3022,7 +3022,7 @@ function setup(ctx) {
     return new Promise((resolve) => {
       const timer = setTimeout(() => {
         pendingAutoCast.delete(requestId);
-        resolve({});
+        resolve({ assignments: {}, diagnostics: ["Automatic casting timed out."] });
       }, 35e3);
       pendingAutoCast.set(requestId, { resolve, timer });
       ctx.sendToBackend({ type: "chat_voice_auto_cast", requestId, chatId, voices, reserved, narratorMissing, userMissing, ghostLifetime: ghostVoiceLifetime });
@@ -3566,10 +3566,13 @@ function setup(ctx) {
       return;
     }
     const connectionProfileVoice = (connections.find((connection) => connection.id === connectionId)?.voice ?? "").trim();
+    let autoCastDiagnostics = [];
     if (preferences.autoVoiceCasting && favoriteVoices.length && (!config.narratorVoice || !config.userVoice || playbackChat.characters.some((character) => !config.characterVoices[character.id]))) {
       flushSave();
-      const assigned = await requestAutoCast(playbackChat.id, favoriteVoices, [connectionProfileVoice, config.narratorVoice, config.userVoice, ...Object.values(config.characterVoices)].filter(Boolean), !config.narratorVoice, !config.userVoice);
+      const autoResult = await requestAutoCast(playbackChat.id, favoriteVoices, [connectionProfileVoice, config.narratorVoice, config.userVoice, ...Object.values(config.characterVoices)].filter(Boolean), !config.narratorVoice, !config.userVoice);
       if (ctx.getActiveChat().chatId !== playbackChat.id) return;
+      const assigned = autoResult.assignments;
+      autoCastDiagnostics = autoResult.diagnostics;
       if (assigned.narrator && !config.narratorVoice) config.narratorVoice = assigned.narrator;
       if (assigned.user && !config.userVoice) config.userVoice = assigned.user;
       for (const [id, voice] of Object.entries(assigned)) if (id !== "narrator" && id !== "user" && !config.characterVoices[id]) config.characterVoices[id] = voice;
@@ -3669,6 +3672,7 @@ function setup(ctx) {
         preferences.speakerParsingMode,
         review
       );
+      for (const line of autoCastDiagnostics) appendSpeakerDebugLog(`Automatic casting: ${line}`);
       const matchingSegments = segments.map((segment) => ({
         ...segment,
         speakerId: segment.speakerId ? aliases.get(segment.speakerId) ?? segment.speakerId : null
@@ -5213,7 +5217,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
       if (pending) {
         clearTimeout(pending.timer);
         pendingAutoCast.delete(payload.requestId);
-        pending.resolve(payload.assignments);
+        pending.resolve({ assignments: payload.assignments, diagnostics: payload.diagnostics ?? [] });
       }
       return;
     }
@@ -5285,7 +5289,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
         const pending = pendingAutoCast.get(payload.requestId);
         clearTimeout(pending.timer);
         pendingAutoCast.delete(payload.requestId);
-        pending.resolve({});
+        pending.resolve({ assignments: {}, diagnostics: [`Automatic casting failed: ${payload.error}`] });
       }
       if (payload.requestId) {
         const pending = pendingStateRequests.get(payload.requestId);
@@ -5460,7 +5464,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
     pendingUncastRequests.clear();
     for (const pending of pendingAutoCast.values()) {
       clearTimeout(pending.timer);
-      pending.resolve({});
+      pending.resolve({ assignments: {}, diagnostics: [] });
     }
     pendingAutoCast.clear();
     for (const pending of pendingDecisionStatusRequests.values()) {

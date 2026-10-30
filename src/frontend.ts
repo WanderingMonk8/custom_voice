@@ -280,7 +280,7 @@ interface TagPlacementPayload {
   error?: string
 }
 
-interface AutoCastPayload { type: 'chat_voice_auto_cast_result'; requestId: string; assignments: Record<string, string> }
+interface AutoCastPayload { type: 'chat_voice_auto_cast_result'; requestId: string; assignments: Record<string, string>; diagnostics?: string[] }
 
 interface UncastMatchPayload {
   type: 'chat_voice_uncast_matches'
@@ -1974,11 +1974,11 @@ export function setup(ctx: SpindleFrontendContext) {
     })
   }
 
-  const pendingAutoCast = new Map<string, { resolve: (assignments: Record<string, string>) => void; timer: ReturnType<typeof setTimeout> }>()
-  function requestAutoCast(chatId: string, voices: FavoriteVoice[], reserved: string[], narratorMissing: boolean, userMissing: boolean): Promise<Record<string, string>> {
+  const pendingAutoCast = new Map<string, { resolve: (result: { assignments: Record<string, string>; diagnostics: string[] }) => void; timer: ReturnType<typeof setTimeout> }>()
+  function requestAutoCast(chatId: string, voices: FavoriteVoice[], reserved: string[], narratorMissing: boolean, userMissing: boolean): Promise<{ assignments: Record<string, string>; diagnostics: string[] }> {
     const requestId = `auto-${Date.now().toString(36)}-${++uncastRequestSequence}`
     return new Promise(resolve => {
-      const timer = setTimeout(() => { pendingAutoCast.delete(requestId); resolve({}) }, 35_000)
+      const timer = setTimeout(() => { pendingAutoCast.delete(requestId); resolve({ assignments: {}, diagnostics: ['Automatic casting timed out.'] }) }, 35_000)
       pendingAutoCast.set(requestId, { resolve, timer })
       ctx.sendToBackend({ type: 'chat_voice_auto_cast', requestId, chatId, voices, reserved, narratorMissing, userMissing, ghostLifetime: ghostVoiceLifetime })
     })
@@ -2711,10 +2711,13 @@ export function setup(ctx: SpindleFrontendContext) {
     const connectionProfileVoice = (
       connections.find(connection => connection.id === connectionId)?.voice ?? ''
     ).trim()
+    let autoCastDiagnostics: string[] = []
     if (preferences.autoVoiceCasting && favoriteVoices.length && (!config.narratorVoice || !config.userVoice || playbackChat.characters.some(character => !config.characterVoices[character.id]))) {
       flushSave()
-      const assigned = await requestAutoCast(playbackChat.id, favoriteVoices, [connectionProfileVoice, config.narratorVoice, config.userVoice, ...Object.values(config.characterVoices)].filter(Boolean), !config.narratorVoice, !config.userVoice)
+      const autoResult = await requestAutoCast(playbackChat.id, favoriteVoices, [connectionProfileVoice, config.narratorVoice, config.userVoice, ...Object.values(config.characterVoices)].filter(Boolean), !config.narratorVoice, !config.userVoice)
       if (ctx.getActiveChat().chatId !== playbackChat.id) return
+      const assigned = autoResult.assignments
+      autoCastDiagnostics = autoResult.diagnostics
       if (assigned.narrator && !config.narratorVoice) config.narratorVoice = assigned.narrator
       if (assigned.user && !config.userVoice) config.userVoice = assigned.user
       for (const [id, voice] of Object.entries(assigned)) if (id !== 'narrator' && id !== 'user' && !config.characterVoices[id]) config.characterVoices[id] = voice
@@ -2825,6 +2828,7 @@ export function setup(ctx: SpindleFrontendContext) {
         preferences.speakerParsingMode,
         review,
       )
+      for (const line of autoCastDiagnostics) appendSpeakerDebugLog(`Automatic casting: ${line}`)
       const matchingSegments = segments.map(segment => ({
         ...segment,
         speakerId: segment.speakerId ? aliases.get(segment.speakerId) ?? segment.speakerId : null,
@@ -4547,7 +4551,7 @@ export function setup(ctx: SpindleFrontendContext) {
       | AutoCastPayload
     if (payload.type === 'chat_voice_auto_cast_result') {
       const pending = pendingAutoCast.get(payload.requestId)
-      if (pending) { clearTimeout(pending.timer); pendingAutoCast.delete(payload.requestId); pending.resolve(payload.assignments) }
+      if (pending) { clearTimeout(pending.timer); pendingAutoCast.delete(payload.requestId); pending.resolve({ assignments: payload.assignments, diagnostics: payload.diagnostics ?? [] }) }
       return
     }
     if (payload.type === 'chat_voice_uncast_matches') {
@@ -4616,7 +4620,7 @@ export function setup(ctx: SpindleFrontendContext) {
     if (payload.type === 'chat_voice_error') {
       if (payload.requestId && pendingAutoCast.has(payload.requestId)) {
         const pending = pendingAutoCast.get(payload.requestId)!
-        clearTimeout(pending.timer); pendingAutoCast.delete(payload.requestId); pending.resolve({})
+        clearTimeout(pending.timer); pendingAutoCast.delete(payload.requestId); pending.resolve({ assignments: {}, diagnostics: [`Automatic casting failed: ${payload.error}`] })
       }
       if (payload.requestId) {
         const pending = pendingStateRequests.get(payload.requestId)
@@ -4801,7 +4805,7 @@ export function setup(ctx: SpindleFrontendContext) {
       pending.reject(new Error('Chat Voice was closed.'))
     }
     pendingUncastRequests.clear()
-    for (const pending of pendingAutoCast.values()) { clearTimeout(pending.timer); pending.resolve({}) }
+    for (const pending of pendingAutoCast.values()) { clearTimeout(pending.timer); pending.resolve({ assignments: {}, diagnostics: [] }) }
     pendingAutoCast.clear()
     for (const pending of pendingDecisionStatusRequests.values()) {
       clearTimeout(pending.timer)
