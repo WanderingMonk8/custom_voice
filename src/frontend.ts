@@ -404,7 +404,7 @@ async function loadPlaybackPreferences(): Promise<PlaybackPreferences> {
     speed: 1,
     volume: 1,
     connectionId: '',
-    saveGeneratedAudio: false,
+    saveGeneratedAudio: true,
     savedAudioLimit: DEFAULT_SAVED_AUDIO_LIMIT,
     skippedTrackerTags: '',
     speakerParsingMode: 'ambiguous',
@@ -440,7 +440,7 @@ async function loadPlaybackPreferences(): Promise<PlaybackPreferences> {
     connectionId: typeof row.value?.ttsConnectionId === 'string'
       ? row.value.ttsConnectionId.trim()
       : '',
-    saveGeneratedAudio: row.value?.chatVoiceSaveGeneratedAudio === true,
+    saveGeneratedAudio: row.value?.chatVoiceSaveGeneratedAudio !== false,
     savedAudioLimit: clampSavedAudioLimit(row.value?.chatVoiceSavedAudioLimit),
     skippedTrackerTags: typeof row.value?.chatVoiceSkippedTrackerTags === 'string'
       ? row.value.chatVoiceSkippedTrackerTags.slice(0, 4_000)
@@ -1074,7 +1074,7 @@ export function setup(ctx: SpindleFrontendContext) {
   saveAudioLabel.className = 'chat-voice-toggle'
   const saveAudioToggle = document.createElement('input')
   saveAudioToggle.type = 'checkbox'
-  saveAudioToggle.checked = false
+  saveAudioToggle.checked = true
   saveAudioToggle.setAttribute('aria-label', 'Save generated audio to messages')
   const saveAudioCopy = document.createElement('span')
   saveAudioCopy.className = 'chat-voice-toggle-copy'
@@ -1237,7 +1237,6 @@ export function setup(ctx: SpindleFrontendContext) {
   panel.append(
     context,
     connectionField.field,
-    saveAudioField.field,
     scanField.field,
     skippedTagsField.field,
     speakerParsingField.field,
@@ -1294,6 +1293,7 @@ export function setup(ctx: SpindleFrontendContext) {
   advancedHint.className = 'chat-voice-hint'
   advancedHint.textContent = 'Concurrency starts at one and adapts up to the selected maximum. Dense short-segment runs stay at one request at a time, while sustained long runs increase gradually. Larger buffers reduce pauses but delay playback. The wait budget controls cumulative rate-limit cooldowns.'
   advancedBody.append(
+    saveAudioField.field,
     playbackBufferField.field,
     concurrentGenerationField.field,
     rateLimitWaitField.field,
@@ -1324,7 +1324,7 @@ export function setup(ctx: SpindleFrontendContext) {
   let userGlobalSaveTimer: ReturnType<typeof setTimeout> | null = null
   let savingNarratorGlobalVoice = false
   let savingUserGlobalVoice = false
-  let saveGeneratedAudio = false
+  let saveGeneratedAudio = true
   let savedAudioLimit = DEFAULT_SAVED_AUDIO_LIMIT
   let savingAudioPreference = false
   let savingAudioLimit = false
