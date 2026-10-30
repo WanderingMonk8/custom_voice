@@ -46,7 +46,7 @@ export function addFavoriteVoice(existing: FavoriteVoice[], voice: FavoriteVoice
 }
 
 export interface UncastVoiceGroup { id: string; speakerId: string; segmentIndexes: number[]; speeches: string[]; context: string[] }
-export interface GhostVoice { id: string; speakerId: string; voiceId: string; context: string; occurrenceKeys: string[]; lastSeenMessageId: string; label?: string }
+export interface GhostVoice { id: string; speakerId: string; voiceId: string; context: string; occurrenceKeys: string[]; lastSeenMessageId: string; label?: string; createdAtMessageId?: string }
 export const GHOST_VOICE_LIFETIME_MESSAGES = 10
 
 export function readGhostVoices(value: unknown): GhostVoice[] {
@@ -59,7 +59,8 @@ export function readGhostVoices(value: unknown): GhostVoice[] {
       label: typeof row.label === 'string' ? row.label.trim().slice(0, 100) : '',
       context: typeof row.context === 'string' ? row.context.slice(0, 2_000) : '',
       occurrenceKeys: Array.isArray(row.occurrenceKeys) ? row.occurrenceKeys.filter((key): key is string => typeof key === 'string').slice(-100) : [],
-      lastSeenMessageId: typeof row.lastSeenMessageId === 'string' ? row.lastSeenMessageId : '' }]
+      lastSeenMessageId: typeof row.lastSeenMessageId === 'string' ? row.lastSeenMessageId : '',
+      ...(typeof row.createdAtMessageId === 'string' && row.createdAtMessageId ? { createdAtMessageId: row.createdAtMessageId } : {}) }]
   })
 }
 
@@ -70,7 +71,9 @@ export function activeGhostVoices(ghosts: GhostVoice[], assistantMessageIds: rea
   return ghosts.filter(ghost => {
     if (ghost.occurrenceKeys.some(key => key.startsWith(`${targetId}:`))) return true
     const lastSeen = ghost.lastSeenMessageId ? assistantMessageIds.indexOf(ghost.lastSeenMessageId) : -1
-    return (lastSeen >= 0 || !ghost.lastSeenMessageId) && lastSeen <= target && target - lastSeen <= Math.max(1, lifetime)
+    const createdAt = ghost.createdAtMessageId ? assistantMessageIds.indexOf(ghost.createdAtMessageId) : -1
+    const activeSince = createdAt >= 0 && createdAt <= target ? Math.max(lastSeen, createdAt) : lastSeen
+    return (activeSince >= 0 || !ghost.lastSeenMessageId) && activeSince <= target && target - activeSince <= Math.max(1, lifetime)
   })
 }
 

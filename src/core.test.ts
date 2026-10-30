@@ -2152,6 +2152,16 @@ test('regeneration ranks only voices available against both historical and curre
   assert.equal(fresh[0]?.ghostId, 'pending:g0')
 })
 
+test('new ghosts from older regenerated messages appear until their creation lifetime expires', () => {
+  const ids = Array.from({ length: 25 }, (_, index) => `assistant-${index}`)
+  const ghost = { id: 'new', speakerId: UNCAST_SPEAKER_ID, voiceId: 'voice', context: '', occurrenceKeys: [`${ids[0]}:speech`], lastSeenMessageId: ids[0], createdAtMessageId: ids[12] }
+  assert.equal(activeGhostVoices([ghost], ids, ids[12], 10).length, 1)
+  assert.equal(activeGhostVoices([ghost], ids, ids[22], 10).length, 1)
+  assert.equal(activeGhostVoices([ghost], ids, ids[23], 10).length, 0)
+  assert.equal(activeGhostVoices([ghost], ids, ids[0], 10).length, 1)
+  assert.equal(activeGhostVoices([ghost], ids, ids[11], 10).length, 0)
+})
+
 test('defaults and clamps the global saved audio limit', () => {
   assert.equal(clampSavedAudioLimit(undefined), 50)
   assert.equal(clampSavedAudioLimit(0), 1)

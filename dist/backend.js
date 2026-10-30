@@ -39,7 +39,8 @@ function readGhostVoices(value) {
       label: typeof row.label === "string" ? row.label.trim().slice(0, 100) : "",
       context: typeof row.context === "string" ? row.context.slice(0, 2e3) : "",
       occurrenceKeys: Array.isArray(row.occurrenceKeys) ? row.occurrenceKeys.filter((key) => typeof key === "string").slice(-100) : [],
-      lastSeenMessageId: typeof row.lastSeenMessageId === "string" ? row.lastSeenMessageId : ""
+      lastSeenMessageId: typeof row.lastSeenMessageId === "string" ? row.lastSeenMessageId : "",
+      ...typeof row.createdAtMessageId === "string" && row.createdAtMessageId ? { createdAtMessageId: row.createdAtMessageId } : {}
     }];
   });
 }
@@ -49,7 +50,9 @@ function activeGhostVoices(ghosts, assistantMessageIds, targetId, lifetime = GHO
   return ghosts.filter((ghost) => {
     if (ghost.occurrenceKeys.some((key) => key.startsWith(`${targetId}:`))) return true;
     const lastSeen = ghost.lastSeenMessageId ? assistantMessageIds.indexOf(ghost.lastSeenMessageId) : -1;
-    return (lastSeen >= 0 || !ghost.lastSeenMessageId) && lastSeen <= target && target - lastSeen <= Math.max(1, lifetime);
+    const createdAt = ghost.createdAtMessageId ? assistantMessageIds.indexOf(ghost.createdAtMessageId) : -1;
+    const activeSince = createdAt >= 0 && createdAt <= target ? Math.max(lastSeen, createdAt) : lastSeen;
+    return (activeSince >= 0 || !ghost.lastSeenMessageId) && activeSince <= target && target - activeSince <= Math.max(1, lifetime);
   });
 }
 function canReserveAutomaticVoice(voiceId, reserved, ghosts, existingGhostId = "") {
@@ -4260,7 +4263,7 @@ async function saveGhostVoiceAssignments(chatId, messageId, assistantIds, groups
       const voiceId = ghost?.voiceId ?? assignment.voiceId;
       if (!canReserveAutomaticVoice(voiceId, unavailable, ghost ? activeGhosts.filter((item) => item.id === ghostId) : activeGhosts, ghostId)) continue;
       if (!ghost) {
-        ghost = { id: ghostId, speakerId: group.speakerId, voiceId, context: "", occurrenceKeys: [], lastSeenMessageId: anchorId };
+        ghost = { id: ghostId, speakerId: group.speakerId, voiceId, context: "", occurrenceKeys: [], lastSeenMessageId: anchorId, createdAtMessageId: currentAssistantIds.at(-1) ?? anchorId };
         ghosts.push(ghost);
         activeGhosts.push(ghost);
       }

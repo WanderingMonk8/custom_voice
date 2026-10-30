@@ -864,7 +864,7 @@ async function saveGhostVoiceAssignments(
       const voiceId = ghost?.voiceId ?? assignment.voiceId
       if (!canReserveAutomaticVoice(voiceId, unavailable, ghost ? activeGhosts.filter(item => item.id === ghostId) : activeGhosts, ghostId)) continue
       if (!ghost) {
-        ghost = { id: ghostId, speakerId: group.speakerId, voiceId, context: '', occurrenceKeys: [], lastSeenMessageId: anchorId }
+        ghost = { id: ghostId, speakerId: group.speakerId, voiceId, context: '', occurrenceKeys: [], lastSeenMessageId: anchorId, createdAtMessageId: currentAssistantIds.at(-1) ?? anchorId }
         ghosts.push(ghost)
         activeGhosts.push(ghost)
       }
