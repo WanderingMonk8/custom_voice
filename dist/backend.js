@@ -107,7 +107,7 @@ function buildUncastVoiceDecision(groups, voices, message, ghosts = []) {
   }
   return { state, questions };
 }
-function resolveUncastVoiceDecisions(groups, voices, answers, ghosts = [], reserved = [], messageId = "", message = "") {
+function resolveUncastVoiceDecisions(groups, voices, answers, ghosts = [], reserved = [], messageId = "", message = "", previousMessageIds = []) {
   const used = new Set(reserved.filter(Boolean));
   const assignments = [];
   const roots = /* @__PURE__ */ new Map();
@@ -128,7 +128,9 @@ function resolveUncastVoiceDecisions(groups, voices, answers, ghosts = [], reser
     const identity = answers[`identity_${group.id}`];
     const labelAnswer = answers[`label_${group.id}`];
     const labelIndex = labelAnswer?.choice.match(/^label_(\d+)$/u);
-    const label = labelIndex && strongChoice(labelAnswer) ? labels[Number(labelIndex[1])] : void 0;
+    const labelProbability = labelAnswer ? labelAnswer.probabilities[labelAnswer.choice] ?? 0 : 0;
+    const labelRunnerUp = labelAnswer ? Math.max(0, ...Object.entries(labelAnswer.probabilities).filter(([key]) => key !== labelAnswer.choice).map(([, probability]) => probability)) : 0;
+    const label = labelIndex && labelAnswer && labelAnswer.confidence >= 0.7 && labelProbability >= 0.7 && labelProbability - labelRunnerUp >= 0.25 ? labels[Number(labelIndex[1])] : void 0;
     if (label) groupLabels.set(group.id, label);
     const previousGroups = groups.slice(0, groups.indexOf(group)).slice(-8);
     const same = previousGroups.flatMap((previous) => {
@@ -139,7 +141,12 @@ function resolveUncastVoiceDecisions(groups, voices, answers, ghosts = [], reser
     else if (label && rootByLabel.has(label)) root = rootByLabel.get(label);
     else if (strongChoice(identity) && identity?.choice.startsWith("group_")) root = roots.get(identity.choice.slice(6)) ?? root;
     const namedGhosts = label ? ghosts.filter((item) => item.label?.toLowerCase() === label) : [];
-    let ghost = namedGhosts.length === 1 ? namedGhosts[0] : exact;
+    const rankedGhosts = namedGhosts.map((item) => ({ item, recent: Math.max(
+      previousMessageIds.indexOf(item.lastSeenMessageId),
+      ...item.occurrenceKeys.map((key) => previousMessageIds.indexOf(key.split(":", 1)[0]))
+    ) })).sort((a, b) => b.recent - a.recent);
+    const priorGhost = rankedGhosts[0]?.recent >= 0 && (rankedGhosts.length === 1 || rankedGhosts[0].recent > rankedGhosts[1].recent) ? rankedGhosts[0].item : void 0;
+    let ghost = namedGhosts.length === 1 ? namedGhosts[0] : priorGhost ?? exact;
     if (!ghost && strongChoice(identity) && identity?.choice.startsWith("ghost_")) ghost = ghosts[Number(identity.choice.slice(6))];
     roots.set(group.id, root);
     if (label && !rootByLabel.has(label)) rootByLabel.set(label, root);
@@ -4673,7 +4680,7 @@ spindle.onFrontendMessage(async (rawPayload, userId, frontendSessionId) => {
           } catch (error) {
             spindle.log.warn(`[Chat Voice] Uncast voice decision failed; using exact ghost matches only: ${error instanceof Error ? error.message : String(error)}`);
           }
-          const assignments = resolveUncastVoiceDecisions(groups, voices, answers, ghosts, payload.reserved, payload.messageId, payload.message.slice(0, 3e4));
+          const assignments = resolveUncastVoiceDecisions(groups, voices, answers, ghosts, payload.reserved, payload.messageId, payload.message.slice(0, 3e4), assistantIds.slice(0, Math.max(0, assistantIds.indexOf(anchor))));
           if (assignments.length) {
             await saveGhostVoiceAssignments(payload.chatId, payload.messageId, assistantIds, groups, assignments, userId, anchor);
           }

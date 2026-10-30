@@ -85,6 +85,9 @@ export function collectUncastVoiceGroups(segments: PlaybackSegment[]): UncastVoi
     if (id === null) continue
     if (id !== UNCAST_SPEAKER_ID && !id.startsWith('unconfigured:')) { anonymous = null; continue }
     if (id !== UNCAST_SPEAKER_ID) anonymous = null
+    // A substantial intervening narrative can introduce a different uncast
+    // speaker even without an intervening cast quotation. Review each side.
+    if (id === UNCAST_SPEAKER_ID && segments[index - 1]?.speakerId === null && segments[index - 1].text.length > 240) anonymous = null
     let group: UncastVoiceGroup | null | undefined = id === UNCAST_SPEAKER_ID ? anonymous : named.get(id)
     if (!group) {
       group = { id: `g${groups.length}`, speakerId: id, segmentIndexes: [], speeches: [], context: [] }
@@ -164,7 +167,7 @@ export interface UncastVoiceAssignment { groupId: string; voiceId: string; gende
 
 export function resolveUncastVoiceDecisions(
   groups: UncastVoiceGroup[], voices: FavoriteVoice[], answers: Record<string, SpeakerDecisionChoice>,
-  ghosts: GhostVoice[] = [], reserved: readonly string[] = [], messageId = '', message = '',
+  ghosts: GhostVoice[] = [], reserved: readonly string[] = [], messageId = '', message = '', previousMessageIds: readonly string[] = [],
 ): UncastVoiceAssignment[] {
   const used = new Set<string>(reserved.filter(Boolean))
   const assignments: UncastVoiceAssignment[] = []
@@ -189,7 +192,9 @@ export function resolveUncastVoiceDecisions(
     const identity = answers[`identity_${group.id}`]
     const labelAnswer = answers[`label_${group.id}`]
     const labelIndex = labelAnswer?.choice.match(/^label_(\d+)$/u)
-    const label = labelIndex && strongChoice(labelAnswer) ? labels[Number(labelIndex[1])] : undefined
+    const labelProbability = labelAnswer ? labelAnswer.probabilities[labelAnswer.choice] ?? 0 : 0
+    const labelRunnerUp = labelAnswer ? Math.max(0, ...Object.entries(labelAnswer.probabilities).filter(([key]) => key !== labelAnswer.choice).map(([, probability]) => probability)) : 0
+    const label = labelIndex && labelAnswer && labelAnswer.confidence >= 0.7 && labelProbability >= 0.7 && labelProbability - labelRunnerUp >= 0.25 ? labels[Number(labelIndex[1])] : undefined
     if (label) groupLabels.set(group.id, label)
     const previousGroups = groups.slice(0, groups.indexOf(group)).slice(-8)
     const same = previousGroups.flatMap(previous => {
@@ -200,7 +205,12 @@ export function resolveUncastVoiceDecisions(
     else if (label && rootByLabel.has(label)) root = rootByLabel.get(label)!
     else if (strongChoice(identity) && identity?.choice.startsWith('group_')) root = roots.get(identity.choice.slice(6)) ?? root
     const namedGhosts = label ? ghosts.filter(item => item.label?.toLowerCase() === label) : []
-    let ghost = namedGhosts.length === 1 ? namedGhosts[0] : exact
+    const rankedGhosts = namedGhosts.map(item => ({ item, recent: Math.max(
+      previousMessageIds.indexOf(item.lastSeenMessageId),
+      ...item.occurrenceKeys.map(key => previousMessageIds.indexOf(key.split(':', 1)[0])),
+    ) })).sort((a, b) => b.recent - a.recent)
+    const priorGhost = rankedGhosts[0]?.recent >= 0 && (rankedGhosts.length === 1 || rankedGhosts[0].recent > rankedGhosts[1].recent) ? rankedGhosts[0].item : undefined
+    let ghost = namedGhosts.length === 1 ? namedGhosts[0] : priorGhost ?? exact
     if (!ghost && strongChoice(identity) && identity?.choice.startsWith('ghost_')) ghost = ghosts[Number(identity.choice.slice(6))]
     roots.set(group.id, root)
     if (label && !rootByLabel.has(label)) rootByLabel.set(label, root)
