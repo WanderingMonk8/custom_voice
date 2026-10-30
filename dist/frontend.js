@@ -4715,7 +4715,21 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
       const badge = document.createElement("span");
       badge.className = "chat-voice-character-count";
       badge.textContent = "Temporary cast";
-      heading.append(name, badge);
+      const meta = document.createElement("span");
+      meta.className = "chat-voice-character-meta";
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.className = "chat-voice-delete-button";
+      remove.textContent = "?";
+      remove.title = `Delete ${name.textContent}`;
+      remove.setAttribute("aria-label", remove.title);
+      remove.addEventListener("click", () => {
+        if (!activeChat) return;
+        flushSave();
+        ctx.sendToBackend({ type: "chat_voice_ghost_edit", chatId: activeChat.id, ghostId: ghost.id, remove: true });
+      });
+      meta.append(badge, remove);
+      heading.append(name, meta);
       const slot = document.createElement("div");
       slot.hidden = true;
       const voiceDisplay = document.createElement("button");

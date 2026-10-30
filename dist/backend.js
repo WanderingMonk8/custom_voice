@@ -4857,7 +4857,9 @@ spindle.onFrontendMessage(async (rawPayload, userId, frontendSessionId) => {
         const ghost = ghosts.find((item) => item.id === payload.ghostId);
         if (!ghost) throw new Error("This uncast character is no longer available.");
         let updatedMetadata = { ...metadata };
-        if (payload.promote) {
+        if (payload.remove) {
+          updatedMetadata.chat_voice_ghost_cast = ghosts.filter((item) => item.id !== ghost.id);
+        } else if (payload.promote) {
           const name = ghost.label || (ghost.speakerId.startsWith("unconfigured:") ? ghost.speakerId.slice(13) : "");
           if (!name) throw new Error("This character needs a recognizable name before it can be added to the cast.");
           const config = readConfig(metadata, chatMemberIds(chat));

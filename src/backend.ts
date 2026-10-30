@@ -97,7 +97,7 @@ type FrontendMessage =
   | { type: 'chat_voice_list_llm_connections'; requestId: string }
   | { type: 'chat_voice_scan'; chatId: string; messageLimit: number }
   | { type: 'chat_voice_auto_cast'; requestId: string; chatId: string; voices: FavoriteVoice[]; reserved: string[]; narratorMissing: boolean; userMissing: boolean; ghostLifetime: number }
-  | { type: 'chat_voice_ghost_edit'; chatId: string; ghostId: string; voice?: string; promote?: boolean }
+  | { type: 'chat_voice_ghost_edit'; chatId: string; ghostId: string; voice?: string; promote?: boolean; remove?: boolean }
   | { type: 'chat_voice_get_message'; chatId: string; messageId: string; requestId: string }
   | { type: 'chat_voice_match_uncast'; requestId: string; chatId: string; messageId: string; message: string; groups: UncastVoiceGroup[]; voices: FavoriteVoice[]; reserved: string[]; lifetime: number }
   | {
@@ -1510,7 +1510,9 @@ spindle.onFrontendMessage(async (rawPayload: unknown, userId, frontendSessionId)
         const ghost = ghosts.find(item => item.id === payload.ghostId)
         if (!ghost) throw new Error('This uncast character is no longer available.')
         let updatedMetadata = { ...metadata }
-        if (payload.promote) {
+        if (payload.remove) {
+          updatedMetadata.chat_voice_ghost_cast = ghosts.filter(item => item.id !== ghost.id)
+        } else if (payload.promote) {
           const name = ghost.label || (ghost.speakerId.startsWith('unconfigured:') ? ghost.speakerId.slice(13) : '')
           if (!name) throw new Error('This character needs a recognizable name before it can be added to the cast.')
           const config = readConfig(metadata, chatMemberIds(chat))
