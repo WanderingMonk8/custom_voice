@@ -1771,7 +1771,7 @@ export function setup(ctx: SpindleFrontendContext) {
   ghostLifetimeField.slot.appendChild(ghostLifetimeInput)
   const ghostLifetimeHint = document.createElement('div')
   ghostLifetimeHint.className = 'chat-voice-hint'
-  ghostLifetimeHint.textContent = 'Keep an uncast character’s selected voice for this many assistant messages after they last spoke.'
+  ghostLifetimeHint.textContent = 'Keep a temporary voice for this many new assistant messages after it is last used for audio.'
   ghostLifetimeField.slot.appendChild(ghostLifetimeHint)
   const onGhostLifetimeInput = () => {
     ghostVoiceLifetime = clampIntegerSetting(ghostLifetimeInput.valueAsNumber, GHOST_VOICE_LIFETIME_MESSAGES, 1000)

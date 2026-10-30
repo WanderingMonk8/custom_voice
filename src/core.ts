@@ -46,7 +46,7 @@ export function addFavoriteVoice(existing: FavoriteVoice[], voice: FavoriteVoice
 }
 
 export interface UncastVoiceGroup { id: string; speakerId: string; segmentIndexes: number[]; speeches: string[]; context: string[] }
-export interface GhostVoice { id: string; speakerId: string; voiceId: string; context: string; occurrenceKeys: string[]; lastSeenMessageId: string; label?: string; createdAtMessageId?: string; aliases?: string[]; conversationHistory?: Array<{ messageId: string; text: string }> }
+export interface GhostVoice { id: string; speakerId: string; voiceId: string; context: string; occurrenceKeys: string[]; lastSeenMessageId: string; label?: string; createdAtMessageId?: string; lastInvokedAtMessageId?: string; aliases?: string[]; conversationHistory?: Array<{ messageId: string; text: string }> }
 export const GHOST_VOICE_LIFETIME_MESSAGES = 10
 
 export function readGhostVoices(value: unknown): GhostVoice[] {
@@ -67,7 +67,8 @@ export function readGhostVoices(value: unknown): GhostVoice[] {
         return typeof item.messageId === 'string' && typeof item.text === 'string' && item.messageId && item.text
           ? [{ messageId: item.messageId.slice(0, 256), text: item.text.slice(0, 6_000) }] : []
       }).slice(-3) : [],
-      ...(typeof row.createdAtMessageId === 'string' && row.createdAtMessageId ? { createdAtMessageId: row.createdAtMessageId } : {}) }]
+      ...(typeof row.createdAtMessageId === 'string' && row.createdAtMessageId ? { createdAtMessageId: row.createdAtMessageId } : {}),
+      ...(typeof row.lastInvokedAtMessageId === 'string' && row.lastInvokedAtMessageId ? { lastInvokedAtMessageId: row.lastInvokedAtMessageId } : {}) }]
   })
 }
 
@@ -102,6 +103,12 @@ export function ghostCastAliases(ghost: GhostVoice): string[] {
   )
 }
 
+/** Refresh expiry at the current chat head, even when an older message was played. */
+export function markGhostVoiceInvoked(ghost: GhostVoice, assistantMessageIds: readonly string[]): void {
+  const latest = assistantMessageIds.at(-1)
+  if (latest) ghost.lastInvokedAtMessageId = latest
+}
+
 /** The caller supplies assistant-message IDs only, in chronological order. */
 export function activeGhostVoices(ghosts: GhostVoice[], assistantMessageIds: readonly string[], targetId: string, lifetime = GHOST_VOICE_LIFETIME_MESSAGES): GhostVoice[] {
   const target = assistantMessageIds.indexOf(targetId)
@@ -110,7 +117,8 @@ export function activeGhostVoices(ghosts: GhostVoice[], assistantMessageIds: rea
     if (ghost.occurrenceKeys.some(key => key.startsWith(`${targetId}:`))) return true
     const lastSeen = ghost.lastSeenMessageId ? assistantMessageIds.indexOf(ghost.lastSeenMessageId) : -1
     const createdAt = ghost.createdAtMessageId ? assistantMessageIds.indexOf(ghost.createdAtMessageId) : -1
-    const activeSince = createdAt >= 0 && createdAt <= target ? Math.max(lastSeen, createdAt) : lastSeen
+    const invokedAt = ghost.lastInvokedAtMessageId ? assistantMessageIds.indexOf(ghost.lastInvokedAtMessageId) : -1
+    const activeSince = Math.max(lastSeen, createdAt <= target ? createdAt : -1, invokedAt <= target ? invokedAt : -1)
     return (activeSince >= 0 || !ghost.lastSeenMessageId) && activeSince <= target && target - activeSince <= Math.max(1, lifetime)
   })
 }

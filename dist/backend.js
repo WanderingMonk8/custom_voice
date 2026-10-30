@@ -46,7 +46,8 @@ function readGhostVoices(value) {
         const item2 = entry;
         return typeof item2.messageId === "string" && typeof item2.text === "string" && item2.messageId && item2.text ? [{ messageId: item2.messageId.slice(0, 256), text: item2.text.slice(0, 6e3) }] : [];
       }).slice(-3) : [],
-      ...typeof row.createdAtMessageId === "string" && row.createdAtMessageId ? { createdAtMessageId: row.createdAtMessageId } : {}
+      ...typeof row.createdAtMessageId === "string" && row.createdAtMessageId ? { createdAtMessageId: row.createdAtMessageId } : {},
+      ...typeof row.lastInvokedAtMessageId === "string" && row.lastInvokedAtMessageId ? { lastInvokedAtMessageId: row.lastInvokedAtMessageId } : {}
     }];
   });
 }
@@ -76,6 +77,10 @@ function ghostCastAliases(ghost) {
     ghost.aliases ?? []
   );
 }
+function markGhostVoiceInvoked(ghost, assistantMessageIds) {
+  const latest = assistantMessageIds.at(-1);
+  if (latest) ghost.lastInvokedAtMessageId = latest;
+}
 function activeGhostVoices(ghosts, assistantMessageIds, targetId, lifetime = GHOST_VOICE_LIFETIME_MESSAGES) {
   const target = assistantMessageIds.indexOf(targetId);
   if (target < 0) return [];
@@ -83,7 +88,8 @@ function activeGhostVoices(ghosts, assistantMessageIds, targetId, lifetime = GHO
     if (ghost.occurrenceKeys.some((key) => key.startsWith(`${targetId}:`))) return true;
     const lastSeen = ghost.lastSeenMessageId ? assistantMessageIds.indexOf(ghost.lastSeenMessageId) : -1;
     const createdAt = ghost.createdAtMessageId ? assistantMessageIds.indexOf(ghost.createdAtMessageId) : -1;
-    const activeSince = createdAt >= 0 && createdAt <= target ? Math.max(lastSeen, createdAt) : lastSeen;
+    const invokedAt = ghost.lastInvokedAtMessageId ? assistantMessageIds.indexOf(ghost.lastInvokedAtMessageId) : -1;
+    const activeSince = Math.max(lastSeen, createdAt <= target ? createdAt : -1, invokedAt <= target ? invokedAt : -1);
     return (activeSince >= 0 || !ghost.lastSeenMessageId) && activeSince <= target && target - activeSince <= Math.max(1, lifetime);
   });
 }
@@ -4478,6 +4484,7 @@ async function saveGhostVoiceAssignments(chatId, messageId, assistantIds, groups
         ghosts.push(ghost);
         activeGhosts.push(ghost);
       }
+      markGhostVoiceInvoked(ghost, currentAssistantIds);
       accepted.push({ ...assignment, voiceId });
       if (!ghost.label && assignment.label) ghost.label = assignment.label;
       ghost.aliases = mergeGhostAliases(ghostCastAliases(ghost), assignment.aliases ?? []);

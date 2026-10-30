@@ -25,6 +25,7 @@ import {
   canReserveAutomaticVoice,
   selectAutomaticVoice,
   activeGhostVoices,
+  markGhostVoiceInvoked,
   collectUncastVoiceGroups,
   ghostCastAliases,
   updateGhostConversationHistory,
@@ -2161,6 +2162,20 @@ test('regeneration ranks only voices available against both historical and curre
   const fresh = resolveUncastVoiceDecisions(groups, available, { voice_g0: confidentDecision('voice_0') }, [], [], 'earlier')
   assert.equal(fresh[0]?.voiceId, 'free-voice')
   assert.equal(fresh[0]?.ghostId, 'pending:g0')
+})
+
+test('refreshes temporary voice expiry when used, including playback of older messages', () => {
+  const ids = Array.from({ length: 25 }, (_, index) => `assistant-${24 - index}`)
+  const ghost = { id: 'ghost', speakerId: UNCAST_SPEAKER_ID, voiceId: 'voice', context: '', occurrenceKeys: [`${ids[0]}:speech`], lastSeenMessageId: ids[0] }
+  assert.equal(activeGhostVoices([ghost], ids, ids[11], 10).length, 0)
+  markGhostVoiceInvoked(ghost, ids.slice(0, 13))
+  const restored = readGhostVoices([ghost])[0]
+  assert.equal(restored.lastInvokedAtMessageId, ids[12])
+  assert.equal(restored.lastSeenMessageId, ids[0])
+  assert.equal(activeGhostVoices([restored], ids, ids[22], 10).length, 1)
+  assert.equal(activeGhostVoices([restored], ids, ids[23], 10).length, 0)
+  assert.equal(activeGhostVoices([restored], ids, ids[11], 10).length, 0)
+  assert.equal(activeGhostVoices([restored], ids, ids[0], 10).length, 1)
 })
 
 test('new ghosts from older regenerated messages appear until their creation lifetime expires', () => {

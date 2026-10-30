@@ -2,6 +2,7 @@ import {
   addScannedFirstNameAliases,
   addUnconfiguredDialogueSpeakers,
   activeGhostVoices,
+  markGhostVoiceInvoked,
   availableUncastVoices,
   applyConfigToMetadata,
   applyCustomTtsEmotionCues,
@@ -877,6 +878,7 @@ async function saveGhostVoiceAssignments(
         ghosts.push(ghost)
         activeGhosts.push(ghost)
       }
+      markGhostVoiceInvoked(ghost, currentAssistantIds)
       accepted.push({ ...assignment, voiceId })
       if (!ghost.label && assignment.label) ghost.label = assignment.label
       ghost.aliases = mergeGhostAliases(ghostCastAliases(ghost), assignment.aliases ?? [])

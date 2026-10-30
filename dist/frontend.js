@@ -38,7 +38,8 @@ function activeGhostVoices(ghosts, assistantMessageIds, targetId, lifetime = GHO
     if (ghost.occurrenceKeys.some((key) => key.startsWith(`${targetId}:`))) return true;
     const lastSeen = ghost.lastSeenMessageId ? assistantMessageIds.indexOf(ghost.lastSeenMessageId) : -1;
     const createdAt = ghost.createdAtMessageId ? assistantMessageIds.indexOf(ghost.createdAtMessageId) : -1;
-    const activeSince = createdAt >= 0 && createdAt <= target ? Math.max(lastSeen, createdAt) : lastSeen;
+    const invokedAt = ghost.lastInvokedAtMessageId ? assistantMessageIds.indexOf(ghost.lastInvokedAtMessageId) : -1;
+    const activeSince = Math.max(lastSeen, createdAt <= target ? createdAt : -1, invokedAt <= target ? invokedAt : -1);
     return (activeSince >= 0 || !ghost.lastSeenMessageId) && activeSince <= target && target - activeSince <= Math.max(1, lifetime);
   });
 }
@@ -2834,7 +2835,7 @@ function setup(ctx) {
   ghostLifetimeField.slot.appendChild(ghostLifetimeInput);
   const ghostLifetimeHint = document.createElement("div");
   ghostLifetimeHint.className = "chat-voice-hint";
-  ghostLifetimeHint.textContent = "Keep an uncast character\u2019s selected voice for this many assistant messages after they last spoke.";
+  ghostLifetimeHint.textContent = "Keep a temporary voice for this many new assistant messages after it is last used for audio.";
   ghostLifetimeField.slot.appendChild(ghostLifetimeHint);
   const onGhostLifetimeInput = () => {
     ghostVoiceLifetime = clampIntegerSetting(ghostLifetimeInput.valueAsNumber, GHOST_VOICE_LIFETIME_MESSAGES, 1e3);
