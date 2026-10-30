@@ -2122,6 +2122,20 @@ test('automatic voice reservations reject exhausted voices and preserve existing
   assert.equal(selectAutomaticVoice(voices, new Set(['last-voice']), confidentDecision('voice_0'), 'unknown'), '')
 })
 
+test('uncast voice matching excludes narration-only people and only groups actual speech', () => {
+  const narration = 'The clerk watches silently. The guard waits by the door.'
+  const segments = parseRosterVoiceSegments(narration, null, [], '', null, true)
+  assert.deepEqual(collectUncastVoiceGroups(segments), [])
+  const groups = collectUncastVoiceGroups([
+    { speakerId: UNCAST_SPEAKER_ID, text: 'A silent clerk watches.', debugPath: ['segment-type:narration'] },
+    { speakerId: UNCAST_SPEAKER_ID, text: 'Come in.', debugPath: ['segment-type:speech (quote 1)'] },
+  ])
+  assert.deepEqual(groups.map(group => group.speeches), [['Come in.']])
+  const plan = buildUncastVoiceDecision(groups, readFavoriteVoices([{ id: 'voice' }]), 'The clerk watches. "Come in."')
+  assert.match(plan.questions.label_g0.instructions, /actually speaks/u)
+  assert.match(plan.questions.voice_g0.instructions, /Narration-only bystanders/u)
+})
+
 test('defaults and clamps the global saved audio limit', () => {
   assert.equal(clampSavedAudioLimit(undefined), 50)
   assert.equal(clampSavedAudioLimit(0), 1)

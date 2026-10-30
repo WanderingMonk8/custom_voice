@@ -85,7 +85,7 @@ function buildUncastVoiceDecision(groups, voices, message, ghosts = []) {
     };
     if (labels.length) questions[`label_${group.id}`] = {
       type: "choice",
-      instructions: `Choose the descriptive label that identifies the speaker of ${group.id} in this scene. Choose none if no label unambiguously identifies this individual. Do not select an object, addressee, or another person.`,
+      instructions: `Choose the descriptive label for the person who actually speaks the quoted dialogue in ${group.id}. A person mentioned in narration, observing, or addressed by the speaker is not necessarily speaking. Choose none unless the label identifies the speaker of these quotations.`,
       criteria: { none: "No reliable descriptive identity.", ...Object.fromEntries(labels.map((label, index) => [`label_${index}`, label])) }
     };
     const earlier = groups.slice(0, groups.indexOf(group));
@@ -108,7 +108,7 @@ function buildUncastVoiceDecision(groups, voices, message, ghosts = []) {
     if (!voices.length) continue;
     questions[`voice_${group.id}`] = {
       type: "choice",
-      instructions: `Rank the available voices by how well their descriptions suit character ${group.id}. Consider the full scene and all dialogue and context belonging to this same individual, including other character groups when clearly the same person. Choose no_match if no voice is suitable.`,
+      instructions: `Rank the available voices for the person who actually speaks the quoted dialogue in ${group.id}. Narration-only bystanders and people merely addressed are not speakers. Use the full scene as context, including other character groups only when clearly the same speaker. Choose no_match if no voice is suitable.`,
       criteria: { ...Object.fromEntries(state.voices.map((voice) => [voice.option, `${voice.name || "Unnamed voice"}; ${voice.category}; ${voice.description || "No description provided."}`])), no_match: "No available voice is suitable." }
     };
   }
