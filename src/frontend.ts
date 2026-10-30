@@ -1776,6 +1776,10 @@ export function setup(ctx: SpindleFrontendContext) {
   const onGhostLifetimeInput = () => {
     ghostVoiceLifetime = clampIntegerSetting(ghostLifetimeInput.valueAsNumber, GHOST_VOICE_LIFETIME_MESSAGES, 1000)
     ghostLifetimeInput.value = String(ghostVoiceLifetime)
+    if (activeChat) {
+      if (editingCharacterVoiceId) removeExpiredGhostCards()
+      else renderCharacters(activeChat.characters)
+    }
     scheduleAdvancedSettingsSave()
   }
   ghostLifetimeInput.addEventListener('change', onGhostLifetimeInput)
@@ -3868,6 +3872,22 @@ export function setup(ctx: SpindleFrontendContext) {
       .then(saved => { if (saved) { favoriteName.value = ''; favoriteId.value = ''; favoriteDescription.value = '' } })
   })
 
+  function removeExpiredGhostCards() {
+    if (!activeChat) return
+    const ids = activeChat.assistantMessageIds ?? []
+    const active = new Set(activeGhostVoices(activeChat.ghosts ?? [], ids, ids.at(-1) ?? '', ghostVoiceLifetime).map(ghost => ghost.id))
+    for (const card of characterList.querySelectorAll<HTMLElement>('[data-ghost-id]')) {
+      const id = card.dataset.ghostId!
+      if (active.has(id)) continue
+      ghostVoiceEditors.get(id)?.input.destroy()
+      ghostVoiceEditors.delete(id)
+      const picker = card.querySelector<HTMLSelectElement>('select')
+      if (picker) favoritePickers.delete(picker)
+      if (editingCharacterVoiceId === `ghost:${id}`) editingCharacterVoiceId = null
+      card.remove()
+    }
+  }
+
   function renderCharacters(characters: DetectedCharacterState[]) {
     for (const input of characterInputs.values()) input.destroy()
     for (const { input } of ghostVoiceEditors.values()) input.destroy()
@@ -3992,6 +4012,7 @@ export function setup(ctx: SpindleFrontendContext) {
     for (const ghost of ghosts) {
       const card = document.createElement('div')
       card.className = 'chat-voice-character chat-voice-character-temporary'
+      card.dataset.ghostId = ghost.id
       const heading = document.createElement('div')
       heading.className = 'chat-voice-character-heading'
       const name = document.createElement('button')
@@ -4124,6 +4145,7 @@ export function setup(ctx: SpindleFrontendContext) {
     addNpcInput.update({ value: '', disabled: !next })
     addNpcButton.disabled = !next
     if (!keepVoiceEditor) renderCharacters(next?.characters ?? [])
+    else removeExpiredGhostCards()
     updateRoleVoiceDisplays()
     updateRoleDefaultControls()
     applyingState = false
@@ -4713,6 +4735,11 @@ export function setup(ctx: SpindleFrontendContext) {
     }
 
     if (dirty || inFlight.size > 0) {
+      if (activeChat && payload.chat) {
+        activeChat.assistantMessageIds = payload.chat.assistantMessageIds
+        activeChat.ghosts = payload.chat.ghosts
+        removeExpiredGhostCards()
+      }
       pendingState?.resolve(payload.chat)
       return
     }

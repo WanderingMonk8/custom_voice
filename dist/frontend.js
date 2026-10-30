@@ -2840,6 +2840,10 @@ function setup(ctx) {
   const onGhostLifetimeInput = () => {
     ghostVoiceLifetime = clampIntegerSetting(ghostLifetimeInput.valueAsNumber, GHOST_VOICE_LIFETIME_MESSAGES, 1e3);
     ghostLifetimeInput.value = String(ghostVoiceLifetime);
+    if (activeChat) {
+      if (editingCharacterVoiceId) removeExpiredGhostCards();
+      else renderCharacters(activeChat.characters);
+    }
     scheduleAdvancedSettingsSave();
   };
   ghostLifetimeInput.addEventListener("change", onGhostLifetimeInput);
@@ -4578,6 +4582,21 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
       }
     });
   });
+  function removeExpiredGhostCards() {
+    if (!activeChat) return;
+    const ids = activeChat.assistantMessageIds ?? [];
+    const active = new Set(activeGhostVoices(activeChat.ghosts ?? [], ids, ids.at(-1) ?? "", ghostVoiceLifetime).map((ghost) => ghost.id));
+    for (const card of characterList.querySelectorAll("[data-ghost-id]")) {
+      const id = card.dataset.ghostId;
+      if (active.has(id)) continue;
+      ghostVoiceEditors.get(id)?.input.destroy();
+      ghostVoiceEditors.delete(id);
+      const picker = card.querySelector("select");
+      if (picker) favoritePickers.delete(picker);
+      if (editingCharacterVoiceId === `ghost:${id}`) editingCharacterVoiceId = null;
+      card.remove();
+    }
+  }
   function renderCharacters(characters) {
     for (const input of characterInputs.values()) input.destroy();
     for (const { input } of ghostVoiceEditors.values()) input.destroy();
@@ -4710,6 +4729,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
     for (const ghost of ghosts) {
       const card = document.createElement("div");
       card.className = "chat-voice-character chat-voice-character-temporary";
+      card.dataset.ghostId = ghost.id;
       const heading = document.createElement("div");
       heading.className = "chat-voice-character-heading";
       const name = document.createElement("button");
@@ -4849,6 +4869,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
     addNpcInput.update({ value: "", disabled: !next });
     addNpcButton.disabled = !next;
     if (!keepVoiceEditor) renderCharacters(next?.characters ?? []);
+    else removeExpiredGhostCards();
     updateRoleVoiceDisplays();
     updateRoleDefaultControls();
     applyingState = false;
@@ -5384,6 +5405,11 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
       return;
     }
     if (dirty || inFlight.size > 0) {
+      if (activeChat && payload.chat) {
+        activeChat.assistantMessageIds = payload.chat.assistantMessageIds;
+        activeChat.ghosts = payload.chat.ghosts;
+        removeExpiredGhostCards();
+      }
       pendingState?.resolve(payload.chat);
       return;
     }
