@@ -879,7 +879,7 @@ async function saveGhostVoiceAssignments(
         ghosts.push(ghost)
         activeGhosts.push(ghost)
       }
-      markGhostVoiceInvoked(ghost, currentAssistantIds)
+      markGhostVoiceInvoked(ghost, currentAssistantIds, messageId)
       accepted.push({ ...assignment, voiceId })
       if (!ghost.label && assignment.label) ghost.label = assignment.label
       ghost.aliases = mergeGhostAliases(ghostCastAliases(ghost), assignment.aliases ?? [])

@@ -41,6 +41,7 @@ function readGhostVoices(value) {
       context: typeof row.context === "string" ? row.context.slice(0, 2e3) : "",
       occurrenceKeys: Array.isArray(row.occurrenceKeys) ? row.occurrenceKeys.filter((key) => typeof key === "string").slice(-100) : [],
       lastSeenMessageId: typeof row.lastSeenMessageId === "string" ? row.lastSeenMessageId : "",
+      invokedMessageIds: Array.isArray(row.invokedMessageIds) ? row.invokedMessageIds.filter((id) => typeof id === "string") : [],
       conversationHistory: Array.isArray(row.conversationHistory) ? row.conversationHistory.flatMap((entry) => {
         if (!entry || typeof entry !== "object") return [];
         const item2 = entry;
@@ -77,7 +78,9 @@ function ghostCastAliases(ghost) {
     ghost.aliases ?? []
   );
 }
-function markGhostVoiceInvoked(ghost, assistantMessageIds) {
+function markGhostVoiceInvoked(ghost, assistantMessageIds, messageId) {
+  if (!messageId || ghost.invokedMessageIds?.includes(messageId) || ghost.occurrenceKeys.some((key) => key.startsWith(`${messageId}:`))) return;
+  ghost.invokedMessageIds = [...ghost.invokedMessageIds ?? [], messageId];
   const latest = assistantMessageIds.at(-1);
   if (latest) ghost.lastInvokedAtMessageId = latest;
 }
@@ -4497,7 +4500,7 @@ async function saveGhostVoiceAssignments(chatId, messageId, assistantIds, groups
         ghosts.push(ghost);
         activeGhosts.push(ghost);
       }
-      markGhostVoiceInvoked(ghost, currentAssistantIds);
+      markGhostVoiceInvoked(ghost, currentAssistantIds, messageId);
       accepted.push({ ...assignment, voiceId });
       if (!ghost.label && assignment.label) ghost.label = assignment.label;
       ghost.aliases = mergeGhostAliases(ghostCastAliases(ghost), assignment.aliases ?? []);

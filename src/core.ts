@@ -46,7 +46,7 @@ export function addFavoriteVoice(existing: FavoriteVoice[], voice: FavoriteVoice
 }
 
 export interface UncastVoiceGroup { id: string; speakerId: string; segmentIndexes: number[]; speeches: string[]; context: string[] }
-export interface GhostVoice { id: string; speakerId: string; voiceId: string; context: string; occurrenceKeys: string[]; lastSeenMessageId: string; label?: string; createdAtMessageId?: string; lastInvokedAtMessageId?: string; aliases?: string[]; conversationHistory?: Array<{ messageId: string; text: string }> }
+export interface GhostVoice { id: string; speakerId: string; voiceId: string; context: string; occurrenceKeys: string[]; lastSeenMessageId: string; label?: string; createdAtMessageId?: string; lastInvokedAtMessageId?: string; invokedMessageIds?: string[]; aliases?: string[]; conversationHistory?: Array<{ messageId: string; text: string }> }
 export const GHOST_VOICE_LIFETIME_MESSAGES = 10
 
 export function readGhostVoices(value: unknown): GhostVoice[] {
@@ -61,6 +61,7 @@ export function readGhostVoices(value: unknown): GhostVoice[] {
       context: typeof row.context === 'string' ? row.context.slice(0, 2_000) : '',
       occurrenceKeys: Array.isArray(row.occurrenceKeys) ? row.occurrenceKeys.filter((key): key is string => typeof key === 'string').slice(-100) : [],
       lastSeenMessageId: typeof row.lastSeenMessageId === 'string' ? row.lastSeenMessageId : '',
+      invokedMessageIds: Array.isArray(row.invokedMessageIds) ? row.invokedMessageIds.filter((id): id is string => typeof id === 'string') : [],
       conversationHistory: Array.isArray(row.conversationHistory) ? row.conversationHistory.flatMap(entry => {
         if (!entry || typeof entry !== 'object') return []
         const item = entry as Record<string, unknown>
@@ -104,7 +105,9 @@ export function ghostCastAliases(ghost: GhostVoice): string[] {
 }
 
 /** Refresh expiry at the current chat head, even when an older message was played. */
-export function markGhostVoiceInvoked(ghost: GhostVoice, assistantMessageIds: readonly string[]): void {
+export function markGhostVoiceInvoked(ghost: GhostVoice, assistantMessageIds: readonly string[], messageId: string): void {
+  if (!messageId || ghost.invokedMessageIds?.includes(messageId) || ghost.occurrenceKeys.some(key => key.startsWith(`${messageId}:`))) return
+  ghost.invokedMessageIds = [...(ghost.invokedMessageIds ?? []), messageId]
   const latest = assistantMessageIds.at(-1)
   if (latest) ghost.lastInvokedAtMessageId = latest
 }

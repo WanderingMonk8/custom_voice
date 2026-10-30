@@ -2169,10 +2169,17 @@ test('refreshes temporary voice expiry when used, including playback of older me
   const ids = Array.from({ length: 25 }, (_, index) => `assistant-${24 - index}`)
   const ghost = { id: 'ghost', speakerId: UNCAST_SPEAKER_ID, voiceId: 'voice', context: '', occurrenceKeys: [`${ids[0]}:speech`], lastSeenMessageId: ids[0] }
   assert.equal(activeGhostVoices([ghost], ids, ids[11], 10).length, 0)
-  markGhostVoiceInvoked(ghost, ids.slice(0, 13))
+  markGhostVoiceInvoked(ghost, ids.slice(0, 13), ids[1])
   const restored = readGhostVoices([ghost])[0]
   assert.equal(restored.lastInvokedAtMessageId, ids[12])
   assert.equal(restored.lastSeenMessageId, ids[0])
+  markGhostVoiceInvoked(restored, ids.slice(0, 20), ids[0])
+  assert.equal(restored.lastInvokedAtMessageId, ids[12])
+  markGhostVoiceInvoked(restored, ids.slice(0, 20), ids[2])
+  assert.equal(restored.lastInvokedAtMessageId, ids[19])
+  markGhostVoiceInvoked(restored, ids, ids[2])
+  assert.equal(restored.lastInvokedAtMessageId, ids[19])
+  restored.lastInvokedAtMessageId = ids[12]
   assert.equal(activeGhostVoices([restored], ids, ids[22], 10).length, 1)
   assert.equal(activeGhostVoices([restored], ids, ids[23], 10).length, 0)
   assert.equal(activeGhostVoices([restored], ids, ids[11], 10).length, 0)
