@@ -37,11 +37,52 @@ function readGhostVoices(value) {
       speakerId: row.speakerId.slice(0, 256),
       voiceId: row.voiceId.slice(0, 512),
       label: typeof row.label === "string" ? row.label.trim().slice(0, 100) : "",
+      aliases: mergeGhostAliases(Array.isArray(row.aliases) ? row.aliases.filter((value2) => typeof value2 === "string") : []),
       context: typeof row.context === "string" ? row.context.slice(0, 2e3) : "",
       occurrenceKeys: Array.isArray(row.occurrenceKeys) ? row.occurrenceKeys.filter((key) => typeof key === "string").slice(-100) : [],
-      lastSeenMessageId: typeof row.lastSeenMessageId === "string" ? row.lastSeenMessageId : ""
+      lastSeenMessageId: typeof row.lastSeenMessageId === "string" ? row.lastSeenMessageId : "",
+      invokedMessageIds: Array.isArray(row.invokedMessageIds) ? row.invokedMessageIds.filter((id) => typeof id === "string") : [],
+      conversationHistory: Array.isArray(row.conversationHistory) ? row.conversationHistory.flatMap((entry) => {
+        if (!entry || typeof entry !== "object") return [];
+        const item2 = entry;
+        return typeof item2.messageId === "string" && typeof item2.text === "string" && item2.messageId && item2.text ? [{ messageId: item2.messageId.slice(0, 256), text: item2.text.slice(0, 6e3) }] : [];
+      }).slice(-3) : [],
+      ...typeof row.createdAtMessageId === "string" && row.createdAtMessageId ? { createdAtMessageId: row.createdAtMessageId } : {},
+      ...typeof row.lastInvokedAtMessageId === "string" && row.lastInvokedAtMessageId ? { lastInvokedAtMessageId: row.lastInvokedAtMessageId } : {}
     }];
   });
+}
+function updateGhostConversationHistory(ghost, messageId, message, assistantMessageIds) {
+  const text = message.trim().slice(0, 6e3);
+  if (!messageId || !text) return;
+  const entries = (ghost.conversationHistory ?? []).filter((item) => item.messageId !== messageId);
+  entries.push({ messageId, text });
+  entries.sort((a, b) => assistantMessageIds.indexOf(a.messageId) - assistantMessageIds.indexOf(b.messageId));
+  ghost.conversationHistory = entries.slice(-3);
+}
+function mergeGhostAliases(...sources) {
+  const aliases = [];
+  const seen = /* @__PURE__ */ new Set();
+  for (const source of sources) for (const value of source) for (const alias of speakerAliases(value)) {
+    const key = alias.toLowerCase();
+    if (seen.has(key) || [...aliases, alias].join(" / ").length > 4096) continue;
+    seen.add(key);
+    aliases.push(alias);
+  }
+  return aliases;
+}
+function ghostCastAliases(ghost) {
+  return mergeGhostAliases(
+    ghost.speakerId.startsWith("unconfigured:") ? [ghost.speakerId.slice("unconfigured:".length)] : [],
+    ghost.label ? [ghost.label] : [],
+    ghost.aliases ?? []
+  );
+}
+function markGhostVoiceInvoked(ghost, assistantMessageIds, messageId) {
+  if (!messageId || ghost.invokedMessageIds?.includes(messageId) || ghost.occurrenceKeys.some((key) => key.startsWith(`${messageId}:`))) return;
+  ghost.invokedMessageIds = [...ghost.invokedMessageIds ?? [], messageId];
+  const latest = assistantMessageIds.at(-1);
+  if (latest) ghost.lastInvokedAtMessageId = latest;
 }
 function activeGhostVoices(ghosts, assistantMessageIds, targetId, lifetime = GHOST_VOICE_LIFETIME_MESSAGES) {
   const target = assistantMessageIds.indexOf(targetId);
@@ -49,12 +90,47 @@ function activeGhostVoices(ghosts, assistantMessageIds, targetId, lifetime = GHO
   return ghosts.filter((ghost) => {
     if (ghost.occurrenceKeys.some((key) => key.startsWith(`${targetId}:`))) return true;
     const lastSeen = ghost.lastSeenMessageId ? assistantMessageIds.indexOf(ghost.lastSeenMessageId) : -1;
-    return (lastSeen >= 0 || !ghost.lastSeenMessageId) && lastSeen <= target && target - lastSeen <= Math.max(1, lifetime);
+    const createdAt = ghost.createdAtMessageId ? assistantMessageIds.indexOf(ghost.createdAtMessageId) : -1;
+    const invokedAt = ghost.lastInvokedAtMessageId ? assistantMessageIds.indexOf(ghost.lastInvokedAtMessageId) : -1;
+    const activeSince = Math.max(lastSeen, createdAt <= target ? createdAt : -1, invokedAt <= target ? invokedAt : -1);
+    return (activeSince >= 0 || !ghost.lastSeenMessageId) && activeSince <= target && target - activeSince <= Math.max(1, lifetime);
   });
+}
+function purgeExpiredGhostContexts(ghosts, assistantMessageIds, lifetime) {
+  const head = assistantMessageIds.at(-1);
+  if (!head) return false;
+  const active = new Set(activeGhostVoices(ghosts, assistantMessageIds, head, lifetime).map((ghost) => ghost.id));
+  let changed = false;
+  for (const ghost of ghosts) {
+    if (active.has(ghost.id) || !ghost.context && !ghost.conversationHistory?.length) continue;
+    ghost.context = "";
+    ghost.conversationHistory = [];
+    changed = true;
+  }
+  return changed;
+}
+function canReserveAutomaticVoice(voiceId, reserved, ghosts, existingGhostId = "") {
+  return !!voiceId && !reserved.has(voiceId) && !ghosts.some((ghost) => ghost.voiceId === voiceId && ghost.id !== existingGhostId);
+}
+function selectAutomaticVoice(voices, used, answer, gender) {
+  const eligible = voices.map((voice, index) => ({ voice, probability: answer.probabilities[`voice_${index}`] ?? 0 })).filter((item) => !used.has(item.voice.id) && (gender === "unknown" || item.voice.category === "unspecified" || item.voice.category === gender));
+  if (eligible.length === 1) return eligible[0].voice.id;
+  if (answer.choice === "no_match") return "";
+  return eligible.filter((item) => item.probability > 0).sort((a, b) => b.probability - a.probability)[0]?.voice.id ?? "";
+}
+function availableUncastVoices(favorites, used) {
+  const reserved = new Set(used.map((voice) => voice.trim()).filter(Boolean));
+  return favorites.filter((voice) => !reserved.has(voice.id));
 }
 function uncastIdentityLabels(message, ghosts) {
   const labels = /* @__PURE__ */ new Set();
-  for (const ghost of ghosts) if (ghost.label) labels.add(ghost.label.toLowerCase());
+  for (const ghost of ghosts) for (const alias of ghostCastAliases(ghost)) labels.add(alias.toLowerCase());
+  const names = addUnconfiguredDialogueSpeakers(message, []).slice(0, 12).map((speaker) => speaker.name);
+  const relations = [...new Set([...message.matchAll(/\b(?:mom|mother|mum|dad|father|sister|brother|daughter|son|wife|husband|partner|parent|aunt|uncle|friend|boss|doctor|nurse|teacher|assistant)\b/giu)].map((match) => match[0].toLowerCase()))];
+  for (const name of names) for (const relation of relations) {
+    if (labels.size >= 60) break;
+    labels.add(`${name.toLowerCase()}'s ${relation}`);
+  }
   for (const match of message.matchAll(/\b(?:the|an?)\s+([a-z][a-z'-]{2,})(?:['?]s)?\b/giu)) {
     labels.add(`the ${match[1].toLowerCase().replace(/['?]s$/u, "")}`);
     if (labels.size >= 80) break;
@@ -66,7 +142,7 @@ function buildUncastVoiceDecision(groups, voices, message, ghosts = []) {
   const state = {
     message,
     characters: groups.map((group) => ({ id: group.id, identity: group.speakerId, speeches: group.speeches, context: group.context })),
-    ghosts: ghosts.map((ghost, index) => ({ option: `ghost_${index}`, identity: ghost.speakerId, label: ghost.label || null, context: ghost.context })),
+    ghosts: ghosts.map((ghost, index) => ({ option: `ghost_${index}`, identity: ghost.speakerId, label: ghost.label || null, aliases: ghostCastAliases(ghost), context: ghost.context, conversationHistory: ghost.conversationHistory ?? [] })),
     voices: voices.map((voice, index) => ({ option: `voice_${index}`, name: voice.name, category: voice.category, description: voice.description }))
   };
   const questions = {};
@@ -78,16 +154,16 @@ function buildUncastVoiceDecision(groups, voices, message, ghosts = []) {
     };
     if (labels.length) questions[`label_${group.id}`] = {
       type: "choice",
-      instructions: `Choose the descriptive label that identifies the speaker of ${group.id} in this scene. Choose none if no label unambiguously identifies this individual. Do not select an object, addressee, or another person.`,
+      instructions: `Choose the descriptive label for the person who actually speaks the quoted dialogue in ${group.id}. A person mentioned in narration, observing, or addressed by the speaker is not necessarily speaking. Choose none unless the label identifies the speaker of these quotations.`,
       criteria: { none: "No reliable descriptive identity.", ...Object.fromEntries(labels.map((label, index) => [`label_${index}`, label])) }
     };
     const earlier = groups.slice(0, groups.indexOf(group));
     if (ghosts.length || earlier.length) questions[`identity_${group.id}`] = {
       type: "choice",
-      instructions: `Does character ${group.id} clearly represent the same individual as one prior character? Compare all contexts and dialogue, not just shared gender or voice. Select new_or_unclear unless the identity is clear.`,
+      instructions: `Does character ${group.id} clearly represent the same individual as one prior character? Compare the full current exchange and prior conversation history, including what others say to this person, relationships, and whether a phone call continues or the same caller arrives in person. Do not confuse a speaker with the person they address; consider scene changes and alternative callers. Shared gender, occupation, or voice alone is insufficient. Select new_or_unclear unless identity is clear.`,
       criteria: {
         new_or_unclear: "A new character, or identity cannot be reliably established.",
-        ...Object.fromEntries(ghosts.map((ghost, index) => [`ghost_${index}`, `Previously seen character ${ghost.label || ghost.speakerId}; context: ${ghost.context}`])),
+        ...Object.fromEntries(ghosts.map((ghost, index) => [`ghost_${index}`, `Previously seen character ${ghostCastAliases(ghost).join(" / ") || ghost.speakerId}; context: ${ghost.context}`])),
         ...Object.fromEntries(earlier.map((previous) => [`group_${previous.id}`, `Earlier character ${previous.id}; context: ${previous.context.join(" ").slice(0, 2e3)}`]))
       }
     };
@@ -101,11 +177,51 @@ function buildUncastVoiceDecision(groups, voices, message, ghosts = []) {
     if (!voices.length) continue;
     questions[`voice_${group.id}`] = {
       type: "choice",
-      instructions: `Rank the available voices by how well their descriptions suit character ${group.id}. Consider the full scene and all dialogue and context belonging to this same individual, including other character groups when clearly the same person. Choose no_match if no voice is suitable.`,
-      criteria: { ...Object.fromEntries(state.voices.map((voice) => [voice.option, `${voice.name || "Unnamed voice"}; ${voice.category}; ${voice.description || "No description provided."}`])), no_match: "No available voice is suitable." }
+      instructions: `Rank the available voices for the person who actually speaks the quoted dialogue in ${group.id}. Narration-only bystanders and people merely addressed are not speakers. Use the full scene as context, including other character groups only when clearly the same speaker. Select the best available voice.`,
+      criteria: { ...Object.fromEntries(state.voices.map((voice) => [voice.option, `${voice.name || "Unnamed voice"}; ${voice.category}; ${voice.description || "No description provided."}`])), ...state.voices.length === 1 ? { no_match: "No suitable voice is available." } : {} }
     };
   }
   return { state, questions };
+}
+function buildUncastIdentityReview(groups, answers, message, ghosts = []) {
+  const labels = uncastIdentityLabels(message, ghosts);
+  const questions = {};
+  for (const [index, group] of groups.entries()) {
+    if (Object.keys(questions).length >= 16) break;
+    const identity = answers[`identity_${group.id}`];
+    const ghostChoice = identity?.choice.match(/^ghost_(\d+)$/u);
+    const candidate = ghostChoice ? ghosts[Number(ghostChoice[1])] : void 0;
+    const probability = identity ? identity.probabilities[identity.choice] ?? 0 : 0;
+    const runnerUp = identity ? Math.max(0, ...Object.entries(identity.probabilities).filter(([key]) => key !== identity.choice).map(([, value]) => value)) : 0;
+    if (candidate && identity && probability >= 0.6 && identity.confidence >= 0.5 && probability - runnerUp >= 0.2 && (probability < 0.8 || identity.confidence < 0.8 || probability - runnerUp < 0.25)) {
+      questions[`review_ghost_${group.id}_${ghostChoice[1]}`] = {
+        type: "choice",
+        instructions: `Compare the speaker in current group ${group.id} with the previously seen character ${candidate.label || candidate.speakerId}. Read the prior character's conversation history and the full current scene, including other participants? dialogue, relationship clues, and continuity from phone to in-person. Confirm only if they are the same person; distinguish callers, people addressed, and people merely mentioned.`,
+        criteria: { same: "The prior character and current speaker are clearly the same person.", different_or_unclear: "They differ or the evidence is insufficient." }
+      };
+    }
+    const label = answers[`label_${group.id}`];
+    const labelIndex = label?.choice.match(/^label_(\d+)$/u);
+    const labelProbability = label ? label.probabilities[label.choice] ?? 0 : 0;
+    const labelRunnerUp = label ? Math.max(0, ...Object.entries(label.probabilities).filter(([key]) => key !== label.choice).map(([, probability2]) => probability2)) : 0;
+    const named = labelIndex && labels[Number(labelIndex[1])] && label && label.confidence >= 0.7 && labelProbability >= 0.7 && labelProbability - labelRunnerUp >= 0.25;
+    if (!named) continue;
+    for (const previous of groups.slice(0, index).slice(-8)) {
+      const pair = answers[`same_${group.id}_${previous.id}`];
+      const priorLabel = answers[`label_${previous.id}`];
+      const priorNamed = priorLabel?.choice.startsWith("label_") && priorLabel.confidence >= 0.7 && (priorLabel.probabilities[priorLabel.choice] ?? 0) >= 0.7;
+      const probability2 = pair?.probabilities.same ?? 0;
+      if (priorNamed || pair?.choice !== "same" || probability2 < 0.8 || pair.confidence < 0.6 || pair.confidence >= 0.8) continue;
+      questions[`review_same_${group.id}_${previous.id}`] = {
+        type: "choice",
+        instructions: `Review whether the speaker of the earlier group ${previous.id} is the same individual as ${group.id}, identified as ${labels[Number(labelIndex[1])]}. Read the entire scene, including intervening turns and narration. Shared occupation, gender, or similar voice alone is not enough.`,
+        criteria: { same: "The scene clearly establishes that both groups have the same speaker.", different_or_unclear: "The speakers differ or the evidence is insufficient." }
+      };
+      if (Object.keys(questions).length >= 16) break;
+    }
+    if (Object.keys(questions).length >= 16) break;
+  }
+  return { state: { message, characters: groups.map((group) => ({ id: group.id, identity: group.speakerId, speeches: group.speeches, context: group.context })), ghosts: ghosts.map((ghost, index) => ({ option: `ghost_${index}`, identity: ghost.speakerId, aliases: ghostCastAliases(ghost), context: ghost.context })) }, questions };
 }
 function resolveUncastVoiceDecisions(groups, voices, answers, ghosts = [], reserved = [], messageId = "", message = "", previousMessageIds = []) {
   const used = new Set(reserved.filter(Boolean));
@@ -124,7 +240,9 @@ function resolveUncastVoiceDecisions(groups, voices, answers, ghosts = [], reser
   for (const group of groups) {
     let root = group.id;
     const occurrenceKey = messageId ? `${messageId}:${hashMessageContent(group.speeches.join("\n"))}` : "";
-    const exact = ghosts.find((item) => occurrenceKey && item.occurrenceKeys.includes(occurrenceKey)) ?? (group.speakerId !== UNCAST_SPEAKER_ID ? ghosts.find((item) => item.speakerId === group.speakerId) : void 0);
+    const name = group.speakerId.startsWith("unconfigured:") ? group.speakerId.slice("unconfigured:".length).toLowerCase() : "";
+    const aliasMatches = name ? ghosts.filter((item) => ghostCastAliases(item).some((alias) => alias.toLowerCase() === name)) : [];
+    const exact = ghosts.find((item) => occurrenceKey && item.occurrenceKeys.includes(occurrenceKey)) ?? (group.speakerId !== UNCAST_SPEAKER_ID ? ghosts.find((item) => item.speakerId === group.speakerId) : void 0) ?? (aliasMatches.length === 1 ? aliasMatches[0] : void 0);
     const identity = answers[`identity_${group.id}`];
     const labelAnswer = answers[`label_${group.id}`];
     const labelIndex = labelAnswer?.choice.match(/^label_(\d+)$/u);
@@ -134,20 +252,27 @@ function resolveUncastVoiceDecisions(groups, voices, answers, ghosts = [], reser
     if (label) groupLabels.set(group.id, label);
     const previousGroups = groups.slice(0, groups.indexOf(group)).slice(-8);
     const same = previousGroups.flatMap((previous) => {
-      const answer = answers[`same_${group.id}_${previous.id}`];
+      const review = answers[`review_same_${group.id}_${previous.id}`];
+      const answer = review && strongChoice(review) ? review : answers[`same_${group.id}_${previous.id}`];
       return answer?.choice === "same" && strongChoice(answer) ? [{ previous, probability: answer.probabilities.same ?? 0 }] : [];
     }).sort((a, b) => b.probability - a.probability);
     if (same[0]) root = roots.get(same[0].previous.id) ?? root;
     else if (label && rootByLabel.has(label)) root = rootByLabel.get(label);
     else if (strongChoice(identity) && identity?.choice.startsWith("group_")) root = roots.get(identity.choice.slice(6)) ?? root;
-    const namedGhosts = label ? ghosts.filter((item) => item.label?.toLowerCase() === label) : [];
+    const namedGhosts = label ? ghosts.filter((item) => ghostCastAliases(item).some((alias) => alias.toLowerCase() === label)) : [];
     const rankedGhosts = namedGhosts.map((item) => ({ item, recent: Math.max(
       previousMessageIds.indexOf(item.lastSeenMessageId),
       ...item.occurrenceKeys.map((key) => previousMessageIds.indexOf(key.split(":", 1)[0]))
     ) })).sort((a, b) => b.recent - a.recent);
     const priorGhost = rankedGhosts[0]?.recent >= 0 && (rankedGhosts.length === 1 || rankedGhosts[0].recent > rankedGhosts[1].recent) ? rankedGhosts[0].item : void 0;
-    let ghost = namedGhosts.length === 1 ? namedGhosts[0] : priorGhost ?? exact;
+    const reviewedGhost = group.speakerId.startsWith("ghost:") ? ghosts.find((item) => item.id === group.speakerId.slice("ghost:".length)) : void 0;
+    let ghost = reviewedGhost ?? (namedGhosts.length === 1 ? namedGhosts[0] : priorGhost ?? exact);
     if (!ghost && strongChoice(identity) && identity?.choice.startsWith("ghost_")) ghost = ghosts[Number(identity.choice.slice(6))];
+    if (!ghost && identity?.choice.startsWith("ghost_")) {
+      const ghostIndex = identity.choice.slice(6);
+      const review = answers[`review_ghost_${group.id}_${ghostIndex}`];
+      if (review?.choice === "same" && strongChoice(review)) ghost = ghosts[Number(ghostIndex)];
+    }
     roots.set(group.id, root);
     if (label && !rootByLabel.has(label)) rootByLabel.set(label, root);
     if (ghost && !reserved.includes(ghost.voiceId) && !linkedGhosts.has(root)) linkedGhosts.set(root, ghost);
@@ -159,18 +284,26 @@ function resolveUncastVoiceDecisions(groups, voices, answers, ghosts = [], reser
     const gender = genders.size === 1 ? genderVotes[0].choice : "unknown";
     let ghost = linkedGhosts.get(root);
     if (!ghost) {
-      const matches = members.map((group) => answers[`voice_${group.id}`]).filter((answer) => answer && answer.choice !== "no_match");
-      const ranked = voices.flatMap((voice, index) => {
+      const matches = members.map((group) => answers[`voice_${group.id}`]).filter((answer) => !!answer);
+      const eligible = voices.flatMap((voice, index) => {
         if (used.has(voice.id) || gender !== "unknown" && voice.category !== "unspecified" && voice.category !== gender) return [];
         const scores = matches.map((match) => match.probabilities[`voice_${index}`] ?? 0).filter((score) => Number.isFinite(score) && score > 0);
-        return scores.length ? [{ voice, score: scores.reduce((sum, score) => sum + score, 0) / scores.length, index }] : [];
-      }).sort((a, b) => b.score - a.score || a.index - b.index);
+        return [{ voice, score: scores.length ? scores.reduce((sum, score) => sum + score, 0) / scores.length : 0, index }];
+      });
+      const ranked = eligible.filter((item) => item.score > 0).sort((a, b) => b.score - a.score || a.index - b.index);
+      if (!ranked.length && eligible.length === 1 && matches.length) ranked.push(eligible[0]);
       if (!ranked[0]) continue;
       ghost = { id: `pending:${root}`, speakerId: members[0].speakerId, voiceId: ranked[0].voice.id, context: members.flatMap((group) => group.context).join(" ").slice(0, 2e3), occurrenceKeys: [], lastSeenMessageId: messageId };
     }
     used.add(ghost.voiceId);
     const label = ghost.label || members.map((group) => groupLabels.get(group.id)).find(Boolean);
-    for (const group of members) assignments.push({ groupId: group.id, voiceId: ghost.voiceId, gender, ghostId: ghost.id, ...label ? { label } : {} });
+    for (const group of members) {
+      const aliases = mergeGhostAliases(
+        group.speakerId.startsWith("unconfigured:") ? [group.speakerId.slice("unconfigured:".length)] : [],
+        groupLabels.has(group.id) ? [groupLabels.get(group.id)] : []
+      );
+      assignments.push({ groupId: group.id, voiceId: ghost.voiceId, gender, ghostId: ghost.id, ...label ? { label } : {}, ...aliases.length ? { aliases } : {} });
+    }
   }
   return assignments;
 }
@@ -277,7 +410,7 @@ function readDetectedCharacters(value, fallbackIds) {
     const count = typeof item.messageCount === "number" && Number.isFinite(item.messageCount) ? Math.max(0, Math.round(item.messageCount)) : 0;
     result.push({
       id: item.id,
-      name: typeof item.name === "string" ? item.name.trim().slice(0, 128) : "",
+      name: typeof item.name === "string" ? item.name.trim().slice(0, 4096) : "",
       messageCount: count
     });
   }
@@ -518,6 +651,12 @@ function addUnconfiguredDialogueSpeakers(content, speakers, skippedTrackerTagPai
     result.push({ id, name });
     for (const alias of aliases) knownAliases.add(alias.toLowerCase());
   };
+  const narrative = narrativeOnly(preparedContent);
+  for (const match of narrative.matchAll(/\b([\p{Lu}][\p{L}\p{M}-]{1,63})['\u2019]s\s+[\p{L}\p{M}-]+/gu)) addCandidate(match[1]);
+  for (const match of narrative.matchAll(/\b(?:and|but|then)\s+([\p{Lu}][\p{L}\p{M}-]{1,63})\s+[\p{Ll}][\p{L}\p{M}-]+/gu)) addCandidate(match[1]);
+  for (const quote of playbackQuotes(preparedContent)) {
+    for (const match of quote.text.matchAll(/\bI(?:'|\u2019)m\s+([\p{Lu}][\p{L}\p{M}-]{1,63})\b/gu)) addCandidate(match[1]);
+  }
   const paragraphs = playbackParagraphs(preparedContent);
   for (let paragraphIndex = 0; paragraphIndex < paragraphs.length; paragraphIndex += 1) {
     const paragraph = paragraphs[paragraphIndex];
@@ -1454,6 +1593,108 @@ function buildSpeakerDecisionPlan(content, speakers, isUserMessage, skippedTrack
     plan.state.turnQuestionsOmitted = true;
   }
   return plan;
+}
+function buildAssistantUserSpeakerReview(plan, answers) {
+  const others = plan.state.speakers.filter((speaker) => speaker.id !== USER_SPEAKER_ID);
+  const questions = {};
+  if (plan.state.messageRole === "assistant" && others.length && hasNamedSpeakerSubject(plan.state.message, others)) {
+    const criteria = speakerDecisionCriteria(plan.state.speakers);
+    for (const speech of plan.state.speeches) {
+      const first = evaluateSpeakerDecisionAnswer(answers[`speech_${speech.id}`], plan.optionSpeakerIds);
+      if (first.identity !== USER_SPEAKER_ID) continue;
+      questions[`user_review_${speech.id}`] = {
+        type: "choice",
+        instructions: `Independently identify who actually speaks quotation ${speech.id}. Consider the full scene, pronouns, the active user persona's name and role, who is physically speaking versus listening or addressed, and dialogue on a phone or other channel. Select the user only if the scene supports that identity; choose an uncast person or unclear if appropriate.`,
+        criteria
+      };
+    }
+  }
+  return { state: plan.state, questions };
+}
+function applyAssistantUserSpeakerReview(plan, answers, reviewed) {
+  for (const speech of plan.state.speeches) {
+    const result = reviewed[`user_review_${speech.id}`];
+    if (!result) continue;
+    answers[`user_review_${speech.id}`] = result;
+    const evaluated = evaluateSpeakerDecisionAnswer(result, plan.optionSpeakerIds, { probability: 0.8, confidence: 0.8, margin: 0.25 });
+    if (plan.state.messageRole === "assistant" && evaluated.identity && evaluated.identity !== USER_SPEAKER_ID && evaluateSpeakerDecisionAnswer(answers[`speech_${speech.id}`], plan.optionSpeakerIds).identity === USER_SPEAKER_ID) {
+      answers[`user_review_original_${speech.id}`] = answers[`speech_${speech.id}`];
+      answers[`speech_${speech.id}`] = result;
+      answers[`user_review_applied_${speech.id}`] = result;
+    }
+  }
+}
+function relationshipReviewContext(messages, targetId, ghosts, skippedTags = "") {
+  const target = messages.findIndex((message) => message.id === targetId);
+  if (target < 0) return { previousMessages: [], ghosts: [] };
+  const prior = messages.slice(0, target);
+  const priorIds = new Set(prior.map((message) => message.id));
+  const previousMessages = prior.filter((message) => !message.is_user).slice(-2).map((message) => ({ id: message.id, text: preparePlaybackContent(message.content ?? "", skippedTags).slice(-4e3) }));
+  const safeGhosts = ghosts.flatMap((ghost) => {
+    const lastIndex = messages.findIndex((message) => message.id === ghost.lastSeenMessageId);
+    const safeCurrent = lastIndex >= 0 && lastIndex <= target;
+    const history = (ghost.conversationHistory ?? []).filter((entry) => priorIds.has(entry.messageId)).map((entry) => ({ messageId: entry.messageId, text: preparePlaybackContent(entry.text, skippedTags).slice(0, 6e3) }));
+    if (!safeCurrent && !history.length) return [];
+    return [{
+      id: ghost.id,
+      label: safeCurrent ? ghost.label ?? "" : "",
+      aliases: safeCurrent ? ghostCastAliases(ghost) : [],
+      context: safeCurrent ? preparePlaybackContent(ghost.context, skippedTags).slice(0, 2e3) : "",
+      conversationHistory: history
+    }];
+  }).slice(0, 20);
+  return { previousMessages, ghosts: safeGhosts };
+}
+function buildRelationshipSpeakerReview(plan, answers, context) {
+  const questions = {};
+  const ghostOptions = {};
+  const speakers = plan.state.speakers.map((speaker) => ({ id: speaker.id, name: speaker.name }));
+  const criteria = speakerDecisionCriteria(plan.state.speakers.slice(0, 220));
+  const remaining = Math.max(0, 255 - Object.keys(criteria).length);
+  const castAliases = new Set(plan.state.speakers.filter((speaker) => speaker.id !== USER_SPEAKER_ID).flatMap((speaker) => speaker.aliases.map((alias) => alias.toLowerCase())));
+  context.ghosts.filter((ghost) => !ghost.aliases.some((alias) => castAliases.has(alias.toLowerCase()))).slice(0, Math.min(20, remaining)).forEach((ghost, index) => {
+    const option = `relationship_ghost_${index}`;
+    ghostOptions[option] = `ghost:${ghost.id}`;
+    criteria[option] = `Previously heard temporary character ${ghost.label || ghost.aliases.join(" / ") || `ghost ${index + 1}`}; use the supplied prior conversation, not the label alone.`;
+  });
+  const phoneExchange = /\b(?:phone|telephone|caller|call|earpiece|voicemail|speakerphone)\b/iu.test(plan.state.message);
+  if (context.previousMessages.length || context.ghosts.length) {
+    for (const speech of plan.state.speeches) {
+      const local = evaluateSpeakerDecisionAnswer(answers[`speech_${speech.id}`], plan.optionSpeakerIds);
+      const paragraph = evaluateSpeakerDecisionAnswer(answers[`paragraph_${speech.paragraphId}`], plan.optionSpeakerIds);
+      const attribution = narrativeAttributionSpeaker(`${speech.narrativeBefore} ${speech.narrativeAfter}`, speakers);
+      if (attribution && local.identity === attribution) continue;
+      const conflict = !!local.identity && !!paragraph.identity && local.identity !== paragraph.identity;
+      if (local.identity && local.identity !== UNCAST_SPEAKER_ID && !conflict && !phoneExchange) continue;
+      questions[`relationship_${speech.id}`] = {
+        type: "choice",
+        instructions: `Who actually speaks quotation ${speech.id}? Compare the current exchange with the earlier conversations and relevant relationships. Distinguish speakers from people addressed or mentioned, and a caller from the person holding the phone. Consider whether a call continues, a different caller appears, or a person later arrives in person. Prefer explicit local attribution and select no_clear_identity when the evidence is insufficient.`,
+        criteria
+      };
+      if (Object.keys(questions).length >= 32) break;
+    }
+  }
+  return { state: { ...plan.state, previousMessages: context.previousMessages, ghosts: context.ghosts }, questions, ghostOptions };
+}
+function applyRelationshipSpeakerReview(plan, answers, reviewed, ghostOptions) {
+  const options = { ...plan.optionSpeakerIds, ...ghostOptions };
+  for (const speech of plan.state.speeches) {
+    const result = reviewed[`relationship_${speech.id}`];
+    if (!result) continue;
+    answers[`relationship_review_${speech.id}`] = result;
+    const reviewedIdentity = evaluateSpeakerDecisionAnswer(result, options, { probability: 0.85, confidence: 0.8, margin: 0.3 }).identity;
+    const original = answers[`speech_${speech.id}`];
+    const originalIdentity = evaluateSpeakerDecisionAnswer(original, plan.optionSpeakerIds).identity;
+    if (!reviewedIdentity || reviewedIdentity === originalIdentity) continue;
+    if (originalIdentity && originalIdentity !== UNCAST_SPEAKER_ID) {
+      const speakers = plan.state.speakers.map((speaker) => ({ id: speaker.id, name: speaker.name }));
+      if (narrativeAttributionSpeaker(`${speech.narrativeBefore} ${speech.narrativeAfter}`, speakers) === originalIdentity) continue;
+    }
+    Object.assign(plan.optionSpeakerIds, ghostOptions);
+    if (original) answers[`relationship_original_${speech.id}`] = original;
+    answers[`speech_${speech.id}`] = result;
+    answers[`relationship_applied_${speech.id}`] = result;
+  }
 }
 var TTS_TAG_THRESHOLDS = {
   probability: 0.65,
@@ -2485,7 +2726,7 @@ var SPEAKER_DECISION_THRESHOLDS = {
 };
 var TTS_TAG_SCHEMA = "tts-tags-7";
 var SPEAKER_DECISION_SCHEMA = {
-  classifier: "jev-5",
+  classifier: "jev-7-named-subjects",
   discourse: "discourse-1",
   hardBoundary: "boundary-1",
   turns: "turn-1",
@@ -3417,6 +3658,12 @@ function resolveSpeakerDecisionSegments(content, plan, answers, speakers, option
         debugPath: [
           `segment-type:speech (quote ${index + 1})`,
           ...decisionAnswerDebug("jev-speech", answer, plan.optionSpeakerIds),
+          ...decisionAnswerDebug("jev-relationship-original", answers[`relationship_original_${speech.id}`], plan.optionSpeakerIds),
+          ...decisionAnswerDebug("jev-relationship-review", answers[`relationship_review_${speech.id}`], plan.optionSpeakerIds),
+          ...answers[`relationship_applied_${speech.id}`] ? ["jev-relationship-review:strong alternative applied"] : [],
+          ...decisionAnswerDebug("jev-user-review-original", answers[`user_review_original_${speech.id}`], plan.optionSpeakerIds),
+          ...decisionAnswerDebug("jev-user-review", answers[`user_review_${speech.id}`], plan.optionSpeakerIds),
+          ...answers[`user_review_applied_${speech.id}`] ? ["jev-user-review:strong alternative applied"] : [],
           ...decisionAnswerDebug(`jev-${speech?.paragraphId ?? "paragraph"}`, paragraphAnswer, plan.optionSpeakerIds),
           `jev-local-thresholds:${describeDecisionThresholds(SPEAKER_DECISION_THRESHOLDS.local)}`,
           ...index === 0 ? [`card-deference:${cardIdentity ? "eligible" : "blocked"} (${cardReason})`] : [],
@@ -3768,9 +4015,13 @@ async function buildState(chat, userId) {
     const savedName = name || (id.startsWith("npc:") ? id.slice(4) : "");
     return character ? [{ ...character, name: savedName || character.name, messageCount }] : savedName ? [{ id, name: savedName, messageCount }] : [];
   });
+  const messages = await spindle.chat.getMessages(chat.id);
   return {
     id: chat.id,
     name: chat.name,
+    castScanned: candidates.length === 0 || metadata.chat_voice_cast_scanned === true || config.detectedCharacters.length > 0,
+    ghosts: readGhostVoices(metadata.chat_voice_ghost_cast),
+    assistantMessageIds: messages.filter((message) => !message.is_user).map((message) => message.id),
     messageLimit: config.messageLimit,
     connectionId: config.connectionId,
     narratorVoice: config.narratorVoice,
@@ -3819,7 +4070,7 @@ function sanitizeSaveConfig(previous, input) {
     for (const character of input.characters) {
       if (!character || typeof character.id !== "string" || typeof character.name !== "string") continue;
       const id = character.id.trim().slice(0, 256);
-      const name = normalizeSpeakerName(character.name).slice(0, 128);
+      const name = normalizeSpeakerName(character.name).slice(0, 4096);
       if (!id || !name || seen.has(id)) continue;
       seen.add(id);
       detectedCharacters.push({
@@ -4212,14 +4463,20 @@ async function scanCardCast(cards, userId) {
   }
 }
 var saveQueues = /* @__PURE__ */ new Map();
-async function saveGhostVoiceAssignments(chatId, messageId, assistantIds, groups, assignments, userId, anchorId = messageId) {
+async function saveGhostVoiceAssignments(chatId, messageId, assistantIds, groups, assignments, userId, anchorId = messageId, reserved = [], lifetime = 10, conversation = "") {
   const queueKey = `${userId ?? "user"}:${chatId}`;
   const previous = saveQueues.get(queueKey) ?? Promise.resolve();
   const task = previous.catch(() => void 0).then(async () => {
     const chat = await spindle.chats.get(chatId, userId);
-    if (!chat) return;
+    if (!chat) return [];
     const metadata = chat.metadata ?? {};
     const ghosts = readGhostVoices(metadata.chat_voice_ghost_cast);
+    const currentMessages = await spindle.chat.getMessages(chatId);
+    const currentAssistantIds = currentMessages.filter((message) => !message.is_user).map((message) => message.id);
+    const activeGhosts = activeGhostVoices(ghosts, currentAssistantIds, currentAssistantIds.at(-1) ?? anchorId, lifetime);
+    const config = readConfig(metadata, chatMemberIds(chat));
+    const unavailable = new Set([...reserved, config.narratorVoice, config.userVoice, ...Object.values(config.characterVoices)].filter(Boolean));
+    const accepted = [];
     const pendingIds = /* @__PURE__ */ new Map();
     for (const assignment of assignments) {
       const group = groups.find((item) => item.id === assignment.groupId);
@@ -4235,11 +4492,19 @@ async function saveGhostVoiceAssignments(chatId, messageId, assistantIds, groups
         }
       }
       let ghost = ghosts.find((item) => item.id === ghostId);
+      if (!ghost && !assignment.ghostId?.startsWith("pending:")) continue;
+      const voiceId = ghost?.voiceId ?? assignment.voiceId;
+      if (!canReserveAutomaticVoice(voiceId, unavailable, ghost ? activeGhosts.filter((item) => item.id === ghostId) : activeGhosts, ghostId)) continue;
       if (!ghost) {
-        ghost = { id: ghostId, speakerId: group.speakerId, voiceId: assignment.voiceId, context: "", occurrenceKeys: [], lastSeenMessageId: anchorId };
+        ghost = { id: ghostId, speakerId: group.speakerId, voiceId, context: "", occurrenceKeys: [], lastSeenMessageId: anchorId, createdAtMessageId: currentAssistantIds.at(-1) ?? anchorId };
         ghosts.push(ghost);
+        activeGhosts.push(ghost);
       }
+      markGhostVoiceInvoked(ghost, currentAssistantIds, messageId);
+      accepted.push({ ...assignment, voiceId });
       if (!ghost.label && assignment.label) ghost.label = assignment.label;
+      ghost.aliases = mergeGhostAliases(ghostCastAliases(ghost), assignment.aliases ?? []);
+      updateGhostConversationHistory(ghost, messageId, conversation, currentAssistantIds);
       const occurrence = `${messageId}:${hashMessageContent(group.speeches.join("\n"))}`;
       if (!ghost.occurrenceKeys.includes(occurrence)) ghost.occurrenceKeys = [...ghost.occurrenceKeys, occurrence].slice(-100);
       const previousIndex = assistantIds.indexOf(ghost.lastSeenMessageId);
@@ -4250,13 +4515,15 @@ async function saveGhostVoiceAssignments(chatId, messageId, assistantIds, groups
         ghost.context = [priorContext, ...group.context].filter(Boolean).join(" ").slice(-2e3);
       }
     }
-    await spindle.chats.update(chatId, { metadata: { ...metadata, chat_voice_ghost_cast: ghosts.slice(-200) } }, userId);
+    if (accepted.length) await spindle.chats.update(chatId, { metadata: { ...metadata, chat_voice_ghost_cast: ghosts.slice(-200) } }, userId);
+    return accepted;
   });
-  saveQueues.set(queueKey, task);
+  const queued = task.then(() => void 0, () => void 0);
+  saveQueues.set(queueKey, queued);
   try {
-    await task;
+    return await task;
   } finally {
-    if (saveQueues.get(queueKey) === task) saveQueues.delete(queueKey);
+    if (saveQueues.get(queueKey) === queued) saveQueues.delete(queueKey);
   }
 }
 function queueSpeakerParse(payload, userId, frontendSessionId) {
@@ -4272,7 +4539,9 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
     const config = readConfig(chat.metadata ?? {}, cards.map((card) => card.id));
     const userAliases = [];
     const seenUserAliases = /* @__PURE__ */ new Set();
-    for (const item of messages) {
+    const activePersona = await spindle.personas.getActive(userId).catch(() => null);
+    const aliasSources = [...activePersona?.name ? [{ is_user: true, name: activePersona.name }] : [], ...messages];
+    for (const item of aliasSources) {
       if (!item.is_user) continue;
       const name = normalizeSpeakerName(item.name);
       if (!name) continue;
@@ -4293,9 +4562,13 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
     const assistantIds = messages.filter((item) => !item.is_user).map((item) => item.id);
     const anchor = message.is_user ? messages.slice(0, messageIndex).filter((item) => !item.is_user).at(-1)?.id ?? "" : message.id;
     const lifetime = Number.isFinite(payload.ghostVoiceLifetime) ? Math.min(1e3, Math.max(1, Math.round(payload.ghostVoiceLifetime))) : 10;
-    for (const ghost of activeGhostVoices(readGhostVoices(chat.metadata?.chat_voice_ghost_cast), assistantIds, anchor, lifetime)) {
+    const activeGhostsForReview = activeGhostVoices(readGhostVoices(chat.metadata?.chat_voice_ghost_cast), assistantIds, anchor, lifetime);
+    const relationshipContext = relationshipReviewContext(messages, message.id, activeGhostsForReview, skippedTrackerTags);
+    for (const ghost of activeGhostsForReview) {
       if (!ghost.speakerId.startsWith("unconfigured:")) continue;
+      const safe = relationshipContext.ghosts.find((item) => item.id === ghost.id);
       const name = ghost.speakerId.slice("unconfigured:".length);
+      if (!safe || !safe.aliases.some((alias) => alias.toLowerCase() === name.toLowerCase())) continue;
       if (!name || configuredSpeakers.some((speaker) => speaker.id === ghost.speakerId || speakerAliases(speaker.name).some((alias) => alias.toLowerCase() === name.toLowerCase()))) continue;
       configuredSpeakers.push({ id: ghost.speakerId, name });
     }
@@ -4392,6 +4665,7 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
           })),
           cardSpeakerId: titleMatchedCardSpeakerId,
           historicalSpeakerId,
+          relationshipReview: { version: "relationship-review-1", context: relationshipContext },
           previousAssistantMessageId: previousAssistantMessage?.id ?? null,
           skippedTrackerTags
         }));
@@ -4422,6 +4696,36 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
               confidence: answer.confidence
             };
           }
+          const userReview = buildAssistantUserSpeakerReview(decisionPlan, answers);
+          let userReviewFailed = false;
+          if (Object.keys(userReview.questions).length) {
+            try {
+              const reviewResult = await spindle.decisions.evaluate({ state: userReview.state, questions: userReview.questions, ...userId ? { userId } : {} });
+              const reviewed = {};
+              for (const [id, answer] of Object.entries(reviewResult.answers)) {
+                if (answer.type === "choice") reviewed[id] = { choice: answer.choice, probabilities: answer.probabilities, confidence: answer.confidence };
+              }
+              applyAssistantUserSpeakerReview(decisionPlan, answers, reviewed);
+            } catch (error) {
+              userReviewFailed = true;
+              spindle.log.warn(`[Chat Voice] User speaker review failed; keeping original assignments: ${error instanceof Error ? error.message : String(error)}`);
+            }
+          }
+          const relationshipReview = buildRelationshipSpeakerReview(decisionPlan, answers, relationshipContext);
+          let relationshipReviewFailed = false;
+          if (Object.keys(relationshipReview.questions).length) {
+            try {
+              const relationshipResult = await spindle.decisions.evaluate({ state: relationshipReview.state, questions: relationshipReview.questions, ...userId ? { userId } : {} });
+              const reviewed = {};
+              for (const [id, answer] of Object.entries(relationshipResult.answers)) {
+                if (answer.type === "choice") reviewed[id] = { choice: answer.choice, probabilities: answer.probabilities, confidence: answer.confidence };
+              }
+              applyRelationshipSpeakerReview(decisionPlan, answers, reviewed, relationshipReview.ghostOptions);
+            } catch (error) {
+              relationshipReviewFailed = true;
+              spindle.log.warn(`[Chat Voice] Relationship speaker review failed; keeping original assignments: ${error instanceof Error ? error.message : String(error)}`);
+            }
+          }
           const { assessment: discourseAssessment, evaluation: discourse } = await reviewDiscourseEscalation(
             decisionPlan,
             answers,
@@ -4445,15 +4749,20 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
               }
             }
           );
+          const relationshipStatus = relationshipReviewFailed ? "failed; original assignments retained" : `${Object.keys(relationshipReview.questions).length} quotation(s) reviewed`;
+          const reviewedSegments = payload.debug ? segments.map((segment) => segment.debugPath ? {
+            ...segment,
+            debugPath: [...segment.debugPath, `relationship-review-status:${relationshipStatus}`]
+          } : segment) : segments;
           const tagResult = await applyTtsTags(
-            segments,
+            reviewedSegments,
             decisionPlan,
             tagStyle,
             tagSelectionsPromise,
             payload.debug
           );
           const taggedSegments = tagResult.segments;
-          if (!tagResult.tagFailed) {
+          if (!tagResult.tagFailed && !userReviewFailed && !relationshipReviewFailed) {
             const nextConfig = {
               ...config,
               parsedMessages: {
@@ -4600,7 +4909,7 @@ function queueScan(payload, userId, frontendSessionId) {
       detectedCharacters: [...detected.values()],
       parsedMessages: {}
     };
-    const metadata = applyConfigToMetadata(chat.metadata ?? {}, nextConfig);
+    const metadata = { ...applyConfigToMetadata(chat.metadata ?? {}, nextConfig), chat_voice_cast_scanned: candidates.length > 0 };
     await spindle.chats.update(chat.id, { metadata }, userId);
     await sendState(userId, void 0, chat.id, frontendSessionId);
     sendFrontend({
@@ -4618,6 +4927,30 @@ spindle.onFrontendMessage(async (rawPayload, userId, frontendSessionId) => {
   const payload = rawPayload;
   try {
     if (payload?.type === "chat_voice_refresh") {
+      if (payload.chatId && Number.isFinite(payload.ghostLifetime)) {
+        const chatId = payload.chatId;
+        const lifetime = Math.min(1e3, Math.max(1, Math.round(payload.ghostLifetime)));
+        const queueKey = `${userId ?? "user"}:${chatId}`;
+        const previous = saveQueues.get(queueKey) ?? Promise.resolve();
+        const task = previous.catch(() => void 0).then(async () => {
+          const chat = await spindle.chats.get(chatId, userId);
+          if (!chat) return;
+          const metadata = chat.metadata ?? {};
+          const ghosts = readGhostVoices(metadata.chat_voice_ghost_cast);
+          if (!ghosts.some((ghost) => ghost.context || ghost.conversationHistory?.length)) return;
+          const messages = await spindle.chat.getMessages(chatId);
+          const ids = messages.filter((message) => !message.is_user).map((message) => message.id);
+          if (purgeExpiredGhostContexts(ghosts, ids, lifetime)) {
+            await spindle.chats.update(chatId, { metadata: { ...metadata, chat_voice_ghost_cast: ghosts } }, userId);
+          }
+        });
+        saveQueues.set(queueKey, task);
+        try {
+          await task;
+        } finally {
+          if (saveQueues.get(queueKey) === task) saveQueues.delete(queueKey);
+        }
+      }
       await sendState(userId, void 0, payload.chatId, frontendSessionId, payload.requestId);
     } else if (payload?.type === "chat_voice_decision_status") {
       sendFrontend({
@@ -4666,33 +4999,54 @@ spindle.onFrontendMessage(async (rawPayload, userId, frontendSessionId) => {
         const savedGhosts = readGhostVoices(chat.metadata?.chat_voice_ghost_cast);
         const lifetime = Number.isFinite(payload.lifetime) ? Math.min(1e3, Math.max(1, Math.round(payload.lifetime))) : 10;
         const ghosts = activeGhostVoices(savedGhosts, assistantIds, anchor, lifetime);
-        const voices = readFavoriteVoices(payload.voices).filter((voice) => !ghosts.some((ghost) => ghost.voiceId === voice.id));
+        const currentGhosts = activeGhostVoices(savedGhosts, assistantIds, assistantIds.at(-1) ?? anchor, lifetime);
+        const config = readConfig(chat.metadata ?? {}, chatMemberIds(chat));
+        const voices = availableUncastVoices(readFavoriteVoices(payload.voices), [...payload.reserved, config.narratorVoice, config.userVoice, ...Object.values(config.characterVoices), ...ghosts.map((ghost) => ghost.voiceId), ...currentGhosts.map((ghost) => ghost.voiceId)]).slice(0, 254);
         if (!groups.length || !voices.length && !ghosts.length) {
-          sendFrontend({ type: "chat_voice_uncast_matches", requestId: payload.requestId, assignments: [] }, userId, frontendSessionId);
+          sendFrontend({ type: "chat_voice_uncast_matches", requestId: payload.requestId, assignments: [], diagnostics: [`No matching request: groups=${groups.length}, availableFavorites=${voices.length}, historicalGhosts=${ghosts.length}, currentGhosts=${currentGhosts.length}.`] }, userId, frontendSessionId);
         } else {
           const plan = buildUncastVoiceDecision(groups, voices, payload.message.slice(0, 3e4), ghosts);
           const answers = {};
+          let decisionError = "";
           try {
             const result = await spindle.decisions.evaluate({ state: plan.state, questions: plan.questions, ...userId ? { userId } : {} });
             for (const [id, answer] of Object.entries(result.answers)) {
               if (answer.type === "choice") answers[id] = { choice: answer.choice, probabilities: answer.probabilities, confidence: answer.confidence };
             }
           } catch (error) {
-            spindle.log.warn(`[Chat Voice] Uncast voice decision failed; using exact ghost matches only: ${error instanceof Error ? error.message : String(error)}`);
+            decisionError = error instanceof Error ? error.message : String(error);
+            spindle.log.warn(`[Chat Voice] Uncast voice decision failed; using exact ghost matches only: ${decisionError}`);
           }
-          const assignments = resolveUncastVoiceDecisions(groups, voices, answers, ghosts, payload.reserved, payload.messageId, payload.message.slice(0, 3e4), assistantIds.slice(0, Math.max(0, assistantIds.indexOf(anchor))));
+          const review = buildUncastIdentityReview(groups, answers, payload.message.slice(0, 3e4), ghosts);
+          let reviewError = "";
+          if (Object.keys(review.questions).length) {
+            try {
+              const result = await spindle.decisions.evaluate({ state: review.state, questions: review.questions, ...userId ? { userId } : {} });
+              for (const [id, answer] of Object.entries(result.answers)) {
+                if (answer.type === "choice") answers[id] = { choice: answer.choice, probabilities: answer.probabilities, confidence: answer.confidence };
+              }
+            } catch (error) {
+              reviewError = error instanceof Error ? error.message : String(error);
+              spindle.log.warn(`[Chat Voice] Uncast identity review failed: ${reviewError}`);
+            }
+          }
+          let assignments = resolveUncastVoiceDecisions(groups, voices, answers, ghosts, payload.reserved, payload.messageId, payload.message.slice(0, 3e4), assistantIds.slice(0, Math.max(0, assistantIds.indexOf(anchor))));
+          const proposedAssignments = assignments;
           if (assignments.length) {
-            await saveGhostVoiceAssignments(payload.chatId, payload.messageId, assistantIds, groups, assignments, userId, anchor);
+            assignments = await saveGhostVoiceAssignments(payload.chatId, payload.messageId, assistantIds, groups, assignments, userId, anchor, payload.reserved, lifetime, payload.message);
           }
           const diagnostics = groups.map((group) => {
             const identity = answers[`identity_${group.id}`];
             const label = answers[`label_${group.id}`];
             const voice = answers[`voice_${group.id}`];
-            const comparisons = Object.entries(answers).filter(([key]) => key.startsWith(`same_${group.id}_`)).map(([key, answer]) => `${key}=${answer.choice} confidence=${answer.confidence} probabilities=${JSON.stringify(answer.probabilities)}`).join(";") || "none";
+            const comparisons = Object.entries(answers).filter(([key]) => key.startsWith(`same_${group.id}_`) || key.startsWith(`review_same_${group.id}_`) || key.startsWith(`review_ghost_${group.id}_`)).map(([key, answer]) => `${key}=${answer.choice} confidence=${answer.confidence} probabilities=${JSON.stringify(answer.probabilities)}`).join(";") || "none";
             const assignment = assignments.find((item) => item.groupId === group.id);
-            return `${group.id} segments=${group.segmentIndexes.map((index) => index + 1).join(",")} identity=${identity ? `${identity.choice} confidence=${identity.confidence} probabilities=${JSON.stringify(identity.probabilities)}` : "none"} label=${label ? `${label.choice} confidence=${label.confidence} probabilities=${JSON.stringify(label.probabilities)}` : "none"} comparisons=${comparisons} voice-choice=${voice ? `${voice.choice} confidence=${voice.confidence} probabilities=${JSON.stringify(voice.probabilities)}` : "none"} final=${assignment ? `${assignment.label || "unnamed"} / ${assignment.ghostId} / ${assignment.voiceId}` : "connection default"}`;
+            const proposed = proposedAssignments.find((item) => item.groupId === group.id);
+            return `${group.id} segments=${group.segmentIndexes.map((index) => index + 1).join(",")} identity=${identity ? `${identity.choice} confidence=${identity.confidence} probabilities=${JSON.stringify(identity.probabilities)}` : "none"} label=${label ? `${label.choice} confidence=${label.confidence} probabilities=${JSON.stringify(label.probabilities)}` : "none"} comparisons=${comparisons} proposed=${proposed ? `${proposed.ghostId} / ${proposed.voiceId} / ${proposed.gender}` : "none"} voice-choice=${voice ? `${voice.choice} confidence=${voice.confidence} probabilities=${JSON.stringify(voice.probabilities)}` : "none"} final=${assignment ? `${assignment.label || "unnamed"} / ${assignment.ghostId} / ${assignment.voiceId}` : "connection default"}`;
           });
+          diagnostics.unshift(`Available favorites=${voices.length}, historical ghosts=${ghosts.length}, current ghosts=${currentGhosts.length}${decisionError ? `; Jev failed: ${decisionError}` : ""}; identity review questions=${Object.keys(review.questions).length}${reviewError ? `; review failed: ${reviewError}` : ""}.`);
           sendFrontend({ type: "chat_voice_uncast_matches", requestId: payload.requestId, assignments, diagnostics }, userId, frontendSessionId);
+          if (assignments.length) await sendState(userId, void 0, payload.chatId, frontendSessionId);
         }
       } catch (error) {
         sendFrontend({ type: "chat_voice_uncast_matches", requestId: payload.requestId, assignments: [], error: error instanceof Error ? error.message : "Could not match uncast voices." }, userId, frontendSessionId);
@@ -4741,6 +5095,129 @@ spindle.onFrontendMessage(async (rawPayload, userId, frontendSessionId) => {
           error: error instanceof Error ? error.message : "Could not load the message."
         }, userId, frontendSessionId);
       }
+    } else if (payload?.type === "chat_voice_auto_cast") {
+      const chat = await spindle.chats.get(payload.chatId, userId);
+      if (!chat) throw new Error("The chat is no longer available.");
+      const cards = await loadCharacters(chat, userId);
+      const config = readConfig(chat.metadata ?? {}, cards.map((card) => card.id));
+      const persona = await spindle.personas.getActive(userId).catch(() => null);
+      const roles = [
+        ...payload.narratorMissing ? [{ id: "narrator", description: "Narrator: a calm, measured, clear storytelling voice suited to extended narration." }] : [],
+        ...payload.userMissing && persona?.description ? [{ id: "user", description: `User persona ${persona.name}: ${persona.description}` }] : [],
+        ...config.detectedCharacters.filter((character) => !config.characterVoices[character.id]).map((character) => ({ id: character.id, description: `Character ${character.name}. Card context: ${cards.map((card) => `${card.name}: ${card.description} ${card.personality}`).join(" ").slice(0, 12e3)}` }))
+      ];
+      const messageIds = (await spindle.chat.getMessages(chat.id)).filter((message) => !message.is_user).map((message) => message.id);
+      const activeGhosts = activeGhostVoices(readGhostVoices(chat.metadata?.chat_voice_ghost_cast), messageIds, messageIds.at(-1) ?? "", payload.ghostLifetime);
+      const voices = readFavoriteVoices(payload.voices).filter((voice) => !payload.reserved.includes(voice.id) && !Object.values(config.characterVoices).includes(voice.id) && !activeGhosts.some((ghost) => ghost.voiceId === voice.id)).slice(0, 254);
+      const selected = {};
+      const diagnostics = [`roles=${roles.length}, favorites=${payload.voices.length}, available=${voices.length}, activeGhosts=${activeGhosts.length}`];
+      if (roles.length && voices.length) {
+        const questions = Object.fromEntries(roles.map((role, index) => [`role_${index}`, {
+          type: "choice",
+          instructions: `Choose the best available voice for ${role.description}. Compare voice descriptions and gender when established.`,
+          criteria: { ...Object.fromEntries(voices.map((voice, i) => [`voice_${i}`, `${voice.name || voice.id}; ${voice.category}; ${voice.description || "No description provided"}`])), ...voices.length === 1 ? { no_match: "No voice is suitable." } : {} }
+        }]));
+        roles.forEach((role, index) => {
+          if (role.id !== "narrator") questions[`gender_${index}`] = {
+            type: "choice",
+            instructions: `Identify the gender of ${role.description}. Choose unknown unless established.`,
+            criteria: { male: "Male.", female: "Female.", unknown: "Not established or neither male nor female." }
+          };
+        });
+        const result = await spindle.decisions.evaluate({ state: { roles, voices: voices.map((voice) => ({ ...voice })) }, questions, ...userId ? { userId } : {} });
+        const used = /* @__PURE__ */ new Set();
+        for (let index = 0; index < roles.length; index++) {
+          const answer = result.answers[`role_${index}`];
+          const genderAnswer = result.answers[`gender_${index}`];
+          const gender = genderAnswer?.type === "choice" && (genderAnswer.choice === "male" || genderAnswer.choice === "female") && genderAnswer.confidence >= 0.6 && (genderAnswer.probabilities[genderAnswer.choice] ?? 0) >= 0.6 ? genderAnswer.choice : "unknown";
+          const voice = answer?.type === "choice" ? selectAutomaticVoice(voices, used, answer, gender) : "";
+          diagnostics.push(`${roles[index].id}: decision=${answer?.type === "choice" ? answer.choice : "missing"}, confidence=${answer?.type === "choice" ? answer.confidence : "n/a"}, gender=${gender}, selected=${voice || "none"}, probabilities=${answer?.type === "choice" ? JSON.stringify(answer.probabilities) : "{}"}, choices=${JSON.stringify(voices.map((item, i) => ({ option: `voice_${i}`, id: item.id, category: item.category })))}`);
+          if (!voice) continue;
+          selected[roles[index].id] = voice;
+          used.add(voice);
+        }
+      }
+      const queueKey = `${userId ?? "user"}:${payload.chatId}`;
+      const previous = saveQueues.get(queueKey) ?? Promise.resolve();
+      const task = previous.catch(() => void 0).then(async () => {
+        const current = await spindle.chats.get(payload.chatId, userId);
+        if (!current) throw new Error("The chat is no longer available.");
+        const next = readConfig(current.metadata ?? {}, chatMemberIds(current));
+        const applied2 = {};
+        const currentMessages = await spindle.chat.getMessages(current.id);
+        const currentIds = currentMessages.filter((message) => !message.is_user).map((message) => message.id);
+        const activeGhosts2 = activeGhostVoices(readGhostVoices(current.metadata?.chat_voice_ghost_cast), currentIds, currentIds.at(-1) ?? "", payload.ghostLifetime);
+        const used = new Set([...payload.reserved, next.narratorVoice, next.userVoice, ...Object.values(next.characterVoices), ...activeGhosts2.map((ghost) => ghost.voiceId)].filter(Boolean));
+        for (const [id, voice] of Object.entries(selected)) {
+          if (used.has(voice)) continue;
+          if (id === "narrator" && payload.narratorMissing && !next.narratorVoice) {
+            next.narratorVoice = voice;
+            next.useGlobalNarratorVoice = false;
+            applied2[id] = voice;
+          } else if (id === "user" && payload.userMissing && !next.userVoice) {
+            next.userVoice = voice;
+            next.useGlobalUserVoice = false;
+            applied2[id] = voice;
+          } else if (id !== "narrator" && id !== "user" && next.detectedCharacters.some((character) => character.id === id) && !next.characterVoices[id]) {
+            next.characterVoices[id] = voice;
+            applied2[id] = voice;
+          }
+          if (applied2[id]) used.add(voice);
+        }
+        if (Object.keys(applied2).length) await spindle.chats.update(current.id, { metadata: applyConfigToMetadata(current.metadata ?? {}, next) }, userId);
+        return applied2;
+      });
+      const queued = task.then(() => void 0, () => void 0);
+      saveQueues.set(queueKey, queued);
+      let applied;
+      try {
+        applied = await task;
+      } finally {
+        if (saveQueues.get(queueKey) === queued) saveQueues.delete(queueKey);
+      }
+      for (const [id, voice] of Object.entries(selected)) diagnostics.push(`${id}: proposed=${voice}, final=${applied[id] || "not applied (voice claimed or setting changed)"}`);
+      sendFrontend({ type: "chat_voice_auto_cast_result", requestId: payload.requestId, assignments: applied, diagnostics }, userId, frontendSessionId);
+      if (Object.keys(applied).length) await sendState(userId, void 0, payload.chatId, frontendSessionId);
+    } else if (payload?.type === "chat_voice_ghost_edit") {
+      const queueKey = `${userId ?? "user"}:${payload.chatId}`;
+      const previous = saveQueues.get(queueKey) ?? Promise.resolve();
+      const task = previous.catch(() => void 0).then(async () => {
+        const chat = await spindle.chats.get(payload.chatId, userId);
+        if (!chat) throw new Error("The chat is no longer available.");
+        const metadata = chat.metadata ?? {};
+        const ghosts = readGhostVoices(metadata.chat_voice_ghost_cast);
+        const ghost = ghosts.find((item) => item.id === payload.ghostId);
+        if (!ghost) throw new Error("This uncast character is no longer available.");
+        let updatedMetadata = { ...metadata };
+        if (payload.remove) {
+          updatedMetadata.chat_voice_ghost_cast = ghosts.filter((item) => item.id !== ghost.id);
+        } else if (payload.promote) {
+          const aliases = ghostCastAliases(ghost);
+          const name = aliases.join(" / ");
+          if (!name) throw new Error("This character needs a recognizable name before it can be added to the cast.");
+          const config = readConfig(metadata, chatMemberIds(chat));
+          const existing = config.detectedCharacters.find((character) => speakerAliases(character.name).some((alias) => aliases.some((ghostAlias) => ghostAlias.toLowerCase() === alias.toLowerCase())));
+          const id = existing?.id ?? `npc:${aliases[0].toLowerCase()}`;
+          if (!existing) config.detectedCharacters.push({ id, name, messageCount: 0 });
+          else existing.name = mergeGhostAliases(speakerAliases(existing.name), aliases).join(" / ");
+          if (!config.characterVoices[id]) config.characterVoices[id] = ghost.voiceId;
+          config.parsedMessages = {};
+          updatedMetadata = applyConfigToMetadata(updatedMetadata, config);
+          updatedMetadata.chat_voice_ghost_cast = ghosts.filter((item) => item.id !== ghost.id);
+        } else {
+          ghost.voiceId = typeof payload.voice === "string" ? payload.voice.trim().slice(0, 512) : ghost.voiceId;
+          if (!ghost.voiceId) throw new Error("Enter a voice ID for this uncast character.");
+          updatedMetadata.chat_voice_ghost_cast = ghosts;
+        }
+        await spindle.chats.update(chat.id, { metadata: updatedMetadata }, userId);
+      });
+      saveQueues.set(queueKey, task);
+      try {
+        await task;
+      } finally {
+        if (saveQueues.get(queueKey) === task) saveQueues.delete(queueKey);
+      }
+      await sendState(userId, void 0, payload.chatId, frontendSessionId);
     } else if (payload?.type === "chat_voice_scan") {
       await queueScan(payload, userId, frontendSessionId);
     } else if (payload?.type === "chat_voice_save") {
@@ -4752,7 +5229,7 @@ spindle.onFrontendMessage(async (rawPayload, userId, frontendSessionId) => {
       type: "chat_voice_error",
       error: message,
       clientRevision: payload?.type === "chat_voice_save" ? payload.clientRevision : void 0,
-      requestId: payload?.type === "chat_voice_refresh" ? payload.requestId : void 0
+      requestId: payload?.type === "chat_voice_refresh" || payload?.type === "chat_voice_auto_cast" ? payload.requestId : void 0
     }, userId, frontendSessionId);
   }
 });

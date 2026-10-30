@@ -14,12 +14,27 @@ import {
   applyTtsTagSelections,
   assessSpeakerDiscourseEscalation,
   buildSpeakerDecisionPlan,
+  buildAssistantUserSpeakerReview,
+  buildRelationshipSpeakerReview,
+  applyRelationshipSpeakerReview,
+  relationshipReviewContext,
+  applyAssistantUserSpeakerReview,
   buildTtsTagPlan,
   bufferAwareGenerationConcurrency,
   availableUncastVoices,
+  canReserveAutomaticVoice,
+  selectAutomaticVoice,
   activeGhostVoices,
+  purgeExpiredGhostContexts,
+  markGhostVoiceInvoked,
   collectUncastVoiceGroups,
+  ghostCastAliases,
+  updateGhostConversationHistory,
+  uncastIdentityLabels,
+  mergeGhostAliases,
+  readGhostVoices,
   buildUncastVoiceDecision,
+  buildUncastIdentityReview,
   resolveUncastVoiceDecisions,
   clampMessageLimit,
   clampSavedAudioLimit,
@@ -2100,6 +2115,275 @@ test('reviews uncast turns separately when a long narrative may introduce someon
     { speakerId: UNCAST_SPEAKER_ID, text: 'The clerk speaks.' },
   ])
   assert.deepEqual(groups.map(group => group.segmentIndexes), [[0], [2]])
+})
+
+test('automatic casting respects reserved voices, gender, and no match', () => {
+  const voices = readFavoriteVoices([{ id: 'used', category: 'male' }, { id: 'female', category: 'female' }, { id: 'male', category: 'male' }])
+  const answer = { choice: 'voice_0', confidence: 0.9, probabilities: { voice_0: 0.8, voice_1: 0.15, voice_2: 0.05, no_match: 0 } }
+  assert.equal(selectAutomaticVoice(voices, new Set(['used']), answer, 'male'), 'male')
+  assert.equal(selectAutomaticVoice(voices, new Set(['used']), answer, 'female'), 'female')
+  assert.equal(selectAutomaticVoice(voices, new Set(), { ...answer, choice: 'no_match' }, 'unknown'), '')
+})
+
+test('automatic voice reservations reject exhausted voices and preserve existing ghost ownership', () => {
+  const ghost = { id: 'one', speakerId: UNCAST_SPEAKER_ID, voiceId: 'last-voice', context: '', occurrenceKeys: [], lastSeenMessageId: 'message' }
+  assert.equal(canReserveAutomaticVoice('last-voice', new Set(), [ghost]), false)
+  assert.equal(canReserveAutomaticVoice('last-voice', new Set(), [ghost], 'one'), true)
+  assert.equal(canReserveAutomaticVoice('last-voice', new Set(['last-voice']), [ghost], 'one'), false)
+  assert.equal(canReserveAutomaticVoice('', new Set(), []), false)
+  const voices = readFavoriteVoices([{ id: 'last-voice' }])
+  assert.equal(selectAutomaticVoice(voices, new Set(['last-voice']), confidentDecision('voice_0'), 'unknown'), '')
+})
+
+test('uncast voice matching excludes narration-only people and only groups actual speech', () => {
+  const narration = 'The clerk watches silently. The guard waits by the door.'
+  const segments = parseRosterVoiceSegments(narration, null, [], '', null, true)
+  assert.deepEqual(collectUncastVoiceGroups(segments), [])
+  const groups = collectUncastVoiceGroups([
+    { speakerId: UNCAST_SPEAKER_ID, text: 'A silent clerk watches.', debugPath: ['segment-type:narration'] },
+    { speakerId: UNCAST_SPEAKER_ID, text: 'Come in.', debugPath: ['segment-type:speech (quote 1)'] },
+  ])
+  assert.deepEqual(groups.map(group => group.speeches), [['Come in.']])
+  const plan = buildUncastVoiceDecision(groups, readFavoriteVoices([{ id: 'voice' }]), 'The clerk watches. "Come in."')
+  assert.match(plan.questions.label_g0.instructions, /actually speaks/u)
+  assert.match(plan.questions.voice_g0.instructions, /Narration-only bystanders/u)
+})
+
+test('regeneration ranks only voices available against both historical and current ghosts', () => {
+  const ids = ['earlier', 'later']
+  const historical = { id: 'old', speakerId: UNCAST_SPEAKER_ID, voiceId: 'old-voice', context: '', occurrenceKeys: [], lastSeenMessageId: 'earlier' }
+  const current = { id: 'new', speakerId: UNCAST_SPEAKER_ID, voiceId: 'new-voice', context: '', occurrenceKeys: [], lastSeenMessageId: 'later' }
+  const ghosts = [historical, current]
+  const atMessage = activeGhostVoices(ghosts, ids, 'earlier')
+  const now = activeGhostVoices(ghosts, ids, 'later')
+  const favorites = readFavoriteVoices([{ id: 'old-voice' }, { id: 'new-voice' }, { id: 'free-voice' }])
+  const available = availableUncastVoices(favorites, [...atMessage, ...now].map(ghost => ghost.voiceId))
+  assert.deepEqual(available.map(voice => voice.id), ['free-voice'])
+  const groups = collectUncastVoiceGroups([{ speakerId: UNCAST_SPEAKER_ID, text: 'Hello again.' }])
+  const fresh = resolveUncastVoiceDecisions(groups, available, { voice_g0: confidentDecision('voice_0') }, [], [], 'earlier')
+  assert.equal(fresh[0]?.voiceId, 'free-voice')
+  assert.equal(fresh[0]?.ghostId, 'pending:g0')
+})
+
+test('refreshes temporary voice expiry when used, including playback of older messages', () => {
+  const ids = Array.from({ length: 25 }, (_, index) => `assistant-${24 - index}`)
+  const ghost = { id: 'ghost', speakerId: UNCAST_SPEAKER_ID, voiceId: 'voice', context: '', occurrenceKeys: [`${ids[0]}:speech`], lastSeenMessageId: ids[0] }
+  assert.equal(activeGhostVoices([ghost], ids, ids[11], 10).length, 0)
+  markGhostVoiceInvoked(ghost, ids.slice(0, 13), ids[1])
+  const restored = readGhostVoices([ghost])[0]
+  assert.equal(restored.lastInvokedAtMessageId, ids[12])
+  assert.equal(restored.lastSeenMessageId, ids[0])
+  markGhostVoiceInvoked(restored, ids.slice(0, 20), ids[0])
+  assert.equal(restored.lastInvokedAtMessageId, ids[12])
+  markGhostVoiceInvoked(restored, ids.slice(0, 20), ids[2])
+  assert.equal(restored.lastInvokedAtMessageId, ids[19])
+  markGhostVoiceInvoked(restored, ids, ids[2])
+  assert.equal(restored.lastInvokedAtMessageId, ids[19])
+  restored.lastInvokedAtMessageId = ids[12]
+  assert.equal(activeGhostVoices([restored], ids, ids[22], 10).length, 1)
+  assert.equal(activeGhostVoices([restored], ids, ids[23], 10).length, 0)
+  assert.equal(activeGhostVoices([restored], ids, ids[11], 10).length, 0)
+  assert.equal(activeGhostVoices([restored], ids, ids[0], 10).length, 1)
+})
+
+test('purges only expired temporary voice context using the latest assistant message', () => {
+  const ids = Array.from({ length: 13 }, (_, index) => `message-${index}`)
+  const expired = { id: 'old', speakerId: UNCAST_SPEAKER_ID, voiceId: 'old-voice', context: 'Old scene', conversationHistory: [{ messageId: ids[0], text: 'Old dialogue' }], occurrenceKeys: [], lastSeenMessageId: ids[0] }
+  const active = { id: 'active', speakerId: UNCAST_SPEAKER_ID, voiceId: 'active-voice', context: 'Recent scene', conversationHistory: [{ messageId: ids[11], text: 'Recent dialogue' }], occurrenceKeys: [], lastSeenMessageId: ids[11] }
+  assert.equal(purgeExpiredGhostContexts([expired, active], [], 10), false)
+  assert.equal(purgeExpiredGhostContexts([expired, active], ids, 10), true)
+  assert.equal(expired.context, '')
+  assert.deepEqual(expired.conversationHistory, [])
+  assert.equal(active.context, 'Recent scene')
+  assert.equal(active.conversationHistory.length, 1)
+  assert.equal(purgeExpiredGhostContexts([expired, active], ids, 10), false)
+})
+
+test('new ghosts from older regenerated messages appear until their creation lifetime expires', () => {
+  const ids = Array.from({ length: 25 }, (_, index) => `assistant-${index}`)
+  const ghost = { id: 'new', speakerId: UNCAST_SPEAKER_ID, voiceId: 'voice', context: '', occurrenceKeys: [`${ids[0]}:speech`], lastSeenMessageId: ids[0], createdAtMessageId: ids[12] }
+  assert.equal(activeGhostVoices([ghost], ids, ids[12], 10).length, 1)
+  assert.equal(activeGhostVoices([ghost], ids, ids[22], 10).length, 1)
+  assert.equal(activeGhostVoices([ghost], ids, ids[23], 10).length, 0)
+  assert.equal(activeGhostVoices([ghost], ids, ids[0], 10).length, 1)
+  assert.equal(activeGhostVoices([ghost], ids, ids[11], 10).length, 0)
+})
+
+test('retains confirmed ghost aliases for matching and promotion', () => {
+  const ghost = readGhostVoices([{ id: 'ghost', speakerId: 'unconfigured:cobb', label: 'the farrier', aliases: ['COBB', 'the farrier', 'the healer'], voiceId: 'voice', context: '', occurrenceKeys: [], lastSeenMessageId: 'previous' }])[0]
+  assert.deepEqual(ghostCastAliases(ghost), ['cobb', 'the farrier', 'the healer'])
+  assert.deepEqual(mergeGhostAliases(['Cobb / the farrier'], ['cobb', 'the healer']), ['Cobb', 'the farrier', 'the healer'])
+  const groups = collectUncastVoiceGroups([{ speakerId: 'unconfigured:the healer', text: 'I can help.' }])
+  const matches = resolveUncastVoiceDecisions(groups, [], {}, [ghost])
+  assert.equal(matches[0]?.ghostId, 'ghost')
+  assert.deepEqual(matches[0]?.aliases, ['the healer'])
+  const ambiguous = resolveUncastVoiceDecisions(groups, [], {}, [ghost, { ...ghost, id: 'other', voiceId: 'another' }])
+  assert.deepEqual(ambiguous, [])
+})
+
+test('reviews borderline opening dialogue against a later clearly labeled speaker', () => {
+  const groups = collectUncastVoiceGroups([
+    { speakerId: null, text: 'Two clerks work. The elder is speaking.' },
+    { speakerId: UNCAST_SPEAKER_ID, text: 'Carry the three to the oats column.' },
+    { speakerId: 'watt', text: 'We have the tally.' },
+    { speakerId: null, text: 'The clerk stops writing.' },
+    { speakerId: UNCAST_SPEAKER_ID, text: 'Brenner?s infantry vanguard.' },
+  ])
+  const message = 'The clerk stops writing. The clerk speaks.'
+  const voices = readFavoriteVoices([{ id: 'first' }, { id: 'second' }])
+  const labelChoice = Object.entries(buildUncastVoiceDecision(groups, voices, message).questions.label_g1.criteria).find(([, label]) => label === 'the clerk')?.[0]
+  assert.ok(labelChoice)
+  const answers = {
+    label_g1: confidentDecision(labelChoice),
+    same_g1_g0: { choice: 'same', probabilities: { same: 0.88, different_or_unclear: 0.12 }, confidence: 0.76 },
+    voice_g0: confidentDecision('voice_0'), voice_g1: confidentDecision('voice_1'),
+  }
+  const review = buildUncastIdentityReview(groups, answers, message)
+  assert.ok(review.questions.review_same_g1_g0)
+  assert.deepEqual(resolveUncastVoiceDecisions(groups, voices, answers).map(item => item.voiceId), ['first', 'second'])
+  const confirmed = resolveUncastVoiceDecisions(groups, voices, { ...answers, review_same_g1_g0: confidentDecision('same') })
+  assert.equal(confirmed[0].voiceId, confirmed[1].voiceId)
+  const rejected = resolveUncastVoiceDecisions(groups, voices, { ...answers, review_same_g1_g0: confidentDecision('different_or_unclear') })
+  assert.deepEqual(rejected.map(item => item.voiceId), ['first', 'second'])
+  const weak = resolveUncastVoiceDecisions(groups, voices, { ...answers, review_same_g1_g0: { choice: 'same', probabilities: { same: 0.65, different_or_unclear: 0.35 }, confidence: 0.6 } })
+  assert.deepEqual(weak.map(item => item.voiceId), ['first', 'second'])
+  assert.deepEqual(Object.keys(buildUncastIdentityReview(groups, { ...answers, same_g1_g0: confidentDecision('different_or_unclear') }, message).questions), [])
+})
+
+test('automatic casting chooses the last compatible unused favorite', () => {
+  const voices = readFavoriteVoices([{ id: 'already-used', category: 'female' }, { id: 'available', category: 'female' }, { id: 'male', category: 'male' }])
+  const answer = { choice: 'no_match', confidence: 0.5, probabilities: { no_match: 0.7, voice_0: 0.2, voice_1: 0.1, voice_2: 0 } }
+  assert.equal(selectAutomaticVoice(voices, new Set(['already-used']), answer, 'female'), 'available')
+  assert.equal(selectAutomaticVoice(voices, new Set(['already-used', 'available']), answer, 'female'), '')
+  const groups = collectUncastVoiceGroups([{ speakerId: UNCAST_SPEAKER_ID, text: 'Hello.' }])
+  const one = readFavoriteVoices([{ id: 'available', category: 'female' }])
+  assert.equal(resolveUncastVoiceDecisions(groups, one, { voice_g0: confidentDecision('no_match'), gender_g0: confidentDecision('female') })[0]?.voiceId, 'available')
+  assert.deepEqual(resolveUncastVoiceDecisions(groups, one, { voice_g0: confidentDecision('no_match'), gender_g0: confidentDecision('male') }), [])
+  const questions = buildUncastVoiceDecision(groups, voices, 'A speaker says hello.').questions
+  assert.equal('no_match' in questions.voice_g0.criteria, false)
+})
+
+test('reviews assistant dialogue attributed to the user when another named subject is present', () => {
+  const message = `"Nine-fifteen, Tessa." The voice crackles through the earpiece. Tessa's jaw stays clamped on the phone. Ken's hand rests on her hip.\n\n"Mom. Mom, I heard you."`
+  const speakers = addUnconfiguredDialogueSpeakers(message, [{ id: USER_SPEAKER_ID, name: 'Ken' }])
+  assert.equal(speakers.filter(speaker => speaker.name.toLowerCase() === 'ken').length, 1)
+  assert.ok(speakers.some(speaker => speaker.name === 'Tessa'))
+  const plan = buildSpeakerDecisionPlan(message, speakers, false)
+  const userOption = plan.state.speakers.find(speaker => speaker.id === USER_SPEAKER_ID)!.option
+  const tessaOption = plan.state.speakers.find(speaker => speaker.name === 'Tessa')!.option
+  const answers = { speech_s0: confidentDecision('uncast_character'), speech_s1: confidentDecision(userOption, 0.68, 0.57) }
+  const review = buildAssistantUserSpeakerReview(plan, answers)
+  assert.ok(review.questions.user_review_s1)
+  assert.equal(review.questions.user_review_s0, undefined)
+  applyAssistantUserSpeakerReview(plan, answers, { user_review_s1: confidentDecision(tessaOption) })
+  assert.equal(answers.speech_s1.choice, tessaOption)
+  assert.equal(resolveSpeakerDecisionSegments(message, plan, answers, speakers, { isUserMessage: false, cardSpeakerId: null, historicalSpeakerId: null }).filter(segment => segment.text.includes('Mom.'))[0]?.speakerId, 'unconfigured:tessa')
+  const weak = { speech_s1: confidentDecision(userOption, 0.68, 0.57) }
+  applyAssistantUserSpeakerReview(plan, weak, { user_review_s1: confidentDecision(tessaOption, 0.7, 0.65) })
+  assert.equal(weak.speech_s1.choice, userOption)
+  const userMessagePlan = buildSpeakerDecisionPlan(message, speakers, true)
+  assert.deepEqual(Object.keys(buildAssistantUserSpeakerReview(userMessagePlan, weak).questions), [])
+})
+
+test('discovers repeated named subjects and self-introductions for uncast voice continuity', () => {
+  const message = `The earbud comes out against her thumb, and Tessa turns at the waist. A stream falls between Ken's feet.\n\n"Oh hey." She puts it away.\n\nTessa does not step back.\n\n"You live in there?" She smiles. "I'm Tessa. Two doors down."`
+  const speakers = addUnconfiguredDialogueSpeakers(message, [{ id: USER_SPEAKER_ID, name: 'Ken' }])
+  assert.ok(speakers.some(speaker => speaker.id === 'unconfigured:tessa'))
+  assert.equal(speakers.some(speaker => speaker.id === 'unconfigured:ken'), false)
+  const group = collectUncastVoiceGroups([{ speakerId: 'unconfigured:tessa', text: "I'm Tessa." }])
+  const oldGhost = { id: 'temporary', speakerId: UNCAST_SPEAKER_ID, voiceId: 'voice', context: 'Tessa turns. She introduces herself.', occurrenceKeys: [], lastSeenMessageId: 'previous' }
+  const linked = resolveUncastVoiceDecisions(group, [], { identity_g0: confidentDecision('ghost_0') }, [oldGhost])
+  assert.equal(linked[0]?.ghostId, 'temporary')
+  assert.deepEqual(linked[0]?.aliases, ['tessa'])
+  const weak = resolveUncastVoiceDecisions(group, [], { identity_g0: { choice: 'ghost_0', confidence: 0.5, probabilities: { ghost_0: 0.6, new_or_unclear: 0.4 } } }, [oldGhost])
+  assert.deepEqual(weak, [])
+  const singular = addUnconfiguredDialogueSpeakers('The lamp flickers. "I am waiting."', [])
+  assert.deepEqual(singular, [])
+})
+
+test('reviews a borderline cross-message match before creating another voice', () => {
+  const ghost = { id: 'old', speakerId: UNCAST_SPEAKER_ID, voiceId: 'tessa-voice', context: 'Tessa introduces herself and answers her phone.', occurrenceKeys: [], lastSeenMessageId: 'earlier' }
+  const groups = collectUncastVoiceGroups([{ speakerId: 'unconfigured:tessa', text: 'Mom, I heard you.' }])
+  const message = "Tessa holds the phone. Her mother speaks on the other end."
+  const answers = { identity_g0: { choice: 'ghost_0', confidence: 0.58, probabilities: { ghost_0: 0.72, new_or_unclear: 0.25, group_g0: 0.03 } }, voice_g0: confidentDecision('voice_0') }
+  const voices = readFavoriteVoices([{ id: 'another-voice' }])
+  const plan = buildUncastIdentityReview(groups, answers, message, [ghost])
+  assert.ok(plan.questions.review_ghost_g0_0)
+  assert.match(plan.state.ghosts[0].context, /Tessa introduces/u)
+  assert.equal(resolveUncastVoiceDecisions(groups, voices, answers, [ghost], [], 'later', message)[0].voiceId, 'another-voice')
+  const confirmed = resolveUncastVoiceDecisions(groups, voices, { ...answers, review_ghost_g0_0: confidentDecision('same') }, [ghost], [], 'later', message)
+  assert.equal(confirmed[0].ghostId, 'old')
+  assert.equal(confirmed[0].voiceId, 'tessa-voice')
+  assert.deepEqual(confirmed[0].aliases, ['tessa'])
+  const rejected = resolveUncastVoiceDecisions(groups, voices, { ...answers, review_ghost_g0_0: confidentDecision('different_or_unclear') }, [ghost], [], 'later', message)
+  assert.equal(rejected[0].voiceId, 'another-voice')
+  const weak = resolveUncastVoiceDecisions(groups, voices, { ...answers, review_ghost_g0_0: { choice: 'same', confidence: 0.6, probabilities: { same: 0.7, different_or_unclear: 0.3 } } }, [ghost], [], 'later', message)
+  assert.equal(weak[0].voiceId, 'another-voice')
+})
+
+test('retains conversation exchanges and relationship labels for later ghost identity review', () => {
+  const ids = ['one', 'two', 'three', 'four']
+  const ghost = { id: 'mother', speakerId: UNCAST_SPEAKER_ID, voiceId: 'voice', context: '', occurrenceKeys: [], lastSeenMessageId: 'one', conversationHistory: [] as Array<{ messageId: string; text: string }> }
+  const first = `"Nine-fifteen, Tessa." Tessa holds the phone. "Mom, I heard you."`
+  const second = `Tessa listens to the phone. "Mom, I said I'm coming." "I'm on Maple, Tessa."`
+  const third = `Marisol arrives. Her daughter Tessa sees her. "Seven minutes."`
+  updateGhostConversationHistory(ghost, 'one', first, ids)
+  updateGhostConversationHistory(ghost, 'two', second, ids)
+  assert.deepEqual(ghost.conversationHistory.map(item => item.messageId), ['one', 'two'])
+  assert.match(ghost.conversationHistory[0].text, /Mom, I heard you/u)
+  const labels = uncastIdentityLabels(first, [])
+  assert.ok(labels.includes("tessa's mom"))
+  const groups = collectUncastVoiceGroups([{ speakerId: 'unconfigured:marisol', text: 'Seven minutes.' }])
+  const plan = buildUncastVoiceDecision(groups, [], third, [ghost])
+  assert.match(plan.questions.identity_g0.instructions, /person they address/u)
+  assert.equal(plan.state.ghosts[0].conversationHistory[1].text, second)
+  const assignment = resolveUncastVoiceDecisions(groups, [], { identity_g0: confidentDecision('ghost_0') }, [ghost], [], 'three', third, ids.slice(0, 2))
+  assert.equal(assignment[0]?.voiceId, 'voice')
+  assert.deepEqual(assignment[0]?.aliases, ['marisol'])
+  updateGhostConversationHistory(ghost, 'three', third, ids)
+  updateGhostConversationHistory(ghost, 'four', 'A later conversation.', ids)
+  updateGhostConversationHistory(ghost, 'one', first, ids)
+  assert.deepEqual(ghost.conversationHistory.map(item => item.messageId), ['two', 'three', 'four'])
+  const reloaded = readGhostVoices([ghost])[0]
+  assert.equal(reloaded.conversationHistory?.length, 3)
+})
+
+test('relationship review preserves caller identity, excludes future context, and routes to the existing ghost', () => {
+  const messages = [
+    { id: 'previous', is_user: false, content: `Tessa answers the phone. "Mom, are you there?" "Yes, Tessa." <tracker>secret prior</tracker>` },
+    { id: 'current', is_user: false, content: `Tessa holds the phone. "Mom, I said I am coming." "I am on Maple, Tessa."` },
+    { id: 'future', is_user: false, content: 'Marisol arrives in person.' },
+  ]
+  const ghost = { id: 'mother', speakerId: UNCAST_SPEAKER_ID, voiceId: 'mom-voice', label: 'Marisol', aliases: ['Marisol'], context: 'Marisol arrives in person.', occurrenceKeys: [], lastSeenMessageId: 'future', conversationHistory: [{ messageId: 'previous', text: messages[0].content }, { messageId: 'future', text: messages[2].content }] }
+  const context = relationshipReviewContext(messages, 'current', [ghost], 'tracker')
+  assert.doesNotMatch(JSON.stringify(context), /secret prior|Marisol/u)
+  assert.match(context.ghosts[0].conversationHistory[0].text, /Mom, are you there/u)
+  const speakers = [{ id: 'npc:tessa', name: 'Tessa' }, { id: USER_SPEAKER_ID, name: 'Ken' }]
+  const plan = buildSpeakerDecisionPlan(messages[1].content, speakers, false)
+  const answers = { speech_s0: confidentDecision('known_0'), speech_s1: confidentDecision('uncast_character') }
+  const review = buildRelationshipSpeakerReview(plan, answers, context)
+  assert.ok(review.questions.relationship_s1)
+  assert.ok(review.ghostOptions.relationship_ghost_0)
+  applyRelationshipSpeakerReview(plan, answers, { relationship_s1: confidentDecision('relationship_ghost_0') }, review.ghostOptions)
+  assert.equal(answers.speech_s1.choice, 'relationship_ghost_0')
+  const resolved = resolveSpeakerDecisionSegments(messages[1].content, plan, answers, speakers, { isUserMessage: false, cardSpeakerId: null, historicalSpeakerId: null })
+  const groups = collectUncastVoiceGroups(resolved)
+  assert.ok(groups.some(group => group.speakerId === 'ghost:mother'))
+  const matches = resolveUncastVoiceDecisions(groups, [], {}, [ghost])
+  assert.equal(matches.find(match => groups.find(group => group.id === match.groupId)?.speakerId === 'ghost:mother')?.voiceId, 'mom-voice')
+})
+
+test('relationship review keeps explicit attributions and rejects weak changes', () => {
+  const content = '"Hello," Tessa says. "Someone is calling."'
+  const speakers = [{ id: 'npc:tessa', name: 'Tessa' }, { id: USER_SPEAKER_ID, name: 'Ken' }]
+  const plan = buildSpeakerDecisionPlan(content, speakers, false)
+  const answers = { speech_s0: confidentDecision('known_0'), speech_s1: confidentDecision('uncast_character') }
+  const context = { previousMessages: [{ id: 'prior', text: 'Someone called.' }], ghosts: [{ id: 'other', label: '', aliases: [], context: 'A caller speaks.', conversationHistory: [] }] }
+  const review = buildRelationshipSpeakerReview(plan, answers, context)
+  assert.equal(review.questions.relationship_s0, undefined)
+  assert.ok(review.questions.relationship_s1)
+  applyRelationshipSpeakerReview(plan, answers, { relationship_s1: { choice: 'relationship_ghost_0', probabilities: { relationship_ghost_0: 0.65, no_clear_identity: 0.35 }, confidence: 0.6 } }, review.ghostOptions)
+  assert.equal(answers.speech_s1.choice, 'uncast_character')
 })
 
 test('defaults and clamps the global saved audio limit', () => {

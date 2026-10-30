@@ -48,6 +48,16 @@ Lumiverse to resolve the account's default Decision connection.
 - Do not implement a separate HTTP client or use `/api/v1/decisions/evaluate`
   directly from the frontend.
 
+## Relationship-aware speaker review (current design)
+
+Before final speaker resolution, a targeted Jev review can compare uncertain or conflicting dialogue with recent exchanges and active temporary characters. The first pass still uses the normal cast and user roster. The review offers distinct ghost IDs, configured speakers, uncast, and unclear as candidates; it does not make a previous speaker or a card character the preferred answer.
+
+Review is limited to unresolved or generic uncast speech, paragraph/speech conflicts, and ambiguous phone or other off-scene exchanges where prior conversation context is relevant. A clear local explicit attribution remains authoritative unless a separately established conflict warrants review. Jev must distinguish speakers from addressees and consider relationship, channel changes, and the possibility of a new caller. The result can replace a first-pass identity only when probability, confidence, and margin clear strict review gates. Failed or uncertain reviews leave the existing result unchanged.
+
+The review receives cleaned current content, a bounded window of earlier assistant messages, and active ghosts with bounded conversation history. History and ghost details from messages after the target must never be included when replaying an older message; configured tracker blocks are removed before submission. Ghost IDs selected by review flow into the existing uncast voice matcher, which reuses the selected ghost only if its voice is still available. They are not persisted as regular cast entries. Local fallback, user voice, and card-title rules remain in force when Jev is unavailable.
+
+The speaker cache key includes the review version, cleaned history, active ghost identities and usable context, so a changed alias, deleted ghost, changed lifetime, or edited prior message cannot reuse an obsolete result. Diagnostics record why review ran, the candidate and confidence, and whether the first-pass decision changed. Regression coverage must include phone calls and an in-person arrival, explicit local attribution, unrelated callers, replay of older messages, tracker removal, cache invalidation, review failure, and cast and user dialogue.
+
 ## Terminology
 
 - **Paragraph**: a playback paragraph after tracker removal and markup cleanup.
