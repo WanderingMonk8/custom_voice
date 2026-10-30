@@ -46,7 +46,7 @@ export function addFavoriteVoice(existing: FavoriteVoice[], voice: FavoriteVoice
 }
 
 export interface UncastVoiceGroup { id: string; speakerId: string; segmentIndexes: number[]; speeches: string[]; context: string[] }
-export interface GhostVoice { id: string; speakerId: string; voiceId: string; context: string; occurrenceKeys: string[]; lastSeenMessageId: string; label?: string; createdAtMessageId?: string }
+export interface GhostVoice { id: string; speakerId: string; voiceId: string; context: string; occurrenceKeys: string[]; lastSeenMessageId: string; label?: string; createdAtMessageId?: string; aliases?: string[] }
 export const GHOST_VOICE_LIFETIME_MESSAGES = 10
 
 export function readGhostVoices(value: unknown): GhostVoice[] {
@@ -57,11 +57,33 @@ export function readGhostVoices(value: unknown): GhostVoice[] {
     if (typeof row.id !== 'string' || typeof row.speakerId !== 'string' || typeof row.voiceId !== 'string' || !row.id || !row.voiceId) return []
     return [{ id: row.id.slice(0, 128), speakerId: row.speakerId.slice(0, 256), voiceId: row.voiceId.slice(0, 512),
       label: typeof row.label === 'string' ? row.label.trim().slice(0, 100) : '',
+      aliases: mergeGhostAliases(Array.isArray(row.aliases) ? row.aliases.filter((value): value is string => typeof value === 'string') : []),
       context: typeof row.context === 'string' ? row.context.slice(0, 2_000) : '',
       occurrenceKeys: Array.isArray(row.occurrenceKeys) ? row.occurrenceKeys.filter((key): key is string => typeof key === 'string').slice(-100) : [],
       lastSeenMessageId: typeof row.lastSeenMessageId === 'string' ? row.lastSeenMessageId : '',
       ...(typeof row.createdAtMessageId === 'string' && row.createdAtMessageId ? { createdAtMessageId: row.createdAtMessageId } : {}) }]
   })
+}
+
+/** Keep only unique, complete aliases within the regular cast name limit. */
+export function mergeGhostAliases(...sources: Array<readonly string[]>): string[] {
+  const aliases: string[] = []
+  const seen = new Set<string>()
+  for (const source of sources) for (const value of source) for (const alias of speakerAliases(value)) {
+    const key = alias.toLowerCase()
+    if (seen.has(key) || [...aliases, alias].join(' / ').length > 4096) continue
+    seen.add(key)
+    aliases.push(alias)
+  }
+  return aliases
+}
+
+/** Include legacy names when promoting previously saved ghosts. */
+export function ghostCastAliases(ghost: GhostVoice): string[] {
+  return mergeGhostAliases(
+    ghost.speakerId.startsWith('unconfigured:') ? [ghost.speakerId.slice('unconfigured:'.length)] : [],
+    ghost.label ? [ghost.label] : [], ghost.aliases ?? [],
+  )
 }
 
 /** The caller supplies assistant-message IDs only, in chronological order. */
@@ -130,7 +152,7 @@ export function availableUncastVoices(favorites: FavoriteVoice[], used: readonly
 /** Collect possible descriptive identities; Jev decides whether any refers to a speaker. */
 export function uncastIdentityLabels(message: string, ghosts: GhostVoice[]): string[] {
   const labels = new Set<string>()
-  for (const ghost of ghosts) if (ghost.label) labels.add(ghost.label.toLowerCase())
+  for (const ghost of ghosts) for (const alias of ghostCastAliases(ghost)) labels.add(alias.toLowerCase())
   for (const match of message.matchAll(/\b(?:the|an?)\s+([a-z][a-z'-]{2,})(?:['?]s)?\b/giu)) {
     labels.add(`the ${match[1].toLowerCase().replace(/['?]s$/u, '')}`)
     if (labels.size >= 80) break
@@ -144,7 +166,7 @@ export function buildUncastVoiceDecision(groups: UncastVoiceGroup[], voices: Fav
   const state = {
     message,
     characters: groups.map(group => ({ id: group.id, identity: group.speakerId, speeches: group.speeches, context: group.context })),
-    ghosts: ghosts.map((ghost, index) => ({ option: `ghost_${index}`, identity: ghost.speakerId, label: ghost.label || null, context: ghost.context })),
+    ghosts: ghosts.map((ghost, index) => ({ option: `ghost_${index}`, identity: ghost.speakerId, label: ghost.label || null, aliases: ghostCastAliases(ghost), context: ghost.context })),
     voices: voices.map((voice, index) => ({ option: `voice_${index}`, name: voice.name, category: voice.category, description: voice.description })),
   }
   const questions: Record<string, { type: 'choice'; instructions: string; criteria: Record<string, string> }> = {}
@@ -162,7 +184,7 @@ export function buildUncastVoiceDecision(groups: UncastVoiceGroup[], voices: Fav
     if (ghosts.length || earlier.length) questions[`identity_${group.id}`] = {
       type: 'choice', instructions: `Does character ${group.id} clearly represent the same individual as one prior character? Compare all contexts and dialogue, not just shared gender or voice. Select new_or_unclear unless the identity is clear.`,
       criteria: { new_or_unclear: 'A new character, or identity cannot be reliably established.',
-        ...Object.fromEntries(ghosts.map((ghost, index) => [`ghost_${index}`, `Previously seen character ${ghost.label || ghost.speakerId}; context: ${ghost.context}`])),
+        ...Object.fromEntries(ghosts.map((ghost, index) => [`ghost_${index}`, `Previously seen character ${ghostCastAliases(ghost).join(" / ") || ghost.speakerId}; context: ${ghost.context}`])),
         ...Object.fromEntries(earlier.map(previous => [`group_${previous.id}`, `Earlier character ${previous.id}; context: ${previous.context.join(' ').slice(0, 2_000)}`])) },
     }
     for (const previous of earlier.slice(-8)) {
@@ -181,7 +203,7 @@ export function buildUncastVoiceDecision(groups: UncastVoiceGroup[], voices: Fav
   return { state, questions }
 }
 
-export interface UncastVoiceAssignment { groupId: string; voiceId: string; gender: string; ghostId?: string; label?: string }
+export interface UncastVoiceAssignment { groupId: string; voiceId: string; gender: string; ghostId?: string; label?: string; aliases?: string[] }
 
 export function resolveUncastVoiceDecisions(
   groups: UncastVoiceGroup[], voices: FavoriteVoice[], answers: Record<string, SpeakerDecisionChoice>,
@@ -205,8 +227,11 @@ export function resolveUncastVoiceDecisions(
   for (const group of groups) {
     let root = group.id
     const occurrenceKey = messageId ? `${messageId}:${hashMessageContent(group.speeches.join('\n'))}` : ''
+    const name = group.speakerId.startsWith('unconfigured:') ? group.speakerId.slice('unconfigured:'.length).toLowerCase() : ''
+    const aliasMatches = name ? ghosts.filter(item => ghostCastAliases(item).some(alias => alias.toLowerCase() === name)) : []
     const exact = ghosts.find(item => occurrenceKey && item.occurrenceKeys.includes(occurrenceKey))
       ?? (group.speakerId !== UNCAST_SPEAKER_ID ? ghosts.find(item => item.speakerId === group.speakerId) : undefined)
+      ?? (aliasMatches.length === 1 ? aliasMatches[0] : undefined)
     const identity = answers[`identity_${group.id}`]
     const labelAnswer = answers[`label_${group.id}`]
     const labelIndex = labelAnswer?.choice.match(/^label_(\d+)$/u)
@@ -222,7 +247,7 @@ export function resolveUncastVoiceDecisions(
     if (same[0]) root = roots.get(same[0].previous.id) ?? root
     else if (label && rootByLabel.has(label)) root = rootByLabel.get(label)!
     else if (strongChoice(identity) && identity?.choice.startsWith('group_')) root = roots.get(identity.choice.slice(6)) ?? root
-    const namedGhosts = label ? ghosts.filter(item => item.label?.toLowerCase() === label) : []
+    const namedGhosts = label ? ghosts.filter(item => ghostCastAliases(item).some(alias => alias.toLowerCase() === label)) : []
     const rankedGhosts = namedGhosts.map(item => ({ item, recent: Math.max(
       previousMessageIds.indexOf(item.lastSeenMessageId),
       ...item.occurrenceKeys.map(key => previousMessageIds.indexOf(key.split(':', 1)[0])),
@@ -254,7 +279,13 @@ export function resolveUncastVoiceDecisions(
     }
     used.add(ghost.voiceId)
     const label = ghost.label || members.map(group => groupLabels.get(group.id)).find(Boolean)
-    for (const group of members) assignments.push({ groupId: group.id, voiceId: ghost.voiceId, gender, ghostId: ghost.id, ...(label ? { label } : {}) })
+    for (const group of members) {
+      const aliases = mergeGhostAliases(
+        group.speakerId.startsWith('unconfigured:') ? [group.speakerId.slice('unconfigured:'.length)] : [],
+        groupLabels.has(group.id) ? [groupLabels.get(group.id)!] : [],
+      )
+      assignments.push({ groupId: group.id, voiceId: ghost.voiceId, gender, ghostId: ghost.id, ...(label ? { label } : {}), ...(aliases.length ? { aliases } : {}) })
+    }
   }
   return assignments
 }
@@ -916,7 +947,7 @@ function readDetectedCharacters(
       : 0
     result.push({
       id: item.id,
-      name: typeof item.name === 'string' ? item.name.trim().slice(0, 128) : '',
+      name: typeof item.name === 'string' ? item.name.trim().slice(0, 4096) : '',
       messageCount: count,
     })
   }

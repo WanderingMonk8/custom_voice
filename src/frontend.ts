@@ -3604,7 +3604,7 @@ export function setup(ctx: SpindleFrontendContext) {
       character.name,
     )
     if (response === null) return null
-    const aliases = speakerAliases(response.slice(0, 128))
+    const aliases = speakerAliases(response.slice(0, 4096))
     if (aliases.length === 0) {
       setStatus('Enter an NPC name first.', 'error')
       return null

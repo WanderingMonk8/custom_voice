@@ -19,6 +19,8 @@ import {
   extractGenerationText,
   formatTtsTag,
   hashMessageContent,
+  ghostCastAliases,
+  mergeGhostAliases,
   hasNamedSpeakerSubject,
   normalizeSpeakerName,
   normalizeCustomTtsEmotionTag,
@@ -294,7 +296,7 @@ function sanitizeSaveConfig(
     for (const character of input.characters) {
       if (!character || typeof character.id !== 'string' || typeof character.name !== 'string') continue
       const id = character.id.trim().slice(0, 256)
-      const name = normalizeSpeakerName(character.name).slice(0, 128)
+      const name = normalizeSpeakerName(character.name).slice(0, 4096)
       if (!id || !name || seen.has(id)) continue
       seen.add(id)
       detectedCharacters.push({
@@ -870,6 +872,7 @@ async function saveGhostVoiceAssignments(
       }
       accepted.push({ ...assignment, voiceId })
       if (!ghost.label && assignment.label) ghost.label = assignment.label
+      ghost.aliases = mergeGhostAliases(ghostCastAliases(ghost), assignment.aliases ?? [])
       const occurrence = `${messageId}:${hashMessageContent(group.speeches.join('\n'))}`
       if (!ghost.occurrenceKeys.includes(occurrence)) ghost.occurrenceKeys = [...ghost.occurrenceKeys, occurrence].slice(-100)
       const previousIndex = assistantIds.indexOf(ghost.lastSeenMessageId)
@@ -1527,12 +1530,14 @@ spindle.onFrontendMessage(async (rawPayload: unknown, userId, frontendSessionId)
         if (payload.remove) {
           updatedMetadata.chat_voice_ghost_cast = ghosts.filter(item => item.id !== ghost.id)
         } else if (payload.promote) {
-          const name = ghost.label || (ghost.speakerId.startsWith('unconfigured:') ? ghost.speakerId.slice(13) : '')
+          const aliases = ghostCastAliases(ghost)
+          const name = aliases.join(' / ')
           if (!name) throw new Error('This character needs a recognizable name before it can be added to the cast.')
           const config = readConfig(metadata, chatMemberIds(chat))
-          const existing = config.detectedCharacters.find(character => speakerAliases(character.name).some(alias => alias.toLowerCase() === name.toLowerCase()))
-          const id = existing?.id ?? `npc:${name.toLowerCase()}`
+          const existing = config.detectedCharacters.find(character => speakerAliases(character.name).some(alias => aliases.some(ghostAlias => ghostAlias.toLowerCase() === alias.toLowerCase())))
+          const id = existing?.id ?? `npc:${aliases[0].toLowerCase()}`
           if (!existing) config.detectedCharacters.push({ id, name, messageCount: 0 })
+          else existing.name = mergeGhostAliases(speakerAliases(existing.name), aliases).join(' / ')
           if (!config.characterVoices[id]) config.characterVoices[id] = ghost.voiceId
           config.parsedMessages = {}
           updatedMetadata = applyConfigToMetadata(updatedMetadata, config)

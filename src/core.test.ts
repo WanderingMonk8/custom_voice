@@ -21,6 +21,9 @@ import {
   selectAutomaticVoice,
   activeGhostVoices,
   collectUncastVoiceGroups,
+  ghostCastAliases,
+  mergeGhostAliases,
+  readGhostVoices,
   buildUncastVoiceDecision,
   resolveUncastVoiceDecisions,
   clampMessageLimit,
@@ -2160,6 +2163,18 @@ test('new ghosts from older regenerated messages appear until their creation lif
   assert.equal(activeGhostVoices([ghost], ids, ids[23], 10).length, 0)
   assert.equal(activeGhostVoices([ghost], ids, ids[0], 10).length, 1)
   assert.equal(activeGhostVoices([ghost], ids, ids[11], 10).length, 0)
+})
+
+test('retains confirmed ghost aliases for matching and promotion', () => {
+  const ghost = readGhostVoices([{ id: 'ghost', speakerId: 'unconfigured:cobb', label: 'the farrier', aliases: ['COBB', 'the farrier', 'the healer'], voiceId: 'voice', context: '', occurrenceKeys: [], lastSeenMessageId: 'previous' }])[0]
+  assert.deepEqual(ghostCastAliases(ghost), ['cobb', 'the farrier', 'the healer'])
+  assert.deepEqual(mergeGhostAliases(['Cobb / the farrier'], ['cobb', 'the healer']), ['Cobb', 'the farrier', 'the healer'])
+  const groups = collectUncastVoiceGroups([{ speakerId: 'unconfigured:the healer', text: 'I can help.' }])
+  const matches = resolveUncastVoiceDecisions(groups, [], {}, [ghost])
+  assert.equal(matches[0]?.ghostId, 'ghost')
+  assert.deepEqual(matches[0]?.aliases, ['the healer'])
+  const ambiguous = resolveUncastVoiceDecisions(groups, [], {}, [ghost, { ...ghost, id: 'other', voiceId: 'another' }])
+  assert.deepEqual(ambiguous, [])
 })
 
 test('defaults and clamps the global saved audio limit', () => {
