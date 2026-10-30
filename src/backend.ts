@@ -12,6 +12,9 @@ import {
   applyTtsTagSelections,
   buildSpeakerDecisionPlan,
   buildAssistantUserSpeakerReview,
+  buildRelationshipSpeakerReview,
+  applyRelationshipSpeakerReview,
+  relationshipReviewContext,
   applyAssistantUserSpeakerReview,
   buildUncastVoiceDecision,
   buildUncastIdentityReview,
@@ -945,9 +948,14 @@ function queueSpeakerParse(
       ? messages.slice(0, messageIndex).filter(item => !item.is_user).at(-1)?.id ?? ''
       : message.id
     const lifetime = Number.isFinite(payload.ghostVoiceLifetime) ? Math.min(1000, Math.max(1, Math.round(payload.ghostVoiceLifetime))) : 10
-    for (const ghost of activeGhostVoices(readGhostVoices(chat.metadata?.chat_voice_ghost_cast), assistantIds, anchor, lifetime)) {
+    const activeGhostsForReview = activeGhostVoices(readGhostVoices(chat.metadata?.chat_voice_ghost_cast), assistantIds, anchor, lifetime)
+    const relationshipContext = relationshipReviewContext(messages, message.id, activeGhostsForReview, skippedTrackerTags)
+    for (const ghost of activeGhostsForReview) {
       if (!ghost.speakerId.startsWith('unconfigured:')) continue
+      const safe = relationshipContext.ghosts.find(item => item.id === ghost.id)
       const name = ghost.speakerId.slice('unconfigured:'.length)
+      // A later-discovered name must not leak into an earlier replay.
+      if (!safe || !safe.aliases.some(alias => alias.toLowerCase() === name.toLowerCase())) continue
       if (!name || configuredSpeakers.some(speaker => speaker.id === ghost.speakerId || speakerAliases(speaker.name).some(alias => alias.toLowerCase() === name.toLowerCase()))) continue
       configuredSpeakers.push({ id: ghost.speakerId, name })
     }
@@ -1066,6 +1074,7 @@ function queueSpeakerParse(
           })),
           cardSpeakerId: titleMatchedCardSpeakerId,
           historicalSpeakerId,
+          relationshipReview: { version: 'relationship-review-1', context: relationshipContext },
           previousAssistantMessageId: previousAssistantMessage?.id ?? null,
           skippedTrackerTags,
         }))
@@ -1113,6 +1122,21 @@ function queueSpeakerParse(
               spindle.log.warn(`[Chat Voice] User speaker review failed; keeping original assignments: ${error instanceof Error ? error.message : String(error)}`)
             }
           }
+          const relationshipReview = buildRelationshipSpeakerReview(decisionPlan, answers, relationshipContext)
+          let relationshipReviewFailed = false
+          if (Object.keys(relationshipReview.questions).length) {
+            try {
+              const relationshipResult = await spindle.decisions.evaluate({ state: relationshipReview.state, questions: relationshipReview.questions, ...(userId ? { userId } : {}) })
+              const reviewed: Record<string, SpeakerDecisionChoice> = {}
+              for (const [id, answer] of Object.entries(relationshipResult.answers)) {
+                if (answer.type === 'choice') reviewed[id] = { choice: answer.choice, probabilities: answer.probabilities, confidence: answer.confidence }
+              }
+              applyRelationshipSpeakerReview(decisionPlan, answers, reviewed, relationshipReview.ghostOptions)
+            } catch (error) {
+              relationshipReviewFailed = true
+              spindle.log.warn(`[Chat Voice] Relationship speaker review failed; keeping original assignments: ${error instanceof Error ? error.message : String(error)}`)
+            }
+          }
           const { assessment: discourseAssessment, evaluation: discourse } = await reviewDiscourseEscalation(
             decisionPlan,
             answers,
@@ -1136,15 +1160,20 @@ function queueSpeakerParse(
               },
             },
           )
+          const relationshipStatus = relationshipReviewFailed ? 'failed; original assignments retained'
+            : `${Object.keys(relationshipReview.questions).length} quotation(s) reviewed`
+          const reviewedSegments = payload.debug ? segments.map(segment => segment.debugPath ? {
+            ...segment, debugPath: [...segment.debugPath, `relationship-review-status:${relationshipStatus}`],
+          } : segment) : segments
           const tagResult = await applyTtsTags(
-            segments,
+            reviewedSegments,
             decisionPlan,
             tagStyle,
             tagSelectionsPromise,
             payload.debug,
           )
           const taggedSegments = tagResult.segments
-          if (!tagResult.tagFailed && !userReviewFailed) {
+          if (!tagResult.tagFailed && !userReviewFailed && !relationshipReviewFailed) {
             const nextConfig: ChatVoiceConfig = {
               ...config,
               parsedMessages: {

@@ -126,7 +126,7 @@ export function collectUncastVoiceGroups(segments: PlaybackSegment[]): UncastVoi
     // Never treat narration as dialogue, even if a malformed upstream segment carries a speaker ID.
     if (segment.debugPath?.some(step => step.startsWith('segment-type:narration'))) continue
     if (id === null) continue
-    if (id !== UNCAST_SPEAKER_ID && !id.startsWith('unconfigured:')) { anonymous = null; continue }
+    if (id !== UNCAST_SPEAKER_ID && !id.startsWith('unconfigured:') && !id.startsWith('ghost:')) { anonymous = null; continue }
     if (id !== UNCAST_SPEAKER_ID) anonymous = null
     // A substantial intervening narrative can introduce a different uncast
     // speaker even without an intervening cast quotation. Review each side.
@@ -322,7 +322,8 @@ export function resolveUncastVoiceDecisions(
       ...item.occurrenceKeys.map(key => previousMessageIds.indexOf(key.split(':', 1)[0])),
     ) })).sort((a, b) => b.recent - a.recent)
     const priorGhost = rankedGhosts[0]?.recent >= 0 && (rankedGhosts.length === 1 || rankedGhosts[0].recent > rankedGhosts[1].recent) ? rankedGhosts[0].item : undefined
-    let ghost = namedGhosts.length === 1 ? namedGhosts[0] : priorGhost ?? exact
+    const reviewedGhost = group.speakerId.startsWith('ghost:') ? ghosts.find(item => item.id === group.speakerId.slice('ghost:'.length)) : undefined
+    let ghost = reviewedGhost ?? (namedGhosts.length === 1 ? namedGhosts[0] : priorGhost ?? exact)
     if (!ghost && strongChoice(identity) && identity?.choice.startsWith('ghost_')) ghost = ghosts[Number(identity.choice.slice(6))]
     if (!ghost && identity?.choice.startsWith('ghost_')) {
       const ghostIndex = identity.choice.slice(6)
@@ -2729,6 +2730,86 @@ export function applyAssistantUserSpeakerReview(plan: SpeakerDecisionPlan, answe
       answers[`speech_${speech.id}`] = result
       answers[`user_review_applied_${speech.id}`] = result
     }
+  }
+}
+
+export interface RelationshipReviewContext {
+  previousMessages: Array<{ id: string; text: string }>
+  ghosts: Array<{ id: string; label: string; aliases: string[]; context: string; conversationHistory: Array<{ messageId: string; text: string }> }>
+}
+
+/** Prepare only earlier, tracker-free context, including when replaying old messages. */
+export function relationshipReviewContext(messages: Array<{ id: string; is_user: boolean; content?: string }>, targetId: string, ghosts: GhostVoice[], skippedTags = ''): RelationshipReviewContext {
+  const target = messages.findIndex(message => message.id === targetId)
+  if (target < 0) return { previousMessages: [], ghosts: [] }
+  const prior = messages.slice(0, target)
+  const priorIds = new Set(prior.map(message => message.id))
+  const previousMessages = prior.filter(message => !message.is_user).slice(-2).map(message => ({ id: message.id, text: preparePlaybackContent(message.content ?? '', skippedTags).slice(-4_000) }))
+  const safeGhosts = ghosts.flatMap(ghost => {
+    const lastIndex = messages.findIndex(message => message.id === ghost.lastSeenMessageId)
+    const safeCurrent = lastIndex >= 0 && lastIndex <= target
+    const history = (ghost.conversationHistory ?? []).filter(entry => priorIds.has(entry.messageId))
+      .map(entry => ({ messageId: entry.messageId, text: preparePlaybackContent(entry.text, skippedTags).slice(0, 6_000) }))
+    if (!safeCurrent && !history.length) return []
+    return [{ id: ghost.id, label: safeCurrent ? ghost.label ?? '' : '', aliases: safeCurrent ? ghostCastAliases(ghost) : [],
+      context: safeCurrent ? preparePlaybackContent(ghost.context, skippedTags).slice(0, 2_000) : '', conversationHistory: history }]
+  }).slice(0, 20)
+  return { previousMessages, ghosts: safeGhosts }
+}
+
+/** Run relationship review only where local identity or an off-scene exchange needs context. */
+export function buildRelationshipSpeakerReview(plan: SpeakerDecisionPlan, answers: Record<string, SpeakerDecisionChoice>, context: RelationshipReviewContext) {
+  const questions: SpeakerDecisionPlan['questions'] = {}
+  const ghostOptions: Record<string, string> = {}
+  const speakers = plan.state.speakers.map(speaker => ({ id: speaker.id, name: speaker.name }))
+  const criteria = speakerDecisionCriteria(plan.state.speakers.slice(0, 220))
+  const remaining = Math.max(0, 255 - Object.keys(criteria).length)
+  const castAliases = new Set(plan.state.speakers.filter(speaker => speaker.id !== USER_SPEAKER_ID).flatMap(speaker => speaker.aliases.map(alias => alias.toLowerCase())))
+  context.ghosts.filter(ghost => !ghost.aliases.some(alias => castAliases.has(alias.toLowerCase())))
+    .slice(0, Math.min(20, remaining)).forEach((ghost, index) => {
+    const option = `relationship_ghost_${index}`
+    ghostOptions[option] = `ghost:${ghost.id}`
+    criteria[option] = `Previously heard temporary character ${ghost.label || ghost.aliases.join(' / ') || `ghost ${index + 1}`}; use the supplied prior conversation, not the label alone.`
+  })
+  const phoneExchange = /\b(?:phone|telephone|caller|call|earpiece|voicemail|speakerphone)\b/iu.test(plan.state.message)
+  if (context.previousMessages.length || context.ghosts.length) {
+    for (const speech of plan.state.speeches) {
+      const local = evaluateSpeakerDecisionAnswer(answers[`speech_${speech.id}`], plan.optionSpeakerIds)
+      const paragraph = evaluateSpeakerDecisionAnswer(answers[`paragraph_${speech.paragraphId}`], plan.optionSpeakerIds)
+      const attribution = narrativeAttributionSpeaker(`${speech.narrativeBefore} ${speech.narrativeAfter}`, speakers)
+      if (attribution && local.identity === attribution) continue
+      const conflict = !!local.identity && !!paragraph.identity && local.identity !== paragraph.identity
+      if (local.identity && local.identity !== UNCAST_SPEAKER_ID && !conflict && !phoneExchange) continue
+      questions[`relationship_${speech.id}`] = {
+        type: 'choice',
+        instructions: `Who actually speaks quotation ${speech.id}? Compare the current exchange with the earlier conversations and relevant relationships. Distinguish speakers from people addressed or mentioned, and a caller from the person holding the phone. Consider whether a call continues, a different caller appears, or a person later arrives in person. Prefer explicit local attribution and select no_clear_identity when the evidence is insufficient.`,
+        criteria,
+      }
+      if (Object.keys(questions).length >= 32) break
+    }
+  }
+  return { state: { ...plan.state, previousMessages: context.previousMessages, ghosts: context.ghosts }, questions, ghostOptions }
+}
+
+/** A strong independent decision is required before relationship evidence changes routing. */
+export function applyRelationshipSpeakerReview(plan: SpeakerDecisionPlan, answers: Record<string, SpeakerDecisionChoice>, reviewed: Record<string, SpeakerDecisionChoice>, ghostOptions: Record<string, string>): void {
+  const options = { ...plan.optionSpeakerIds, ...ghostOptions }
+  for (const speech of plan.state.speeches) {
+    const result = reviewed[`relationship_${speech.id}`]
+    if (!result) continue
+    answers[`relationship_review_${speech.id}`] = result
+    const reviewedIdentity = evaluateSpeakerDecisionAnswer(result, options, { probability: 0.85, confidence: 0.8, margin: 0.3 }).identity
+    const original = answers[`speech_${speech.id}`]
+    const originalIdentity = evaluateSpeakerDecisionAnswer(original, plan.optionSpeakerIds).identity
+    if (!reviewedIdentity || reviewedIdentity === originalIdentity) continue
+    if (originalIdentity && originalIdentity !== UNCAST_SPEAKER_ID) {
+      const speakers = plan.state.speakers.map(speaker => ({ id: speaker.id, name: speaker.name }))
+      if (narrativeAttributionSpeaker(`${speech.narrativeBefore} ${speech.narrativeAfter}`, speakers) === originalIdentity) continue
+    }
+    Object.assign(plan.optionSpeakerIds, ghostOptions)
+    if (original) answers[`relationship_original_${speech.id}`] = original
+    answers[`speech_${speech.id}`] = result
+    answers[`relationship_applied_${speech.id}`] = result
   }
 }
 
@@ -5595,6 +5676,9 @@ export function resolveSpeakerDecisionSegments(
         debugPath: [
           `segment-type:speech (quote ${index + 1})`,
           ...decisionAnswerDebug('jev-speech', answer, plan.optionSpeakerIds),
+          ...decisionAnswerDebug('jev-relationship-original', answers[`relationship_original_${speech.id}`], plan.optionSpeakerIds),
+          ...decisionAnswerDebug('jev-relationship-review', answers[`relationship_review_${speech.id}`], plan.optionSpeakerIds),
+          ...(answers[`relationship_applied_${speech.id}`] ? ['jev-relationship-review:strong alternative applied'] : []),
           ...decisionAnswerDebug('jev-user-review-original', answers[`user_review_original_${speech.id}`], plan.optionSpeakerIds),
           ...decisionAnswerDebug('jev-user-review', answers[`user_review_${speech.id}`], plan.optionSpeakerIds),
           ...(answers[`user_review_applied_${speech.id}`] ? ['jev-user-review:strong alternative applied'] : []),

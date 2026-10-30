@@ -15,6 +15,9 @@ import {
   assessSpeakerDiscourseEscalation,
   buildSpeakerDecisionPlan,
   buildAssistantUserSpeakerReview,
+  buildRelationshipSpeakerReview,
+  applyRelationshipSpeakerReview,
+  relationshipReviewContext,
   applyAssistantUserSpeakerReview,
   buildTtsTagPlan,
   bufferAwareGenerationConcurrency,
@@ -2307,6 +2310,44 @@ test('retains conversation exchanges and relationship labels for later ghost ide
   assert.deepEqual(ghost.conversationHistory.map(item => item.messageId), ['two', 'three', 'four'])
   const reloaded = readGhostVoices([ghost])[0]
   assert.equal(reloaded.conversationHistory?.length, 3)
+})
+
+test('relationship review preserves caller identity, excludes future context, and routes to the existing ghost', () => {
+  const messages = [
+    { id: 'previous', is_user: false, content: `Tessa answers the phone. "Mom, are you there?" "Yes, Tessa." <tracker>secret prior</tracker>` },
+    { id: 'current', is_user: false, content: `Tessa holds the phone. "Mom, I said I am coming." "I am on Maple, Tessa."` },
+    { id: 'future', is_user: false, content: 'Marisol arrives in person.' },
+  ]
+  const ghost = { id: 'mother', speakerId: UNCAST_SPEAKER_ID, voiceId: 'mom-voice', label: 'Marisol', aliases: ['Marisol'], context: 'Marisol arrives in person.', occurrenceKeys: [], lastSeenMessageId: 'future', conversationHistory: [{ messageId: 'previous', text: messages[0].content }, { messageId: 'future', text: messages[2].content }] }
+  const context = relationshipReviewContext(messages, 'current', [ghost], 'tracker')
+  assert.doesNotMatch(JSON.stringify(context), /secret prior|Marisol/u)
+  assert.match(context.ghosts[0].conversationHistory[0].text, /Mom, are you there/u)
+  const speakers = [{ id: 'npc:tessa', name: 'Tessa' }, { id: USER_SPEAKER_ID, name: 'Ken' }]
+  const plan = buildSpeakerDecisionPlan(messages[1].content, speakers, false)
+  const answers = { speech_s0: confidentDecision('known_0'), speech_s1: confidentDecision('uncast_character') }
+  const review = buildRelationshipSpeakerReview(plan, answers, context)
+  assert.ok(review.questions.relationship_s1)
+  assert.ok(review.ghostOptions.relationship_ghost_0)
+  applyRelationshipSpeakerReview(plan, answers, { relationship_s1: confidentDecision('relationship_ghost_0') }, review.ghostOptions)
+  assert.equal(answers.speech_s1.choice, 'relationship_ghost_0')
+  const resolved = resolveSpeakerDecisionSegments(messages[1].content, plan, answers, speakers, { isUserMessage: false, cardSpeakerId: null, historicalSpeakerId: null })
+  const groups = collectUncastVoiceGroups(resolved)
+  assert.ok(groups.some(group => group.speakerId === 'ghost:mother'))
+  const matches = resolveUncastVoiceDecisions(groups, [], {}, [ghost])
+  assert.equal(matches.find(match => groups.find(group => group.id === match.groupId)?.speakerId === 'ghost:mother')?.voiceId, 'mom-voice')
+})
+
+test('relationship review keeps explicit attributions and rejects weak changes', () => {
+  const content = '"Hello," Tessa says. "Someone is calling."'
+  const speakers = [{ id: 'npc:tessa', name: 'Tessa' }, { id: USER_SPEAKER_ID, name: 'Ken' }]
+  const plan = buildSpeakerDecisionPlan(content, speakers, false)
+  const answers = { speech_s0: confidentDecision('known_0'), speech_s1: confidentDecision('uncast_character') }
+  const context = { previousMessages: [{ id: 'prior', text: 'Someone called.' }], ghosts: [{ id: 'other', label: '', aliases: [], context: 'A caller speaks.', conversationHistory: [] }] }
+  const review = buildRelationshipSpeakerReview(plan, answers, context)
+  assert.equal(review.questions.relationship_s0, undefined)
+  assert.ok(review.questions.relationship_s1)
+  applyRelationshipSpeakerReview(plan, answers, { relationship_s1: { choice: 'relationship_ghost_0', probabilities: { relationship_ghost_0: 0.65, no_clear_identity: 0.35 }, confidence: 0.6 } }, review.ghostOptions)
+  assert.equal(answers.speech_s1.choice, 'uncast_character')
 })
 
 test('defaults and clamps the global saved audio limit', () => {

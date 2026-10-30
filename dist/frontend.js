@@ -51,7 +51,7 @@ function collectUncastVoiceGroups(segments) {
     const id = segment.speakerId;
     if (segment.debugPath?.some((step) => step.startsWith("segment-type:narration"))) continue;
     if (id === null) continue;
-    if (id !== UNCAST_SPEAKER_ID && !id.startsWith("unconfigured:")) {
+    if (id !== UNCAST_SPEAKER_ID && !id.startsWith("unconfigured:") && !id.startsWith("ghost:")) {
       anonymous = null;
       continue;
     }
