@@ -2305,6 +2305,16 @@ function setup(ctx) {
   favoriteAdd.className = "chat-voice-add-button";
   favoriteAdd.textContent = "Add favorite";
   favoriteForm.append(favoriteName, favoriteId, favoriteDescription, favoriteCategory, favoriteAdd);
+  const favoriteFilter = document.createElement("select");
+  favoriteFilter.className = "chat-voice-favorite-select";
+  favoriteFilter.setAttribute("aria-label", "Filter favorite voices");
+  for (const [value, label] of [["unspecified", "Unspecified (all voices)"], ["male", "Male"], ["female", "Female"]]) {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = label;
+    favoriteFilter.appendChild(option);
+  }
+  favoriteFilter.addEventListener("change", () => renderFavoriteVoices());
   const favoriteList = document.createElement("div");
   favoriteList.className = "chat-voice-favorite-list";
   favoriteList.setAttribute("role", "region");
@@ -2315,7 +2325,7 @@ function setup(ctx) {
   favoriteError.dataset.state = "error";
   favoriteError.setAttribute("role", "alert");
   favoriteError.hidden = true;
-  favoritesSection.append(favoriteForm, favoriteError, favoriteList);
+  favoritesSection.append(favoriteForm, favoriteError, favoriteFilter, favoriteList);
   const status = document.createElement("div");
   status.className = "chat-voice-status";
   status.setAttribute("role", "status");
@@ -4395,7 +4405,15 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
       favoriteList.appendChild(empty);
       return;
     }
-    for (const voice of favoriteVoices) {
+    const visibleVoices = favoriteVoices.filter((voice) => favoriteFilter.value === "unspecified" || voice.category === favoriteFilter.value);
+    if (!visibleVoices.length) {
+      const empty = document.createElement("div");
+      empty.className = "chat-voice-hint";
+      empty.textContent = "No favorite voices match this filter.";
+      favoriteList.appendChild(empty);
+      return;
+    }
+    for (const voice of visibleVoices) {
       const row = document.createElement("div");
       row.className = "chat-voice-favorite-row";
       const copy = document.createElement("span");
