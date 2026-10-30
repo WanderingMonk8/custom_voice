@@ -1422,6 +1422,7 @@ export function setup(ctx: SpindleFrontendContext) {
   const inFlight = new Set<number>()
   const characterInputs = new Map<string, SpindleTextInputHandle>()
   const characterVoiceDisplays = new Map<string, HTMLButtonElement>()
+  const ghostVoiceEditors = new Map<string, { input: SpindleTextInputHandle; display: HTMLButtonElement }>()
   let editingCharacterVoiceId: string | null = null
   let lastContextMessageId: string | null = null
   const nativeButtonStates = new Map<HTMLButtonElement, {
@@ -3662,6 +3663,11 @@ export function setup(ctx: SpindleFrontendContext) {
   }
 
   function updateCharacterVoiceDisplays(): void {
+    for (const { input, display } of ghostVoiceEditors.values()) {
+      const voiceId = input.getValue().trim()
+      display.textContent = favoriteVoices.find(voice => voice.id === voiceId)?.name || voiceId || 'Connection default voice'
+      display.title = voiceId ? `Voice ID: ${voiceId}. Click to edit.` : 'Click to enter a voice ID.'
+    }
     for (const [id, display] of characterVoiceDisplays) {
       const voiceId = characterInputs.get(id)?.getValue().trim() ?? ''
       const favorite = favoriteVoices.find(voice => voice.id === voiceId)
@@ -3859,6 +3865,8 @@ export function setup(ctx: SpindleFrontendContext) {
 
   function renderCharacters(characters: DetectedCharacterState[]) {
     for (const input of characterInputs.values()) input.destroy()
+    for (const { input } of ghostVoiceEditors.values()) input.destroy()
+    ghostVoiceEditors.clear()
     characterInputs.clear()
     characterVoiceDisplays.clear()
     favoritePickers.clear()
@@ -3999,26 +4007,64 @@ export function setup(ctx: SpindleFrontendContext) {
       badge.className = 'chat-voice-character-count'
       badge.textContent = 'Temporary cast'
       heading.append(name, badge)
-      const voice = document.createElement('input')
-      voice.className = 'chat-voice-favorite-select'
-      voice.value = ghost.voiceId
-      voice.title = favoriteVoices.find(item => item.id === ghost.voiceId)?.name || ghost.voiceId
-      const selectedName = document.createElement('div')
-      selectedName.className = 'chat-voice-hint'
-      selectedName.textContent = favoriteVoices.find(item => item.id === ghost.voiceId)?.name || ghost.voiceId
-      voice.setAttribute('aria-label', `Voice ID for ${name.textContent}`)
-      voice.addEventListener('change', () => {
-        if (activeChat && voice.value.trim()) ctx.sendToBackend({ type: 'chat_voice_ghost_edit', chatId: activeChat.id, ghostId: ghost.id, voice: voice.value })
-      })
+      const slot = document.createElement('div')
+      slot.hidden = true
+      const voiceDisplay = document.createElement('button')
+      voiceDisplay.type = 'button'
+      voiceDisplay.className = 'chat-voice-selected-voice'
+      voiceDisplay.setAttribute('aria-label', `Selected voice for ${name.textContent}; press Enter to edit voice ID`)
       const picker = document.createElement('select')
       picker.className = 'chat-voice-favorite-select'
       picker.setAttribute('aria-label', `Favorite voice for ${name.textContent}`)
+      card.append(heading, voiceDisplay, slot, picker)
+      characterList.appendChild(card)
+      const input = ctx.components.mountTextInput(slot, {
+        value: ghost.voiceId,
+        placeholder: `Voice name or ID for ${name.textContent}`,
+        ariaLabel: `Custom voice for ${name.textContent}`,
+        disabled: !activeChat,
+        onChange: () => updateCharacterVoiceDisplays(),
+      })
+      ghostVoiceEditors.set(ghost.id, { input, display: voiceDisplay })
+      const editorId = `ghost:${ghost.id}`
+      const chatId = activeChat?.id
+      const beginEditing = () => {
+        if (!activeChat || activeChat.id !== chatId) return
+        editingCharacterVoiceId = editorId
+        voiceDisplay.hidden = true
+        slot.hidden = false
+        input.focus()
+      }
+      const endEditing = () => {
+        if (editingCharacterVoiceId !== editorId) return
+        editingCharacterVoiceId = null
+        slot.hidden = true
+        voiceDisplay.hidden = false
+        const voice = input.getValue().trim()
+        if (voice && voice !== ghost.voiceId && activeChat?.id === chatId) {
+          ctx.sendToBackend({ type: 'chat_voice_ghost_edit', chatId, ghostId: ghost.id, voice })
+        } else if (!voice) input.update({ value: ghost.voiceId })
+        updateCharacterVoiceDisplays()
+      }
+      voiceDisplay.addEventListener('click', beginEditing)
+      voiceDisplay.addEventListener('keydown', event => {
+        if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); beginEditing() }
+      })
+      slot.addEventListener('focusout', event => {
+        if (event.relatedTarget && slot.contains(event.relatedTarget as Node)) return
+        endEditing()
+      })
+      slot.addEventListener('keydown', event => {
+        if (event.key === 'Enter') { event.preventDefault(); input.blur(); endEditing(); voiceDisplay.focus() }
+      })
       picker.addEventListener('change', () => {
-        if (activeChat && picker.value) ctx.sendToBackend({ type: 'chat_voice_ghost_edit', chatId: activeChat.id, ghostId: ghost.id, voice: picker.value })
+        if (!picker.value || activeChat?.id !== chatId) return
+        input.update({ value: picker.value })
+        updateCharacterVoiceDisplays()
+        ctx.sendToBackend({ type: 'chat_voice_ghost_edit', chatId, ghostId: ghost.id, voice: picker.value })
+        picker.value = ''
       })
       favoritePickers.add(picker)
-      card.append(heading, selectedName, voice, picker)
-      characterList.appendChild(card)
     }
     updateFavoritePickers()
   }
@@ -4725,6 +4771,7 @@ export function setup(ctx: SpindleFrontendContext) {
     unsubscribeMessageRendered()
     unsubscribeBackend()
     for (const input of characterInputs.values()) input.destroy()
+    for (const { input } of ghostVoiceEditors.values()) input.destroy()
     for (const pending of pendingMessageRequests.values()) {
       clearTimeout(pending.timer)
       pending.reject(new Error('Chat Voice was closed.'))
