@@ -980,6 +980,7 @@ export function setup(ctx: SpindleFrontendContext) {
       border:1px solid var(--lumiverse-border); border-radius:var(--lumiverse-radius);
       background:var(--lumiverse-fill-subtle);
     }
+    .chat-voice-character-temporary { border:1px dashed #e05b5b; }
     .chat-voice-character-heading { display:flex; justify-content:space-between; gap:8px; align-items:baseline; }
     .chat-voice-character-meta { display:flex; align-items:center; gap:6px; }
     .chat-voice-character-name { color:var(--lumiverse-text); font-size:12px; font-weight:600; }
@@ -3986,8 +3987,7 @@ export function setup(ctx: SpindleFrontendContext) {
     }
     for (const ghost of ghosts) {
       const card = document.createElement('div')
-      card.className = 'chat-voice-character'
-      card.style.borderStyle = 'dashed'
+      card.className = 'chat-voice-character chat-voice-character-temporary'
       const heading = document.createElement('div')
       heading.className = 'chat-voice-character-heading'
       const name = document.createElement('button')
@@ -3996,7 +3996,7 @@ export function setup(ctx: SpindleFrontendContext) {
       name.style.background = 'transparent'
       name.style.border = '0'
       name.style.color = 'inherit'
-      name.textContent = ghost.label || (ghost.speakerId.startsWith('unconfigured:') ? ghost.speakerId.slice(13) : 'Unnamed character')
+      name.textContent = ghost.label || (ghost.speakerId.startsWith('unconfigured:') ? ghost.speakerId.slice(13) : `Unnamed character ? ${ghost.id.replace(/^ghost-/u, '')}`)
       name.title = 'Double-click to add to the regular cast'
       name.addEventListener('dblclick', () => {
         if (!activeChat) return
