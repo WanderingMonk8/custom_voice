@@ -3996,7 +3996,7 @@ export function setup(ctx: SpindleFrontendContext) {
       name.style.background = 'transparent'
       name.style.border = '0'
       name.style.color = 'inherit'
-      name.textContent = ghost.label || (ghost.speakerId.startsWith('unconfigured:') ? ghost.speakerId.slice(13) : `Unnamed character ? ${ghost.id.replace(/^ghost-/u, '')}`)
+      name.textContent = ghost.label || (ghost.speakerId.startsWith('unconfigured:') ? ghost.speakerId.slice(13) : `Unnamed character \u00b7 ${ghost.id.replace(/^ghost-/u, '')}`)
       name.title = 'Double-click to add to the regular cast'
       name.addEventListener('dblclick', () => {
         if (!activeChat) return
@@ -4011,7 +4011,7 @@ export function setup(ctx: SpindleFrontendContext) {
       const remove = document.createElement('button')
       remove.type = 'button'
       remove.className = 'chat-voice-delete-button'
-      remove.textContent = '?'
+      remove.textContent = '\u00d7'
       remove.title = `Delete ${name.textContent}`
       remove.setAttribute('aria-label', remove.title)
       remove.addEventListener('click', () => {
