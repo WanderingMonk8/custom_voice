@@ -2059,6 +2059,49 @@ test('strong pairwise identity links override conflicting cached turn voices', (
   assert.match(buildUncastVoiceDecision(groups, [], 'The clerk and Watt.').questions.same_g1_g0.instructions, /same individual/u)
 })
 
+test('retains a confident descriptive uncast identity across turns and messages', () => {
+  const groups = collectUncastVoiceGroups([
+    { speakerId: UNCAST_SPEAKER_ID, text: 'First.' },
+    { speakerId: 'watt', text: 'Answer.' },
+    { speakerId: UNCAST_SPEAKER_ID, text: 'Second.' },
+  ])
+  const message = "The clerk's quill moves. The clerk speaks."
+  const plan = buildUncastVoiceDecision(groups, [], message)
+  const labelKey = Object.entries(plan.questions.label_g0.criteria).find(([, label]) => label === 'the clerk')?.[0]
+  assert.ok(labelKey)
+  const ghost = { id: 'clerk-ghost', speakerId: UNCAST_SPEAKER_ID, label: 'the clerk', voiceId: 'clerk-voice', context: 'The clerk speaks.', occurrenceKeys: [], lastSeenMessageId: 'previous' }
+  const result = resolveUncastVoiceDecisions(groups, [], {
+    label_g0: confidentDecision(labelKey), label_g1: confidentDecision(labelKey),
+  }, [ghost], [], 'current', message)
+  assert.deepEqual(result.map(item => [item.voiceId, item.label]), [['clerk-voice', 'the clerk'], ['clerk-voice', 'the clerk']])
+  const weak = resolveUncastVoiceDecisions(groups, [], {
+    label_g0: { choice: labelKey, confidence: 0.4, probabilities: { [labelKey]: 0.6, none: 0.4 } },
+  }, [ghost], [], 'current', message)
+  assert.deepEqual(weak, [])
+})
+
+test('uses a clear label below the identity threshold and prefers the prior message over a stale replay', () => {
+  const groups = collectUncastVoiceGroups([{ speakerId: UNCAST_SPEAKER_ID, text: 'Continue.' }])
+  const message = 'The clerk speaks.'
+  const ghosts = [
+    { id: 'stale', speakerId: UNCAST_SPEAKER_ID, label: 'the clerk', voiceId: 'stale-voice', context: '', occurrenceKeys: [`current:${hashMessageContent('Continue.')}`], lastSeenMessageId: 'current' },
+    { id: 'prior', speakerId: UNCAST_SPEAKER_ID, label: 'the clerk', voiceId: 'prior-voice', context: '', occurrenceKeys: ['prior:abc'], lastSeenMessageId: 'prior' },
+  ]
+  const result = resolveUncastVoiceDecisions(groups, [], {
+    label_g0: { choice: 'label_0', confidence: 0.77, probabilities: { label_0: 0.77, none: 0.05, label_1: 0.16 } },
+  }, ghosts, [], 'current', message, ['prior'])
+  assert.equal(result[0]?.voiceId, 'prior-voice')
+})
+
+test('reviews uncast turns separately when a long narrative may introduce someone else', () => {
+  const groups = collectUncastVoiceGroups([
+    { speakerId: UNCAST_SPEAKER_ID, text: 'The guard speaks.' },
+    { speakerId: null, text: 'They cross the camp. '.repeat(20) + 'The clerk looks up.' },
+    { speakerId: UNCAST_SPEAKER_ID, text: 'The clerk speaks.' },
+  ])
+  assert.deepEqual(groups.map(group => group.segmentIndexes), [[0], [2]])
+})
+
 test('defaults and clamps the global saved audio limit', () => {
   assert.equal(clampSavedAudioLimit(undefined), 50)
   assert.equal(clampSavedAudioLimit(0), 1)

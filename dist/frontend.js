@@ -44,6 +44,7 @@ function collectUncastVoiceGroups(segments) {
       continue;
     }
     if (id !== UNCAST_SPEAKER_ID) anonymous = null;
+    if (id === UNCAST_SPEAKER_ID && segments[index - 1]?.speakerId === null && segments[index - 1].text.length > 240) anonymous = null;
     let group = id === UNCAST_SPEAKER_ID ? anonymous : named.get(id);
     if (!group) {
       group = { id: `g${groups.length}`, speakerId: id, segmentIndexes: [], speeches: [], context: [] };
