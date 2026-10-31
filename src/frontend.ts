@@ -996,7 +996,7 @@ export function setup(ctx: SpindleFrontendContext) {
     .chat-voice-add-row { display:grid; grid-template-columns:minmax(0, 1fr) auto; gap:8px; }
     .chat-voice-favorites { display:flex; flex-direction:column; gap:8px; }
     .chat-voice-favorite-form { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
-    .chat-voice-favorite-form input, .chat-voice-favorite-select, .chat-voice-favorite-form select {
+    .chat-voice-favorite-form input, .chat-voice-rename-input, .chat-voice-favorite-select, .chat-voice-favorite-form select {
       min-width:0; width:100%; box-sizing:border-box; min-height:36px; padding:7px 9px;
       border:1px solid var(--lumiverse-border); border-radius:var(--lumiverse-radius);
       background:var(--lumiverse-bg-secondary, #222); color:var(--lumiverse-text); font:inherit; font-size:12px;
@@ -3606,15 +3606,10 @@ export function setup(ctx: SpindleFrontendContext) {
     markChanged(0)
   }
 
-  function renameCharacter(characterId: string): string | null {
+  function renameCharacter(characterId: string, response: string): string | null {
     if (!activeChat) return null
     const character = activeChat.characters.find(item => item.id === characterId)
     if (!character) return null
-    const response = hostWindow.prompt(
-      'Rename this character or add aliases separated by â€œ/â€.',
-      character.name,
-    )
-    if (response === null) return null
     const aliases = speakerAliases(response.slice(0, 4096))
     if (aliases.length === 0) {
       setStatus('Enter an NPC name first.', 'error')
@@ -3927,6 +3922,25 @@ export function setup(ctx: SpindleFrontendContext) {
       const meta = document.createElement('span')
       meta.className = 'chat-voice-character-meta'
       meta.append(count)
+      const renameForm = document.createElement('form')
+      renameForm.hidden = true
+      const renameLabel = document.createElement('label')
+      renameLabel.textContent = 'Name and aliases (separate with /)'
+      renameLabel.className = 'chat-voice-hint'
+      const renameInput = document.createElement('input')
+      renameInput.className = 'chat-voice-rename-input'
+      renameInput.type = 'text'
+      renameInput.maxLength = 4096
+      renameInput.setAttribute('aria-label', 'Character name and aliases')
+      const saveRename = document.createElement('button')
+      saveRename.type = 'submit'
+      saveRename.className = 'chat-voice-preview-button'
+      saveRename.textContent = 'Save'
+      const cancelRename = document.createElement('button')
+      cancelRename.type = 'button'
+      cancelRename.className = 'chat-voice-preview-button'
+      cancelRename.textContent = 'Cancel'
+      renameForm.append(renameLabel, renameInput, saveRename, cancelRename)
       {
         const rename = document.createElement('button')
         rename.type = 'button'
@@ -3943,8 +3957,24 @@ export function setup(ctx: SpindleFrontendContext) {
         remove.setAttribute('aria-label', remove.title)
         remove.disabled = !activeChat
         rename.addEventListener('click', () => {
-          const renamed = renameCharacter(character.id)
+          const current = activeChat?.characters.find(item => item.id === character.id)
+          if (!current) return
+          renameInput.value = current.name
+          renameForm.hidden = false
+          editingCharacterVoiceId = `rename:${character.id}`
+          renameInput.focus()
+          renameInput.select()
+        })
+        cancelRename.addEventListener('click', () => {
+          renameForm.hidden = true
+          if (editingCharacterVoiceId === `rename:${character.id}`) editingCharacterVoiceId = null
+        })
+        renameForm.addEventListener('submit', event => {
+          event.preventDefault()
+          const renamed = renameCharacter(character.id, renameInput.value)
           if (!renamed) return
+          renameForm.hidden = true
+          if (editingCharacterVoiceId === `rename:${character.id}`) editingCharacterVoiceId = null
           name.textContent = renamed
           rename.title = `Rename ${renamed} or edit aliases`
           rename.setAttribute('aria-label', rename.title)
@@ -3968,7 +3998,7 @@ export function setup(ctx: SpindleFrontendContext) {
       picker.className = 'chat-voice-favorite-select'
       picker.setAttribute('aria-label', `Favorite voice for ${character.name}`)
       heading.append(name, meta)
-      card.append(heading, voiceDisplay, slot, picker)
+      card.append(heading, renameForm, voiceDisplay, slot, picker)
       characterList.appendChild(card)
       const input = ctx.components.mountTextInput(slot, {
         value: character.voice,
