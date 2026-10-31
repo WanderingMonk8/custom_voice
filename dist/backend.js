@@ -223,11 +223,15 @@ function buildUncastIdentityReview(groups, answers, message, ghosts = []) {
   }
   return { state: { message, characters: groups.map((group) => ({ id: group.id, identity: group.speakerId, speeches: group.speeches, context: group.context })), ghosts: ghosts.map((ghost, index) => ({ option: `ghost_${index}`, identity: ghost.speakerId, aliases: ghostCastAliases(ghost), context: ghost.context })) }, questions };
 }
+function isBroadPersonLabel(label) {
+  return /^(?:(?:the|a|an)\s+)?(?:(?:young|younger|old|older|elderly|middle-aged|tall|short)\s+)*(?:woman|man|person|girl|boy|guy|lady|stranger|someone|somebody)$/iu.test(label.trim());
+}
 function resolveUncastVoiceDecisions(groups, voices, answers, ghosts = [], reserved = [], messageId = "", message = "", previousMessageIds = []) {
   const used = new Set(reserved.filter(Boolean));
   const assignments = [];
   const roots = /* @__PURE__ */ new Map();
   const linkedGhosts = /* @__PURE__ */ new Map();
+  const linkReasons = /* @__PURE__ */ new Map();
   const labels = uncastIdentityLabels(message, ghosts);
   const groupLabels = /* @__PURE__ */ new Map();
   const rootByLabel = /* @__PURE__ */ new Map();
@@ -241,8 +245,9 @@ function resolveUncastVoiceDecisions(groups, voices, answers, ghosts = [], reser
     let root = group.id;
     const occurrenceKey = messageId ? `${messageId}:${hashMessageContent(group.speeches.join("\n"))}` : "";
     const name = group.speakerId.startsWith("unconfigured:") ? group.speakerId.slice("unconfigured:".length).toLowerCase() : "";
-    const aliasMatches = name ? ghosts.filter((item) => ghostCastAliases(item).some((alias) => alias.toLowerCase() === name)) : [];
-    const exact = ghosts.find((item) => occurrenceKey && item.occurrenceKeys.includes(occurrenceKey)) ?? (group.speakerId !== UNCAST_SPEAKER_ID ? ghosts.find((item) => item.speakerId === group.speakerId) : void 0) ?? (aliasMatches.length === 1 ? aliasMatches[0] : void 0);
+    const aliasMatches = name && !isBroadPersonLabel(name) ? ghosts.filter((item) => ghostCastAliases(item).some((alias) => alias.toLowerCase() === name)) : [];
+    const occurrence = ghosts.find((item) => occurrenceKey && item.occurrenceKeys.includes(occurrenceKey));
+    const exact = occurrence ?? (group.speakerId !== UNCAST_SPEAKER_ID && !isBroadPersonLabel(name) ? ghosts.find((item) => item.speakerId === group.speakerId) : void 0) ?? (aliasMatches.length === 1 ? aliasMatches[0] : void 0);
     const identity = answers[`identity_${group.id}`];
     const labelAnswer = answers[`label_${group.id}`];
     const labelIndex = labelAnswer?.choice.match(/^label_(\d+)$/u);
@@ -257,9 +262,9 @@ function resolveUncastVoiceDecisions(groups, voices, answers, ghosts = [], reser
       return answer?.choice === "same" && strongChoice(answer) ? [{ previous, probability: answer.probabilities.same ?? 0 }] : [];
     }).sort((a, b) => b.probability - a.probability);
     if (same[0]) root = roots.get(same[0].previous.id) ?? root;
-    else if (label && rootByLabel.has(label)) root = rootByLabel.get(label);
+    else if (label && !isBroadPersonLabel(label) && rootByLabel.has(label)) root = rootByLabel.get(label);
     else if (strongChoice(identity) && identity?.choice.startsWith("group_")) root = roots.get(identity.choice.slice(6)) ?? root;
-    const namedGhosts = label ? ghosts.filter((item) => ghostCastAliases(item).some((alias) => alias.toLowerCase() === label)) : [];
+    const namedGhosts = label && !isBroadPersonLabel(label) ? ghosts.filter((item) => ghostCastAliases(item).some((alias) => alias.toLowerCase() === label)) : [];
     const rankedGhosts = namedGhosts.map((item) => ({ item, recent: Math.max(
       previousMessageIds.indexOf(item.lastSeenMessageId),
       ...item.occurrenceKeys.map((key) => previousMessageIds.indexOf(key.split(":", 1)[0]))
@@ -267,15 +272,25 @@ function resolveUncastVoiceDecisions(groups, voices, answers, ghosts = [], reser
     const priorGhost = rankedGhosts[0]?.recent >= 0 && (rankedGhosts.length === 1 || rankedGhosts[0].recent > rankedGhosts[1].recent) ? rankedGhosts[0].item : void 0;
     const reviewedGhost = group.speakerId.startsWith("ghost:") ? ghosts.find((item) => item.id === group.speakerId.slice("ghost:".length)) : void 0;
     let ghost = reviewedGhost ?? (namedGhosts.length === 1 ? namedGhosts[0] : priorGhost ?? exact);
-    if (!ghost && strongChoice(identity) && identity?.choice.startsWith("ghost_")) ghost = ghosts[Number(identity.choice.slice(6))];
+    let reason = reviewedGhost ? "speaker relationship review" : ghost === occurrence && ghost ? "exact message occurrence" : ghost && namedGhosts.includes(ghost) ? "label or alias match" : ghost ? "speaker name or alias match" : "";
+    if (!ghost && strongChoice(identity) && identity?.choice.startsWith("ghost_")) {
+      ghost = ghosts[Number(identity.choice.slice(6))];
+      if (ghost) reason = "Jev identity match";
+    }
     if (!ghost && identity?.choice.startsWith("ghost_")) {
       const ghostIndex = identity.choice.slice(6);
       const review = answers[`review_ghost_${group.id}_${ghostIndex}`];
-      if (review?.choice === "same" && strongChoice(review)) ghost = ghosts[Number(ghostIndex)];
+      if (review?.choice === "same" && strongChoice(review)) {
+        ghost = ghosts[Number(ghostIndex)];
+        if (ghost) reason = "Jev identity follow-up review";
+      }
     }
     roots.set(group.id, root);
     if (label && !rootByLabel.has(label)) rootByLabel.set(label, root);
-    if (ghost && !reserved.includes(ghost.voiceId) && !linkedGhosts.has(root)) linkedGhosts.set(root, ghost);
+    if (ghost && !reserved.includes(ghost.voiceId) && !linkedGhosts.has(root)) {
+      linkedGhosts.set(root, ghost);
+      linkReasons.set(root, `${reason}: ${ghost.id} (${ghost.label || ghost.speakerId})`);
+    }
   }
   for (const root of new Set(roots.values())) {
     const members = groups.filter((group) => roots.get(group.id) === root);
@@ -294,6 +309,7 @@ function resolveUncastVoiceDecisions(groups, voices, answers, ghosts = [], reser
       if (!ranked.length && eligible.length === 1 && matches.length) ranked.push(eligible[0]);
       if (!ranked[0]) continue;
       ghost = { id: `pending:${root}`, speakerId: members[0].speakerId, voiceId: ranked[0].voice.id, context: members.flatMap((group) => group.context).join(" ").slice(0, 2e3), occurrenceKeys: [], lastSeenMessageId: messageId };
+      linkReasons.set(root, "new voice selected from favorites");
     }
     used.add(ghost.voiceId);
     const label = ghost.label || members.map((group) => groupLabels.get(group.id)).find(Boolean);
@@ -302,7 +318,7 @@ function resolveUncastVoiceDecisions(groups, voices, answers, ghosts = [], reser
         group.speakerId.startsWith("unconfigured:") ? [group.speakerId.slice("unconfigured:".length)] : [],
         groupLabels.has(group.id) ? [groupLabels.get(group.id)] : []
       );
-      assignments.push({ groupId: group.id, voiceId: ghost.voiceId, gender, ghostId: ghost.id, ...label ? { label } : {}, ...aliases.length ? { aliases } : {} });
+      assignments.push({ groupId: group.id, voiceId: ghost.voiceId, gender, ghostId: ghost.id, matchReason: `${linkReasons.get(root) ?? "unknown"}${group.id !== root ? `; linked to group ${root}` : ""}`, ...label ? { label } : {}, ...aliases.length ? { aliases } : {} });
     }
   }
   return assignments;
@@ -5042,7 +5058,7 @@ spindle.onFrontendMessage(async (rawPayload, userId, frontendSessionId) => {
             const comparisons = Object.entries(answers).filter(([key]) => key.startsWith(`same_${group.id}_`) || key.startsWith(`review_same_${group.id}_`) || key.startsWith(`review_ghost_${group.id}_`)).map(([key, answer]) => `${key}=${answer.choice} confidence=${answer.confidence} probabilities=${JSON.stringify(answer.probabilities)}`).join(";") || "none";
             const assignment = assignments.find((item) => item.groupId === group.id);
             const proposed = proposedAssignments.find((item) => item.groupId === group.id);
-            return `${group.id} segments=${group.segmentIndexes.map((index) => index + 1).join(",")} identity=${identity ? `${identity.choice} confidence=${identity.confidence} probabilities=${JSON.stringify(identity.probabilities)}` : "none"} label=${label ? `${label.choice} confidence=${label.confidence} probabilities=${JSON.stringify(label.probabilities)}` : "none"} comparisons=${comparisons} proposed=${proposed ? `${proposed.ghostId} / ${proposed.voiceId} / ${proposed.gender}` : "none"} voice-choice=${voice ? `${voice.choice} confidence=${voice.confidence} probabilities=${JSON.stringify(voice.probabilities)}` : "none"} final=${assignment ? `${assignment.label || "unnamed"} / ${assignment.ghostId} / ${assignment.voiceId}` : "connection default"}`;
+            return `${group.id} segments=${group.segmentIndexes.map((index) => index + 1).join(",")} identity=${identity ? `${identity.choice} confidence=${identity.confidence} probabilities=${JSON.stringify(identity.probabilities)}` : "none"} label=${label ? `${label.choice} confidence=${label.confidence} probabilities=${JSON.stringify(label.probabilities)}` : "none"} comparisons=${comparisons} proposed=${proposed ? `${proposed.ghostId} / ${proposed.voiceId} / ${proposed.gender}` : "none"} match-reason=${proposed?.matchReason ?? "none"} voice-choice=${voice ? `${voice.choice} confidence=${voice.confidence} probabilities=${JSON.stringify(voice.probabilities)}` : "none"} final=${assignment ? `${assignment.label || "unnamed"} / ${assignment.ghostId} / ${assignment.voiceId}` : "connection default"}`;
           });
           diagnostics.unshift(`Available favorites=${voices.length}, historical ghosts=${ghosts.length}, current ghosts=${currentGhosts.length}${decisionError ? `; Jev failed: ${decisionError}` : ""}; identity review questions=${Object.keys(review.questions).length}${reviewError ? `; review failed: ${reviewError}` : ""}.`);
           sendFrontend({ type: "chat_voice_uncast_matches", requestId: payload.requestId, assignments, diagnostics }, userId, frontendSessionId);

@@ -297,7 +297,12 @@ export function buildUncastIdentityReview(groups: UncastVoiceGroup[], answers: R
   return { state: { message, characters: groups.map(group => ({ id: group.id, identity: group.speakerId, speeches: group.speeches, context: group.context })), ghosts: ghosts.map((ghost, index) => ({ option: `ghost_${index}`, identity: ghost.speakerId, aliases: ghostCastAliases(ghost), context: ghost.context })) }, questions }
 }
 
-export interface UncastVoiceAssignment { groupId: string; voiceId: string; gender: string; ghostId?: string; label?: string; aliases?: string[] }
+export interface UncastVoiceAssignment { groupId: string; voiceId: string; gender: string; ghostId?: string; label?: string; aliases?: string[]; matchReason?: string }
+
+/** Broad descriptions are useful context, but do not uniquely identify a person. */
+function isBroadPersonLabel(label: string): boolean {
+  return /^(?:(?:the|a|an)\s+)?(?:(?:young|younger|old|older|elderly|middle-aged|tall|short)\s+)*(?:woman|man|person|girl|boy|guy|lady|stranger|someone|somebody)$/iu.test(label.trim())
+}
 
 export function resolveUncastVoiceDecisions(
   groups: UncastVoiceGroup[], voices: FavoriteVoice[], answers: Record<string, SpeakerDecisionChoice>,
@@ -307,6 +312,7 @@ export function resolveUncastVoiceDecisions(
   const assignments: UncastVoiceAssignment[] = []
   const roots = new Map<string, string>()
   const linkedGhosts = new Map<string, GhostVoice>()
+  const linkReasons = new Map<string, string>()
   const labels = uncastIdentityLabels(message, ghosts)
   const groupLabels = new Map<string, string>()
   const rootByLabel = new Map<string, string>()
@@ -322,9 +328,10 @@ export function resolveUncastVoiceDecisions(
     let root = group.id
     const occurrenceKey = messageId ? `${messageId}:${hashMessageContent(group.speeches.join('\n'))}` : ''
     const name = group.speakerId.startsWith('unconfigured:') ? group.speakerId.slice('unconfigured:'.length).toLowerCase() : ''
-    const aliasMatches = name ? ghosts.filter(item => ghostCastAliases(item).some(alias => alias.toLowerCase() === name)) : []
-    const exact = ghosts.find(item => occurrenceKey && item.occurrenceKeys.includes(occurrenceKey))
-      ?? (group.speakerId !== UNCAST_SPEAKER_ID ? ghosts.find(item => item.speakerId === group.speakerId) : undefined)
+    const aliasMatches = name && !isBroadPersonLabel(name) ? ghosts.filter(item => ghostCastAliases(item).some(alias => alias.toLowerCase() === name)) : []
+    const occurrence = ghosts.find(item => occurrenceKey && item.occurrenceKeys.includes(occurrenceKey))
+    const exact = occurrence
+      ?? (group.speakerId !== UNCAST_SPEAKER_ID && !isBroadPersonLabel(name) ? ghosts.find(item => item.speakerId === group.speakerId) : undefined)
       ?? (aliasMatches.length === 1 ? aliasMatches[0] : undefined)
     const identity = answers[`identity_${group.id}`]
     const labelAnswer = answers[`label_${group.id}`]
@@ -340,9 +347,9 @@ export function resolveUncastVoiceDecisions(
       return answer?.choice === 'same' && strongChoice(answer) ? [{ previous, probability: answer.probabilities.same ?? 0 }] : []
     }).sort((a, b) => b.probability - a.probability)
     if (same[0]) root = roots.get(same[0].previous.id) ?? root
-    else if (label && rootByLabel.has(label)) root = rootByLabel.get(label)!
+    else if (label && !isBroadPersonLabel(label) && rootByLabel.has(label)) root = rootByLabel.get(label)!
     else if (strongChoice(identity) && identity?.choice.startsWith('group_')) root = roots.get(identity.choice.slice(6)) ?? root
-    const namedGhosts = label ? ghosts.filter(item => ghostCastAliases(item).some(alias => alias.toLowerCase() === label)) : []
+    const namedGhosts = label && !isBroadPersonLabel(label) ? ghosts.filter(item => ghostCastAliases(item).some(alias => alias.toLowerCase() === label)) : []
     const rankedGhosts = namedGhosts.map(item => ({ item, recent: Math.max(
       previousMessageIds.indexOf(item.lastSeenMessageId),
       ...item.occurrenceKeys.map(key => previousMessageIds.indexOf(key.split(':', 1)[0])),
@@ -350,17 +357,18 @@ export function resolveUncastVoiceDecisions(
     const priorGhost = rankedGhosts[0]?.recent >= 0 && (rankedGhosts.length === 1 || rankedGhosts[0].recent > rankedGhosts[1].recent) ? rankedGhosts[0].item : undefined
     const reviewedGhost = group.speakerId.startsWith('ghost:') ? ghosts.find(item => item.id === group.speakerId.slice('ghost:'.length)) : undefined
     let ghost = reviewedGhost ?? (namedGhosts.length === 1 ? namedGhosts[0] : priorGhost ?? exact)
-    if (!ghost && strongChoice(identity) && identity?.choice.startsWith('ghost_')) ghost = ghosts[Number(identity.choice.slice(6))]
+    let reason = reviewedGhost ? 'speaker relationship review' : ghost === occurrence && ghost ? 'exact message occurrence' : ghost && namedGhosts.includes(ghost) ? 'label or alias match' : ghost ? 'speaker name or alias match' : ''
+    if (!ghost && strongChoice(identity) && identity?.choice.startsWith('ghost_')) { ghost = ghosts[Number(identity.choice.slice(6))]; if (ghost) reason = 'Jev identity match' }
     if (!ghost && identity?.choice.startsWith('ghost_')) {
       const ghostIndex = identity.choice.slice(6)
       const review = answers[`review_ghost_${group.id}_${ghostIndex}`]
-      if (review?.choice === 'same' && strongChoice(review)) ghost = ghosts[Number(ghostIndex)]
+      if (review?.choice === 'same' && strongChoice(review)) { ghost = ghosts[Number(ghostIndex)]; if (ghost) reason = 'Jev identity follow-up review' }
     }
     roots.set(group.id, root)
     if (label && !rootByLabel.has(label)) rootByLabel.set(label, root)
     // A matching earlier group owns the voice, even if a previous replay
     // cached a different voice for this individual turn.
-    if (ghost && !reserved.includes(ghost.voiceId) && !linkedGhosts.has(root)) linkedGhosts.set(root, ghost)
+    if (ghost && !reserved.includes(ghost.voiceId) && !linkedGhosts.has(root)) { linkedGhosts.set(root, ghost); linkReasons.set(root, `${reason}: ${ghost.id} (${ghost.label || ghost.speakerId})`) }
   }
   for (const root of new Set(roots.values())) {
     const members = groups.filter(group => roots.get(group.id) === root)
@@ -379,6 +387,7 @@ export function resolveUncastVoiceDecisions(
       if (!ranked.length && eligible.length === 1 && matches.length) ranked.push(eligible[0])
       if (!ranked[0]) continue
       ghost = { id: `pending:${root}`, speakerId: members[0].speakerId, voiceId: ranked[0].voice.id, context: members.flatMap(group => group.context).join(' ').slice(0, 2_000), occurrenceKeys: [], lastSeenMessageId: messageId }
+      linkReasons.set(root, 'new voice selected from favorites')
     }
     used.add(ghost.voiceId)
     const label = ghost.label || members.map(group => groupLabels.get(group.id)).find(Boolean)
@@ -387,7 +396,7 @@ export function resolveUncastVoiceDecisions(
         group.speakerId.startsWith('unconfigured:') ? [group.speakerId.slice('unconfigured:'.length)] : [],
         groupLabels.has(group.id) ? [groupLabels.get(group.id)!] : [],
       )
-      assignments.push({ groupId: group.id, voiceId: ghost.voiceId, gender, ghostId: ghost.id, ...(label ? { label } : {}), ...(aliases.length ? { aliases } : {}) })
+      assignments.push({ groupId: group.id, voiceId: ghost.voiceId, gender, ghostId: ghost.id, matchReason: `${linkReasons.get(root) ?? 'unknown'}${group.id !== root ? `; linked to group ${root}` : ''}`, ...(label ? { label } : {}), ...(aliases.length ? { aliases } : {}) })
     }
   }
   return assignments

@@ -2221,6 +2221,21 @@ test('retains confirmed ghost aliases for matching and promotion', () => {
   assert.deepEqual(ambiguous, [])
 })
 
+test('requires identity review before matching broad person descriptions to earlier ghosts', () => {
+  const group = collectUncastVoiceGroups([{ speakerId: 'unconfigured:the woman', text: 'Sit anywhere.' }])
+  const ghost = { id: 'old', speakerId: 'unconfigured:the woman', label: 'the woman', voiceId: 'old-voice', context: 'A woman at another location.', occurrenceKeys: [], lastSeenMessageId: 'previous' }
+  const voices = readFavoriteVoices([{ id: 'new-voice' }])
+  const fresh = resolveUncastVoiceDecisions(group, voices, { voice_g0: confidentDecision('voice_0') }, [ghost])
+  assert.equal(fresh[0].voiceId, 'new-voice')
+  assert.match(fresh[0].matchReason!, /new voice/u)
+  const reviewed = resolveUncastVoiceDecisions(group, voices, { identity_g0: confidentDecision('ghost_0') }, [ghost])
+  assert.equal(reviewed[0].voiceId, 'old-voice')
+  assert.match(reviewed[0].matchReason!, /Jev identity match: old/u)
+  const occurrence = { ...ghost, occurrenceKeys: [`current:${hashMessageContent('Sit anywhere.')}`] }
+  const replay = resolveUncastVoiceDecisions(group, voices, {}, [occurrence], [], 'current')
+  assert.match(replay[0].matchReason!, /exact message occurrence/u)
+})
+
 test('reviews borderline opening dialogue against a later clearly labeled speaker', () => {
   const groups = collectUncastVoiceGroups([
     { speakerId: null, text: 'Two clerks work. The elder is speaking.' },
