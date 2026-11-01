@@ -2336,6 +2336,33 @@ test('reviews a borderline cross-message match before creating another voice', (
   assert.equal(weak[0].voiceId, 'another-voice')
 })
 
+test('reviews a newly named speaker against anonymous history even when the first pass says new', () => {
+  const ghosts = [
+    { id: 'mom', speakerId: UNCAST_SPEAKER_ID, label: "tessa's mom", voiceId: 'mom-voice', context: 'A caller speaks to Tessa.', occurrenceKeys: [], lastSeenMessageId: 'earlier', conversationHistory: [{ messageId: 'earlier', text: 'Tessa says Mom while speaking on the phone.' }] },
+    { id: 'clerk', speakerId: UNCAST_SPEAKER_ID, label: 'the clerk', voiceId: 'clerk-voice', context: 'A clerk works elsewhere.', occurrenceKeys: [], lastSeenMessageId: 'earlier' },
+  ]
+  const groups = collectUncastVoiceGroups([{ speakerId: 'unconfigured:marisol', text: 'Seven minutes.' }])
+  const message = 'Marisol arrives. Her daughter Tessa sees her.'
+  const voices = readFavoriteVoices([{ id: 'new-voice' }])
+  const answers = { identity_g0: confidentDecision('new_or_unclear'), voice_g0: confidentDecision('voice_0') }
+  const review = buildUncastIdentityReview(groups, answers, message, ghosts)
+  assert.ok(review.questions.review_reveal_g0_0)
+  assert.equal(review.state.ghosts[0].conversationHistory[0].text, ghosts[0].conversationHistory![0].text)
+  const confirmed = resolveUncastVoiceDecisions(groups, voices, { ...answers, review_reveal_g0_0: confidentDecision('same') }, ghosts, [], 'current', message)
+  assert.equal(confirmed[0].ghostId, 'mom')
+  assert.deepEqual(confirmed[0].aliases, ['marisol'])
+  assert.match(confirmed[0].matchReason!, /name-reveal/u)
+  const uncertain = resolveUncastVoiceDecisions(groups, voices, { ...answers, review_reveal_g0_0: confidentDecision('different_or_unclear') }, ghosts, [], 'current', message)
+  assert.equal(uncertain[0].voiceId, 'new-voice')
+  const conflicting = resolveUncastVoiceDecisions(groups, voices, { ...answers, review_reveal_g0_0: confidentDecision('same'), review_reveal_g0_1: confidentDecision('same') }, ghosts, [], 'current', message)
+  assert.equal(conflicting[0].voiceId, 'new-voice')
+  const introduction = collectUncastVoiceGroups([{ speakerId: UNCAST_SPEAKER_ID, text: "I'm Marisol. Nice to meet you." }])
+  assert.ok(buildUncastIdentityReview(introduction, answers, message, ghosts).questions.review_reveal_g0_0)
+  const selfNamed = resolveUncastVoiceDecisions(introduction, voices, { ...answers, review_reveal_g0_0: confidentDecision('same') }, ghosts, [], 'current', message)
+  assert.equal(selfNamed[0].ghostId, 'mom')
+  assert.deepEqual(selfNamed[0].aliases, ['marisol'])
+})
+
 test('retains conversation exchanges and relationship labels for later ghost identity review', () => {
   const ids = ['one', 'two', 'three', 'four']
   const ghost = { id: 'mother', speakerId: UNCAST_SPEAKER_ID, voiceId: 'voice', context: '', occurrenceKeys: [], lastSeenMessageId: 'one', conversationHistory: [] as Array<{ messageId: string; text: string }> }

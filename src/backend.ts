@@ -2,6 +2,7 @@ import {
   addScannedFirstNameAliases,
   addUnconfiguredDialogueSpeakers,
   activeGhostVoices,
+  isDescriptiveGhostLabel,
   purgeExpiredGhostContexts,
   markGhostVoiceInvoked,
   availableUncastVoices,
@@ -881,8 +882,10 @@ async function saveGhostVoiceAssignments(
       }
       markGhostVoiceInvoked(ghost, currentAssistantIds, messageId)
       accepted.push({ ...assignment, voiceId })
-      if (!ghost.label && assignment.label) ghost.label = assignment.label
       ghost.aliases = mergeGhostAliases(ghostCastAliases(ghost), assignment.aliases ?? [])
+      const revealedName = (assignment.aliases ?? []).find(alias => !isDescriptiveGhostLabel(alias))
+      if (revealedName && (!ghost.label || isDescriptiveGhostLabel(ghost.label))) ghost.label = revealedName
+      else if (!ghost.label && assignment.label) ghost.label = assignment.label
       updateGhostConversationHistory(ghost, messageId, conversation, currentAssistantIds)
       const occurrence = `${messageId}:${hashMessageContent(group.speeches.join('\n'))}`
       if (!ghost.occurrenceKeys.includes(occurrence)) ghost.occurrenceKeys = [...ghost.occurrenceKeys, occurrence].slice(-100)
@@ -1472,7 +1475,7 @@ spindle.onFrontendMessage(async (rawPayload: unknown, userId, frontendSessionId)
             const identity = answers[`identity_${group.id}`]
             const label = answers[`label_${group.id}`]
             const voice = answers[`voice_${group.id}`]
-            const comparisons = Object.entries(answers).filter(([key]) => key.startsWith(`same_${group.id}_`) || key.startsWith(`review_same_${group.id}_`) || key.startsWith(`review_ghost_${group.id}_`)).map(([key, answer]) => `${key}=${answer.choice} confidence=${answer.confidence} probabilities=${JSON.stringify(answer.probabilities)}`).join(';') || 'none'
+            const comparisons = Object.entries(answers).filter(([key]) => key.startsWith(`same_${group.id}_`) || key.startsWith(`review_same_${group.id}_`) || key.startsWith(`review_ghost_${group.id}_`) || key.startsWith(`review_reveal_${group.id}_`)).map(([key, answer]) => `${key}=${answer.choice} confidence=${answer.confidence} probabilities=${JSON.stringify(answer.probabilities)}`).join(';') || 'none'
             const assignment = assignments.find(item => item.groupId === group.id)
             const proposed = proposedAssignments.find(item => item.groupId === group.id)
             return `${group.id} segments=${group.segmentIndexes.map(index => index + 1).join(',')} identity=${identity ? `${identity.choice} confidence=${identity.confidence} probabilities=${JSON.stringify(identity.probabilities)}` : 'none'} label=${label ? `${label.choice} confidence=${label.confidence} probabilities=${JSON.stringify(label.probabilities)}` : 'none'} comparisons=${comparisons} proposed=${proposed ? `${proposed.ghostId} / ${proposed.voiceId} / ${proposed.gender}` : 'none'} match-reason=${proposed?.matchReason ?? 'none'} voice-choice=${voice ? `${voice.choice} confidence=${voice.confidence} probabilities=${JSON.stringify(voice.probabilities)}` : 'none'} final=${assignment ? `${assignment.label || 'unnamed'} / ${assignment.ghostId} / ${assignment.voiceId}` : 'connection default'}`

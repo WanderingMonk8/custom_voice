@@ -254,6 +254,12 @@ export function buildUncastVoiceDecision(groups: UncastVoiceGroup[], voices: Fav
   return { state, questions }
 }
 
+function revealedUncastName(group: UncastVoiceGroup): string {
+  if (group.speakerId.startsWith('unconfigured:')) return group.speakerId.slice('unconfigured:'.length)
+  const names = new Set(group.speeches.flatMap(speech => [...speech.matchAll(/\b(?:[Mm]y name is|[Ii] am|[Ii]'m)\s+([A-Z][a-z]+(?:[-'][A-Z]?[a-z]+)?)(?=[,.!?;:]|\s+(?:and|from|but|here)\b)/gu)].map(match => match[1].toLowerCase())))
+  return names.size === 1 ? [...names][0] : ''
+}
+
 /** Review borderline same-speaker links when a later turn has a clear label. */
 export function buildUncastIdentityReview(groups: UncastVoiceGroup[], answers: Record<string, SpeakerDecisionChoice>, message: string, ghosts: GhostVoice[] = []) {
   const labels = uncastIdentityLabels(message, ghosts)
@@ -271,6 +277,23 @@ export function buildUncastIdentityReview(groups: UncastVoiceGroup[], answers: R
         type: 'choice',
         instructions: `Compare the speaker in current group ${group.id} with the previously seen character ${candidate.label || candidate.speakerId}. Read the prior character's conversation history and the full current scene, including other participants? dialogue, relationship clues, and continuity from phone to in-person. Confirm only if they are the same person; distinguish callers, people addressed, and people merely mentioned.`,
         criteria: { same: 'The prior character and current speaker are clearly the same person.', different_or_unclear: 'They differ or the evidence is insufficient.' },
+      }
+    }
+    // A newly revealed name may not yet appear in an anonymous ghost's aliases.
+    // Ask about unnamed candidates even when the first pass chose new/unclear.
+    const revealedName = revealedUncastName(group)
+    const alreadyNamed = ghosts.some(ghost => ghostCastAliases(ghost).some(alias => alias.toLowerCase() === revealedName.toLowerCase()))
+    if (revealedName && !isBroadPersonLabel(revealedName) && !alreadyNamed) {
+      for (const [ghostIndex, ghost] of ghosts.entries()) {
+        if (Object.keys(questions).length >= 16) break
+        const aliases = ghostCastAliases(ghost)
+        if (aliases.some(alias => !isDescriptiveGhostLabel(alias))) continue
+        const key = `review_reveal_${group.id}_${ghostIndex}`
+        questions[key] = {
+          type: 'choice',
+          instructions: `Has previously seen character ghost_${ghostIndex} now been identified as ${revealedName}, the actual speaker of ${group.id}? Compare that character's saved conversation history and the full scene, including relationships, locations, actions, and who addresses whom. Do not equate people based only on gender, occupation, or a shared setting. Confirm only when the evidence clearly identifies the same individual.`,
+          criteria: { same: 'The newly named speaker and the earlier character are clearly the same person.', different_or_unclear: 'They are different, or the available evidence is insufficient.' },
+        }
       }
     }
     const label = answers[`label_${group.id}`]
@@ -294,14 +317,18 @@ export function buildUncastIdentityReview(groups: UncastVoiceGroup[], answers: R
     }
     if (Object.keys(questions).length >= 16) break
   }
-  return { state: { message, characters: groups.map(group => ({ id: group.id, identity: group.speakerId, speeches: group.speeches, context: group.context })), ghosts: ghosts.map((ghost, index) => ({ option: `ghost_${index}`, identity: ghost.speakerId, aliases: ghostCastAliases(ghost), context: ghost.context })) }, questions }
+  return { state: { message, characters: groups.map(group => ({ id: group.id, identity: group.speakerId, speeches: group.speeches, context: group.context })), ghosts: ghosts.map((ghost, index) => ({ option: `ghost_${index}`, identity: ghost.speakerId, aliases: ghostCastAliases(ghost), context: ghost.context, conversationHistory: ghost.conversationHistory ?? [] })) }, questions }
 }
 
 export interface UncastVoiceAssignment { groupId: string; voiceId: string; gender: string; ghostId?: string; label?: string; aliases?: string[]; matchReason?: string }
 
 /** Broad descriptions are useful context, but do not uniquely identify a person. */
-function isBroadPersonLabel(label: string): boolean {
+export function isBroadPersonLabel(label: string): boolean {
   return /^(?:(?:the|a|an)\s+)?(?:(?:young|younger|old|older|elderly|middle-aged|tall|short)\s+)*(?:woman|man|person|girl|boy|guy|lady|stranger|someone|somebody)$/iu.test(label.trim())
+}
+
+export function isDescriptiveGhostLabel(label: string): boolean {
+  return isBroadPersonLabel(label) || /^(?:the|a|an)\s/iu.test(label.trim()) || /['’]s\s/iu.test(label.trim())
 }
 
 export function resolveUncastVoiceDecisions(
@@ -364,6 +391,13 @@ export function resolveUncastVoiceDecisions(
       const review = answers[`review_ghost_${group.id}_${ghostIndex}`]
       if (review?.choice === 'same' && strongChoice(review)) { ghost = ghosts[Number(ghostIndex)]; if (ghost) reason = 'Jev identity follow-up review' }
     }
+    if (!ghost) {
+      const confirmed = ghosts.flatMap((candidate, index) => {
+        const review = answers[`review_reveal_${group.id}_${index}`]
+        return review?.choice === 'same' && strongChoice(review) ? [candidate] : []
+      })
+      if (confirmed.length === 1) { ghost = confirmed[0]; reason = 'Jev name-reveal review' }
+    }
     roots.set(group.id, root)
     if (label && !rootByLabel.has(label)) rootByLabel.set(label, root)
     // A matching earlier group owns the voice, even if a previous replay
@@ -394,6 +428,7 @@ export function resolveUncastVoiceDecisions(
     for (const group of members) {
       const aliases = mergeGhostAliases(
         group.speakerId.startsWith('unconfigured:') ? [group.speakerId.slice('unconfigured:'.length)] : [],
+        group.speakerId === UNCAST_SPEAKER_ID && linkReasons.get(root)?.startsWith('Jev name-reveal review') && revealedUncastName(group) ? [revealedUncastName(group)] : [],
         groupLabels.has(group.id) ? [groupLabels.get(group.id)!] : [],
       )
       assignments.push({ groupId: group.id, voiceId: ghost.voiceId, gender, ghostId: ghost.id, matchReason: `${linkReasons.get(root) ?? 'unknown'}${group.id !== root ? `; linked to group ${root}` : ''}`, ...(label ? { label } : {}), ...(aliases.length ? { aliases } : {}) })
