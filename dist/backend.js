@@ -1749,6 +1749,22 @@ function recoverPreviousGhostContinuity(messages, targetId, parsed, ghosts, skip
   const ids = new Set(matches.map((items) => items[0].id));
   return ids.size === 1 ? `ghost:${matches[0][0].id}` : null;
 }
+function previousNamedGhostContinuity(messages, targetId, ghosts, configured, skippedTags = "") {
+  const index = messages.findIndex((message) => message.id === targetId);
+  if (index < 0) return null;
+  const prior = messages.slice(0, index).filter((message) => !message.is_user).at(-1);
+  if (!prior || !buildSpeakerDecisionPlan(prior.content ?? "", [], false, skippedTags).state.speeches.length) return null;
+  const candidates = ghosts.flatMap((ghost) => {
+    const names = ghostCastAliases(ghost).filter((alias) => !isDescriptiveGhostLabel(alias));
+    return names.length ? [{ id: `ghost:${ghost.id}`, name: names.join(" / ") }] : [];
+  });
+  const active = candidates.filter((candidate) => hasNamedSpeakerSubject(prior.content ?? "", [candidate], skippedTags));
+  if (active.length !== 1) return null;
+  const otherCast = configured.filter((speaker) => speaker.id !== USER_SPEAKER_ID);
+  const priorNarration = narrativeOnly(preparePlaybackContent(prior.content ?? "", skippedTags));
+  if (hasSpeakerMentions(mentionedSpeakers(priorNarration, otherCast))) return null;
+  return active[0].id;
+}
 function relationshipReviewContext(messages, targetId, ghosts, skippedTags = "") {
   const target = messages.findIndex((message) => message.id === targetId);
   if (target < 0) return { previousMessages: [], ghosts: [] };
@@ -1821,16 +1837,24 @@ function applyRelationshipSpeakerReview(plan, answers, reviewed, ghostOptions, c
     const answer = answers[`turn_${turn.speechId}`];
     return !!answer && (answer.choice === TURN_RESPOND_OPTION || answer.choice === TURN_OTHER_OPTION) && answer.confidence >= 0.65 && (answer.probabilities[answer.choice] ?? 0) >= 0.7;
   });
+  const otherNamedSpeakers = speakers.filter((speaker) => speaker.id !== USER_SPEAKER_ID && speaker.id !== continuitySpeakerId && !/^(?:what|who|where|when|why|how)$/iu.test(speaker.name.trim()));
+  const namedChange = otherNamedSpeakers.length > 0 && hasNamedSpeakerSubject(plan.state.message, otherNamedSpeakers);
+  const newUncastSubject = hasExplicitUncastCue(plan.state.message, "");
+  const continuityOption = Object.entries(options).find(([, id]) => id === continuitySpeakerId)?.[0];
+  const sceneContradicts = scene && scene.choice !== "no_clear_identity" && sceneOptionIdentity !== continuitySpeakerId && sceneEvaluation?.resolved;
+  const inherited = continuityOption && !namedChange && !newUncastSubject && !conflictingAttribution && !conflictingTurn && !sceneContradicts ? { choice: continuityOption, probabilities: { [continuityOption]: 1 }, confidence: 1 } : null;
   for (const speech of plan.state.speeches) {
     const result = reviewed[`relationship_${speech.id}`];
     const original = answers[`speech_${speech.id}`];
     const originalIdentity = evaluateSpeakerDecisionAnswer(original, plan.optionSpeakerIds).identity;
-    if (sceneIdentity && !conflictingAttribution && !conflictingTurn && scene) {
+    const chosen = inherited ?? (sceneIdentity && !conflictingAttribution && !conflictingTurn ? scene : null);
+    if (chosen) {
       Object.assign(plan.optionSpeakerIds, ghostOptions);
       if (original) answers[`relationship_original_${speech.id}`] = original;
-      answers[`speech_${speech.id}`] = scene;
-      answers[`relationship_review_${speech.id}`] = scene;
-      answers[`relationship_applied_${speech.id}`] = scene;
+      answers[`speech_${speech.id}`] = chosen;
+      answers[`relationship_review_${speech.id}`] = chosen;
+      answers[`relationship_applied_${speech.id}`] = chosen;
+      if (inherited) answers[`relationship_inherited_${speech.id}`] = chosen;
       continue;
     }
     if (!result) continue;
@@ -3810,6 +3834,7 @@ function resolveSpeakerDecisionSegments(content, plan, answers, speakers, option
           ...decisionAnswerDebug("jev-speech", answer, plan.optionSpeakerIds),
           ...decisionAnswerDebug("jev-relationship-original", answers[`relationship_original_${speech.id}`], plan.optionSpeakerIds),
           ...decisionAnswerDebug("jev-relationship-review", answers[`relationship_review_${speech.id}`], plan.optionSpeakerIds),
+          ...answers[`relationship_inherited_${speech.id}`] ? ["jev-relationship-review:inherited established previous speaker"] : [],
           ...answers[`relationship_applied_${speech.id}`] ? ["jev-relationship-review:strong alternative applied"] : [],
           ...decisionAnswerDebug("jev-user-review-original", answers[`user_review_original_${speech.id}`], plan.optionSpeakerIds),
           ...decisionAnswerDebug("jev-user-review", answers[`user_review_${speech.id}`], plan.optionSpeakerIds),
@@ -4727,7 +4752,7 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
     const lifetime = Number.isFinite(payload.ghostVoiceLifetime) ? Math.min(1e3, Math.max(1, Math.round(payload.ghostVoiceLifetime))) : 10;
     const activeGhostsForReview = activeGhostVoices(readGhostVoices(chat.metadata?.chat_voice_ghost_cast), assistantIds, anchor, lifetime);
     const relationshipContext = relationshipReviewContext(messages, message.id, activeGhostsForReview, skippedTrackerTags);
-    const storedContinuity = !message.is_user ? previousContinuitySpeaker(messages, message.id, chat.metadata?.chat_voice_speaker_continuity) ?? recoverPreviousGhostContinuity(messages, message.id, config.parsedMessages, activeGhostsForReview, skippedTrackerTags) : null;
+    const storedContinuity = !message.is_user ? previousNamedGhostContinuity(messages, message.id, activeGhostsForReview, configuredSpeakers, skippedTrackerTags) ?? previousContinuitySpeaker(messages, message.id, chat.metadata?.chat_voice_speaker_continuity) ?? recoverPreviousGhostContinuity(messages, message.id, config.parsedMessages, activeGhostsForReview, skippedTrackerTags) : null;
     const continuitySpeakerId = storedContinuity && (storedContinuity.startsWith("ghost:") ? activeGhostsForReview.some((ghost) => `ghost:${ghost.id}` === storedContinuity) : configuredSpeakers.some((speaker) => speaker.id === storedContinuity)) ? storedContinuity : null;
     for (const ghost of activeGhostsForReview) {
       if (!ghost.speakerId.startsWith("unconfigured:")) continue;
@@ -4830,7 +4855,7 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
           })),
           cardSpeakerId: titleMatchedCardSpeakerId,
           historicalSpeakerId,
-          relationshipReview: { version: "relationship-review-3", context: relationshipContext, continuitySpeakerId },
+          relationshipReview: { version: "relationship-review-4", context: relationshipContext, continuitySpeakerId },
           previousAssistantMessageId: previousAssistantMessage?.id ?? null,
           skippedTrackerTags
         }));

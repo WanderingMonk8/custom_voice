@@ -18,6 +18,7 @@ import {
   buildRelationshipSpeakerReview,
   applyRelationshipSpeakerReview,
   previousContinuitySpeaker,
+  previousNamedGhostContinuity,
   recoverPreviousGhostContinuity,
   relationshipReviewContext,
   applyAssistantUserSpeakerReview,
@@ -2484,6 +2485,24 @@ test('recovers existing ghost continuity only when cached dialogue matches the p
   assert.equal(recoverPreviousGhostContinuity([{ ...messages[0], content: 'She says "Changed."' }, messages[1]], 'current', parsed, [ghost]), null)
   assert.equal(recoverPreviousGhostContinuity(messages, 'current', parsed, [ghost, { ...ghost, id: 'other' }]), null)
   assert.equal(recoverPreviousGhostContinuity(messages, 'old', parsed, [ghost]), null)
+})
+
+test('bootstraps from an explicitly named prior temporary character and inherits an ambiguous scene', () => {
+  const messages = [{ id: 'earlier', is_user: false, content: 'Tasha takes off her cap. "That is better."' }, { id: 'current', is_user: false, content: 'She smiles. "Keep going."' }]
+  const ghost = { id: 'tasha', speakerId: UNCAST_SPEAKER_ID, label: 'Tasha', aliases: ['Tasha'], voiceId: 'voice', context: '', lastSeenMessageId: 'earlier', occurrenceKeys: [] }
+  const cast = [{ id: 'npc:tova', name: 'Tova' }]
+  assert.equal(previousNamedGhostContinuity(messages, 'current', [ghost], cast), 'ghost:tasha')
+  assert.equal(previousNamedGhostContinuity([{ ...messages[0], content: 'Tasha and Tova speak. "Hello."' }, messages[1]], 'current', [ghost], cast), null)
+  const plan = buildSpeakerDecisionPlan(messages[1].content, cast, false)
+  const answers: Record<string, SpeakerDecisionChoice> = { speech_s0: confidentDecision('known_0') }
+  const context = { previousMessages: [{ id: 'earlier', text: messages[0].content }], ghosts: [{ id: 'tasha', label: 'Tasha', aliases: ['Tasha'], context: '', conversationHistory: [] }] }
+  const review = buildRelationshipSpeakerReview(plan, answers, context, 'ghost:tasha')
+  applyRelationshipSpeakerReview(plan, answers, { relationship_scene: { choice: 'no_clear_identity', confidence: 0.34, probabilities: { relationship_ghost_0: 0.56, no_clear_identity: 0.43 } } }, review.ghostOptions, null, 'ghost:tasha')
+  assert.equal(answers.speech_s0.choice, 'relationship_ghost_0')
+  const changed = buildSpeakerDecisionPlan('Tova says, "Now it is my turn."', cast, false)
+  const changedAnswers: Record<string, SpeakerDecisionChoice> = { speech_s0: confidentDecision('known_0') }
+  applyRelationshipSpeakerReview(changed, changedAnswers, {}, review.ghostOptions, null, 'ghost:tasha')
+  assert.equal(changedAnswers.speech_s0.choice, 'known_0')
 })
 
 test('defaults and clamps the global saved audio limit', () => {

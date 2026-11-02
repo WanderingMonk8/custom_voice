@@ -40,6 +40,7 @@ import {
   preferredCardSpeakerId,
   previousAssistantSpeakerFallback,
   previousContinuitySpeaker,
+  previousNamedGhostContinuity,
   recoverPreviousGhostContinuity,
   mergeScannedCardCast,
   readConfig,
@@ -970,7 +971,8 @@ function queueSpeakerParse(
     const lifetime = Number.isFinite(payload.ghostVoiceLifetime) ? Math.min(1000, Math.max(1, Math.round(payload.ghostVoiceLifetime))) : 10
     const activeGhostsForReview = activeGhostVoices(readGhostVoices(chat.metadata?.chat_voice_ghost_cast), assistantIds, anchor, lifetime)
     const relationshipContext = relationshipReviewContext(messages, message.id, activeGhostsForReview, skippedTrackerTags)
-    const storedContinuity = !message.is_user ? previousContinuitySpeaker(messages, message.id, chat.metadata?.chat_voice_speaker_continuity)
+    const storedContinuity = !message.is_user ? previousNamedGhostContinuity(messages, message.id, activeGhostsForReview, configuredSpeakers, skippedTrackerTags)
+      ?? previousContinuitySpeaker(messages, message.id, chat.metadata?.chat_voice_speaker_continuity)
       ?? recoverPreviousGhostContinuity(messages, message.id, config.parsedMessages, activeGhostsForReview, skippedTrackerTags) : null
     const continuitySpeakerId = storedContinuity && (storedContinuity.startsWith('ghost:')
       ? activeGhostsForReview.some(ghost => `ghost:${ghost.id}` === storedContinuity)
@@ -1099,7 +1101,7 @@ function queueSpeakerParse(
           })),
           cardSpeakerId: titleMatchedCardSpeakerId,
           historicalSpeakerId,
-          relationshipReview: { version: 'relationship-review-3', context: relationshipContext, continuitySpeakerId },
+          relationshipReview: { version: 'relationship-review-4', context: relationshipContext, continuitySpeakerId },
           previousAssistantMessageId: previousAssistantMessage?.id ?? null,
           skippedTrackerTags,
         }))
