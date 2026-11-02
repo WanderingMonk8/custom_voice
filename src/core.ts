@@ -2872,6 +2872,47 @@ export function previousNamedGhostContinuity(messages: Array<{ id: string; is_us
   return active[0].id
 }
 
+export const CONTINUITY_LOOKBACK_BLOCKED = '__chat_voice_continuity_blocked__'
+
+/** Look back through at most five assistant turns, stopping at clear or conflicting evidence. */
+export function lookbackSpeakerContinuity(messages: Array<{ id: string; is_user: boolean; content?: string }>, targetId: string, records: unknown, parsed: Record<string, CachedMessageParse>, ghosts: GhostVoice[], configured: CharacterLike[], skippedTags = ''): string | null {
+  const index = messages.findIndex(message => message.id === targetId)
+  if (index < 0) return null
+  const target = messages[index]
+  const preceding = messages.slice(0, index).filter(message => !message.is_user).slice(-5).reverse()
+  for (const prior of preceding) {
+    if (!buildSpeakerDecisionPlan(prior.content ?? '', [], false, skippedTags).state.speeches.length) continue
+    const view = [prior, target]
+    // Names introduced after this turn must not leak into earlier replays.
+    const priorIndex = messages.findIndex(message => message.id === prior.id)
+    const availableGhosts = ghosts.filter(ghost => {
+      const lastSeen = messages.findIndex(message => message.id === ghost.lastSeenMessageId)
+      return lastSeen >= 0 && lastSeen <= priorIndex
+    })
+    const cast = configured.filter(speaker => speaker.id !== USER_SPEAKER_ID)
+    const named = previousNamedGhostContinuity(view, targetId, availableGhosts, cast, skippedTags)
+    if (named) return named
+    const matchedCast = cast.filter(speaker => hasNamedSpeakerSubject(prior.content ?? '', [speaker], skippedTags))
+    const matchedGhosts = availableGhosts.filter(ghost => ghostCastAliases(ghost).some(alias => !isDescriptiveGhostLabel(alias) && hasNamedSpeakerSubject(prior.content ?? '', [{ id: `ghost:${ghost.id}`, name: alias }], skippedTags)))
+    if (matchedCast.length + matchedGhosts.length > 1) return CONTINUITY_LOOKBACK_BLOCKED
+    if (matchedCast.length === 1) return matchedCast[0].id
+    if (matchedGhosts.length === 1) {
+      if (hasSpeakerMentions(mentionedSpeakers(narrativeOnly(preparePlaybackContent(prior.content ?? '', skippedTags)), cast))) return CONTINUITY_LOOKBACK_BLOCKED
+      return `ghost:${matchedGhosts[0].id}`
+    }
+    const record = previousContinuitySpeaker(view, targetId, records)
+    if (record) return record
+    const recovered = recoverPreviousGhostContinuity(view, targetId, parsed, availableGhosts, skippedTags)
+    if (recovered) return recovered
+    const rawRecord = records && typeof records === 'object' && !Array.isArray(records) ? (records as Record<string, unknown>)[prior.id] : null
+    if (rawRecord && typeof rawRecord === 'object' && (rawRecord as Record<string, unknown>).contentHash === hashMessageContent(prior.content ?? '') && (rawRecord as Record<string, unknown>).speakerId === null) return CONTINUITY_LOOKBACK_BLOCKED
+    const discovered = addUnconfiguredDialogueSpeakers(prior.content ?? '', configured, skippedTags)
+      .filter(speaker => speaker.id.startsWith('unconfigured:') && !/^(?:what|who|where|when|why|how)$/iu.test(speaker.name))
+    if (discovered.some(speaker => hasNamedSpeakerSubject(prior.content ?? '', [speaker], skippedTags)) || hasAnonymousSpeechAttribution(preparePlaybackContent(prior.content ?? '', skippedTags))) return CONTINUITY_LOOKBACK_BLOCKED
+  }
+  return null
+}
+
 /** Prepare only earlier, tracker-free context, including when replaying old messages. */
 export function relationshipReviewContext(messages: Array<{ id: string; is_user: boolean; content?: string }>, targetId: string, ghosts: GhostVoice[], skippedTags = ''): RelationshipReviewContext {
   const target = messages.findIndex(message => message.id === targetId)

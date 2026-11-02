@@ -39,9 +39,8 @@ import {
   parseRosterVoiceSegments,
   preferredCardSpeakerId,
   previousAssistantSpeakerFallback,
-  previousContinuitySpeaker,
-  previousNamedGhostContinuity,
-  recoverPreviousGhostContinuity,
+  lookbackSpeakerContinuity,
+  CONTINUITY_LOOKBACK_BLOCKED,
   mergeScannedCardCast,
   readConfig,
   readFavoriteVoices,
@@ -971,9 +970,7 @@ function queueSpeakerParse(
     const lifetime = Number.isFinite(payload.ghostVoiceLifetime) ? Math.min(1000, Math.max(1, Math.round(payload.ghostVoiceLifetime))) : 10
     const activeGhostsForReview = activeGhostVoices(readGhostVoices(chat.metadata?.chat_voice_ghost_cast), assistantIds, anchor, lifetime)
     const relationshipContext = relationshipReviewContext(messages, message.id, activeGhostsForReview, skippedTrackerTags)
-    const storedContinuity = !message.is_user ? previousNamedGhostContinuity(messages, message.id, activeGhostsForReview, configuredSpeakers, skippedTrackerTags)
-      ?? previousContinuitySpeaker(messages, message.id, chat.metadata?.chat_voice_speaker_continuity)
-      ?? recoverPreviousGhostContinuity(messages, message.id, config.parsedMessages, activeGhostsForReview, skippedTrackerTags) : null
+    const storedContinuity = !message.is_user ? lookbackSpeakerContinuity(messages, message.id, chat.metadata?.chat_voice_speaker_continuity, config.parsedMessages, activeGhostsForReview, configuredSpeakers, skippedTrackerTags) : null
     const continuitySpeakerId = storedContinuity && (storedContinuity.startsWith('ghost:')
       ? activeGhostsForReview.some(ghost => `ghost:${ghost.id}` === storedContinuity)
       : configuredSpeakers.some(speaker => speaker.id === storedContinuity)) ? storedContinuity : null
@@ -1016,11 +1013,13 @@ function queueSpeakerParse(
       : namelessCardSpeakerId
     let previousAssistantMessage: typeof message | null = null
     let historicalSpeakerId: string | null = null
-    if (!message.is_user && !namelessCardSpeakerId) {
+    if (!message.is_user && !namelessCardSpeakerId && storedContinuity !== CONTINUITY_LOOKBACK_BLOCKED) {
       const searchForLastClearIdentity = !namedSpeakerSubject
-      for (let index = messageIndex - 1; index >= 0; index--) {
+      let reviewedAssistantMessages = 0
+      for (let index = messageIndex - 1; index >= 0 && reviewedAssistantMessages < 5; index--) {
         const previous = messages[index]
         if (previous.is_user) continue
+        reviewedAssistantMessages += 1
         const previousSpeakers = searchForLastClearIdentity
           ? addUnconfiguredDialogueSpeakers(previous.content ?? '', speakers, skippedTrackerTags)
           : speakers
@@ -1101,7 +1100,7 @@ function queueSpeakerParse(
           })),
           cardSpeakerId: titleMatchedCardSpeakerId,
           historicalSpeakerId,
-          relationshipReview: { version: 'relationship-review-4', context: relationshipContext, continuitySpeakerId },
+          relationshipReview: { version: 'relationship-review-5', context: relationshipContext, continuitySpeakerId },
           previousAssistantMessageId: previousAssistantMessage?.id ?? null,
           skippedTrackerTags,
         }))

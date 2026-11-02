@@ -19,6 +19,8 @@ import {
   applyRelationshipSpeakerReview,
   previousContinuitySpeaker,
   previousNamedGhostContinuity,
+  lookbackSpeakerContinuity,
+  CONTINUITY_LOOKBACK_BLOCKED,
   recoverPreviousGhostContinuity,
   relationshipReviewContext,
   applyAssistantUserSpeakerReview,
@@ -2508,6 +2510,21 @@ test('bootstraps from an explicitly named prior temporary character and inherits
   const changedAnswers: Record<string, SpeakerDecisionChoice> = { speech_s0: confidentDecision('known_0') }
   applyRelationshipSpeakerReview(changed, changedAnswers, {}, review.ghostOptions, null, 'ghost:tasha')
   assert.equal(changedAnswers.speech_s0.choice, 'known_0')
+})
+
+test('looks back at most five assistant messages and stops at the nearest clear speaker', () => {
+  const ghost = { id: 'tasha', speakerId: UNCAST_SPEAKER_ID, label: 'Tasha', aliases: ['Tasha'], voiceId: 'voice', context: '', lastSeenMessageId: 'named', occurrenceKeys: [] }
+  const cast = [{ id: 'npc:tova', name: 'Tova' }]
+  const named = { id: 'named', is_user: false, content: 'Tasha smiles. "Hello."' }
+  const ambiguous = Array.from({ length: 4 }, (_, index) => ({ id: `amb-${index}`, is_user: false, content: 'She smiles. "Yes."' }))
+  const target = { id: 'target', is_user: false, content: 'She speaks. "Again."' }
+  const user = { id: 'user', is_user: true, content: 'I listen.' }
+  const find = (messages: typeof ambiguous) => lookbackSpeakerContinuity(messages, 'target', {}, {}, [ghost], cast)
+  assert.equal(find([named, user, ...ambiguous, target]), 'ghost:tasha')
+  assert.equal(find([named, ...ambiguous, { ...ambiguous[0], id: 'fifth' }, target]), null)
+  assert.equal(find([named, ...ambiguous, { id: 'tova', is_user: false, content: 'Tova says, "Hello."' }, target]), 'npc:tova')
+  assert.equal(find([named, ...ambiguous, { id: 'other', is_user: false, content: 'The clerk says, "Hello."' }, target]), CONTINUITY_LOOKBACK_BLOCKED)
+  assert.equal(find([named, ...ambiguous, { id: 'mixed', is_user: false, content: 'Tasha and Tova speak. "Hello."' }, target]), CONTINUITY_LOOKBACK_BLOCKED)
 })
 
 test('defaults and clamps the global saved audio limit', () => {

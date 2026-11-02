@@ -1765,6 +1765,42 @@ function previousNamedGhostContinuity(messages, targetId, ghosts, configured, sk
   if (hasSpeakerMentions(mentionedSpeakers(priorNarration, otherCast))) return null;
   return active[0].id;
 }
+var CONTINUITY_LOOKBACK_BLOCKED = "__chat_voice_continuity_blocked__";
+function lookbackSpeakerContinuity(messages, targetId, records, parsed, ghosts, configured, skippedTags = "") {
+  const index = messages.findIndex((message) => message.id === targetId);
+  if (index < 0) return null;
+  const target = messages[index];
+  const preceding = messages.slice(0, index).filter((message) => !message.is_user).slice(-5).reverse();
+  for (const prior of preceding) {
+    if (!buildSpeakerDecisionPlan(prior.content ?? "", [], false, skippedTags).state.speeches.length) continue;
+    const view = [prior, target];
+    const priorIndex = messages.findIndex((message) => message.id === prior.id);
+    const availableGhosts = ghosts.filter((ghost) => {
+      const lastSeen = messages.findIndex((message) => message.id === ghost.lastSeenMessageId);
+      return lastSeen >= 0 && lastSeen <= priorIndex;
+    });
+    const cast = configured.filter((speaker) => speaker.id !== USER_SPEAKER_ID);
+    const named = previousNamedGhostContinuity(view, targetId, availableGhosts, cast, skippedTags);
+    if (named) return named;
+    const matchedCast = cast.filter((speaker) => hasNamedSpeakerSubject(prior.content ?? "", [speaker], skippedTags));
+    const matchedGhosts = availableGhosts.filter((ghost) => ghostCastAliases(ghost).some((alias) => !isDescriptiveGhostLabel(alias) && hasNamedSpeakerSubject(prior.content ?? "", [{ id: `ghost:${ghost.id}`, name: alias }], skippedTags)));
+    if (matchedCast.length + matchedGhosts.length > 1) return CONTINUITY_LOOKBACK_BLOCKED;
+    if (matchedCast.length === 1) return matchedCast[0].id;
+    if (matchedGhosts.length === 1) {
+      if (hasSpeakerMentions(mentionedSpeakers(narrativeOnly(preparePlaybackContent(prior.content ?? "", skippedTags)), cast))) return CONTINUITY_LOOKBACK_BLOCKED;
+      return `ghost:${matchedGhosts[0].id}`;
+    }
+    const record = previousContinuitySpeaker(view, targetId, records);
+    if (record) return record;
+    const recovered = recoverPreviousGhostContinuity(view, targetId, parsed, availableGhosts, skippedTags);
+    if (recovered) return recovered;
+    const rawRecord = records && typeof records === "object" && !Array.isArray(records) ? records[prior.id] : null;
+    if (rawRecord && typeof rawRecord === "object" && rawRecord.contentHash === hashMessageContent(prior.content ?? "") && rawRecord.speakerId === null) return CONTINUITY_LOOKBACK_BLOCKED;
+    const discovered = addUnconfiguredDialogueSpeakers(prior.content ?? "", configured, skippedTags).filter((speaker) => speaker.id.startsWith("unconfigured:") && !/^(?:what|who|where|when|why|how)$/iu.test(speaker.name));
+    if (discovered.some((speaker) => hasNamedSpeakerSubject(prior.content ?? "", [speaker], skippedTags)) || hasAnonymousSpeechAttribution(preparePlaybackContent(prior.content ?? "", skippedTags))) return CONTINUITY_LOOKBACK_BLOCKED;
+  }
+  return null;
+}
 function relationshipReviewContext(messages, targetId, ghosts, skippedTags = "") {
   const target = messages.findIndex((message) => message.id === targetId);
   if (target < 0) return { previousMessages: [], ghosts: [] };
@@ -4757,7 +4793,7 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
     const lifetime = Number.isFinite(payload.ghostVoiceLifetime) ? Math.min(1e3, Math.max(1, Math.round(payload.ghostVoiceLifetime))) : 10;
     const activeGhostsForReview = activeGhostVoices(readGhostVoices(chat.metadata?.chat_voice_ghost_cast), assistantIds, anchor, lifetime);
     const relationshipContext = relationshipReviewContext(messages, message.id, activeGhostsForReview, skippedTrackerTags);
-    const storedContinuity = !message.is_user ? previousNamedGhostContinuity(messages, message.id, activeGhostsForReview, configuredSpeakers, skippedTrackerTags) ?? previousContinuitySpeaker(messages, message.id, chat.metadata?.chat_voice_speaker_continuity) ?? recoverPreviousGhostContinuity(messages, message.id, config.parsedMessages, activeGhostsForReview, skippedTrackerTags) : null;
+    const storedContinuity = !message.is_user ? lookbackSpeakerContinuity(messages, message.id, chat.metadata?.chat_voice_speaker_continuity, config.parsedMessages, activeGhostsForReview, configuredSpeakers, skippedTrackerTags) : null;
     const continuitySpeakerId = storedContinuity && (storedContinuity.startsWith("ghost:") ? activeGhostsForReview.some((ghost) => `ghost:${ghost.id}` === storedContinuity) : configuredSpeakers.some((speaker) => speaker.id === storedContinuity)) ? storedContinuity : null;
     for (const ghost of activeGhostsForReview) {
       if (!ghost.speakerId.startsWith("unconfigured:")) continue;
@@ -4789,11 +4825,13 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
     const defaultSpeakerId = message.is_user ? USER_SPEAKER_ID : namelessCardSpeakerId;
     let previousAssistantMessage = null;
     let historicalSpeakerId = null;
-    if (!message.is_user && !namelessCardSpeakerId) {
+    if (!message.is_user && !namelessCardSpeakerId && storedContinuity !== CONTINUITY_LOOKBACK_BLOCKED) {
       const searchForLastClearIdentity = !namedSpeakerSubject;
-      for (let index = messageIndex - 1; index >= 0; index--) {
+      let reviewedAssistantMessages = 0;
+      for (let index = messageIndex - 1; index >= 0 && reviewedAssistantMessages < 5; index--) {
         const previous = messages[index];
         if (previous.is_user) continue;
+        reviewedAssistantMessages += 1;
         const previousSpeakers = searchForLastClearIdentity ? addUnconfiguredDialogueSpeakers(previous.content ?? "", speakers, skippedTrackerTags) : speakers;
         const candidate = previousAssistantSpeakerFallback(
           message.content ?? "",
@@ -4860,7 +4898,7 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
           })),
           cardSpeakerId: titleMatchedCardSpeakerId,
           historicalSpeakerId,
-          relationshipReview: { version: "relationship-review-4", context: relationshipContext, continuitySpeakerId },
+          relationshipReview: { version: "relationship-review-5", context: relationshipContext, continuitySpeakerId },
           previousAssistantMessageId: previousAssistantMessage?.id ?? null,
           skippedTrackerTags
         }));
