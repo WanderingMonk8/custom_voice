@@ -2820,6 +2820,40 @@ export function previousContinuitySpeaker(messages: Array<{ id: string; is_user:
   return value.contentHash === hashMessageContent(prior.content ?? '') && typeof value.speakerId === 'string' && value.speakerId ? value.speakerId : null
 }
 
+/** Recover pre-continuity records only when cached speech and a ghost occurrence agree. */
+export function recoverPreviousGhostContinuity(messages: Array<{ id: string; is_user: boolean; content?: string }>, targetId: string, parsed: Record<string, CachedMessageParse>, ghosts: GhostVoice[], skippedTags = ''): string | null {
+  const index = messages.findIndex(message => message.id === targetId)
+  if (index < 0) return null
+  const prior = messages.slice(0, index).filter(message => !message.is_user).at(-1)
+  if (!prior) return null
+  const segments = parsed[prior.id]?.segments
+  const expected = buildSpeakerDecisionPlan(prior.content ?? '', [], false, skippedTags).state.speeches
+  if (!expected.length || expected.length > 64) return null
+  // Occurrences encode the exact spoken text; require one ghost to cover every
+  // quote so a mixed-speaker message cannot create a false continuation.
+  const recovered = ghosts.filter(ghost => {
+    const reachable = new Set([0])
+    for (let start = 0; start < expected.length; start++) {
+      if (!reachable.has(start)) continue
+      for (let end = start + 1; end <= expected.length; end++) {
+        const hash = hashMessageContent(expected.slice(start, end).map(speech => speech.text).join('\n'))
+        if (ghost.occurrenceKeys.includes(`${prior.id}:${hash}`)) reachable.add(end)
+      }
+    }
+    return reachable.has(expected.length)
+  })
+  if (recovered.length === 1) return `ghost:${recovered[0].id}`
+  if (recovered.length > 1 || !segments) return null
+  const speeches = segments.filter(segment => segment.speakerId !== null)
+  if (!speeches.length || speeches.length !== expected.length || speeches.some((segment, i) => segment.text.trim() !== expected[i].text.trim())) return null
+  const groups = collectUncastVoiceGroups(segments)
+  if (groups.reduce((sum, group) => sum + group.speeches.length, 0) !== speeches.length) return null
+  const matches = groups.map(group => ghosts.filter(ghost => ghost.occurrenceKeys.includes(`${prior.id}:${hashMessageContent(group.speeches.join('\n'))}`)))
+  if (matches.some(items => items.length !== 1)) return null
+  const ids = new Set(matches.map(items => items[0].id))
+  return ids.size === 1 ? `ghost:${matches[0][0].id}` : null
+}
+
 /** Prepare only earlier, tracker-free context, including when replaying old messages. */
 export function relationshipReviewContext(messages: Array<{ id: string; is_user: boolean; content?: string }>, targetId: string, ghosts: GhostVoice[], skippedTags = ''): RelationshipReviewContext {
   const target = messages.findIndex(message => message.id === targetId)
@@ -2885,7 +2919,7 @@ export function buildRelationshipSpeakerReview(plan: SpeakerDecisionPlan, answer
 export function applyRelationshipSpeakerReview(plan: SpeakerDecisionPlan, answers: Record<string, SpeakerDecisionChoice>, reviewed: Record<string, SpeakerDecisionChoice>, ghostOptions: Record<string, string>, cardSpeakerId: string | null = null, continuitySpeakerId: string | null = null): void {
   const options = { ...plan.optionSpeakerIds, ...ghostOptions }
   const scene = reviewed.relationship_scene
-  const sceneEvaluation = scene ? evaluateSpeakerDecisionAnswer(scene, options, { probability: 0.6, confidence: 0.55, margin: 0.3 }) : null
+  const sceneEvaluation = scene ? evaluateSpeakerDecisionAnswer(scene, options, { probability: 0.6, confidence: 0.45, margin: 0.3 }) : null
   const sceneOptionIdentity = scene ? options[scene.choice] : null
   const sceneIdentity = (!cardSpeakerId || (continuitySpeakerId && sceneOptionIdentity === continuitySpeakerId)) && scene && sceneOptionIdentity && sceneEvaluation?.leadingChoice === scene.choice
     ? sceneEvaluation.identity : null

@@ -109,6 +109,41 @@ function purgeExpiredGhostContexts(ghosts, assistantMessageIds, lifetime) {
   }
   return changed;
 }
+function collectUncastVoiceGroups(segments) {
+  const groups = [];
+  const named = /* @__PURE__ */ new Map();
+  let anonymous = null;
+  for (let index = 0; index < segments.length; index++) {
+    const segment = segments[index];
+    const id = segment.speakerId;
+    if (segment.debugPath?.some((step) => step.startsWith("segment-type:narration"))) continue;
+    if (id === null) continue;
+    if (id !== UNCAST_SPEAKER_ID && !id.startsWith("unconfigured:") && !id.startsWith("ghost:")) {
+      anonymous = null;
+      continue;
+    }
+    if (id !== UNCAST_SPEAKER_ID) anonymous = null;
+    if (id === UNCAST_SPEAKER_ID && segments[index - 1]?.speakerId === null && segments[index - 1].text.length > 240) anonymous = null;
+    let group = id === UNCAST_SPEAKER_ID ? anonymous : named.get(id);
+    if (!group) {
+      group = { id: `g${groups.length}`, speakerId: id, segmentIndexes: [], speeches: [], context: [] };
+      groups.push(group);
+      if (id === UNCAST_SPEAKER_ID) anonymous = group;
+      else {
+        named.set(id, group);
+        anonymous = null;
+      }
+    }
+    group.segmentIndexes.push(index);
+    group.speeches.push(segment.text);
+    group.context.push([
+      segments[index - 1]?.speakerId === null ? segments[index - 1].text : "",
+      segment.text,
+      segments[index + 1]?.speakerId === null ? segments[index + 1].text : ""
+    ].filter(Boolean).join(" ").slice(0, 2e3));
+  }
+  return groups;
+}
 function canReserveAutomaticVoice(voiceId, reserved, ghosts, existingGhostId = "") {
   return !!voiceId && !reserved.has(voiceId) && !ghosts.some((ghost) => ghost.voiceId === voiceId && ghost.id !== existingGhostId);
 }
@@ -1684,6 +1719,36 @@ function previousContinuitySpeaker(messages, targetId, records) {
   const value = record;
   return value.contentHash === hashMessageContent(prior.content ?? "") && typeof value.speakerId === "string" && value.speakerId ? value.speakerId : null;
 }
+function recoverPreviousGhostContinuity(messages, targetId, parsed, ghosts, skippedTags = "") {
+  const index = messages.findIndex((message) => message.id === targetId);
+  if (index < 0) return null;
+  const prior = messages.slice(0, index).filter((message) => !message.is_user).at(-1);
+  if (!prior) return null;
+  const segments = parsed[prior.id]?.segments;
+  const expected = buildSpeakerDecisionPlan(prior.content ?? "", [], false, skippedTags).state.speeches;
+  if (!expected.length || expected.length > 64) return null;
+  const recovered = ghosts.filter((ghost) => {
+    const reachable = /* @__PURE__ */ new Set([0]);
+    for (let start = 0; start < expected.length; start++) {
+      if (!reachable.has(start)) continue;
+      for (let end = start + 1; end <= expected.length; end++) {
+        const hash = hashMessageContent(expected.slice(start, end).map((speech) => speech.text).join("\n"));
+        if (ghost.occurrenceKeys.includes(`${prior.id}:${hash}`)) reachable.add(end);
+      }
+    }
+    return reachable.has(expected.length);
+  });
+  if (recovered.length === 1) return `ghost:${recovered[0].id}`;
+  if (recovered.length > 1 || !segments) return null;
+  const speeches = segments.filter((segment) => segment.speakerId !== null);
+  if (!speeches.length || speeches.length !== expected.length || speeches.some((segment, i) => segment.text.trim() !== expected[i].text.trim())) return null;
+  const groups = collectUncastVoiceGroups(segments);
+  if (groups.reduce((sum, group) => sum + group.speeches.length, 0) !== speeches.length) return null;
+  const matches = groups.map((group) => ghosts.filter((ghost) => ghost.occurrenceKeys.includes(`${prior.id}:${hashMessageContent(group.speeches.join("\n"))}`)));
+  if (matches.some((items) => items.length !== 1)) return null;
+  const ids = new Set(matches.map((items) => items[0].id));
+  return ids.size === 1 ? `ghost:${matches[0][0].id}` : null;
+}
 function relationshipReviewContext(messages, targetId, ghosts, skippedTags = "") {
   const target = messages.findIndex((message) => message.id === targetId);
   if (target < 0) return { previousMessages: [], ghosts: [] };
@@ -1747,7 +1812,7 @@ function buildRelationshipSpeakerReview(plan, answers, context, continuitySpeake
 function applyRelationshipSpeakerReview(plan, answers, reviewed, ghostOptions, cardSpeakerId = null, continuitySpeakerId = null) {
   const options = { ...plan.optionSpeakerIds, ...ghostOptions };
   const scene = reviewed.relationship_scene;
-  const sceneEvaluation = scene ? evaluateSpeakerDecisionAnswer(scene, options, { probability: 0.6, confidence: 0.55, margin: 0.3 }) : null;
+  const sceneEvaluation = scene ? evaluateSpeakerDecisionAnswer(scene, options, { probability: 0.6, confidence: 0.45, margin: 0.3 }) : null;
   const sceneOptionIdentity = scene ? options[scene.choice] : null;
   const sceneIdentity = (!cardSpeakerId || continuitySpeakerId && sceneOptionIdentity === continuitySpeakerId) && scene && sceneOptionIdentity && sceneEvaluation?.leadingChoice === scene.choice ? sceneEvaluation.identity : null;
   const speakers = plan.state.speakers.map((speaker) => ({ id: speaker.id, name: speaker.name }));
@@ -4662,7 +4727,7 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
     const lifetime = Number.isFinite(payload.ghostVoiceLifetime) ? Math.min(1e3, Math.max(1, Math.round(payload.ghostVoiceLifetime))) : 10;
     const activeGhostsForReview = activeGhostVoices(readGhostVoices(chat.metadata?.chat_voice_ghost_cast), assistantIds, anchor, lifetime);
     const relationshipContext = relationshipReviewContext(messages, message.id, activeGhostsForReview, skippedTrackerTags);
-    const storedContinuity = !message.is_user ? previousContinuitySpeaker(messages, message.id, chat.metadata?.chat_voice_speaker_continuity) : null;
+    const storedContinuity = !message.is_user ? previousContinuitySpeaker(messages, message.id, chat.metadata?.chat_voice_speaker_continuity) ?? recoverPreviousGhostContinuity(messages, message.id, config.parsedMessages, activeGhostsForReview, skippedTrackerTags) : null;
     const continuitySpeakerId = storedContinuity && (storedContinuity.startsWith("ghost:") ? activeGhostsForReview.some((ghost) => `ghost:${ghost.id}` === storedContinuity) : configuredSpeakers.some((speaker) => speaker.id === storedContinuity)) ? storedContinuity : null;
     for (const ghost of activeGhostsForReview) {
       if (!ghost.speakerId.startsWith("unconfigured:")) continue;
@@ -4765,7 +4830,7 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
           })),
           cardSpeakerId: titleMatchedCardSpeakerId,
           historicalSpeakerId,
-          relationshipReview: { version: "relationship-review-2", context: relationshipContext, continuitySpeakerId },
+          relationshipReview: { version: "relationship-review-3", context: relationshipContext, continuitySpeakerId },
           previousAssistantMessageId: previousAssistantMessage?.id ?? null,
           skippedTrackerTags
         }));

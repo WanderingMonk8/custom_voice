@@ -18,6 +18,7 @@ import {
   buildRelationshipSpeakerReview,
   applyRelationshipSpeakerReview,
   previousContinuitySpeaker,
+  recoverPreviousGhostContinuity,
   relationshipReviewContext,
   applyAssistantUserSpeakerReview,
   buildTtsTagPlan,
@@ -2438,7 +2439,7 @@ test('uses a leading temporary speaker for a continuous anonymous scene while pr
     const answers: Record<string, SpeakerDecisionChoice> = { speech_s0: confidentDecision('known_0', 0.42, 0.35), speech_s1: confidentDecision('known_0', 0.58, 0.53), speech_s2: confidentDecision('known_0', 0.6, 0.55) }
     return { plan, answers, review: buildRelationshipSpeakerReview(plan, answers, context) }
   }
-  const scene = { choice: 'relationship_ghost_0', confidence: 0.62, probabilities: { relationship_ghost_0: 0.65, no_clear_identity: 0.2 } }
+  const scene = { choice: 'relationship_ghost_0', confidence: 0.49, probabilities: { relationship_ghost_0: 0.66, no_clear_identity: 0.33 } }
   const current = create()
   assert.ok(current.review.questions.relationship_scene)
   applyRelationshipSpeakerReview(current.plan, current.answers, { relationship_scene: scene }, current.review.ghostOptions)
@@ -2472,6 +2473,17 @@ test('inherits continuity only from the unchanged immediately previous assistant
   assert.equal(previousContinuitySpeaker(messages, 'z', records), null)
   assert.equal(previousContinuitySpeaker(messages, 'b', { ...records, a: { contentHash: 'stale', speakerId: 'ghost:tasha' } }), null)
   assert.equal(previousContinuitySpeaker(messages, 'b', { ...records, a: { contentHash: records.a.contentHash, speakerId: null } }), null)
+})
+
+test('recovers existing ghost continuity only when cached dialogue matches the previous message', () => {
+  const messages = [{ id: 'old', is_user: false, content: 'She speaks. "Hello there."' }, { id: 'current', is_user: false, content: 'She continues.' }]
+  const parsed = { old: { contentHash: 'legacy', segments: [{ text: 'She speaks.', speakerId: null }, { text: 'Hello there.', speakerId: UNCAST_SPEAKER_ID }] } }
+  const ghost = { id: 'tasha', speakerId: UNCAST_SPEAKER_ID, voiceId: 'voice', context: '', lastSeenMessageId: 'old', occurrenceKeys: [`old:${hashMessageContent('Hello there.')}`] }
+  assert.equal(recoverPreviousGhostContinuity(messages, 'current', parsed, [ghost]), 'ghost:tasha')
+  assert.equal(recoverPreviousGhostContinuity(messages, 'current', {}, [ghost]), 'ghost:tasha')
+  assert.equal(recoverPreviousGhostContinuity([{ ...messages[0], content: 'She says "Changed."' }, messages[1]], 'current', parsed, [ghost]), null)
+  assert.equal(recoverPreviousGhostContinuity(messages, 'current', parsed, [ghost, { ...ghost, id: 'other' }]), null)
+  assert.equal(recoverPreviousGhostContinuity(messages, 'old', parsed, [ghost]), null)
 })
 
 test('defaults and clamps the global saved audio limit', () => {
