@@ -1033,6 +1033,10 @@ export function setup(ctx: SpindleFrontendContext) {
     }
     .chat-voice-favorite-row { display:flex; flex-wrap:wrap; align-items:center; gap:8px;
       padding:8px; border:1px solid var(--lumiverse-border); border-radius:var(--lumiverse-radius); }
+    .chat-voice-favorite-edit { flex:1 0 100%; display:flex; flex-wrap:wrap; gap:6px; }
+    .chat-voice-favorite-edit[hidden] { display:none; }
+    .chat-voice-favorite-edit input, .chat-voice-favorite-edit textarea { box-sizing:border-box; width:100%; min-width:0; padding:7px 9px; border:1px solid var(--lumiverse-border); border-radius:var(--lumiverse-radius); background:var(--lumiverse-bg-secondary, #222); color:var(--lumiverse-text); font:inherit; font-size:12px; }
+    .chat-voice-favorite-edit textarea { min-height:72px; resize:vertical; }
     .chat-voice-favorite-copy { flex:1 1 100px; min-width:0; overflow-wrap:anywhere; color:var(--lumiverse-text); font-size:12px; }
     .chat-voice-favorite-copy small { display:block; color:var(--lumiverse-text-muted); }
     .chat-voice-preview-button { min-height:28px; padding:0 8px; border:1px solid var(--lumiverse-border);
@@ -1348,6 +1352,7 @@ export function setup(ctx: SpindleFrontendContext) {
   let defaultUserVoice = ''
   let favoriteVoices: FavoriteVoice[] = []
   let favoritesSaving = false
+  let editingFavoriteVoiceId: string | null = null
   let previewController: AbortController | null = null
   let previewAudio: HTMLAudioElement | null = null
   let previewUrl: string | null = null
@@ -3900,6 +3905,7 @@ export function setup(ctx: SpindleFrontendContext) {
   }
 
   function renderFavoriteVoices(): void {
+    editingFavoriteVoiceId = null
     favoriteList.replaceChildren()
     if (!favoriteVoices.length) {
       const empty = document.createElement('div')
@@ -3947,42 +3953,79 @@ export function setup(ctx: SpindleFrontendContext) {
           ? { ...item, category: nextCategory } : item))
           .then(saved => { if (!saved) { category.value = voice.category; category.disabled = false } })
       })
-      const preview = document.createElement('button')
-      preview.type = 'button'
-      preview.className = 'chat-voice-preview-button'
-      preview.textContent = 'Preview'
-      preview.setAttribute('aria-label', `Preview ${voice.name || voice.id}`)
-      preview.addEventListener('click', () => { void previewVoice(voice.id, voice.name || voice.id) })
+      const preview = createCastPreviewButton(() => voice.name || voice.id, () => voice.id)
+      const editForm = document.createElement('form')
+      editForm.className = 'chat-voice-favorite-edit'
+      editForm.hidden = true
+      const editLabel = document.createElement('label')
+      editLabel.className = 'chat-voice-hint'
+      const nameInput = document.createElement('input')
+      nameInput.type = 'text'
+      nameInput.maxLength = 128
+      nameInput.setAttribute('aria-label', 'Favorite voice name')
+      const descriptionInput = document.createElement('textarea')
+      descriptionInput.maxLength = 500
+      descriptionInput.setAttribute('aria-label', 'Favorite voice description')
+      const saveEdit = document.createElement('button')
+      saveEdit.type = 'submit'
+      saveEdit.className = 'chat-voice-preview-button'
+      saveEdit.textContent = 'Save'
+      const cancelEdit = document.createElement('button')
+      cancelEdit.type = 'button'
+      cancelEdit.className = 'chat-voice-preview-button'
+      cancelEdit.textContent = 'Cancel'
+      let editKind: 'name' | 'description' = 'name'
+      const openEdit = (kind: 'name' | 'description') => {
+        const current = favoriteVoices.find(item => item.id === voice.id)
+        if (!current) return
+        for (const other of favoriteList.querySelectorAll<HTMLFormElement>('.chat-voice-favorite-edit')) other.hidden = true
+        editKind = kind
+        editingFavoriteVoiceId = voice.id
+        editLabel.textContent = kind === 'name' ? 'Voice name (leave blank to display the ID)' : 'Voice description'
+        nameInput.value = current.name
+        descriptionInput.value = current.description
+        nameInput.hidden = kind !== 'name'
+        descriptionInput.hidden = kind !== 'description'
+        editForm.hidden = false
+        const input = kind === 'name' ? nameInput : descriptionInput
+        input.focus()
+        input.select()
+      }
+      cancelEdit.addEventListener('click', () => {
+        editForm.hidden = true
+        if (editingFavoriteVoiceId === voice.id) editingFavoriteVoiceId = null
+      })
+      editForm.addEventListener('submit', event => {
+        event.preventDefault()
+        const value = (editKind === 'name' ? nameInput.value : descriptionInput.value).trim()
+        saveEdit.disabled = true
+        void saveFavoriteVoices(favoriteVoices.map(item => item.id === voice.id
+          ? { ...item, [editKind]: value } : item)).then(saved => {
+          if (saved && editingFavoriteVoiceId === voice.id) editingFavoriteVoiceId = null
+          if (!saved) saveEdit.disabled = false
+        })
+      })
+      editForm.append(editLabel, nameInput, descriptionInput, saveEdit, cancelEdit)
       const rename = document.createElement('button')
       rename.type = 'button'
       rename.className = 'chat-voice-rename-button'
       rename.innerHTML = RENAME_ICON
       rename.title = `Rename favorite ${voice.name || voice.id}`
       rename.setAttribute('aria-label', rename.title)
-      rename.addEventListener('click', () => {
-        const name = hostWindow.prompt('Name this favorite voice. Leave blank to display its voice ID.', voice.name)
-        if (name === null) return
-        void saveFavoriteVoices(favoriteVoices.map(item => item.id === voice.id
-          ? { ...item, name: name.trim().slice(0, 128) } : item))
-      })
+      rename.addEventListener('click', () => openEdit('name'))
       const describe = document.createElement('button')
       describe.type = 'button'
       describe.className = 'chat-voice-preview-button'
       describe.textContent = 'Description'
       describe.setAttribute('aria-label', `Edit description for ${voice.name || voice.id}`)
-      describe.addEventListener('click', () => {
-        const description = hostWindow.prompt('Describe the voice in a few terms.', voice.description)
-        if (description === null) return
-        void saveFavoriteVoices(favoriteVoices.map(item => item.id === voice.id
-          ? { ...item, description: description.trim().slice(0, 500) } : item))
-      })
+      describe.addEventListener('click', () => openEdit('description'))
       const remove = document.createElement('button')
       remove.type = 'button'
       remove.className = 'chat-voice-delete-button'
       remove.textContent = '×'
       remove.setAttribute('aria-label', `Remove favorite ${voice.name || voice.id}`)
       remove.addEventListener('click', () => { void saveFavoriteVoices(favoriteVoices.filter(item => item.id !== voice.id)) })
-      row.append(copy, category, preview, rename, describe, remove)
+      row.append(copy, category, preview, rename, describe, remove, editForm)
       favoriteList.appendChild(row)
     }
   }
@@ -4346,7 +4389,7 @@ export function setup(ctx: SpindleFrontendContext) {
       ])
       connections = loadedConnections
       llmConnections = loadedLlmConnections
-      if (!favoritesSaving) {
+      if (!favoritesSaving && !editingFavoriteVoiceId) {
         favoriteVoices = preferences.favoriteVoices
         renderFavoriteVoices()
         updateFavoritePickers()
