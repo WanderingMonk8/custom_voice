@@ -2965,6 +2965,7 @@ export function applyRelationshipSpeakerReview(plan: SpeakerDecisionPlan, answer
       answers[`speech_${speech.id}`] = chosen
       answers[`relationship_review_${speech.id}`] = chosen
       answers[`relationship_applied_${speech.id}`] = chosen
+      answers[`relationship_continuity_${speech.id}`] = chosen
       if (inherited) answers[`relationship_inherited_${speech.id}`] = chosen
       continue
     }
@@ -4963,7 +4964,11 @@ export function assessSpeakerDiscourseEscalation(
       && evidence.speech.leadingMargin < DISCOURSE_BRITTLE_MARGIN
     ))
     const targets = evidences
-      .filter(evidence => effectiveIdentity(evidence) === null || hardConflicts.includes(evidence))
+      // An established continuation has already passed the scene and local
+      // speaker-change guards. The discourse roster does not include temporary
+      // ghosts, so reviewing it here would force an unrelated cast choice.
+      .filter(evidence => !answers[`relationship_continuity_${evidence.speechId}`]
+        && (effectiveIdentity(evidence) === null || hardConflicts.includes(evidence)))
       .map(evidence => evidence.speechId)
 
     const triggers: SpeakerDiscourseTrigger[] = []
@@ -5675,6 +5680,10 @@ export function resolveSpeakerDecisionSegments(
         : 'resolution:chain-identity (filled unresolved span)')
     }
     const baseIdentity = (chainDecision?.identity ?? undefined) ?? identity
+    if (answers[`relationship_continuity_${speech.id}`]) {
+      discoursePathBySpeechIndex.set(index, 'resolution:inherited previous assistant speaker (protected from discourse override)')
+      return identity
+    }
     const outcome = speech ? discourseOutcomes.get(speech.id) : undefined
     if (!outcome?.applied) return baseIdentity
     discoursePathBySpeechIndex.set(index, outcome.reason === 'overrode-conflict'

@@ -1854,6 +1854,7 @@ function applyRelationshipSpeakerReview(plan, answers, reviewed, ghostOptions, c
       answers[`speech_${speech.id}`] = chosen;
       answers[`relationship_review_${speech.id}`] = chosen;
       answers[`relationship_applied_${speech.id}`] = chosen;
+      answers[`relationship_continuity_${speech.id}`] = chosen;
       if (inherited) answers[`relationship_inherited_${speech.id}`] = chosen;
       continue;
     }
@@ -3156,7 +3157,7 @@ function assessSpeakerDiscourseEscalation(plan, answers, options = {}) {
       return identity !== null && evidence.paragraph.resolved && identity !== evidence.paragraph.identity;
     });
     const brittleConflicts = evidences.filter((evidence) => effectiveIdentity(evidence) === null && evidence.paragraph.resolved && evidence.speech.leadingIdentity !== null && evidence.speech.leadingIdentity !== evidence.paragraph.identity && evidence.speech.leadingProbability >= 0.25 && evidence.speech.leadingMargin < DISCOURSE_BRITTLE_MARGIN);
-    const targets = evidences.filter((evidence) => effectiveIdentity(evidence) === null || hardConflicts.includes(evidence)).map((evidence) => evidence.speechId);
+    const targets = evidences.filter((evidence) => !answers[`relationship_continuity_${evidence.speechId}`] && (effectiveIdentity(evidence) === null || hardConflicts.includes(evidence))).map((evidence) => evidence.speechId);
     const triggers = [];
     const weakParagraphs = speechParagraphIds.filter((paragraphId) => (evidenceByParagraph.get(paragraphId) ?? []).every((evidence) => effectiveIdentity(evidence) === null));
     for (let index = 1; index < weakParagraphs.length; index += 1) {
@@ -3710,6 +3711,10 @@ function resolveSpeakerDecisionSegments(content, plan, answers, speakers, option
       chainPathBySpeechIndex.set(index, chainDecision.overrode ? "resolution:chain-identity (overrode clear answer)" : "resolution:chain-identity (filled unresolved span)");
     }
     const baseIdentity = chainDecision?.identity ?? void 0 ?? identity;
+    if (answers[`relationship_continuity_${speech.id}`]) {
+      discoursePathBySpeechIndex.set(index, "resolution:inherited previous assistant speaker (protected from discourse override)");
+      return identity;
+    }
     const outcome = speech ? discourseOutcomes.get(speech.id) : void 0;
     if (!outcome?.applied) return baseIdentity;
     discoursePathBySpeechIndex.set(index, outcome.reason === "overrode-conflict" ? "resolution:discourse-identity (overrode paragraph/speech conflict)" : "resolution:discourse-identity (filled unresolved first pass)");
