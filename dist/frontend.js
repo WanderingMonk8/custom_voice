@@ -2145,9 +2145,9 @@ function setup(ctx) {
     .chat-voice-favorite-option { display:flex; align-items:center; gap:4px; padding:2px 4px; }
     .chat-voice-favorite-option:hover, .chat-voice-favorite-option:focus-within { background:var(--lumiverse-fill-subtle); }
     .chat-voice-favorite-option-name { flex:1; min-width:0; border:0; background:transparent; color:var(--lumiverse-text); font:inherit; font-size:12px; text-align:left; padding:7px; cursor:pointer; overflow-wrap:anywhere; }
-    .chat-voice-favorite-option .chat-voice-cast-preview { visibility:hidden; }
-    .chat-voice-favorite-option:hover .chat-voice-cast-preview, .chat-voice-favorite-option:focus-within .chat-voice-cast-preview { visibility:visible; }
-    @media (hover:none) { .chat-voice-favorite-option .chat-voice-cast-preview { visibility:visible; } }
+    .chat-voice-favorite-option .chat-voice-cast-preview { opacity:0; pointer-events:none; }
+    .chat-voice-favorite-option:hover .chat-voice-cast-preview, .chat-voice-favorite-option:focus-within .chat-voice-cast-preview { opacity:1; pointer-events:auto; }
+    @media (hover:none) { .chat-voice-favorite-option .chat-voice-cast-preview { opacity:1; pointer-events:auto; } }
     .chat-voice-character-meta { display:flex; align-items:center; gap:6px; }
     .chat-voice-character-name { color:var(--lumiverse-text); font-size:12px; font-weight:600; }
     .chat-voice-character-count { color:var(--lumiverse-text-muted); font-size:11px; white-space:nowrap; }
@@ -4474,7 +4474,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
             pickerView.summary.focus();
           });
           const preview = createCastPreviewButton(() => voice.name || voice.id, () => voice.id);
-          row.append(selectVoice, preview);
+          row.append(preview, selectVoice);
           view.options.appendChild(row);
         }
       }
