@@ -11,6 +11,8 @@ import {
   collectUncastVoiceGroups,
   availableUncastVoices,
   GHOST_VOICE_LIFETIME_MESSAGES,
+  DEFAULT_SPEAKER_LOOKBACK,
+  MAX_SPEAKER_LOOKBACK,
   clampSavedAudioLimit,
   DEFAULT_SAVED_AUDIO_LIMIT,
   eligibleCardFallbackSpeakerId,
@@ -353,6 +355,7 @@ interface PlaybackPreferences {
   concurrentGenerations: number
   rateLimitWaitSeconds: number
   ghostVoiceLifetime: number
+  speakerLookback: number
   autoVoiceCasting: boolean
   speakerAssignmentDebug: boolean
   defaultNarratorVoice: string
@@ -416,6 +419,7 @@ async function loadPlaybackPreferences(): Promise<PlaybackPreferences> {
     concurrentGenerations: DEFAULT_CONCURRENT_GENERATIONS,
     rateLimitWaitSeconds: DEFAULT_RATE_LIMIT_WAIT_SECONDS,
     ghostVoiceLifetime: GHOST_VOICE_LIFETIME_MESSAGES,
+    speakerLookback: DEFAULT_SPEAKER_LOOKBACK,
     autoVoiceCasting: true,
     speakerAssignmentDebug: false,
     defaultNarratorVoice: '',
@@ -470,6 +474,7 @@ async function loadPlaybackPreferences(): Promise<PlaybackPreferences> {
       MAX_RATE_LIMIT_WAIT_SECONDS,
     ),
     ghostVoiceLifetime: clampIntegerSetting(row.value?.chatVoiceGhostVoiceLifetime, GHOST_VOICE_LIFETIME_MESSAGES, 1000),
+    speakerLookback: clampIntegerSetting(row.value?.chatVoiceSpeakerLookback, DEFAULT_SPEAKER_LOOKBACK, MAX_SPEAKER_LOOKBACK),
     autoVoiceCasting: row.value?.chatVoiceAutoCasting !== false,
     speakerAssignmentDebug: row.value?.chatVoiceSpeakerAssignmentDebug === true,
     defaultNarratorVoice: typeof row.value?.chatVoiceDefaultNarratorVoice === 'string'
@@ -559,6 +564,7 @@ function saveAdvancedPlaybackPreferences(
   speakerAssignmentDebug: boolean,
   ghostVoiceLifetime: number,
   autoVoiceCasting: boolean,
+  speakerLookback: number,
 ): Promise<void> {
   return updateVoiceSettings(current => ({
     ...current,
@@ -580,6 +586,7 @@ function saveAdvancedPlaybackPreferences(
     chatVoiceSpeakerAssignmentDebug: speakerAssignmentDebug,
     chatVoiceAutoCasting: autoVoiceCasting,
     chatVoiceGhostVoiceLifetime: clampIntegerSetting(ghostVoiceLifetime, GHOST_VOICE_LIFETIME_MESSAGES, 1000),
+    chatVoiceSpeakerLookback: clampIntegerSetting(speakerLookback, DEFAULT_SPEAKER_LOOKBACK, MAX_SPEAKER_LOOKBACK),
   }))
 }
 
@@ -1261,6 +1268,7 @@ export function setup(ctx: SpindleFrontendContext) {
   const concurrentGenerationField = createField('Maximum concurrent generations')
   const rateLimitWaitField = createField('Rate-limit wait budget (seconds)')
   const ghostLifetimeField = createField('Uncast voice lifetime (assistant messages)')
+  const speakerLookbackField = createField('Speaker lookback (assistant messages)')
   const autoCastingLabel = document.createElement('label')
   autoCastingLabel.className = 'chat-voice-toggle'
   const autoCastingToggle = document.createElement('input')
@@ -1298,6 +1306,7 @@ export function setup(ctx: SpindleFrontendContext) {
     concurrentGenerationField.field,
     rateLimitWaitField.field,
     ghostLifetimeField.field,
+    speakerLookbackField.field,
     autoCastingLabel,
     speakerDebugLabel,
     speakerDebugOutput,
@@ -1353,6 +1362,7 @@ export function setup(ctx: SpindleFrontendContext) {
   let rateLimitWaitSeconds = DEFAULT_RATE_LIMIT_WAIT_SECONDS
   let autoVoiceCasting = true
   let ghostVoiceLifetime = GHOST_VOICE_LIFETIME_MESSAGES
+  let speakerLookback = DEFAULT_SPEAKER_LOOKBACK
   let ghostLifetimeLoaded = false
   let speakerAssignmentDebug = false
   let advancedSettingsSaveTimer: ReturnType<typeof setTimeout> | null = null
@@ -1785,6 +1795,18 @@ export function setup(ctx: SpindleFrontendContext) {
     refreshLocalState()
   }
   ghostLifetimeInput.addEventListener('change', onGhostLifetimeInput)
+  const speakerLookbackInput = createNumberInput(DEFAULT_SPEAKER_LOOKBACK, MAX_SPEAKER_LOOKBACK, 'Speaker lookback in assistant messages')
+  speakerLookbackField.slot.appendChild(speakerLookbackInput)
+  const speakerLookbackHint = document.createElement('div')
+  speakerLookbackHint.className = 'chat-voice-hint'
+  speakerLookbackHint.textContent = 'Check up to this many previous assistant messages for the last clear speaker.'
+  speakerLookbackField.slot.appendChild(speakerLookbackHint)
+  const onSpeakerLookbackInput = () => {
+    speakerLookback = clampIntegerSetting(speakerLookbackInput.valueAsNumber, DEFAULT_SPEAKER_LOOKBACK, MAX_SPEAKER_LOOKBACK)
+    speakerLookbackInput.value = String(speakerLookback)
+    scheduleAdvancedSettingsSave()
+  }
+  speakerLookbackInput.addEventListener('change', onSpeakerLookbackInput)
   playbackBufferField.slot.appendChild(playbackBufferInput)
   concurrentGenerationField.slot.appendChild(concurrentGenerationInput)
   rateLimitWaitField.slot.appendChild(rateLimitWaitInput)
@@ -1975,6 +1997,7 @@ export function setup(ctx: SpindleFrontendContext) {
         tagLlmModel: preferences.tagLlmModel,
         skippedTrackerTags: preferences.skippedTrackerTags,
         ghostVoiceLifetime: preferences.ghostVoiceLifetime,
+        speakerLookback: preferences.speakerLookback,
         debug: preferences.speakerAssignmentDebug,
       })
     })
@@ -2695,6 +2718,7 @@ export function setup(ctx: SpindleFrontendContext) {
       preferences.concurrentGenerations = concurrentGenerationLimit
       preferences.rateLimitWaitSeconds = rateLimitWaitSeconds
       preferences.ghostVoiceLifetime = ghostVoiceLifetime
+      preferences.speakerLookback = speakerLookback
       preferences.autoVoiceCasting = autoVoiceCasting
       preferences.speakerAssignmentDebug = speakerAssignmentDebug
     } else {
@@ -4268,6 +4292,7 @@ export function setup(ctx: SpindleFrontendContext) {
         concurrentGenerationLimit = preferences.concurrentGenerations
         rateLimitWaitSeconds = preferences.rateLimitWaitSeconds
         ghostVoiceLifetime = preferences.ghostVoiceLifetime
+        speakerLookback = preferences.speakerLookback
         ghostLifetimeLoaded = true
         refreshLocalState()
         autoVoiceCasting = preferences.autoVoiceCasting
@@ -4277,6 +4302,7 @@ export function setup(ctx: SpindleFrontendContext) {
         concurrentGenerationInput.value = String(concurrentGenerationLimit)
         rateLimitWaitInput.value = String(rateLimitWaitSeconds)
         ghostLifetimeInput.value = String(ghostVoiceLifetime)
+        speakerLookbackInput.value = String(speakerLookback)
         speakerDebugToggle.checked = speakerAssignmentDebug
         speakerDebugOutput.hidden = !speakerAssignmentDebug
       }
@@ -4418,6 +4444,7 @@ export function setup(ctx: SpindleFrontendContext) {
         speakerAssignmentDebug,
         ghostVoiceLifetime,
         autoVoiceCasting,
+        speakerLookback,
       )
       setStatus('Advanced playback settings saved globally.', 'saved')
     } catch (error) {
@@ -4920,6 +4947,7 @@ export function setup(ctx: SpindleFrontendContext) {
         speakerAssignmentDebug,
         ghostVoiceLifetime,
         autoVoiceCasting,
+        speakerLookback,
       )
     }
     skippedTrackerTagsInput.destroy()
@@ -4932,6 +4960,7 @@ export function setup(ctx: SpindleFrontendContext) {
     concurrentGenerationInput.removeEventListener('change', onConcurrentGenerationInput)
     rateLimitWaitInput.removeEventListener('change', onRateLimitWaitInput)
     ghostLifetimeInput.removeEventListener('change', onGhostLifetimeInput)
+    speakerLookbackInput.removeEventListener('change', onSpeakerLookbackInput)
     speakerDebugToggle.removeEventListener('change', onSpeakerDebugChanged)
     addNpcInput.destroy()
     addNpcButton.removeEventListener('click', onAddNpc)

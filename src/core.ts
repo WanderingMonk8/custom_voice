@@ -2873,13 +2873,16 @@ export function previousNamedGhostContinuity(messages: Array<{ id: string; is_us
 }
 
 export const CONTINUITY_LOOKBACK_BLOCKED = '__chat_voice_continuity_blocked__'
+export const DEFAULT_SPEAKER_LOOKBACK = 5
+export const MAX_SPEAKER_LOOKBACK = 100
 
-/** Look back through at most five assistant turns, stopping at clear or conflicting evidence. */
-export function lookbackSpeakerContinuity(messages: Array<{ id: string; is_user: boolean; content?: string }>, targetId: string, records: unknown, parsed: Record<string, CachedMessageParse>, ghosts: GhostVoice[], configured: CharacterLike[], skippedTags = ''): string | null {
+/** Look back through assistant turns, stopping at clear or conflicting evidence. */
+export function lookbackSpeakerContinuity(messages: Array<{ id: string; is_user: boolean; content?: string }>, targetId: string, records: unknown, parsed: Record<string, CachedMessageParse>, ghosts: GhostVoice[], configured: CharacterLike[], skippedTags = '', limit = DEFAULT_SPEAKER_LOOKBACK): string | null {
   const index = messages.findIndex(message => message.id === targetId)
   if (index < 0) return null
   const target = messages[index]
-  const preceding = messages.slice(0, index).filter(message => !message.is_user).slice(-5).reverse()
+  const count = Number.isFinite(limit) ? Math.max(1, Math.min(MAX_SPEAKER_LOOKBACK, Math.round(limit))) : DEFAULT_SPEAKER_LOOKBACK
+  const preceding = messages.slice(0, index).filter(message => !message.is_user).slice(-count).reverse()
   for (const prior of preceding) {
     if (!buildSpeakerDecisionPlan(prior.content ?? '', [], false, skippedTags).state.speeches.length) continue
     const view = [prior, target]

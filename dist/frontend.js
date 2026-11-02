@@ -1200,6 +1200,8 @@ var TURN_RELATION_CRITERIA = {
   [TURN_OTHER_OPTION]: "A different participant addresses someone else in the scene, a third party, or an off-scene channel.",
   [TURN_UNCLEAR_OPTION]: "The text does not establish whether the speaker continues or changes."
 };
+var DEFAULT_SPEAKER_LOOKBACK = 5;
+var MAX_SPEAKER_LOOKBACK = 100;
 var TTS_EMOTION_OPTIONS = [
   { value: "happy", description: "Cheerful, upbeat." },
   { value: "sad", description: "Melancholic, downcast." },
@@ -1646,6 +1648,7 @@ async function loadPlaybackPreferences() {
     concurrentGenerations: DEFAULT_CONCURRENT_GENERATIONS,
     rateLimitWaitSeconds: DEFAULT_RATE_LIMIT_WAIT_SECONDS,
     ghostVoiceLifetime: GHOST_VOICE_LIFETIME_MESSAGES,
+    speakerLookback: DEFAULT_SPEAKER_LOOKBACK,
     autoVoiceCasting: true,
     speakerAssignmentDebug: false,
     defaultNarratorVoice: "",
@@ -1686,6 +1689,7 @@ async function loadPlaybackPreferences() {
       MAX_RATE_LIMIT_WAIT_SECONDS
     ),
     ghostVoiceLifetime: clampIntegerSetting(row.value?.chatVoiceGhostVoiceLifetime, GHOST_VOICE_LIFETIME_MESSAGES, 1e3),
+    speakerLookback: clampIntegerSetting(row.value?.chatVoiceSpeakerLookback, DEFAULT_SPEAKER_LOOKBACK, MAX_SPEAKER_LOOKBACK),
     autoVoiceCasting: row.value?.chatVoiceAutoCasting !== false,
     speakerAssignmentDebug: row.value?.chatVoiceSpeakerAssignmentDebug === true,
     defaultNarratorVoice: typeof row.value?.chatVoiceDefaultNarratorVoice === "string" ? row.value.chatVoiceDefaultNarratorVoice.trim().slice(0, 512) : "",
@@ -1747,7 +1751,7 @@ function saveTtsTagPreferences(style, placement, connectionId, model) {
     chatVoiceTagLlmModel: model.trim().slice(0, 256)
   }));
 }
-function saveAdvancedPlaybackPreferences(bufferSegments, concurrentGenerations, rateLimitWaitSeconds, speakerAssignmentDebug, ghostVoiceLifetime, autoVoiceCasting) {
+function saveAdvancedPlaybackPreferences(bufferSegments, concurrentGenerations, rateLimitWaitSeconds, speakerAssignmentDebug, ghostVoiceLifetime, autoVoiceCasting, speakerLookback) {
   return updateVoiceSettings((current) => ({
     ...current,
     chatVoicePlaybackBufferSegments: clampIntegerSetting(
@@ -1767,7 +1771,8 @@ function saveAdvancedPlaybackPreferences(bufferSegments, concurrentGenerations, 
     ),
     chatVoiceSpeakerAssignmentDebug: speakerAssignmentDebug,
     chatVoiceAutoCasting: autoVoiceCasting,
-    chatVoiceGhostVoiceLifetime: clampIntegerSetting(ghostVoiceLifetime, GHOST_VOICE_LIFETIME_MESSAGES, 1e3)
+    chatVoiceGhostVoiceLifetime: clampIntegerSetting(ghostVoiceLifetime, GHOST_VOICE_LIFETIME_MESSAGES, 1e3),
+    chatVoiceSpeakerLookback: clampIntegerSetting(speakerLookback, DEFAULT_SPEAKER_LOOKBACK, MAX_SPEAKER_LOOKBACK)
   }));
 }
 function saveDefaultRoleVoice(role, voice) {
@@ -2387,6 +2392,7 @@ function setup(ctx) {
   const concurrentGenerationField = createField("Maximum concurrent generations");
   const rateLimitWaitField = createField("Rate-limit wait budget (seconds)");
   const ghostLifetimeField = createField("Uncast voice lifetime (assistant messages)");
+  const speakerLookbackField = createField("Speaker lookback (assistant messages)");
   const autoCastingLabel = document.createElement("label");
   autoCastingLabel.className = "chat-voice-toggle";
   const autoCastingToggle = document.createElement("input");
@@ -2424,6 +2430,7 @@ function setup(ctx) {
     concurrentGenerationField.field,
     rateLimitWaitField.field,
     ghostLifetimeField.field,
+    speakerLookbackField.field,
     autoCastingLabel,
     speakerDebugLabel,
     speakerDebugOutput,
@@ -2477,6 +2484,7 @@ function setup(ctx) {
   let rateLimitWaitSeconds = DEFAULT_RATE_LIMIT_WAIT_SECONDS;
   let autoVoiceCasting = true;
   let ghostVoiceLifetime = GHOST_VOICE_LIFETIME_MESSAGES;
+  let speakerLookback = DEFAULT_SPEAKER_LOOKBACK;
   let ghostLifetimeLoaded = false;
   let speakerAssignmentDebug = false;
   let advancedSettingsSaveTimer = null;
@@ -2849,6 +2857,18 @@ function setup(ctx) {
     refreshLocalState();
   };
   ghostLifetimeInput.addEventListener("change", onGhostLifetimeInput);
+  const speakerLookbackInput = createNumberInput(DEFAULT_SPEAKER_LOOKBACK, MAX_SPEAKER_LOOKBACK, "Speaker lookback in assistant messages");
+  speakerLookbackField.slot.appendChild(speakerLookbackInput);
+  const speakerLookbackHint = document.createElement("div");
+  speakerLookbackHint.className = "chat-voice-hint";
+  speakerLookbackHint.textContent = "Check up to this many previous assistant messages for the last clear speaker.";
+  speakerLookbackField.slot.appendChild(speakerLookbackHint);
+  const onSpeakerLookbackInput = () => {
+    speakerLookback = clampIntegerSetting(speakerLookbackInput.valueAsNumber, DEFAULT_SPEAKER_LOOKBACK, MAX_SPEAKER_LOOKBACK);
+    speakerLookbackInput.value = String(speakerLookback);
+    scheduleAdvancedSettingsSave();
+  };
+  speakerLookbackInput.addEventListener("change", onSpeakerLookbackInput);
   playbackBufferField.slot.appendChild(playbackBufferInput);
   concurrentGenerationField.slot.appendChild(concurrentGenerationInput);
   rateLimitWaitField.slot.appendChild(rateLimitWaitInput);
@@ -3025,6 +3045,7 @@ function setup(ctx) {
         tagLlmModel: preferences.tagLlmModel,
         skippedTrackerTags: preferences.skippedTrackerTags,
         ghostVoiceLifetime: preferences.ghostVoiceLifetime,
+        speakerLookback: preferences.speakerLookback,
         debug: preferences.speakerAssignmentDebug
       });
     });
@@ -3566,6 +3587,7 @@ function setup(ctx) {
       preferences.concurrentGenerations = concurrentGenerationLimit;
       preferences.rateLimitWaitSeconds = rateLimitWaitSeconds;
       preferences.ghostVoiceLifetime = ghostVoiceLifetime;
+      preferences.speakerLookback = speakerLookback;
       preferences.autoVoiceCasting = autoVoiceCasting;
       preferences.speakerAssignmentDebug = speakerAssignmentDebug;
     } else {
@@ -4984,6 +5006,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
         concurrentGenerationLimit = preferences.concurrentGenerations;
         rateLimitWaitSeconds = preferences.rateLimitWaitSeconds;
         ghostVoiceLifetime = preferences.ghostVoiceLifetime;
+        speakerLookback = preferences.speakerLookback;
         ghostLifetimeLoaded = true;
         refreshLocalState();
         autoVoiceCasting = preferences.autoVoiceCasting;
@@ -4993,6 +5016,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
         concurrentGenerationInput.value = String(concurrentGenerationLimit);
         rateLimitWaitInput.value = String(rateLimitWaitSeconds);
         ghostLifetimeInput.value = String(ghostVoiceLifetime);
+        speakerLookbackInput.value = String(speakerLookback);
         speakerDebugToggle.checked = speakerAssignmentDebug;
         speakerDebugOutput.hidden = !speakerAssignmentDebug;
       }
@@ -5117,7 +5141,8 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
         rateLimitWaitSeconds,
         speakerAssignmentDebug,
         ghostVoiceLifetime,
-        autoVoiceCasting
+        autoVoiceCasting,
+        speakerLookback
       );
       setStatus("Advanced playback settings saved globally.", "saved");
     } catch (error) {
@@ -5585,7 +5610,8 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
         rateLimitWaitSeconds,
         speakerAssignmentDebug,
         ghostVoiceLifetime,
-        autoVoiceCasting
+        autoVoiceCasting,
+        speakerLookback
       );
     }
     skippedTrackerTagsInput.destroy();
@@ -5598,6 +5624,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
     concurrentGenerationInput.removeEventListener("change", onConcurrentGenerationInput);
     rateLimitWaitInput.removeEventListener("change", onRateLimitWaitInput);
     ghostLifetimeInput.removeEventListener("change", onGhostLifetimeInput);
+    speakerLookbackInput.removeEventListener("change", onSpeakerLookbackInput);
     speakerDebugToggle.removeEventListener("change", onSpeakerDebugChanged);
     addNpcInput.destroy();
     addNpcButton.removeEventListener("click", onAddNpc);

@@ -2522,6 +2522,8 @@ test('looks back at most five assistant messages and stops at the nearest clear 
   const find = (messages: typeof ambiguous) => lookbackSpeakerContinuity(messages, 'target', {}, {}, [ghost], cast)
   assert.equal(find([named, user, ...ambiguous, target]), 'ghost:tasha')
   assert.equal(find([named, ...ambiguous, { ...ambiguous[0], id: 'fifth' }, target]), null)
+  assert.equal(lookbackSpeakerContinuity([named, ...ambiguous, { ...ambiguous[0], id: 'fifth' }, target], 'target', {}, {}, [ghost], cast, '', 6), 'ghost:tasha')
+  assert.equal(lookbackSpeakerContinuity([named, ...ambiguous, target], 'target', {}, {}, [ghost], cast, '', 2), null)
   assert.equal(find([named, ...ambiguous, { id: 'tova', is_user: false, content: 'Tova says, "Hello."' }, target]), 'npc:tova')
   assert.equal(find([named, ...ambiguous, { id: 'other', is_user: false, content: 'The clerk says, "Hello."' }, target]), CONTINUITY_LOOKBACK_BLOCKED)
   assert.equal(find([named, ...ambiguous, { id: 'mixed', is_user: false, content: 'Tasha and Tova speak. "Hello."' }, target]), CONTINUITY_LOOKBACK_BLOCKED)
