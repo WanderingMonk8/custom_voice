@@ -39,7 +39,8 @@ function activeGhostVoices(ghosts, assistantMessageIds, targetId, lifetime = GHO
     const lastSeen = ghost.lastSeenMessageId ? assistantMessageIds.indexOf(ghost.lastSeenMessageId) : -1;
     const createdAt = ghost.createdAtMessageId ? assistantMessageIds.indexOf(ghost.createdAtMessageId) : -1;
     const invokedAt = ghost.lastInvokedAtMessageId ? assistantMessageIds.indexOf(ghost.lastInvokedAtMessageId) : -1;
-    const activeSince = Math.max(lastSeen, createdAt <= target ? createdAt : -1, invokedAt <= target ? invokedAt : -1);
+    const earlierOccurrences = ghost.occurrenceKeys.map((key) => assistantMessageIds.indexOf(key.split(":", 1)[0])).filter((index) => index >= 0 && index <= target);
+    const activeSince = Math.max(lastSeen <= target ? lastSeen : -1, createdAt <= target ? createdAt : -1, invokedAt <= target ? invokedAt : -1, ...earlierOccurrences);
     return (activeSince >= 0 || !ghost.lastSeenMessageId) && activeSince <= target && target - activeSince <= Math.max(1, lifetime);
   });
 }

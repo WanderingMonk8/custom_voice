@@ -92,7 +92,8 @@ function activeGhostVoices(ghosts, assistantMessageIds, targetId, lifetime = GHO
     const lastSeen = ghost.lastSeenMessageId ? assistantMessageIds.indexOf(ghost.lastSeenMessageId) : -1;
     const createdAt = ghost.createdAtMessageId ? assistantMessageIds.indexOf(ghost.createdAtMessageId) : -1;
     const invokedAt = ghost.lastInvokedAtMessageId ? assistantMessageIds.indexOf(ghost.lastInvokedAtMessageId) : -1;
-    const activeSince = Math.max(lastSeen, createdAt <= target ? createdAt : -1, invokedAt <= target ? invokedAt : -1);
+    const earlierOccurrences = ghost.occurrenceKeys.map((key) => assistantMessageIds.indexOf(key.split(":", 1)[0])).filter((index) => index >= 0 && index <= target);
+    const activeSince = Math.max(lastSeen <= target ? lastSeen : -1, createdAt <= target ? createdAt : -1, invokedAt <= target ? invokedAt : -1, ...earlierOccurrences);
     return (activeSince >= 0 || !ghost.lastSeenMessageId) && activeSince <= target && target - activeSince <= Math.max(1, lifetime);
   });
 }
@@ -1768,7 +1769,7 @@ function previousNamedGhostContinuity(messages, targetId, ghosts, configured, sk
 var CONTINUITY_LOOKBACK_BLOCKED = "__chat_voice_continuity_blocked__";
 var DEFAULT_SPEAKER_LOOKBACK = 5;
 var MAX_SPEAKER_LOOKBACK = 100;
-function lookbackSpeakerContinuity(messages, targetId, records, parsed, ghosts, configured, skippedTags = "", limit = DEFAULT_SPEAKER_LOOKBACK) {
+function lookbackSpeakerContinuity(messages, targetId, records, parsed, ghosts, configured, skippedTags = "", limit = DEFAULT_SPEAKER_LOOKBACK, diagnostics) {
   const index = messages.findIndex((message) => message.id === targetId);
   if (index < 0) return null;
   const target = messages[index];
@@ -1780,27 +1781,64 @@ function lookbackSpeakerContinuity(messages, targetId, records, parsed, ghosts, 
     const priorIndex = messages.findIndex((message) => message.id === prior.id);
     const availableGhosts = ghosts.filter((ghost) => {
       const lastSeen = messages.findIndex((message) => message.id === ghost.lastSeenMessageId);
-      return lastSeen >= 0 && lastSeen <= priorIndex;
+      const earlierOccurrence = ghost.occurrenceKeys.some((key) => {
+        const occurrenceIndex = messages.findIndex((message) => message.id === key.split(":", 1)[0]);
+        return occurrenceIndex >= 0 && occurrenceIndex <= priorIndex;
+      });
+      const earlierHistory = ghost.conversationHistory?.some((entry) => {
+        const historyIndex = messages.findIndex((message) => message.id === entry.messageId);
+        return historyIndex >= 0 && historyIndex <= priorIndex;
+      }) ?? false;
+      const eligible = lastSeen >= 0 && lastSeen <= priorIndex || earlierOccurrence || earlierHistory;
+      diagnostics?.push(`${prior.id}/${ghost.id}: ${eligible ? "eligible" : "excluded"} (lastSeen=${ghost.lastSeenMessageId || "none"}, earlierOccurrence=${earlierOccurrence}, earlierHistory=${earlierHistory})`);
+      return eligible;
     });
     const cast = configured.filter((speaker) => speaker.id !== USER_SPEAKER_ID);
     const named = previousNamedGhostContinuity(view, targetId, availableGhosts, cast, skippedTags);
-    if (named) return named;
+    if (named) {
+      diagnostics?.push(`${prior.id}: named subject -> ${named}`);
+      return named;
+    }
     const matchedCast = cast.filter((speaker) => hasNamedSpeakerSubject(prior.content ?? "", [speaker], skippedTags));
     const matchedGhosts = availableGhosts.filter((ghost) => ghostCastAliases(ghost).some((alias) => !isDescriptiveGhostLabel(alias) && hasNamedSpeakerSubject(prior.content ?? "", [{ id: `ghost:${ghost.id}`, name: alias }], skippedTags)));
-    if (matchedCast.length + matchedGhosts.length > 1) return CONTINUITY_LOOKBACK_BLOCKED;
-    if (matchedCast.length === 1) return matchedCast[0].id;
+    if (matchedCast.length + matchedGhosts.length > 1) {
+      diagnostics?.push(`${prior.id}: conflicting named subjects`);
+      return CONTINUITY_LOOKBACK_BLOCKED;
+    }
+    if (matchedCast.length === 1) {
+      diagnostics?.push(`${prior.id}: named cast subject -> ${matchedCast[0].id}`);
+      return matchedCast[0].id;
+    }
     if (matchedGhosts.length === 1) {
-      if (hasSpeakerMentions(mentionedSpeakers(narrativeOnly(preparePlaybackContent(prior.content ?? "", skippedTags)), cast))) return CONTINUITY_LOOKBACK_BLOCKED;
-      return `ghost:${matchedGhosts[0].id}`;
+      if (hasSpeakerMentions(mentionedSpeakers(narrativeOnly(preparePlaybackContent(prior.content ?? "", skippedTags)), cast))) {
+        diagnostics?.push(`${prior.id}: named cast conflict`);
+        return CONTINUITY_LOOKBACK_BLOCKED;
+      }
+      const id = `ghost:${matchedGhosts[0].id}`;
+      diagnostics?.push(`${prior.id}: named temporary subject -> ${id}`);
+      return id;
     }
     const record = previousContinuitySpeaker(view, targetId, records);
-    if (record) return record;
+    if (record) {
+      diagnostics?.push(`${prior.id}: saved continuity -> ${record}`);
+      return record;
+    }
     const recovered = recoverPreviousGhostContinuity(view, targetId, parsed, availableGhosts, skippedTags);
-    if (recovered) return recovered;
+    if (recovered) {
+      diagnostics?.push(`${prior.id}: recorded speech -> ${recovered}`);
+      return recovered;
+    }
     const rawRecord = records && typeof records === "object" && !Array.isArray(records) ? records[prior.id] : null;
-    if (rawRecord && typeof rawRecord === "object" && rawRecord.contentHash === hashMessageContent(prior.content ?? "") && rawRecord.speakerId === null) return CONTINUITY_LOOKBACK_BLOCKED;
+    if (rawRecord && typeof rawRecord === "object" && rawRecord.contentHash === hashMessageContent(prior.content ?? "") && rawRecord.speakerId === null) {
+      diagnostics?.push(`${prior.id}: saved ambiguous or mixed speaker`);
+      return CONTINUITY_LOOKBACK_BLOCKED;
+    }
     const discovered = addUnconfiguredDialogueSpeakers(prior.content ?? "", configured, skippedTags).filter((speaker) => speaker.id.startsWith("unconfigured:") && !/^(?:what|who|where|when|why|how)$/iu.test(speaker.name));
-    if (discovered.some((speaker) => hasNamedSpeakerSubject(prior.content ?? "", [speaker], skippedTags)) || hasAnonymousSpeechAttribution(preparePlaybackContent(prior.content ?? "", skippedTags))) return CONTINUITY_LOOKBACK_BLOCKED;
+    if (discovered.some((speaker) => hasNamedSpeakerSubject(prior.content ?? "", [speaker], skippedTags)) || hasAnonymousSpeechAttribution(preparePlaybackContent(prior.content ?? "", skippedTags))) {
+      diagnostics?.push(`${prior.id}: another unconfigured speaker`);
+      return CONTINUITY_LOOKBACK_BLOCKED;
+    }
+    diagnostics?.push(`${prior.id}: no clear speaker`);
   }
   return null;
 }
@@ -4797,7 +4835,8 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
     const speakerLookback = Number.isFinite(payload.speakerLookback) ? Math.min(MAX_SPEAKER_LOOKBACK, Math.max(1, Math.round(payload.speakerLookback))) : DEFAULT_SPEAKER_LOOKBACK;
     const activeGhostsForReview = activeGhostVoices(readGhostVoices(chat.metadata?.chat_voice_ghost_cast), assistantIds, anchor, lifetime);
     const relationshipContext = relationshipReviewContext(messages, message.id, activeGhostsForReview, skippedTrackerTags);
-    const storedContinuity = !message.is_user ? lookbackSpeakerContinuity(messages, message.id, chat.metadata?.chat_voice_speaker_continuity, config.parsedMessages, activeGhostsForReview, configuredSpeakers, skippedTrackerTags, speakerLookback) : null;
+    const lookbackDiagnostics = [];
+    const storedContinuity = !message.is_user ? lookbackSpeakerContinuity(messages, message.id, chat.metadata?.chat_voice_speaker_continuity, config.parsedMessages, activeGhostsForReview, configuredSpeakers, skippedTrackerTags, speakerLookback, payload.debug ? lookbackDiagnostics : void 0) : null;
     const continuitySpeakerId = storedContinuity && (storedContinuity.startsWith("ghost:") ? activeGhostsForReview.some((ghost) => `ghost:${ghost.id}` === storedContinuity) : configuredSpeakers.some((speaker) => speaker.id === storedContinuity)) ? storedContinuity : null;
     for (const ghost of activeGhostsForReview) {
       if (!ghost.speakerId.startsWith("unconfigured:")) continue;
@@ -4902,7 +4941,7 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
           })),
           cardSpeakerId: titleMatchedCardSpeakerId,
           historicalSpeakerId,
-          relationshipReview: { version: "relationship-review-5", context: relationshipContext, continuitySpeakerId, speakerLookback },
+          relationshipReview: { version: "relationship-review-6", context: relationshipContext, continuitySpeakerId, speakerLookback },
           previousAssistantMessageId: previousAssistantMessage?.id ?? null,
           skippedTrackerTags
         }));
@@ -4950,7 +4989,7 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
           }
           const relationshipReview = buildRelationshipSpeakerReview(decisionPlan, answers, relationshipContext, continuitySpeakerId);
           let relationshipReviewFailed = false;
-          let relationshipSceneDiagnostic = `continuity=${continuitySpeakerId ?? "none"}; candidates=${Object.entries(relationshipReview.ghostOptions).map(([option, id]) => `${option}=${id}`).join(",") || "none"}`;
+          let relationshipSceneDiagnostic = `continuity=${continuitySpeakerId ?? "none"}; lookback=${lookbackDiagnostics.join(" | ") || "none"}; candidates=${Object.entries(relationshipReview.ghostOptions).map(([option, id]) => `${option}=${id}`).join(",") || "none"}`;
           if (Object.keys(relationshipReview.questions).length) {
             try {
               const relationshipResult = await spindle.decisions.evaluate({ state: relationshipReview.state, questions: relationshipReview.questions, ...userId ? { userId } : {} });

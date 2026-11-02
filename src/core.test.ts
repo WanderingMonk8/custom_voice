@@ -2017,7 +2017,7 @@ test('keeps ghost voices for the configured count of assistant messages and neve
   }, [ghost], ['voice-1']), [])
   const replay = { ...ghost, lastSeenMessageId: ids[10], occurrenceKeys: [`${ids[0]}:stored`] }
   assert.equal(activeGhostVoices([replay], ids, ids[0], 1).length, 1)
-  assert.equal(activeGhostVoices([replay], ids, ids[1], 10).length, 0)
+  assert.equal(activeGhostVoices([replay], ids, ids[1], 10).length, 1)
 })
 
 test('links separate same-character runs to one ghost voice and gathers their local context', () => {
@@ -2527,6 +2527,24 @@ test('looks back at most five assistant messages and stops at the nearest clear 
   assert.equal(find([named, ...ambiguous, { id: 'tova', is_user: false, content: 'Tova says, "Hello."' }, target]), 'npc:tova')
   assert.equal(find([named, ...ambiguous, { id: 'other', is_user: false, content: 'The clerk says, "Hello."' }, target]), CONTINUITY_LOOKBACK_BLOCKED)
   assert.equal(find([named, ...ambiguous, { id: 'mixed', is_user: false, content: 'Tasha and Tova speak. "Hello."' }, target]), CONTINUITY_LOOKBACK_BLOCKED)
+})
+
+test('keeps a historically seen temporary speaker eligible after later playback without leaking future-only ghosts', () => {
+  const messages = [
+    { id: 'first', is_user: false, content: 'Tasha smiles. "Hello."' },
+    { id: 'current', is_user: false, content: 'She smiles. "Again."' },
+    { id: 'future', is_user: false, content: 'Tasha returns. "Later."' },
+  ]
+  const ghost = { id: 'tasha', speakerId: UNCAST_SPEAKER_ID, label: 'Tasha', aliases: ['Tasha'], voiceId: 'voice', context: '', lastSeenMessageId: 'future', occurrenceKeys: [`first:${hashMessageContent('Hello.')}`, `future:${hashMessageContent('Later.')}`] }
+  const ids = messages.map(message => message.id)
+  const active = activeGhostVoices([ghost], ids, 'current', 5)
+  assert.equal(active.length, 1)
+  const trace: string[] = []
+  assert.equal(lookbackSpeakerContinuity(messages, 'current', {}, {}, active, [], '', 5, trace), 'ghost:tasha')
+  assert.ok(trace.some(line => line.includes('earlierOccurrence=true')))
+  const futureOnly = { ...ghost, occurrenceKeys: [`future:${hashMessageContent('Later.')}`] }
+  assert.equal(activeGhostVoices([futureOnly], ids, 'current', 5).length, 0)
+  assert.notEqual(lookbackSpeakerContinuity(messages, 'current', {}, {}, [futureOnly], [], '', 5), 'ghost:tasha')
 })
 
 test('defaults and clamps the global saved audio limit', () => {

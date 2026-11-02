@@ -974,7 +974,8 @@ function queueSpeakerParse(
     const speakerLookback = Number.isFinite(payload.speakerLookback) ? Math.min(MAX_SPEAKER_LOOKBACK, Math.max(1, Math.round(payload.speakerLookback))) : DEFAULT_SPEAKER_LOOKBACK
     const activeGhostsForReview = activeGhostVoices(readGhostVoices(chat.metadata?.chat_voice_ghost_cast), assistantIds, anchor, lifetime)
     const relationshipContext = relationshipReviewContext(messages, message.id, activeGhostsForReview, skippedTrackerTags)
-    const storedContinuity = !message.is_user ? lookbackSpeakerContinuity(messages, message.id, chat.metadata?.chat_voice_speaker_continuity, config.parsedMessages, activeGhostsForReview, configuredSpeakers, skippedTrackerTags, speakerLookback) : null
+    const lookbackDiagnostics: string[] = []
+    const storedContinuity = !message.is_user ? lookbackSpeakerContinuity(messages, message.id, chat.metadata?.chat_voice_speaker_continuity, config.parsedMessages, activeGhostsForReview, configuredSpeakers, skippedTrackerTags, speakerLookback, payload.debug ? lookbackDiagnostics : undefined) : null
     const continuitySpeakerId = storedContinuity && (storedContinuity.startsWith('ghost:')
       ? activeGhostsForReview.some(ghost => `ghost:${ghost.id}` === storedContinuity)
       : configuredSpeakers.some(speaker => speaker.id === storedContinuity)) ? storedContinuity : null
@@ -1104,7 +1105,7 @@ function queueSpeakerParse(
           })),
           cardSpeakerId: titleMatchedCardSpeakerId,
           historicalSpeakerId,
-          relationshipReview: { version: 'relationship-review-5', context: relationshipContext, continuitySpeakerId, speakerLookback },
+          relationshipReview: { version: 'relationship-review-6', context: relationshipContext, continuitySpeakerId, speakerLookback },
           previousAssistantMessageId: previousAssistantMessage?.id ?? null,
           skippedTrackerTags,
         }))
@@ -1154,7 +1155,7 @@ function queueSpeakerParse(
           }
           const relationshipReview = buildRelationshipSpeakerReview(decisionPlan, answers, relationshipContext, continuitySpeakerId)
           let relationshipReviewFailed = false
-          let relationshipSceneDiagnostic = `continuity=${continuitySpeakerId ?? 'none'}; candidates=${Object.entries(relationshipReview.ghostOptions).map(([option, id]) => `${option}=${id}`).join(',') || 'none'}`
+          let relationshipSceneDiagnostic = `continuity=${continuitySpeakerId ?? 'none'}; lookback=${lookbackDiagnostics.join(' | ') || 'none'}; candidates=${Object.entries(relationshipReview.ghostOptions).map(([option, id]) => `${option}=${id}`).join(',') || 'none'}`
           if (Object.keys(relationshipReview.questions).length) {
             try {
               const relationshipResult = await spindle.decisions.evaluate({ state: relationshipReview.state, questions: relationshipReview.questions, ...(userId ? { userId } : {}) })
