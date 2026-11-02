@@ -999,6 +999,19 @@ export function setup(ctx: SpindleFrontendContext) {
     .chat-voice-character-title { display:flex; align-items:center; gap:6px; min-width:0; }
     .chat-voice-cast-preview { display:inline-flex; flex:none; align-items:center; justify-content:center; width:24px; height:24px; padding:3px; border:1px solid var(--lumiverse-border); border-radius:6px; background:var(--lumiverse-fill-subtle); color:var(--lumiverse-text); cursor:pointer; }
     .chat-voice-cast-preview svg { width:100%; height:100%; }
+    .chat-voice-favorite-picker { position:relative; width:100%; }
+    .chat-voice-favorite-picker summary { display:flex; align-items:center; justify-content:space-between; cursor:pointer; list-style:none; }
+    .chat-voice-favorite-picker summary::-webkit-details-marker { display:none; }
+    .chat-voice-favorite-picker summary::after { content:'\u2304'; font-size:16px; }
+    .chat-voice-favorite-picker[aria-disabled="true"] summary { opacity:.55; cursor:not-allowed; }
+    .chat-voice-favorite-options { max-height:240px; overflow:auto; border:1px solid var(--lumiverse-border); border-radius:var(--lumiverse-radius); background:var(--lumiverse-bg-secondary, #222); }
+    .chat-voice-favorite-category { padding:7px 9px 3px; color:var(--lumiverse-text-muted); font-size:11px; font-weight:700; }
+    .chat-voice-favorite-option { display:flex; align-items:center; gap:4px; padding:2px 4px; }
+    .chat-voice-favorite-option:hover, .chat-voice-favorite-option:focus-within { background:var(--lumiverse-fill-subtle); }
+    .chat-voice-favorite-option-name { flex:1; min-width:0; border:0; background:transparent; color:var(--lumiverse-text); font:inherit; font-size:12px; text-align:left; padding:7px; cursor:pointer; overflow-wrap:anywhere; }
+    .chat-voice-favorite-option .chat-voice-cast-preview { visibility:hidden; }
+    .chat-voice-favorite-option:hover .chat-voice-cast-preview, .chat-voice-favorite-option:focus-within .chat-voice-cast-preview { visibility:visible; }
+    @media (hover:none) { .chat-voice-favorite-option .chat-voice-cast-preview { visibility:visible; } }
     .chat-voice-character-meta { display:flex; align-items:center; gap:6px; }
     .chat-voice-character-name { color:var(--lumiverse-text); font-size:12px; font-weight:600; }
     .chat-voice-character-count { color:var(--lumiverse-text-muted); font-size:11px; white-space:nowrap; }
@@ -1144,6 +1157,10 @@ export function setup(ctx: SpindleFrontendContext) {
     field.label.classList.add('chat-voice-role-heading')
     const title = document.createElement('span')
     title.textContent = titleText
+    const titleGroup = document.createElement('span')
+    titleGroup.className = 'chat-voice-character-title'
+    const preview = createCastPreviewButton(() => titleText, () => titleText === 'Narrator voice' ? narratorInput.getValue() : userVoiceInput.getValue())
+    titleGroup.append(preview, title)
     const toggle = document.createElement('label')
     toggle.className = 'chat-voice-role-default'
     const checkbox = document.createElement('input')
@@ -1152,7 +1169,7 @@ export function setup(ctx: SpindleFrontendContext) {
     const copy = document.createElement('span')
     copy.textContent = 'Use global'
     toggle.append(checkbox, copy)
-    field.label.append(title, toggle)
+    field.label.append(titleGroup, toggle)
     return checkbox
   }
 
@@ -1335,6 +1352,19 @@ export function setup(ctx: SpindleFrontendContext) {
   let previewAudio: HTMLAudioElement | null = null
   let previewUrl: string | null = null
   const favoritePickers = new Set<HTMLSelectElement>()
+  const favoritePickerViews = new WeakMap<HTMLSelectElement, { details: HTMLDetailsElement; summary: HTMLElement; options: HTMLDivElement }>()
+  let openFavoritePicker: HTMLDetailsElement | null = null
+  const closeFavoritePickerOnOutsideClick = (event: Event) => {
+    if (openFavoritePicker && !event.composedPath().includes(openFavoritePicker)) openFavoritePicker.open = false
+  }
+  const closeFavoritePickerOnEscape = (event: KeyboardEvent) => {
+    if (event.key !== 'Escape' || !openFavoritePicker) return
+    const summary = openFavoritePicker.querySelector<HTMLElement>('summary')
+    openFavoritePicker.open = false
+    summary?.focus()
+  }
+  hostDocument.addEventListener('pointerdown', closeFavoritePickerOnOutsideClick)
+  hostDocument.addEventListener('keydown', closeFavoritePickerOnEscape)
   let localNarratorVoice = ''
   let localUserVoice = ''
   let useGlobalNarratorVoice = true
@@ -3698,6 +3728,62 @@ export function setup(ctx: SpindleFrontendContext) {
         picker.appendChild(group)
       }
       picker.disabled = !activeChat || favoriteVoices.length === 0
+      let view = favoritePickerViews.get(picker)
+      if (!view) {
+        const details = document.createElement('details')
+        details.className = 'chat-voice-favorite-picker'
+        details.style.marginTop = picker.style.marginTop
+        const summary = document.createElement('summary')
+        summary.className = 'chat-voice-favorite-select'
+        summary.setAttribute('aria-label', picker.getAttribute('aria-label') || 'Favorite voice')
+        const options = document.createElement('div')
+        options.className = 'chat-voice-favorite-options'
+        details.append(summary, options)
+        picker.insertAdjacentElement('afterend', details)
+        picker.hidden = true
+        picker.tabIndex = -1
+        summary.addEventListener('click', event => { if (picker.disabled) event.preventDefault() })
+        details.addEventListener('toggle', () => {
+          if (details.open) {
+            if (openFavoritePicker && openFavoritePicker !== details) openFavoritePicker.open = false
+            openFavoritePicker = details
+          } else if (openFavoritePicker === details) openFavoritePicker = null
+        })
+        view = { details, summary, options }
+        favoritePickerViews.set(picker, view)
+      }
+      view.summary.textContent = placeholder.textContent
+      view.summary.setAttribute('aria-disabled', String(picker.disabled))
+      view.details.setAttribute('aria-disabled', String(picker.disabled))
+      if (picker.disabled) view.details.open = false
+      view.options.replaceChildren()
+      for (const [category, label] of [['female', 'Female'], ['male', 'Male'], ['unspecified', 'Unspecified']] as const) {
+        const entries = favoriteVoices.filter(voice => voice.category === category)
+        if (!entries.length) continue
+        const heading = document.createElement('div')
+        heading.className = 'chat-voice-favorite-category'
+        heading.textContent = label
+        view.options.appendChild(heading)
+        for (const voice of entries) {
+          const row = document.createElement('div')
+          row.className = 'chat-voice-favorite-option'
+          const selectVoice = document.createElement('button')
+          selectVoice.type = 'button'
+          selectVoice.className = 'chat-voice-favorite-option-name'
+          selectVoice.textContent = voice.name || voice.id
+          const pickerView = view
+          selectVoice.addEventListener('click', () => {
+            if (picker.disabled) return
+            picker.value = voice.id
+            picker.dispatchEvent(new Event('change', { bubbles: true }))
+            pickerView.details.open = false
+            pickerView.summary.focus()
+          })
+          const preview = createCastPreviewButton(() => voice.name || voice.id, () => voice.id)
+          row.append(selectVoice, preview)
+          view.options.appendChild(row)
+        }
+      }
     }
     updateCharacterVoiceDisplays()
     updateRoleVoiceDisplays()
@@ -4901,6 +4987,8 @@ export function setup(ctx: SpindleFrontendContext) {
   refreshLocalState()
 
   return () => {
+    hostDocument.removeEventListener('pointerdown', closeFavoritePickerOnOutsideClick)
+    hostDocument.removeEventListener('keydown', closeFavoritePickerOnEscape)
     stopVoicePreview()
     stopPlayback()
     for (const controller of backgroundSynthesisControllers) controller.abort()
