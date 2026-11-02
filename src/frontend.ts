@@ -375,6 +375,13 @@ const VOICE_ICON = `
   </svg>
 `
 
+const MICROPHONE_ICON = `
+  <svg viewBox="0 0 24 24" fill="none" aria-hidden="true" xmlns="http://www.w3.org/2000/svg">
+    <rect x="9" y="2" width="6" height="12" rx="3" stroke="currentColor" stroke-width="1.8"/>
+    <path d="M5 11a7 7 0 0 0 14 0M12 18v4M9 22h6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+  </svg>
+`
+
 const STOP_ACTION_ICON = `<svg viewBox="0 0 24 24" width="13" height="13" fill="currentColor" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="1"/></svg>`
 const PLAY_TTS_ACTION_ICON = `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" aria-hidden="true"><path d="M11 5 6 9H3v6h3l5 4V5Z" fill="currentColor"/><path d="M15 9.5a4 4 0 0 1 0 5M18 7a7.5 7.5 0 0 1 0 10" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>`
 const RENAME_ICON = `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" aria-hidden="true"><path d="M4 20h4l11-11-4-4L4 16v4Zm9.5-13.5 4 4" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>`
@@ -989,6 +996,9 @@ export function setup(ctx: SpindleFrontendContext) {
     }
     .chat-voice-character-temporary { border:1px dashed #e05b5b; }
     .chat-voice-character-heading { display:flex; justify-content:space-between; gap:8px; align-items:baseline; }
+    .chat-voice-character-title { display:flex; align-items:center; gap:6px; min-width:0; }
+    .chat-voice-cast-preview { display:inline-flex; flex:none; align-items:center; justify-content:center; width:24px; height:24px; padding:3px; border:1px solid var(--lumiverse-border); border-radius:6px; background:var(--lumiverse-fill-subtle); color:var(--lumiverse-text); cursor:pointer; }
+    .chat-voice-cast-preview svg { width:100%; height:100%; }
     .chat-voice-character-meta { display:flex; align-items:center; gap:6px; }
     .chat-voice-character-name { color:var(--lumiverse-text); font-size:12px; font-weight:600; }
     .chat-voice-character-count { color:var(--lumiverse-text-muted); font-size:11px; white-space:nowrap; }
@@ -3720,7 +3730,7 @@ export function setup(ctx: SpindleFrontendContext) {
     previewUrl = null
   }
 
-  async function previewFavoriteVoice(voice: FavoriteVoice): Promise<void> {
+  async function previewVoice(voiceId: string, voiceLabel: string): Promise<void> {
     const connectionId = connectionPicker.getValue() || lumiverseConnectionId
     if (!connectionId) {
       setStatus('Choose a TTS connection to preview a voice.', 'error')
@@ -3729,7 +3739,7 @@ export function setup(ctx: SpindleFrontendContext) {
     stopVoicePreview()
     const controller = new AbortController()
     previewController = controller
-    setStatus(`Generating preview for ${voice.name || voice.id}…`)
+    setStatus(`Generating preview for ${voiceLabel}…`)
     const budget: RateLimitBudget = {
       blockedUntil: 0, cumulativeWaitMs: 0, consecutiveResponses: 0,
       maximumWaitMs: rateLimitWaitSeconds * 1_000, recovering: false, recoveryTail: Promise.resolve(),
@@ -3738,7 +3748,7 @@ export function setup(ctx: SpindleFrontendContext) {
     connectionVoiceGates.set(connectionId, gate)
     try {
       const segment = await runSynthesisTask(() => synthesizeVoiceSegment(
-        connectionId, 'Hello. This is a preview of my voice.', voice.id, 1,
+        connectionId, 'Hello. This is a preview of my voice.', voiceId, 1,
         controller.signal, sharedSynthesisPacer, budget, gate,
         delay => setStatus(`Preview rate limited; retrying in ${Math.ceil(delay / 1_000)}s…`),
       ), true)
@@ -3753,12 +3763,27 @@ export function setup(ctx: SpindleFrontendContext) {
         }
       }
       await audio.play()
-      if (previewController === controller) setStatus(`Playing preview for ${voice.name || voice.id}.`)
+      if (previewController === controller) setStatus(`Playing preview for ${voiceLabel}.`)
     } catch (error) {
       if (controller.signal.aborted) return
       stopVoicePreview()
       setStatus(error instanceof Error ? `Voice preview failed: ${error.message}` : 'Voice preview failed.', 'error')
     }
+  }
+
+  function createCastPreviewButton(name: () => string, voice: () => string): HTMLButtonElement {
+    const button = document.createElement('button')
+    button.type = 'button'
+    button.className = 'chat-voice-cast-preview'
+    button.innerHTML = MICROPHONE_ICON
+    button.title = `Preview voice for ${name()}`
+    button.setAttribute('aria-label', button.title)
+    button.addEventListener('click', () => {
+      const id = voice().trim()
+      const label = favoriteVoices.find(item => item.id === id)?.name || id || 'connection default voice'
+      void previewVoice(id, label)
+    })
+    return button
   }
 
   async function saveFavoriteVoices(next: FavoriteVoice[], adding?: FavoriteVoice): Promise<boolean> {
@@ -3841,7 +3866,7 @@ export function setup(ctx: SpindleFrontendContext) {
       preview.className = 'chat-voice-preview-button'
       preview.textContent = 'Preview'
       preview.setAttribute('aria-label', `Preview ${voice.name || voice.id}`)
-      preview.addEventListener('click', () => { void previewFavoriteVoice(voice) })
+      preview.addEventListener('click', () => { void previewVoice(voice.id, voice.name || voice.id) })
       const rename = document.createElement('button')
       rename.type = 'button'
       rename.className = 'chat-voice-rename-button'
@@ -3938,6 +3963,10 @@ export function setup(ctx: SpindleFrontendContext) {
       const name = document.createElement('span')
       name.className = 'chat-voice-character-name'
       name.textContent = character.name
+      const title = document.createElement('span')
+      title.className = 'chat-voice-character-title'
+      const castPreview = createCastPreviewButton(() => name.textContent || character.name, () => input.getValue())
+      title.append(castPreview, name)
       const count = document.createElement('span')
       count.className = 'chat-voice-character-count'
       count.textContent = character.messageCount > 0
@@ -4000,6 +4029,8 @@ export function setup(ctx: SpindleFrontendContext) {
           renameForm.hidden = true
           if (editingCharacterVoiceId === `rename:${character.id}`) editingCharacterVoiceId = null
           name.textContent = renamed
+          castPreview.title = `Preview voice for ${renamed}`
+          castPreview.setAttribute('aria-label', castPreview.title)
           rename.title = `Rename ${renamed} or edit aliases`
           rename.setAttribute('aria-label', rename.title)
           remove.title = `Delete ${renamed}`
@@ -4021,7 +4052,7 @@ export function setup(ctx: SpindleFrontendContext) {
       const picker = document.createElement('select')
       picker.className = 'chat-voice-favorite-select'
       picker.setAttribute('aria-label', `Favorite voice for ${character.name}`)
-      heading.append(name, meta)
+      heading.append(title, meta)
       card.append(heading, renameForm, voiceDisplay, slot, picker)
       characterList.appendChild(card)
       const input = ctx.components.mountTextInput(slot, {
@@ -4079,6 +4110,10 @@ export function setup(ctx: SpindleFrontendContext) {
       name.style.border = '0'
       name.style.color = 'inherit'
       name.textContent = ghost.label || (ghost.speakerId.startsWith('unconfigured:') ? ghost.speakerId.slice(13) : `Unnamed character \u00b7 ${ghost.id.replace(/^ghost-/u, '')}`)
+      const title = document.createElement('span')
+      title.className = 'chat-voice-character-title'
+      const castPreview = createCastPreviewButton(() => name.textContent || 'temporary character', () => input.getValue())
+      title.append(castPreview, name)
       name.title = 'Double-click to add to the regular cast'
       name.addEventListener('dblclick', () => {
         if (!activeChat) return
@@ -4102,7 +4137,7 @@ export function setup(ctx: SpindleFrontendContext) {
         ctx.sendToBackend({ type: 'chat_voice_ghost_edit', chatId: activeChat.id, ghostId: ghost.id, remove: true })
       })
       meta.append(badge, remove)
-      heading.append(name, meta)
+      heading.append(title, meta)
       const slot = document.createElement('div')
       slot.hidden = true
       const voiceDisplay = document.createElement('button')
