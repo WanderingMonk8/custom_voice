@@ -39,6 +39,7 @@ import {
   parseRosterVoiceSegments,
   preferredCardSpeakerId,
   previousAssistantSpeakerFallback,
+  previousContinuitySpeaker,
   mergeScannedCardCast,
   readConfig,
   readFavoriteVoices,
@@ -58,6 +59,7 @@ import {
   stripTtsModulationMarker,
   validateTtsSpeechPlacement,
   USER_SPEAKER_ID,
+  UNCAST_SPEAKER_ID,
   type CharacterLike,
   type ChatVoiceConfig,
   type PlaybackSegment,
@@ -849,7 +851,7 @@ async function saveGhostVoiceAssignments(
     if (!chat) return []
     const metadata = chat.metadata ?? {}
     const ghosts = readGhostVoices(metadata.chat_voice_ghost_cast)
-    const currentMessages = await spindle.chat.getMessages(chatId) as Array<{ id: string; is_user: boolean }>
+    const currentMessages = await spindle.chat.getMessages(chatId) as Array<{ id: string; is_user: boolean; content?: string }>
     const currentAssistantIds = currentMessages.filter(message => !message.is_user).map(message => message.id)
     const activeGhosts = activeGhostVoices(ghosts, currentAssistantIds, currentAssistantIds.at(-1) ?? anchorId, lifetime)
     const config = readConfig(metadata, chatMemberIds(chat))
@@ -881,7 +883,7 @@ async function saveGhostVoiceAssignments(
         activeGhosts.push(ghost)
       }
       markGhostVoiceInvoked(ghost, currentAssistantIds, messageId)
-      accepted.push({ ...assignment, voiceId })
+      accepted.push({ ...assignment, ghostId, voiceId })
       ghost.aliases = mergeGhostAliases(ghostCastAliases(ghost), assignment.aliases ?? [])
       const revealedName = (assignment.aliases ?? []).find(alias => !isDescriptiveGhostLabel(alias))
       if (revealedName && (!ghost.label || isDescriptiveGhostLabel(ghost.label))) ghost.label = revealedName
@@ -897,7 +899,18 @@ async function saveGhostVoiceAssignments(
         ghost.context = [priorContext, ...group.context].filter(Boolean).join(' ').slice(-2_000)
       }
     }
-    if (accepted.length) await spindle.chats.update(chatId, { metadata: { ...metadata, chat_voice_ghost_cast: ghosts.slice(-200) } }, userId)
+    if (accepted.length) {
+      const source = currentMessages.find(item => item.id === messageId)
+      const matchingIds = new Set(accepted.map(item => item.ghostId))
+      const expected = buildSpeakerDecisionPlan(conversation, [], false).state.speeches.length
+      const covered = groups.reduce((sum, group) => sum + group.speeches.length, 0)
+      const previousRecords = metadata.chat_voice_speaker_continuity
+      const records = previousRecords && typeof previousRecords === 'object' && !Array.isArray(previousRecords) ? { ...previousRecords as Record<string, unknown> } : {}
+      if (source && !source.is_user && expected > 0 && covered === expected && accepted.length === groups.length && matchingIds.size === 1) {
+        records[messageId] = { contentHash: hashMessageContent(source.content ?? ''), speakerId: `ghost:${accepted[0].ghostId}` }
+      }
+      await spindle.chats.update(chatId, { metadata: { ...metadata, chat_voice_ghost_cast: ghosts.slice(-200), chat_voice_speaker_continuity: records } }, userId)
+    }
     return accepted
   })
   const queued = task.then(() => undefined, () => undefined)
@@ -956,6 +969,10 @@ function queueSpeakerParse(
     const lifetime = Number.isFinite(payload.ghostVoiceLifetime) ? Math.min(1000, Math.max(1, Math.round(payload.ghostVoiceLifetime))) : 10
     const activeGhostsForReview = activeGhostVoices(readGhostVoices(chat.metadata?.chat_voice_ghost_cast), assistantIds, anchor, lifetime)
     const relationshipContext = relationshipReviewContext(messages, message.id, activeGhostsForReview, skippedTrackerTags)
+    const storedContinuity = !message.is_user ? previousContinuitySpeaker(messages, message.id, chat.metadata?.chat_voice_speaker_continuity) : null
+    const continuitySpeakerId = storedContinuity && (storedContinuity.startsWith('ghost:')
+      ? activeGhostsForReview.some(ghost => `ghost:${ghost.id}` === storedContinuity)
+      : configuredSpeakers.some(speaker => speaker.id === storedContinuity)) ? storedContinuity : null
     for (const ghost of activeGhostsForReview) {
       if (!ghost.speakerId.startsWith('unconfigured:')) continue
       const safe = relationshipContext.ghosts.find(item => item.id === ghost.id)
@@ -1080,7 +1097,7 @@ function queueSpeakerParse(
           })),
           cardSpeakerId: titleMatchedCardSpeakerId,
           historicalSpeakerId,
-          relationshipReview: { version: 'relationship-review-1', context: relationshipContext },
+          relationshipReview: { version: 'relationship-review-2', context: relationshipContext, continuitySpeakerId },
           previousAssistantMessageId: previousAssistantMessage?.id ?? null,
           skippedTrackerTags,
         }))
@@ -1128,8 +1145,9 @@ function queueSpeakerParse(
               spindle.log.warn(`[Chat Voice] User speaker review failed; keeping original assignments: ${error instanceof Error ? error.message : String(error)}`)
             }
           }
-          const relationshipReview = buildRelationshipSpeakerReview(decisionPlan, answers, relationshipContext)
+          const relationshipReview = buildRelationshipSpeakerReview(decisionPlan, answers, relationshipContext, continuitySpeakerId)
           let relationshipReviewFailed = false
+          let relationshipSceneDiagnostic = `continuity=${continuitySpeakerId ?? 'none'}; candidates=${Object.entries(relationshipReview.ghostOptions).map(([option, id]) => `${option}=${id}`).join(',') || 'none'}`
           if (Object.keys(relationshipReview.questions).length) {
             try {
               const relationshipResult = await spindle.decisions.evaluate({ state: relationshipReview.state, questions: relationshipReview.questions, ...(userId ? { userId } : {}) })
@@ -1137,7 +1155,9 @@ function queueSpeakerParse(
               for (const [id, answer] of Object.entries(relationshipResult.answers)) {
                 if (answer.type === 'choice') reviewed[id] = { choice: answer.choice, probabilities: answer.probabilities, confidence: answer.confidence }
               }
-              applyRelationshipSpeakerReview(decisionPlan, answers, reviewed, relationshipReview.ghostOptions, titleMatchedCardSpeakerId)
+              if (reviewed.relationship_scene) relationshipSceneDiagnostic += `; scene=${JSON.stringify(reviewed.relationship_scene)}`
+              applyRelationshipSpeakerReview(decisionPlan, answers, reviewed, relationshipReview.ghostOptions, titleMatchedCardSpeakerId, continuitySpeakerId)
+              relationshipSceneDiagnostic += `; applied=${Object.keys(answers).some(key => key.startsWith('relationship_applied_'))}`
             } catch (error) {
               relationshipReviewFailed = true
               spindle.log.warn(`[Chat Voice] Relationship speaker review failed; keeping original assignments: ${error instanceof Error ? error.message : String(error)}`)
@@ -1167,7 +1187,7 @@ function queueSpeakerParse(
             },
           )
           const relationshipStatus = relationshipReviewFailed ? 'failed; original assignments retained'
-            : `${Object.keys(relationshipReview.questions).length} quotation(s) reviewed`
+            : `${Object.keys(relationshipReview.questions).length} question(s) reviewed; ${relationshipSceneDiagnostic}`
           const reviewedSegments = payload.debug ? segments.map(segment => segment.debugPath ? {
             ...segment, debugPath: [...segment.debugPath, `relationship-review-status:${relationshipStatus}`],
           } : segment) : segments
@@ -1179,6 +1199,11 @@ function queueSpeakerParse(
             payload.debug,
           )
           const taggedSegments = tagResult.segments
+          const continuityIds = new Set(taggedSegments.flatMap(segment => segment.speakerId ? [segment.speakerId] : []))
+          const continuityCandidate = continuityIds.size === 1 ? [...continuityIds][0] : null
+          const stableContinuity = continuityCandidate && continuityCandidate !== UNCAST_SPEAKER_ID && continuityCandidate !== USER_SPEAKER_ID
+            && (continuityCandidate === continuitySpeakerId || namedSpeakerSubject || Object.keys(answers).some(key => key.startsWith('relationship_applied_')))
+            ? continuityCandidate : null
           if (!tagResult.tagFailed && !userReviewFailed && !relationshipReviewFailed) {
             const nextConfig: ChatVoiceConfig = {
               ...config,
@@ -1206,11 +1231,11 @@ function queueSpeakerParse(
                 },
               },
             }
-            await spindle.chats.update(
-              chat.id,
-              { metadata: applyConfigToMetadata(chat.metadata ?? {}, nextConfig) },
-              userId,
-            )
+            const metadata = chat.metadata ?? {}
+            const previousRecords = metadata.chat_voice_speaker_continuity
+            const records = previousRecords && typeof previousRecords === 'object' && !Array.isArray(previousRecords) ? { ...previousRecords as Record<string, unknown> } : {}
+            if (!message.is_user) records[message.id] = { contentHash: hashMessageContent(message.content ?? ''), speakerId: stableContinuity }
+            await spindle.chats.update(chat.id, { metadata: { ...applyConfigToMetadata(metadata, nextConfig), chat_voice_speaker_continuity: records } }, userId)
           }
           sendSpeakerParse({
             requestId: payload.requestId,

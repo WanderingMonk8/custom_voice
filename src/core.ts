@@ -2808,6 +2808,18 @@ export interface RelationshipReviewContext {
   ghosts: Array<{ id: string; label: string; aliases: string[]; context: string; conversationHistory: Array<{ messageId: string; text: string }> }>
 }
 
+/** A continuity record is valid only for the unchanged, immediately preceding assistant message. */
+export function previousContinuitySpeaker(messages: Array<{ id: string; is_user: boolean; content?: string }>, targetId: string, records: unknown): string | null {
+  const index = messages.findIndex(message => message.id === targetId)
+  if (index < 0 || !records || typeof records !== 'object' || Array.isArray(records)) return null
+  const prior = messages.slice(0, index).filter(message => !message.is_user).at(-1)
+  if (!prior) return null
+  const record = (records as Record<string, unknown>)[prior.id]
+  if (!record || typeof record !== 'object' || Array.isArray(record)) return null
+  const value = record as Record<string, unknown>
+  return value.contentHash === hashMessageContent(prior.content ?? '') && typeof value.speakerId === 'string' && value.speakerId ? value.speakerId : null
+}
+
 /** Prepare only earlier, tracker-free context, including when replaying old messages. */
 export function relationshipReviewContext(messages: Array<{ id: string; is_user: boolean; content?: string }>, targetId: string, ghosts: GhostVoice[], skippedTags = ''): RelationshipReviewContext {
   const target = messages.findIndex(message => message.id === targetId)
@@ -2828,7 +2840,7 @@ export function relationshipReviewContext(messages: Array<{ id: string; is_user:
 }
 
 /** Run relationship review only where local identity or an off-scene exchange needs context. */
-export function buildRelationshipSpeakerReview(plan: SpeakerDecisionPlan, answers: Record<string, SpeakerDecisionChoice>, context: RelationshipReviewContext) {
+export function buildRelationshipSpeakerReview(plan: SpeakerDecisionPlan, answers: Record<string, SpeakerDecisionChoice>, context: RelationshipReviewContext, continuitySpeakerId: string | null = null) {
   const questions: SpeakerDecisionPlan['questions'] = {}
   const ghostOptions: Record<string, string> = {}
   const speakers = plan.state.speakers.map(speaker => ({ id: speaker.id, name: speaker.name }))
@@ -2858,22 +2870,24 @@ export function buildRelationshipSpeakerReview(plan: SpeakerDecisionPlan, answer
       if (Object.keys(questions).length >= 32) break
     }
   }
-  if (plan.state.messageRole === 'assistant' && plan.state.speeches.length > 1 && Object.keys(ghostOptions).length && Object.keys(questions).length) {
+  const continuityOption = continuitySpeakerId ? plan.state.speakers.find(speaker => speaker.id === continuitySpeakerId)?.option : undefined
+  if (plan.state.messageRole === 'assistant' && (plan.state.speeches.length > 1 || (plan.state.speeches.length === 1 && continuitySpeakerId)) && (Object.keys(ghostOptions).length || continuityOption) && (Object.keys(questions).length || continuitySpeakerId)) {
     questions.relationship_scene = {
       type: 'choice',
-      instructions: 'Does one previously heard temporary character clearly speak every quotation in this message? Compare the entire scene and preceding conversation; distinguish scene changes, different speakers and people addressed. Select no_clear_identity if any quotation may belong to another speaker or the continuity is uncertain.',
-      criteria: { no_clear_identity: 'The scene has multiple speakers or the identity is uncertain.', ...Object.fromEntries(Object.keys(ghostOptions).map(option => [option, criteria[option]])) },
+      instructions: `Does one previously heard temporary character clearly speak every quotation in this message? Compare the entire scene and preceding conversation; distinguish scene changes, different speakers and people addressed. ${continuitySpeakerId ? `The immediately preceding assistant message ended with ${continuitySpeakerId}; treat this as a continuity clue, not proof.` : ''} Select no_clear_identity if any quotation may belong to another speaker or the continuity is uncertain.`,
+      criteria: { no_clear_identity: 'The scene has multiple speakers or the identity is uncertain.', ...Object.fromEntries([...Object.keys(ghostOptions), ...(continuityOption ? [continuityOption] : [])].map(option => [option, criteria[option]])) },
     }
   }
   return { state: { ...plan.state, previousMessages: context.previousMessages, ghosts: context.ghosts }, questions, ghostOptions }
 }
 
 /** A strong independent decision is required before relationship evidence changes routing. */
-export function applyRelationshipSpeakerReview(plan: SpeakerDecisionPlan, answers: Record<string, SpeakerDecisionChoice>, reviewed: Record<string, SpeakerDecisionChoice>, ghostOptions: Record<string, string>, cardSpeakerId: string | null = null): void {
+export function applyRelationshipSpeakerReview(plan: SpeakerDecisionPlan, answers: Record<string, SpeakerDecisionChoice>, reviewed: Record<string, SpeakerDecisionChoice>, ghostOptions: Record<string, string>, cardSpeakerId: string | null = null, continuitySpeakerId: string | null = null): void {
   const options = { ...plan.optionSpeakerIds, ...ghostOptions }
   const scene = reviewed.relationship_scene
   const sceneEvaluation = scene ? evaluateSpeakerDecisionAnswer(scene, options, { probability: 0.6, confidence: 0.55, margin: 0.3 }) : null
-  const sceneIdentity = !cardSpeakerId && scene && ghostOptions[scene.choice] && sceneEvaluation?.leadingChoice === scene.choice
+  const sceneOptionIdentity = scene ? options[scene.choice] : null
+  const sceneIdentity = (!cardSpeakerId || (continuitySpeakerId && sceneOptionIdentity === continuitySpeakerId)) && scene && sceneOptionIdentity && sceneEvaluation?.leadingChoice === scene.choice
     ? sceneEvaluation.identity : null
   const speakers = plan.state.speakers.map(speaker => ({ id: speaker.id, name: speaker.name }))
   const conflictingAttribution = plan.state.speeches.some(speech => narrativeAttributionSpeaker(`${speech.narrativeBefore} ${speech.narrativeAfter}`, speakers))

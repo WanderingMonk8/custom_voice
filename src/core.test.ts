@@ -17,6 +17,7 @@ import {
   buildAssistantUserSpeakerReview,
   buildRelationshipSpeakerReview,
   applyRelationshipSpeakerReview,
+  previousContinuitySpeaker,
   relationshipReviewContext,
   applyAssistantUserSpeakerReview,
   buildTtsTagPlan,
@@ -2445,6 +2446,9 @@ test('uses a leading temporary speaker for a continuous anonymous scene while pr
   const unique = create()
   applyRelationshipSpeakerReview(unique.plan, unique.answers, { relationship_scene: scene }, unique.review.ghostOptions, 'npc:tova')
   assert.equal(unique.answers.speech_s1.choice, 'known_0')
+  const established = create()
+  applyRelationshipSpeakerReview(established.plan, established.answers, { relationship_scene: scene }, established.review.ghostOptions, 'npc:tova', 'ghost:tasha')
+  assert.equal(established.answers.speech_s1.choice, 'relationship_ghost_0')
   const tied = create()
   applyRelationshipSpeakerReview(tied.plan, tied.answers, { relationship_scene: { ...scene, probabilities: { relationship_ghost_0: 0.52, no_clear_identity: 0.48 } } }, tied.review.ghostOptions)
   assert.equal(tied.answers.speech_s1.choice, 'known_0')
@@ -2453,6 +2457,21 @@ test('uses a leading temporary speaker for a continuous anonymous scene while pr
   changed.answers.turn_s1 = confidentDecision('responds_to_previous_speaker')
   applyRelationshipSpeakerReview(changed.plan, changed.answers, { relationship_scene: scene }, changed.review.ghostOptions)
   assert.equal(changed.answers.speech_s1.choice, 'known_0')
+})
+
+test('inherits continuity only from the unchanged immediately previous assistant message', () => {
+  const messages = [
+    { id: 'z', is_user: false, content: 'Tasha speaks.' },
+    { id: 'user', is_user: true, content: 'A reply.' },
+    { id: 'a', is_user: false, content: 'She continues.' },
+    { id: 'b', is_user: false, content: 'She speaks again.' },
+  ]
+  const records = { z: { contentHash: hashMessageContent('Tasha speaks.'), speakerId: 'ghost:tasha' }, a: { contentHash: hashMessageContent('She continues.'), speakerId: 'ghost:tasha' } }
+  assert.equal(previousContinuitySpeaker(messages, 'a', records), 'ghost:tasha')
+  assert.equal(previousContinuitySpeaker(messages, 'b', records), 'ghost:tasha')
+  assert.equal(previousContinuitySpeaker(messages, 'z', records), null)
+  assert.equal(previousContinuitySpeaker(messages, 'b', { ...records, a: { contentHash: 'stale', speakerId: 'ghost:tasha' } }), null)
+  assert.equal(previousContinuitySpeaker(messages, 'b', { ...records, a: { contentHash: records.a.contentHash, speakerId: null } }), null)
 })
 
 test('defaults and clamps the global saved audio limit', () => {
