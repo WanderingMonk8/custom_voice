@@ -2428,6 +2428,33 @@ test('relationship review keeps explicit attributions and rejects weak changes',
   assert.equal(answers.speech_s1.choice, 'uncast_character')
 })
 
+test('uses a leading temporary speaker for a continuous anonymous scene while preserving card and speaker boundaries', () => {
+  const content = 'She lifts her cap. "Ten minutes." She smiles. "I should write it down." She bends forward. "That is the whole story."'
+  const speakers = [{ id: 'npc:tova', name: 'Tova' }]
+  const context = { previousMessages: [{ id: 'prior', text: 'Tasha holds her cap.' }], ghosts: [{ id: 'tasha', label: 'Tasha', aliases: ['Tasha'], context: 'Tasha speaks.', conversationHistory: [] }] }
+  const create = () => {
+    const plan = buildSpeakerDecisionPlan(content, speakers, false)
+    const answers: Record<string, SpeakerDecisionChoice> = { speech_s0: confidentDecision('known_0', 0.42, 0.35), speech_s1: confidentDecision('known_0', 0.58, 0.53), speech_s2: confidentDecision('known_0', 0.6, 0.55) }
+    return { plan, answers, review: buildRelationshipSpeakerReview(plan, answers, context) }
+  }
+  const scene = { choice: 'relationship_ghost_0', confidence: 0.62, probabilities: { relationship_ghost_0: 0.65, no_clear_identity: 0.2 } }
+  const current = create()
+  assert.ok(current.review.questions.relationship_scene)
+  applyRelationshipSpeakerReview(current.plan, current.answers, { relationship_scene: scene }, current.review.ghostOptions)
+  assert.deepEqual(current.plan.state.speeches.map(speech => current.answers[`speech_${speech.id}`].choice), ['relationship_ghost_0', 'relationship_ghost_0', 'relationship_ghost_0'])
+  const unique = create()
+  applyRelationshipSpeakerReview(unique.plan, unique.answers, { relationship_scene: scene }, unique.review.ghostOptions, 'npc:tova')
+  assert.equal(unique.answers.speech_s1.choice, 'known_0')
+  const tied = create()
+  applyRelationshipSpeakerReview(tied.plan, tied.answers, { relationship_scene: { ...scene, probabilities: { relationship_ghost_0: 0.52, no_clear_identity: 0.48 } } }, tied.review.ghostOptions)
+  assert.equal(tied.answers.speech_s1.choice, 'known_0')
+  const changed = create()
+  changed.plan.state.turns.push({ speechId: 's1', previousSpeechId: 's0', bridge: '' })
+  changed.answers.turn_s1 = confidentDecision('responds_to_previous_speaker')
+  applyRelationshipSpeakerReview(changed.plan, changed.answers, { relationship_scene: scene }, changed.review.ghostOptions)
+  assert.equal(changed.answers.speech_s1.choice, 'known_0')
+})
+
 test('defaults and clamps the global saved audio limit', () => {
   assert.equal(clampSavedAudioLimit(undefined), 50)
   assert.equal(clampSavedAudioLimit(0), 1)

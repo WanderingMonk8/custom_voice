@@ -1137,7 +1137,7 @@ function queueSpeakerParse(
               for (const [id, answer] of Object.entries(relationshipResult.answers)) {
                 if (answer.type === 'choice') reviewed[id] = { choice: answer.choice, probabilities: answer.probabilities, confidence: answer.confidence }
               }
-              applyRelationshipSpeakerReview(decisionPlan, answers, reviewed, relationshipReview.ghostOptions)
+              applyRelationshipSpeakerReview(decisionPlan, answers, reviewed, relationshipReview.ghostOptions, titleMatchedCardSpeakerId)
             } catch (error) {
               relationshipReviewFailed = true
               spindle.log.warn(`[Chat Voice] Relationship speaker review failed; keeping original assignments: ${error instanceof Error ? error.message : String(error)}`)

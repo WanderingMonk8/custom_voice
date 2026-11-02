@@ -1724,20 +1724,43 @@ function buildRelationshipSpeakerReview(plan, answers, context) {
       if (Object.keys(questions).length >= 32) break;
     }
   }
+  if (plan.state.messageRole === "assistant" && plan.state.speeches.length > 1 && Object.keys(ghostOptions).length && Object.keys(questions).length) {
+    questions.relationship_scene = {
+      type: "choice",
+      instructions: "Does one previously heard temporary character clearly speak every quotation in this message? Compare the entire scene and preceding conversation; distinguish scene changes, different speakers and people addressed. Select no_clear_identity if any quotation may belong to another speaker or the continuity is uncertain.",
+      criteria: { no_clear_identity: "The scene has multiple speakers or the identity is uncertain.", ...Object.fromEntries(Object.keys(ghostOptions).map((option) => [option, criteria[option]])) }
+    };
+  }
   return { state: { ...plan.state, previousMessages: context.previousMessages, ghosts: context.ghosts }, questions, ghostOptions };
 }
-function applyRelationshipSpeakerReview(plan, answers, reviewed, ghostOptions) {
+function applyRelationshipSpeakerReview(plan, answers, reviewed, ghostOptions, cardSpeakerId = null) {
   const options = { ...plan.optionSpeakerIds, ...ghostOptions };
+  const scene = reviewed.relationship_scene;
+  const sceneEvaluation = scene ? evaluateSpeakerDecisionAnswer(scene, options, { probability: 0.6, confidence: 0.55, margin: 0.3 }) : null;
+  const sceneIdentity = !cardSpeakerId && scene && ghostOptions[scene.choice] && sceneEvaluation?.leadingChoice === scene.choice ? sceneEvaluation.identity : null;
+  const speakers = plan.state.speakers.map((speaker) => ({ id: speaker.id, name: speaker.name }));
+  const conflictingAttribution = plan.state.speeches.some((speech) => narrativeAttributionSpeaker(`${speech.narrativeBefore} ${speech.narrativeAfter}`, speakers));
+  const conflictingTurn = plan.state.turns.some((turn) => {
+    const answer = answers[`turn_${turn.speechId}`];
+    return !!answer && (answer.choice === TURN_RESPOND_OPTION || answer.choice === TURN_OTHER_OPTION) && answer.confidence >= 0.65 && (answer.probabilities[answer.choice] ?? 0) >= 0.7;
+  });
   for (const speech of plan.state.speeches) {
     const result = reviewed[`relationship_${speech.id}`];
+    const original = answers[`speech_${speech.id}`];
+    const originalIdentity = evaluateSpeakerDecisionAnswer(original, plan.optionSpeakerIds).identity;
+    if (sceneIdentity && !conflictingAttribution && !conflictingTurn && scene) {
+      Object.assign(plan.optionSpeakerIds, ghostOptions);
+      if (original) answers[`relationship_original_${speech.id}`] = original;
+      answers[`speech_${speech.id}`] = scene;
+      answers[`relationship_review_${speech.id}`] = scene;
+      answers[`relationship_applied_${speech.id}`] = scene;
+      continue;
+    }
     if (!result) continue;
     answers[`relationship_review_${speech.id}`] = result;
     const reviewedIdentity = evaluateSpeakerDecisionAnswer(result, options, { probability: 0.85, confidence: 0.8, margin: 0.3 }).identity;
-    const original = answers[`speech_${speech.id}`];
-    const originalIdentity = evaluateSpeakerDecisionAnswer(original, plan.optionSpeakerIds).identity;
     if (!reviewedIdentity || reviewedIdentity === originalIdentity) continue;
     if (originalIdentity && originalIdentity !== UNCAST_SPEAKER_ID) {
-      const speakers = plan.state.speakers.map((speaker) => ({ id: speaker.id, name: speaker.name }));
       if (narrativeAttributionSpeaker(`${speech.narrativeBefore} ${speech.narrativeAfter}`, speakers) === originalIdentity) continue;
     }
     Object.assign(plan.optionSpeakerIds, ghostOptions);
@@ -4772,7 +4795,7 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
               for (const [id, answer] of Object.entries(relationshipResult.answers)) {
                 if (answer.type === "choice") reviewed[id] = { choice: answer.choice, probabilities: answer.probabilities, confidence: answer.confidence };
               }
-              applyRelationshipSpeakerReview(decisionPlan, answers, reviewed, relationshipReview.ghostOptions);
+              applyRelationshipSpeakerReview(decisionPlan, answers, reviewed, relationshipReview.ghostOptions, titleMatchedCardSpeakerId);
             } catch (error) {
               relationshipReviewFailed = true;
               spindle.log.warn(`[Chat Voice] Relationship speaker review failed; keeping original assignments: ${error instanceof Error ? error.message : String(error)}`);
