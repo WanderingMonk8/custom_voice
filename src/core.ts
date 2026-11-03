@@ -121,7 +121,8 @@ export function activeGhostVoices(ghosts: GhostVoice[], assistantMessageIds: rea
     const lastSeen = ghost.lastSeenMessageId ? assistantMessageIds.indexOf(ghost.lastSeenMessageId) : -1
     const createdAt = ghost.createdAtMessageId ? assistantMessageIds.indexOf(ghost.createdAtMessageId) : -1
     const invokedAt = ghost.lastInvokedAtMessageId ? assistantMessageIds.indexOf(ghost.lastInvokedAtMessageId) : -1
-    const activeSince = Math.max(lastSeen, createdAt <= target ? createdAt : -1, invokedAt <= target ? invokedAt : -1)
+    const earlierOccurrences = ghost.occurrenceKeys.map(key => assistantMessageIds.indexOf(key.split(':', 1)[0])).filter(index => index >= 0 && index <= target)
+    const activeSince = Math.max(lastSeen <= target ? lastSeen : -1, createdAt <= target ? createdAt : -1, invokedAt <= target ? invokedAt : -1, ...earlierOccurrences)
     return (activeSince >= 0 || !ghost.lastSeenMessageId) && activeSince <= target && target - activeSince <= Math.max(1, lifetime)
   })
 }
@@ -254,6 +255,12 @@ export function buildUncastVoiceDecision(groups: UncastVoiceGroup[], voices: Fav
   return { state, questions }
 }
 
+function revealedUncastName(group: UncastVoiceGroup): string {
+  if (group.speakerId.startsWith('unconfigured:')) return group.speakerId.slice('unconfigured:'.length)
+  const names = new Set(group.speeches.flatMap(speech => [...speech.matchAll(/\b(?:[Mm]y name is|[Ii] am|[Ii]'m)\s+([A-Z][a-z]+(?:[-'][A-Z]?[a-z]+)?)(?=[,.!?;:]|\s+(?:and|from|but|here)\b)/gu)].map(match => match[1].toLowerCase())))
+  return names.size === 1 ? [...names][0] : ''
+}
+
 /** Review borderline same-speaker links when a later turn has a clear label. */
 export function buildUncastIdentityReview(groups: UncastVoiceGroup[], answers: Record<string, SpeakerDecisionChoice>, message: string, ghosts: GhostVoice[] = []) {
   const labels = uncastIdentityLabels(message, ghosts)
@@ -271,6 +278,23 @@ export function buildUncastIdentityReview(groups: UncastVoiceGroup[], answers: R
         type: 'choice',
         instructions: `Compare the speaker in current group ${group.id} with the previously seen character ${candidate.label || candidate.speakerId}. Read the prior character's conversation history and the full current scene, including other participants? dialogue, relationship clues, and continuity from phone to in-person. Confirm only if they are the same person; distinguish callers, people addressed, and people merely mentioned.`,
         criteria: { same: 'The prior character and current speaker are clearly the same person.', different_or_unclear: 'They differ or the evidence is insufficient.' },
+      }
+    }
+    // A newly revealed name may not yet appear in an anonymous ghost's aliases.
+    // Ask about unnamed candidates even when the first pass chose new/unclear.
+    const revealedName = revealedUncastName(group)
+    const alreadyNamed = ghosts.some(ghost => ghostCastAliases(ghost).some(alias => alias.toLowerCase() === revealedName.toLowerCase()))
+    if (revealedName && !isBroadPersonLabel(revealedName) && !alreadyNamed) {
+      for (const [ghostIndex, ghost] of ghosts.entries()) {
+        if (Object.keys(questions).length >= 16) break
+        const aliases = ghostCastAliases(ghost)
+        if (aliases.some(alias => !isDescriptiveGhostLabel(alias))) continue
+        const key = `review_reveal_${group.id}_${ghostIndex}`
+        questions[key] = {
+          type: 'choice',
+          instructions: `Has previously seen character ghost_${ghostIndex} now been identified as ${revealedName}, the actual speaker of ${group.id}? Compare that character's saved conversation history and the full scene, including relationships, locations, actions, and who addresses whom. Do not equate people based only on gender, occupation, or a shared setting. Confirm only when the evidence clearly identifies the same individual.`,
+          criteria: { same: 'The newly named speaker and the earlier character are clearly the same person.', different_or_unclear: 'They are different, or the available evidence is insufficient.' },
+        }
       }
     }
     const label = answers[`label_${group.id}`]
@@ -294,10 +318,19 @@ export function buildUncastIdentityReview(groups: UncastVoiceGroup[], answers: R
     }
     if (Object.keys(questions).length >= 16) break
   }
-  return { state: { message, characters: groups.map(group => ({ id: group.id, identity: group.speakerId, speeches: group.speeches, context: group.context })), ghosts: ghosts.map((ghost, index) => ({ option: `ghost_${index}`, identity: ghost.speakerId, aliases: ghostCastAliases(ghost), context: ghost.context })) }, questions }
+  return { state: { message, characters: groups.map(group => ({ id: group.id, identity: group.speakerId, speeches: group.speeches, context: group.context })), ghosts: ghosts.map((ghost, index) => ({ option: `ghost_${index}`, identity: ghost.speakerId, aliases: ghostCastAliases(ghost), context: ghost.context, conversationHistory: ghost.conversationHistory ?? [] })) }, questions }
 }
 
-export interface UncastVoiceAssignment { groupId: string; voiceId: string; gender: string; ghostId?: string; label?: string; aliases?: string[] }
+export interface UncastVoiceAssignment { groupId: string; voiceId: string; gender: string; ghostId?: string; label?: string; aliases?: string[]; matchReason?: string }
+
+/** Broad descriptions are useful context, but do not uniquely identify a person. */
+export function isBroadPersonLabel(label: string): boolean {
+  return /^(?:(?:the|a|an)\s+)?(?:(?:young|younger|old|older|elderly|middle-aged|tall|short)\s+)*(?:woman|man|person|girl|boy|guy|lady|stranger|someone|somebody)$/iu.test(label.trim())
+}
+
+export function isDescriptiveGhostLabel(label: string): boolean {
+  return isBroadPersonLabel(label) || /^(?:the|a|an)\s/iu.test(label.trim()) || /['’]s\s/iu.test(label.trim())
+}
 
 export function resolveUncastVoiceDecisions(
   groups: UncastVoiceGroup[], voices: FavoriteVoice[], answers: Record<string, SpeakerDecisionChoice>,
@@ -307,6 +340,7 @@ export function resolveUncastVoiceDecisions(
   const assignments: UncastVoiceAssignment[] = []
   const roots = new Map<string, string>()
   const linkedGhosts = new Map<string, GhostVoice>()
+  const linkReasons = new Map<string, string>()
   const labels = uncastIdentityLabels(message, ghosts)
   const groupLabels = new Map<string, string>()
   const rootByLabel = new Map<string, string>()
@@ -322,9 +356,10 @@ export function resolveUncastVoiceDecisions(
     let root = group.id
     const occurrenceKey = messageId ? `${messageId}:${hashMessageContent(group.speeches.join('\n'))}` : ''
     const name = group.speakerId.startsWith('unconfigured:') ? group.speakerId.slice('unconfigured:'.length).toLowerCase() : ''
-    const aliasMatches = name ? ghosts.filter(item => ghostCastAliases(item).some(alias => alias.toLowerCase() === name)) : []
-    const exact = ghosts.find(item => occurrenceKey && item.occurrenceKeys.includes(occurrenceKey))
-      ?? (group.speakerId !== UNCAST_SPEAKER_ID ? ghosts.find(item => item.speakerId === group.speakerId) : undefined)
+    const aliasMatches = name && !isBroadPersonLabel(name) ? ghosts.filter(item => ghostCastAliases(item).some(alias => alias.toLowerCase() === name)) : []
+    const occurrence = ghosts.find(item => occurrenceKey && item.occurrenceKeys.includes(occurrenceKey))
+    const exact = occurrence
+      ?? (group.speakerId !== UNCAST_SPEAKER_ID && !isBroadPersonLabel(name) ? ghosts.find(item => item.speakerId === group.speakerId) : undefined)
       ?? (aliasMatches.length === 1 ? aliasMatches[0] : undefined)
     const identity = answers[`identity_${group.id}`]
     const labelAnswer = answers[`label_${group.id}`]
@@ -340,9 +375,9 @@ export function resolveUncastVoiceDecisions(
       return answer?.choice === 'same' && strongChoice(answer) ? [{ previous, probability: answer.probabilities.same ?? 0 }] : []
     }).sort((a, b) => b.probability - a.probability)
     if (same[0]) root = roots.get(same[0].previous.id) ?? root
-    else if (label && rootByLabel.has(label)) root = rootByLabel.get(label)!
+    else if (label && !isBroadPersonLabel(label) && rootByLabel.has(label)) root = rootByLabel.get(label)!
     else if (strongChoice(identity) && identity?.choice.startsWith('group_')) root = roots.get(identity.choice.slice(6)) ?? root
-    const namedGhosts = label ? ghosts.filter(item => ghostCastAliases(item).some(alias => alias.toLowerCase() === label)) : []
+    const namedGhosts = label && !isBroadPersonLabel(label) ? ghosts.filter(item => ghostCastAliases(item).some(alias => alias.toLowerCase() === label)) : []
     const rankedGhosts = namedGhosts.map(item => ({ item, recent: Math.max(
       previousMessageIds.indexOf(item.lastSeenMessageId),
       ...item.occurrenceKeys.map(key => previousMessageIds.indexOf(key.split(':', 1)[0])),
@@ -350,17 +385,25 @@ export function resolveUncastVoiceDecisions(
     const priorGhost = rankedGhosts[0]?.recent >= 0 && (rankedGhosts.length === 1 || rankedGhosts[0].recent > rankedGhosts[1].recent) ? rankedGhosts[0].item : undefined
     const reviewedGhost = group.speakerId.startsWith('ghost:') ? ghosts.find(item => item.id === group.speakerId.slice('ghost:'.length)) : undefined
     let ghost = reviewedGhost ?? (namedGhosts.length === 1 ? namedGhosts[0] : priorGhost ?? exact)
-    if (!ghost && strongChoice(identity) && identity?.choice.startsWith('ghost_')) ghost = ghosts[Number(identity.choice.slice(6))]
+    let reason = reviewedGhost ? 'speaker relationship review' : ghost === occurrence && ghost ? 'exact message occurrence' : ghost && namedGhosts.includes(ghost) ? 'label or alias match' : ghost ? 'speaker name or alias match' : ''
+    if (!ghost && strongChoice(identity) && identity?.choice.startsWith('ghost_')) { ghost = ghosts[Number(identity.choice.slice(6))]; if (ghost) reason = 'Jev identity match' }
     if (!ghost && identity?.choice.startsWith('ghost_')) {
       const ghostIndex = identity.choice.slice(6)
       const review = answers[`review_ghost_${group.id}_${ghostIndex}`]
-      if (review?.choice === 'same' && strongChoice(review)) ghost = ghosts[Number(ghostIndex)]
+      if (review?.choice === 'same' && strongChoice(review)) { ghost = ghosts[Number(ghostIndex)]; if (ghost) reason = 'Jev identity follow-up review' }
+    }
+    if (!ghost) {
+      const confirmed = ghosts.flatMap((candidate, index) => {
+        const review = answers[`review_reveal_${group.id}_${index}`]
+        return review?.choice === 'same' && strongChoice(review) ? [candidate] : []
+      })
+      if (confirmed.length === 1) { ghost = confirmed[0]; reason = 'Jev name-reveal review' }
     }
     roots.set(group.id, root)
     if (label && !rootByLabel.has(label)) rootByLabel.set(label, root)
     // A matching earlier group owns the voice, even if a previous replay
     // cached a different voice for this individual turn.
-    if (ghost && !reserved.includes(ghost.voiceId) && !linkedGhosts.has(root)) linkedGhosts.set(root, ghost)
+    if (ghost && !reserved.includes(ghost.voiceId) && !linkedGhosts.has(root)) { linkedGhosts.set(root, ghost); linkReasons.set(root, `${reason}: ${ghost.id} (${ghost.label || ghost.speakerId})`) }
   }
   for (const root of new Set(roots.values())) {
     const members = groups.filter(group => roots.get(group.id) === root)
@@ -379,15 +422,17 @@ export function resolveUncastVoiceDecisions(
       if (!ranked.length && eligible.length === 1 && matches.length) ranked.push(eligible[0])
       if (!ranked[0]) continue
       ghost = { id: `pending:${root}`, speakerId: members[0].speakerId, voiceId: ranked[0].voice.id, context: members.flatMap(group => group.context).join(' ').slice(0, 2_000), occurrenceKeys: [], lastSeenMessageId: messageId }
+      linkReasons.set(root, 'new voice selected from favorites')
     }
     used.add(ghost.voiceId)
     const label = ghost.label || members.map(group => groupLabels.get(group.id)).find(Boolean)
     for (const group of members) {
       const aliases = mergeGhostAliases(
         group.speakerId.startsWith('unconfigured:') ? [group.speakerId.slice('unconfigured:'.length)] : [],
+        group.speakerId === UNCAST_SPEAKER_ID && linkReasons.get(root)?.startsWith('Jev name-reveal review') && revealedUncastName(group) ? [revealedUncastName(group)] : [],
         groupLabels.has(group.id) ? [groupLabels.get(group.id)!] : [],
       )
-      assignments.push({ groupId: group.id, voiceId: ghost.voiceId, gender, ghostId: ghost.id, ...(label ? { label } : {}), ...(aliases.length ? { aliases } : {}) })
+      assignments.push({ groupId: group.id, voiceId: ghost.voiceId, gender, ghostId: ghost.id, matchReason: `${linkReasons.get(root) ?? 'unknown'}${group.id !== root ? `; linked to group ${root}` : ''}`, ...(label ? { label } : {}), ...(aliases.length ? { aliases } : {}) })
     }
   }
   return assignments
@@ -2764,6 +2809,127 @@ export interface RelationshipReviewContext {
   ghosts: Array<{ id: string; label: string; aliases: string[]; context: string; conversationHistory: Array<{ messageId: string; text: string }> }>
 }
 
+/** A continuity record is valid only for the unchanged, immediately preceding assistant message. */
+export function previousContinuitySpeaker(messages: Array<{ id: string; is_user: boolean; content?: string }>, targetId: string, records: unknown): string | null {
+  const index = messages.findIndex(message => message.id === targetId)
+  if (index < 0 || !records || typeof records !== 'object' || Array.isArray(records)) return null
+  const prior = messages.slice(0, index).filter(message => !message.is_user).at(-1)
+  if (!prior) return null
+  const record = (records as Record<string, unknown>)[prior.id]
+  if (!record || typeof record !== 'object' || Array.isArray(record)) return null
+  const value = record as Record<string, unknown>
+  return value.contentHash === hashMessageContent(prior.content ?? '') && typeof value.speakerId === 'string' && value.speakerId ? value.speakerId : null
+}
+
+/** Recover pre-continuity records only when cached speech and a ghost occurrence agree. */
+export function recoverPreviousGhostContinuity(messages: Array<{ id: string; is_user: boolean; content?: string }>, targetId: string, parsed: Record<string, CachedMessageParse>, ghosts: GhostVoice[], skippedTags = ''): string | null {
+  const index = messages.findIndex(message => message.id === targetId)
+  if (index < 0) return null
+  const prior = messages.slice(0, index).filter(message => !message.is_user).at(-1)
+  if (!prior) return null
+  const segments = parsed[prior.id]?.segments
+  const expected = buildSpeakerDecisionPlan(prior.content ?? '', [], false, skippedTags).state.speeches
+  if (!expected.length || expected.length > 64) return null
+  // Occurrences encode the exact spoken text; require one ghost to cover every
+  // quote so a mixed-speaker message cannot create a false continuation.
+  const recovered = ghosts.filter(ghost => {
+    const reachable = new Set([0])
+    for (let start = 0; start < expected.length; start++) {
+      if (!reachable.has(start)) continue
+      for (let end = start + 1; end <= expected.length; end++) {
+        const hash = hashMessageContent(expected.slice(start, end).map(speech => speech.text).join('\n'))
+        if (ghost.occurrenceKeys.includes(`${prior.id}:${hash}`)) reachable.add(end)
+      }
+    }
+    return reachable.has(expected.length)
+  })
+  if (recovered.length === 1) return `ghost:${recovered[0].id}`
+  if (recovered.length > 1 || !segments) return null
+  const speeches = segments.filter(segment => segment.speakerId !== null)
+  if (!speeches.length || speeches.length !== expected.length || speeches.some((segment, i) => segment.text.trim() !== expected[i].text.trim())) return null
+  const groups = collectUncastVoiceGroups(segments)
+  if (groups.reduce((sum, group) => sum + group.speeches.length, 0) !== speeches.length) return null
+  const matches = groups.map(group => ghosts.filter(ghost => ghost.occurrenceKeys.includes(`${prior.id}:${hashMessageContent(group.speeches.join('\n'))}`)))
+  if (matches.some(items => items.length !== 1)) return null
+  const ids = new Set(matches.map(items => items[0].id))
+  return ids.size === 1 ? `ghost:${matches[0][0].id}` : null
+}
+
+/** Bootstrap continuity from an unambiguous named subject in the prior turn. */
+export function previousNamedGhostContinuity(messages: Array<{ id: string; is_user: boolean; content?: string }>, targetId: string, ghosts: GhostVoice[], configured: CharacterLike[], skippedTags = ''): string | null {
+  const index = messages.findIndex(message => message.id === targetId)
+  if (index < 0) return null
+  const prior = messages.slice(0, index).filter(message => !message.is_user).at(-1)
+  if (!prior || !buildSpeakerDecisionPlan(prior.content ?? '', [], false, skippedTags).state.speeches.length) return null
+  const candidates = ghosts.flatMap(ghost => {
+    const names = ghostCastAliases(ghost).filter(alias => !isDescriptiveGhostLabel(alias))
+    return names.length ? [{ id: `ghost:${ghost.id}`, name: names.join(' / ') }] : []
+  })
+  const active = candidates.filter(candidate => hasNamedSpeakerSubject(prior.content ?? '', [candidate], skippedTags))
+  if (active.length !== 1) return null
+  const otherCast = configured.filter(speaker => speaker.id !== USER_SPEAKER_ID)
+  const priorNarration = narrativeOnly(preparePlaybackContent(prior.content ?? '', skippedTags))
+  if (hasSpeakerMentions(mentionedSpeakers(priorNarration, otherCast))) return null
+  return active[0].id
+}
+
+export const CONTINUITY_LOOKBACK_BLOCKED = '__chat_voice_continuity_blocked__'
+export const DEFAULT_SPEAKER_LOOKBACK = 5
+export const MAX_SPEAKER_LOOKBACK = 100
+
+/** Look back through assistant turns, stopping at clear or conflicting evidence. */
+export function lookbackSpeakerContinuity(messages: Array<{ id: string; is_user: boolean; content?: string }>, targetId: string, records: unknown, parsed: Record<string, CachedMessageParse>, ghosts: GhostVoice[], configured: CharacterLike[], skippedTags = '', limit = DEFAULT_SPEAKER_LOOKBACK, diagnostics?: string[]): string | null {
+  const index = messages.findIndex(message => message.id === targetId)
+  if (index < 0) return null
+  const target = messages[index]
+  const count = Number.isFinite(limit) ? Math.max(1, Math.min(MAX_SPEAKER_LOOKBACK, Math.round(limit))) : DEFAULT_SPEAKER_LOOKBACK
+  const preceding = messages.slice(0, index).filter(message => !message.is_user).slice(-count).reverse()
+  for (const prior of preceding) {
+    if (!buildSpeakerDecisionPlan(prior.content ?? '', [], false, skippedTags).state.speeches.length) continue
+    const view = [prior, target]
+    // Names introduced after this turn must not leak into earlier replays.
+    const priorIndex = messages.findIndex(message => message.id === prior.id)
+    const availableGhosts = ghosts.filter(ghost => {
+      const lastSeen = messages.findIndex(message => message.id === ghost.lastSeenMessageId)
+      const earlierOccurrence = ghost.occurrenceKeys.some(key => {
+        const occurrenceIndex = messages.findIndex(message => message.id === key.split(':', 1)[0])
+        return occurrenceIndex >= 0 && occurrenceIndex <= priorIndex
+      })
+      const earlierHistory = ghost.conversationHistory?.some(entry => {
+        const historyIndex = messages.findIndex(message => message.id === entry.messageId)
+        return historyIndex >= 0 && historyIndex <= priorIndex
+      }) ?? false
+      const eligible = (lastSeen >= 0 && lastSeen <= priorIndex) || earlierOccurrence || earlierHistory
+      diagnostics?.push(`${prior.id}/${ghost.id}: ${eligible ? 'eligible' : 'excluded'} (lastSeen=${ghost.lastSeenMessageId || 'none'}, earlierOccurrence=${earlierOccurrence}, earlierHistory=${earlierHistory})`)
+      return eligible
+    })
+    const cast = configured.filter(speaker => speaker.id !== USER_SPEAKER_ID)
+    const named = previousNamedGhostContinuity(view, targetId, availableGhosts, cast, skippedTags)
+    if (named) { diagnostics?.push(`${prior.id}: named subject -> ${named}`); return named }
+    const matchedCast = cast.filter(speaker => hasNamedSpeakerSubject(prior.content ?? '', [speaker], skippedTags))
+    const matchedGhosts = availableGhosts.filter(ghost => ghostCastAliases(ghost).some(alias => !isDescriptiveGhostLabel(alias) && hasNamedSpeakerSubject(prior.content ?? '', [{ id: `ghost:${ghost.id}`, name: alias }], skippedTags)))
+    if (matchedCast.length + matchedGhosts.length > 1) { diagnostics?.push(`${prior.id}: conflicting named subjects`); return CONTINUITY_LOOKBACK_BLOCKED }
+    if (matchedCast.length === 1) { diagnostics?.push(`${prior.id}: named cast subject -> ${matchedCast[0].id}`); return matchedCast[0].id }
+    if (matchedGhosts.length === 1) {
+      if (hasSpeakerMentions(mentionedSpeakers(narrativeOnly(preparePlaybackContent(prior.content ?? '', skippedTags)), cast))) { diagnostics?.push(`${prior.id}: named cast conflict`); return CONTINUITY_LOOKBACK_BLOCKED }
+      const id = `ghost:${matchedGhosts[0].id}`
+      diagnostics?.push(`${prior.id}: named temporary subject -> ${id}`)
+      return id
+    }
+    const record = previousContinuitySpeaker(view, targetId, records)
+    if (record) { diagnostics?.push(`${prior.id}: saved continuity -> ${record}`); return record }
+    const recovered = recoverPreviousGhostContinuity(view, targetId, parsed, availableGhosts, skippedTags)
+    if (recovered) { diagnostics?.push(`${prior.id}: recorded speech -> ${recovered}`); return recovered }
+    const rawRecord = records && typeof records === 'object' && !Array.isArray(records) ? (records as Record<string, unknown>)[prior.id] : null
+    if (rawRecord && typeof rawRecord === 'object' && (rawRecord as Record<string, unknown>).contentHash === hashMessageContent(prior.content ?? '') && (rawRecord as Record<string, unknown>).speakerId === null) { diagnostics?.push(`${prior.id}: saved ambiguous or mixed speaker`); return CONTINUITY_LOOKBACK_BLOCKED }
+    const discovered = addUnconfiguredDialogueSpeakers(prior.content ?? '', configured, skippedTags)
+      .filter(speaker => speaker.id.startsWith('unconfigured:') && !/^(?:what|who|where|when|why|how)$/iu.test(speaker.name))
+    if (discovered.some(speaker => hasNamedSpeakerSubject(prior.content ?? '', [speaker], skippedTags)) || hasAnonymousSpeechAttribution(preparePlaybackContent(prior.content ?? '', skippedTags))) { diagnostics?.push(`${prior.id}: another unconfigured speaker`); return CONTINUITY_LOOKBACK_BLOCKED }
+    diagnostics?.push(`${prior.id}: no clear speaker`)
+  }
+  return null
+}
+
 /** Prepare only earlier, tracker-free context, including when replaying old messages. */
 export function relationshipReviewContext(messages: Array<{ id: string; is_user: boolean; content?: string }>, targetId: string, ghosts: GhostVoice[], skippedTags = ''): RelationshipReviewContext {
   const target = messages.findIndex(message => message.id === targetId)
@@ -2784,7 +2950,7 @@ export function relationshipReviewContext(messages: Array<{ id: string; is_user:
 }
 
 /** Run relationship review only where local identity or an off-scene exchange needs context. */
-export function buildRelationshipSpeakerReview(plan: SpeakerDecisionPlan, answers: Record<string, SpeakerDecisionChoice>, context: RelationshipReviewContext) {
+export function buildRelationshipSpeakerReview(plan: SpeakerDecisionPlan, answers: Record<string, SpeakerDecisionChoice>, context: RelationshipReviewContext, continuitySpeakerId: string | null = null) {
   const questions: SpeakerDecisionPlan['questions'] = {}
   const ghostOptions: Record<string, string> = {}
   const speakers = plan.state.speakers.map(speaker => ({ id: speaker.id, name: speaker.name }))
@@ -2814,22 +2980,58 @@ export function buildRelationshipSpeakerReview(plan: SpeakerDecisionPlan, answer
       if (Object.keys(questions).length >= 32) break
     }
   }
+  const continuityOption = continuitySpeakerId ? plan.state.speakers.find(speaker => speaker.id === continuitySpeakerId)?.option : undefined
+  if (plan.state.messageRole === 'assistant' && (plan.state.speeches.length > 1 || (plan.state.speeches.length === 1 && continuitySpeakerId)) && (Object.keys(ghostOptions).length || continuityOption) && (Object.keys(questions).length || continuitySpeakerId)) {
+    questions.relationship_scene = {
+      type: 'choice',
+      instructions: `Does one previously heard temporary character clearly speak every quotation in this message? Compare the entire scene and preceding conversation; distinguish scene changes, different speakers and people addressed. ${continuitySpeakerId ? `The immediately preceding assistant message ended with ${continuitySpeakerId}; treat this as a continuity clue, not proof.` : ''} Select no_clear_identity if any quotation may belong to another speaker or the continuity is uncertain.`,
+      criteria: { no_clear_identity: 'The scene has multiple speakers or the identity is uncertain.', ...Object.fromEntries([...Object.keys(ghostOptions), ...(continuityOption ? [continuityOption] : [])].map(option => [option, criteria[option]])) },
+    }
+  }
   return { state: { ...plan.state, previousMessages: context.previousMessages, ghosts: context.ghosts }, questions, ghostOptions }
 }
 
 /** A strong independent decision is required before relationship evidence changes routing. */
-export function applyRelationshipSpeakerReview(plan: SpeakerDecisionPlan, answers: Record<string, SpeakerDecisionChoice>, reviewed: Record<string, SpeakerDecisionChoice>, ghostOptions: Record<string, string>): void {
+export function applyRelationshipSpeakerReview(plan: SpeakerDecisionPlan, answers: Record<string, SpeakerDecisionChoice>, reviewed: Record<string, SpeakerDecisionChoice>, ghostOptions: Record<string, string>, cardSpeakerId: string | null = null, continuitySpeakerId: string | null = null): void {
   const options = { ...plan.optionSpeakerIds, ...ghostOptions }
+  const scene = reviewed.relationship_scene
+  const sceneEvaluation = scene ? evaluateSpeakerDecisionAnswer(scene, options, { probability: 0.6, confidence: 0.45, margin: 0.3 }) : null
+  const sceneOptionIdentity = scene ? options[scene.choice] : null
+  const sceneIdentity = (!cardSpeakerId || (continuitySpeakerId && sceneOptionIdentity === continuitySpeakerId)) && scene && sceneOptionIdentity && sceneEvaluation?.leadingChoice === scene.choice
+    ? sceneEvaluation.identity : null
+  const speakers = plan.state.speakers.map(speaker => ({ id: speaker.id, name: speaker.name }))
+  const conflictingAttribution = plan.state.speeches.some(speech => narrativeAttributionSpeaker(`${speech.narrativeBefore} ${speech.narrativeAfter}`, speakers))
+  const conflictingTurn = plan.state.turns.some(turn => {
+    const answer = answers[`turn_${turn.speechId}`]
+    return !!answer && (answer.choice === TURN_RESPOND_OPTION || answer.choice === TURN_OTHER_OPTION) && answer.confidence >= 0.65 && (answer.probabilities[answer.choice] ?? 0) >= 0.7
+  })
+  const otherNamedSpeakers = speakers.filter(speaker => speaker.id !== USER_SPEAKER_ID && speaker.id !== continuitySpeakerId && !/^(?:what|who|where|when|why|how)$/iu.test(speaker.name.trim()))
+  const namedChange = otherNamedSpeakers.length > 0 && hasNamedSpeakerSubject(plan.state.message, otherNamedSpeakers)
+  const newUncastSubject = hasExplicitUncastCue(plan.state.message, '')
+  const continuityOption = Object.entries(options).find(([, id]) => id === continuitySpeakerId)?.[0]
+  const sceneContradicts = scene && scene.choice !== 'no_clear_identity' && sceneOptionIdentity !== continuitySpeakerId && sceneEvaluation?.resolved
+  const inherited = continuityOption && !namedChange && !newUncastSubject && !conflictingAttribution && !conflictingTurn && !sceneContradicts
+    ? { choice: continuityOption, probabilities: { [continuityOption]: 1 }, confidence: 1 } : null
   for (const speech of plan.state.speeches) {
     const result = reviewed[`relationship_${speech.id}`]
+    const original = answers[`speech_${speech.id}`]
+    const originalIdentity = evaluateSpeakerDecisionAnswer(original, plan.optionSpeakerIds).identity
+    const chosen = inherited ?? (sceneIdentity && !conflictingAttribution && !conflictingTurn ? scene : null)
+    if (chosen) {
+      Object.assign(plan.optionSpeakerIds, ghostOptions)
+      if (original) answers[`relationship_original_${speech.id}`] = original
+      answers[`speech_${speech.id}`] = chosen
+      answers[`relationship_review_${speech.id}`] = chosen
+      answers[`relationship_applied_${speech.id}`] = chosen
+      answers[`relationship_continuity_${speech.id}`] = chosen
+      if (inherited) answers[`relationship_inherited_${speech.id}`] = chosen
+      continue
+    }
     if (!result) continue
     answers[`relationship_review_${speech.id}`] = result
     const reviewedIdentity = evaluateSpeakerDecisionAnswer(result, options, { probability: 0.85, confidence: 0.8, margin: 0.3 }).identity
-    const original = answers[`speech_${speech.id}`]
-    const originalIdentity = evaluateSpeakerDecisionAnswer(original, plan.optionSpeakerIds).identity
     if (!reviewedIdentity || reviewedIdentity === originalIdentity) continue
     if (originalIdentity && originalIdentity !== UNCAST_SPEAKER_ID) {
-      const speakers = plan.state.speakers.map(speaker => ({ id: speaker.id, name: speaker.name }))
       if (narrativeAttributionSpeaker(`${speech.narrativeBefore} ${speech.narrativeAfter}`, speakers) === originalIdentity) continue
     }
     Object.assign(plan.optionSpeakerIds, ghostOptions)
@@ -4820,7 +5022,11 @@ export function assessSpeakerDiscourseEscalation(
       && evidence.speech.leadingMargin < DISCOURSE_BRITTLE_MARGIN
     ))
     const targets = evidences
-      .filter(evidence => effectiveIdentity(evidence) === null || hardConflicts.includes(evidence))
+      // An established continuation has already passed the scene and local
+      // speaker-change guards. The discourse roster does not include temporary
+      // ghosts, so reviewing it here would force an unrelated cast choice.
+      .filter(evidence => !answers[`relationship_continuity_${evidence.speechId}`]
+        && (effectiveIdentity(evidence) === null || hardConflicts.includes(evidence)))
       .map(evidence => evidence.speechId)
 
     const triggers: SpeakerDiscourseTrigger[] = []
@@ -5532,6 +5738,10 @@ export function resolveSpeakerDecisionSegments(
         : 'resolution:chain-identity (filled unresolved span)')
     }
     const baseIdentity = (chainDecision?.identity ?? undefined) ?? identity
+    if (answers[`relationship_continuity_${speech.id}`]) {
+      discoursePathBySpeechIndex.set(index, 'resolution:inherited previous assistant speaker (protected from discourse override)')
+      return identity
+    }
     const outcome = speech ? discourseOutcomes.get(speech.id) : undefined
     if (!outcome?.applied) return baseIdentity
     discoursePathBySpeechIndex.set(index, outcome.reason === 'overrode-conflict'
@@ -5704,6 +5914,7 @@ export function resolveSpeakerDecisionSegments(
           ...decisionAnswerDebug('jev-speech', answer, plan.optionSpeakerIds),
           ...decisionAnswerDebug('jev-relationship-original', answers[`relationship_original_${speech.id}`], plan.optionSpeakerIds),
           ...decisionAnswerDebug('jev-relationship-review', answers[`relationship_review_${speech.id}`], plan.optionSpeakerIds),
+          ...(answers[`relationship_inherited_${speech.id}`] ? ['jev-relationship-review:inherited established previous speaker'] : []),
           ...(answers[`relationship_applied_${speech.id}`] ? ['jev-relationship-review:strong alternative applied'] : []),
           ...decisionAnswerDebug('jev-user-review-original', answers[`user_review_original_${speech.id}`], plan.optionSpeakerIds),
           ...decisionAnswerDebug('jev-user-review', answers[`user_review_${speech.id}`], plan.optionSpeakerIds),

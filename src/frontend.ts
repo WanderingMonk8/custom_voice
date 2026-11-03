@@ -11,6 +11,8 @@ import {
   collectUncastVoiceGroups,
   availableUncastVoices,
   GHOST_VOICE_LIFETIME_MESSAGES,
+  DEFAULT_SPEAKER_LOOKBACK,
+  MAX_SPEAKER_LOOKBACK,
   clampSavedAudioLimit,
   DEFAULT_SAVED_AUDIO_LIMIT,
   eligibleCardFallbackSpeakerId,
@@ -353,6 +355,7 @@ interface PlaybackPreferences {
   concurrentGenerations: number
   rateLimitWaitSeconds: number
   ghostVoiceLifetime: number
+  speakerLookback: number
   autoVoiceCasting: boolean
   speakerAssignmentDebug: boolean
   defaultNarratorVoice: string
@@ -369,6 +372,13 @@ function clampIntegerSetting(value: unknown, fallback: number, maximum: number):
 const VOICE_ICON = `
   <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
     <path d="M5 10v4M9 7v10M13 4v16M17 8v8M21 10v4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+  </svg>
+`
+
+const MICROPHONE_ICON = `
+  <svg viewBox="0 0 24 24" fill="none" aria-hidden="true" xmlns="http://www.w3.org/2000/svg">
+    <rect x="9" y="2" width="6" height="12" rx="3" stroke="currentColor" stroke-width="1.8"/>
+    <path d="M5 11a7 7 0 0 0 14 0M12 18v4M9 22h6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
   </svg>
 `
 
@@ -416,6 +426,7 @@ async function loadPlaybackPreferences(): Promise<PlaybackPreferences> {
     concurrentGenerations: DEFAULT_CONCURRENT_GENERATIONS,
     rateLimitWaitSeconds: DEFAULT_RATE_LIMIT_WAIT_SECONDS,
     ghostVoiceLifetime: GHOST_VOICE_LIFETIME_MESSAGES,
+    speakerLookback: DEFAULT_SPEAKER_LOOKBACK,
     autoVoiceCasting: true,
     speakerAssignmentDebug: false,
     defaultNarratorVoice: '',
@@ -470,6 +481,7 @@ async function loadPlaybackPreferences(): Promise<PlaybackPreferences> {
       MAX_RATE_LIMIT_WAIT_SECONDS,
     ),
     ghostVoiceLifetime: clampIntegerSetting(row.value?.chatVoiceGhostVoiceLifetime, GHOST_VOICE_LIFETIME_MESSAGES, 1000),
+    speakerLookback: clampIntegerSetting(row.value?.chatVoiceSpeakerLookback, DEFAULT_SPEAKER_LOOKBACK, MAX_SPEAKER_LOOKBACK),
     autoVoiceCasting: row.value?.chatVoiceAutoCasting !== false,
     speakerAssignmentDebug: row.value?.chatVoiceSpeakerAssignmentDebug === true,
     defaultNarratorVoice: typeof row.value?.chatVoiceDefaultNarratorVoice === 'string'
@@ -559,6 +571,7 @@ function saveAdvancedPlaybackPreferences(
   speakerAssignmentDebug: boolean,
   ghostVoiceLifetime: number,
   autoVoiceCasting: boolean,
+  speakerLookback: number,
 ): Promise<void> {
   return updateVoiceSettings(current => ({
     ...current,
@@ -580,6 +593,7 @@ function saveAdvancedPlaybackPreferences(
     chatVoiceSpeakerAssignmentDebug: speakerAssignmentDebug,
     chatVoiceAutoCasting: autoVoiceCasting,
     chatVoiceGhostVoiceLifetime: clampIntegerSetting(ghostVoiceLifetime, GHOST_VOICE_LIFETIME_MESSAGES, 1000),
+    chatVoiceSpeakerLookback: clampIntegerSetting(speakerLookback, DEFAULT_SPEAKER_LOOKBACK, MAX_SPEAKER_LOOKBACK),
   }))
 }
 
@@ -982,6 +996,22 @@ export function setup(ctx: SpindleFrontendContext) {
     }
     .chat-voice-character-temporary { border:1px dashed #e05b5b; }
     .chat-voice-character-heading { display:flex; justify-content:space-between; gap:8px; align-items:baseline; }
+    .chat-voice-character-title { display:flex; align-items:center; gap:6px; min-width:0; }
+    .chat-voice-cast-preview { display:inline-flex; flex:none; align-items:center; justify-content:center; width:24px; height:24px; padding:3px; border:1px solid var(--lumiverse-border); border-radius:6px; background:var(--lumiverse-fill-subtle); color:var(--lumiverse-text); cursor:pointer; }
+    .chat-voice-cast-preview svg { width:100%; height:100%; }
+    .chat-voice-favorite-picker { position:relative; width:100%; }
+    .chat-voice-favorite-picker summary { display:flex; align-items:center; justify-content:space-between; cursor:pointer; list-style:none; }
+    .chat-voice-favorite-picker summary::-webkit-details-marker { display:none; }
+    .chat-voice-favorite-picker summary::after { content:'\u2304'; font-size:16px; }
+    .chat-voice-favorite-picker[aria-disabled="true"] summary { opacity:.55; cursor:not-allowed; }
+    .chat-voice-favorite-options { max-height:240px; overflow:auto; border:1px solid var(--lumiverse-border); border-radius:var(--lumiverse-radius); background:var(--lumiverse-bg-secondary, #222); }
+    .chat-voice-favorite-category { padding:7px 9px 3px; color:var(--lumiverse-text-muted); font-size:11px; font-weight:700; }
+    .chat-voice-favorite-option { display:flex; align-items:center; gap:4px; padding:2px 4px; }
+    .chat-voice-favorite-option:hover, .chat-voice-favorite-option:focus-within { background:var(--lumiverse-fill-subtle); }
+    .chat-voice-favorite-option-name { flex:1; min-width:0; border:0; background:transparent; color:var(--lumiverse-text); font:inherit; font-size:12px; text-align:left; padding:7px; cursor:pointer; overflow-wrap:anywhere; }
+    .chat-voice-favorite-option .chat-voice-cast-preview { opacity:0; pointer-events:none; }
+    .chat-voice-favorite-option:hover .chat-voice-cast-preview, .chat-voice-favorite-option:focus-within .chat-voice-cast-preview { opacity:1; pointer-events:auto; }
+    @media (hover:none) { .chat-voice-favorite-option .chat-voice-cast-preview { opacity:1; pointer-events:auto; } }
     .chat-voice-character-meta { display:flex; align-items:center; gap:6px; }
     .chat-voice-character-name { color:var(--lumiverse-text); font-size:12px; font-weight:600; }
     .chat-voice-character-count { color:var(--lumiverse-text-muted); font-size:11px; white-space:nowrap; }
@@ -996,13 +1026,17 @@ export function setup(ctx: SpindleFrontendContext) {
     .chat-voice-add-row { display:grid; grid-template-columns:minmax(0, 1fr) auto; gap:8px; }
     .chat-voice-favorites { display:flex; flex-direction:column; gap:8px; }
     .chat-voice-favorite-form { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
-    .chat-voice-favorite-form input, .chat-voice-favorite-select, .chat-voice-favorite-form select {
+    .chat-voice-favorite-form input, .chat-voice-rename-input, .chat-voice-favorite-select, .chat-voice-favorite-form select {
       min-width:0; width:100%; box-sizing:border-box; min-height:36px; padding:7px 9px;
       border:1px solid var(--lumiverse-border); border-radius:var(--lumiverse-radius);
       background:var(--lumiverse-bg-secondary, #222); color:var(--lumiverse-text); font:inherit; font-size:12px;
     }
     .chat-voice-favorite-row { display:flex; flex-wrap:wrap; align-items:center; gap:8px;
       padding:8px; border:1px solid var(--lumiverse-border); border-radius:var(--lumiverse-radius); }
+    .chat-voice-favorite-edit { flex:1 0 100%; display:flex; flex-wrap:wrap; gap:6px; }
+    .chat-voice-favorite-edit[hidden] { display:none; }
+    .chat-voice-favorite-edit input, .chat-voice-favorite-edit textarea { box-sizing:border-box; width:100%; min-width:0; padding:7px 9px; border:1px solid var(--lumiverse-border); border-radius:var(--lumiverse-radius); background:var(--lumiverse-bg-secondary, #222); color:var(--lumiverse-text); font:inherit; font-size:12px; }
+    .chat-voice-favorite-edit textarea { min-height:72px; resize:vertical; }
     .chat-voice-favorite-copy { flex:1 1 100px; min-width:0; overflow-wrap:anywhere; color:var(--lumiverse-text); font-size:12px; }
     .chat-voice-favorite-copy small { display:block; color:var(--lumiverse-text-muted); }
     .chat-voice-preview-button { min-height:28px; padding:0 8px; border:1px solid var(--lumiverse-border);
@@ -1127,6 +1161,10 @@ export function setup(ctx: SpindleFrontendContext) {
     field.label.classList.add('chat-voice-role-heading')
     const title = document.createElement('span')
     title.textContent = titleText
+    const titleGroup = document.createElement('span')
+    titleGroup.className = 'chat-voice-character-title'
+    const preview = createCastPreviewButton(() => titleText, () => titleText === 'Narrator voice' ? narratorInput.getValue() : userVoiceInput.getValue())
+    titleGroup.append(preview, title)
     const toggle = document.createElement('label')
     toggle.className = 'chat-voice-role-default'
     const checkbox = document.createElement('input')
@@ -1135,7 +1173,7 @@ export function setup(ctx: SpindleFrontendContext) {
     const copy = document.createElement('span')
     copy.textContent = 'Use global'
     toggle.append(checkbox, copy)
-    field.label.append(title, toggle)
+    field.label.append(titleGroup, toggle)
     return checkbox
   }
 
@@ -1261,6 +1299,7 @@ export function setup(ctx: SpindleFrontendContext) {
   const concurrentGenerationField = createField('Maximum concurrent generations')
   const rateLimitWaitField = createField('Rate-limit wait budget (seconds)')
   const ghostLifetimeField = createField('Uncast voice lifetime (assistant messages)')
+  const speakerLookbackField = createField('Speaker lookback (assistant messages)')
   const autoCastingLabel = document.createElement('label')
   autoCastingLabel.className = 'chat-voice-toggle'
   const autoCastingToggle = document.createElement('input')
@@ -1298,6 +1337,7 @@ export function setup(ctx: SpindleFrontendContext) {
     concurrentGenerationField.field,
     rateLimitWaitField.field,
     ghostLifetimeField.field,
+    speakerLookbackField.field,
     autoCastingLabel,
     speakerDebugLabel,
     speakerDebugOutput,
@@ -1312,10 +1352,24 @@ export function setup(ctx: SpindleFrontendContext) {
   let defaultUserVoice = ''
   let favoriteVoices: FavoriteVoice[] = []
   let favoritesSaving = false
+  let editingFavoriteVoiceId: string | null = null
   let previewController: AbortController | null = null
   let previewAudio: HTMLAudioElement | null = null
   let previewUrl: string | null = null
   const favoritePickers = new Set<HTMLSelectElement>()
+  const favoritePickerViews = new WeakMap<HTMLSelectElement, { details: HTMLDetailsElement; summary: HTMLElement; options: HTMLDivElement }>()
+  let openFavoritePicker: HTMLDetailsElement | null = null
+  const closeFavoritePickerOnOutsideClick = (event: Event) => {
+    if (openFavoritePicker && !event.composedPath().includes(openFavoritePicker)) openFavoritePicker.open = false
+  }
+  const closeFavoritePickerOnEscape = (event: KeyboardEvent) => {
+    if (event.key !== 'Escape' || !openFavoritePicker) return
+    const summary = openFavoritePicker.querySelector<HTMLElement>('summary')
+    openFavoritePicker.open = false
+    summary?.focus()
+  }
+  hostDocument.addEventListener('pointerdown', closeFavoritePickerOnOutsideClick)
+  hostDocument.addEventListener('keydown', closeFavoritePickerOnEscape)
   let localNarratorVoice = ''
   let localUserVoice = ''
   let useGlobalNarratorVoice = true
@@ -1353,6 +1407,7 @@ export function setup(ctx: SpindleFrontendContext) {
   let rateLimitWaitSeconds = DEFAULT_RATE_LIMIT_WAIT_SECONDS
   let autoVoiceCasting = true
   let ghostVoiceLifetime = GHOST_VOICE_LIFETIME_MESSAGES
+  let speakerLookback = DEFAULT_SPEAKER_LOOKBACK
   let ghostLifetimeLoaded = false
   let speakerAssignmentDebug = false
   let advancedSettingsSaveTimer: ReturnType<typeof setTimeout> | null = null
@@ -1785,6 +1840,18 @@ export function setup(ctx: SpindleFrontendContext) {
     refreshLocalState()
   }
   ghostLifetimeInput.addEventListener('change', onGhostLifetimeInput)
+  const speakerLookbackInput = createNumberInput(DEFAULT_SPEAKER_LOOKBACK, MAX_SPEAKER_LOOKBACK, 'Speaker lookback in assistant messages')
+  speakerLookbackField.slot.appendChild(speakerLookbackInput)
+  const speakerLookbackHint = document.createElement('div')
+  speakerLookbackHint.className = 'chat-voice-hint'
+  speakerLookbackHint.textContent = 'Check up to this many previous assistant messages for the last clear speaker.'
+  speakerLookbackField.slot.appendChild(speakerLookbackHint)
+  const onSpeakerLookbackInput = () => {
+    speakerLookback = clampIntegerSetting(speakerLookbackInput.valueAsNumber, DEFAULT_SPEAKER_LOOKBACK, MAX_SPEAKER_LOOKBACK)
+    speakerLookbackInput.value = String(speakerLookback)
+    scheduleAdvancedSettingsSave()
+  }
+  speakerLookbackInput.addEventListener('change', onSpeakerLookbackInput)
   playbackBufferField.slot.appendChild(playbackBufferInput)
   concurrentGenerationField.slot.appendChild(concurrentGenerationInput)
   rateLimitWaitField.slot.appendChild(rateLimitWaitInput)
@@ -1975,6 +2042,7 @@ export function setup(ctx: SpindleFrontendContext) {
         tagLlmModel: preferences.tagLlmModel,
         skippedTrackerTags: preferences.skippedTrackerTags,
         ghostVoiceLifetime: preferences.ghostVoiceLifetime,
+        speakerLookback: preferences.speakerLookback,
         debug: preferences.speakerAssignmentDebug,
       })
     })
@@ -2695,6 +2763,7 @@ export function setup(ctx: SpindleFrontendContext) {
       preferences.concurrentGenerations = concurrentGenerationLimit
       preferences.rateLimitWaitSeconds = rateLimitWaitSeconds
       preferences.ghostVoiceLifetime = ghostVoiceLifetime
+      preferences.speakerLookback = speakerLookback
       preferences.autoVoiceCasting = autoVoiceCasting
       preferences.speakerAssignmentDebug = speakerAssignmentDebug
     } else {
@@ -3606,15 +3675,10 @@ export function setup(ctx: SpindleFrontendContext) {
     markChanged(0)
   }
 
-  function renameCharacter(characterId: string): string | null {
+  function renameCharacter(characterId: string, response: string): string | null {
     if (!activeChat) return null
     const character = activeChat.characters.find(item => item.id === characterId)
     if (!character) return null
-    const response = hostWindow.prompt(
-      'Rename this character or add aliases separated by â€œ/â€.',
-      character.name,
-    )
-    if (response === null) return null
     const aliases = speakerAliases(response.slice(0, 4096))
     if (aliases.length === 0) {
       setStatus('Enter an NPC name first.', 'error')
@@ -3669,6 +3733,62 @@ export function setup(ctx: SpindleFrontendContext) {
         picker.appendChild(group)
       }
       picker.disabled = !activeChat || favoriteVoices.length === 0
+      let view = favoritePickerViews.get(picker)
+      if (!view) {
+        const details = document.createElement('details')
+        details.className = 'chat-voice-favorite-picker'
+        details.style.marginTop = picker.style.marginTop
+        const summary = document.createElement('summary')
+        summary.className = 'chat-voice-favorite-select'
+        summary.setAttribute('aria-label', picker.getAttribute('aria-label') || 'Favorite voice')
+        const options = document.createElement('div')
+        options.className = 'chat-voice-favorite-options'
+        details.append(summary, options)
+        picker.insertAdjacentElement('afterend', details)
+        picker.hidden = true
+        picker.tabIndex = -1
+        summary.addEventListener('click', event => { if (picker.disabled) event.preventDefault() })
+        details.addEventListener('toggle', () => {
+          if (details.open) {
+            if (openFavoritePicker && openFavoritePicker !== details) openFavoritePicker.open = false
+            openFavoritePicker = details
+          } else if (openFavoritePicker === details) openFavoritePicker = null
+        })
+        view = { details, summary, options }
+        favoritePickerViews.set(picker, view)
+      }
+      view.summary.textContent = placeholder.textContent
+      view.summary.setAttribute('aria-disabled', String(picker.disabled))
+      view.details.setAttribute('aria-disabled', String(picker.disabled))
+      if (picker.disabled) view.details.open = false
+      view.options.replaceChildren()
+      for (const [category, label] of [['female', 'Female'], ['male', 'Male'], ['unspecified', 'Unspecified']] as const) {
+        const entries = favoriteVoices.filter(voice => voice.category === category)
+        if (!entries.length) continue
+        const heading = document.createElement('div')
+        heading.className = 'chat-voice-favorite-category'
+        heading.textContent = label
+        view.options.appendChild(heading)
+        for (const voice of entries) {
+          const row = document.createElement('div')
+          row.className = 'chat-voice-favorite-option'
+          const selectVoice = document.createElement('button')
+          selectVoice.type = 'button'
+          selectVoice.className = 'chat-voice-favorite-option-name'
+          selectVoice.textContent = voice.name || voice.id
+          const pickerView = view
+          selectVoice.addEventListener('click', () => {
+            if (picker.disabled) return
+            picker.value = voice.id
+            picker.dispatchEvent(new Event('change', { bubbles: true }))
+            pickerView.details.open = false
+            pickerView.summary.focus()
+          })
+          const preview = createCastPreviewButton(() => voice.name || voice.id, () => voice.id)
+          row.append(preview, selectVoice)
+          view.options.appendChild(row)
+        }
+      }
     }
     updateCharacterVoiceDisplays()
     updateRoleVoiceDisplays()
@@ -3701,7 +3821,7 @@ export function setup(ctx: SpindleFrontendContext) {
     previewUrl = null
   }
 
-  async function previewFavoriteVoice(voice: FavoriteVoice): Promise<void> {
+  async function previewVoice(voiceId: string, voiceLabel: string): Promise<void> {
     const connectionId = connectionPicker.getValue() || lumiverseConnectionId
     if (!connectionId) {
       setStatus('Choose a TTS connection to preview a voice.', 'error')
@@ -3710,7 +3830,7 @@ export function setup(ctx: SpindleFrontendContext) {
     stopVoicePreview()
     const controller = new AbortController()
     previewController = controller
-    setStatus(`Generating preview for ${voice.name || voice.id}…`)
+    setStatus(`Generating preview for ${voiceLabel}…`)
     const budget: RateLimitBudget = {
       blockedUntil: 0, cumulativeWaitMs: 0, consecutiveResponses: 0,
       maximumWaitMs: rateLimitWaitSeconds * 1_000, recovering: false, recoveryTail: Promise.resolve(),
@@ -3719,7 +3839,7 @@ export function setup(ctx: SpindleFrontendContext) {
     connectionVoiceGates.set(connectionId, gate)
     try {
       const segment = await runSynthesisTask(() => synthesizeVoiceSegment(
-        connectionId, 'Hello. This is a preview of my voice.', voice.id, 1,
+        connectionId, 'Hello. This is a preview of my voice.', voiceId, 1,
         controller.signal, sharedSynthesisPacer, budget, gate,
         delay => setStatus(`Preview rate limited; retrying in ${Math.ceil(delay / 1_000)}s…`),
       ), true)
@@ -3734,12 +3854,27 @@ export function setup(ctx: SpindleFrontendContext) {
         }
       }
       await audio.play()
-      if (previewController === controller) setStatus(`Playing preview for ${voice.name || voice.id}.`)
+      if (previewController === controller) setStatus(`Playing preview for ${voiceLabel}.`)
     } catch (error) {
       if (controller.signal.aborted) return
       stopVoicePreview()
       setStatus(error instanceof Error ? `Voice preview failed: ${error.message}` : 'Voice preview failed.', 'error')
     }
+  }
+
+  function createCastPreviewButton(name: () => string, voice: () => string): HTMLButtonElement {
+    const button = document.createElement('button')
+    button.type = 'button'
+    button.className = 'chat-voice-cast-preview'
+    button.innerHTML = MICROPHONE_ICON
+    button.title = `Preview voice for ${name()}`
+    button.setAttribute('aria-label', button.title)
+    button.addEventListener('click', () => {
+      const id = voice().trim()
+      const label = favoriteVoices.find(item => item.id === id)?.name || id || 'connection default voice'
+      void previewVoice(id, label)
+    })
+    return button
   }
 
   async function saveFavoriteVoices(next: FavoriteVoice[], adding?: FavoriteVoice): Promise<boolean> {
@@ -3770,6 +3905,7 @@ export function setup(ctx: SpindleFrontendContext) {
   }
 
   function renderFavoriteVoices(): void {
+    editingFavoriteVoiceId = null
     favoriteList.replaceChildren()
     if (!favoriteVoices.length) {
       const empty = document.createElement('div')
@@ -3817,42 +3953,79 @@ export function setup(ctx: SpindleFrontendContext) {
           ? { ...item, category: nextCategory } : item))
           .then(saved => { if (!saved) { category.value = voice.category; category.disabled = false } })
       })
-      const preview = document.createElement('button')
-      preview.type = 'button'
-      preview.className = 'chat-voice-preview-button'
-      preview.textContent = 'Preview'
-      preview.setAttribute('aria-label', `Preview ${voice.name || voice.id}`)
-      preview.addEventListener('click', () => { void previewFavoriteVoice(voice) })
+      const preview = createCastPreviewButton(() => voice.name || voice.id, () => voice.id)
+      const editForm = document.createElement('form')
+      editForm.className = 'chat-voice-favorite-edit'
+      editForm.hidden = true
+      const editLabel = document.createElement('label')
+      editLabel.className = 'chat-voice-hint'
+      const nameInput = document.createElement('input')
+      nameInput.type = 'text'
+      nameInput.maxLength = 128
+      nameInput.setAttribute('aria-label', 'Favorite voice name')
+      const descriptionInput = document.createElement('textarea')
+      descriptionInput.maxLength = 500
+      descriptionInput.setAttribute('aria-label', 'Favorite voice description')
+      const saveEdit = document.createElement('button')
+      saveEdit.type = 'submit'
+      saveEdit.className = 'chat-voice-preview-button'
+      saveEdit.textContent = 'Save'
+      const cancelEdit = document.createElement('button')
+      cancelEdit.type = 'button'
+      cancelEdit.className = 'chat-voice-preview-button'
+      cancelEdit.textContent = 'Cancel'
+      let editKind: 'name' | 'description' = 'name'
+      const openEdit = (kind: 'name' | 'description') => {
+        const current = favoriteVoices.find(item => item.id === voice.id)
+        if (!current) return
+        for (const other of favoriteList.querySelectorAll<HTMLFormElement>('.chat-voice-favorite-edit')) other.hidden = true
+        editKind = kind
+        editingFavoriteVoiceId = voice.id
+        editLabel.textContent = kind === 'name' ? 'Voice name (leave blank to display the ID)' : 'Voice description'
+        nameInput.value = current.name
+        descriptionInput.value = current.description
+        nameInput.hidden = kind !== 'name'
+        descriptionInput.hidden = kind !== 'description'
+        editForm.hidden = false
+        const input = kind === 'name' ? nameInput : descriptionInput
+        input.focus()
+        input.select()
+      }
+      cancelEdit.addEventListener('click', () => {
+        editForm.hidden = true
+        if (editingFavoriteVoiceId === voice.id) editingFavoriteVoiceId = null
+      })
+      editForm.addEventListener('submit', event => {
+        event.preventDefault()
+        const value = (editKind === 'name' ? nameInput.value : descriptionInput.value).trim()
+        saveEdit.disabled = true
+        void saveFavoriteVoices(favoriteVoices.map(item => item.id === voice.id
+          ? { ...item, [editKind]: value } : item)).then(saved => {
+          if (saved && editingFavoriteVoiceId === voice.id) editingFavoriteVoiceId = null
+          if (!saved) saveEdit.disabled = false
+        })
+      })
+      editForm.append(editLabel, nameInput, descriptionInput, saveEdit, cancelEdit)
       const rename = document.createElement('button')
       rename.type = 'button'
       rename.className = 'chat-voice-rename-button'
       rename.innerHTML = RENAME_ICON
       rename.title = `Rename favorite ${voice.name || voice.id}`
       rename.setAttribute('aria-label', rename.title)
-      rename.addEventListener('click', () => {
-        const name = hostWindow.prompt('Name this favorite voice. Leave blank to display its voice ID.', voice.name)
-        if (name === null) return
-        void saveFavoriteVoices(favoriteVoices.map(item => item.id === voice.id
-          ? { ...item, name: name.trim().slice(0, 128) } : item))
-      })
+      rename.addEventListener('click', () => openEdit('name'))
       const describe = document.createElement('button')
       describe.type = 'button'
       describe.className = 'chat-voice-preview-button'
       describe.textContent = 'Description'
       describe.setAttribute('aria-label', `Edit description for ${voice.name || voice.id}`)
-      describe.addEventListener('click', () => {
-        const description = hostWindow.prompt('Describe the voice in a few terms.', voice.description)
-        if (description === null) return
-        void saveFavoriteVoices(favoriteVoices.map(item => item.id === voice.id
-          ? { ...item, description: description.trim().slice(0, 500) } : item))
-      })
+      describe.addEventListener('click', () => openEdit('description'))
       const remove = document.createElement('button')
       remove.type = 'button'
       remove.className = 'chat-voice-delete-button'
       remove.textContent = '×'
       remove.setAttribute('aria-label', `Remove favorite ${voice.name || voice.id}`)
       remove.addEventListener('click', () => { void saveFavoriteVoices(favoriteVoices.filter(item => item.id !== voice.id)) })
-      row.append(copy, category, preview, rename, describe, remove)
+      row.append(copy, category, preview, rename, describe, remove, editForm)
       favoriteList.appendChild(row)
     }
   }
@@ -3919,6 +4092,10 @@ export function setup(ctx: SpindleFrontendContext) {
       const name = document.createElement('span')
       name.className = 'chat-voice-character-name'
       name.textContent = character.name
+      const title = document.createElement('span')
+      title.className = 'chat-voice-character-title'
+      const castPreview = createCastPreviewButton(() => name.textContent || character.name, () => input.getValue())
+      title.append(castPreview, name)
       const count = document.createElement('span')
       count.className = 'chat-voice-character-count'
       count.textContent = character.messageCount > 0
@@ -3927,6 +4104,25 @@ export function setup(ctx: SpindleFrontendContext) {
       const meta = document.createElement('span')
       meta.className = 'chat-voice-character-meta'
       meta.append(count)
+      const renameForm = document.createElement('form')
+      renameForm.hidden = true
+      const renameLabel = document.createElement('label')
+      renameLabel.textContent = 'Name and aliases (separate with /)'
+      renameLabel.className = 'chat-voice-hint'
+      const renameInput = document.createElement('input')
+      renameInput.className = 'chat-voice-rename-input'
+      renameInput.type = 'text'
+      renameInput.maxLength = 4096
+      renameInput.setAttribute('aria-label', 'Character name and aliases')
+      const saveRename = document.createElement('button')
+      saveRename.type = 'submit'
+      saveRename.className = 'chat-voice-preview-button'
+      saveRename.textContent = 'Save'
+      const cancelRename = document.createElement('button')
+      cancelRename.type = 'button'
+      cancelRename.className = 'chat-voice-preview-button'
+      cancelRename.textContent = 'Cancel'
+      renameForm.append(renameLabel, renameInput, saveRename, cancelRename)
       {
         const rename = document.createElement('button')
         rename.type = 'button'
@@ -3943,9 +4139,27 @@ export function setup(ctx: SpindleFrontendContext) {
         remove.setAttribute('aria-label', remove.title)
         remove.disabled = !activeChat
         rename.addEventListener('click', () => {
-          const renamed = renameCharacter(character.id)
+          const current = activeChat?.characters.find(item => item.id === character.id)
+          if (!current) return
+          renameInput.value = current.name
+          renameForm.hidden = false
+          editingCharacterVoiceId = `rename:${character.id}`
+          renameInput.focus()
+          renameInput.select()
+        })
+        cancelRename.addEventListener('click', () => {
+          renameForm.hidden = true
+          if (editingCharacterVoiceId === `rename:${character.id}`) editingCharacterVoiceId = null
+        })
+        renameForm.addEventListener('submit', event => {
+          event.preventDefault()
+          const renamed = renameCharacter(character.id, renameInput.value)
           if (!renamed) return
+          renameForm.hidden = true
+          if (editingCharacterVoiceId === `rename:${character.id}`) editingCharacterVoiceId = null
           name.textContent = renamed
+          castPreview.title = `Preview voice for ${renamed}`
+          castPreview.setAttribute('aria-label', castPreview.title)
           rename.title = `Rename ${renamed} or edit aliases`
           rename.setAttribute('aria-label', rename.title)
           remove.title = `Delete ${renamed}`
@@ -3967,8 +4181,8 @@ export function setup(ctx: SpindleFrontendContext) {
       const picker = document.createElement('select')
       picker.className = 'chat-voice-favorite-select'
       picker.setAttribute('aria-label', `Favorite voice for ${character.name}`)
-      heading.append(name, meta)
-      card.append(heading, voiceDisplay, slot, picker)
+      heading.append(title, meta)
+      card.append(heading, renameForm, voiceDisplay, slot, picker)
       characterList.appendChild(card)
       const input = ctx.components.mountTextInput(slot, {
         value: character.voice,
@@ -4025,6 +4239,10 @@ export function setup(ctx: SpindleFrontendContext) {
       name.style.border = '0'
       name.style.color = 'inherit'
       name.textContent = ghost.label || (ghost.speakerId.startsWith('unconfigured:') ? ghost.speakerId.slice(13) : `Unnamed character \u00b7 ${ghost.id.replace(/^ghost-/u, '')}`)
+      const title = document.createElement('span')
+      title.className = 'chat-voice-character-title'
+      const castPreview = createCastPreviewButton(() => name.textContent || 'temporary character', () => input.getValue())
+      title.append(castPreview, name)
       name.title = 'Double-click to add to the regular cast'
       name.addEventListener('dblclick', () => {
         if (!activeChat) return
@@ -4048,7 +4266,7 @@ export function setup(ctx: SpindleFrontendContext) {
         ctx.sendToBackend({ type: 'chat_voice_ghost_edit', chatId: activeChat.id, ghostId: ghost.id, remove: true })
       })
       meta.append(badge, remove)
-      heading.append(name, meta)
+      heading.append(title, meta)
       const slot = document.createElement('div')
       slot.hidden = true
       const voiceDisplay = document.createElement('button')
@@ -4171,7 +4389,7 @@ export function setup(ctx: SpindleFrontendContext) {
       ])
       connections = loadedConnections
       llmConnections = loadedLlmConnections
-      if (!favoritesSaving) {
+      if (!favoritesSaving && !editingFavoriteVoiceId) {
         favoriteVoices = preferences.favoriteVoices
         renderFavoriteVoices()
         updateFavoritePickers()
@@ -4238,6 +4456,7 @@ export function setup(ctx: SpindleFrontendContext) {
         concurrentGenerationLimit = preferences.concurrentGenerations
         rateLimitWaitSeconds = preferences.rateLimitWaitSeconds
         ghostVoiceLifetime = preferences.ghostVoiceLifetime
+        speakerLookback = preferences.speakerLookback
         ghostLifetimeLoaded = true
         refreshLocalState()
         autoVoiceCasting = preferences.autoVoiceCasting
@@ -4247,6 +4466,7 @@ export function setup(ctx: SpindleFrontendContext) {
         concurrentGenerationInput.value = String(concurrentGenerationLimit)
         rateLimitWaitInput.value = String(rateLimitWaitSeconds)
         ghostLifetimeInput.value = String(ghostVoiceLifetime)
+        speakerLookbackInput.value = String(speakerLookback)
         speakerDebugToggle.checked = speakerAssignmentDebug
         speakerDebugOutput.hidden = !speakerAssignmentDebug
       }
@@ -4388,6 +4608,7 @@ export function setup(ctx: SpindleFrontendContext) {
         speakerAssignmentDebug,
         ghostVoiceLifetime,
         autoVoiceCasting,
+        speakerLookback,
       )
       setStatus('Advanced playback settings saved globally.', 'saved')
     } catch (error) {
@@ -4809,6 +5030,8 @@ export function setup(ctx: SpindleFrontendContext) {
   refreshLocalState()
 
   return () => {
+    hostDocument.removeEventListener('pointerdown', closeFavoritePickerOnOutsideClick)
+    hostDocument.removeEventListener('keydown', closeFavoritePickerOnEscape)
     stopVoicePreview()
     stopPlayback()
     for (const controller of backgroundSynthesisControllers) controller.abort()
@@ -4890,6 +5113,7 @@ export function setup(ctx: SpindleFrontendContext) {
         speakerAssignmentDebug,
         ghostVoiceLifetime,
         autoVoiceCasting,
+        speakerLookback,
       )
     }
     skippedTrackerTagsInput.destroy()
@@ -4902,6 +5126,7 @@ export function setup(ctx: SpindleFrontendContext) {
     concurrentGenerationInput.removeEventListener('change', onConcurrentGenerationInput)
     rateLimitWaitInput.removeEventListener('change', onRateLimitWaitInput)
     ghostLifetimeInput.removeEventListener('change', onGhostLifetimeInput)
+    speakerLookbackInput.removeEventListener('change', onSpeakerLookbackInput)
     speakerDebugToggle.removeEventListener('change', onSpeakerDebugChanged)
     addNpcInput.destroy()
     addNpcButton.removeEventListener('click', onAddNpc)

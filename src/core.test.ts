@@ -17,6 +17,11 @@ import {
   buildAssistantUserSpeakerReview,
   buildRelationshipSpeakerReview,
   applyRelationshipSpeakerReview,
+  previousContinuitySpeaker,
+  previousNamedGhostContinuity,
+  lookbackSpeakerContinuity,
+  CONTINUITY_LOOKBACK_BLOCKED,
+  recoverPreviousGhostContinuity,
   relationshipReviewContext,
   applyAssistantUserSpeakerReview,
   buildTtsTagPlan,
@@ -2012,7 +2017,7 @@ test('keeps ghost voices for the configured count of assistant messages and neve
   }, [ghost], ['voice-1']), [])
   const replay = { ...ghost, lastSeenMessageId: ids[10], occurrenceKeys: [`${ids[0]}:stored`] }
   assert.equal(activeGhostVoices([replay], ids, ids[0], 1).length, 1)
-  assert.equal(activeGhostVoices([replay], ids, ids[1], 10).length, 0)
+  assert.equal(activeGhostVoices([replay], ids, ids[1], 10).length, 1)
 })
 
 test('links separate same-character runs to one ghost voice and gathers their local context', () => {
@@ -2221,6 +2226,21 @@ test('retains confirmed ghost aliases for matching and promotion', () => {
   assert.deepEqual(ambiguous, [])
 })
 
+test('requires identity review before matching broad person descriptions to earlier ghosts', () => {
+  const group = collectUncastVoiceGroups([{ speakerId: 'unconfigured:the woman', text: 'Sit anywhere.' }])
+  const ghost = { id: 'old', speakerId: 'unconfigured:the woman', label: 'the woman', voiceId: 'old-voice', context: 'A woman at another location.', occurrenceKeys: [], lastSeenMessageId: 'previous' }
+  const voices = readFavoriteVoices([{ id: 'new-voice' }])
+  const fresh = resolveUncastVoiceDecisions(group, voices, { voice_g0: confidentDecision('voice_0') }, [ghost])
+  assert.equal(fresh[0].voiceId, 'new-voice')
+  assert.match(fresh[0].matchReason!, /new voice/u)
+  const reviewed = resolveUncastVoiceDecisions(group, voices, { identity_g0: confidentDecision('ghost_0') }, [ghost])
+  assert.equal(reviewed[0].voiceId, 'old-voice')
+  assert.match(reviewed[0].matchReason!, /Jev identity match: old/u)
+  const occurrence = { ...ghost, occurrenceKeys: [`current:${hashMessageContent('Sit anywhere.')}`] }
+  const replay = resolveUncastVoiceDecisions(group, voices, {}, [occurrence], [], 'current')
+  assert.match(replay[0].matchReason!, /exact message occurrence/u)
+})
+
 test('reviews borderline opening dialogue against a later clearly labeled speaker', () => {
   const groups = collectUncastVoiceGroups([
     { speakerId: null, text: 'Two clerks work. The elder is speaking.' },
@@ -2321,6 +2341,33 @@ test('reviews a borderline cross-message match before creating another voice', (
   assert.equal(weak[0].voiceId, 'another-voice')
 })
 
+test('reviews a newly named speaker against anonymous history even when the first pass says new', () => {
+  const ghosts = [
+    { id: 'mom', speakerId: UNCAST_SPEAKER_ID, label: "tessa's mom", voiceId: 'mom-voice', context: 'A caller speaks to Tessa.', occurrenceKeys: [], lastSeenMessageId: 'earlier', conversationHistory: [{ messageId: 'earlier', text: 'Tessa says Mom while speaking on the phone.' }] },
+    { id: 'clerk', speakerId: UNCAST_SPEAKER_ID, label: 'the clerk', voiceId: 'clerk-voice', context: 'A clerk works elsewhere.', occurrenceKeys: [], lastSeenMessageId: 'earlier' },
+  ]
+  const groups = collectUncastVoiceGroups([{ speakerId: 'unconfigured:marisol', text: 'Seven minutes.' }])
+  const message = 'Marisol arrives. Her daughter Tessa sees her.'
+  const voices = readFavoriteVoices([{ id: 'new-voice' }])
+  const answers = { identity_g0: confidentDecision('new_or_unclear'), voice_g0: confidentDecision('voice_0') }
+  const review = buildUncastIdentityReview(groups, answers, message, ghosts)
+  assert.ok(review.questions.review_reveal_g0_0)
+  assert.equal(review.state.ghosts[0].conversationHistory[0].text, ghosts[0].conversationHistory![0].text)
+  const confirmed = resolveUncastVoiceDecisions(groups, voices, { ...answers, review_reveal_g0_0: confidentDecision('same') }, ghosts, [], 'current', message)
+  assert.equal(confirmed[0].ghostId, 'mom')
+  assert.deepEqual(confirmed[0].aliases, ['marisol'])
+  assert.match(confirmed[0].matchReason!, /name-reveal/u)
+  const uncertain = resolveUncastVoiceDecisions(groups, voices, { ...answers, review_reveal_g0_0: confidentDecision('different_or_unclear') }, ghosts, [], 'current', message)
+  assert.equal(uncertain[0].voiceId, 'new-voice')
+  const conflicting = resolveUncastVoiceDecisions(groups, voices, { ...answers, review_reveal_g0_0: confidentDecision('same'), review_reveal_g0_1: confidentDecision('same') }, ghosts, [], 'current', message)
+  assert.equal(conflicting[0].voiceId, 'new-voice')
+  const introduction = collectUncastVoiceGroups([{ speakerId: UNCAST_SPEAKER_ID, text: "I'm Marisol. Nice to meet you." }])
+  assert.ok(buildUncastIdentityReview(introduction, answers, message, ghosts).questions.review_reveal_g0_0)
+  const selfNamed = resolveUncastVoiceDecisions(introduction, voices, { ...answers, review_reveal_g0_0: confidentDecision('same') }, ghosts, [], 'current', message)
+  assert.equal(selfNamed[0].ghostId, 'mom')
+  assert.deepEqual(selfNamed[0].aliases, ['marisol'])
+})
+
 test('retains conversation exchanges and relationship labels for later ghost identity review', () => {
   const ids = ['one', 'two', 'three', 'four']
   const ghost = { id: 'mother', speakerId: UNCAST_SPEAKER_ID, voiceId: 'voice', context: '', occurrenceKeys: [], lastSeenMessageId: 'one', conversationHistory: [] as Array<{ messageId: string; text: string }> }
@@ -2384,6 +2431,120 @@ test('relationship review keeps explicit attributions and rejects weak changes',
   assert.ok(review.questions.relationship_s1)
   applyRelationshipSpeakerReview(plan, answers, { relationship_s1: { choice: 'relationship_ghost_0', probabilities: { relationship_ghost_0: 0.65, no_clear_identity: 0.35 }, confidence: 0.6 } }, review.ghostOptions)
   assert.equal(answers.speech_s1.choice, 'uncast_character')
+})
+
+test('uses a leading temporary speaker for a continuous anonymous scene while preserving card and speaker boundaries', () => {
+  const content = 'She lifts her cap. "Ten minutes." She smiles. "I should write it down." She bends forward. "That is the whole story."'
+  const speakers = [{ id: 'npc:tova', name: 'Tova' }]
+  const context = { previousMessages: [{ id: 'prior', text: 'Tasha holds her cap.' }], ghosts: [{ id: 'tasha', label: 'Tasha', aliases: ['Tasha'], context: 'Tasha speaks.', conversationHistory: [] }] }
+  const create = () => {
+    const plan = buildSpeakerDecisionPlan(content, speakers, false)
+    const answers: Record<string, SpeakerDecisionChoice> = { speech_s0: confidentDecision('known_0', 0.42, 0.35), speech_s1: confidentDecision('known_0', 0.58, 0.53), speech_s2: confidentDecision('known_0', 0.6, 0.55) }
+    return { plan, answers, review: buildRelationshipSpeakerReview(plan, answers, context) }
+  }
+  const scene = { choice: 'relationship_ghost_0', confidence: 0.49, probabilities: { relationship_ghost_0: 0.66, no_clear_identity: 0.33 } }
+  const current = create()
+  assert.ok(current.review.questions.relationship_scene)
+  applyRelationshipSpeakerReview(current.plan, current.answers, { relationship_scene: scene }, current.review.ghostOptions)
+  assert.deepEqual(current.plan.state.speeches.map(speech => current.answers[`speech_${speech.id}`].choice), ['relationship_ghost_0', 'relationship_ghost_0', 'relationship_ghost_0'])
+  const unique = create()
+  applyRelationshipSpeakerReview(unique.plan, unique.answers, { relationship_scene: scene }, unique.review.ghostOptions, 'npc:tova')
+  assert.equal(unique.answers.speech_s1.choice, 'known_0')
+  const established = create()
+  applyRelationshipSpeakerReview(established.plan, established.answers, { relationship_scene: scene }, established.review.ghostOptions, 'npc:tova', 'ghost:tasha')
+  assert.equal(established.answers.speech_s1.choice, 'relationship_ghost_0')
+  for (const paragraph of established.plan.state.paragraphs) established.answers[`paragraph_${paragraph.id}`] = confidentDecision('known_0')
+  const assessment = assessSpeakerDiscourseEscalation(established.plan, established.answers)
+  assert.equal(assessment.plan, null)
+  const resolved = resolveSpeakerDecisionSegments(content, established.plan, established.answers, speakers, { isUserMessage: false, cardSpeakerId: null, historicalSpeakerId: null, discourse: { assessment, answers: null } })
+  assert.deepEqual(resolved.filter(segment => segment.speakerId !== null).map(segment => segment.speakerId), ['ghost:tasha', 'ghost:tasha', 'ghost:tasha'])
+  const tied = create()
+  applyRelationshipSpeakerReview(tied.plan, tied.answers, { relationship_scene: { ...scene, probabilities: { relationship_ghost_0: 0.52, no_clear_identity: 0.48 } } }, tied.review.ghostOptions)
+  assert.equal(tied.answers.speech_s1.choice, 'known_0')
+  const changed = create()
+  changed.plan.state.turns.push({ speechId: 's1', previousSpeechId: 's0', bridge: '' })
+  changed.answers.turn_s1 = confidentDecision('responds_to_previous_speaker')
+  applyRelationshipSpeakerReview(changed.plan, changed.answers, { relationship_scene: scene }, changed.review.ghostOptions)
+  assert.equal(changed.answers.speech_s1.choice, 'known_0')
+})
+
+test('inherits continuity only from the unchanged immediately previous assistant message', () => {
+  const messages = [
+    { id: 'z', is_user: false, content: 'Tasha speaks.' },
+    { id: 'user', is_user: true, content: 'A reply.' },
+    { id: 'a', is_user: false, content: 'She continues.' },
+    { id: 'b', is_user: false, content: 'She speaks again.' },
+  ]
+  const records = { z: { contentHash: hashMessageContent('Tasha speaks.'), speakerId: 'ghost:tasha' }, a: { contentHash: hashMessageContent('She continues.'), speakerId: 'ghost:tasha' } }
+  assert.equal(previousContinuitySpeaker(messages, 'a', records), 'ghost:tasha')
+  assert.equal(previousContinuitySpeaker(messages, 'b', records), 'ghost:tasha')
+  assert.equal(previousContinuitySpeaker(messages, 'z', records), null)
+  assert.equal(previousContinuitySpeaker(messages, 'b', { ...records, a: { contentHash: 'stale', speakerId: 'ghost:tasha' } }), null)
+  assert.equal(previousContinuitySpeaker(messages, 'b', { ...records, a: { contentHash: records.a.contentHash, speakerId: null } }), null)
+})
+
+test('recovers existing ghost continuity only when cached dialogue matches the previous message', () => {
+  const messages = [{ id: 'old', is_user: false, content: 'She speaks. "Hello there."' }, { id: 'current', is_user: false, content: 'She continues.' }]
+  const parsed = { old: { contentHash: 'legacy', segments: [{ text: 'She speaks.', speakerId: null }, { text: 'Hello there.', speakerId: UNCAST_SPEAKER_ID }] } }
+  const ghost = { id: 'tasha', speakerId: UNCAST_SPEAKER_ID, voiceId: 'voice', context: '', lastSeenMessageId: 'old', occurrenceKeys: [`old:${hashMessageContent('Hello there.')}`] }
+  assert.equal(recoverPreviousGhostContinuity(messages, 'current', parsed, [ghost]), 'ghost:tasha')
+  assert.equal(recoverPreviousGhostContinuity(messages, 'current', {}, [ghost]), 'ghost:tasha')
+  assert.equal(recoverPreviousGhostContinuity([{ ...messages[0], content: 'She says "Changed."' }, messages[1]], 'current', parsed, [ghost]), null)
+  assert.equal(recoverPreviousGhostContinuity(messages, 'current', parsed, [ghost, { ...ghost, id: 'other' }]), null)
+  assert.equal(recoverPreviousGhostContinuity(messages, 'old', parsed, [ghost]), null)
+})
+
+test('bootstraps from an explicitly named prior temporary character and inherits an ambiguous scene', () => {
+  const messages = [{ id: 'earlier', is_user: false, content: 'Tasha takes off her cap. "That is better."' }, { id: 'current', is_user: false, content: 'She smiles. "Keep going."' }]
+  const ghost = { id: 'tasha', speakerId: UNCAST_SPEAKER_ID, label: 'Tasha', aliases: ['Tasha'], voiceId: 'voice', context: '', lastSeenMessageId: 'earlier', occurrenceKeys: [] }
+  const cast = [{ id: 'npc:tova', name: 'Tova' }]
+  assert.equal(previousNamedGhostContinuity(messages, 'current', [ghost], cast), 'ghost:tasha')
+  assert.equal(previousNamedGhostContinuity([{ ...messages[0], content: 'Tasha and Tova speak. "Hello."' }, messages[1]], 'current', [ghost], cast), null)
+  const plan = buildSpeakerDecisionPlan(messages[1].content, cast, false)
+  const answers: Record<string, SpeakerDecisionChoice> = { speech_s0: confidentDecision('known_0') }
+  const context = { previousMessages: [{ id: 'earlier', text: messages[0].content }], ghosts: [{ id: 'tasha', label: 'Tasha', aliases: ['Tasha'], context: '', conversationHistory: [] }] }
+  const review = buildRelationshipSpeakerReview(plan, answers, context, 'ghost:tasha')
+  applyRelationshipSpeakerReview(plan, answers, { relationship_scene: { choice: 'no_clear_identity', confidence: 0.34, probabilities: { relationship_ghost_0: 0.56, no_clear_identity: 0.43 } } }, review.ghostOptions, null, 'ghost:tasha')
+  assert.equal(answers.speech_s0.choice, 'relationship_ghost_0')
+  const changed = buildSpeakerDecisionPlan('Tova says, "Now it is my turn."', cast, false)
+  const changedAnswers: Record<string, SpeakerDecisionChoice> = { speech_s0: confidentDecision('known_0') }
+  applyRelationshipSpeakerReview(changed, changedAnswers, {}, review.ghostOptions, null, 'ghost:tasha')
+  assert.equal(changedAnswers.speech_s0.choice, 'known_0')
+})
+
+test('looks back at most five assistant messages and stops at the nearest clear speaker', () => {
+  const ghost = { id: 'tasha', speakerId: UNCAST_SPEAKER_ID, label: 'Tasha', aliases: ['Tasha'], voiceId: 'voice', context: '', lastSeenMessageId: 'named', occurrenceKeys: [] }
+  const cast = [{ id: 'npc:tova', name: 'Tova' }]
+  const named = { id: 'named', is_user: false, content: 'Tasha smiles. "Hello."' }
+  const ambiguous = Array.from({ length: 4 }, (_, index) => ({ id: `amb-${index}`, is_user: false, content: 'She smiles. "Yes."' }))
+  const target = { id: 'target', is_user: false, content: 'She speaks. "Again."' }
+  const user = { id: 'user', is_user: true, content: 'I listen.' }
+  const find = (messages: typeof ambiguous) => lookbackSpeakerContinuity(messages, 'target', {}, {}, [ghost], cast)
+  assert.equal(find([named, user, ...ambiguous, target]), 'ghost:tasha')
+  assert.equal(find([named, ...ambiguous, { ...ambiguous[0], id: 'fifth' }, target]), null)
+  assert.equal(lookbackSpeakerContinuity([named, ...ambiguous, { ...ambiguous[0], id: 'fifth' }, target], 'target', {}, {}, [ghost], cast, '', 6), 'ghost:tasha')
+  assert.equal(lookbackSpeakerContinuity([named, ...ambiguous, target], 'target', {}, {}, [ghost], cast, '', 2), null)
+  assert.equal(find([named, ...ambiguous, { id: 'tova', is_user: false, content: 'Tova says, "Hello."' }, target]), 'npc:tova')
+  assert.equal(find([named, ...ambiguous, { id: 'other', is_user: false, content: 'The clerk says, "Hello."' }, target]), CONTINUITY_LOOKBACK_BLOCKED)
+  assert.equal(find([named, ...ambiguous, { id: 'mixed', is_user: false, content: 'Tasha and Tova speak. "Hello."' }, target]), CONTINUITY_LOOKBACK_BLOCKED)
+})
+
+test('keeps a historically seen temporary speaker eligible after later playback without leaking future-only ghosts', () => {
+  const messages = [
+    { id: 'first', is_user: false, content: 'Tasha smiles. "Hello."' },
+    { id: 'current', is_user: false, content: 'She smiles. "Again."' },
+    { id: 'future', is_user: false, content: 'Tasha returns. "Later."' },
+  ]
+  const ghost = { id: 'tasha', speakerId: UNCAST_SPEAKER_ID, label: 'Tasha', aliases: ['Tasha'], voiceId: 'voice', context: '', lastSeenMessageId: 'future', occurrenceKeys: [`first:${hashMessageContent('Hello.')}`, `future:${hashMessageContent('Later.')}`] }
+  const ids = messages.map(message => message.id)
+  const active = activeGhostVoices([ghost], ids, 'current', 5)
+  assert.equal(active.length, 1)
+  const trace: string[] = []
+  assert.equal(lookbackSpeakerContinuity(messages, 'current', {}, {}, active, [], '', 5, trace), 'ghost:tasha')
+  assert.ok(trace.some(line => line.includes('earlierOccurrence=true')))
+  const futureOnly = { ...ghost, occurrenceKeys: [`future:${hashMessageContent('Later.')}`] }
+  assert.equal(activeGhostVoices([futureOnly], ids, 'current', 5).length, 0)
+  assert.notEqual(lookbackSpeakerContinuity(messages, 'current', {}, {}, [futureOnly], [], '', 5), 'ghost:tasha')
 })
 
 test('defaults and clamps the global saved audio limit', () => {
