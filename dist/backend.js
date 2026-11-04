@@ -344,6 +344,15 @@ function resolveUncastVoiceDecisions(groups, voices, answers, ghosts = [], reser
         if (ghost) reason = "Jev identity follow-up review";
       }
     }
+    if (!ghost && identity?.choice.startsWith("ghost_")) {
+      const ghostIndex = Number(identity.choice.slice(6));
+      const review = answers[`review_ghost_${group.id}_${ghostIndex}`];
+      const candidate = ghosts[ghostIndex];
+      if (candidate && review?.choice === "same" && (review.probabilities.same ?? 0) >= 0.8 && review.confidence >= 0.75) {
+        ghost = candidate;
+        reason = "Jev identity follow-up review (weak identity)";
+      }
+    }
     if (!ghost) {
       const confirmed = ghosts.flatMap((candidate, index) => {
         const review = answers[`review_reveal_${group.id}_${index}`];

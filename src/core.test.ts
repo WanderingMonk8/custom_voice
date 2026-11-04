@@ -2020,6 +2020,23 @@ test('keeps ghost voices for the configured count of assistant messages and neve
   assert.equal(activeGhostVoices([replay], ids, ids[1], 10).length, 1)
 })
 
+test('reuses a ghost voice for a weak identity only when the follow-up review confirms it', () => {
+  const ghost = { id: 'ghost-girl', speakerId: UNCAST_SPEAKER_ID, voiceId: 'voice-girl', label: 'the girl', context: 'The girl ordered coffee.', occurrenceKeys: [], lastSeenMessageId: 'assistant-0' }
+  const groups = collectUncastVoiceGroups([{ text: 'Shit.', speakerId: UNCAST_SPEAKER_ID }])
+  const weakIdentity = { choice: 'ghost_0', probabilities: { ghost_0: 0.61, new_or_unclear: 0.2, uncast_character: 0.19 }, confidence: 0.53 }
+  const confirmed = resolveUncastVoiceDecisions(groups, [], {
+    identity_g0: weakIdentity,
+    review_ghost_g0_0: { choice: 'same', probabilities: { same: 0.9, different_or_unclear: 0.1 }, confidence: 0.82 },
+  }, [ghost])
+  assert.equal(confirmed[0]?.voiceId, 'voice-girl')
+  assert.equal(confirmed[0]?.ghostId, 'ghost-girl')
+  const unconfirmed = resolveUncastVoiceDecisions(groups, [], {
+    identity_g0: weakIdentity,
+    review_ghost_g0_0: { choice: 'different_or_unclear', probabilities: { same: 0.3, different_or_unclear: 0.7 }, confidence: 0.7 },
+  }, [ghost])
+  assert.equal(unconfirmed.some(assignment => assignment.ghostId === 'ghost-girl'), false)
+})
+
 test('links separate same-character runs to one ghost voice and gathers their local context', () => {
   const groups = collectUncastVoiceGroups([
     { speakerId: null, text: 'The clerk smiles.' },
