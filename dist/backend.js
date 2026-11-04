@@ -282,6 +282,9 @@ function buildUncastIdentityReview(groups, answers, message, ghosts = []) {
 function isBroadPersonLabel(label) {
   return /^(?:(?:the|a|an)\s+)?(?:(?:young|younger|old|older|elderly|middle-aged|tall|short)\s+)*(?:woman|man|person|girl|boy|guy|lady|stranger|someone|somebody)$/iu.test(label.trim());
 }
+function isGenericAdultLabel(label) {
+  return /^(?:(?:the|a|an)\s+)?(?:(?:young|younger|old|older|elderly|middle-aged|tall|short)\s+)*(?:woman|man|person|lady|guy|stranger|someone|somebody)$/iu.test(label.trim());
+}
 function isDescriptiveGhostLabel(label) {
   return isBroadPersonLabel(label) || /^(?:the|a|an)\s/iu.test(label.trim()) || /['’]s\s/iu.test(label.trim());
 }
@@ -361,6 +364,14 @@ function resolveUncastVoiceDecisions(groups, voices, answers, ghosts = [], reser
       if (confirmed.length === 1) {
         ghost = confirmed[0];
         reason = "Jev name-reveal review";
+      }
+    }
+    if (!ghost && group.speakerId === UNCAST_SPEAKER_ID && groupLabels.has(group.id)) {
+      const literal = normalizeSpeakerName(groupLabels.get(group.id)).toLowerCase();
+      const sameLabel = literal && !isGenericAdultLabel(literal) ? ghosts.filter((item) => ghostCastAliases(item).some((alias) => alias.toLowerCase() === literal)) : [];
+      if (sameLabel.length === 1) {
+        ghost = sameLabel[0];
+        reason = "repeated unnamed label";
       }
     }
     roots.set(group.id, root);

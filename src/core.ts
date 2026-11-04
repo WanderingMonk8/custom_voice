@@ -328,6 +328,11 @@ export function isBroadPersonLabel(label: string): boolean {
   return /^(?:(?:the|a|an)\s+)?(?:(?:young|younger|old|older|elderly|middle-aged|tall|short)\s+)*(?:woman|man|person|girl|boy|guy|lady|stranger|someone|somebody)$/iu.test(label.trim())
 }
 
+/** Adult person words name no particular individual, unlike a repeated "the girl" label. */
+function isGenericAdultLabel(label: string): boolean {
+  return /^(?:(?:the|a|an)\s+)?(?:(?:young|younger|old|older|elderly|middle-aged|tall|short)\s+)*(?:woman|man|person|lady|guy|stranger|someone|somebody)$/iu.test(label.trim())
+}
+
 export function isDescriptiveGhostLabel(label: string): boolean {
   return isBroadPersonLabel(label) || /^(?:the|a|an)\s/iu.test(label.trim()) || /['’]s\s/iu.test(label.trim())
 }
@@ -410,6 +415,14 @@ export function resolveUncastVoiceDecisions(
         return review?.choice === 'same' && strongChoice(review) ? [candidate] : []
       })
       if (confirmed.length === 1) { ghost = confirmed[0]; reason = 'Jev name-reveal review' }
+    }
+    // The same literal unnamed label across messages ("the girl") is evidence
+    // in its own right, but only when exactly one stored character carries it
+    // and the label is specific enough not to name a broad person type.
+    if (!ghost && group.speakerId === UNCAST_SPEAKER_ID && groupLabels.has(group.id)) {
+      const literal = normalizeSpeakerName(groupLabels.get(group.id)!).toLowerCase()
+      const sameLabel = literal && !isGenericAdultLabel(literal) ? ghosts.filter(item => ghostCastAliases(item).some(alias => alias.toLowerCase() === literal)) : []
+      if (sameLabel.length === 1) { ghost = sameLabel[0]; reason = 'repeated unnamed label' }
     }
     roots.set(group.id, root)
     if (label && !rootByLabel.has(label)) rootByLabel.set(label, root)

@@ -2037,6 +2037,26 @@ test('reuses a ghost voice for a weak identity only when the follow-up review co
   assert.equal(unconfirmed.some(assignment => assignment.ghostId === 'ghost-girl'), false)
 })
 
+test('treats a repeated specific unnamed label as a voice match and ignores broad person labels', () => {
+  const girl = { id: 'ghost-girl', speakerId: UNCAST_SPEAKER_ID, voiceId: 'voice-girl', label: 'the girl', context: 'A girl orders coffee.', occurrenceKeys: [], lastSeenMessageId: 'assistant-0' }
+  const groups = collectUncastVoiceGroups([{ text: 'Thanks for pulling out.', speakerId: UNCAST_SPEAKER_ID }])
+  const message = 'The girl sits down. "Thanks for pulling out."'
+  const labelIndex = uncastIdentityLabels(message, [girl]).indexOf('the girl')
+  const assigned = resolveUncastVoiceDecisions(groups, [], {
+    identity_g0: { choice: 'new_or_unclear', probabilities: { new_or_unclear: 0.5, ghost_0: 0.3 }, confidence: 0.4 },
+    label_g0: { choice: `label_${labelIndex}`, probabilities: { [`label_${labelIndex}`]: 0.95 }, confidence: 0.95 },
+  }, [girl], [], 'later', message)
+  assert.equal(assigned[0]?.ghostId, 'ghost-girl')
+  const broad = { ...girl, id: 'ghost-woman', label: 'the woman', voiceId: 'voice-woman' }
+  const broadMessage = 'The woman sits down. "Thanks for pulling out."'
+  const broadIndex = uncastIdentityLabels(broadMessage, [broad]).indexOf('the woman')
+  const broadAssigned = resolveUncastVoiceDecisions(groups, [], {
+    identity_g0: { choice: 'new_or_unclear', probabilities: { new_or_unclear: 0.5, ghost_0: 0.3 }, confidence: 0.4 },
+    label_g0: { choice: `label_${broadIndex}`, probabilities: { [`label_${broadIndex}`]: 0.95 }, confidence: 0.95 },
+  }, [broad], [], 'later', broadMessage)
+  assert.equal(broadAssigned.some(assignment => assignment.ghostId === 'ghost-woman'), false)
+})
+
 test('links separate same-character runs to one ghost voice and gathers their local context', () => {
   const groups = collectUncastVoiceGroups([
     { speakerId: null, text: 'The clerk smiles.' },
