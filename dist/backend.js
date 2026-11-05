@@ -1972,6 +1972,35 @@ function buildOpeningSpeakerReview(plan, answers, context, cardSpeakerId) {
     state: { ...review.state, message: paragraphs.map((paragraph) => paragraph.text).join("\n\n"), paragraphs, speeches: plan.state.speeches.filter((speech) => openingSpeechIds.has(speech.id)), runs: [openingRun], turns: plan.state.turns.filter((turn) => openingSpeechIds.has(turn.speechId)), reviewedRuns: [openingRun], boundaryEvidence }
   };
 }
+function buildBoundaryExchangeShadowReview(review) {
+  const questions = {};
+  const targets = Object.keys(review.questions).filter((id) => id.startsWith("relationship_"));
+  for (const id of targets) {
+    const speechId = id.slice("relationship_".length);
+    questions[`boundary_${speechId}`] = {
+      type: "choice",
+      instructions: `Identify who actually speaks ${speechId} in the current opening. Read the complete previous exchange and current opening as a conversation: track who addresses whom across the message boundary, who responds, who continues, and whether another person interrupts. Consider narration, pronouns, actions, topic and later clarification together. A repeated word may be a response to the earlier message, not the immediately preceding quotation. A person mentioned or addressed is not necessarily the speaker. Choose no_clear_identity if the evidence does not establish the speaker.`,
+      criteria: review.questions[id].criteria
+    };
+  }
+  const controls = [
+    { id: "boundary_control_continuation", prior: 'I turn to Mira. "Sometimes you sacrifice for a friend."', current: '"Sacrifice." Mira turns with her tray. "What are you sacrificing? The noodles?" A stranger steps aside. "No, I know what you mean."', target: "What are you sacrificing? The noodles?" },
+    { id: "boundary_control_interruption", prior: 'I turn to Mira. "Sometimes you sacrifice for a friend."', current: '"Sacrifice," Mira says. Rowan steps between us. "What are you sacrificing? The noodles?" he asks. Mira shakes her head.', target: "What are you sacrificing? The noodles?" },
+    { id: "boundary_control_reply", prior: 'I turn to Mira. "Are you coming?"', current: '"Yes," Mira says. Rowan sets down his cup. "I am staying," he replies.', target: "I am staying," },
+    { id: "boundary_control_unclear", prior: 'I turn to Mira. "Are you coming?"', current: '"Maybe." A door opens. "I am staying."', target: "I am staying." }
+  ];
+  for (const control of controls) questions[control.id] = {
+    type: "choice",
+    instructions: `Use only the prior and current texts of synthetic control ${control.id}; identify who says its target quotation. Do not use the chat or other controls.`,
+    criteria: { mira: "Mira", rowan: "Rowan", no_clear_identity: "Cannot establish the speaker" }
+  };
+  return {
+    state: { previousMessages: review.state.previousMessages, message: review.state.message, paragraphs: review.state.paragraphs, speeches: review.state.speeches, boundaryEvidence: review.state.boundaryEvidence, controls },
+    questions,
+    targetIds: targets.map((id) => `boundary_${id.slice("relationship_".length)}`),
+    expectedControls: { boundary_control_continuation: "mira", boundary_control_interruption: "rowan", boundary_control_reply: "rowan", boundary_control_unclear: "no_clear_identity" }
+  };
+}
 function applyOpeningExchangeReview(plan, answers, reviewed) {
   const run = plan.state.runs.find((item) => item.speechIds.includes("s0"));
   if (!run || run.speechIds.length < 2) return;
@@ -5221,6 +5250,16 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
           if (openingReview) {
             if (payload.debug) relationshipSceneDiagnostic += `; opening-scope=${JSON.stringify({ previous: openingReview.state.previousMessages.map((item) => ({ id: item.id, role: item.role, chars: item.text.length })), speeches: openingReview.state.speeches.map((item) => ({ id: item.id, paragraphId: item.paragraphId, text: item.text.slice(0, 160) })), boundary: openingReview.state.boundaryEvidence ? { role: openingReview.state.boundaryEvidence.role, lead: openingReview.state.boundaryEvidence.lead.slice(-240), quotation: openingReview.state.boundaryEvidence.quotation.slice(-240) } : null })}`;
             const startedAt = Date.now();
+            const boundaryShadow = payload.shadowEvaluation && payload.debug ? buildBoundaryExchangeShadowReview(openingReview) : null;
+            let boundaryTimer;
+            const boundaryPromise = boundaryShadow ? Promise.race([
+              Promise.resolve().then(() => spindle.decisions.evaluate({ state: boundaryShadow.state, questions: boundaryShadow.questions, ...userId ? { userId } : {} })).then((result2) => ({ result: result2, error: "", duration: Date.now() - startedAt })).catch(() => ({ result: null, error: "request failed", duration: Date.now() - startedAt })),
+              new Promise((resolve) => {
+                boundaryTimer = setTimeout(() => resolve({ result: null, error: "timed out after 5s", duration: Date.now() - startedAt }), 5e3);
+              })
+            ]).finally(() => {
+              if (boundaryTimer) clearTimeout(boundaryTimer);
+            }) : null;
             try {
               const result2 = await spindle.decisions.evaluate({ state: openingReview.state, questions: openingReview.questions, ...userId ? { userId } : {} });
               const reviewed = {};
@@ -5239,6 +5278,22 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
             } catch {
               relationshipReviewFailed = true;
               relationshipSceneDiagnostic += `; opening-reread=failed/${Date.now() - startedAt}ms`;
+            }
+            if (boundaryShadow && boundaryPromise) {
+              try {
+                const output = await boundaryPromise;
+                if (!output.result) relationshipSceneDiagnostic += `; boundary-exchange-shadow=${output.error}`;
+                else {
+                  const reviewed = {};
+                  for (const [id, answer] of Object.entries(output.result.answers)) if (answer.type === "choice") reviewed[id] = { choice: answer.choice, probabilities: answer.probabilities, confidence: answer.confidence };
+                  const invalid = invalidSpeakerReviewAnswers(boundaryShadow.questions, reviewed);
+                  const targets = boundaryShadow.targetIds.map((id) => invalid.includes(id) ? `${id}:invalid` : `${id}:${reviewed[id].choice}(${boundaryShadow.questions[id].criteria[reviewed[id].choice]}),confidence=${reviewed[id].confidence.toFixed(2)},probabilities=${JSON.stringify(reviewed[id].probabilities)}`);
+                  const controls = Object.entries(boundaryShadow.expectedControls).map(([id, expected]) => `${id}:${invalid.includes(id) ? "invalid" : reviewed[id].choice}/${expected}`);
+                  relationshipSceneDiagnostic += `; boundary-exchange-shadow=${output.duration}ms, targets=[${targets.join("; ")}], synthetic-controls=[${controls.join(", ")}] (candidate/expected; no routing changes)`;
+                }
+              } catch {
+                relationshipSceneDiagnostic += "; boundary-exchange-shadow=invalid response";
+              }
             }
           }
           const backlinkReview = !relationshipReviewFailed ? buildOpeningBacklinkReview(decisionPlan, answers, relationshipContext, titleMatchedCardSpeakerId) : null;

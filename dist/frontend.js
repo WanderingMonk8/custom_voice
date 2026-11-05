@@ -2477,7 +2477,7 @@ function setup(ctx) {
   speakerShadowText.textContent = "Compare experimental speaker review";
   const speakerShadowHint = document.createElement("span");
   speakerShadowHint.className = "chat-voice-toggle-hint";
-  speakerShadowHint.textContent = "Runs extra Jev reviews without changing audio or cast. With debug enabled, eligible opening links also get an alternative comparison and synthetic controls. May increase cost and delay.";
+  speakerShadowHint.textContent = "Runs extra Jev reviews without changing audio or cast. With debug enabled, eligible openings also get boundary-exchange comparisons and synthetic controls. May increase cost and delay.";
   speakerShadowCopy.append(speakerShadowText, speakerShadowHint);
   speakerShadowLabel.append(speakerShadowToggle, speakerShadowCopy);
   const speakerRunLabel = document.createElement("label");

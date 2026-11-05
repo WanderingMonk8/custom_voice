@@ -20,6 +20,7 @@ import {
   applyContextualUserReconciliation,
   buildRelationshipSpeakerReview,
   buildOpeningSpeakerReview,
+  buildBoundaryExchangeShadowReview,
   applyOpeningExchangeReview,
   buildOpeningBacklinkReview,
   buildContrastiveOpeningLinkReview,
@@ -1230,6 +1231,14 @@ function queueSpeakerParse(
           if (openingReview) {
             if (payload.debug) relationshipSceneDiagnostic += `; opening-scope=${JSON.stringify({ previous: openingReview.state.previousMessages.map(item => ({ id: item.id, role: item.role, chars: item.text.length })), speeches: openingReview.state.speeches.map(item => ({ id: item.id, paragraphId: item.paragraphId, text: item.text.slice(0, 160) })), boundary: openingReview.state.boundaryEvidence ? { role: openingReview.state.boundaryEvidence.role, lead: openingReview.state.boundaryEvidence.lead.slice(-240), quotation: openingReview.state.boundaryEvidence.quotation.slice(-240) } : null })}`
             const startedAt = Date.now()
+            const boundaryShadow = payload.shadowEvaluation && payload.debug ? buildBoundaryExchangeShadowReview(openingReview) : null
+            let boundaryTimer: ReturnType<typeof setTimeout> | undefined
+            const boundaryPromise = boundaryShadow ? Promise.race([
+              Promise.resolve().then(() => spindle.decisions.evaluate({ state: boundaryShadow.state, questions: boundaryShadow.questions, ...(userId ? { userId } : {}) }))
+                .then(result => ({ result, error: '', duration: Date.now() - startedAt }))
+                .catch(() => ({ result: null, error: 'request failed', duration: Date.now() - startedAt })),
+              new Promise<{ result: null; error: string; duration: number }>(resolve => { boundaryTimer = setTimeout(() => resolve({ result: null, error: 'timed out after 5s', duration: Date.now() - startedAt }), 5000) }),
+            ]).finally(() => { if (boundaryTimer) clearTimeout(boundaryTimer) }) : null
             try {
               const result = await spindle.decisions.evaluate({ state: openingReview.state, questions: openingReview.questions, ...(userId ? { userId } : {}) })
               const reviewed: Record<string, SpeakerDecisionChoice> = {}
@@ -1248,6 +1257,22 @@ function queueSpeakerParse(
             } catch {
               relationshipReviewFailed = true
               relationshipSceneDiagnostic += `; opening-reread=failed/${Date.now() - startedAt}ms`
+            }
+            if (boundaryShadow && boundaryPromise) {
+              try {
+                const output = await boundaryPromise
+                if (!output.result) relationshipSceneDiagnostic += `; boundary-exchange-shadow=${output.error}`
+                else {
+                  const reviewed: Record<string, SpeakerDecisionChoice> = {}
+                  for (const [id, answer] of Object.entries(output.result.answers)) if (answer.type === 'choice') reviewed[id] = { choice: answer.choice, probabilities: answer.probabilities, confidence: answer.confidence }
+                  const invalid = invalidSpeakerReviewAnswers(boundaryShadow.questions, reviewed)
+                  const targets = boundaryShadow.targetIds.map(id => invalid.includes(id) ? `${id}:invalid` : `${id}:${reviewed[id].choice}(${boundaryShadow.questions[id].criteria[reviewed[id].choice]}),confidence=${reviewed[id].confidence.toFixed(2)},probabilities=${JSON.stringify(reviewed[id].probabilities)}`)
+                  const controls = Object.entries(boundaryShadow.expectedControls).map(([id, expected]) => `${id}:${invalid.includes(id) ? 'invalid' : reviewed[id].choice}/${expected}`)
+                  relationshipSceneDiagnostic += `; boundary-exchange-shadow=${output.duration}ms, targets=[${targets.join('; ')}], synthetic-controls=[${controls.join(', ')}] (candidate/expected; no routing changes)`
+                }
+              } catch {
+                relationshipSceneDiagnostic += '; boundary-exchange-shadow=invalid response'
+              }
             }
           }
           const backlinkReview = !relationshipReviewFailed ? buildOpeningBacklinkReview(decisionPlan, answers, relationshipContext, titleMatchedCardSpeakerId) : null

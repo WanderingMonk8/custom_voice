@@ -25,6 +25,7 @@ import {
   applyContextualUserReconciliation,
   buildRelationshipSpeakerReview,
   buildOpeningSpeakerReview,
+  buildBoundaryExchangeShadowReview,
   applyOpeningExchangeReview,
   buildOpeningBacklinkReview,
   buildContrastiveOpeningLinkReview,
@@ -2681,6 +2682,15 @@ test('opening re-read uses bounded prior dialogue and only changes supported unr
   const context = { previousMessages: [{ id: 'old', role: 'assistant' as const, text: 'Old context.' }, { id: 'prior', role: 'assistant' as const, text: 'Ewan takes his tray.' }, { id: 'user', role: 'user' as const, text: 'I turn to Ewan. "Sometimes you sacrifice."' }], ghosts: [] }
   const review = buildOpeningSpeakerReview(plan, answers, context, null)!
   assert.deepEqual(review.state.previousMessages.map(item => item.id), ['prior', 'user'])
+  const before = JSON.stringify({ review, answers })
+  const boundaryShadow = buildBoundaryExchangeShadowReview(review)
+  assert.ok(boundaryShadow.questions.boundary_s1)
+  assert.match(boundaryShadow.questions.boundary_s1.instructions, /across the message boundary/u)
+  assert.deepEqual(boundaryShadow.state.previousMessages.map(item => item.id), ['prior', 'user'])
+  assert.equal(boundaryShadow.expectedControls.boundary_control_interruption, 'rowan')
+  assert.equal(boundaryShadow.expectedControls.boundary_control_unclear, 'no_clear_identity')
+  assert.equal('expectedControls' in boundaryShadow.state, false)
+  assert.equal(JSON.stringify({ review, answers }), before)
   assert.ok(review.questions.relationship_s0)
   assert.ok(review.questions.relationship_s1)
   assert.match(review.questions.relationship_s0.instructions, /not the user who authored/u)

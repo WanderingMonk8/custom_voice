@@ -3348,6 +3348,37 @@ export function buildOpeningSpeakerReview(plan: SpeakerDecisionPlan, answers: Re
   }
 }
 
+/** Independent, observational review of the boundary exchange and interruption controls. */
+export function buildBoundaryExchangeShadowReview(review: NonNullable<ReturnType<typeof buildOpeningSpeakerReview>>) {
+  const questions: SpeakerDecisionPlan['questions'] = {}
+  const targets = Object.keys(review.questions).filter(id => id.startsWith('relationship_'))
+  for (const id of targets) {
+    const speechId = id.slice('relationship_'.length)
+    questions[`boundary_${speechId}`] = {
+      type: 'choice',
+      instructions: `Identify who actually speaks ${speechId} in the current opening. Read the complete previous exchange and current opening as a conversation: track who addresses whom across the message boundary, who responds, who continues, and whether another person interrupts. Consider narration, pronouns, actions, topic and later clarification together. A repeated word may be a response to the earlier message, not the immediately preceding quotation. A person mentioned or addressed is not necessarily the speaker. Choose no_clear_identity if the evidence does not establish the speaker.`,
+      criteria: review.questions[id].criteria,
+    }
+  }
+  const controls = [
+    { id: 'boundary_control_continuation', prior: 'I turn to Mira. "Sometimes you sacrifice for a friend."', current: '"Sacrifice." Mira turns with her tray. "What are you sacrificing? The noodles?" A stranger steps aside. "No, I know what you mean."', target: 'What are you sacrificing? The noodles?' },
+    { id: 'boundary_control_interruption', prior: 'I turn to Mira. "Sometimes you sacrifice for a friend."', current: '"Sacrifice," Mira says. Rowan steps between us. "What are you sacrificing? The noodles?" he asks. Mira shakes her head.', target: 'What are you sacrificing? The noodles?' },
+    { id: 'boundary_control_reply', prior: 'I turn to Mira. "Are you coming?"', current: '"Yes," Mira says. Rowan sets down his cup. "I am staying," he replies.', target: 'I am staying,' },
+    { id: 'boundary_control_unclear', prior: 'I turn to Mira. "Are you coming?"', current: '"Maybe." A door opens. "I am staying."', target: 'I am staying.' },
+  ]
+  for (const control of controls) questions[control.id] = {
+    type: 'choice',
+    instructions: `Use only the prior and current texts of synthetic control ${control.id}; identify who says its target quotation. Do not use the chat or other controls.`,
+    criteria: { mira: 'Mira', rowan: 'Rowan', no_clear_identity: 'Cannot establish the speaker' },
+  }
+  return {
+    state: { previousMessages: review.state.previousMessages, message: review.state.message, paragraphs: review.state.paragraphs, speeches: review.state.speeches, boundaryEvidence: review.state.boundaryEvidence, controls },
+    questions,
+    targetIds: targets.map(id => `boundary_${id.slice('relationship_'.length)}`),
+    expectedControls: { boundary_control_continuation: 'mira', boundary_control_interruption: 'rowan', boundary_control_reply: 'rowan', boundary_control_unclear: 'no_clear_identity' },
+  }
+}
+
 /** Reconcile an explicitly evaluated single-speaker opening without blanket inheritance. */
 export function applyOpeningExchangeReview(plan: SpeakerDecisionPlan, answers: Record<string, SpeakerDecisionChoice>, reviewed: Record<string, SpeakerDecisionChoice>): void {
   const run = plan.state.runs.find(item => item.speechIds.includes('s0'))
