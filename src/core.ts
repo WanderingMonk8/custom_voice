@@ -2900,6 +2900,62 @@ export interface RelationshipReviewContext {
   ghosts: Array<{ id: string; label: string; aliases: string[]; context: string; conversationHistory: Array<{ messageId: string; text: string }> }>
 }
 
+/** Recheck user-voice assignments made by any stage, with prior conversation. */
+export function buildContextualUserReconciliation(plan: SpeakerDecisionPlan, answers: Record<string, SpeakerDecisionChoice>, context: RelationshipReviewContext) {
+  const questions: SpeakerDecisionPlan['questions'] = {}
+  if (plan.state.messageRole !== 'assistant') return { state: { ...plan.state, previousMessages: context.previousMessages }, questions }
+  for (const speech of plan.state.speeches) {
+    const current = evaluateSpeakerDecisionAnswer(answers[`speech_${speech.id}`], plan.optionSpeakerIds).identity
+    const candidate = evaluateSpeakerDecisionAnswer(answers[`relationship_review_${speech.id}`], plan.optionSpeakerIds).identity
+    if (current !== USER_SPEAKER_ID && candidate !== USER_SPEAKER_ID) continue
+    questions[`persona_check_${speech.id}`] = {
+      type: 'choice',
+      instructions: `Is quotation ${speech.id} in the CURRENT assistant message actually spoken by the user persona? Read the complete current exchange and role-labeled previousMessages. Distinguish the author of a previous user message, the addressee, a person echoing a word, a third party, and a remote caller. The user may genuinely speak in an assistant message, but is not the speaker merely because the previous message was written by the user. Choose unclear when the evidence does not establish whether the persona speaks.`,
+      criteria: { user: 'The user persona actually speaks this quotation.', other: 'Another person speaks this quotation.', no_clear_identity: 'It is unclear whether the user persona speaks.' },
+    }
+  }
+  return { state: { ...plan.state, previousMessages: context.previousMessages }, questions }
+}
+
+/** Preserve a user assignment only after explicit attribution or contextual confirmation. */
+export function applyContextualUserReconciliation(plan: SpeakerDecisionPlan, answers: Record<string, SpeakerDecisionChoice>, reviewed: Record<string, SpeakerDecisionChoice>, questions: SpeakerDecisionPlan['questions']): void {
+  const speakers = plan.state.speakers.map(speaker => ({ id: speaker.id, name: speaker.name }))
+  for (const speech of plan.state.speeches) {
+    const key = `persona_check_${speech.id}`
+    if (!questions[key]) continue
+    const result = reviewed[key]
+    answers[`persona_check_${speech.id}`] = result ?? { choice: 'no_clear_identity', probabilities: {}, confidence: 0 }
+    const checked = evaluateSpeakerDecisionAnswer(result, { user: USER_SPEAKER_ID, other: 'other' }, { probability: 0.8, confidence: 0.75, margin: 0.25 })
+    const explicit = narrativeAttributionSpeaker(`${speech.narrativeBefore} ${speech.narrativeAfter}`, speakers)
+    const candidate = answers[`relationship_review_${speech.id}`]
+    const candidateIdentity = evaluateSpeakerDecisionAnswer(candidate, plan.optionSpeakerIds).identity
+    if ((checked.identity === USER_SPEAKER_ID && (!explicit || explicit === USER_SPEAKER_ID)) || explicit === USER_SPEAKER_ID) {
+      const currentIdentity = evaluateSpeakerDecisionAnswer(answers[`speech_${speech.id}`], plan.optionSpeakerIds).identity
+      if (currentIdentity !== USER_SPEAKER_ID && candidateIdentity === USER_SPEAKER_ID) {
+        answers[`relationship_original_${speech.id}`] = answers[`speech_${speech.id}`]
+        answers[`speech_${speech.id}`] = candidate
+        answers[`relationship_applied_${speech.id}`] = candidate
+        answers[`relationship_global_${speech.id}`] = candidate
+        answers[`relationship_continuity_${speech.id}`] = candidate
+      }
+      answers[`persona_confirmed_${speech.id}`] = result ?? candidate
+      delete answers[`global_uncertain_${speech.id}`]
+    } else {
+      if (evaluateSpeakerDecisionAnswer(answers[`speech_${speech.id}`], plan.optionSpeakerIds).identity === USER_SPEAKER_ID) {
+        answers[`persona_original_${speech.id}`] = answers[`speech_${speech.id}`]
+        const before = answers[`relationship_original_${speech.id}`]
+        const beforeIdentity = evaluateSpeakerDecisionAnswer(before, plan.optionSpeakerIds).identity
+        answers[`speech_${speech.id}`] = before && beforeIdentity !== USER_SPEAKER_ID ? before : { choice: 'no_clear_identity', probabilities: {}, confidence: 0 }
+        delete answers[`relationship_confirmed_${speech.id}`]
+        delete answers[`relationship_applied_${speech.id}`]
+        delete answers[`relationship_global_${speech.id}`]
+        delete answers[`relationship_continuity_${speech.id}`]
+      }
+      answers[`global_uncertain_${speech.id}`] = result ?? { choice: 'no_clear_identity', probabilities: {}, confidence: 0 }
+    }
+  }
+}
+
 /** Resolve a historically safe ghost to a unique named roster entry, if any. */
 export function continuityRosterIdentity(id: string | null, context: RelationshipReviewContext, speakers: CharacterLike[]): string | null {
   if (!id?.startsWith('ghost:')) return id
@@ -3271,6 +3327,8 @@ export function applyOpeningExchangeReview(plan: SpeakerDecisionPlan, answers: R
   const pattern = evaluateSpeakerDecisionAnswer(reviewed.opening_exchange_pattern, { single_speaker: 'single_speaker', multiple_speakers: 'multiple_speakers' }, { probability: 0.85, confidence: 0.8, margin: 0.3 })
   const identity = evaluateSpeakerDecisionAnswer(reviewed.opening_exchange_speaker, plan.optionSpeakerIds, { probability: 0.85, confidence: 0.8, margin: 0.3 }).identity
   if (pattern.identity !== 'single_speaker' || !identity || identity === UNCAST_SPEAKER_ID) return
+  if (identity === USER_SPEAKER_ID && plan.state.messageRole === 'assistant'
+    && run.speechIds.some(id => answers[`global_uncertain_${id}`] && answers.persona_phase_complete && !answers[`persona_confirmed_${id}`])) return
   const speakers = plan.state.speakers.map(speaker => ({ id: speaker.id, name: speaker.name }))
   for (const id of run.speechIds) {
     const speech = plan.state.speeches.find(item => item.id === id)
@@ -3341,6 +3399,7 @@ export function applyOpeningBacklinkReview(plan: SpeakerDecisionPlan, answers: R
     if (result) answers[`backlink_review_${link.targetId}`] = result
     const decision = evaluateSpeakerDecisionAnswer(result, { same: 'same', different_or_unclear: 'different_or_unclear' }, { probability: 0.85, confidence: 0.8, margin: 0.3 })
     const anchor = answers[`speech_${link.anchorId}`]
+    if (link.identity === USER_SPEAKER_ID && plan.state.messageRole === 'assistant' && answers.persona_phase_complete && !answers[`persona_confirmed_${link.targetId}`]) continue
     if (!answers[`global_uncertain_${link.targetId}`] || answers[`global_uncertain_${link.anchorId}`] || (!answers[`relationship_applied_${link.anchorId}`] && !answers[`relationship_confirmed_${link.anchorId}`]) || decision.identity !== 'same' || evaluateSpeakerDecisionAnswer(anchor, plan.optionSpeakerIds).identity !== link.identity) continue
     answers[`relationship_original_${link.targetId}`] = answers[`speech_${link.targetId}`]
     answers[`speech_${link.targetId}`] = anchor
@@ -3427,10 +3486,17 @@ export function applyRelationshipSpeakerReview(plan: SpeakerDecisionPlan, answer
     // confirming review, rather than the stricter gates for changing identity.
     // Missing, unclear or conflicting reviews still follow the uncertainty path.
     const localOriginal = evaluateSpeakerDecisionAnswer(original, plan.optionSpeakerIds, { probability: 0.6, confidence: 0.55, margin: 0.3 }).identity
-    const weakAgreement = evaluateSpeakerDecisionAnswer(result, options, { probability: 0.5, confidence: 0.45, margin: 0.05 }).identity
+    const weakAgreement = evaluateSpeakerDecisionAnswer(result, options, { probability: 0.45, confidence: 0.4, margin: 0.05 }).identity
     const explicitAttribution = narrativeAttributionSpeaker(`${speech.narrativeBefore} ${speech.narrativeAfter}`, speakers)
     const confirmingIdentity = evaluateSpeakerDecisionAnswer(result, options, SPEAKER_DECISION_THRESHOLDS.local).identity
       ?? (localOriginal && (localOriginal !== USER_SPEAKER_ID || plan.state.messageRole === 'user') && weakAgreement === localOriginal && (!explicitAttribution || explicitAttribution === localOriginal) ? localOriginal : null)
+    if (globalMode && plan.state.messageRole === 'assistant' && answers.persona_phase_complete
+      && !answers[`persona_confirmed_${speech.id}`]
+      && explicitAttribution !== USER_SPEAKER_ID
+      && (confirmingIdentity === USER_SPEAKER_ID || evaluateSpeakerDecisionAnswer(result, options).identity === USER_SPEAKER_ID)) {
+      answers[`global_uncertain_${speech.id}`] = result
+      continue
+    }
     if (globalMode && originalIdentity && originalIdentity !== UNCAST_SPEAKER_ID && confirmingIdentity === originalIdentity) {
       delete answers[`global_uncertain_${speech.id}`]
       answers[`relationship_confirmed_${speech.id}`] = result
@@ -6386,6 +6452,9 @@ export function resolveSpeakerDecisionSegments(
           ...(answers[`relationship_inherited_${speech.id}`] ? ['jev-relationship-review:inherited established previous speaker'] : []),
           ...(answers[`relationship_applied_${speech.id}`] ? ['jev-relationship-review:strong alternative applied'] : []),
           ...(answers[`relationship_confirmed_${speech.id}`] ? ['jev-relationship-review:accepted first-pass identity confirmed'] : []),
+          ...decisionAnswerDebug('jev-contextual-user-review', answers[`persona_check_${speech.id}`], { user: USER_SPEAKER_ID, other: 'other' }),
+          ...decisionAnswerDebug('jev-contextual-user-original', answers[`persona_original_${speech.id}`], plan.optionSpeakerIds),
+          ...(answers[`persona_confirmed_${speech.id}`] ? ['jev-contextual-user-review:user assignment confirmed'] : []),
           ...decisionAnswerDebug('jev-opening-backlink', answers[`backlink_review_${speech.id}`], { same: 'same', different_or_unclear: 'different_or_unclear' }),
           ...(answers[`relationship_backlink_${speech.id}`] ? ['jev-opening-backlink:accepted same-speaker link to later validated quote'] : []),
           ...(answers[`relationship_exchange_${speech.id}`] ? ['jev-opening-exchange:strong single-speaker review applied'] : []),

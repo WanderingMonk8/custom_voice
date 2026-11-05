@@ -15,6 +15,8 @@ import {
   applyTtsTagSelections,
   buildSpeakerDecisionPlan,
   buildAssistantUserSpeakerReview,
+  buildContextualUserReconciliation,
+  applyContextualUserReconciliation,
   buildRelationshipSpeakerReview,
   buildOpeningSpeakerReview,
   applyOpeningExchangeReview,
@@ -1089,7 +1091,7 @@ function queueSpeakerParse(
           })),
           cardSpeakerId: titleMatchedCardSpeakerId,
           historicalSpeakerId,
-          relationshipReview: { version: 'cross-message-run-11', context: relationshipContext, speakerLookback, strategy: payload.runReview === true ? 'run' : 'scene' },
+          relationshipReview: { version: 'cross-message-run-12', context: relationshipContext, speakerLookback, strategy: payload.runReview === true ? 'run' : 'scene' },
           skippedTrackerTags,
         }))
         const cached = config.parsedMessages[payload.messageId]
@@ -1195,6 +1197,30 @@ function queueSpeakerParse(
               spindle.log.warn(`[Chat Voice] Relationship speaker review failed; preserving validated assignments and marking uncertain targets: ${error instanceof Error ? error.message : String(error)}`)
             }
           }
+          // Reconcile persona assignments after contextual review as well as
+          // first pass, including assignments introduced by that review.
+          const personaReview = buildContextualUserReconciliation(decisionPlan, answers, relationshipContext)
+          if (Object.keys(personaReview.questions).length) {
+            const startedAt = Date.now()
+            const reviewed: Record<string, SpeakerDecisionChoice> = {}
+            try {
+              const result = await spindle.decisions.evaluate({ state: personaReview.state, questions: personaReview.questions, ...(userId ? { userId } : {}) })
+              for (const [id, answer] of Object.entries(result.answers)) {
+                if (answer.type === 'choice') reviewed[id] = { choice: answer.choice, probabilities: answer.probabilities, confidence: answer.confidence }
+              }
+              const invalid = invalidSpeakerReviewAnswers(personaReview.questions, reviewed)
+              if (invalid.length) {
+                userReviewFailed = true
+                for (const id of invalid) delete reviewed[id]
+                relationshipSceneDiagnostic += `; contextual-user-review=incomplete (${invalid.length} invalid answers)`
+              } else relationshipSceneDiagnostic += `; contextual-user-review=${Object.keys(personaReview.questions).length} questions/${Date.now() - startedAt}ms`
+            } catch {
+              userReviewFailed = true
+              relationshipSceneDiagnostic += `; contextual-user-review=failed/${Date.now() - startedAt}ms`
+            }
+            applyContextualUserReconciliation(decisionPlan, answers, reviewed, personaReview.questions)
+          }
+          answers.persona_phase_complete = { choice: 'complete', probabilities: {}, confidence: 0 }
           // Re-read only unresolved opening quotations with the nearest exchange.
           // This is a fresh bounded decision, never an unconditional inheritance.
           const openingReview = !relationshipReviewFailed ? buildOpeningSpeakerReview(decisionPlan, answers, relationshipContext, titleMatchedCardSpeakerId) : null
@@ -1288,7 +1314,7 @@ function queueSpeakerParse(
                   const aligned = segments.length === shadowSegments.length && segments.every((segment, index) => segment.text === shadowSegments[index].text)
                   const changes = aligned ? segments.flatMap((segment, index) => segment.speakerId !== shadowSegments[index].speakerId
                     ? [`${index + 1}:${segment.speakerId ?? 'none'}->${shadowSegments[index].speakerId ?? 'none'}`] : []) : []
-                  relationshipSceneDiagnostic += `; shadow=completed, questions=${Object.keys(shadowReview.questions).length}, duration=${shadowResult.duration}ms, changed-segments=${aligned ? changes.length : 'unaligned'}${changes.length ? ` (${changes.join(', ')})` : ''}${openingReview || backlinkReview ? '; shadow excludes opening re-read and backlink' : ''}`
+                  relationshipSceneDiagnostic += `; shadow=completed, questions=${Object.keys(shadowReview.questions).length}, duration=${shadowResult.duration}ms, changed-segments=${aligned ? changes.length : 'unaligned'}${changes.length ? ` (${changes.join(', ')})` : ''}; shadow excludes contextual user reconciliation${openingReview || backlinkReview ? ', opening re-read and backlink' : ''}`
                 } catch {
                   relationshipSceneDiagnostic += '; shadow=resolution failed'
                 }

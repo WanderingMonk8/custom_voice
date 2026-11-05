@@ -19,6 +19,8 @@ import {
   assessSpeakerDiscourseEscalation,
   buildSpeakerDecisionPlan,
   buildAssistantUserSpeakerReview,
+  buildContextualUserReconciliation,
+  applyContextualUserReconciliation,
   buildRelationshipSpeakerReview,
   buildOpeningSpeakerReview,
   applyOpeningExchangeReview,
@@ -2682,13 +2684,22 @@ test('agreement retains a clear first-pass identity without requiring override t
   assert.equal(segments[0].speakerId, 'npc:zadie')
   assert.ok(segments[0].debugPath?.includes('jev-relationship-review:accepted first-pass identity confirmed'))
   const weak = make()
-  applyRelationshipSpeakerReview(weak.plan, weak.answers, { relationship_s0: { choice: 'known_0', probabilities: { known_0: 0.50, known_1: 0.30, no_clear_identity: 0.20 }, confidence: 0.40 } }, {}, null, null, true)
+  applyRelationshipSpeakerReview(weak.plan, weak.answers, { relationship_s0: { choice: 'known_0', probabilities: { known_0: 0.50, known_1: 0.30, no_clear_identity: 0.20 }, confidence: 0.39 } }, {}, null, null, true)
   assert.ok(weak.answers.global_uncertain_s0)
   const weakAgreement = make()
   weakAgreement.answers.speech_s0 = { choice: 'known_0', probabilities: { known_0: 0.64, known_1: 0.32, no_clear_identity: 0.04 }, confidence: 0.60 }
   applyRelationshipSpeakerReview(weakAgreement.plan, weakAgreement.answers, { relationship_s0: { choice: 'known_0', probabilities: { known_0: 0.51, known_1: 0.43, no_clear_identity: 0.06 }, confidence: 0.48 } }, {}, null, null, true)
   assert.ok(weakAgreement.answers.relationship_confirmed_s0)
   assert.equal(weakAgreement.answers.global_uncertain_s0, undefined)
+  const zadieLog = make()
+  zadieLog.answers.speech_s0 = { choice: 'known_0', probabilities: { known_0: 0.70, known_1: 0.25, no_clear_identity: 0.05 }, confidence: 0.66 }
+  applyRelationshipSpeakerReview(zadieLog.plan, zadieLog.answers, { relationship_s0: { choice: 'known_0', probabilities: { known_0: 0.49, known_1: 0.41, no_clear_identity: 0.10 }, confidence: 0.45 } }, {}, null, null, true)
+  assert.ok(zadieLog.answers.relationship_confirmed_s0)
+  assert.equal(zadieLog.answers.global_uncertain_s0, undefined)
+  const zadieSecond = make()
+  zadieSecond.answers.speech_s0 = { choice: 'known_0', probabilities: { known_0: 0.60, known_1: 0.24, no_clear_identity: 0.16 }, confidence: 0.55 }
+  applyRelationshipSpeakerReview(zadieSecond.plan, zadieSecond.answers, { relationship_s0: { choice: 'known_0', probabilities: { known_0: 0.45, known_1: 0.31, no_clear_identity: 0.24 }, confidence: 0.41 } }, {}, null, null, true)
+  assert.ok(zadieSecond.answers.relationship_confirmed_s0)
   const conflict = make()
   applyRelationshipSpeakerReview(conflict.plan, conflict.answers, { relationship_s0: { choice: 'known_1', probabilities: { known_1: 0.75, known_0: 0.20, no_clear_identity: 0.05 }, confidence: 0.70 } }, {}, null, null, true)
   assert.ok(conflict.answers.global_uncertain_s0)
@@ -2698,6 +2709,44 @@ test('agreement retains a clear first-pass identity without requiring override t
   applyRelationshipSpeakerReview(userPlan, userAnswers, { relationship_s0: { choice: 'known_0', probabilities: { known_0: 0.51, known_1: 0.16, no_clear_identity: 0.33 }, confidence: 0.48 } }, {}, null, null, true)
   assert.ok(userAnswers.global_uncertain_s0)
   assert.equal(userAnswers.relationship_confirmed_s0, undefined)
+})
+
+test('contextual persona reconciliation reviews existing and newly introduced user assignments', () => {
+  const speakers = [{ id: 'npc:ewan', name: 'Ewan' }, { id: USER_SPEAKER_ID, name: 'Ken' }]
+  const message = '"Sacrifice."\n\nHe turns with the tray.\n\n"The noodles?"\n\n"No, I know what you meant."'
+  const plan = buildSpeakerDecisionPlan(message, speakers, false)
+  const context = { previousMessages: [{ id: 'u', role: 'user' as const, text: 'I turn to Ewan. "Sometimes you sacrifice."' }], ghosts: [] }
+  const answers: Record<string, SpeakerDecisionChoice> = { speech_s0: confidentDecision('known_1'), speech_s1: confidentDecision('known_1'), speech_s2: confidentDecision('known_0'), relationship_original_s1: confidentDecision('no_clear_identity'), relationship_review_s1: confidentDecision('known_1'), relationship_applied_s1: confidentDecision('known_1'), relationship_continuity_s1: confidentDecision('known_1') }
+  const review = buildContextualUserReconciliation(plan, answers, context)
+  assert.ok(review.questions.persona_check_s0)
+  assert.ok(review.questions.persona_check_s1)
+  assert.equal(review.questions.persona_check_s2, undefined)
+  applyContextualUserReconciliation(plan, answers, { persona_check_s0: confidentDecision('no_clear_identity'), persona_check_s1: confidentDecision('other') }, review.questions)
+  assert.ok(answers.global_uncertain_s0)
+  assert.ok(answers.global_uncertain_s1)
+  assert.equal(answers.speech_s0.choice, 'no_clear_identity')
+  assert.equal(answers.relationship_continuity_s1, undefined)
+  answers.persona_phase_complete = { choice: 'complete', probabilities: {}, confidence: 0 }
+  applyRelationshipSpeakerReview(plan, answers, { relationship_s0: confidentDecision('known_0', 0.67, 0.65), relationship_s1: confidentDecision('known_0', 0.67, 0.65) }, {}, null, null, true)
+  assert.equal(answers.speech_s0.choice, 'known_0')
+  assert.equal(answers.speech_s1.choice, 'known_0')
+  const late = buildSpeakerDecisionPlan('"Who said that?"', speakers, false)
+  const lateAnswers: Record<string, SpeakerDecisionChoice> = { speech_s0: confidentDecision('no_clear_identity'), persona_phase_complete: { choice: 'complete', probabilities: {}, confidence: 0 } }
+  applyRelationshipSpeakerReview(late, lateAnswers, { relationship_s0: confidentDecision('known_1') }, {}, null, null, true)
+  assert.ok(lateAnswers.global_uncertain_s0)
+  const genuine = buildSpeakerDecisionPlan('"I agree," Ken says.', speakers, false)
+  const genuineAnswers: Record<string, SpeakerDecisionChoice> = { speech_s0: confidentDecision('known_1') }
+  const genuineReview = buildContextualUserReconciliation(genuine, genuineAnswers, context)
+  applyContextualUserReconciliation(genuine, genuineAnswers, { persona_check_s0: confidentDecision('user') }, genuineReview.questions)
+  assert.ok(genuineAnswers.persona_confirmed_s0)
+  assert.equal(genuineAnswers.global_uncertain_s0, undefined)
+  const attributedOther = buildSpeakerDecisionPlan('"I agree," Ewan says.', speakers, false)
+  const wrongPersona: Record<string, SpeakerDecisionChoice> = { speech_s0: confidentDecision('known_1') }
+  const attributedReview = buildContextualUserReconciliation(attributedOther, wrongPersona, context)
+  applyContextualUserReconciliation(attributedOther, wrongPersona, { persona_check_s0: confidentDecision('user') }, attributedReview.questions)
+  assert.ok(wrongPersona.global_uncertain_s0)
+  assert.equal(wrongPersona.persona_confirmed_s0, undefined)
+  assert.equal(buildContextualUserReconciliation(buildSpeakerDecisionPlan('"I agree."', speakers, true), genuineAnswers, context).questions.persona_check_s0, undefined)
 })
 
 test('opening exchange review fills uncertain lines only for a strongly supported coherent speaker', () => {
