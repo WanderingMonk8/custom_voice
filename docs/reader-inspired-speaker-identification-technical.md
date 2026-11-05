@@ -38,6 +38,28 @@ target + earlier messages + safe roster/ghost snapshot
 
 The first production slice reuses Jev and the existing segmentation, question batching, thresholds infrastructure, run detection, voice routing, tag pipeline and playback. It replaces overlapping targeted relationship/scene decisions for selected runs with a run-oriented review. Keep legacy functions available behind an explicit development/shadow switch until regression and latency evidence supports removal. Never run both policies and silently combine their answers.
 
+### End-to-end decision flow
+
+```mermaid
+flowchart TD
+    A[Target message and bounded earlier user and assistant messages] --> B[Clean and segment; build prior-safe roster and ghost snapshot]
+    B --> C[Jev first pass: identities and local turn relations]
+    C --> D{Ambiguous or structurally suspicious run?}
+    D -- No --> H[Validate first-pass decisions per speech]
+    D -- Yes --> E[Build bounded cross-message run context and candidates]
+    E --> F[Jev run review: participants, references, turns and speeches]
+    F --> G{Valid, sufficiently supported result?}
+    G -- Yes --> I[Reconcile with local and later target-message evidence]
+    G -- No or review failed --> J[Retain separately validated decisions; mark conflicts unclear]
+    H --> K[Resolve identities and revisable temporary-voice matches]
+    I --> K
+    J --> K
+    K --> L[Freeze synthesis plan]
+    L --> M[Existing tags, TTS and playback]
+```
+
+This is the proposed live path. Optional LLM escalation is a separately controlled experiment, not a required step or a replacement for validation.
+
 ### Resource roles
 
 1. **Deterministic code:** preserve text and offsets; form bounded runs; select prior-only evidence; validate IDs and outputs; enforce hard scene/role/channel safety conditions; reconcile and route voices; maintain cache, diagnostics and cancellation state. It must not guess identity from a name's apparent gender.
@@ -136,6 +158,25 @@ If the Jev run review remains unresolved and the user explicitly enables an adva
 
 Before this mode can alter routing, require a separate bounded validation/verification policy, evaluate it against Jev-only results, and define the maximum additional calls and deadline. If parsing or verification fails, discard the proposal and retain a safe unresolved/previously validated result. No provider-specific structured-output or token-usage guarantee may be assumed.
 
+### Example: bridging Ewan's opening reply
+
+```mermaid
+flowchart LR
+    A[Earlier assistant message: Ewan has the tray] --> D[Candidate: Ewan]
+    B[User message: Ken addresses Ewan about sacrifice] --> E[Candidate relationship: response]
+    C[Target: a person with the tray turns back] --> D
+    F[Target quote: Sacrifice] --> E
+    D --> G[Run review considers combined evidence]
+    E --> G
+    H[Someone sidesteps the tray] --> I[Bystander unless speech evidence says otherwise]
+    I --> G
+    G --> J{Identity and evidence pass validation?}
+    J -- Yes --> K[Assign the supported speaker to the relevant speech]
+    J -- No --> L[Keep that speech unclear]
+```
+
+The arrows express candidate evidence, not deterministic identity rules. Each quote is evaluated individually within the run; the bystander may become a speaker if the text later supports it.
+
 ## Stage D: deterministic reconciliation
 
 Create a single reconciliation function for each speech; do not let multiple stages overwrite the same identity without recording the source and conflict. Initial policy:
@@ -148,6 +189,33 @@ Create a single reconciliation function for each speech; do not let multiple sta
 6. Once a final stable speaker identity is selected, use the existing segment/tag/voice pipeline. Narration must remain narrator audio; unresolved speech must remain identifiable as **speech**, not be relabeled narration. Define an explicit unresolved-speech route using existing connection/default/temporary-cast policy and report that choice; never silently use the narrator solely because a speaker ID is null. This needs frontend/backend integration tests.
 
 The first-slice behavior on review failure is to retain only separately validated first-pass/local results, keep uncertain conflicts unresolved, and continue playback using the explicit unresolved route. No scene-wide inheritance or forced single-card result is restored on failure.
+
+### Per-speech reconciliation and routing
+
+```mermaid
+flowchart TD
+    A[Local decision plus targeted run evidence] --> B{Valid explicit speech attribution?}
+    B -- Yes --> C{Separately supported contradiction?}
+    C -- No --> D[Retain attributed identity]
+    C -- Yes --> E[Apply stricter conflict review]
+    B -- No --> F{Run candidate supported and gates pass?}
+    F -- Yes --> G[Assign candidate for this speech]
+    F -- No --> H[Mark speech unclear or conflicting]
+    E --> I{Override supported?}
+    I -- Yes --> G
+    I -- No --> H
+    D --> J[Resolve cast or temporary voice]
+    G --> J
+    H --> K[Use explicit unresolved-speech policy]
+    J --> L{Saved occurrence conflicts with current evidence?}
+    L -- No --> M[Reuse or assign a justified voice]
+    L -- Yes --> N[Review conflict; preserve prior record]
+    N --> O{Correction confirmed?}
+    O -- Yes --> M
+    O -- No --> K
+```
+
+Narration remains narrator audio throughout. A saved occurrence is a clue, not proof, and an unclear speech must not be relabeled as narration.
 
 ## Stage E: revisable temporary voice matching
 
