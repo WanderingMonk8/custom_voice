@@ -366,6 +366,7 @@ interface PlaybackPreferences {
   speakerShadowEvaluation: boolean
   speakerRunReview: boolean
   focusedOpeningFallback: boolean
+  bestAvailableSpeaker: boolean
   skipNarration: boolean
   defaultNarratorVoice: string
   defaultUserVoice: string
@@ -441,6 +442,7 @@ async function loadPlaybackPreferences(): Promise<PlaybackPreferences> {
     speakerShadowEvaluation: false,
     speakerRunReview: false,
     focusedOpeningFallback: false,
+    bestAvailableSpeaker: false,
     skipNarration: false,
     defaultNarratorVoice: '',
     defaultUserVoice: '',
@@ -500,6 +502,7 @@ async function loadPlaybackPreferences(): Promise<PlaybackPreferences> {
     speakerShadowEvaluation: row.value?.chatVoiceSpeakerShadowEvaluation === true,
     speakerRunReview: row.value?.chatVoiceSpeakerRunReview === true,
     focusedOpeningFallback: row.value?.chatVoiceFocusedOpeningFallback === true,
+    bestAvailableSpeaker: row.value?.chatVoiceBestAvailableSpeaker === true,
     skipNarration: row.value?.chatVoiceSkipNarration === true,
     defaultNarratorVoice: typeof row.value?.chatVoiceDefaultNarratorVoice === 'string'
       ? row.value.chatVoiceDefaultNarratorVoice.trim().slice(0, 512)
@@ -592,6 +595,7 @@ function saveAdvancedPlaybackPreferences(
   speakerShadowEvaluation: boolean,
   speakerRunReview: boolean,
   focusedOpeningFallback: boolean,
+  bestAvailableSpeaker: boolean,
   skipNarration: boolean,
 ): Promise<void> {
   return updateVoiceSettings(current => ({
@@ -615,6 +619,7 @@ function saveAdvancedPlaybackPreferences(
     chatVoiceSpeakerShadowEvaluation: speakerShadowEvaluation,
     chatVoiceSpeakerRunReview: speakerRunReview,
     chatVoiceFocusedOpeningFallback: focusedOpeningFallback,
+    chatVoiceBestAvailableSpeaker: bestAvailableSpeaker,
     chatVoiceSkipNarration: skipNarration,
     chatVoiceAutoCasting: autoVoiceCasting,
     chatVoiceGhostVoiceLifetime: clampIntegerSetting(ghostVoiceLifetime, GHOST_VOICE_LIFETIME_MESSAGES, 1000),
@@ -1386,6 +1391,19 @@ export function setup(ctx: SpindleFrontendContext) {
   focusedFallbackHint.textContent = 'May change voices for unresolved opening dialogue using nearby validated speakers. Accuracy on interruptions is unverified. Adds Jev cost and may delay playback.'
   focusedFallbackCopy.append(focusedFallbackText, focusedFallbackHint)
   focusedFallbackLabel.append(focusedFallbackToggle, focusedFallbackCopy)
+  const bestAvailableLabel = document.createElement('label')
+  bestAvailableLabel.className = 'chat-voice-toggle'
+  const bestAvailableToggle = document.createElement('input')
+  bestAvailableToggle.type = 'checkbox'
+  const bestAvailableCopy = document.createElement('span')
+  bestAvailableCopy.className = 'chat-voice-toggle-copy'
+  const bestAvailableText = document.createElement('span')
+  bestAvailableText.textContent = 'Best-available voice for unresolved speech'
+  const bestAvailableHint = document.createElement('span')
+  bestAvailableHint.className = 'chat-voice-toggle-hint'
+  bestAvailableHint.textContent = 'Experimental: guess a plausible scene speaker or unnamed character instead of defaulting when evidence allows. Guesses may be wrong. Adds Jev cost and can delay playback.'
+  bestAvailableCopy.append(bestAvailableText, bestAvailableHint)
+  bestAvailableLabel.append(bestAvailableToggle, bestAvailableCopy)
   const skipNarrationLabel = document.createElement('label')
   skipNarrationLabel.className = 'chat-voice-toggle'
   const skipNarrationToggle = document.createElement('input')
@@ -1420,6 +1438,7 @@ export function setup(ctx: SpindleFrontendContext) {
     speakerDebugLabel,
     speakerRunLabel,
     focusedFallbackLabel,
+    bestAvailableLabel,
     speakerShadowLabel,
     speakerDebugOutput,
     advancedHint,
@@ -1494,6 +1513,7 @@ export function setup(ctx: SpindleFrontendContext) {
   let speakerShadowEvaluation = false
   let speakerRunReview = false
   let focusedOpeningFallback = false
+  let bestAvailableSpeaker = false
   let skipNarration = false
   let advancedSettingsSaveTimer: ReturnType<typeof setTimeout> | null = null
   let savingAdvancedSettings = false
@@ -1950,6 +1970,7 @@ export function setup(ctx: SpindleFrontendContext) {
   speakerShadowToggle.addEventListener('change', onSpeakerShadowChanged)
   speakerRunToggle.addEventListener('change', onSpeakerRunChanged)
   focusedFallbackToggle.addEventListener('change', onFocusedFallbackChanged)
+  bestAvailableToggle.addEventListener('change', onBestAvailableChanged)
   skipNarrationToggle.addEventListener('change', onSkipNarrationChanged)
   autoCastingToggle.addEventListener('change', () => { autoVoiceCasting = autoCastingToggle.checked; scheduleAdvancedSettingsSave() })
 
@@ -2136,6 +2157,7 @@ export function setup(ctx: SpindleFrontendContext) {
         shadowEvaluation: preferences.speakerShadowEvaluation,
         runReview: preferences.speakerRunReview,
         focusedOpeningFallback: preferences.focusedOpeningFallback,
+        bestAvailableSpeaker: preferences.bestAvailableSpeaker,
       })
     })
   }
@@ -2172,6 +2194,7 @@ export function setup(ctx: SpindleFrontendContext) {
   }
 
   const SPEAKER_SOURCE_LABELS: Record<SpeakerAssignmentSource, string> = {
+    'best-available': 'best-available guess (uncertain)',
     'first-pass': 'first pass',
     'contextual-confirmation': 'contextually confirmed first pass',
     'contextual-review': 'contextual review',
@@ -2839,6 +2862,7 @@ export function setup(ctx: SpindleFrontendContext) {
       preferences.speakerShadowEvaluation = speakerShadowEvaluation
       preferences.speakerRunReview = speakerRunReview
       preferences.focusedOpeningFallback = focusedOpeningFallback
+      preferences.bestAvailableSpeaker = bestAvailableSpeaker
       preferences.skipNarration = skipNarration
     } else {
       playbackBufferSegments = preferences.playbackBufferSegments
@@ -2848,6 +2872,7 @@ export function setup(ctx: SpindleFrontendContext) {
       speakerShadowEvaluation = preferences.speakerShadowEvaluation
       speakerRunReview = preferences.speakerRunReview
       focusedOpeningFallback = preferences.focusedOpeningFallback
+      bestAvailableSpeaker = preferences.bestAvailableSpeaker
       skipNarration = preferences.skipNarration
     }
     const connectionId = config.connectionId
@@ -4552,6 +4577,8 @@ export function setup(ctx: SpindleFrontendContext) {
         speakerRunToggle.checked = speakerRunReview
         focusedOpeningFallback = preferences.focusedOpeningFallback
         focusedFallbackToggle.checked = focusedOpeningFallback
+        bestAvailableSpeaker = preferences.bestAvailableSpeaker
+        bestAvailableToggle.checked = bestAvailableSpeaker
         skipNarration = preferences.skipNarration
         skipNarrationToggle.checked = skipNarration
         speakerDebugOutput.hidden = !speakerAssignmentDebug
@@ -4698,6 +4725,11 @@ export function setup(ctx: SpindleFrontendContext) {
     scheduleAdvancedSettingsSave()
   }
 
+  function onBestAvailableChanged(): void {
+    bestAvailableSpeaker = bestAvailableToggle.checked
+    scheduleAdvancedSettingsSave()
+  }
+
   function onSkipNarrationChanged(): void {
     skipNarration = skipNarrationToggle.checked
     scheduleAdvancedSettingsSave()
@@ -4718,6 +4750,7 @@ export function setup(ctx: SpindleFrontendContext) {
         speakerShadowEvaluation,
         speakerRunReview,
         focusedOpeningFallback,
+        bestAvailableSpeaker,
         skipNarration,
       )
       setStatus('Advanced playback settings saved globally.', 'saved')
@@ -5227,6 +5260,7 @@ export function setup(ctx: SpindleFrontendContext) {
         speakerShadowEvaluation,
         speakerRunReview,
         focusedOpeningFallback,
+        bestAvailableSpeaker,
         skipNarration,
       )
     }
@@ -5245,6 +5279,7 @@ export function setup(ctx: SpindleFrontendContext) {
     speakerShadowToggle.removeEventListener('change', onSpeakerShadowChanged)
     speakerRunToggle.removeEventListener('change', onSpeakerRunChanged)
     focusedFallbackToggle.removeEventListener('change', onFocusedFallbackChanged)
+    bestAvailableToggle.removeEventListener('change', onBestAvailableChanged)
     skipNarrationToggle.removeEventListener('change', onSkipNarrationChanged)
     addNpcInput.destroy()
     addNpcButton.removeEventListener('click', onAddNpc)

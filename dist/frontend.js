@@ -93,6 +93,7 @@ function speakersForMessageRole(speakers, _isUserMessage, userName = "User") {
 }
 function speakerAssignmentSourceFromTrace(steps, localFallback) {
   const resolution = steps.find((step) => step.startsWith("resolution:"));
+  if (resolution?.startsWith("resolution:best-available speaker")) return "best-available";
   if (resolution?.startsWith("resolution:chain-identity (overrode")) return "chain-override";
   if (resolution?.startsWith("resolution:chain-identity")) return "chain-fill";
   if (resolution?.startsWith("resolution:discourse-identity (overrode")) return "discourse-override";
@@ -1673,6 +1674,7 @@ async function loadPlaybackPreferences() {
     speakerShadowEvaluation: false,
     speakerRunReview: false,
     focusedOpeningFallback: false,
+    bestAvailableSpeaker: false,
     skipNarration: false,
     defaultNarratorVoice: "",
     defaultUserVoice: "",
@@ -1718,6 +1720,7 @@ async function loadPlaybackPreferences() {
     speakerShadowEvaluation: row.value?.chatVoiceSpeakerShadowEvaluation === true,
     speakerRunReview: row.value?.chatVoiceSpeakerRunReview === true,
     focusedOpeningFallback: row.value?.chatVoiceFocusedOpeningFallback === true,
+    bestAvailableSpeaker: row.value?.chatVoiceBestAvailableSpeaker === true,
     skipNarration: row.value?.chatVoiceSkipNarration === true,
     defaultNarratorVoice: typeof row.value?.chatVoiceDefaultNarratorVoice === "string" ? row.value.chatVoiceDefaultNarratorVoice.trim().slice(0, 512) : "",
     defaultUserVoice: typeof row.value?.chatVoiceDefaultUserVoice === "string" ? row.value.chatVoiceDefaultUserVoice.trim().slice(0, 512) : "",
@@ -1778,7 +1781,7 @@ function saveTtsTagPreferences(style, placement, connectionId, model) {
     chatVoiceTagLlmModel: model.trim().slice(0, 256)
   }));
 }
-function saveAdvancedPlaybackPreferences(bufferSegments, concurrentGenerations, rateLimitWaitSeconds, speakerAssignmentDebug, ghostVoiceLifetime, autoVoiceCasting, speakerLookback, speakerShadowEvaluation, speakerRunReview, focusedOpeningFallback, skipNarration) {
+function saveAdvancedPlaybackPreferences(bufferSegments, concurrentGenerations, rateLimitWaitSeconds, speakerAssignmentDebug, ghostVoiceLifetime, autoVoiceCasting, speakerLookback, speakerShadowEvaluation, speakerRunReview, focusedOpeningFallback, bestAvailableSpeaker, skipNarration) {
   return updateVoiceSettings((current) => ({
     ...current,
     chatVoicePlaybackBufferSegments: clampIntegerSetting(
@@ -1800,6 +1803,7 @@ function saveAdvancedPlaybackPreferences(bufferSegments, concurrentGenerations, 
     chatVoiceSpeakerShadowEvaluation: speakerShadowEvaluation,
     chatVoiceSpeakerRunReview: speakerRunReview,
     chatVoiceFocusedOpeningFallback: focusedOpeningFallback,
+    chatVoiceBestAvailableSpeaker: bestAvailableSpeaker,
     chatVoiceSkipNarration: skipNarration,
     chatVoiceAutoCasting: autoVoiceCasting,
     chatVoiceGhostVoiceLifetime: clampIntegerSetting(ghostVoiceLifetime, GHOST_VOICE_LIFETIME_MESSAGES, 1e3),
@@ -2509,6 +2513,19 @@ function setup(ctx) {
   focusedFallbackHint.textContent = "May change voices for unresolved opening dialogue using nearby validated speakers. Accuracy on interruptions is unverified. Adds Jev cost and may delay playback.";
   focusedFallbackCopy.append(focusedFallbackText, focusedFallbackHint);
   focusedFallbackLabel.append(focusedFallbackToggle, focusedFallbackCopy);
+  const bestAvailableLabel = document.createElement("label");
+  bestAvailableLabel.className = "chat-voice-toggle";
+  const bestAvailableToggle = document.createElement("input");
+  bestAvailableToggle.type = "checkbox";
+  const bestAvailableCopy = document.createElement("span");
+  bestAvailableCopy.className = "chat-voice-toggle-copy";
+  const bestAvailableText = document.createElement("span");
+  bestAvailableText.textContent = "Best-available voice for unresolved speech";
+  const bestAvailableHint = document.createElement("span");
+  bestAvailableHint.className = "chat-voice-toggle-hint";
+  bestAvailableHint.textContent = "Experimental: guess a plausible scene speaker or unnamed character instead of defaulting when evidence allows. Guesses may be wrong. Adds Jev cost and can delay playback.";
+  bestAvailableCopy.append(bestAvailableText, bestAvailableHint);
+  bestAvailableLabel.append(bestAvailableToggle, bestAvailableCopy);
   const skipNarrationLabel = document.createElement("label");
   skipNarrationLabel.className = "chat-voice-toggle";
   const skipNarrationToggle = document.createElement("input");
@@ -2543,6 +2560,7 @@ function setup(ctx) {
     speakerDebugLabel,
     speakerRunLabel,
     focusedFallbackLabel,
+    bestAvailableLabel,
     speakerShadowLabel,
     speakerDebugOutput,
     advancedHint
@@ -2615,6 +2633,7 @@ function setup(ctx) {
   let speakerShadowEvaluation = false;
   let speakerRunReview = false;
   let focusedOpeningFallback = false;
+  let bestAvailableSpeaker = false;
   let skipNarration = false;
   let advancedSettingsSaveTimer = null;
   let savingAdvancedSettings = false;
@@ -3011,6 +3030,7 @@ function setup(ctx) {
   speakerShadowToggle.addEventListener("change", onSpeakerShadowChanged);
   speakerRunToggle.addEventListener("change", onSpeakerRunChanged);
   focusedFallbackToggle.addEventListener("change", onFocusedFallbackChanged);
+  bestAvailableToggle.addEventListener("change", onBestAvailableChanged);
   skipNarrationToggle.addEventListener("change", onSkipNarrationChanged);
   autoCastingToggle.addEventListener("change", () => {
     autoVoiceCasting = autoCastingToggle.checked;
@@ -3182,7 +3202,8 @@ function setup(ctx) {
         debug: preferences.speakerAssignmentDebug,
         shadowEvaluation: preferences.speakerShadowEvaluation,
         runReview: preferences.speakerRunReview,
-        focusedOpeningFallback: preferences.focusedOpeningFallback
+        focusedOpeningFallback: preferences.focusedOpeningFallback,
+        bestAvailableSpeaker: preferences.bestAvailableSpeaker
       });
     });
   }
@@ -3218,6 +3239,7 @@ function setup(ctx) {
     return speaker ? `${speaker.name} [${speakerId}]` : speakerId;
   }
   const SPEAKER_SOURCE_LABELS = {
+    "best-available": "best-available guess (uncertain)",
     "first-pass": "first pass",
     "contextual-confirmation": "contextually confirmed first pass",
     "contextual-review": "contextual review",
@@ -3720,6 +3742,7 @@ function setup(ctx) {
       preferences.speakerShadowEvaluation = speakerShadowEvaluation;
       preferences.speakerRunReview = speakerRunReview;
       preferences.focusedOpeningFallback = focusedOpeningFallback;
+      preferences.bestAvailableSpeaker = bestAvailableSpeaker;
       preferences.skipNarration = skipNarration;
     } else {
       playbackBufferSegments = preferences.playbackBufferSegments;
@@ -3729,6 +3752,7 @@ function setup(ctx) {
       speakerShadowEvaluation = preferences.speakerShadowEvaluation;
       speakerRunReview = preferences.speakerRunReview;
       focusedOpeningFallback = preferences.focusedOpeningFallback;
+      bestAvailableSpeaker = preferences.bestAvailableSpeaker;
       skipNarration = preferences.skipNarration;
     }
     const connectionId = config.connectionId || (connections.some((connection) => connection.id === preferences.connectionId) ? preferences.connectionId : connections.find((connection) => connection.is_default)?.id ?? lumiverseConnectionId);
@@ -5279,6 +5303,8 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
         speakerRunToggle.checked = speakerRunReview;
         focusedOpeningFallback = preferences.focusedOpeningFallback;
         focusedFallbackToggle.checked = focusedOpeningFallback;
+        bestAvailableSpeaker = preferences.bestAvailableSpeaker;
+        bestAvailableToggle.checked = bestAvailableSpeaker;
         skipNarration = preferences.skipNarration;
         skipNarrationToggle.checked = skipNarration;
         speakerDebugOutput.hidden = !speakerAssignmentDebug;
@@ -5406,6 +5432,10 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
     focusedOpeningFallback = focusedFallbackToggle.checked;
     scheduleAdvancedSettingsSave();
   }
+  function onBestAvailableChanged() {
+    bestAvailableSpeaker = bestAvailableToggle.checked;
+    scheduleAdvancedSettingsSave();
+  }
   function onSkipNarrationChanged() {
     skipNarration = skipNarrationToggle.checked;
     scheduleAdvancedSettingsSave();
@@ -5425,6 +5455,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
         speakerShadowEvaluation,
         speakerRunReview,
         focusedOpeningFallback,
+        bestAvailableSpeaker,
         skipNarration
       );
       setStatus("Advanced playback settings saved globally.", "saved");
@@ -5900,6 +5931,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
         speakerShadowEvaluation,
         speakerRunReview,
         focusedOpeningFallback,
+        bestAvailableSpeaker,
         skipNarration
       );
     }
@@ -5918,6 +5950,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
     speakerShadowToggle.removeEventListener("change", onSpeakerShadowChanged);
     speakerRunToggle.removeEventListener("change", onSpeakerRunChanged);
     focusedFallbackToggle.removeEventListener("change", onFocusedFallbackChanged);
+    bestAvailableToggle.removeEventListener("change", onBestAvailableChanged);
     skipNarrationToggle.removeEventListener("change", onSkipNarrationChanged);
     addNpcInput.destroy();
     addNpcButton.removeEventListener("click", onAddNpc);

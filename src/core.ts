@@ -639,11 +639,12 @@ export interface PlaybackSegment {
   debugPath?: string[]
 }
 
-export type SpeakerAssignmentSource = 'first-pass' | 'contextual-confirmation' | 'contextual-review' | 'opening-exchange' | 'opening-backlink' | 'opening-forwardlink' | 'chain-fill' | 'chain-override' | 'discourse-fill' | 'discourse-override' | 'inheritance' | 'previous-assistant' | 'card-title' | 'role-fallback' | 'local-parser' | 'unreported'
+export type SpeakerAssignmentSource = 'best-available' | 'first-pass' | 'contextual-confirmation' | 'contextual-review' | 'opening-exchange' | 'opening-backlink' | 'opening-forwardlink' | 'chain-fill' | 'chain-override' | 'discourse-fill' | 'discourse-override' | 'inheritance' | 'previous-assistant' | 'card-title' | 'role-fallback' | 'local-parser' | 'unreported'
 
 /** Classify existing diagnostic traces without affecting speaker decisions. */
 export function speakerAssignmentSourceFromTrace(steps: readonly string[], localFallback: boolean): SpeakerAssignmentSource {
   const resolution = steps.find(step => step.startsWith('resolution:'))
+  if (resolution?.startsWith('resolution:best-available speaker')) return 'best-available'
   if (resolution?.startsWith('resolution:chain-identity (overrode')) return 'chain-override'
   if (resolution?.startsWith('resolution:chain-identity')) return 'chain-fill'
   if (resolution?.startsWith('resolution:discourse-identity (overrode')) return 'discourse-override'
@@ -3297,6 +3298,59 @@ export function invalidSpeakerReviewAnswers(questions: SpeakerDecisionPlan['ques
       || Object.entries(probabilities).some(([key, value]) => !Object.hasOwn(question.criteria, key) || !Number.isFinite(value) || value < 0 || value > 1)) return [id]
     return []
   })
+}
+
+/** A last-resort, scene-bounded guess. Results are never used as anchors. */
+export function buildBestAvailableSpeakerReview(plan: SpeakerDecisionPlan, answers: Record<string, SpeakerDecisionChoice>, context: RelationshipReviewContext) {
+  const text = `${plan.state.message}\n${context.previousMessages.slice(-2).map(item => item.text).join('\n')}`.toLocaleLowerCase()
+  const mentioned = (name: string) => {
+    const clean = name.trim().toLocaleLowerCase()
+    if (clean.length < 2) return false
+    const escaped = clean.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    return new RegExp(`(^|[^\\p{L}\\p{N}])${escaped}(?=$|[^\\p{L}\\p{N}])`, 'u').test(text)
+  }
+  const knownCriteria = speakerDecisionCriteria(plan.state.speakers.slice(0, 220))
+  const options: Record<string, string> = {}
+  const criteria: Record<string, string> = {}
+  for (const speaker of plan.state.speakers) {
+    if (speaker.id === USER_SPEAKER_ID) continue
+    const validated = plan.state.speeches.some(speech => (answers[`relationship_applied_${speech.id}`] || answers[`relationship_confirmed_${speech.id}`]) && evaluateSpeakerDecisionAnswer(answers[`speech_${speech.id}`], plan.optionSpeakerIds).identity === speaker.id)
+    if (!validated && !speaker.aliases.some(mentioned)) continue
+    options[speaker.option] = speaker.id
+    criteria[speaker.option] = knownCriteria[speaker.option]
+  }
+  for (const [index, ghost] of context.ghosts.slice(0, 20).entries()) {
+    if (![ghost.label, ...ghost.aliases].some(mentioned)) continue
+    const option = `best_ghost_${index}`
+    options[option] = `ghost:${ghost.id}`
+    criteria[option] = `Temporary character ${ghost.label || ghost.aliases.join(' / ')}; use context, not name alone.`
+  }
+  criteria.uncast_character = 'A distinct unnamed or uncast person is the most plausible speaker.'
+  criteria.no_clear_identity = 'No plausible speaker can be selected from the evidence.'
+  options.uncast_character = UNCAST_SPEAKER_ID
+  const questions: SpeakerDecisionPlan['questions'] = {}
+  for (const speech of plan.state.speeches) {
+    if (!answers[`global_uncertain_${speech.id}`]) continue
+    const speechCriteria = { ...criteria }
+    if (answers[`persona_confirmed_${speech.id}`]) {
+      const user = plan.state.speakers.find(speaker => speaker.id === USER_SPEAKER_ID)
+      if (user) { speechCriteria[user.option] = knownCriteria[user.option]; options[user.option] = USER_SPEAKER_ID }
+    }
+    questions[`best_guess_${speech.id}`] = { type: 'choice', criteria: speechCriteria, instructions: `For quotation ${speech.id}, select the most plausible actual speaker among the candidates, using the current scene and role-labeled previous messages, including user messages. Consider dialogue content, who addresses whom, pronouns, narrative actions, later attribution, scene and channel changes. A mentioned bystander or the author of a previous message is not automatically speaking. If evidence points to a different unnamed person choose uncast_character. If no candidate is plausible choose no_clear_identity. This is an explicitly uncertain best guess, not a validated identity.` }
+    if (Object.keys(questions).length >= 32) break
+  }
+  return { state: { ...plan.state, previousMessages: context.previousMessages, ghosts: context.ghosts }, questions, options }
+}
+
+export function applyBestAvailableSpeakerReview(plan: SpeakerDecisionPlan, answers: Record<string, SpeakerDecisionChoice>, review: ReturnType<typeof buildBestAvailableSpeakerReview>, results: Record<string, SpeakerDecisionChoice>): void {
+  for (const [id, question] of Object.entries(review.questions)) {
+    const answer = results[id]
+    if (invalidSpeakerReviewAnswers({ [id]: question }, { [id]: answer }).length || !Object.hasOwn(review.options, answer.choice) || answer.confidence < 0.2 || (answer.probabilities[answer.choice] ?? 0) < 0.25) continue
+    const speechId = id.slice('best_guess_'.length)
+    if (!answers[`global_uncertain_${speechId}`]) continue
+    plan.optionSpeakerIds[answer.choice] = review.options[answer.choice]
+    answers[id] = answer
+  }
 }
 
 /** A small, prior-only re-read for an unresolved opening exchange. */
@@ -6389,6 +6443,12 @@ export function resolveSpeakerDecisionSegments(
   const speechIdentities = firstPassSpeechIdentities.map((identity, index) => {
     const speech = plan.state.speeches[index]
     if (options.evidenceOnly && answers[`global_uncertain_${speech.id}`]) {
+      const guessed = answers[`best_guess_${speech.id}`]
+      const guessedIdentity = guessed ? plan.optionSpeakerIds[guessed.choice] : null
+      if (guessedIdentity) {
+        discoursePathBySpeechIndex.set(index, 'resolution:best-available speaker (low-confidence guess; not an anchor)')
+        return guessedIdentity
+      }
       discoursePathBySpeechIndex.set(index, 'resolution:global-context unresolved (chain fill suppressed)')
       return undefined
     }
@@ -6613,6 +6673,7 @@ export function resolveSpeakerDecisionSegments(
           ...decisionAnswerDebug('jev-opening-exchange-pattern', answers[`opening_pattern_${speech.id}`], { single_speaker: 'single_speaker', multiple_speakers: 'multiple_speakers' }),
           ...decisionAnswerDebug('jev-opening-exchange-speaker', answers[`opening_speaker_${speech.id}`], plan.optionSpeakerIds),
           ...(answers[`global_uncertain_${speech.id}`] ? ['jev-global-review:uncertain; unsupported identity and chain fill suppressed'] : []),
+          ...decisionAnswerDebug('jev-best-available-guess', answers[`best_guess_${speech.id}`], plan.optionSpeakerIds),
           ...decisionAnswerDebug('jev-user-review-original', answers[`user_review_original_${speech.id}`], plan.optionSpeakerIds),
           ...decisionAnswerDebug('jev-user-review', answers[`user_review_${speech.id}`], plan.optionSpeakerIds),
           ...(answers[`user_review_applied_${speech.id}`] ? ['jev-user-review:strong alternative applied'] : []),

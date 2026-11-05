@@ -30,6 +30,8 @@ import {
   buildOpeningBacklinkReview,
   buildContrastiveOpeningLinkReview,
   applyFocusedOpeningFallback,
+  buildBestAvailableSpeakerReview,
+  applyBestAvailableSpeakerReview,
   applyOpeningBacklinkReview,
   invalidSpeakerReviewAnswers,
   applyRelationshipSpeakerReview,
@@ -2923,6 +2925,37 @@ test('backward links require a strong independent same-speaker answer and a vali
   assert.equal(buildOpeningBacklinkReview(changedScene, sceneAnswers, context, null), null)
   const explicitlyDifferent = buildSpeakerDecisionPlan('"First," Ken says.\n\n"Second," Ewan says.', speakers, false)
   assert.equal(buildOpeningBacklinkReview(explicitlyDifferent, sceneAnswers, context, null), null)
+})
+
+test('best-available guesses use scene candidates and never become validated anchors', () => {
+  const speakers = [{ id: 'npc:ewan', name: 'Ewan' }, { id: 'npc:absent', name: 'Absent' }, { id: USER_SPEAKER_ID, name: 'Ken' }]
+  const plan = buildSpeakerDecisionPlan('"Sacrifice."\n\nHe holds a tray.\n\n"The noodles?"', speakers, false)
+  const answers: Record<string, SpeakerDecisionChoice> = { speech_s0: confidentDecision('no_clear_identity'), global_uncertain_s0: confidentDecision('no_clear_identity'), speech_s1: confidentDecision('no_clear_identity'), global_uncertain_s1: confidentDecision('no_clear_identity') }
+  const review = buildBestAvailableSpeakerReview(plan, answers, { previousMessages: [{ id: 'prior', role: 'user' as const, text: 'I turn to Ewan. "Sometimes you sacrifice."' }], ghosts: [] })
+  assert.ok(review.questions.best_guess_s0.criteria.known_0)
+  assert.equal(review.questions.best_guess_s0.criteria.known_1, undefined)
+  assert.equal(review.questions.best_guess_s0.criteria.known_2, undefined)
+  assert.ok(review.questions.best_guess_s0.criteria.uncast_character)
+  applyBestAvailableSpeakerReview(plan, answers, review, { best_guess_s0: { choice: 'known_0', probabilities: { known_0: 0.4, no_clear_identity: 0.3, uncast_character: 0.3 }, confidence: 0.3 } })
+  assert.ok(answers.global_uncertain_s0)
+  assert.equal(answers.relationship_applied_s0, undefined)
+  const segments = resolveSpeakerDecisionSegments(plan.state.message, plan, answers, speakers, { isUserMessage: false, cardSpeakerId: null, historicalSpeakerId: null, evidenceOnly: true, includeDebug: true })
+  const speech = segments.filter(segment => segment.speakerId !== null)
+  assert.equal(speech[0].speakerId, 'npc:ewan')
+  assert.equal(speech[1].speakerId, UNRESOLVED_SPEAKER_ID)
+  assert.ok(speech[0].debugPath?.some(step => step.includes('low-confidence guess; not an anchor')))
+  assert.equal(buildOpeningBacklinkReview(plan, answers, { previousMessages: [{ id: 'prior', role: 'user', text: 'I turn to Ewan.' }], ghosts: [] }, null), null)
+  const uncastAnswers: Record<string, SpeakerDecisionChoice> = { speech_s0: confidentDecision('no_clear_identity'), global_uncertain_s0: confidentDecision('no_clear_identity') }
+  applyBestAvailableSpeakerReview(plan, uncastAnswers, review, { best_guess_s0: { choice: 'uncast_character', probabilities: { uncast_character: 0.6, no_clear_identity: 0.4 }, confidence: 0.4 } })
+  const uncast = resolveSpeakerDecisionSegments(plan.state.message, plan, uncastAnswers, speakers, { isUserMessage: false, cardSpeakerId: null, historicalSpeakerId: null, evidenceOnly: true })
+  assert.equal(uncast.find(segment => segment.speakerId !== null)?.speakerId, UNCAST_SPEAKER_ID)
+  const unknownAnswers: Record<string, SpeakerDecisionChoice> = { speech_s0: confidentDecision('no_clear_identity'), global_uncertain_s0: confidentDecision('no_clear_identity') }
+  applyBestAvailableSpeakerReview(plan, unknownAnswers, review, { best_guess_s0: { choice: 'no_clear_identity', probabilities: { no_clear_identity: 1 }, confidence: 1 } })
+  assert.equal(unknownAnswers.best_guess_s0, undefined)
+  applyBestAvailableSpeakerReview(plan, unknownAnswers, review, { best_guess_s0: { choice: 'known_2', probabilities: { known_2: 1 }, confidence: 1 } })
+  assert.equal(unknownAnswers.best_guess_s0, undefined)
+  const ghostReview = buildBestAvailableSpeakerReview(plan, unknownAnswers, { previousMessages: [{ id: 'prior', role: 'user', text: 'Mira returns to the table.' }], ghosts: [{ id: 'mira', label: 'Mira', aliases: ['Mira'], context: 'Friend at the table', conversationHistory: [] }] })
+  assert.equal(ghostReview.options.best_ghost_0, 'ghost:mira')
 })
 
 test('focused shadow compares the earlier unnamed reply to a validated later anchor', () => {
