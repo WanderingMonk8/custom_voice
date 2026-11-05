@@ -2493,6 +2493,46 @@ test('global review avoids scene-wide inheritance and treats card as context onl
   assert.equal(resolveSpeakerDecisionSegments(failed.state.message, failed, failedAnswers, speakers, { isUserMessage: false, cardSpeakerId: null, historicalSpeakerId: null, evidenceOnly: true }).find(segment => segment.text === 'What now?')?.speakerId, null)
 })
 
+test('scene references link Ewan to the tray without making a bystander the speaker', () => {
+  const content = '"Sacrifice."\n\nHe is ten paces off with the tray, and he turns halfway around.\n\n"What are you sacrificing?"\n\nSomebody behind him sidesteps the tray. He shifts without looking.\n\n"No, I know what you meant."'
+  const speakers = [{ id: 'npc:ewan', name: 'Ewan' }, { id: 'npc:tessa', name: 'Tessa' }, { id: USER_SPEAKER_ID, name: 'Ken' }]
+  const context = { previousMessages: [{ id: 'earlier', role: 'assistant' as const, text: 'Ewan picks up his tray.' }, { id: 'prior', role: 'user' as const, text: 'I turn to Ewan. "Sometimes you have to sacrifice for someone you like."' }], ghosts: [] }
+  const make = () => {
+    const plan = buildSpeakerDecisionPlan(content, speakers, false)
+    const answers: Record<string, SpeakerDecisionChoice> = { speech_s0: confidentDecision('no_clear_identity'), speech_s1: confidentDecision('no_clear_identity'), speech_s2: confidentDecision('no_clear_identity') }
+    const review = buildRelationshipSpeakerReview(plan, answers, context, null, { cardSpeakerId: null, targets: ['s0', 's1', 's2'] })
+    return { plan, answers, review }
+  }
+  const { plan, answers, review } = make()
+  assert.ok(review.questions.scene_reference_s0)
+  assert.ok(review.questions.scene_secondary_s1)
+  assert.ok(review.questions.scene_link_s0)
+  assert.match(review.state.sceneReferences!.find(item => item.speechId === 's0')!.narration, /tray/u)
+  assert.equal(review.state.previousMessages[1].role, 'user')
+  applyRelationshipSpeakerReview(plan, answers, {
+    relationship_s0: confidentDecision('no_clear_identity'),
+    scene_reference_s0: confidentDecision('known_0'),
+    scene_link_s0: confidentDecision('same_speaker'),
+    relationship_s1: confidentDecision('known_0'),
+    scene_reference_s2: confidentDecision('known_1'),
+    scene_link_s2: confidentDecision('different_person'),
+  }, review.ghostOptions, null, null, true)
+  assert.equal(answers.speech_s0.choice, 'known_0')
+  assert.equal(answers.speech_s1.choice, 'known_0')
+  assert.equal(answers.speech_s2.choice, 'no_clear_identity')
+  assert.ok(answers.scene_applied_s0)
+  const resolved = resolveSpeakerDecisionSegments(content, plan, answers, speakers, { isUserMessage: false, cardSpeakerId: null, historicalSpeakerId: null, evidenceOnly: true, includeDebug: true })
+  assert.equal(resolved.find(segment => segment.text === 'Sacrifice.')?.speakerId, 'npc:ewan')
+  assert.ok(resolved.find(segment => segment.text === 'Sacrifice.')?.debugPath?.some(item => item.includes('jev-scene-link')))
+  const unlinked = make()
+  applyRelationshipSpeakerReview(unlinked.plan, unlinked.answers, { scene_reference_s0: confidentDecision('known_0'), scene_link_s0: confidentDecision('no_clear_identity') }, unlinked.review.ghostOptions, null, null, true)
+  assert.equal(unlinked.answers.speech_s0.choice, 'no_clear_identity')
+  const contradictory = make()
+  applyRelationshipSpeakerReview(contradictory.plan, contradictory.answers, { relationship_s0: confidentDecision('known_1'), scene_reference_s0: confidentDecision('known_0'), scene_link_s0: confidentDecision('same_speaker') }, contradictory.review.ghostOptions, null, null, true)
+  assert.equal(contradictory.answers.speech_s0.choice, 'known_1')
+  assert.equal(contradictory.answers.scene_applied_s0, undefined)
+})
+
 test('relationship review keeps explicit attributions and rejects weak changes', () => {
   const content = '"Hello," Tessa says. "Someone is calling."'
   const speakers = [{ id: 'npc:tessa', name: 'Tessa' }, { id: USER_SPEAKER_ID, name: 'Ken' }]

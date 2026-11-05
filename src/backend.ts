@@ -1076,7 +1076,7 @@ function queueSpeakerParse(
           })),
           cardSpeakerId: titleMatchedCardSpeakerId,
           historicalSpeakerId,
-          relationshipReview: { version: 'global-context-1', context: relationshipContext, speakerLookback },
+          relationshipReview: { version: 'global-context-scene-2', context: relationshipContext, speakerLookback },
           skippedTrackerTags,
         }))
         const cached = config.parsedMessages[payload.messageId]

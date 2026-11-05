@@ -1726,6 +1726,7 @@ function relationshipReviewContext(messages, targetId, ghosts, skippedTags = "",
 function buildRelationshipSpeakerReview(plan, answers, context, continuitySpeakerId = null, globalOptions) {
   const questions = {};
   const ghostOptions = {};
+  const sceneReferences = [];
   const speakers = plan.state.speakers.map((speaker) => ({ id: speaker.id, name: speaker.name }));
   const criteria = speakerDecisionCriteria(plan.state.speakers.slice(0, 220));
   const remaining = Math.max(0, 255 - Object.keys(criteria).length);
@@ -1749,7 +1750,29 @@ function buildRelationshipSpeakerReview(plan, answers, context, continuitySpeake
         instructions: `Who actually speaks quotation ${speech.id}? Compare names, actions and pronoun references in the current exchange with the earlier conversations and relevant relationships. Distinguish speakers from people addressed or mentioned, bystanders, and a caller or text sender from the person holding the phone. Pronouns are evidence, not proof of gender or identity. Consider whether a call or text thread continues, a different participant appears, or a person later arrives in person. Prefer explicit local attribution and select no_clear_identity when the evidence is insufficient.`,
         criteria
       };
-      if (Object.keys(questions).length >= 32) break;
+      if (globalOptions) {
+        const paragraphIndex = plan.state.paragraphs.findIndex((paragraph2) => paragraph2.id === speech.paragraphId);
+        const narration = plan.state.paragraphs.slice(Math.max(0, paragraphIndex - 1), paragraphIndex + 2).map((paragraph2) => cleanPlaybackText(narrativeOnly(paragraph2.text))).filter(Boolean).join("\n").slice(0, 2e3);
+        if (narration) {
+          sceneReferences.push({ speechId: speech.id, narration, quotation: speech.text });
+          questions[`scene_reference_${speech.id}`] = {
+            type: "choice",
+            instructions: `In sceneReferences for ${speech.id}, identify the person whose actions or pronouns are the immediate focus of the supplied narration. Use previousMessages to resolve references such as who carried an object. This asks who acts in narration, not who speaks; the actor may instead be an addressee or a bystander. If several people could be the focus or the identity is unclear, select no_clear_identity.`,
+            criteria
+          };
+          questions[`scene_secondary_${speech.id}`] = {
+            type: "choice",
+            instructions: `In sceneReferences for ${speech.id}, is another distinct person explicitly acting in the supplied narration, such as an addressee or bystander? Identify that other person, not the focal actor; if no other person has a clear known identity, choose no_clear_identity. Do not assume that person is speaking.`,
+            criteria
+          };
+          questions[`scene_link_${speech.id}`] = {
+            type: "choice",
+            instructions: `In sceneReferences for ${speech.id}, does the person who is the immediate focus of the supplied narration actually speak this quotation? Compare dialogue, actions, pronouns, preceding user and assistant messages, turn changes and channels. A person mentioned, addressed, or passing by is not automatically speaking. Only choose same_speaker when the connection is clear; otherwise choose different_person or unclear.`,
+            criteria: { same_speaker: "The focal narrative actor is the person speaking this quotation.", different_person: "The focal narrative actor is another person, such as an addressee or bystander.", no_clear_identity: "The relationship between the actor and speaker is uncertain." }
+          };
+        }
+      }
+      if (Object.keys(questions).filter((id) => id.startsWith("relationship_s")).length >= 32) break;
     }
   }
   const continuityOption = continuitySpeakerId ? plan.state.speakers.find((speaker) => speaker.id === continuitySpeakerId)?.option : void 0;
@@ -1760,10 +1783,11 @@ function buildRelationshipSpeakerReview(plan, answers, context, continuitySpeake
       criteria: { no_clear_identity: "The scene has multiple speakers or the identity is uncertain.", ...Object.fromEntries([...Object.keys(ghostOptions), ...continuityOption ? [continuityOption] : []].map((option) => [option, criteria[option]])) }
     };
   }
-  return { state: { ...plan.state, previousMessages: context.previousMessages, ghosts: context.ghosts, ...globalOptions ? { cardSpeakerPrior: globalOptions.cardSpeakerId, contextPolicy: "Earlier messages are evidence, not automatic speaker assignments. A single-character card is a weak preference only. Distinguish user and assistant roles. Never assume a person is speaking merely because they spoke last." } : {} }, questions, ghostOptions };
+  return { state: { ...plan.state, previousMessages: context.previousMessages, ghosts: context.ghosts, ...globalOptions ? { sceneReferences, cardSpeakerPrior: globalOptions.cardSpeakerId, contextPolicy: "Earlier messages are evidence, not automatic speaker assignments. A single-character card is a weak preference only. Distinguish user and assistant roles. Never assume a person is speaking merely because they spoke last." } : {} }, questions, ghostOptions };
 }
 function applyRelationshipSpeakerReview(plan, answers, reviewed, ghostOptions, cardSpeakerId = null, continuitySpeakerId = null, globalMode = false) {
   const options = { ...plan.optionSpeakerIds, ...ghostOptions };
+  if (globalMode) Object.assign(plan.optionSpeakerIds, ghostOptions);
   const scene = reviewed.relationship_scene;
   const sceneEvaluation = scene ? evaluateSpeakerDecisionAnswer(scene, options, { probability: 0.6, confidence: 0.45, margin: 0.3 }) : null;
   const sceneOptionIdentity = scene ? options[scene.choice] : null;
@@ -1788,6 +1812,28 @@ function applyRelationshipSpeakerReview(plan, answers, reviewed, ghostOptions, c
     const result = reviewed[`relationship_${speech.id}`];
     const original = answers[`speech_${speech.id}`];
     const originalIdentity = evaluateSpeakerDecisionAnswer(original, plan.optionSpeakerIds).identity;
+    if (globalMode) {
+      const reference = reviewed[`scene_reference_${speech.id}`];
+      const secondary = reviewed[`scene_secondary_${speech.id}`];
+      const link = reviewed[`scene_link_${speech.id}`];
+      if (reference) answers[`scene_reference_${speech.id}`] = reference;
+      if (secondary) answers[`scene_secondary_${speech.id}`] = secondary;
+      if (link) answers[`scene_link_${speech.id}`] = link;
+      const referenceIdentity = evaluateSpeakerDecisionAnswer(reference, options, { probability: 0.8, confidence: 0.75, margin: 0.3 }).identity;
+      const linkIdentity = evaluateSpeakerDecisionAnswer(link, { same_speaker: "same_speaker", different_person: "different_person" }, { probability: 0.85, confidence: 0.8, margin: 0.3 }).identity;
+      const speechIdentity = evaluateSpeakerDecisionAnswer(result, options).identity;
+      if ((!originalIdentity || originalIdentity === UNCAST_SPEAKER_ID) && reference && referenceIdentity && referenceIdentity !== UNCAST_SPEAKER_ID && linkIdentity === "same_speaker" && (!speechIdentity || speechIdentity === referenceIdentity)) {
+        Object.assign(plan.optionSpeakerIds, ghostOptions);
+        if (original) answers[`relationship_original_${speech.id}`] = original;
+        if (result) answers[`relationship_review_${speech.id}`] = result;
+        answers[`speech_${speech.id}`] = reference;
+        answers[`relationship_applied_${speech.id}`] = reference;
+        answers[`relationship_global_${speech.id}`] = reference;
+        answers[`relationship_continuity_${speech.id}`] = reference;
+        answers[`scene_applied_${speech.id}`] = reference;
+        continue;
+      }
+    }
     const chosen = globalMode ? null : preferredCard || inherited || (sceneIdentity && !conflictingAttribution && !conflictingTurn ? scene : null);
     if (chosen) {
       Object.assign(plan.optionSpeakerIds, ghostOptions);
@@ -3788,6 +3834,10 @@ function resolveSpeakerDecisionSegments(content, plan, answers, speakers, option
           ...decisionAnswerDebug("jev-speech", answer, plan.optionSpeakerIds),
           ...decisionAnswerDebug("jev-relationship-original", answers[`relationship_original_${speech.id}`], plan.optionSpeakerIds),
           ...decisionAnswerDebug("jev-relationship-review", answers[`relationship_review_${speech.id}`], plan.optionSpeakerIds),
+          ...decisionAnswerDebug("jev-scene-reference", answers[`scene_reference_${speech.id}`], plan.optionSpeakerIds),
+          ...decisionAnswerDebug("jev-scene-secondary", answers[`scene_secondary_${speech.id}`], plan.optionSpeakerIds),
+          ...decisionAnswerDebug("jev-scene-link", answers[`scene_link_${speech.id}`], { same_speaker: "same_speaker", different_person: "different_person" }),
+          ...answers[`scene_applied_${speech.id}`] ? ["jev-scene-reference:actor linked to this speech by independent review"] : [],
           ...answers[`relationship_inherited_${speech.id}`] ? ["jev-relationship-review:inherited established previous speaker"] : [],
           ...answers[`relationship_applied_${speech.id}`] ? ["jev-relationship-review:strong alternative applied"] : [],
           ...decisionAnswerDebug("jev-user-review-original", answers[`user_review_original_${speech.id}`], plan.optionSpeakerIds),
@@ -4679,7 +4729,7 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
           })),
           cardSpeakerId: titleMatchedCardSpeakerId,
           historicalSpeakerId,
-          relationshipReview: { version: "global-context-1", context: relationshipContext, speakerLookback },
+          relationshipReview: { version: "global-context-scene-2", context: relationshipContext, speakerLookback },
           skippedTrackerTags
         }));
         const cached = config.parsedMessages[payload.messageId];
