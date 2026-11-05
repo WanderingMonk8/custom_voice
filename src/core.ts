@@ -1363,7 +1363,7 @@ const PREPOSITION_WORDS = [
 const NON_NAME_PARAGRAPH_LEADS = new Set<string>([
   ...PREPOSITION_WORDS,
   'a', 'an', 'although', 'and', 'because', 'but', 'he', 'her', 'here', 'his', 'if',
-  'it', 'its', 'or', 'she', 'so', 'somewhere', 'that', 'the', 'their', 'then',
+  'it', 'its', 'or', 'she', 'so', 'somebody', 'someone', 'anybody', 'anyone', 'nobody', 'noone', 'everybody', 'everyone', 'somewhere', 'that', 'the', 'their', 'then',
   'there', 'they', 'this', 'those', 'though', 'unless', 'we', 'when', 'where',
   'whereas', 'whether', 'while', 'who', 'whom', 'whose', 'you', 'your',
 ])
@@ -2742,14 +2742,14 @@ export function buildSpeakerDecisionPlan(
   for (const paragraph of stateParagraphs) {
     questions[`paragraph_${paragraph.id}`] = {
       type: 'choice',
-      instructions: `Which identity is locally established as the acting or speaking subject of paragraph ${paragraph.id}? Judge the paragraph's narration together with any quotations in it, not card or history preference.`,
+      instructions: `Which identity is locally established as the acting or speaking subject of paragraph ${paragraph.id}? Judge narration and quotations, including named subjects and pronoun references across nearby paragraphs and earlier conversation. Distinguish speakers from people addressed or mentioned; use pronouns as contextual evidence, not proof of gender or identity. Do not prefer a card or historical speaker without evidence.`,
       criteria,
     }
   }
   for (const speech of stateSpeeches) {
     questions[`speech_${speech.id}`] = {
       type: 'choice',
-      instructions: `Who speaks quotation ${speech.id}? Use the quotation, the narration before and after it, short narration between quotations, attribution, action ownership, pronouns, and dialogue flow. Do not prefer a known speaker merely because they are listed.`,
+      instructions: `Who speaks quotation ${speech.id}? Use the quotation, narration before and after it, the previous assistant messages, name and pronoun references, action ownership, and dialogue flow. Follow a person's actions across messages and distinguish the speaker from a person addressed or a bystander. Consider phone calls and incoming text messages as separate channels. Pronouns are contextual clues, not proof of gender or identity; choose no_clear_identity if the link is uncertain. Do not prefer a known speaker merely because they are listed.`,
       criteria,
     }
   }
@@ -3050,7 +3050,7 @@ export function buildRelationshipSpeakerReview(plan: SpeakerDecisionPlan, answer
       if (local.identity && local.identity !== UNCAST_SPEAKER_ID && !conflict && !phoneExchange) continue
       questions[`relationship_${speech.id}`] = {
         type: 'choice',
-        instructions: `Who actually speaks quotation ${speech.id}? Compare the current exchange with the earlier conversations and relevant relationships. Distinguish speakers from people addressed or mentioned, and a caller from the person holding the phone. Consider whether a call continues, a different caller appears, or a person later arrives in person. Prefer explicit local attribution and select no_clear_identity when the evidence is insufficient.`,
+        instructions: `Who actually speaks quotation ${speech.id}? Compare names, actions and pronoun references in the current exchange with the earlier conversations and relevant relationships. Distinguish speakers from people addressed or mentioned, bystanders, and a caller or text sender from the person holding the phone. Pronouns are evidence, not proof of gender or identity. Consider whether a call or text thread continues, a different participant appears, or a person later arrives in person. Prefer explicit local attribution and select no_clear_identity when the evidence is insufficient.`,
         criteria,
       }
       if (Object.keys(questions).length >= 32) break
@@ -5323,7 +5323,7 @@ export function assessSpeakerDiscourseEscalation(
     for (const speechId of run.targets) {
       questions[`discourse_${speechId}`] = {
         type: 'choice',
-        instructions: `Who speaks quotation ${speechId} in dialogue run ${run.id}? Use the complete dialogue sequence, response relationships, turn continuity, channel changes, and both boundary anchors. First-pass answers are evidence, not fixed answers. Do not alternate speakers from paragraph order alone.`,
+        instructions: `Who speaks quotation ${speechId} in dialogue run ${run.id}? Use the complete dialogue sequence, names, action ownership, pronoun references, response relationships, turn continuity, channel changes, and both boundary anchors. Distinguish speakers from addressees and bystanders. Pronouns are contextual clues, not proof of gender or identity. First-pass answers are evidence, not fixed answers. Do not alternate speakers from paragraph order alone.`,
         criteria,
       }
     }
@@ -5932,6 +5932,9 @@ export function resolveSpeakerDecisionSegments(
   let processedParagraphIndex = -1
   for (let index = 0; index < plan.state.speeches.length; index += 1) {
     const speech = plan.state.speeches[index]
+    const turnAnswer = answers[`turn_${speech.id}`]
+    const clearSpeakerSwitch = turnAnswer?.choice === TURN_RESPOND_OPTION
+      && turnAnswer.confidence >= 0.65 && (turnAnswer.probabilities[TURN_RESPOND_OPTION] ?? 0) >= 0.7
     const currentParagraphIndex = Number.parseInt(speech.paragraphId.slice(1), 10)
     while (processedParagraphIndex < currentParagraphIndex) {
       processedParagraphIndex += 1
@@ -5942,6 +5945,10 @@ export function resolveSpeakerDecisionSegments(
       }
     }
     const direct = routingIdentities[index]
+    if (clearSpeakerSwitch && direct === undefined) {
+      upstreamIdentity = null
+      upstreamSource = 'speaker-switch'
+    }
     let speakerId: string | null
     if (direct !== undefined) {
       speakerId = direct
@@ -5952,11 +5959,11 @@ export function resolveSpeakerDecisionSegments(
           ?? chainPathBySpeechIndex.get(index)
           ?? 'resolution:direct-speech-identity',
       ])
-    } else if (upstreamIdentity) {
+    } else if (upstreamIdentity && !clearSpeakerSwitch) {
       speakerId = upstreamIdentity
       resolutionPaths.push([`resolution:upstream-identity (${upstreamSource})`])
     } else if (
-      options.historicalSpeakerId
+      options.historicalSpeakerId && !clearSpeakerSwitch
       && (
         routingIdentities.slice(index + 1).some(identity => identity !== undefined)
         || plan.state.paragraphs.slice(currentParagraphIndex + 1)
@@ -5972,7 +5979,7 @@ export function resolveSpeakerDecisionSegments(
           ? 'resolution:unique card-title match (uncast identity had no explicit role cue)'
           : 'resolution:unique card-title match (no local known or uncast identity)',
       ])
-    } else if (!hasLocalIdentity && options.historicalSpeakerId) {
+    } else if (!hasLocalIdentity && options.historicalSpeakerId && !clearSpeakerSwitch) {
       speakerId = options.historicalSpeakerId
       resolutionPaths.push(['resolution:previous-assistant identity (no local identity or card match)'])
     } else {
@@ -6490,6 +6497,28 @@ export function previousAssistantSpeakerFallback(
     }
   }
   if (!previousSpeakerId) return null
+
+  // A previous speaker is only a fallback, not evidence that the person in a
+  // new opening scene is the same person. Compare explicit subject pronouns
+  // near the name; never infer gender from the name or from a voice category.
+  const previousSpeaker = speakers.find(speaker => speaker.id === previousSpeakerId)
+  const aliases = previousSpeaker ? speakerAliases(previousSpeaker.name) : []
+  let priorPronoun: string | null = null
+  for (let index = 0; index < previousParagraphs.length; index++) {
+    const paragraph = previousParagraphs[index]
+    const narrative = narrativeOnly(paragraph.text)
+    if (!aliases.some(alias => new RegExp(`\\b${escapedPattern(alias)}\\b`, 'iu').test(narrative))) continue
+    const pronouns = new Set([...narrative.matchAll(/\b(he|she|they)\b/giu)].map(match => match[1].toLowerCase()))
+    if (pronouns.size === 1) priorPronoun = [...pronouns][0]
+    else if (pronouns.size === 0) {
+      const following = narrativeOnly(previousParagraphs[index + 1]?.text ?? '').trimStart().match(/^(he|she|they)\b/iu)
+      if (following) priorPronoun = following[1].toLowerCase()
+    }
+  }
+  const opening = playbackContent.slice(0, Math.min(playbackContent.length, (quoteMatches[1]?.start ?? quoteMatches[0].end) + 300))
+  const openingNarration = narrativeOnly(opening)
+  const openingPronouns = new Set([...openingNarration.matchAll(/\b(he|she|they)\b/giu)].map(match => match[1].toLowerCase()))
+  if (priorPronoun && openingPronouns.size === 1 && !openingPronouns.has(priorPronoun)) return null
 
   let hasOpeningContinuity = false
   let openingContinuityEnd = 0

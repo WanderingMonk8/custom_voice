@@ -1122,7 +1122,7 @@ function queueSpeakerParse(
           })),
           cardSpeakerId: titleMatchedCardSpeakerId,
           historicalSpeakerId,
-          relationshipReview: { version: 'relationship-review-10', context: relationshipContext, continuitySpeakerId, speakerLookback },
+          relationshipReview: { version: 'relationship-review-11', context: relationshipContext, continuitySpeakerId, speakerLookback },
           previousAssistantMessageId: previousAssistantMessage?.id ?? null,
           skippedTrackerTags,
         }))
@@ -1142,7 +1142,7 @@ function queueSpeakerParse(
           : null
         try {
           const result = await spindle.decisions.evaluate({
-            state: decisionPlan.state,
+            state: { ...decisionPlan.state, previousMessages: relationshipContext.previousMessages },
             questions: decisionPlan.questions,
             ...(userId ? { userId } : {}),
           })

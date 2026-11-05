@@ -4280,6 +4280,30 @@ test('inherits an identity-free single speaker from the previous assistant messa
   )
 })
 
+test('does not inherit the previous speaker across conflicting explicit subject pronouns', () => {
+  const speakers = [{ id: 'npc:ewan', name: 'Ewan' }, { id: 'unconfigured:tessa', name: 'Tessa' }]
+  const previous = 'Ewan picks up his tray. "I am going."\n\nTessa puts her bowl down. She frowns. "Talk about something else."'
+  const current = '"Sacrifice."\n\nHe turns halfway back with the tray balanced on one palm.\n\n"What are you sacrificing?"\n\nHe shifts his weight.\n\n"Text her."'
+  assert.equal(previousAssistantSpeakerFallback(current, previous, null, speakers), null)
+  assert.ok(!addUnconfiguredDialogueSpeakers('Somebody behind him sidesteps the tray. Somebody moves. "Hello."', speakers).some(speaker => speaker.name === 'Somebody'))
+})
+
+test('speaker questions ask Jev to use names, pronouns and communication channels', () => {
+  const plan = buildSpeakerDecisionPlan('"Hello."', [{ id: 'npc:ewan', name: 'Ewan' }], false)
+  assert.match(plan.questions.speech_s0.instructions, /pronoun references/u)
+  assert.match(plan.questions.speech_s0.instructions, /text messages/u)
+  assert.match(plan.questions.speech_s0.instructions, /not proof of gender/u)
+})
+
+test('a clear response turn stops automatic carryover of the preceding speaker', () => {
+  const content = '"Hello."\n\nThe other person looks up.\n\n"What now?"'
+  const speakers = [{ id: 'npc:tessa', name: 'Tessa' }]
+  const plan = buildSpeakerDecisionPlan(content, speakers, false)
+  const answers: Record<string, SpeakerDecisionChoice> = { speech_s0: confidentDecision('known_0'), speech_s1: confidentDecision('no_clear_identity'), turn_s1: confidentDecision('responds_to_previous_speaker') }
+  const result = resolveSpeakerDecisionSegments(content, plan, answers, speakers, { isUserMessage: false, cardSpeakerId: null, historicalSpeakerId: 'npc:tessa' })
+  assert.notEqual(result.find(segment => segment.text === 'What now?')?.speakerId, 'npc:tessa')
+})
+
 test('prefers the sole character card for an unattributed assistant message', () => {
   const speakers = [
     { id: 'card-zuri', name: 'Zuri Vale / Zuri' },
