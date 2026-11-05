@@ -1982,12 +1982,20 @@ function buildBoundaryExchangeShadowReview(review) {
       instructions: `Identify who actually speaks ${speechId} in the current opening. Read the complete previous exchange and current opening as a conversation: track who addresses whom across the message boundary, who responds, who continues, and whether another person interrupts. Consider narration, pronouns, actions, topic and later clarification together. A repeated word may be a response to the earlier message, not the immediately preceding quotation. A person mentioned or addressed is not necessarily the speaker. Choose no_clear_identity if the evidence does not establish the speaker.`,
       criteria: review.questions[id].criteria
     };
+    questions[`retrospective_${speechId}`] = {
+      type: "choice",
+      instructions: `Identify the actual speaker of ${speechId} in the current opening. First read the entire opening and preceding exchange, then re-read ${speechId} in light of later explicit names, self-introductions, speech attributions, actions, pronouns and continuity of conversation. A later named speaker may clarify an earlier unnamed speaker, but do not assume they are the same: check for interruptions, speaker changes, new arrivals, scene and channel changes, and narration identifying someone else. People addressed or mentioned are not necessarily speaking. Choose no_clear_identity when the evidence does not establish the speaker.`,
+      criteria: review.questions[id].criteria
+    };
   }
   const controls = [
     { id: "boundary_control_continuation", prior: 'I turn to Mira. "Sometimes you sacrifice for a friend."', current: '"Sacrifice." Mira turns with her tray. "What are you sacrificing? The noodles?" A stranger steps aside. "No, I know what you mean."', target: "What are you sacrificing? The noodles?" },
     { id: "boundary_control_interruption", prior: 'I turn to Mira. "Sometimes you sacrifice for a friend."', current: '"Sacrifice," Mira says. Rowan steps between us. "What are you sacrificing? The noodles?" he asks. Mira shakes her head.', target: "What are you sacrificing? The noodles?" },
     { id: "boundary_control_reply", prior: 'I turn to Mira. "Are you coming?"', current: '"Yes," Mira says. Rowan sets down his cup. "I am staying," he replies.', target: "I am staying," },
-    { id: "boundary_control_unclear", prior: 'I turn to Mira. "Are you coming?"', current: '"Maybe." A door opens. "I am staying."', target: "I am staying." }
+    { id: "boundary_control_unclear", prior: 'I turn to Mira. "Are you coming?"', current: '"Maybe." A door opens. "I am staying."', target: "I am staying." },
+    { id: "retrospective_control_introduction", prior: 'I ask the woman, "Where do you live?"', current: '"Bishop. Third floor." She balances her tray. "It is noisy, though." She sits down. "Mira. Mira Lee. Nice to meet you."', target: "Bishop. Third floor." },
+    { id: "retrospective_control_interruption", prior: 'I ask the woman, "Where do you live?"', current: '"Bishop. Third floor," Rowan answers. The woman sets her tray down. "Mira. Mira Lee. Nice to meet you," she says.', target: "Bishop. Third floor," },
+    { id: "retrospective_control_unclear", prior: 'I ask the group, "Where do you live?"', current: '"Bishop. Third floor." Someone moves behind the table. "Mira. Mira Lee," the woman says.', target: "Bishop. Third floor." }
   ];
   for (const control of controls) questions[control.id] = {
     type: "choice",
@@ -1998,7 +2006,8 @@ function buildBoundaryExchangeShadowReview(review) {
     state: { previousMessages: review.state.previousMessages, message: review.state.message, paragraphs: review.state.paragraphs, speeches: review.state.speeches, boundaryEvidence: review.state.boundaryEvidence, controls },
     questions,
     targetIds: targets.map((id) => `boundary_${id.slice("relationship_".length)}`),
-    expectedControls: { boundary_control_continuation: "mira", boundary_control_interruption: "rowan", boundary_control_reply: "rowan", boundary_control_unclear: "no_clear_identity" }
+    retrospectiveTargetIds: targets.map((id) => `retrospective_${id.slice("relationship_".length)}`),
+    expectedControls: { boundary_control_continuation: "mira", boundary_control_interruption: "rowan", boundary_control_reply: "rowan", boundary_control_unclear: "no_clear_identity", retrospective_control_introduction: "mira", retrospective_control_interruption: "rowan", retrospective_control_unclear: "no_clear_identity" }
   };
 }
 function applyOpeningExchangeReview(plan, answers, reviewed) {
@@ -5288,8 +5297,9 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
                   for (const [id, answer] of Object.entries(output.result.answers)) if (answer.type === "choice") reviewed[id] = { choice: answer.choice, probabilities: answer.probabilities, confidence: answer.confidence };
                   const invalid = invalidSpeakerReviewAnswers(boundaryShadow.questions, reviewed);
                   const targets = boundaryShadow.targetIds.map((id) => invalid.includes(id) ? `${id}:invalid` : `${id}:${reviewed[id].choice}(${boundaryShadow.questions[id].criteria[reviewed[id].choice]}),confidence=${reviewed[id].confidence.toFixed(2)},probabilities=${JSON.stringify(reviewed[id].probabilities)}`);
+                  const retrospective = boundaryShadow.retrospectiveTargetIds.map((id) => invalid.includes(id) ? `${id}:invalid` : `${id}:${reviewed[id].choice}(${boundaryShadow.questions[id].criteria[reviewed[id].choice]}),confidence=${reviewed[id].confidence.toFixed(2)},probabilities=${JSON.stringify(reviewed[id].probabilities)}`);
                   const controls = Object.entries(boundaryShadow.expectedControls).map(([id, expected]) => `${id}:${invalid.includes(id) ? "invalid" : reviewed[id].choice}/${expected}`);
-                  relationshipSceneDiagnostic += `; boundary-exchange-shadow=${output.duration}ms, targets=[${targets.join("; ")}], synthetic-controls=[${controls.join(", ")}] (candidate/expected; no routing changes)`;
+                  relationshipSceneDiagnostic += `; boundary-exchange-shadow=${output.duration}ms, targets=[${targets.join("; ")}], retrospective=[${retrospective.join("; ")}], synthetic-controls=[${controls.join(", ")}] (candidate/expected; no routing changes)`;
                 }
               } catch {
                 relationshipSceneDiagnostic += "; boundary-exchange-shadow=invalid response";

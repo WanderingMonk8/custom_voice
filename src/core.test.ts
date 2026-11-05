@@ -2685,10 +2685,15 @@ test('opening re-read uses bounded prior dialogue and only changes supported unr
   const before = JSON.stringify({ review, answers })
   const boundaryShadow = buildBoundaryExchangeShadowReview(review)
   assert.ok(boundaryShadow.questions.boundary_s1)
+  assert.ok(boundaryShadow.questions.retrospective_s1)
+  assert.match(boundaryShadow.questions.retrospective_s1.instructions, /self-introductions/u)
   assert.match(boundaryShadow.questions.boundary_s1.instructions, /across the message boundary/u)
   assert.deepEqual(boundaryShadow.state.previousMessages.map(item => item.id), ['prior', 'user'])
   assert.equal(boundaryShadow.expectedControls.boundary_control_interruption, 'rowan')
   assert.equal(boundaryShadow.expectedControls.boundary_control_unclear, 'no_clear_identity')
+  assert.equal(boundaryShadow.expectedControls.retrospective_control_introduction, 'mira')
+  assert.equal(boundaryShadow.expectedControls.retrospective_control_interruption, 'rowan')
+  assert.equal(boundaryShadow.expectedControls.retrospective_control_unclear, 'no_clear_identity')
   assert.equal('expectedControls' in boundaryShadow.state, false)
   assert.equal(JSON.stringify({ review, answers }), before)
   assert.ok(review.questions.relationship_s0)
@@ -2704,6 +2709,19 @@ test('opening re-read uses bounded prior dialogue and only changes supported unr
   applyRelationshipSpeakerReview(plan, unresolved, { relationship_s1: { choice: 'known_0', probabilities: { known_0: 0.4, no_clear_identity: 0.6 }, confidence: 0.4 } }, {}, null, null, true)
   assert.ok(unresolved.global_uncertain_s1)
   assert.equal(buildOpeningSpeakerReview(plan, unresolved, { previousMessages: [], ghosts: [] }, null), null)
+})
+
+test('retrospective shadow retains later self-identification in the bounded opening without applying answers', () => {
+  const speakers = [{ id: 'npc:tessa', name: 'Tessa' }, { id: USER_SPEAKER_ID, name: 'Ken' }]
+  const plan = buildSpeakerDecisionPlan('"Bishop. Third floor."\n\nShe balances her tray. "It is noisy."\n\n"Tessa. Tessa Doyle." She sits down.', speakers, false)
+  const answers: Record<string, SpeakerDecisionChoice> = { speech_s0: confidentDecision('no_clear_identity'), global_uncertain_s0: confidentDecision('no_clear_identity') }
+  const review = buildOpeningSpeakerReview(plan, answers, { previousMessages: [{ id: 'prior', role: 'user' as const, text: 'I ask her, "Where do you live?"' }], ghosts: [] }, null)!
+  const before = JSON.stringify(answers)
+  const shadow = buildBoundaryExchangeShadowReview(review)
+  assert.match(shadow.state.message, /Tessa Doyle/u)
+  assert.ok(shadow.questions.retrospective_s0)
+  assert.equal(JSON.stringify(answers), before)
+  assert.equal('expectedControls' in shadow.state, false)
 })
 
 test('agreement retains a clear first-pass identity without requiring override thresholds', () => {

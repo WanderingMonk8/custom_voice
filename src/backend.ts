@@ -1267,8 +1267,9 @@ function queueSpeakerParse(
                   for (const [id, answer] of Object.entries(output.result.answers)) if (answer.type === 'choice') reviewed[id] = { choice: answer.choice, probabilities: answer.probabilities, confidence: answer.confidence }
                   const invalid = invalidSpeakerReviewAnswers(boundaryShadow.questions, reviewed)
                   const targets = boundaryShadow.targetIds.map(id => invalid.includes(id) ? `${id}:invalid` : `${id}:${reviewed[id].choice}(${boundaryShadow.questions[id].criteria[reviewed[id].choice]}),confidence=${reviewed[id].confidence.toFixed(2)},probabilities=${JSON.stringify(reviewed[id].probabilities)}`)
+                  const retrospective = boundaryShadow.retrospectiveTargetIds.map(id => invalid.includes(id) ? `${id}:invalid` : `${id}:${reviewed[id].choice}(${boundaryShadow.questions[id].criteria[reviewed[id].choice]}),confidence=${reviewed[id].confidence.toFixed(2)},probabilities=${JSON.stringify(reviewed[id].probabilities)}`)
                   const controls = Object.entries(boundaryShadow.expectedControls).map(([id, expected]) => `${id}:${invalid.includes(id) ? 'invalid' : reviewed[id].choice}/${expected}`)
-                  relationshipSceneDiagnostic += `; boundary-exchange-shadow=${output.duration}ms, targets=[${targets.join('; ')}], synthetic-controls=[${controls.join(', ')}] (candidate/expected; no routing changes)`
+                  relationshipSceneDiagnostic += `; boundary-exchange-shadow=${output.duration}ms, targets=[${targets.join('; ')}], retrospective=[${retrospective.join('; ')}], synthetic-controls=[${controls.join(', ')}] (candidate/expected; no routing changes)`
                 }
               } catch {
                 relationshipSceneDiagnostic += '; boundary-exchange-shadow=invalid response'
