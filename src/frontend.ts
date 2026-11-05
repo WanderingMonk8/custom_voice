@@ -16,6 +16,7 @@ import {
   clampSavedAudioLimit,
   DEFAULT_SAVED_AUDIO_LIMIT,
   eligibleCardFallbackSpeakerId,
+  enabledUnlessExplicitlyDisabled,
   encodeConcatenatedWav,
   expiredSavedAudioRecords,
   hashMessageContent,
@@ -365,7 +366,6 @@ interface PlaybackPreferences {
   speakerAssignmentDebug: boolean
   speakerShadowEvaluation: boolean
   speakerRunReview: boolean
-  focusedOpeningFallback: boolean
   bestAvailableSpeaker: boolean
   skipNarration: boolean
   defaultNarratorVoice: string
@@ -440,9 +440,8 @@ async function loadPlaybackPreferences(): Promise<PlaybackPreferences> {
     autoVoiceCasting: true,
     speakerAssignmentDebug: false,
     speakerShadowEvaluation: false,
-    speakerRunReview: false,
-    focusedOpeningFallback: false,
-    bestAvailableSpeaker: false,
+    speakerRunReview: true,
+    bestAvailableSpeaker: true,
     skipNarration: false,
     defaultNarratorVoice: '',
     defaultUserVoice: '',
@@ -500,9 +499,8 @@ async function loadPlaybackPreferences(): Promise<PlaybackPreferences> {
     autoVoiceCasting: row.value?.chatVoiceAutoCasting !== false,
     speakerAssignmentDebug: row.value?.chatVoiceSpeakerAssignmentDebug === true,
     speakerShadowEvaluation: row.value?.chatVoiceSpeakerShadowEvaluation === true,
-    speakerRunReview: row.value?.chatVoiceSpeakerRunReview === true,
-    focusedOpeningFallback: row.value?.chatVoiceFocusedOpeningFallback === true,
-    bestAvailableSpeaker: row.value?.chatVoiceBestAvailableSpeaker === true,
+    speakerRunReview: enabledUnlessExplicitlyDisabled(row.value?.chatVoiceSpeakerRunReview),
+    bestAvailableSpeaker: enabledUnlessExplicitlyDisabled(row.value?.chatVoiceBestAvailableSpeaker),
     skipNarration: row.value?.chatVoiceSkipNarration === true,
     defaultNarratorVoice: typeof row.value?.chatVoiceDefaultNarratorVoice === 'string'
       ? row.value.chatVoiceDefaultNarratorVoice.trim().slice(0, 512)
@@ -594,7 +592,6 @@ function saveAdvancedPlaybackPreferences(
   speakerLookback: number,
   speakerShadowEvaluation: boolean,
   speakerRunReview: boolean,
-  focusedOpeningFallback: boolean,
   bestAvailableSpeaker: boolean,
   skipNarration: boolean,
 ): Promise<void> {
@@ -618,7 +615,6 @@ function saveAdvancedPlaybackPreferences(
     chatVoiceSpeakerAssignmentDebug: speakerAssignmentDebug,
     chatVoiceSpeakerShadowEvaluation: speakerShadowEvaluation,
     chatVoiceSpeakerRunReview: speakerRunReview,
-    chatVoiceFocusedOpeningFallback: focusedOpeningFallback,
     chatVoiceBestAvailableSpeaker: bestAvailableSpeaker,
     chatVoiceSkipNarration: skipNarration,
     chatVoiceAutoCasting: autoVoiceCasting,
@@ -1354,12 +1350,13 @@ export function setup(ctx: SpindleFrontendContext) {
   speakerDebugLabel.append(speakerDebugToggle, speakerDebugCopy)
   const speakerShadowLabel = document.createElement('label')
   speakerShadowLabel.className = 'chat-voice-toggle'
+  speakerShadowLabel.hidden = true
   const speakerShadowToggle = document.createElement('input')
   speakerShadowToggle.type = 'checkbox'
   const speakerShadowCopy = document.createElement('span')
   speakerShadowCopy.className = 'chat-voice-toggle-copy'
   const speakerShadowText = document.createElement('span')
-  speakerShadowText.textContent = 'Compare experimental speaker review'
+  speakerShadowText.textContent = 'Compare speaker reviews (diagnostic)'
   const speakerShadowHint = document.createElement('span')
   speakerShadowHint.className = 'chat-voice-toggle-hint'
   speakerShadowHint.textContent = 'Runs extra Jev reviews without changing audio or cast. With debug enabled, eligible openings also get boundary-exchange comparisons and synthetic controls. May increase cost and delay.'
@@ -1372,25 +1369,12 @@ export function setup(ctx: SpindleFrontendContext) {
   const speakerRunCopy = document.createElement('span')
   speakerRunCopy.className = 'chat-voice-toggle-copy'
   const speakerRunText = document.createElement('span')
-  speakerRunText.textContent = 'Use experimental run-focused speaker review'
+  speakerRunText.textContent = 'Review speakers by dialogue run'
   const speakerRunHint = document.createElement('span')
   speakerRunHint.className = 'chat-voice-toggle-hint'
-  speakerRunHint.textContent = 'Changes live speaker assignments. Turn off to restore scene-focused review. Accuracy and latency have not yet been validated.'
+  speakerRunHint.textContent = 'Uses the surrounding conversation to review speaker assignments. Turn off for scene-focused review.'
   speakerRunCopy.append(speakerRunText, speakerRunHint)
   speakerRunLabel.append(speakerRunToggle, speakerRunCopy)
-  const focusedFallbackLabel = document.createElement('label')
-  focusedFallbackLabel.className = 'chat-voice-toggle'
-  const focusedFallbackToggle = document.createElement('input')
-  focusedFallbackToggle.type = 'checkbox'
-  const focusedFallbackCopy = document.createElement('span')
-  focusedFallbackCopy.className = 'chat-voice-toggle-copy'
-  const focusedFallbackText = document.createElement('span')
-  focusedFallbackText.textContent = 'Experimental unresolved opening speaker fallback'
-  const focusedFallbackHint = document.createElement('span')
-  focusedFallbackHint.className = 'chat-voice-toggle-hint'
-  focusedFallbackHint.textContent = 'May change voices for unresolved opening dialogue using nearby validated speakers. Accuracy on interruptions is unverified. Adds Jev cost and may delay playback.'
-  focusedFallbackCopy.append(focusedFallbackText, focusedFallbackHint)
-  focusedFallbackLabel.append(focusedFallbackToggle, focusedFallbackCopy)
   const bestAvailableLabel = document.createElement('label')
   bestAvailableLabel.className = 'chat-voice-toggle'
   const bestAvailableToggle = document.createElement('input')
@@ -1401,7 +1385,7 @@ export function setup(ctx: SpindleFrontendContext) {
   bestAvailableText.textContent = 'Best-available voice for unresolved speech'
   const bestAvailableHint = document.createElement('span')
   bestAvailableHint.className = 'chat-voice-toggle-hint'
-  bestAvailableHint.textContent = 'Experimental: guess a plausible scene speaker or unnamed character instead of defaulting when evidence allows. Guesses may be wrong. Adds Jev cost and can delay playback.'
+  bestAvailableHint.textContent = 'For unresolved speech, guess a plausible scene speaker or unnamed character. Guesses can be wrong. Adds Jev cost and may delay playback. Turn off to use the default voice for uncertain speech.'
   bestAvailableCopy.append(bestAvailableText, bestAvailableHint)
   bestAvailableLabel.append(bestAvailableToggle, bestAvailableCopy)
   const skipNarrationLabel = document.createElement('label')
@@ -1437,7 +1421,6 @@ export function setup(ctx: SpindleFrontendContext) {
     skipNarrationLabel,
     speakerDebugLabel,
     speakerRunLabel,
-    focusedFallbackLabel,
     bestAvailableLabel,
     speakerShadowLabel,
     speakerDebugOutput,
@@ -1511,9 +1494,8 @@ export function setup(ctx: SpindleFrontendContext) {
   let ghostLifetimeLoaded = false
   let speakerAssignmentDebug = false
   let speakerShadowEvaluation = false
-  let speakerRunReview = false
-  let focusedOpeningFallback = false
-  let bestAvailableSpeaker = false
+  let speakerRunReview = true
+  let bestAvailableSpeaker = true
   let skipNarration = false
   let advancedSettingsSaveTimer: ReturnType<typeof setTimeout> | null = null
   let savingAdvancedSettings = false
@@ -1969,7 +1951,6 @@ export function setup(ctx: SpindleFrontendContext) {
   speakerDebugToggle.addEventListener('change', onSpeakerDebugChanged)
   speakerShadowToggle.addEventListener('change', onSpeakerShadowChanged)
   speakerRunToggle.addEventListener('change', onSpeakerRunChanged)
-  focusedFallbackToggle.addEventListener('change', onFocusedFallbackChanged)
   bestAvailableToggle.addEventListener('change', onBestAvailableChanged)
   skipNarrationToggle.addEventListener('change', onSkipNarrationChanged)
   autoCastingToggle.addEventListener('change', () => { autoVoiceCasting = autoCastingToggle.checked; scheduleAdvancedSettingsSave() })
@@ -2154,9 +2135,9 @@ export function setup(ctx: SpindleFrontendContext) {
         ghostVoiceLifetime: preferences.ghostVoiceLifetime,
         speakerLookback: preferences.speakerLookback,
         debug: preferences.speakerAssignmentDebug,
-        shadowEvaluation: preferences.speakerShadowEvaluation,
+        shadowEvaluation: preferences.speakerShadowEvaluation && preferences.speakerAssignmentDebug,
         runReview: preferences.speakerRunReview,
-        focusedOpeningFallback: preferences.focusedOpeningFallback,
+        focusedOpeningFallback: false,
         bestAvailableSpeaker: preferences.bestAvailableSpeaker,
       })
     })
@@ -2861,7 +2842,6 @@ export function setup(ctx: SpindleFrontendContext) {
       preferences.speakerAssignmentDebug = speakerAssignmentDebug
       preferences.speakerShadowEvaluation = speakerShadowEvaluation
       preferences.speakerRunReview = speakerRunReview
-      preferences.focusedOpeningFallback = focusedOpeningFallback
       preferences.bestAvailableSpeaker = bestAvailableSpeaker
       preferences.skipNarration = skipNarration
     } else {
@@ -2871,7 +2851,6 @@ export function setup(ctx: SpindleFrontendContext) {
       speakerAssignmentDebug = preferences.speakerAssignmentDebug
       speakerShadowEvaluation = preferences.speakerShadowEvaluation
       speakerRunReview = preferences.speakerRunReview
-      focusedOpeningFallback = preferences.focusedOpeningFallback
       bestAvailableSpeaker = preferences.bestAvailableSpeaker
       skipNarration = preferences.skipNarration
     }
@@ -4571,12 +4550,11 @@ export function setup(ctx: SpindleFrontendContext) {
         ghostLifetimeInput.value = String(ghostVoiceLifetime)
         speakerLookbackInput.value = String(speakerLookback)
         speakerDebugToggle.checked = speakerAssignmentDebug
+        speakerShadowLabel.hidden = !speakerAssignmentDebug
         speakerShadowEvaluation = preferences.speakerShadowEvaluation
         speakerShadowToggle.checked = speakerShadowEvaluation
         speakerRunReview = preferences.speakerRunReview
         speakerRunToggle.checked = speakerRunReview
-        focusedOpeningFallback = preferences.focusedOpeningFallback
-        focusedFallbackToggle.checked = focusedOpeningFallback
         bestAvailableSpeaker = preferences.bestAvailableSpeaker
         bestAvailableToggle.checked = bestAvailableSpeaker
         skipNarration = preferences.skipNarration
@@ -4707,6 +4685,7 @@ export function setup(ctx: SpindleFrontendContext) {
   function onSpeakerDebugChanged(): void {
     speakerAssignmentDebug = speakerDebugToggle.checked
     speakerDebugOutput.hidden = !speakerAssignmentDebug
+    speakerShadowLabel.hidden = !speakerAssignmentDebug
     scheduleAdvancedSettingsSave()
   }
 
@@ -4717,11 +4696,6 @@ export function setup(ctx: SpindleFrontendContext) {
 
   function onSpeakerRunChanged(): void {
     speakerRunReview = speakerRunToggle.checked
-    scheduleAdvancedSettingsSave()
-  }
-
-  function onFocusedFallbackChanged(): void {
-    focusedOpeningFallback = focusedFallbackToggle.checked
     scheduleAdvancedSettingsSave()
   }
 
@@ -4749,7 +4723,6 @@ export function setup(ctx: SpindleFrontendContext) {
         speakerLookback,
         speakerShadowEvaluation,
         speakerRunReview,
-        focusedOpeningFallback,
         bestAvailableSpeaker,
         skipNarration,
       )
@@ -5259,7 +5232,6 @@ export function setup(ctx: SpindleFrontendContext) {
         speakerLookback,
         speakerShadowEvaluation,
         speakerRunReview,
-        focusedOpeningFallback,
         bestAvailableSpeaker,
         skipNarration,
       )
@@ -5278,7 +5250,6 @@ export function setup(ctx: SpindleFrontendContext) {
     speakerDebugToggle.removeEventListener('change', onSpeakerDebugChanged)
     speakerShadowToggle.removeEventListener('change', onSpeakerShadowChanged)
     speakerRunToggle.removeEventListener('change', onSpeakerRunChanged)
-    focusedFallbackToggle.removeEventListener('change', onFocusedFallbackChanged)
     bestAvailableToggle.removeEventListener('change', onBestAvailableChanged)
     skipNarrationToggle.removeEventListener('change', onSkipNarrationChanged)
     addNpcInput.destroy()

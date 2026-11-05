@@ -30,6 +30,7 @@ import {
   buildOpeningBacklinkReview,
   buildContrastiveOpeningLinkReview,
   applyFocusedOpeningFallback,
+  enabledUnlessExplicitlyDisabled,
   buildBestAvailableSpeakerReview,
   applyBestAvailableSpeakerReview,
   applyOpeningBacklinkReview,
@@ -2925,6 +2926,12 @@ test('backward links require a strong independent same-speaker answer and a vali
   assert.equal(buildOpeningBacklinkReview(changedScene, sceneAnswers, context, null), null)
   const explicitlyDifferent = buildSpeakerDecisionPlan('"First," Ken says.\n\n"Second," Ewan says.', speakers, false)
   assert.equal(buildOpeningBacklinkReview(explicitlyDifferent, sceneAnswers, context, null), null)
+})
+
+test('speaker feature defaults enable unset values while preserving explicit opt-outs', () => {
+  assert.equal(enabledUnlessExplicitlyDisabled(undefined), true)
+  assert.equal(enabledUnlessExplicitlyDisabled(true), true)
+  assert.equal(enabledUnlessExplicitlyDisabled(false), false)
 })
 
 test('best-available guesses use scene candidates and never become validated anchors', () => {

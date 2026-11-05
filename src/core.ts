@@ -1,6 +1,8 @@
 export const CONFIG_KEY = 'chat_voice'
 export const USER_SPEAKER_ID = '__chat_voice_user__'
 export const UNCAST_SPEAKER_ID = '__chat_voice_uncast__'
+/** New defaults should not override an existing explicit opt-out. */
+export const enabledUnlessExplicitlyDisabled = (value: unknown): boolean => value !== false
 /** A speech span whose identity is unknown; unlike null, this is not narration. */
 export const UNRESOLVED_SPEAKER_ID = '__chat_voice_unresolved__'
 export const DEFAULT_MESSAGE_LIMIT = 20
