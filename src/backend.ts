@@ -14,6 +14,7 @@ import {
   assessSpeakerDiscourseEscalation,
   applyTtsTagSelections,
   buildSpeakerDecisionPlan,
+  snapshotSpeakerFirstPass,
   buildAssistantUserSpeakerReview,
   buildContextualUserReconciliation,
   applyContextualUserReconciliation,
@@ -1125,6 +1126,7 @@ function queueSpeakerParse(
               confidence: answer.confidence,
             }
           }
+          if (payload.debug) snapshotSpeakerFirstPass(decisionPlan, answers)
           const userReview = buildAssistantUserSpeakerReview(decisionPlan, answers)
           let userReviewFailed = false
           if (Object.keys(userReview.questions).length) {
@@ -1323,6 +1325,7 @@ function queueSpeakerParse(
               relationshipSceneDiagnostic += `; shadow=${shadowResult?.error ?? 'not needed'}`
             }
           }
+          relationshipSceneDiagnostic += `; speaker-review-total=${Date.now() - firstPassStartedAt}ms (includes optional shadow wait; excludes later tag placement)`
           const relationshipStatus = relationshipReviewFailed ? `failed; validated assignments retained, uncertain targets protected; ${relationshipSceneDiagnostic}`
             : `${Object.keys(relationshipReview.questions).length} question(s) reviewed; ${relationshipSceneDiagnostic}`
           const reviewedSegments = payload.debug ? segments.map(segment => segment.debugPath ? {

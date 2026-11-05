@@ -639,6 +639,38 @@ export interface PlaybackSegment {
   debugPath?: string[]
 }
 
+export type SpeakerAssignmentSource = 'first-pass' | 'contextual-confirmation' | 'contextual-review' | 'opening-exchange' | 'opening-backlink' | 'chain-fill' | 'chain-override' | 'discourse-fill' | 'discourse-override' | 'inheritance' | 'previous-assistant' | 'card-title' | 'role-fallback' | 'local-parser' | 'unreported'
+
+/** Classify existing diagnostic traces without affecting speaker decisions. */
+export function speakerAssignmentSourceFromTrace(steps: readonly string[], localFallback: boolean): SpeakerAssignmentSource {
+  const resolution = steps.find(step => step.startsWith('resolution:'))
+  if (resolution?.startsWith('resolution:chain-identity (overrode')) return 'chain-override'
+  if (resolution?.startsWith('resolution:chain-identity')) return 'chain-fill'
+  if (resolution?.startsWith('resolution:discourse-identity (overrode')) return 'discourse-override'
+  if (resolution?.startsWith('resolution:discourse-identity')) return 'discourse-fill'
+  if (resolution?.startsWith('resolution:global-context confirmed')) return 'contextual-confirmation'
+  if (resolution?.startsWith('resolution:global-context review')) {
+    if (steps.includes('jev-opening-exchange:strong single-speaker review applied')) return 'opening-exchange'
+    if (steps.includes('jev-opening-backlink:accepted same-speaker link to later validated quote')) return 'opening-backlink'
+    return 'contextual-review'
+  }
+  if (resolution === 'resolution:direct-speech-identity') return steps.includes('jev-user-review:strong alternative applied') ? 'contextual-review' : 'first-pass'
+  if (resolution?.startsWith('resolution:upstream-identity')) return 'inheritance'
+  if (resolution?.startsWith('resolution:previous-assistant')) return 'previous-assistant'
+  if (resolution?.startsWith('resolution:unique card-title')) return 'card-title'
+  if (resolution?.startsWith('resolution:user-role') || resolution?.startsWith('resolution:unresolved speech') || resolution?.startsWith('resolution:assistant connection-default')) return 'role-fallback'
+  if (localFallback || steps.some(step => step.startsWith('jev-fallback:') || step.startsWith('jev-disabled:'))) return 'local-parser'
+  return 'unreported'
+}
+
+/** Snapshot Jev's initial answers for debug reporting, before later reviews. */
+export function snapshotSpeakerFirstPass(plan: SpeakerDecisionPlan, answers: Record<string, SpeakerDecisionChoice>): void {
+  for (const speech of plan.state.speeches) {
+    const answer = answers[`speech_${speech.id}`]
+    if (answer) answers[`first_pass_${speech.id}`] = { ...answer, probabilities: { ...answer.probabilities } }
+  }
+}
+
 /** Suppress narration only after speaker classification; unresolved speech stays audible. */
 export function filterNarrationSegments(segments: PlaybackSegment[], skipNarration: boolean): PlaybackSegment[] {
   return skipNarration ? segments.filter(segment => segment.speakerId !== null) : segments
@@ -6251,7 +6283,7 @@ export function resolveSpeakerDecisionSegments(
     }
     const baseIdentity = (chainDecision?.identity ?? undefined) ?? identity
     if (answers[`relationship_confirmed_${speech.id}`]) {
-      discoursePathBySpeechIndex.set(index, 'resolution:global-context confirmed first pass (protected from local override)')
+      discoursePathBySpeechIndex.set(index, 'resolution:global-context confirmed current identity (protected from local override)')
       return identity
     }
     if (answers[`relationship_continuity_${speech.id}`]) {
@@ -6438,6 +6470,7 @@ export function resolveSpeakerDecisionSegments(
       ...(options.includeDebug ? {
         debugPath: [
           `segment-type:speech (quote ${index + 1})`,
+          ...(answers[`first_pass_${speech.id}`] ? decisionAnswerDebug('jev-first-pass-speech', answers[`first_pass_${speech.id}`], plan.optionSpeakerIds) : []),
           ...decisionAnswerDebug('jev-speech', answer, plan.optionSpeakerIds),
           ...decisionAnswerDebug('jev-relationship-original', answers[`relationship_original_${speech.id}`], plan.optionSpeakerIds),
           ...decisionAnswerDebug('jev-relationship-review', answers[`relationship_review_${speech.id}`], plan.optionSpeakerIds),

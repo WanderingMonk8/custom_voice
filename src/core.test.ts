@@ -18,6 +18,8 @@ import {
   applyTtsTagSelections,
   assessSpeakerDiscourseEscalation,
   buildSpeakerDecisionPlan,
+  snapshotSpeakerFirstPass,
+  speakerAssignmentSourceFromTrace,
   buildAssistantUserSpeakerReview,
   buildContextualUserReconciliation,
   applyContextualUserReconciliation,
@@ -2532,6 +2534,26 @@ test('global review avoids scene-wide inheritance and treats card as context onl
   assert.equal(resolveSpeakerDecisionSegments(failed.state.message, failed, failedAnswers, speakers, { isUserMessage: false, cardSpeakerId: null, historicalSpeakerId: null, evidenceOnly: true }).find(segment => segment.text === 'What now?')?.speakerId, UNRESOLVED_SPEAKER_ID)
 })
 
+test('speaker diagnostic source labels follow final resolution rather than an intermediate guess', () => {
+  assert.equal(speakerAssignmentSourceFromTrace(['resolution:global-context confirmed current identity (protected from local override)'], false), 'contextual-confirmation')
+  assert.equal(speakerAssignmentSourceFromTrace(['resolution:global-context review (protected from local override)'], false), 'contextual-review')
+  assert.equal(speakerAssignmentSourceFromTrace(['jev-opening-exchange:strong single-speaker review applied', 'resolution:global-context review (protected from local override)'], false), 'opening-exchange')
+  assert.equal(speakerAssignmentSourceFromTrace(['jev-opening-backlink:accepted same-speaker link to later validated quote', 'resolution:global-context review (protected from local override)'], false), 'opening-backlink')
+  assert.equal(speakerAssignmentSourceFromTrace(['jev-opening-exchange:strong single-speaker review applied', 'resolution:unresolved speech (connection-default fallback)'], false), 'role-fallback')
+  assert.equal(speakerAssignmentSourceFromTrace(['resolution:direct-speech-identity'], false), 'first-pass')
+  assert.equal(speakerAssignmentSourceFromTrace([], true), 'local-parser')
+})
+
+test('first-pass debug snapshots remain unchanged after later review decisions', () => {
+  const plan = buildSpeakerDecisionPlan('"Hello."', [{ id: 'npc:a', name: 'A' }], false)
+  const answers: Record<string, SpeakerDecisionChoice> = { speech_s0: confidentDecision('known_0') }
+  snapshotSpeakerFirstPass(plan, answers)
+  answers.speech_s0.probabilities.known_0 = 0.4
+  answers.speech_s0.choice = 'no_clear_identity'
+  assert.equal(answers.first_pass_s0.choice, 'known_0')
+  assert.equal(answers.first_pass_s0.probabilities.known_0, 0.92)
+})
+
 test('dialogue-only filtering removes narration but keeps cast, user and unresolved speech', () => {
   const segments = [
     { text: 'Narration.', speakerId: null },
@@ -2747,6 +2769,34 @@ test('contextual persona reconciliation reviews existing and newly introduced us
   assert.ok(wrongPersona.global_uncertain_s0)
   assert.equal(wrongPersona.persona_confirmed_s0, undefined)
   assert.equal(buildContextualUserReconciliation(buildSpeakerDecisionPlan('"I agree."', speakers, true), genuineAnswers, context).questions.persona_check_s0, undefined)
+})
+
+test('replays opening user-confusion and later text-message agreement without mixing identities', () => {
+  const speakers = [{ id: 'npc:ewan', name: 'Ewan' }, { id: 'npc:zadie', name: 'Zadie' }, { id: USER_SPEAKER_ID, name: 'Ken' }]
+  const message = '"Sacrifice."\n\nHe turns with the tray.\n\n"The noodles?"\n\n"No, I know what you meant."\n\nHe lifts one shoulder.\n\n"Whatever. Text her."\n\nHours later, a phone buzzes.\n\n"Do not bring food."\n\n"Dinner is handled."'
+  const plan = buildSpeakerDecisionPlan(message, speakers, false)
+  const context = { previousMessages: [{ id: 'prior', role: 'user' as const, text: 'I turn to Ewan. "Sometimes you sacrifice."' }], ghosts: [] }
+  const answers: Record<string, SpeakerDecisionChoice> = {
+    speech_s0: confidentDecision('known_2', 0.74, 0.71), speech_s1: confidentDecision('no_clear_identity'),
+    speech_s2: confidentDecision('known_0'), speech_s3: confidentDecision('known_0'),
+    speech_s4: confidentDecision('known_1', 0.70, 0.66), speech_s5: { choice: 'known_1', probabilities: { known_1: 0.60, known_2: 0.24, no_clear_identity: 0.16 }, confidence: 0.55 },
+  }
+  snapshotSpeakerFirstPass(plan, answers)
+  applyRelationshipSpeakerReview(plan, answers, {
+    relationship_s0: confidentDecision('known_2', 0.54, 0.51),
+    relationship_s1: confidentDecision('known_2', 0.56, 0.53),
+    relationship_s4: { choice: 'known_1', probabilities: { known_1: 0.49, known_2: 0.41, no_clear_identity: 0.1 }, confidence: 0.45 },
+    relationship_s5: { choice: 'known_1', probabilities: { known_1: 0.45, known_2: 0.31, no_clear_identity: 0.24 }, confidence: 0.41 },
+  }, {}, null, null, true)
+  const personaReview = buildContextualUserReconciliation(plan, answers, context)
+  applyContextualUserReconciliation(plan, answers, { persona_check_s0: confidentDecision('no_clear_identity'), persona_check_s1: confidentDecision('other') }, personaReview.questions)
+  answers.persona_phase_complete = { choice: 'complete', probabilities: {}, confidence: 0 }
+  assert.ok(buildOpeningSpeakerReview(plan, answers, context, null)?.questions.relationship_s0)
+  applyRelationshipSpeakerReview(plan, answers, { relationship_s0: confidentDecision('known_0', 0.67, 0.65), relationship_s1: confidentDecision('known_0', 0.67, 0.65) }, {}, null, null, true)
+  const segments = resolveSpeakerDecisionSegments(message, plan, answers, speakers, { isUserMessage: false, cardSpeakerId: null, historicalSpeakerId: null, evidenceOnly: true, includeDebug: true })
+  assert.deepEqual(segments.filter(segment => segment.speakerId !== null).map(segment => segment.speakerId), ['npc:ewan', 'npc:ewan', 'npc:ewan', 'npc:ewan', 'npc:zadie', 'npc:zadie'])
+  assert.ok(segments[0].debugPath?.some(step => step === 'jev-first-pass-speech-normalized:__chat_voice_user__'))
+  assert.equal(speakerAssignmentSourceFromTrace(segments[0].debugPath ?? [], false), 'contextual-review')
 })
 
 test('opening exchange review fills uncertain lines only for a strongly supported coherent speaker', () => {

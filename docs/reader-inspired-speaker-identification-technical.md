@@ -283,6 +283,8 @@ Use a separate opt-in evaluation corpus of anonymized or user-approved real pass
 
 An offline paired-decision scorer is available as `npm run evaluate:speakers -- path/to/labeled-decisions.json`. See [the synthetic example](examples/speaker-review-evaluation.synthetic.json) for its format. The JSON is an array of cases with unique `id`, `conversation`, and aligned `expected`, `baseline`, and `candidate` arrays. Each item is a stable speaker ID or `null` for unresolved; optional `baselineMs` and `candidateMs` are measured per-case durations. It reports aggregate exact matches, unresolved rates, paired improvements/regressions and nearest-rank p50/p95 durations. It does not run Jev, collect model decisions, infer confidence, measure token usage or cost, or prove generalization. Use independent, conversation-separated real evaluations with appropriately reviewed labels; do not interpret synthetic test scores as model accuracy. Keep the private input outside the repository unless explicitly approved.
 
+The experimental run-focused live policy remains opt-in pending a representative paired evaluation. The current shadow comparison does not include all post-review reconciliation and opening re-reads, so its differences are not a complete-policy accuracy comparison. Debug traces separately preserve initial first-pass decisions and report final routing sources and elapsed-time proxies; they are not calibrated confidence, token or billing measurements.
+
 ## Rollout and implementation order
 
 1. **Instrument and baseline:** add opt-in privacy-safe timings, question/context sizes and recorded fixtures; establish current accuracy and cost. No routing changes.

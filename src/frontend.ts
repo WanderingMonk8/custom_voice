@@ -34,6 +34,7 @@ import {
   reducedRequestWindowLimit,
   rollingRequestWindowDelay,
   speakerAliases,
+  speakerAssignmentSourceFromTrace,
   speakerAliasIdLookup,
   speakersForMessageRole,
   splitLargeVoicePlanSegments,
@@ -44,6 +45,7 @@ import {
   upsertSavedAudioRecord,
   type GhostVoice,
   type PlaybackSegment,
+  type SpeakerAssignmentSource,
   type FavoriteVoice,
   type UncastVoiceGroup,
   type UncastVoiceAssignment,
@@ -2147,21 +2149,12 @@ export function setup(ctx: SpindleFrontendContext) {
     return speaker ? `${speaker.name} [${speakerId}]` : speakerId
   }
 
-  type SpeakerAssignmentSource =
-    | 'first-pass'
-    | 'chain-fill'
-    | 'chain-override'
-    | 'discourse-fill'
-    | 'discourse-override'
-    | 'inheritance'
-    | 'previous-assistant'
-    | 'card-title'
-    | 'role-fallback'
-    | 'local-parser'
-    | 'unreported'
-
   const SPEAKER_SOURCE_LABELS: Record<SpeakerAssignmentSource, string> = {
     'first-pass': 'first pass',
+    'contextual-confirmation': 'contextually confirmed first pass',
+    'contextual-review': 'contextual review',
+    'opening-exchange': 'opening exchange review',
+    'opening-backlink': 'opening backward link',
     'chain-fill': 'turn chain fill',
     'chain-override': 'turn chain override',
     'discourse-fill': 'discourse fill',
@@ -2188,23 +2181,7 @@ export function setup(ctx: SpindleFrontendContext) {
     parsingMode: PlaybackPreferences['speakerParsingMode'],
     review: SpeakerParseReview,
   ): SpeakerAssignmentSource {
-    const resolution = speakerDebugStep(segment, 'resolution:')
-    if (resolution?.startsWith('resolution:chain-identity (overrode')) return 'chain-override'
-    if (resolution?.startsWith('resolution:chain-identity')) return 'chain-fill'
-    if (resolution?.startsWith('resolution:discourse-identity (overrode')) return 'discourse-override'
-    if (resolution?.startsWith('resolution:discourse-identity')) return 'discourse-fill'
-    if (resolution === 'resolution:direct-speech-identity') return 'first-pass'
-    if (resolution?.startsWith('resolution:upstream-identity')) return 'inheritance'
-    if (resolution?.startsWith('resolution:previous-assistant')) return 'previous-assistant'
-    if (resolution?.startsWith('resolution:unique card-title')) return 'card-title'
-    if (resolution?.startsWith('resolution:user-role')) return 'role-fallback'
-    if (resolution?.startsWith('resolution:unresolved speech')) return 'role-fallback'
-    if (resolution?.startsWith('resolution:assistant connection-default')) return 'role-fallback'
-    if (review.failed || review.usedLlm === false || parsingMode === 'off') return 'local-parser'
-    if (speakerDebugStep(segment, 'jev-fallback:') || speakerDebugStep(segment, 'jev-disabled:')) {
-      return 'local-parser'
-    }
-    return 'unreported'
+    return speakerAssignmentSourceFromTrace(segment.debugPath ?? [], review.failed || review.usedLlm === false || parsingMode === 'off')
   }
 
   function speakerSourceDetail(
@@ -2267,7 +2244,7 @@ export function setup(ctx: SpindleFrontendContext) {
     const lines = ['Jev pipeline: first pass answered; deterministic policy applied after normalization']
     const speechSegments = segments.filter(segment => speakerDebugStep(segment, 'segment-type:speech'))
     const normalized = speechSegments
-      .map(segment => speakerDebugStep(segment, 'jev-speech-normalized:'))
+      .map(segment => speakerDebugStep(segment, 'jev-first-pass-speech-normalized:') ?? speakerDebugStep(segment, 'jev-speech-normalized:'))
       .filter((step): step is string => step !== undefined)
     if (normalized.length > 0) {
       const clear = normalized.filter(step => !step.includes(':unclear')).length
@@ -2917,6 +2894,7 @@ export function setup(ctx: SpindleFrontendContext) {
     }
     activePlayback = playback
     updatePlaybackButtons()
+    const playbackSetupFinishedAt = Date.now()
 
     try {
       if (playback.controller.signal.aborted) throw new DOMException('Playback stopped.', 'AbortError')
@@ -3653,6 +3631,7 @@ export function setup(ctx: SpindleFrontendContext) {
         appendSpeakerDebugLog(
           `Playback [${index + 1}] using voice=${JSON.stringify(plan[index].voice || '<connection default>')}.`,
         )
+        if (index === 0) appendSpeakerDebugLog(`Time from playback setup to first audio dispatch: ${Date.now() - playbackSetupFinishedAt}ms (includes speaker review, tag placement and buffering).`)
         setStatus(`Playing ${index + 1} of ${plan.length} voice segment${plan.length === 1 ? '' : 's'}…`)
         await playDecodedBuffer(playback, current.segment, preferences.volume)
       }

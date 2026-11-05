@@ -91,6 +91,26 @@ function speakersForMessageRole(speakers, _isUserMessage, userName = "User") {
     { id: USER_SPEAKER_ID, name: normalizeSpeakerName(userName) || "User" }
   ];
 }
+function speakerAssignmentSourceFromTrace(steps, localFallback) {
+  const resolution = steps.find((step) => step.startsWith("resolution:"));
+  if (resolution?.startsWith("resolution:chain-identity (overrode")) return "chain-override";
+  if (resolution?.startsWith("resolution:chain-identity")) return "chain-fill";
+  if (resolution?.startsWith("resolution:discourse-identity (overrode")) return "discourse-override";
+  if (resolution?.startsWith("resolution:discourse-identity")) return "discourse-fill";
+  if (resolution?.startsWith("resolution:global-context confirmed")) return "contextual-confirmation";
+  if (resolution?.startsWith("resolution:global-context review")) {
+    if (steps.includes("jev-opening-exchange:strong single-speaker review applied")) return "opening-exchange";
+    if (steps.includes("jev-opening-backlink:accepted same-speaker link to later validated quote")) return "opening-backlink";
+    return "contextual-review";
+  }
+  if (resolution === "resolution:direct-speech-identity") return steps.includes("jev-user-review:strong alternative applied") ? "contextual-review" : "first-pass";
+  if (resolution?.startsWith("resolution:upstream-identity")) return "inheritance";
+  if (resolution?.startsWith("resolution:previous-assistant")) return "previous-assistant";
+  if (resolution?.startsWith("resolution:unique card-title")) return "card-title";
+  if (resolution?.startsWith("resolution:user-role") || resolution?.startsWith("resolution:unresolved speech") || resolution?.startsWith("resolution:assistant connection-default")) return "role-fallback";
+  if (localFallback || steps.some((step) => step.startsWith("jev-fallback:") || step.startsWith("jev-disabled:"))) return "local-parser";
+  return "unreported";
+}
 function filterNarrationSegments(segments, skipNarration) {
   return skipNarration ? segments.filter((segment) => segment.speakerId !== null) : segments;
 }
@@ -3178,6 +3198,10 @@ function setup(ctx) {
   }
   const SPEAKER_SOURCE_LABELS = {
     "first-pass": "first pass",
+    "contextual-confirmation": "contextually confirmed first pass",
+    "contextual-review": "contextual review",
+    "opening-exchange": "opening exchange review",
+    "opening-backlink": "opening backward link",
     "chain-fill": "turn chain fill",
     "chain-override": "turn chain override",
     "discourse-fill": "discourse fill",
@@ -3196,23 +3220,7 @@ function setup(ctx) {
     return speakerDebugLine(segment.debugPath ?? [], prefix);
   }
   function speakerAssignmentSource(segment, parsingMode, review) {
-    const resolution = speakerDebugStep(segment, "resolution:");
-    if (resolution?.startsWith("resolution:chain-identity (overrode")) return "chain-override";
-    if (resolution?.startsWith("resolution:chain-identity")) return "chain-fill";
-    if (resolution?.startsWith("resolution:discourse-identity (overrode")) return "discourse-override";
-    if (resolution?.startsWith("resolution:discourse-identity")) return "discourse-fill";
-    if (resolution === "resolution:direct-speech-identity") return "first-pass";
-    if (resolution?.startsWith("resolution:upstream-identity")) return "inheritance";
-    if (resolution?.startsWith("resolution:previous-assistant")) return "previous-assistant";
-    if (resolution?.startsWith("resolution:unique card-title")) return "card-title";
-    if (resolution?.startsWith("resolution:user-role")) return "role-fallback";
-    if (resolution?.startsWith("resolution:unresolved speech")) return "role-fallback";
-    if (resolution?.startsWith("resolution:assistant connection-default")) return "role-fallback";
-    if (review.failed || review.usedLlm === false || parsingMode === "off") return "local-parser";
-    if (speakerDebugStep(segment, "jev-fallback:") || speakerDebugStep(segment, "jev-disabled:")) {
-      return "local-parser";
-    }
-    return "unreported";
+    return speakerAssignmentSourceFromTrace(segment.debugPath ?? [], review.failed || review.usedLlm === false || parsingMode === "off");
   }
   function speakerSourceDetail(segment, source, parsingMode, review) {
     if (source !== "local-parser") return SPEAKER_SOURCE_LABELS[source];
@@ -3250,7 +3258,7 @@ function setup(ctx) {
     }
     const lines = ["Jev pipeline: first pass answered; deterministic policy applied after normalization"];
     const speechSegments = segments.filter((segment) => speakerDebugStep(segment, "segment-type:speech"));
-    const normalized = speechSegments.map((segment) => speakerDebugStep(segment, "jev-speech-normalized:")).filter((step) => step !== void 0);
+    const normalized = speechSegments.map((segment) => speakerDebugStep(segment, "jev-first-pass-speech-normalized:") ?? speakerDebugStep(segment, "jev-speech-normalized:")).filter((step) => step !== void 0);
     if (normalized.length > 0) {
       const clear = normalized.filter((step) => !step.includes(":unclear")).length;
       lines.push(
@@ -3753,6 +3761,7 @@ function setup(ctx) {
     };
     activePlayback = playback;
     updatePlaybackButtons();
+    const playbackSetupFinishedAt = Date.now();
     try {
       if (playback.controller.signal.aborted) throw new DOMException("Playback stopped.", "AbortError");
       const playbackSpeakers = addUnconfiguredDialogueSpeakers(
@@ -4342,6 +4351,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
         appendSpeakerDebugLog(
           `Playback [${index + 1}] using voice=${JSON.stringify(plan[index].voice || "<connection default>")}.`
         );
+        if (index === 0) appendSpeakerDebugLog(`Time from playback setup to first audio dispatch: ${Date.now() - playbackSetupFinishedAt}ms (includes speaker review, tag placement and buffering).`);
         setStatus(`Playing ${index + 1} of ${plan.length} voice segment${plan.length === 1 ? "" : "s"}\u2026`);
         await playDecodedBuffer(playback, current.segment, preferences.volume);
       }

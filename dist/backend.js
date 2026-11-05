@@ -423,6 +423,12 @@ function speakersForMessageRole(speakers, _isUserMessage, userName = "User") {
     { id: USER_SPEAKER_ID, name: normalizeSpeakerName(userName) || "User" }
   ];
 }
+function snapshotSpeakerFirstPass(plan, answers) {
+  for (const speech of plan.state.speeches) {
+    const answer = answers[`speech_${speech.id}`];
+    if (answer) answers[`first_pass_${speech.id}`] = { ...answer, probabilities: { ...answer.probabilities } };
+  }
+}
 function markUnresolvedSpeechSegments(segments, includeDebug = false) {
   return segments.map((segment) => {
     const isSpeech = segment.debugPath?.some((step) => step.startsWith("segment-type:speech")) ?? false;
@@ -3999,7 +4005,7 @@ function resolveSpeakerDecisionSegments(content, plan, answers, speakers, option
     }
     const baseIdentity = chainDecision?.identity ?? void 0 ?? identity;
     if (answers[`relationship_confirmed_${speech.id}`]) {
-      discoursePathBySpeechIndex.set(index, "resolution:global-context confirmed first pass (protected from local override)");
+      discoursePathBySpeechIndex.set(index, "resolution:global-context confirmed current identity (protected from local override)");
       return identity;
     }
     if (answers[`relationship_continuity_${speech.id}`]) {
@@ -4133,6 +4139,7 @@ function resolveSpeakerDecisionSegments(content, plan, answers, speakers, option
       ...options.includeDebug ? {
         debugPath: [
           `segment-type:speech (quote ${index + 1})`,
+          ...answers[`first_pass_${speech.id}`] ? decisionAnswerDebug("jev-first-pass-speech", answers[`first_pass_${speech.id}`], plan.optionSpeakerIds) : [],
           ...decisionAnswerDebug("jev-speech", answer, plan.optionSpeakerIds),
           ...decisionAnswerDebug("jev-relationship-original", answers[`relationship_original_${speech.id}`], plan.optionSpeakerIds),
           ...decisionAnswerDebug("jev-relationship-review", answers[`relationship_review_${speech.id}`], plan.optionSpeakerIds),
@@ -5080,6 +5087,7 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
               confidence: answer.confidence
             };
           }
+          if (payload.debug) snapshotSpeakerFirstPass(decisionPlan, answers);
           const userReview = buildAssistantUserSpeakerReview(decisionPlan, answers);
           let userReviewFailed = false;
           if (Object.keys(userReview.questions).length) {
@@ -5275,6 +5283,7 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
               relationshipSceneDiagnostic += `; shadow=${shadowResult?.error ?? "not needed"}`;
             }
           }
+          relationshipSceneDiagnostic += `; speaker-review-total=${Date.now() - firstPassStartedAt}ms (includes optional shadow wait; excludes later tag placement)`;
           const relationshipStatus = relationshipReviewFailed ? `failed; validated assignments retained, uncertain targets protected; ${relationshipSceneDiagnostic}` : `${Object.keys(relationshipReview.questions).length} question(s) reviewed; ${relationshipSceneDiagnostic}`;
           const reviewedSegments = payload.debug ? segments.map((segment) => segment.debugPath ? {
             ...segment,
