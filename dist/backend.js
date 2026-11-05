@@ -1823,16 +1823,37 @@ function lookbackSpeakerContinuity(messages, targetId, records, parsed, ghosts, 
     const lastSpeech = priorPlan.state.speeches.at(-1);
     const ghostSpeakers = availableGhosts.flatMap((ghost) => {
       const aliases = ghostCastAliases(ghost).filter((alias) => !isDescriptiveGhostLabel(alias));
-      return aliases.length ? [{ id: `ghost:${ghost.id}`, name: aliases.join(" / ") }] : [];
+      const overlapsCast = aliases.some((alias) => cast.some((speaker) => speakerAliases(speaker.name).some((name) => name.toLowerCase() === alias.toLowerCase())));
+      return aliases.length && !overlapsCast ? [{ id: `ghost:${ghost.id}`, name: aliases.join(" / ") }] : [];
     });
     if (lastSpeech) {
-      const candidates = [...cast, ...ghostSpeakers];
+      const candidates2 = [...cast, ...ghostSpeakers];
       const context = `${lastSpeech.narrativeBefore} ${lastSpeech.narrativeAfter}`;
-      const namedCandidates = candidates.filter((candidate) => speakerAliases(candidate.name).some((alias) => new RegExp(`\\b${alias.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "iu").test(context)));
-      const attributed = namedCandidates.length === 1 ? narrativeAttributionSpeaker(context, candidates) : null;
+      const namedCandidates = candidates2.filter((candidate) => speakerAliases(candidate.name).some((alias) => new RegExp(`\\b${alias.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "iu").test(context)));
+      const attributed = namedCandidates.length === 1 ? narrativeAttributionSpeaker(context, candidates2) : null;
       if (attributed) {
         diagnostics?.push(`${prior.id}: final speech attribution -> ${attributed}`);
         return attributed;
+      }
+    }
+    const priorContent = preparePlaybackContent(prior.content ?? "", skippedTags);
+    const lastQuote = playbackQuotes(priorContent).at(-1);
+    const candidates = [...cast, ...ghostSpeakers];
+    if (lastQuote) {
+      const paragraphs = playbackParagraphs(priorContent.slice(0, lastQuote.end));
+      for (let i = paragraphs.length - 1; i >= 0; i--) {
+        const narration = narrativeOnly(paragraphs[i].text);
+        const mentions = mentionedSpeakers(narration, candidates);
+        const subject = unambiguousNarrativeSpeaker(narration, candidates);
+        if (subject) {
+          diagnostics?.push(`${prior.id}: closing named subject -> ${subject}`);
+          return subject;
+        }
+        if (hasAnonymousSpeechAttribution(narration)) {
+          diagnostics?.push(`${prior.id}: closing anonymous speaker blocks continuity`);
+          return CONTINUITY_LOOKBACK_BLOCKED;
+        }
+        if (mentions.clean.size > 1) break;
       }
     }
     const named = previousNamedGhostContinuity(view, targetId, availableGhosts, cast, skippedTags);
@@ -4981,7 +5002,7 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
           })),
           cardSpeakerId: titleMatchedCardSpeakerId,
           historicalSpeakerId,
-          relationshipReview: { version: "relationship-review-7", context: relationshipContext, continuitySpeakerId, speakerLookback },
+          relationshipReview: { version: "relationship-review-8", context: relationshipContext, continuitySpeakerId, speakerLookback },
           previousAssistantMessageId: previousAssistantMessage?.id ?? null,
           skippedTrackerTags
         }));

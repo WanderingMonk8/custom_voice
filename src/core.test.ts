@@ -2579,6 +2579,19 @@ test('uses saved continuity or the final explicit attribution in a multi-charact
   assert.equal(lookbackSpeakerContinuity(messages, 'target', records, {}, [], cast), 'npc:zadie')
 })
 
+test('finds the last named speaker after an anonymous interruption and continued dialogue', () => {
+  const cast = [{ id: 'npc:sarah', name: 'Sarah' }, { id: 'npc:zadie', name: 'Zadie' }]
+  const previous = { id: 'prior', is_user: false, content: 'Sarah says, "Earlier."\n\nA woman walks past. "Whites are going in."\n\nShe keeps walking.\n\nZadie does not blink at the interruption. She pulls her notebook closer.\n\n"Write it down."\n\nHer voice dries at the edges.\n\n"Since you are being thorough."\n\nA pause.\n\n"Do not make me come find you."' }
+  const target = { id: 'target', is_user: false, content: 'She smiles. "Every night."' }
+  const diagnostics: string[] = []
+  assert.equal(lookbackSpeakerContinuity([previous, target], 'target', {}, {}, [], cast, '', 5, diagnostics), 'npc:zadie')
+  assert.ok(diagnostics.some(line => line.includes('closing named subject -> npc:zadie')))
+  const ghost = { id: 'zadie', speakerId: UNCAST_SPEAKER_ID, label: 'Zadie', aliases: ['Zadie'], voiceId: 'voice', context: '', lastSeenMessageId: 'prior', occurrenceKeys: [] }
+  assert.equal(lookbackSpeakerContinuity([previous, target], 'target', {}, {}, [ghost], [cast[0]]), 'ghost:zadie')
+  const interruptedAgain = { ...previous, content: previous.content + '\n\nThe clerk says, "Wait."' }
+  assert.notEqual(lookbackSpeakerContinuity([interruptedAgain, target], 'target', {}, {}, [], cast), 'npc:zadie')
+})
+
 test('keeps a historically seen temporary speaker eligible after later playback without leaking future-only ghosts', () => {
   const messages = [
     { id: 'first', is_user: false, content: 'Tasha smiles. "Hello."' },
