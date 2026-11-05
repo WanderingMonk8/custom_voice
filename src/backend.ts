@@ -18,6 +18,7 @@ import {
   buildRelationshipSpeakerReview,
   applyRelationshipSpeakerReview,
   continueUncastClosingSpeech,
+  continuityRosterIdentity,
   relationshipReviewContext,
   applyAssistantUserSpeakerReview,
   buildUncastVoiceDecision,
@@ -991,7 +992,7 @@ function queueSpeakerParse(
     const relationshipContext = relationshipReviewContext(messages, message.id, activeGhostsForReview, skippedTrackerTags)
     const lookbackDiagnostics: string[] = []
     const storedContinuity = !message.is_user ? lookbackSpeakerContinuity(messages, message.id, chat.metadata?.chat_voice_speaker_continuity, config.parsedMessages, activeGhostsForReview, configuredSpeakers, skippedTrackerTags, speakerLookback, payload.debug ? lookbackDiagnostics : undefined) : null
-    const continuitySpeakerId = storedContinuity && (storedContinuity.startsWith('ghost:')
+    let continuitySpeakerId = storedContinuity && (storedContinuity.startsWith('ghost:')
       ? activeGhostsForReview.some(ghost => `ghost:${ghost.id}` === storedContinuity)
       : configuredSpeakers.some(speaker => speaker.id === storedContinuity)) ? storedContinuity : null
     for (const ghost of activeGhostsForReview) {
@@ -1008,6 +1009,7 @@ function queueSpeakerParse(
       configuredSpeakers,
       skippedTrackerTags,
     )
+    continuitySpeakerId = continuityRosterIdentity(continuitySpeakerId, relationshipContext, speakers)
     const namedSpeakerSubject = hasNamedSpeakerSubject(
       message.content ?? '',
       speakers,
@@ -1120,7 +1122,7 @@ function queueSpeakerParse(
           })),
           cardSpeakerId: titleMatchedCardSpeakerId,
           historicalSpeakerId,
-          relationshipReview: { version: 'relationship-review-9', context: relationshipContext, continuitySpeakerId, speakerLookback },
+          relationshipReview: { version: 'relationship-review-10', context: relationshipContext, continuitySpeakerId, speakerLookback },
           previousAssistantMessageId: previousAssistantMessage?.id ?? null,
           skippedTrackerTags,
         }))

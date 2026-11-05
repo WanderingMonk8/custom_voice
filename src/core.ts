@@ -2839,6 +2839,16 @@ export interface RelationshipReviewContext {
   ghosts: Array<{ id: string; label: string; aliases: string[]; context: string; conversationHistory: Array<{ messageId: string; text: string }> }>
 }
 
+/** Resolve a historically safe ghost to a unique named roster entry, if any. */
+export function continuityRosterIdentity(id: string | null, context: RelationshipReviewContext, speakers: CharacterLike[]): string | null {
+  if (!id?.startsWith('ghost:')) return id
+  const ghost = context.ghosts.find(item => `ghost:${item.id}` === id)
+  if (!ghost) return id
+  const aliases = new Set(ghost.aliases.map(alias => alias.toLowerCase()))
+  const matches = speakers.filter(speaker => speaker.id !== USER_SPEAKER_ID && speakerAliases(speaker.name).some(alias => aliases.has(alias.toLowerCase())))
+  return matches.length === 1 ? matches[0].id : id
+}
+
 /** A continuity record is valid only for the unchanged, immediately preceding assistant message. */
 export function previousContinuitySpeaker(messages: Array<{ id: string; is_user: boolean; content?: string }>, targetId: string, records: unknown): string | null {
   const index = messages.findIndex(message => message.id === targetId)
@@ -3109,6 +3119,7 @@ export function applyRelationshipSpeakerReview(plan: SpeakerDecisionPlan, answer
     if (original) answers[`relationship_original_${speech.id}`] = original
     answers[`speech_${speech.id}`] = result
     answers[`relationship_applied_${speech.id}`] = result
+    if (reviewedIdentity === continuitySpeakerId) answers[`relationship_continuity_${speech.id}`] = result
   }
 }
 
@@ -3124,8 +3135,10 @@ export function continueUncastClosingSpeech(plan: SpeakerDecisionPlan, answers: 
   const previousAnswer = answers[`speech_${previous.id}`]
   const previousId = evaluateSpeakerDecisionAnswer(previousAnswer, plan.optionSpeakerIds).identity
   const beforeId = evaluateSpeakerDecisionAnswer(answers[`speech_${before.id}`], plan.optionSpeakerIds).identity
-  if (current !== UNCAST_SPEAKER_ID || !previousId || previousId === UNCAST_SPEAKER_ID || previousId === USER_SPEAKER_ID || previousId !== beforeId || !previousAnswer) return
-  const bridge = plan.state.turns.find(turn => turn.speechId === last.id)?.bridge ?? last.narrativeBefore
+  if ((current !== UNCAST_SPEAKER_ID && current !== null) || !previousId || previousId === UNCAST_SPEAKER_ID || previousId === USER_SPEAKER_ID || previousId !== beforeId || !previousAnswer) return
+  const start = plan.state.paragraphs.findIndex(paragraph => paragraph.id === previous.paragraphId)
+  const end = plan.state.paragraphs.findIndex(paragraph => paragraph.id === last.paragraphId)
+  const bridge = plan.state.turns.find(turn => turn.speechId === last.id)?.bridge || (start >= 0 && end >= start ? plan.state.paragraphs.slice(start + 1, end + 1).map(paragraph => paragraph.text).join('\n\n') : last.narrativeBefore)
   const turn = answers[`turn_${last.id}`]
   if (!/\b(?:enter(?:s|ed|ing)?|arriv(?:es|ed|ing)|steps?|mov(?:es|ed|ing)|walks?)\b/iu.test(bridge)
     || hasAnonymousSpeechAttribution(bridge) || narrativeAttributionSpeaker(bridge, plan.state.speakers) || (turn && turn.confidence >= 0.65 && (turn.choice === TURN_RESPOND_OPTION || turn.choice === TURN_OTHER_OPTION))) return

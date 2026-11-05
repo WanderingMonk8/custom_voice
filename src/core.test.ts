@@ -8,6 +8,7 @@ import {
   mergeScannedCardCast,
   isScenarioCardTitle,
   continueUncastClosingSpeech,
+  continuityRosterIdentity,
   applyConfigToMetadata,
   applyCustomTtsEmotionCues,
   applyCustomTtsEmotionCuesWithModulation,
@@ -3375,6 +3376,26 @@ test('keeps the established speaker when a visitor enters before an uncast closi
   const differentAnswers: Record<string, SpeakerDecisionChoice> = { speech_s0: confidentDecision('known_0'), speech_s1: confidentDecision('known_0'), speech_s2: confidentDecision('uncast_character') }
   continueUncastClosingSpeech(different, differentAnswers)
   assert.equal(differentAnswers.speech_s2.choice, 'uncast_character')
+  const unresolved: Record<string, SpeakerDecisionChoice> = { speech_s0: confidentDecision('known_0'), speech_s1: confidentDecision('known_0'), speech_s2: { choice: 'known_0', confidence: 0.45, probabilities: { known_0: 0.51, uncast_character: 0.27, no_clear_identity: 0.22 } } }
+  continueUncastClosingSpeech(plan, unresolved)
+  assert.equal(unresolved.speech_s2.choice, 'known_0')
+  assert.ok(unresolved.relationship_continuity_s2)
+})
+
+test('maps a safe ghost alias to its unique roster identity for relationship and discourse review', () => {
+  const context = { previousMessages: [{ id: 'previous', text: 'Halloran speaks.' }], ghosts: [{ id: 'halloran', label: 'Halloran', aliases: ['Halloran'], context: '', conversationHistory: [] }] }
+  const speakers = [{ id: 'npc:sarah', name: 'Sarah' }, { id: 'unconfigured:halloran', name: 'Halloran' }]
+  const continuity = continuityRosterIdentity('ghost:halloran', context, speakers)
+  assert.equal(continuity, 'unconfigured:halloran')
+  assert.equal(continuityRosterIdentity('ghost:halloran', context, [...speakers, { id: 'npc:halloran', name: 'Halloran' }]), 'ghost:halloran')
+  const plan = buildSpeakerDecisionPlan('"Does he know?"\n\nHer eyes come up.\n\n"Because he will."\n\n"Next."', speakers, false)
+  const answers: Record<string, SpeakerDecisionChoice> = { speech_s0: confidentDecision('known_1'), speech_s1: confidentDecision('known_0'), speech_s2: confidentDecision('known_1') }
+  const review = buildRelationshipSpeakerReview(plan, answers, context, continuity)
+  applyRelationshipSpeakerReview(plan, answers, { relationship_s1: confidentDecision('known_1', 0.97, 0.97) }, review.ghostOptions, null, continuity)
+  assert.equal(answers.speech_s1.choice, 'known_1')
+  assert.ok(answers.relationship_continuity_s1)
+  const assessment = assessSpeakerDiscourseEscalation(plan, answers)
+  assert.ok(!assessment.runs.some(run => run.targets.includes('s1')))
 })
 
 test('assigns quoted output to saved cast members using dialogue tags', () => {
