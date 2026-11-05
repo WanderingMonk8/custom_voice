@@ -24,6 +24,7 @@ import {
   applyOpeningExchangeReview,
   buildOpeningBacklinkReview,
   buildContrastiveOpeningLinkReview,
+  applyFocusedOpeningFallback,
   applyOpeningBacklinkReview,
   invalidSpeakerReviewAnswers,
   applyRelationshipSpeakerReview,
@@ -150,6 +151,7 @@ type FrontendMessage =
       speakerLookback: number
       debug: boolean
       shadowEvaluation?: boolean
+      focusedOpeningFallback?: boolean
       runReview?: boolean
     }
   | {
@@ -1094,7 +1096,7 @@ function queueSpeakerParse(
           })),
           cardSpeakerId: titleMatchedCardSpeakerId,
           historicalSpeakerId,
-          relationshipReview: { version: 'cross-message-run-13', context: relationshipContext, speakerLookback, strategy: payload.runReview === true ? 'run' : 'scene' },
+          relationshipReview: { version: 'cross-message-run-13', context: relationshipContext, speakerLookback, strategy: payload.runReview === true ? 'run' : 'scene', focusedOpeningFallback: payload.focusedOpeningFallback === true },
           skippedTrackerTags,
         }))
         const cached = config.parsedMessages[payload.messageId]
@@ -1168,6 +1170,7 @@ function queueSpeakerParse(
             new Promise<{ result: null; error: string; duration: number }>(resolve => { shadowTimer = setTimeout(() => resolve({ result: null, error: 'timed out after 5s', duration: Date.now() - shadowStartedAt }), 5000) }),
           ]).finally(() => { if (shadowTimer) clearTimeout(shadowTimer) }) : null
           let relationshipReviewFailed = false
+          let focusedFallbackRetry = false
           let relationshipSceneDiagnostic = `strategy=${payload.runReview === true ? 'run' : 'scene'}; global-context=${relationshipContext.previousMessages.length} messages, ${relationshipContext.previousMessages.reduce((sum, item) => sum + item.text.length, 0)} characters; target=${decisionPlan.state.message.length} characters; first-pass=${decisionQuestionCount} questions/${firstPassDuration}ms; review=${Object.keys(relationshipReview.questions).length} questions; candidates=${Object.entries(relationshipReview.ghostOptions).map(([option, id]) => `${option}=${id}`).join(',') || 'none'}`
           if (Object.keys(relationshipReview.questions).length) {
             const reviewStartedAt = Date.now()
@@ -1279,9 +1282,8 @@ function queueSpeakerParse(
           const backlinkReview = !relationshipReviewFailed ? buildOpeningBacklinkReview(decisionPlan, answers, relationshipContext, titleMatchedCardSpeakerId) : null
           if (backlinkReview) {
             const startedAt = Date.now()
-            // Only the existing opt-in comparison plus explicit debug enables
-            // this experimental request. Its output never changes routing.
-            const contrastive = payload.shadowEvaluation && payload.debug ? buildContrastiveOpeningLinkReview(backlinkReview) : null
+            // Diagnostics or the separate opt-in fallback can request this review.
+            const contrastive = (payload.shadowEvaluation && payload.debug) || payload.focusedOpeningFallback ? buildContrastiveOpeningLinkReview(backlinkReview) : null
             let contrastiveTimer: ReturnType<typeof setTimeout> | undefined
             const contrastivePromise = contrastive ? Promise.race([
               Promise.resolve().then(() => spindle.decisions.evaluate({ state: contrastive.state, questions: contrastive.questions, ...(userId ? { userId } : {}) }))
@@ -1315,22 +1317,38 @@ function queueSpeakerParse(
             if (contrastive && contrastivePromise) {
               try {
               const output = await contrastivePromise
-              if (!output.result) relationshipSceneDiagnostic += `; contrastive-shadow=${output.error}`
+              if (!output.result) {
+                if (payload.focusedOpeningFallback) focusedFallbackRetry = true
+                relationshipSceneDiagnostic += `; contrastive-shadow=${output.error}`
+              }
               else {
                 const reviewed: Record<string, SpeakerDecisionChoice> = {}
                 for (const [id, answer] of Object.entries(output.result.answers)) {
                   if (answer.type === 'choice') reviewed[id] = { choice: answer.choice, probabilities: answer.probabilities, confidence: answer.confidence }
                 }
                 const invalid = invalidSpeakerReviewAnswers(contrastive.questions, reviewed)
-                if (invalid.length) relationshipSceneDiagnostic += `; contrastive-shadow=incomplete (${invalid.length} invalid answers)`
+                if (invalid.length) {
+                  if (payload.focusedOpeningFallback) focusedFallbackRetry = true
+                  relationshipSceneDiagnostic += `; contrastive-shadow=incomplete (${invalid.length} invalid answers)`
+                }
                 else {
+                  if (payload.focusedOpeningFallback && !relationshipReviewFailed) {
+                    const controlIds = ['focused_control_introduction', 'focused_control_interruption', 'focused_control_unclear'] as const
+                    const controlsPass = controlIds.every(id => reviewed[id].choice === contrastive.expectedControls[id])
+                    if (!controlsPass) focusedFallbackRetry = true
+                    const before = Object.keys(answers).filter(id => id.startsWith('focused_fallback_')).length
+                    if (controlsPass) applyFocusedOpeningFallback(decisionPlan, answers, reviewed, backlinkReview.links, baselineLinks)
+                    const applied = Object.keys(answers).filter(id => id.startsWith('focused_fallback_')).length - before
+                    relationshipSceneDiagnostic += `; focused-fallback=${controlsPass ? `${applied} applied` : 'blocked by synthetic controls'}`
+                  }
                   const pairs = Object.keys(backlinkReview.links).map(id => `${id}:live=${baselineLinks[id]?.choice ?? 'unavailable'},candidate=${reviewed[id].choice},confidence=${reviewed[id].confidence.toFixed(2)},probabilities=${JSON.stringify(reviewed[id].probabilities)}`)
                   const focused = Object.keys(backlinkReview.links).map(id => `focused_${id}:target=${backlinkReview.links[id].targetId},anchor=${backlinkReview.links[id].anchorId},identity=${backlinkReview.links[id].identity},candidate=${reviewed[`focused_${id}`].choice},confidence=${reviewed[`focused_${id}`].confidence.toFixed(2)},probabilities=${JSON.stringify(reviewed[`focused_${id}`].probabilities)}`)
                   const controls = Object.entries(contrastive.expectedControls).map(([id, expected]) => `${id}:${reviewed[id].choice}/${expected}`)
-                  relationshipSceneDiagnostic += `; contrastive-shadow=${output.duration}ms, questions=${Object.keys(contrastive.questions).length}, pairs=[${pairs.join('; ')}], focused=[${focused.join('; ')}], synthetic-controls=[${controls.join(', ')}] (candidate/expected; no routing changes)`
+                  relationshipSceneDiagnostic += `; contrastive-shadow=${output.duration}ms, questions=${Object.keys(contrastive.questions).length}, pairs=[${pairs.join('; ')}], focused=[${focused.join('; ')}], synthetic-controls=[${controls.join(', ')}] (candidate/expected; ${payload.focusedOpeningFallback ? 'experimental fallback enabled' : 'no routing changes'})`
                 }
               }
               } catch {
+                if (payload.focusedOpeningFallback) focusedFallbackRetry = true
                 relationshipSceneDiagnostic += '; contrastive-shadow=invalid response'
               }
             }
@@ -1418,7 +1436,7 @@ function queueSpeakerParse(
           const stableContinuity = continuityCandidate && continuityCandidate !== UNCAST_SPEAKER_ID && continuityCandidate !== UNRESOLVED_SPEAKER_ID && continuityCandidate !== USER_SPEAKER_ID
             && (continuityCandidate === continuitySpeakerId || namedSpeakerSubject || Object.keys(answers).some(key => key.startsWith('relationship_applied_')))
             ? continuityCandidate : null
-          if (!tagResult.tagFailed && !userReviewFailed && !relationshipReviewFailed) {
+          if (!tagResult.tagFailed && !userReviewFailed && !relationshipReviewFailed && !focusedFallbackRetry) {
             const nextConfig: ChatVoiceConfig = {
               ...config,
               parsedMessages: {

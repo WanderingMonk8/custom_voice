@@ -365,6 +365,7 @@ interface PlaybackPreferences {
   speakerAssignmentDebug: boolean
   speakerShadowEvaluation: boolean
   speakerRunReview: boolean
+  focusedOpeningFallback: boolean
   skipNarration: boolean
   defaultNarratorVoice: string
   defaultUserVoice: string
@@ -439,6 +440,7 @@ async function loadPlaybackPreferences(): Promise<PlaybackPreferences> {
     speakerAssignmentDebug: false,
     speakerShadowEvaluation: false,
     speakerRunReview: false,
+    focusedOpeningFallback: false,
     skipNarration: false,
     defaultNarratorVoice: '',
     defaultUserVoice: '',
@@ -497,6 +499,7 @@ async function loadPlaybackPreferences(): Promise<PlaybackPreferences> {
     speakerAssignmentDebug: row.value?.chatVoiceSpeakerAssignmentDebug === true,
     speakerShadowEvaluation: row.value?.chatVoiceSpeakerShadowEvaluation === true,
     speakerRunReview: row.value?.chatVoiceSpeakerRunReview === true,
+    focusedOpeningFallback: row.value?.chatVoiceFocusedOpeningFallback === true,
     skipNarration: row.value?.chatVoiceSkipNarration === true,
     defaultNarratorVoice: typeof row.value?.chatVoiceDefaultNarratorVoice === 'string'
       ? row.value.chatVoiceDefaultNarratorVoice.trim().slice(0, 512)
@@ -588,6 +591,7 @@ function saveAdvancedPlaybackPreferences(
   speakerLookback: number,
   speakerShadowEvaluation: boolean,
   speakerRunReview: boolean,
+  focusedOpeningFallback: boolean,
   skipNarration: boolean,
 ): Promise<void> {
   return updateVoiceSettings(current => ({
@@ -610,6 +614,7 @@ function saveAdvancedPlaybackPreferences(
     chatVoiceSpeakerAssignmentDebug: speakerAssignmentDebug,
     chatVoiceSpeakerShadowEvaluation: speakerShadowEvaluation,
     chatVoiceSpeakerRunReview: speakerRunReview,
+    chatVoiceFocusedOpeningFallback: focusedOpeningFallback,
     chatVoiceSkipNarration: skipNarration,
     chatVoiceAutoCasting: autoVoiceCasting,
     chatVoiceGhostVoiceLifetime: clampIntegerSetting(ghostVoiceLifetime, GHOST_VOICE_LIFETIME_MESSAGES, 1000),
@@ -1368,6 +1373,19 @@ export function setup(ctx: SpindleFrontendContext) {
   speakerRunHint.textContent = 'Changes live speaker assignments. Turn off to restore scene-focused review. Accuracy and latency have not yet been validated.'
   speakerRunCopy.append(speakerRunText, speakerRunHint)
   speakerRunLabel.append(speakerRunToggle, speakerRunCopy)
+  const focusedFallbackLabel = document.createElement('label')
+  focusedFallbackLabel.className = 'chat-voice-toggle'
+  const focusedFallbackToggle = document.createElement('input')
+  focusedFallbackToggle.type = 'checkbox'
+  const focusedFallbackCopy = document.createElement('span')
+  focusedFallbackCopy.className = 'chat-voice-toggle-copy'
+  const focusedFallbackText = document.createElement('span')
+  focusedFallbackText.textContent = 'Experimental unresolved opening speaker fallback'
+  const focusedFallbackHint = document.createElement('span')
+  focusedFallbackHint.className = 'chat-voice-toggle-hint'
+  focusedFallbackHint.textContent = 'May change voices for unresolved opening dialogue using nearby validated speakers. Accuracy on interruptions is unverified. Adds Jev cost and may delay playback.'
+  focusedFallbackCopy.append(focusedFallbackText, focusedFallbackHint)
+  focusedFallbackLabel.append(focusedFallbackToggle, focusedFallbackCopy)
   const skipNarrationLabel = document.createElement('label')
   skipNarrationLabel.className = 'chat-voice-toggle'
   const skipNarrationToggle = document.createElement('input')
@@ -1401,6 +1419,7 @@ export function setup(ctx: SpindleFrontendContext) {
     skipNarrationLabel,
     speakerDebugLabel,
     speakerRunLabel,
+    focusedFallbackLabel,
     speakerShadowLabel,
     speakerDebugOutput,
     advancedHint,
@@ -1474,6 +1493,7 @@ export function setup(ctx: SpindleFrontendContext) {
   let speakerAssignmentDebug = false
   let speakerShadowEvaluation = false
   let speakerRunReview = false
+  let focusedOpeningFallback = false
   let skipNarration = false
   let advancedSettingsSaveTimer: ReturnType<typeof setTimeout> | null = null
   let savingAdvancedSettings = false
@@ -1929,6 +1949,7 @@ export function setup(ctx: SpindleFrontendContext) {
   speakerDebugToggle.addEventListener('change', onSpeakerDebugChanged)
   speakerShadowToggle.addEventListener('change', onSpeakerShadowChanged)
   speakerRunToggle.addEventListener('change', onSpeakerRunChanged)
+  focusedFallbackToggle.addEventListener('change', onFocusedFallbackChanged)
   skipNarrationToggle.addEventListener('change', onSkipNarrationChanged)
   autoCastingToggle.addEventListener('change', () => { autoVoiceCasting = autoCastingToggle.checked; scheduleAdvancedSettingsSave() })
 
@@ -2114,6 +2135,7 @@ export function setup(ctx: SpindleFrontendContext) {
         debug: preferences.speakerAssignmentDebug,
         shadowEvaluation: preferences.speakerShadowEvaluation,
         runReview: preferences.speakerRunReview,
+        focusedOpeningFallback: preferences.focusedOpeningFallback,
       })
     })
   }
@@ -2816,6 +2838,7 @@ export function setup(ctx: SpindleFrontendContext) {
       preferences.speakerAssignmentDebug = speakerAssignmentDebug
       preferences.speakerShadowEvaluation = speakerShadowEvaluation
       preferences.speakerRunReview = speakerRunReview
+      preferences.focusedOpeningFallback = focusedOpeningFallback
       preferences.skipNarration = skipNarration
     } else {
       playbackBufferSegments = preferences.playbackBufferSegments
@@ -2824,6 +2847,7 @@ export function setup(ctx: SpindleFrontendContext) {
       speakerAssignmentDebug = preferences.speakerAssignmentDebug
       speakerShadowEvaluation = preferences.speakerShadowEvaluation
       speakerRunReview = preferences.speakerRunReview
+      focusedOpeningFallback = preferences.focusedOpeningFallback
       skipNarration = preferences.skipNarration
     }
     const connectionId = config.connectionId
@@ -4526,6 +4550,8 @@ export function setup(ctx: SpindleFrontendContext) {
         speakerShadowToggle.checked = speakerShadowEvaluation
         speakerRunReview = preferences.speakerRunReview
         speakerRunToggle.checked = speakerRunReview
+        focusedOpeningFallback = preferences.focusedOpeningFallback
+        focusedFallbackToggle.checked = focusedOpeningFallback
         skipNarration = preferences.skipNarration
         skipNarrationToggle.checked = skipNarration
         speakerDebugOutput.hidden = !speakerAssignmentDebug
@@ -4667,6 +4693,11 @@ export function setup(ctx: SpindleFrontendContext) {
     scheduleAdvancedSettingsSave()
   }
 
+  function onFocusedFallbackChanged(): void {
+    focusedOpeningFallback = focusedFallbackToggle.checked
+    scheduleAdvancedSettingsSave()
+  }
+
   function onSkipNarrationChanged(): void {
     skipNarration = skipNarrationToggle.checked
     scheduleAdvancedSettingsSave()
@@ -4686,6 +4717,7 @@ export function setup(ctx: SpindleFrontendContext) {
         speakerLookback,
         speakerShadowEvaluation,
         speakerRunReview,
+        focusedOpeningFallback,
         skipNarration,
       )
       setStatus('Advanced playback settings saved globally.', 'saved')
@@ -5194,6 +5226,7 @@ export function setup(ctx: SpindleFrontendContext) {
         speakerLookback,
         speakerShadowEvaluation,
         speakerRunReview,
+        focusedOpeningFallback,
         skipNarration,
       )
     }
@@ -5211,6 +5244,7 @@ export function setup(ctx: SpindleFrontendContext) {
     speakerDebugToggle.removeEventListener('change', onSpeakerDebugChanged)
     speakerShadowToggle.removeEventListener('change', onSpeakerShadowChanged)
     speakerRunToggle.removeEventListener('change', onSpeakerRunChanged)
+    focusedFallbackToggle.removeEventListener('change', onFocusedFallbackChanged)
     skipNarrationToggle.removeEventListener('change', onSkipNarrationChanged)
     addNpcInput.destroy()
     addNpcButton.removeEventListener('click', onAddNpc)

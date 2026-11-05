@@ -3505,6 +3505,35 @@ export function buildContrastiveOpeningLinkReview(review: NonNullable<ReturnType
 }
 
 /** Apply only clear links to anchors that remain validated and unchanged. */
+export function applyFocusedOpeningFallback(plan: SpeakerDecisionPlan, answers: Record<string, SpeakerDecisionChoice>, reviewed: Record<string, SpeakerDecisionChoice>, links: Record<string, { targetId: string; anchorId: string; identity: string }>, baseline: Record<string, SpeakerDecisionChoice>): void {
+  const qualified: Record<string, SpeakerDecisionChoice> = {}
+  for (const [id, link] of Object.entries(links)) {
+    const focused = reviewed[`focused_${id}`]
+    if (!focused || evaluateSpeakerDecisionAnswer(focused, { same: 'same', different: 'different', no_clear_identity: 'no_clear_identity' }, { probability: 0.65, confidence: 0.5, margin: 0.3 }).identity !== 'same') continue
+    const conflicts = Object.entries(links).some(([otherId, other]) => {
+      if (other.targetId !== link.targetId) return false
+      const candidate = reviewed[`focused_${otherId}`]
+      const direct = baseline[otherId]
+      const focusedDecision = candidate && evaluateSpeakerDecisionAnswer(candidate, { same: 'same', different: 'different', no_clear_identity: 'no_clear_identity' }, { probability: 0.65, confidence: 0.5, margin: 0.3 }).identity
+      const baselineDecision = direct && evaluateSpeakerDecisionAnswer(direct, { same: 'same', different_or_unclear: 'different_or_unclear' }, { probability: 0.85, confidence: 0.8, margin: 0.3 }).identity
+      return (focusedDecision === 'same' && other.identity !== link.identity) || (focusedDecision === 'different' && other.identity === link.identity) || (baselineDecision === 'different_or_unclear' && other.identity === link.identity)
+    })
+    if (!conflicts) qualified[id] = focused
+  }
+  for (const [id, result] of Object.entries(qualified)) {
+    const link = links[id]
+    const anchor = answers[`speech_${link.anchorId}`]
+    if (link.identity === USER_SPEAKER_ID && plan.state.messageRole === 'assistant' && answers.persona_phase_complete && !answers[`persona_confirmed_${link.targetId}`]) continue
+    if (!answers[`global_uncertain_${link.targetId}`] || answers[`global_uncertain_${link.anchorId}`] || (!answers[`relationship_applied_${link.anchorId}`] && !answers[`relationship_confirmed_${link.anchorId}`]) || evaluateSpeakerDecisionAnswer(anchor, plan.optionSpeakerIds).identity !== link.identity) continue
+    answers[`relationship_original_${link.targetId}`] = answers[`speech_${link.targetId}`]
+    answers[`speech_${link.targetId}`] = anchor
+    answers[`focused_fallback_${link.targetId}`] = result
+    answers[`relationship_continuity_${link.targetId}`] = anchor
+    answers[`relationship_global_${link.targetId}`] = anchor
+    delete answers[`global_uncertain_${link.targetId}`]
+  }
+}
+
 export function applyOpeningBacklinkReview(plan: SpeakerDecisionPlan, answers: Record<string, SpeakerDecisionChoice>, reviewed: Record<string, SpeakerDecisionChoice>, links: Record<string, { targetId: string; anchorId: string; identity: string }>): void {
   const checked: Array<{ id: string; link: { targetId: string; anchorId: string; identity: string }; decision: string | null; result: SpeakerDecisionChoice }> = []
   for (const [id, link] of Object.entries(links)) {

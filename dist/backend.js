@@ -2117,6 +2117,34 @@ function buildContrastiveOpeningLinkReview(review) {
   };
   return { state: { ...review.state, controls }, questions, expectedControls: { control_continuation: "same", control_reply: "different", control_uncertain: "no_clear_identity", focused_control_introduction: "same", focused_control_interruption: "different", focused_control_unclear: "no_clear_identity" } };
 }
+function applyFocusedOpeningFallback(plan, answers, reviewed, links, baseline) {
+  const qualified = {};
+  for (const [id, link] of Object.entries(links)) {
+    const focused = reviewed[`focused_${id}`];
+    if (!focused || evaluateSpeakerDecisionAnswer(focused, { same: "same", different: "different", no_clear_identity: "no_clear_identity" }, { probability: 0.65, confidence: 0.5, margin: 0.3 }).identity !== "same") continue;
+    const conflicts = Object.entries(links).some(([otherId, other]) => {
+      if (other.targetId !== link.targetId) return false;
+      const candidate = reviewed[`focused_${otherId}`];
+      const direct = baseline[otherId];
+      const focusedDecision = candidate && evaluateSpeakerDecisionAnswer(candidate, { same: "same", different: "different", no_clear_identity: "no_clear_identity" }, { probability: 0.65, confidence: 0.5, margin: 0.3 }).identity;
+      const baselineDecision = direct && evaluateSpeakerDecisionAnswer(direct, { same: "same", different_or_unclear: "different_or_unclear" }, { probability: 0.85, confidence: 0.8, margin: 0.3 }).identity;
+      return focusedDecision === "same" && other.identity !== link.identity || focusedDecision === "different" && other.identity === link.identity || baselineDecision === "different_or_unclear" && other.identity === link.identity;
+    });
+    if (!conflicts) qualified[id] = focused;
+  }
+  for (const [id, result] of Object.entries(qualified)) {
+    const link = links[id];
+    const anchor = answers[`speech_${link.anchorId}`];
+    if (link.identity === USER_SPEAKER_ID && plan.state.messageRole === "assistant" && answers.persona_phase_complete && !answers[`persona_confirmed_${link.targetId}`]) continue;
+    if (!answers[`global_uncertain_${link.targetId}`] || answers[`global_uncertain_${link.anchorId}`] || !answers[`relationship_applied_${link.anchorId}`] && !answers[`relationship_confirmed_${link.anchorId}`] || evaluateSpeakerDecisionAnswer(anchor, plan.optionSpeakerIds).identity !== link.identity) continue;
+    answers[`relationship_original_${link.targetId}`] = answers[`speech_${link.targetId}`];
+    answers[`speech_${link.targetId}`] = anchor;
+    answers[`focused_fallback_${link.targetId}`] = result;
+    answers[`relationship_continuity_${link.targetId}`] = anchor;
+    answers[`relationship_global_${link.targetId}`] = anchor;
+    delete answers[`global_uncertain_${link.targetId}`];
+  }
+}
 function applyOpeningBacklinkReview(plan, answers, reviewed, links) {
   const checked = [];
   for (const [id, link] of Object.entries(links)) {
@@ -5138,7 +5166,7 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
           })),
           cardSpeakerId: titleMatchedCardSpeakerId,
           historicalSpeakerId,
-          relationshipReview: { version: "cross-message-run-13", context: relationshipContext, speakerLookback, strategy: payload.runReview === true ? "run" : "scene" },
+          relationshipReview: { version: "cross-message-run-13", context: relationshipContext, speakerLookback, strategy: payload.runReview === true ? "run" : "scene", focusedOpeningFallback: payload.focusedOpeningFallback === true },
           skippedTrackerTags
         }));
         const cached = config.parsedMessages[payload.messageId];
@@ -5210,6 +5238,7 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
             if (shadowTimer) clearTimeout(shadowTimer);
           }) : null;
           let relationshipReviewFailed = false;
+          let focusedFallbackRetry = false;
           let relationshipSceneDiagnostic = `strategy=${payload.runReview === true ? "run" : "scene"}; global-context=${relationshipContext.previousMessages.length} messages, ${relationshipContext.previousMessages.reduce((sum, item) => sum + item.text.length, 0)} characters; target=${decisionPlan.state.message.length} characters; first-pass=${decisionQuestionCount} questions/${firstPassDuration}ms; review=${Object.keys(relationshipReview.questions).length} questions; candidates=${Object.entries(relationshipReview.ghostOptions).map(([option, id]) => `${option}=${id}`).join(",") || "none"}`;
           if (Object.keys(relationshipReview.questions).length) {
             const reviewStartedAt = Date.now();
@@ -5317,7 +5346,7 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
           const backlinkReview = !relationshipReviewFailed ? buildOpeningBacklinkReview(decisionPlan, answers, relationshipContext, titleMatchedCardSpeakerId) : null;
           if (backlinkReview) {
             const startedAt = Date.now();
-            const contrastive = payload.shadowEvaluation && payload.debug ? buildContrastiveOpeningLinkReview(backlinkReview) : null;
+            const contrastive = payload.shadowEvaluation && payload.debug || payload.focusedOpeningFallback ? buildContrastiveOpeningLinkReview(backlinkReview) : null;
             let contrastiveTimer;
             const contrastivePromise = contrastive ? Promise.race([
               Promise.resolve().then(() => spindle.decisions.evaluate({ state: contrastive.state, questions: contrastive.questions, ...userId ? { userId } : {} })).then((result2) => ({ result: result2, error: "", duration: Date.now() - startedAt })).catch(() => ({ result: null, error: "request failed", duration: Date.now() - startedAt })),
@@ -5353,22 +5382,36 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
             if (contrastive && contrastivePromise) {
               try {
                 const output = await contrastivePromise;
-                if (!output.result) relationshipSceneDiagnostic += `; contrastive-shadow=${output.error}`;
-                else {
+                if (!output.result) {
+                  if (payload.focusedOpeningFallback) focusedFallbackRetry = true;
+                  relationshipSceneDiagnostic += `; contrastive-shadow=${output.error}`;
+                } else {
                   const reviewed = {};
                   for (const [id, answer] of Object.entries(output.result.answers)) {
                     if (answer.type === "choice") reviewed[id] = { choice: answer.choice, probabilities: answer.probabilities, confidence: answer.confidence };
                   }
                   const invalid = invalidSpeakerReviewAnswers(contrastive.questions, reviewed);
-                  if (invalid.length) relationshipSceneDiagnostic += `; contrastive-shadow=incomplete (${invalid.length} invalid answers)`;
-                  else {
+                  if (invalid.length) {
+                    if (payload.focusedOpeningFallback) focusedFallbackRetry = true;
+                    relationshipSceneDiagnostic += `; contrastive-shadow=incomplete (${invalid.length} invalid answers)`;
+                  } else {
+                    if (payload.focusedOpeningFallback && !relationshipReviewFailed) {
+                      const controlIds = ["focused_control_introduction", "focused_control_interruption", "focused_control_unclear"];
+                      const controlsPass = controlIds.every((id) => reviewed[id].choice === contrastive.expectedControls[id]);
+                      if (!controlsPass) focusedFallbackRetry = true;
+                      const before = Object.keys(answers).filter((id) => id.startsWith("focused_fallback_")).length;
+                      if (controlsPass) applyFocusedOpeningFallback(decisionPlan, answers, reviewed, backlinkReview.links, baselineLinks);
+                      const applied = Object.keys(answers).filter((id) => id.startsWith("focused_fallback_")).length - before;
+                      relationshipSceneDiagnostic += `; focused-fallback=${controlsPass ? `${applied} applied` : "blocked by synthetic controls"}`;
+                    }
                     const pairs = Object.keys(backlinkReview.links).map((id) => `${id}:live=${baselineLinks[id]?.choice ?? "unavailable"},candidate=${reviewed[id].choice},confidence=${reviewed[id].confidence.toFixed(2)},probabilities=${JSON.stringify(reviewed[id].probabilities)}`);
                     const focused = Object.keys(backlinkReview.links).map((id) => `focused_${id}:target=${backlinkReview.links[id].targetId},anchor=${backlinkReview.links[id].anchorId},identity=${backlinkReview.links[id].identity},candidate=${reviewed[`focused_${id}`].choice},confidence=${reviewed[`focused_${id}`].confidence.toFixed(2)},probabilities=${JSON.stringify(reviewed[`focused_${id}`].probabilities)}`);
                     const controls = Object.entries(contrastive.expectedControls).map(([id, expected]) => `${id}:${reviewed[id].choice}/${expected}`);
-                    relationshipSceneDiagnostic += `; contrastive-shadow=${output.duration}ms, questions=${Object.keys(contrastive.questions).length}, pairs=[${pairs.join("; ")}], focused=[${focused.join("; ")}], synthetic-controls=[${controls.join(", ")}] (candidate/expected; no routing changes)`;
+                    relationshipSceneDiagnostic += `; contrastive-shadow=${output.duration}ms, questions=${Object.keys(contrastive.questions).length}, pairs=[${pairs.join("; ")}], focused=[${focused.join("; ")}], synthetic-controls=[${controls.join(", ")}] (candidate/expected; ${payload.focusedOpeningFallback ? "experimental fallback enabled" : "no routing changes"})`;
                   }
                 }
               } catch {
+                if (payload.focusedOpeningFallback) focusedFallbackRetry = true;
                 relationshipSceneDiagnostic += "; contrastive-shadow=invalid response";
               }
             }
@@ -5455,7 +5498,7 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
           const continuityIds = new Set(taggedSegments.flatMap((segment) => segment.speakerId ? [segment.speakerId] : []));
           const continuityCandidate = continuityIds.size === 1 ? [...continuityIds][0] : null;
           const stableContinuity = continuityCandidate && continuityCandidate !== UNCAST_SPEAKER_ID && continuityCandidate !== UNRESOLVED_SPEAKER_ID && continuityCandidate !== USER_SPEAKER_ID && (continuityCandidate === continuitySpeakerId || namedSpeakerSubject || Object.keys(answers).some((key) => key.startsWith("relationship_applied_"))) ? continuityCandidate : null;
-          if (!tagResult.tagFailed && !userReviewFailed && !relationshipReviewFailed) {
+          if (!tagResult.tagFailed && !userReviewFailed && !relationshipReviewFailed && !focusedFallbackRetry) {
             const nextConfig = {
               ...config,
               parsedMessages: {

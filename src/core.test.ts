@@ -29,6 +29,7 @@ import {
   applyOpeningExchangeReview,
   buildOpeningBacklinkReview,
   buildContrastiveOpeningLinkReview,
+  applyFocusedOpeningFallback,
   applyOpeningBacklinkReview,
   invalidSpeakerReviewAnswers,
   applyRelationshipSpeakerReview,
@@ -2960,6 +2961,27 @@ test('opening links consider adjacent validated speakers in both directions with
   assert.equal(contrastive.expectedControls.control_reply, 'different')
   assert.equal('expectedControls' in contrastive.state, false)
   assert.equal(JSON.stringify(review), reviewBefore)
+  const focusedSame = { choice: 'same', probabilities: { same: 0.68, different: 0.21, no_clear_identity: 0.11 }, confidence: 0.52 }
+  const focusedDifferent = { choice: 'different', probabilities: { same: 0.1, different: 0.85, no_clear_identity: 0.05 }, confidence: 0.8 }
+  const fallback = make()
+  applyFocusedOpeningFallback(plan, fallback, { focused_backlink_s1: focusedSame }, review.links, {})
+  assert.equal(fallback.speech_s1.choice, 'known_0')
+  assert.equal(fallback.focused_fallback_s1, focusedSame)
+  const fallbackSegments = resolveSpeakerDecisionSegments(plan.state.message, plan, fallback, speakers, { isUserMessage: false, cardSpeakerId: null, historicalSpeakerId: null, evidenceOnly: true, includeDebug: true })
+  assert.equal(fallbackSegments.filter(segment => segment.speakerId !== null)[1].speakerId, 'npc:ewan')
+  const conflicting = make()
+  applyFocusedOpeningFallback(plan, conflicting, { focused_backlink_s1: focusedSame, focused_forwardlink_s1: focusedDifferent }, review.links, {})
+  assert.ok(conflicting.global_uncertain_s1)
+  const weak = make()
+  applyFocusedOpeningFallback(plan, weak, { focused_backlink_s1: { ...focusedSame, confidence: 0.3 } }, review.links, {})
+  assert.ok(weak.global_uncertain_s1)
+  const stale = make()
+  stale.speech_s2 = confidentDecision('known_1')
+  applyFocusedOpeningFallback(plan, stale, { focused_backlink_s1: focusedSame }, review.links, {})
+  assert.ok(stale.global_uncertain_s1)
+  const blockedBaseline = make()
+  applyFocusedOpeningFallback(plan, blockedBaseline, { focused_backlink_s1: focusedSame }, review.links, { backlink_s1: confidentDecision('different_or_unclear') })
+  assert.ok(blockedBaseline.global_uncertain_s1)
   assert.match(review.state.pairEvidence.forwardlink_s1.between, /tray/u)
   assert.match(review.questions.forwardlink_s1.instructions, /earlier quotation s0/u)
   applyOpeningBacklinkReview(plan, answers, { forwardlink_s1: confidentDecision('same'), backlink_s1: { choice: 'different_or_unclear', probabilities: { different_or_unclear: 0.62, same: 0.38 }, confidence: 0.24 } }, review.links)
