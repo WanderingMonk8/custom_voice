@@ -1105,7 +1105,7 @@ function queueSpeakerParse(
           })),
           cardSpeakerId: titleMatchedCardSpeakerId,
           historicalSpeakerId,
-          relationshipReview: { version: 'relationship-review-6', context: relationshipContext, continuitySpeakerId, speakerLookback },
+          relationshipReview: { version: 'relationship-review-7', context: relationshipContext, continuitySpeakerId, speakerLookback },
           previousAssistantMessageId: previousAssistantMessage?.id ?? null,
           skippedTrackerTags,
         }))
@@ -1164,7 +1164,7 @@ function queueSpeakerParse(
                 if (answer.type === 'choice') reviewed[id] = { choice: answer.choice, probabilities: answer.probabilities, confidence: answer.confidence }
               }
               if (reviewed.relationship_scene) relationshipSceneDiagnostic += `; scene=${JSON.stringify(reviewed.relationship_scene)}`
-              applyRelationshipSpeakerReview(decisionPlan, answers, reviewed, relationshipReview.ghostOptions, titleMatchedCardSpeakerId, continuitySpeakerId)
+              applyRelationshipSpeakerReview(decisionPlan, answers, reviewed, relationshipReview.ghostOptions, namelessCardSpeakerId, continuitySpeakerId)
               relationshipSceneDiagnostic += `; applied=${Object.keys(answers).some(key => key.startsWith('relationship_applied_'))}`
             } catch (error) {
               relationshipReviewFailed = true

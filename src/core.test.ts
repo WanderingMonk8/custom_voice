@@ -2488,13 +2488,16 @@ test('uses a leading temporary speaker for a continuous anonymous scene while pr
   applyRelationshipSpeakerReview(unique.plan, unique.answers, { relationship_scene: scene }, unique.review.ghostOptions, 'npc:tova')
   assert.equal(unique.answers.speech_s1.choice, 'known_0')
   const established = create()
-  applyRelationshipSpeakerReview(established.plan, established.answers, { relationship_scene: scene }, established.review.ghostOptions, 'npc:tova', 'ghost:tasha')
+  applyRelationshipSpeakerReview(established.plan, established.answers, { relationship_scene: scene }, established.review.ghostOptions, null, 'ghost:tasha')
   assert.equal(established.answers.speech_s1.choice, 'relationship_ghost_0')
   for (const paragraph of established.plan.state.paragraphs) established.answers[`paragraph_${paragraph.id}`] = confidentDecision('known_0')
   const assessment = assessSpeakerDiscourseEscalation(established.plan, established.answers)
   assert.equal(assessment.plan, null)
   const resolved = resolveSpeakerDecisionSegments(content, established.plan, established.answers, speakers, { isUserMessage: false, cardSpeakerId: null, historicalSpeakerId: null, discourse: { assessment, answers: null } })
   assert.deepEqual(resolved.filter(segment => segment.speakerId !== null).map(segment => segment.speakerId), ['ghost:tasha', 'ghost:tasha', 'ghost:tasha'])
+  const cardFirst = create()
+  applyRelationshipSpeakerReview(cardFirst.plan, cardFirst.answers, { relationship_scene: scene }, cardFirst.review.ghostOptions, 'npc:tova', 'ghost:tasha')
+  assert.equal(cardFirst.answers.speech_s1.choice, 'known_0')
   const tied = create()
   applyRelationshipSpeakerReview(tied.plan, tied.answers, { relationship_scene: { ...scene, probabilities: { relationship_ghost_0: 0.52, no_clear_identity: 0.48 } } }, tied.review.ghostOptions)
   assert.equal(tied.answers.speech_s1.choice, 'known_0')
@@ -2564,6 +2567,16 @@ test('looks back at most five assistant messages and stops at the nearest clear 
   assert.equal(find([named, ...ambiguous, { id: 'tova', is_user: false, content: 'Tova says, "Hello."' }, target]), 'npc:tova')
   assert.equal(find([named, ...ambiguous, { id: 'other', is_user: false, content: 'The clerk says, "Hello."' }, target]), CONTINUITY_LOOKBACK_BLOCKED)
   assert.equal(find([named, ...ambiguous, { id: 'mixed', is_user: false, content: 'Tasha and Tova speak. "Hello."' }, target]), CONTINUITY_LOOKBACK_BLOCKED)
+})
+
+test('uses saved continuity or the final explicit attribution in a multi-character previous message', () => {
+  const cast = [{ id: 'npc:sarah', name: 'Sarah' }, { id: 'npc:zadie', name: 'Zadie' }]
+  const prior = { id: 'prior', is_user: false, content: 'Sarah says, "Hello."\n\nZadie says, "Goodbye."' }
+  const target = { id: 'target', is_user: false, content: 'She smiles. "Again."' }
+  const messages = [prior, target]
+  assert.equal(lookbackSpeakerContinuity(messages, 'target', {}, {}, [], cast), 'npc:zadie')
+  const records = { prior: { contentHash: hashMessageContent(prior.content), speakerId: 'npc:zadie' } }
+  assert.equal(lookbackSpeakerContinuity(messages, 'target', records, {}, [], cast), 'npc:zadie')
 })
 
 test('keeps a historically seen temporary speaker eligible after later playback without leaking future-only ghosts', () => {

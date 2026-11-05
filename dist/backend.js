@@ -1814,6 +1814,27 @@ function lookbackSpeakerContinuity(messages, targetId, records, parsed, ghosts, 
       return eligible;
     });
     const cast = configured.filter((speaker) => speaker.id !== USER_SPEAKER_ID);
+    const record = previousContinuitySpeaker(view, targetId, records);
+    if (record) {
+      diagnostics?.push(`${prior.id}: saved continuity -> ${record}`);
+      return record;
+    }
+    const priorPlan = buildSpeakerDecisionPlan(prior.content ?? "", [], false, skippedTags);
+    const lastSpeech = priorPlan.state.speeches.at(-1);
+    const ghostSpeakers = availableGhosts.flatMap((ghost) => {
+      const aliases = ghostCastAliases(ghost).filter((alias) => !isDescriptiveGhostLabel(alias));
+      return aliases.length ? [{ id: `ghost:${ghost.id}`, name: aliases.join(" / ") }] : [];
+    });
+    if (lastSpeech) {
+      const candidates = [...cast, ...ghostSpeakers];
+      const context = `${lastSpeech.narrativeBefore} ${lastSpeech.narrativeAfter}`;
+      const namedCandidates = candidates.filter((candidate) => speakerAliases(candidate.name).some((alias) => new RegExp(`\\b${alias.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "iu").test(context)));
+      const attributed = namedCandidates.length === 1 ? narrativeAttributionSpeaker(context, candidates) : null;
+      if (attributed) {
+        diagnostics?.push(`${prior.id}: final speech attribution -> ${attributed}`);
+        return attributed;
+      }
+    }
     const named = previousNamedGhostContinuity(view, targetId, availableGhosts, cast, skippedTags);
     if (named) {
       diagnostics?.push(`${prior.id}: named subject -> ${named}`);
@@ -1837,11 +1858,6 @@ function lookbackSpeakerContinuity(messages, targetId, records, parsed, ghosts, 
       const id = `ghost:${matchedGhosts[0].id}`;
       diagnostics?.push(`${prior.id}: named temporary subject -> ${id}`);
       return id;
-    }
-    const record = previousContinuitySpeaker(view, targetId, records);
-    if (record) {
-      diagnostics?.push(`${prior.id}: saved continuity -> ${record}`);
-      return record;
     }
     const recovered = recoverPreviousGhostContinuity(view, targetId, parsed, availableGhosts, skippedTags);
     if (recovered) {
@@ -1938,13 +1954,17 @@ function applyRelationshipSpeakerReview(plan, answers, reviewed, ghostOptions, c
   const namedChange = otherNamedSpeakers.length > 0 && hasNamedSpeakerSubject(plan.state.message, otherNamedSpeakers);
   const newUncastSubject = hasExplicitUncastCue(plan.state.message, "");
   const continuityOption = Object.entries(options).find(([, id]) => id === continuitySpeakerId)?.[0];
+  const cardOption = Object.entries(options).find(([, id]) => id === cardSpeakerId)?.[0];
   const sceneContradicts = scene && scene.choice !== "no_clear_identity" && sceneOptionIdentity !== continuitySpeakerId && sceneEvaluation?.resolved;
-  const inherited = continuityOption && !namedChange && !newUncastSubject && !conflictingAttribution && !conflictingTurn && !sceneContradicts ? { choice: continuityOption, probabilities: { [continuityOption]: 1 }, confidence: 1 } : null;
+  const cardAlternatives = speakers.filter((speaker) => speaker.id !== USER_SPEAKER_ID && speaker.id !== cardSpeakerId);
+  const cardNamedChange = cardAlternatives.length > 0 && hasNamedSpeakerSubject(plan.state.message, cardAlternatives);
+  const preferredCard = cardOption && !cardNamedChange && !newUncastSubject && !conflictingAttribution && !conflictingTurn ? { choice: cardOption, probabilities: { [cardOption]: 1 }, confidence: 1 } : null;
+  const inherited = !preferredCard && continuityOption && !namedChange && !newUncastSubject && !conflictingAttribution && !conflictingTurn && !sceneContradicts ? { choice: continuityOption, probabilities: { [continuityOption]: 1 }, confidence: 1 } : null;
   for (const speech of plan.state.speeches) {
     const result = reviewed[`relationship_${speech.id}`];
     const original = answers[`speech_${speech.id}`];
     const originalIdentity = evaluateSpeakerDecisionAnswer(original, plan.optionSpeakerIds).identity;
-    const chosen = inherited ?? (sceneIdentity && !conflictingAttribution && !conflictingTurn ? scene : null);
+    const chosen = preferredCard || inherited || (sceneIdentity && !conflictingAttribution && !conflictingTurn ? scene : null);
     if (chosen) {
       Object.assign(plan.optionSpeakerIds, ghostOptions);
       if (original) answers[`relationship_original_${speech.id}`] = original;
@@ -4961,7 +4981,7 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
           })),
           cardSpeakerId: titleMatchedCardSpeakerId,
           historicalSpeakerId,
-          relationshipReview: { version: "relationship-review-6", context: relationshipContext, continuitySpeakerId, speakerLookback },
+          relationshipReview: { version: "relationship-review-7", context: relationshipContext, continuitySpeakerId, speakerLookback },
           previousAssistantMessageId: previousAssistantMessage?.id ?? null,
           skippedTrackerTags
         }));
@@ -5018,7 +5038,7 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
                 if (answer.type === "choice") reviewed[id] = { choice: answer.choice, probabilities: answer.probabilities, confidence: answer.confidence };
               }
               if (reviewed.relationship_scene) relationshipSceneDiagnostic += `; scene=${JSON.stringify(reviewed.relationship_scene)}`;
-              applyRelationshipSpeakerReview(decisionPlan, answers, reviewed, relationshipReview.ghostOptions, titleMatchedCardSpeakerId, continuitySpeakerId);
+              applyRelationshipSpeakerReview(decisionPlan, answers, reviewed, relationshipReview.ghostOptions, namelessCardSpeakerId, continuitySpeakerId);
               relationshipSceneDiagnostic += `; applied=${Object.keys(answers).some((key) => key.startsWith("relationship_applied_"))}`;
             } catch (error) {
               relationshipReviewFailed = true;
