@@ -101,6 +101,7 @@ function speakerAssignmentSourceFromTrace(steps, localFallback) {
   if (resolution?.startsWith("resolution:global-context review")) {
     if (steps.includes("jev-opening-exchange:strong single-speaker review applied")) return "opening-exchange";
     if (steps.includes("jev-opening-backlink:accepted same-speaker link to later validated quote")) return "opening-backlink";
+    if (steps.includes("jev-opening-forwardlink:accepted same-speaker link to earlier validated quote")) return "opening-forwardlink";
     return "contextual-review";
   }
   if (resolution === "resolution:direct-speech-identity") return steps.includes("jev-user-review:strong alternative applied") ? "contextual-review" : "first-pass";
@@ -3202,6 +3203,7 @@ function setup(ctx) {
     "contextual-review": "contextual review",
     "opening-exchange": "opening exchange review",
     "opening-backlink": "opening backward link",
+    "opening-forwardlink": "opening forward link",
     "chain-fill": "turn chain fill",
     "chain-override": "turn chain override",
     "discourse-fill": "discourse fill",

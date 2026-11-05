@@ -2155,6 +2155,7 @@ export function setup(ctx: SpindleFrontendContext) {
     'contextual-review': 'contextual review',
     'opening-exchange': 'opening exchange review',
     'opening-backlink': 'opening backward link',
+    'opening-forwardlink': 'opening forward link',
     'chain-fill': 'turn chain fill',
     'chain-override': 'turn chain override',
     'discourse-fill': 'discourse fill',

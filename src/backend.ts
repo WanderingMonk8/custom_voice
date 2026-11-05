@@ -1092,7 +1092,7 @@ function queueSpeakerParse(
           })),
           cardSpeakerId: titleMatchedCardSpeakerId,
           historicalSpeakerId,
-          relationshipReview: { version: 'cross-message-run-12', context: relationshipContext, speakerLookback, strategy: payload.runReview === true ? 'run' : 'scene' },
+          relationshipReview: { version: 'cross-message-run-13', context: relationshipContext, speakerLookback, strategy: payload.runReview === true ? 'run' : 'scene' },
           skippedTrackerTags,
         }))
         const cached = config.parsedMessages[payload.messageId]
@@ -1261,14 +1261,14 @@ function queueSpeakerParse(
               const invalid = invalidSpeakerReviewAnswers(backlinkReview.questions, reviewed)
               if (invalid.length) {
                 relationshipReviewFailed = true
-                relationshipSceneDiagnostic += `; opening-backlink=incomplete (${invalid.length} invalid answers)`
+                relationshipSceneDiagnostic += `; opening-links=incomplete (${invalid.length} invalid answers)`
               } else {
                 applyOpeningBacklinkReview(decisionPlan, answers, reviewed, backlinkReview.links)
-                relationshipSceneDiagnostic += `; opening-backlink=${Object.keys(backlinkReview.questions).length} questions/${Date.now() - startedAt}ms`
+                relationshipSceneDiagnostic += `; opening-links=${Object.keys(backlinkReview.questions).length} questions/${Date.now() - startedAt}ms`
               }
             } catch {
               relationshipReviewFailed = true
-              relationshipSceneDiagnostic += `; opening-backlink=failed/${Date.now() - startedAt}ms`
+              relationshipSceneDiagnostic += `; opening-links=failed/${Date.now() - startedAt}ms`
             }
           }
           const discourse: DiscourseEvaluation = {
@@ -1316,7 +1316,7 @@ function queueSpeakerParse(
                   const aligned = segments.length === shadowSegments.length && segments.every((segment, index) => segment.text === shadowSegments[index].text)
                   const changes = aligned ? segments.flatMap((segment, index) => segment.speakerId !== shadowSegments[index].speakerId
                     ? [`${index + 1}:${segment.speakerId ?? 'none'}->${shadowSegments[index].speakerId ?? 'none'}`] : []) : []
-                  relationshipSceneDiagnostic += `; shadow=completed, questions=${Object.keys(shadowReview.questions).length}, duration=${shadowResult.duration}ms, changed-segments=${aligned ? changes.length : 'unaligned'}${changes.length ? ` (${changes.join(', ')})` : ''}; shadow excludes contextual user reconciliation${openingReview || backlinkReview ? ', opening re-read and backlink' : ''}`
+                  relationshipSceneDiagnostic += `; shadow=completed, questions=${Object.keys(shadowReview.questions).length}, duration=${shadowResult.duration}ms, changed-segments=${aligned ? changes.length : 'unaligned'}${changes.length ? ` (${changes.join(', ')})` : ''}; shadow excludes contextual user reconciliation${openingReview || backlinkReview ? ', opening re-read and links' : ''}`
                 } catch {
                   relationshipSceneDiagnostic += '; shadow=resolution failed'
                 }

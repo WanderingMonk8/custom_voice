@@ -2539,6 +2539,7 @@ test('speaker diagnostic source labels follow final resolution rather than an in
   assert.equal(speakerAssignmentSourceFromTrace(['resolution:global-context review (protected from local override)'], false), 'contextual-review')
   assert.equal(speakerAssignmentSourceFromTrace(['jev-opening-exchange:strong single-speaker review applied', 'resolution:global-context review (protected from local override)'], false), 'opening-exchange')
   assert.equal(speakerAssignmentSourceFromTrace(['jev-opening-backlink:accepted same-speaker link to later validated quote', 'resolution:global-context review (protected from local override)'], false), 'opening-backlink')
+  assert.equal(speakerAssignmentSourceFromTrace(['jev-opening-forwardlink:accepted same-speaker link to earlier validated quote', 'resolution:global-context review (protected from local override)'], false), 'opening-forwardlink')
   assert.equal(speakerAssignmentSourceFromTrace(['jev-opening-exchange:strong single-speaker review applied', 'resolution:unresolved speech (connection-default fallback)'], false), 'role-fallback')
   assert.equal(speakerAssignmentSourceFromTrace(['resolution:direct-speech-identity'], false), 'first-pass')
   assert.equal(speakerAssignmentSourceFromTrace([], true), 'local-parser')
@@ -2892,6 +2893,33 @@ test('backward links require a strong independent same-speaker answer and a vali
   assert.equal(buildOpeningBacklinkReview(changedScene, sceneAnswers, context, null), null)
   const explicitlyDifferent = buildSpeakerDecisionPlan('"First," Ken says.\n\n"Second," Ewan says.', speakers, false)
   assert.equal(buildOpeningBacklinkReview(explicitlyDifferent, sceneAnswers, context, null), null)
+})
+
+test('opening links consider adjacent validated speakers in both directions without forcing continuity', () => {
+  const speakers = [{ id: 'npc:ewan', name: 'Ewan' }, { id: USER_SPEAKER_ID, name: 'Ken' }]
+  const plan = buildSpeakerDecisionPlan('"Sacrifice."\n\nHe turns with the tray.\n\n"The noodles?"\n\n"No, I know what you meant."', speakers, false)
+  const context = { previousMessages: [{ id: 'prior', role: 'user' as const, text: 'I turn to Ewan. "Sometimes you sacrifice."' }], ghosts: [] }
+  const make = () => ({ speech_s0: confidentDecision('known_0'), relationship_applied_s0: confidentDecision('known_0'), speech_s1: confidentDecision('no_clear_identity'), global_uncertain_s1: confidentDecision('no_clear_identity'), speech_s2: confidentDecision('known_0'), relationship_applied_s2: confidentDecision('known_0') } as Record<string, SpeakerDecisionChoice>)
+  const answers = make()
+  const review = buildOpeningBacklinkReview(plan, answers, context, null)!
+  assert.equal(review.links.forwardlink_s1.anchorId, 's0')
+  assert.equal(review.links.backlink_s1.anchorId, 's2')
+  assert.match(review.state.pairEvidence.forwardlink_s1.between, /tray/u)
+  assert.match(review.questions.forwardlink_s1.instructions, /earlier quotation s0/u)
+  applyOpeningBacklinkReview(plan, answers, { forwardlink_s1: confidentDecision('same'), backlink_s1: { choice: 'different_or_unclear', probabilities: { different_or_unclear: 0.62, same: 0.38 }, confidence: 0.24 } }, review.links)
+  assert.equal(answers.speech_s1.choice, 'known_0')
+  assert.ok(answers.relationship_forwardlink_s1)
+  assert.equal(answers.global_uncertain_s1, undefined)
+  const disagreement = make()
+  applyOpeningBacklinkReview(plan, disagreement, { forwardlink_s1: confidentDecision('same'), backlink_s1: confidentDecision('different_or_unclear') }, review.links)
+  assert.ok(disagreement.global_uncertain_s1)
+  const changed = make()
+  changed.speech_s0 = confidentDecision('known_1')
+  applyOpeningBacklinkReview(plan, changed, { forwardlink_s1: confidentDecision('same') }, review.links)
+  assert.ok(changed.global_uncertain_s1)
+  const turn = buildSpeakerDecisionPlan('"Sacrifice," Ewan says.\n\n"No," Ken replies.\n\n"Fine," Ewan says.', speakers, false)
+  const mixed: Record<string, SpeakerDecisionChoice> = { speech_s0: confidentDecision('known_0'), relationship_applied_s0: confidentDecision('known_0'), speech_s1: confidentDecision('no_clear_identity'), global_uncertain_s1: confidentDecision('no_clear_identity'), speech_s2: confidentDecision('known_0'), relationship_applied_s2: confidentDecision('known_0') }
+  assert.equal(buildOpeningBacklinkReview(turn, mixed, context, null), null)
 })
 
 test('uncertain global review blocks chain guessing and uses unresolved speech voice, not narration', () => {

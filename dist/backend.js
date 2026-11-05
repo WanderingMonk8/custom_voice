@@ -2019,17 +2019,22 @@ function buildOpeningBacklinkReview(plan, answers, context, cardSpeakerId) {
     if (!answers[`global_uncertain_${targetId}`] || Object.keys(questions).length >= 12) continue;
     const target = plan.state.speeches.find((speech) => speech.id === targetId);
     if (!target) continue;
-    for (const anchorId of run.speechIds.slice(index + 1)) {
+    const directions = [
+      { prefix: "forwardlink", candidates: run.speechIds.slice(Math.max(0, index - 3), index).reverse(), earlier: true },
+      { prefix: "backlink", candidates: run.speechIds.slice(index + 1, index + 4), earlier: false }
+    ];
+    for (const direction of directions) for (const anchorId of direction.candidates) {
+      if (Object.keys(questions).length >= 12) break;
       if (answers[`global_uncertain_${anchorId}`]) continue;
-      if (!answers[`relationship_applied_${anchorId}`] && !answers[`relationship_confirmed_${anchorId}`]) continue;
       const identity = evaluateSpeakerDecisionAnswer(answers[`speech_${anchorId}`], plan.optionSpeakerIds).identity;
       if (!identity || identity === UNCAST_SPEAKER_ID) continue;
+      if (!answers[`relationship_applied_${anchorId}`] && !answers[`relationship_confirmed_${anchorId}`]) break;
       const explicit = narrativeAttributionSpeaker(`${target.narrativeBefore} ${target.narrativeAfter}`, speakers);
       if (explicit && explicit !== identity) break;
-      const id = `backlink_${targetId}`;
+      const id = `${direction.prefix}_${targetId}`;
       questions[id] = {
         type: "choice",
-        instructions: `Do quotations ${targetId} and ${anchorId} in pairEvidence have the same actual speaker? Both quotations are from the CURRENT message. boundaryEvidence, if present, separately shows the final quotation from the PREVIOUS message, its surrounding narration and the current opening. Do not confuse an echo or response in the current opening with the earlier quotation or automatically assign it to the earlier speaker. The later quotation ${anchorId} has a provisional supported identity, but that is not proof about ${targetId}. Read the preceding exchange and all intervening text and speech. Consider topic, pronouns, actions, turn changes, new entrants, channels and later clarification. A person addressed or merely passing by is not automatically speaking. Choose same only when the link is clear; otherwise choose different_or_unclear.`,
+        instructions: `Do quotations ${targetId} and ${anchorId} in pairEvidence have the same actual speaker? Both quotations are from the CURRENT message. boundaryEvidence, if present, separately shows the final quotation from the PREVIOUS message, its surrounding narration and the current opening. Do not confuse an echo or response in the current opening with the earlier quotation or automatically assign it to the earlier speaker. The ${direction.earlier ? "earlier" : "later"} quotation ${anchorId} has a provisional supported identity, but that is not proof about ${targetId}. Read the preceding exchange and all intervening text and speech. Consider topic, pronouns, actions, turn changes, new entrants, channels and later clarification. A person addressed or merely passing by is not automatically speaking. Choose same only when the link is clear; otherwise choose different_or_unclear.`,
         criteria: { same: "Both quotations are spoken by the same person.", different_or_unclear: "They have different speakers or the evidence is not clear." }
       };
       links[id] = { targetId, anchorId, identity };
@@ -2037,7 +2042,7 @@ function buildOpeningBacklinkReview(plan, answers, context, cardSpeakerId) {
       const anchorIndex = plan.state.speeches.findIndex((speech) => speech.id === anchorId);
       const targetQuote = quotes[targetIndex];
       const anchorQuote = quotes[anchorIndex];
-      pairEvidence[id] = { target: target.text, anchor: plan.state.speeches[anchorIndex]?.text ?? "", between: targetQuote && anchorQuote ? plan.state.message.slice(targetQuote.end, anchorQuote.start).slice(0, 4e3) : "" };
+      pairEvidence[id] = { target: target.text, anchor: plan.state.speeches[anchorIndex]?.text ?? "", between: targetQuote && anchorQuote ? plan.state.message.slice(direction.earlier ? anchorQuote.end : targetQuote.end, direction.earlier ? targetQuote.start : anchorQuote.start).slice(0, 4e3) : "" };
       break;
     }
   }
@@ -2045,16 +2050,24 @@ function buildOpeningBacklinkReview(plan, answers, context, cardSpeakerId) {
   return { state: { ...base.state, backlinkCandidates: links, pairEvidence }, questions, links };
 }
 function applyOpeningBacklinkReview(plan, answers, reviewed, links) {
+  const checked = [];
   for (const [id, link] of Object.entries(links)) {
     const result = reviewed[id];
-    if (result) answers[`backlink_review_${link.targetId}`] = result;
+    if (!result) continue;
+    answers[`${id.startsWith("forwardlink_") ? "forwardlink" : "backlink"}_review_${link.targetId}`] = result;
     const decision = evaluateSpeakerDecisionAnswer(result, { same: "same", different_or_unclear: "different_or_unclear" }, { probability: 0.85, confidence: 0.8, margin: 0.3 });
     const anchor = answers[`speech_${link.anchorId}`];
     if (link.identity === USER_SPEAKER_ID && plan.state.messageRole === "assistant" && answers.persona_phase_complete && !answers[`persona_confirmed_${link.targetId}`]) continue;
-    if (!answers[`global_uncertain_${link.targetId}`] || answers[`global_uncertain_${link.anchorId}`] || !answers[`relationship_applied_${link.anchorId}`] && !answers[`relationship_confirmed_${link.anchorId}`] || decision.identity !== "same" || evaluateSpeakerDecisionAnswer(anchor, plan.optionSpeakerIds).identity !== link.identity) continue;
+    if (!answers[`global_uncertain_${link.targetId}`] || answers[`global_uncertain_${link.anchorId}`] || !answers[`relationship_applied_${link.anchorId}`] && !answers[`relationship_confirmed_${link.anchorId}`] || evaluateSpeakerDecisionAnswer(anchor, plan.optionSpeakerIds).identity !== link.identity) continue;
+    checked.push({ id, link, decision: decision.identity, result });
+  }
+  for (const { id, link, result } of checked.filter((item) => item.decision === "same")) {
+    if (checked.some((other) => other.link.targetId === link.targetId && (other.decision === "same" && other.link.identity !== link.identity || other.decision === "different_or_unclear" && other.link.identity === link.identity))) continue;
+    if (!answers[`global_uncertain_${link.targetId}`]) continue;
+    const anchor = answers[`speech_${link.anchorId}`];
     answers[`relationship_original_${link.targetId}`] = answers[`speech_${link.targetId}`];
     answers[`speech_${link.targetId}`] = anchor;
-    answers[`relationship_backlink_${link.targetId}`] = result;
+    answers[`relationship_${id.startsWith("forwardlink_") ? "forwardlink" : "backlink"}_${link.targetId}`] = result;
     answers[`relationship_continuity_${link.targetId}`] = anchor;
     answers[`relationship_global_${link.targetId}`] = anchor;
     delete answers[`global_uncertain_${link.targetId}`];
@@ -4159,6 +4172,8 @@ function resolveSpeakerDecisionSegments(content, plan, answers, speakers, option
           ...answers[`persona_confirmed_${speech.id}`] ? ["jev-contextual-user-review:user assignment confirmed"] : [],
           ...decisionAnswerDebug("jev-opening-backlink", answers[`backlink_review_${speech.id}`], { same: "same", different_or_unclear: "different_or_unclear" }),
           ...answers[`relationship_backlink_${speech.id}`] ? ["jev-opening-backlink:accepted same-speaker link to later validated quote"] : [],
+          ...decisionAnswerDebug("jev-opening-forwardlink", answers[`forwardlink_review_${speech.id}`], { same: "same", different_or_unclear: "different_or_unclear" }),
+          ...answers[`relationship_forwardlink_${speech.id}`] ? ["jev-opening-forwardlink:accepted same-speaker link to earlier validated quote"] : [],
           ...answers[`relationship_exchange_${speech.id}`] ? ["jev-opening-exchange:strong single-speaker review applied"] : [],
           ...decisionAnswerDebug("jev-opening-exchange-pattern", answers[`opening_pattern_${speech.id}`], { single_speaker: "single_speaker", multiple_speakers: "multiple_speakers" }),
           ...decisionAnswerDebug("jev-opening-exchange-speaker", answers[`opening_speaker_${speech.id}`], plan.optionSpeakerIds),
@@ -5055,7 +5070,7 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
           })),
           cardSpeakerId: titleMatchedCardSpeakerId,
           historicalSpeakerId,
-          relationshipReview: { version: "cross-message-run-12", context: relationshipContext, speakerLookback, strategy: payload.runReview === true ? "run" : "scene" },
+          relationshipReview: { version: "cross-message-run-13", context: relationshipContext, speakerLookback, strategy: payload.runReview === true ? "run" : "scene" },
           skippedTrackerTags
         }));
         const cached = config.parsedMessages[payload.messageId];
@@ -5216,14 +5231,14 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
               const invalid = invalidSpeakerReviewAnswers(backlinkReview.questions, reviewed);
               if (invalid.length) {
                 relationshipReviewFailed = true;
-                relationshipSceneDiagnostic += `; opening-backlink=incomplete (${invalid.length} invalid answers)`;
+                relationshipSceneDiagnostic += `; opening-links=incomplete (${invalid.length} invalid answers)`;
               } else {
                 applyOpeningBacklinkReview(decisionPlan, answers, reviewed, backlinkReview.links);
-                relationshipSceneDiagnostic += `; opening-backlink=${Object.keys(backlinkReview.questions).length} questions/${Date.now() - startedAt}ms`;
+                relationshipSceneDiagnostic += `; opening-links=${Object.keys(backlinkReview.questions).length} questions/${Date.now() - startedAt}ms`;
               }
             } catch {
               relationshipReviewFailed = true;
-              relationshipSceneDiagnostic += `; opening-backlink=failed/${Date.now() - startedAt}ms`;
+              relationshipSceneDiagnostic += `; opening-links=failed/${Date.now() - startedAt}ms`;
             }
           }
           const discourse = {
@@ -5274,7 +5289,7 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
                   });
                   const aligned = segments.length === shadowSegments.length && segments.every((segment, index) => segment.text === shadowSegments[index].text);
                   const changes = aligned ? segments.flatMap((segment, index) => segment.speakerId !== shadowSegments[index].speakerId ? [`${index + 1}:${segment.speakerId ?? "none"}->${shadowSegments[index].speakerId ?? "none"}`] : []) : [];
-                  relationshipSceneDiagnostic += `; shadow=completed, questions=${Object.keys(shadowReview.questions).length}, duration=${shadowResult.duration}ms, changed-segments=${aligned ? changes.length : "unaligned"}${changes.length ? ` (${changes.join(", ")})` : ""}; shadow excludes contextual user reconciliation${openingReview || backlinkReview ? ", opening re-read and backlink" : ""}`;
+                  relationshipSceneDiagnostic += `; shadow=completed, questions=${Object.keys(shadowReview.questions).length}, duration=${shadowResult.duration}ms, changed-segments=${aligned ? changes.length : "unaligned"}${changes.length ? ` (${changes.join(", ")})` : ""}; shadow excludes contextual user reconciliation${openingReview || backlinkReview ? ", opening re-read and links" : ""}`;
                 } catch {
                   relationshipSceneDiagnostic += "; shadow=resolution failed";
                 }
