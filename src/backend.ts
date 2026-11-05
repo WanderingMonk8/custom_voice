@@ -19,6 +19,7 @@ import {
   buildContextualUserReconciliation,
   applyContextualUserReconciliation,
   buildRelationshipSpeakerReview,
+  suppressUngroundedSpeakerChoices,
   buildOpeningSpeakerReview,
   buildBoundaryExchangeShadowReview,
   applyOpeningExchangeReview,
@@ -1101,7 +1102,7 @@ function queueSpeakerParse(
           })),
           cardSpeakerId: titleMatchedCardSpeakerId,
           historicalSpeakerId,
-          relationshipReview: { version: 'cross-message-run-14', context: relationshipContext, speakerLookback, strategy: payload.runReview === true ? 'run' : 'scene', focusedOpeningFallback: payload.focusedOpeningFallback === true, bestAvailableSpeaker: payload.bestAvailableSpeaker === true },
+          relationshipReview: { version: 'cross-message-run-15', context: relationshipContext, speakerLookback, strategy: payload.runReview === true ? 'run' : 'scene', focusedOpeningFallback: payload.focusedOpeningFallback === true, bestAvailableSpeaker: payload.bestAvailableSpeaker === true },
           skippedTrackerTags,
         }))
         const cached = config.parsedMessages[payload.messageId]
@@ -1136,6 +1137,7 @@ function queueSpeakerParse(
             }
           }
           if (payload.debug) snapshotSpeakerFirstPass(decisionPlan, answers)
+          suppressUngroundedSpeakerChoices(decisionPlan, answers, relationshipContext, titleMatchedCardSpeakerId)
           const userReview = buildAssistantUserSpeakerReview(decisionPlan, answers)
           let userReviewFailed = false
           if (Object.keys(userReview.questions).length) {
@@ -1385,7 +1387,7 @@ function queueSpeakerParse(
             }
           }
           if (payload.bestAvailableSpeaker && !relationshipReviewFailed && !userReviewFailed) {
-            const bestReview = buildBestAvailableSpeakerReview(decisionPlan, answers, relationshipContext)
+            const bestReview = buildBestAvailableSpeakerReview(decisionPlan, answers, relationshipContext, titleMatchedCardSpeakerId)
             if (Object.keys(bestReview.questions).length) {
               let timer: ReturnType<typeof setTimeout> | undefined
               try {

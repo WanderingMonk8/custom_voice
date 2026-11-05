@@ -3193,15 +3193,52 @@ export function relationshipReviewContext(messages: Array<{ id: string; is_user:
 }
 
 /** Run relationship review only where local identity or an off-scene exchange needs context. */
+export function independentlyGroundedSpeakerIds(plan: SpeakerDecisionPlan, context: RelationshipReviewContext, cardSpeakerId: string | null = null): Set<string> {
+  const text = `${plan.state.message}\n${context.previousMessages.map(item => item.text).join('\n')}`
+  const mentioned = (value: string) => {
+    const alias = value.trim()
+    return alias.length >= 2 && new RegExp(`(^|[^\\p{L}\\p{N}])${escapedPattern(alias)}(?=$|[^\\p{L}\\p{N}])`, 'iu').test(text)
+  }
+  const ids = new Set<string>([USER_SPEAKER_ID, UNCAST_SPEAKER_ID])
+  if (cardSpeakerId) ids.add(cardSpeakerId)
+  for (const speaker of plan.state.speakers) if (speaker.aliases.some(mentioned)) ids.add(speaker.id)
+  const previousIds = new Set(context.previousMessages.map(item => item.id))
+  for (const ghost of context.ghosts) if ([ghost.label, ...ghost.aliases].some(mentioned) || ghost.conversationHistory.some(item => previousIds.has(item.messageId))) ids.add(`ghost:${ghost.id}`)
+  return ids
+}
+
+/** Prevent ungrounded first-pass cast choices from anchoring later reviews. */
+export function suppressUngroundedSpeakerChoices(plan: SpeakerDecisionPlan, answers: Record<string, SpeakerDecisionChoice>, context: RelationshipReviewContext, cardSpeakerId: string | null = null): void {
+  if (plan.state.messageRole !== 'assistant') return
+  const grounded = independentlyGroundedSpeakerIds(plan, context, cardSpeakerId)
+  for (const speech of plan.state.speeches) {
+    const key = `speech_${speech.id}`
+    const answer = answers[key]
+    const identity = answer && plan.optionSpeakerIds[answer.choice]
+    if (!identity || grounded.has(identity)) continue
+    answers[`ungrounded_original_${speech.id}`] = answer
+    answers[key] = { choice: 'no_clear_identity', probabilities: { no_clear_identity: 1 }, confidence: 1 }
+    answers[`global_uncertain_${speech.id}`] = answer
+  }
+  for (const paragraph of plan.state.paragraphs) {
+    const key = `paragraph_${paragraph.id}`
+    const answer = answers[key]
+    const identity = answer && plan.optionSpeakerIds[answer.choice]
+    if (identity && !grounded.has(identity)) answers[key] = { choice: 'no_clear_identity', probabilities: { no_clear_identity: 1 }, confidence: 1 }
+  }
+}
+
 export function buildRelationshipSpeakerReview(plan: SpeakerDecisionPlan, answers: Record<string, SpeakerDecisionChoice>, context: RelationshipReviewContext, continuitySpeakerId: string | null = null, globalOptions?: { cardSpeakerId: string | null; targets: string[]; strategy?: 'scene' | 'run' }) {
   const questions: SpeakerDecisionPlan['questions'] = {}
   const ghostOptions: Record<string, string> = {}
   const sceneReferences: Array<{ speechId: string; narration: string; quotation: string }> = []
   const speakers = plan.state.speakers.map(speaker => ({ id: speaker.id, name: speaker.name }))
   const criteria = speakerDecisionCriteria(plan.state.speakers.slice(0, 220))
+  const grounded = globalOptions ? independentlyGroundedSpeakerIds(plan, context, globalOptions.cardSpeakerId) : null
+  if (grounded) for (const speaker of plan.state.speakers) if (!grounded.has(speaker.id)) delete criteria[speaker.option]
   const remaining = Math.max(0, 255 - Object.keys(criteria).length)
   const castAliases = new Set(plan.state.speakers.filter(speaker => speaker.id !== USER_SPEAKER_ID).flatMap(speaker => speaker.aliases.map(alias => alias.toLowerCase())))
-  context.ghosts.filter(ghost => !ghost.aliases.some(alias => castAliases.has(alias.toLowerCase())))
+  context.ghosts.filter(ghost => (!grounded || grounded.has(`ghost:${ghost.id}`)) && !ghost.aliases.some(alias => castAliases.has(alias.toLowerCase())))
     .slice(0, Math.min(20, remaining)).forEach((ghost, index) => {
     const option = `relationship_ghost_${index}`
     ghostOptions[option] = `ghost:${ghost.id}`
@@ -3303,26 +3340,19 @@ export function invalidSpeakerReviewAnswers(questions: SpeakerDecisionPlan['ques
 }
 
 /** A last-resort, scene-bounded guess. Results are never used as anchors. */
-export function buildBestAvailableSpeakerReview(plan: SpeakerDecisionPlan, answers: Record<string, SpeakerDecisionChoice>, context: RelationshipReviewContext) {
-  const text = `${plan.state.message}\n${context.previousMessages.slice(-2).map(item => item.text).join('\n')}`.toLocaleLowerCase()
-  const mentioned = (name: string) => {
-    const clean = name.trim().toLocaleLowerCase()
-    if (clean.length < 2) return false
-    const escaped = clean.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-    return new RegExp(`(^|[^\\p{L}\\p{N}])${escaped}(?=$|[^\\p{L}\\p{N}])`, 'u').test(text)
-  }
+export function buildBestAvailableSpeakerReview(plan: SpeakerDecisionPlan, answers: Record<string, SpeakerDecisionChoice>, context: RelationshipReviewContext, cardSpeakerId: string | null = null) {
+  const grounded = independentlyGroundedSpeakerIds(plan, context, cardSpeakerId)
   const knownCriteria = speakerDecisionCriteria(plan.state.speakers.slice(0, 220))
   const options: Record<string, string> = {}
   const criteria: Record<string, string> = {}
   for (const speaker of plan.state.speakers) {
     if (speaker.id === USER_SPEAKER_ID) continue
-    const validated = plan.state.speeches.some(speech => (answers[`relationship_applied_${speech.id}`] || answers[`relationship_confirmed_${speech.id}`]) && evaluateSpeakerDecisionAnswer(answers[`speech_${speech.id}`], plan.optionSpeakerIds).identity === speaker.id)
-    if (!validated && !speaker.aliases.some(mentioned)) continue
+    if (!grounded.has(speaker.id)) continue
     options[speaker.option] = speaker.id
     criteria[speaker.option] = knownCriteria[speaker.option]
   }
   for (const [index, ghost] of context.ghosts.slice(0, 20).entries()) {
-    if (![ghost.label, ...ghost.aliases].some(mentioned)) continue
+    if (!grounded.has(`ghost:${ghost.id}`)) continue
     const option = `best_ghost_${index}`
     options[option] = `ghost:${ghost.id}`
     criteria[option] = `Temporary character ${ghost.label || ghost.aliases.join(' / ')}; use context, not name alone.`
@@ -6714,6 +6744,8 @@ export function resolveSpeakerDecisionSegments(
           `segment-type:speech (quote ${index + 1})`,
           ...(answers[`first_pass_${speech.id}`] ? decisionAnswerDebug('jev-first-pass-speech', answers[`first_pass_${speech.id}`], plan.optionSpeakerIds) : []),
           ...decisionAnswerDebug('jev-speech', answer, plan.optionSpeakerIds),
+          ...decisionAnswerDebug('jev-ungrounded-first-pass', answers[`ungrounded_original_${speech.id}`], plan.optionSpeakerIds),
+          ...(answers[`ungrounded_original_${speech.id}`] ? ['jev-grounding:unsupported cast identity excluded from first-pass anchor'] : []),
           ...decisionAnswerDebug('jev-relationship-original', answers[`relationship_original_${speech.id}`], plan.optionSpeakerIds),
           ...decisionAnswerDebug('jev-relationship-review', answers[`relationship_review_${speech.id}`], plan.optionSpeakerIds),
           ...decisionAnswerDebug('jev-scene-reference', answers[`scene_reference_${speech.id}`], plan.optionSpeakerIds),

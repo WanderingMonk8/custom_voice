@@ -24,6 +24,8 @@ import {
   buildContextualUserReconciliation,
   applyContextualUserReconciliation,
   buildRelationshipSpeakerReview,
+  independentlyGroundedSpeakerIds,
+  suppressUngroundedSpeakerChoices,
   buildOpeningSpeakerReview,
   buildBoundaryExchangeShadowReview,
   applyOpeningExchangeReview,
@@ -2934,6 +2936,39 @@ test('speaker feature defaults enable unset values while preserving explicit opt
   assert.equal(enabledUnlessExplicitlyDisabled(undefined), true)
   assert.equal(enabledUnlessExplicitlyDisabled(true), true)
   assert.equal(enabledUnlessExplicitlyDisabled(false), false)
+})
+
+test('cast candidates require independent scene or lookback evidence, not their own prior assignment', () => {
+  const speakers = [{ id: 'npc:zara', name: 'Zara Vane / Zara' }, { id: 'npc:ewan', name: 'Ewan' }, { id: USER_SPEAKER_ID, name: 'Ken' }]
+  const plan = buildSpeakerDecisionPlan('She smiles. "Dear." She turns. "Come on."', speakers, false)
+  const context = { previousMessages: [{ id: 'prior', role: 'user' as const, text: 'I turn toward Ewan.' }], ghosts: [] }
+  const answers: Record<string, SpeakerDecisionChoice> = { speech_s0: confidentDecision('known_0'), paragraph_p0: confidentDecision('known_0') }
+  suppressUngroundedSpeakerChoices(plan, answers, context)
+  assert.ok(answers.global_uncertain_s0)
+  assert.equal(answers.speech_s0.choice, 'no_clear_identity')
+  assert.equal(answers.ungrounded_original_s0.choice, 'known_0')
+  const review = buildRelationshipSpeakerReview(plan, answers, context, null, { cardSpeakerId: null, targets: ['s0'], strategy: 'run' })
+  assert.equal(review.questions.relationship_s0.criteria.known_0, undefined)
+  assert.ok(review.questions.relationship_s0.criteria.known_1)
+  assert.ok(review.questions.relationship_s0.criteria.uncast_character)
+  answers.relationship_applied_s0 = confidentDecision('known_0')
+  answers.speech_s0 = confidentDecision('known_0')
+  const fallback = buildBestAvailableSpeakerReview(plan, answers, context)
+  assert.equal(fallback.questions.best_guess_s0.criteria.known_0, undefined)
+  assert.ok(fallback.questions.best_guess_s0.criteria.known_1)
+  assert.ok(independentlyGroundedSpeakerIds(plan, context, 'npc:zara').has('npc:zara'))
+  const soloAnswers: Record<string, SpeakerDecisionChoice> = { speech_s0: confidentDecision('known_0') }
+  suppressUngroundedSpeakerChoices(plan, soloAnswers, context, 'npc:zara')
+  assert.equal(soloAnswers.speech_s0.choice, 'known_0')
+  const namedContext = { previousMessages: [{ id: 'prior', role: 'user' as const, text: 'I turn to Zara.' }], ghosts: [] }
+  assert.ok(independentlyGroundedSpeakerIds(plan, namedContext).has('npc:zara'))
+  const ghostContext = { previousMessages: [{ id: 'prior', role: 'assistant' as const, text: 'She opens the door.' }], ghosts: [
+    { id: 'active', label: '', aliases: [], context: 'She speaks.', conversationHistory: [{ messageId: 'prior', text: 'She opens the door.' }] },
+    { id: 'stale', label: 'Maeve', aliases: ['Maeve'], context: '', conversationHistory: [{ messageId: 'older', text: 'Maeve speaks.' }] },
+  ] }
+  const groundedGhosts = independentlyGroundedSpeakerIds(plan, ghostContext)
+  assert.ok(groundedGhosts.has('ghost:active'))
+  assert.equal(groundedGhosts.has('ghost:stale'), false)
 })
 
 test('verified self-introduction reconciles earlier uncertain identities without crossing scene changes or explicit speakers', () => {

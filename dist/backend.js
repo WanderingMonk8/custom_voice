@@ -1827,15 +1827,52 @@ function relationshipReviewContext(messages, targetId, ghosts, skippedTags = "",
   });
   return { previousMessages, ghosts: safeGhosts };
 }
+function independentlyGroundedSpeakerIds(plan, context, cardSpeakerId = null) {
+  const text = `${plan.state.message}
+${context.previousMessages.map((item) => item.text).join("\n")}`;
+  const mentioned = (value) => {
+    const alias = value.trim();
+    return alias.length >= 2 && new RegExp(`(^|[^\\p{L}\\p{N}])${escapedPattern(alias)}(?=$|[^\\p{L}\\p{N}])`, "iu").test(text);
+  };
+  const ids = /* @__PURE__ */ new Set([USER_SPEAKER_ID, UNCAST_SPEAKER_ID]);
+  if (cardSpeakerId) ids.add(cardSpeakerId);
+  for (const speaker of plan.state.speakers) if (speaker.aliases.some(mentioned)) ids.add(speaker.id);
+  const previousIds = new Set(context.previousMessages.map((item) => item.id));
+  for (const ghost of context.ghosts) if ([ghost.label, ...ghost.aliases].some(mentioned) || ghost.conversationHistory.some((item) => previousIds.has(item.messageId))) ids.add(`ghost:${ghost.id}`);
+  return ids;
+}
+function suppressUngroundedSpeakerChoices(plan, answers, context, cardSpeakerId = null) {
+  if (plan.state.messageRole !== "assistant") return;
+  const grounded = independentlyGroundedSpeakerIds(plan, context, cardSpeakerId);
+  for (const speech of plan.state.speeches) {
+    const key = `speech_${speech.id}`;
+    const answer = answers[key];
+    const identity = answer && plan.optionSpeakerIds[answer.choice];
+    if (!identity || grounded.has(identity)) continue;
+    answers[`ungrounded_original_${speech.id}`] = answer;
+    answers[key] = { choice: "no_clear_identity", probabilities: { no_clear_identity: 1 }, confidence: 1 };
+    answers[`global_uncertain_${speech.id}`] = answer;
+  }
+  for (const paragraph of plan.state.paragraphs) {
+    const key = `paragraph_${paragraph.id}`;
+    const answer = answers[key];
+    const identity = answer && plan.optionSpeakerIds[answer.choice];
+    if (identity && !grounded.has(identity)) answers[key] = { choice: "no_clear_identity", probabilities: { no_clear_identity: 1 }, confidence: 1 };
+  }
+}
 function buildRelationshipSpeakerReview(plan, answers, context, continuitySpeakerId = null, globalOptions) {
   const questions = {};
   const ghostOptions = {};
   const sceneReferences = [];
   const speakers = plan.state.speakers.map((speaker) => ({ id: speaker.id, name: speaker.name }));
   const criteria = speakerDecisionCriteria(plan.state.speakers.slice(0, 220));
+  const grounded = globalOptions ? independentlyGroundedSpeakerIds(plan, context, globalOptions.cardSpeakerId) : null;
+  if (grounded) {
+    for (const speaker of plan.state.speakers) if (!grounded.has(speaker.id)) delete criteria[speaker.option];
+  }
   const remaining = Math.max(0, 255 - Object.keys(criteria).length);
   const castAliases = new Set(plan.state.speakers.filter((speaker) => speaker.id !== USER_SPEAKER_ID).flatMap((speaker) => speaker.aliases.map((alias) => alias.toLowerCase())));
-  context.ghosts.filter((ghost) => !ghost.aliases.some((alias) => castAliases.has(alias.toLowerCase()))).slice(0, Math.min(20, remaining)).forEach((ghost, index) => {
+  context.ghosts.filter((ghost) => (!grounded || grounded.has(`ghost:${ghost.id}`)) && !ghost.aliases.some((alias) => castAliases.has(alias.toLowerCase()))).slice(0, Math.min(20, remaining)).forEach((ghost, index) => {
     const option = `relationship_ghost_${index}`;
     ghostOptions[option] = `ghost:${ghost.id}`;
     criteria[option] = `Previously heard temporary character ${ghost.label || ghost.aliases.join(" / ") || `ghost ${index + 1}`}; use the supplied prior conversation, not the label alone.`;
@@ -1926,27 +1963,19 @@ function invalidSpeakerReviewAnswers(questions, answers) {
     return [];
   });
 }
-function buildBestAvailableSpeakerReview(plan, answers, context) {
-  const text = `${plan.state.message}
-${context.previousMessages.slice(-2).map((item) => item.text).join("\n")}`.toLocaleLowerCase();
-  const mentioned = (name) => {
-    const clean = name.trim().toLocaleLowerCase();
-    if (clean.length < 2) return false;
-    const escaped = clean.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    return new RegExp(`(^|[^\\p{L}\\p{N}])${escaped}(?=$|[^\\p{L}\\p{N}])`, "u").test(text);
-  };
+function buildBestAvailableSpeakerReview(plan, answers, context, cardSpeakerId = null) {
+  const grounded = independentlyGroundedSpeakerIds(plan, context, cardSpeakerId);
   const knownCriteria = speakerDecisionCriteria(plan.state.speakers.slice(0, 220));
   const options = {};
   const criteria = {};
   for (const speaker of plan.state.speakers) {
     if (speaker.id === USER_SPEAKER_ID) continue;
-    const validated = plan.state.speeches.some((speech) => (answers[`relationship_applied_${speech.id}`] || answers[`relationship_confirmed_${speech.id}`]) && evaluateSpeakerDecisionAnswer(answers[`speech_${speech.id}`], plan.optionSpeakerIds).identity === speaker.id);
-    if (!validated && !speaker.aliases.some(mentioned)) continue;
+    if (!grounded.has(speaker.id)) continue;
     options[speaker.option] = speaker.id;
     criteria[speaker.option] = knownCriteria[speaker.option];
   }
   for (const [index, ghost] of context.ghosts.slice(0, 20).entries()) {
-    if (![ghost.label, ...ghost.aliases].some(mentioned)) continue;
+    if (!grounded.has(`ghost:${ghost.id}`)) continue;
     const option = `best_ghost_${index}`;
     options[option] = `ghost:${ghost.id}`;
     criteria[option] = `Temporary character ${ghost.label || ghost.aliases.join(" / ")}; use context, not name alone.`;
@@ -4370,6 +4399,8 @@ function resolveSpeakerDecisionSegments(content, plan, answers, speakers, option
           `segment-type:speech (quote ${index + 1})`,
           ...answers[`first_pass_${speech.id}`] ? decisionAnswerDebug("jev-first-pass-speech", answers[`first_pass_${speech.id}`], plan.optionSpeakerIds) : [],
           ...decisionAnswerDebug("jev-speech", answer, plan.optionSpeakerIds),
+          ...decisionAnswerDebug("jev-ungrounded-first-pass", answers[`ungrounded_original_${speech.id}`], plan.optionSpeakerIds),
+          ...answers[`ungrounded_original_${speech.id}`] ? ["jev-grounding:unsupported cast identity excluded from first-pass anchor"] : [],
           ...decisionAnswerDebug("jev-relationship-original", answers[`relationship_original_${speech.id}`], plan.optionSpeakerIds),
           ...decisionAnswerDebug("jev-relationship-review", answers[`relationship_review_${speech.id}`], plan.optionSpeakerIds),
           ...decisionAnswerDebug("jev-scene-reference", answers[`scene_reference_${speech.id}`], plan.optionSpeakerIds),
@@ -5288,7 +5319,7 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
           })),
           cardSpeakerId: titleMatchedCardSpeakerId,
           historicalSpeakerId,
-          relationshipReview: { version: "cross-message-run-14", context: relationshipContext, speakerLookback, strategy: payload.runReview === true ? "run" : "scene", focusedOpeningFallback: payload.focusedOpeningFallback === true, bestAvailableSpeaker: payload.bestAvailableSpeaker === true },
+          relationshipReview: { version: "cross-message-run-15", context: relationshipContext, speakerLookback, strategy: payload.runReview === true ? "run" : "scene", focusedOpeningFallback: payload.focusedOpeningFallback === true, bestAvailableSpeaker: payload.bestAvailableSpeaker === true },
           skippedTrackerTags
         }));
         const cached = config.parsedMessages[payload.messageId];
@@ -5321,6 +5352,7 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
             };
           }
           if (payload.debug) snapshotSpeakerFirstPass(decisionPlan, answers);
+          suppressUngroundedSpeakerChoices(decisionPlan, answers, relationshipContext, titleMatchedCardSpeakerId);
           const userReview = buildAssistantUserSpeakerReview(decisionPlan, answers);
           let userReviewFailed = false;
           if (Object.keys(userReview.questions).length) {
@@ -5571,7 +5603,7 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
             }
           }
           if (payload.bestAvailableSpeaker && !relationshipReviewFailed && !userReviewFailed) {
-            const bestReview = buildBestAvailableSpeakerReview(decisionPlan, answers, relationshipContext);
+            const bestReview = buildBestAvailableSpeakerReview(decisionPlan, answers, relationshipContext, titleMatchedCardSpeakerId);
             if (Object.keys(bestReview.questions).length) {
               let timer;
               try {
