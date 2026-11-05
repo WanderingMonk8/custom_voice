@@ -3234,8 +3234,10 @@ export function buildOpeningSpeakerReview(plan: SpeakerDecisionPlan, answers: Re
   }
   const lastSpeech = plan.state.speeches.find(speech => speech.id === openingRun.speechIds.at(-1))
   const lastParagraph = plan.state.paragraphs.findIndex(paragraph => paragraph.id === lastSpeech?.paragraphId)
-  const paragraphs = plan.state.paragraphs.slice(0, lastParagraph >= 0 ? lastParagraph + 2 : 1)
-  const paragraphIds = new Set(paragraphs.map(paragraph => paragraph.id))
+  // Do not include the following paragraph: it may contain another
+  // conversation or a different channel, even when it is adjacent to the run.
+  const paragraphs = plan.state.paragraphs.slice(0, lastParagraph >= 0 ? lastParagraph + 1 : 1)
+  const openingSpeechIds = new Set(openingRun.speechIds)
   const prior = localContext.previousMessages.at(-1)!
   const priorQuote = playbackQuotes(prior.text).at(-1)
   const boundaryEvidence = priorQuote ? {
@@ -3248,7 +3250,7 @@ export function buildOpeningSpeakerReview(plan: SpeakerDecisionPlan, answers: Re
   return {
     ...review,
     questions,
-    state: { ...review.state, message: paragraphs.map(paragraph => paragraph.text).join('\n\n'), paragraphs, speeches: plan.state.speeches.filter(speech => paragraphIds.has(speech.paragraphId)), runs: [openingRun], turns: plan.state.turns.filter(turn => openingRun.speechIds.includes(turn.speechId)), reviewedRuns: [openingRun], boundaryEvidence },
+    state: { ...review.state, message: paragraphs.map(paragraph => paragraph.text).join('\n\n'), paragraphs, speeches: plan.state.speeches.filter(speech => openingSpeechIds.has(speech.id)), runs: [openingRun], turns: plan.state.turns.filter(turn => openingSpeechIds.has(turn.speechId)), reviewedRuns: [openingRun], boundaryEvidence },
   }
 }
 
@@ -3419,14 +3421,17 @@ export function applyRelationshipSpeakerReview(plan: SpeakerDecisionPlan, answer
     // Agreement is not an override. Apply the ordinary acceptance gates to a
     // confirming review, rather than the stricter gates for changing identity.
     // Missing, unclear or conflicting reviews still follow the uncertainty path.
+    const localOriginal = evaluateSpeakerDecisionAnswer(original, plan.optionSpeakerIds, { probability: 0.6, confidence: 0.55, margin: 0.3 }).identity
+    const weakAgreement = evaluateSpeakerDecisionAnswer(result, options, { probability: 0.5, confidence: 0.45, margin: 0.05 }).identity
+    const explicitAttribution = narrativeAttributionSpeaker(`${speech.narrativeBefore} ${speech.narrativeAfter}`, speakers)
     const confirmingIdentity = evaluateSpeakerDecisionAnswer(result, options, SPEAKER_DECISION_THRESHOLDS.local).identity
+      ?? (localOriginal && weakAgreement === localOriginal && (!explicitAttribution || explicitAttribution === localOriginal) ? localOriginal : null)
     if (globalMode && originalIdentity && originalIdentity !== UNCAST_SPEAKER_ID && confirmingIdentity === originalIdentity) {
       delete answers[`global_uncertain_${speech.id}`]
       answers[`relationship_confirmed_${speech.id}`] = result
       continue
     }
     const reviewedIdentity = evaluateSpeakerDecisionAnswer(result, options, globalMode && (!originalIdentity || originalIdentity === UNCAST_SPEAKER_ID) ? SPEAKER_DECISION_THRESHOLDS.local : { probability: 0.85, confidence: 0.8, margin: 0.3 }).identity
-    const explicitAttribution = narrativeAttributionSpeaker(`${speech.narrativeBefore} ${speech.narrativeAfter}`, speakers)
     if (globalMode && !reviewedIdentity && (!originalIdentity || originalIdentity === UNCAST_SPEAKER_ID || explicitAttribution !== originalIdentity)) {
       answers[`global_uncertain_${speech.id}`] = result
     }

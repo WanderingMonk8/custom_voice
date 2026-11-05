@@ -1896,8 +1896,8 @@ function buildOpeningSpeakerReview(plan, answers, context, cardSpeakerId) {
   }
   const lastSpeech = plan.state.speeches.find((speech) => speech.id === openingRun.speechIds.at(-1));
   const lastParagraph = plan.state.paragraphs.findIndex((paragraph) => paragraph.id === lastSpeech?.paragraphId);
-  const paragraphs = plan.state.paragraphs.slice(0, lastParagraph >= 0 ? lastParagraph + 2 : 1);
-  const paragraphIds = new Set(paragraphs.map((paragraph) => paragraph.id));
+  const paragraphs = plan.state.paragraphs.slice(0, lastParagraph >= 0 ? lastParagraph + 1 : 1);
+  const openingSpeechIds = new Set(openingRun.speechIds);
   const prior = localContext.previousMessages.at(-1);
   const priorQuote = playbackQuotes(prior.text).at(-1);
   const boundaryEvidence = priorQuote ? {
@@ -1911,7 +1911,7 @@ function buildOpeningSpeakerReview(plan, answers, context, cardSpeakerId) {
   return {
     ...review,
     questions,
-    state: { ...review.state, message: paragraphs.map((paragraph) => paragraph.text).join("\n\n"), paragraphs, speeches: plan.state.speeches.filter((speech) => paragraphIds.has(speech.paragraphId)), runs: [openingRun], turns: plan.state.turns.filter((turn) => openingRun.speechIds.includes(turn.speechId)), reviewedRuns: [openingRun], boundaryEvidence }
+    state: { ...review.state, message: paragraphs.map((paragraph) => paragraph.text).join("\n\n"), paragraphs, speeches: plan.state.speeches.filter((speech) => openingSpeechIds.has(speech.id)), runs: [openingRun], turns: plan.state.turns.filter((turn) => openingSpeechIds.has(turn.speechId)), reviewedRuns: [openingRun], boundaryEvidence }
   };
 }
 function applyOpeningExchangeReview(plan, answers, reviewed) {
@@ -2068,14 +2068,16 @@ function applyRelationshipSpeakerReview(plan, answers, reviewed, ghostOptions, c
     }
     if (!result) continue;
     answers[`relationship_review_${speech.id}`] = result;
-    const confirmingIdentity = evaluateSpeakerDecisionAnswer(result, options, SPEAKER_DECISION_THRESHOLDS.local).identity;
+    const localOriginal = evaluateSpeakerDecisionAnswer(original, plan.optionSpeakerIds, { probability: 0.6, confidence: 0.55, margin: 0.3 }).identity;
+    const weakAgreement = evaluateSpeakerDecisionAnswer(result, options, { probability: 0.5, confidence: 0.45, margin: 0.05 }).identity;
+    const explicitAttribution = narrativeAttributionSpeaker(`${speech.narrativeBefore} ${speech.narrativeAfter}`, speakers);
+    const confirmingIdentity = evaluateSpeakerDecisionAnswer(result, options, SPEAKER_DECISION_THRESHOLDS.local).identity ?? (localOriginal && weakAgreement === localOriginal && (!explicitAttribution || explicitAttribution === localOriginal) ? localOriginal : null);
     if (globalMode && originalIdentity && originalIdentity !== UNCAST_SPEAKER_ID && confirmingIdentity === originalIdentity) {
       delete answers[`global_uncertain_${speech.id}`];
       answers[`relationship_confirmed_${speech.id}`] = result;
       continue;
     }
     const reviewedIdentity = evaluateSpeakerDecisionAnswer(result, options, globalMode && (!originalIdentity || originalIdentity === UNCAST_SPEAKER_ID) ? SPEAKER_DECISION_THRESHOLDS.local : { probability: 0.85, confidence: 0.8, margin: 0.3 }).identity;
-    const explicitAttribution = narrativeAttributionSpeaker(`${speech.narrativeBefore} ${speech.narrativeAfter}`, speakers);
     if (globalMode && !reviewedIdentity && (!originalIdentity || originalIdentity === UNCAST_SPEAKER_ID || explicitAttribution !== originalIdentity)) {
       answers[`global_uncertain_${speech.id}`] = result;
     }
@@ -4985,7 +4987,7 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
           })),
           cardSpeakerId: titleMatchedCardSpeakerId,
           historicalSpeakerId,
-          relationshipReview: { version: "cross-message-run-9", context: relationshipContext, speakerLookback, strategy: payload.runReview === true ? "run" : "scene" },
+          relationshipReview: { version: "cross-message-run-10", context: relationshipContext, speakerLookback, strategy: payload.runReview === true ? "run" : "scene" },
           skippedTrackerTags
         }));
         const cached = config.parsedMessages[payload.messageId];
@@ -5089,6 +5091,7 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
           }
           const openingReview = !relationshipReviewFailed ? buildOpeningSpeakerReview(decisionPlan, answers, relationshipContext, titleMatchedCardSpeakerId) : null;
           if (openingReview) {
+            if (payload.debug) relationshipSceneDiagnostic += `; opening-scope=${JSON.stringify({ previous: openingReview.state.previousMessages.map((item) => ({ id: item.id, role: item.role, chars: item.text.length })), speeches: openingReview.state.speeches.map((item) => ({ id: item.id, paragraphId: item.paragraphId, text: item.text.slice(0, 160) })), boundary: openingReview.state.boundaryEvidence ? { role: openingReview.state.boundaryEvidence.role, lead: openingReview.state.boundaryEvidence.lead.slice(-240), quotation: openingReview.state.boundaryEvidence.quotation.slice(-240) } : null })}`;
             const startedAt = Date.now();
             try {
               const result2 = await spindle.decisions.evaluate({ state: openingReview.state, questions: openingReview.questions, ...userId ? { userId } : {} });

@@ -2669,6 +2669,11 @@ test('agreement retains a clear first-pass identity without requiring override t
   const weak = make()
   applyRelationshipSpeakerReview(weak.plan, weak.answers, { relationship_s0: { choice: 'known_0', probabilities: { known_0: 0.50, known_1: 0.30, no_clear_identity: 0.20 }, confidence: 0.40 } }, {}, null, null, true)
   assert.ok(weak.answers.global_uncertain_s0)
+  const weakAgreement = make()
+  weakAgreement.answers.speech_s0 = { choice: 'known_0', probabilities: { known_0: 0.64, known_1: 0.32, no_clear_identity: 0.04 }, confidence: 0.60 }
+  applyRelationshipSpeakerReview(weakAgreement.plan, weakAgreement.answers, { relationship_s0: { choice: 'known_0', probabilities: { known_0: 0.51, known_1: 0.43, no_clear_identity: 0.06 }, confidence: 0.48 } }, {}, null, null, true)
+  assert.ok(weakAgreement.answers.relationship_confirmed_s0)
+  assert.equal(weakAgreement.answers.global_uncertain_s0, undefined)
   const conflict = make()
   applyRelationshipSpeakerReview(conflict.plan, conflict.answers, { relationship_s0: { choice: 'known_1', probabilities: { known_1: 0.75, known_0: 0.20, no_clear_identity: 0.05 }, confidence: 0.70 } }, {}, null, null, true)
   assert.ok(conflict.answers.global_uncertain_s0)
@@ -2704,6 +2709,32 @@ test('opening exchange review fills uncertain lines only for a strongly supporte
   const perSpeechConflict = make()
   applyOpeningExchangeReview(plan, perSpeechConflict, { ...supported, relationship_s1: confidentDecision('known_1') })
   assert.ok(perSpeechConflict.global_uncertain_s1)
+})
+
+test('opening review excludes the following scene and its dialogue from all focused state', () => {
+  const speakers = [{ id: 'npc:ewan', name: 'Ewan' }, { id: USER_SPEAKER_ID, name: 'Ken' }]
+  const content = '"Sacrifice."\n\nHe turns with the tray.\n\n"The noodles?"\n\nHours later, another room. "An unrelated message."'
+  const plan = buildSpeakerDecisionPlan(content, speakers, false)
+  const answers: Record<string, SpeakerDecisionChoice> = { speech_s0: confidentDecision('no_clear_identity'), global_uncertain_s0: confidentDecision('no_clear_identity') }
+  const context = { previousMessages: [{ id: 'prior', role: 'user' as const, text: 'I turn to Ewan. "Sometimes you sacrifice."' }], ghosts: [] }
+  const review = buildOpeningSpeakerReview(plan, answers, context, null)!
+  assert.deepEqual(review.state.speeches.map(speech => speech.id), ['s0', 's1'])
+  assert.doesNotMatch(review.state.message, /unrelated message/u)
+  assert.ok(review.state.runs.every(run => run.speechIds.every(id => id === 's0' || id === 's1')))
+  assert.equal(review.state.boundaryEvidence?.quotation, 'Sometimes you sacrifice.')
+})
+
+test('opening review scopes the tray exchange separately from incoming phone messages', () => {
+  const speakers = [{ id: 'npc:ewan', name: 'Ewan' }, { id: 'npc:zadie', name: 'Zadie' }, { id: USER_SPEAKER_ID, name: 'Ken' }]
+  const message = '"Sacrifice."\n\nHe is ten paces off with the tray balanced on one palm, and he turns halfway around.\n\n"What are you sacrificing? The noodles?"\n\nSomebody behind him sidesteps the tray, and he shifts without looking.\n\n"No, I know what you meant." A beat, and his jaw works over something he cannot say. "You do not take a little off the top and keep the rest."\n\nHe lifts one shoulder.\n\n"Whatever. Text her."\n\nHe goes. The tray goes through the window, and there is a crash from the other side of it, and then he is out the side door and the door swings twice and settles.\n\nThe phone buzzes in Ken’s hand.\n\n"Do not bring food."\n\n"Dinner is handled."'
+  const plan = buildSpeakerDecisionPlan(message, speakers, false)
+  const context = { previousMessages: [{ id: 'user', role: 'user' as const, text: 'I turn to Ewan again. "Sometimes you gotta sacrifice a little for someone you like, you know?"' }], ghosts: [] }
+  const answers: Record<string, SpeakerDecisionChoice> = { speech_s0: confidentDecision('no_clear_identity'), global_uncertain_s0: confidentDecision('no_clear_identity') }
+  const review = buildOpeningSpeakerReview(plan, answers, context, null)!
+  assert.deepEqual(review.state.speeches.map(item => item.id), ['s0', 's1', 's2', 's3', 's4'])
+  assert.doesNotMatch(review.state.message, /Do not bring food|Dinner is handled/u)
+  assert.match(review.state.boundaryEvidence?.quotation ?? '', /sacrifice a little/u)
+  assert.match(review.state.boundaryEvidence?.lead ?? '', /turn to Ewan/u)
 })
 
 test('backward links require a strong independent same-speaker answer and a validated later anchor', () => {
