@@ -1333,6 +1333,11 @@ export function normalizeSpeakerName(value: string): string {
   return value.normalize('NFKC').trim().replace(/\s+/g, ' ')
 }
 
+/** Obvious setting titles are not evidence that the card itself is a speaker. */
+export function isScenarioCardTitle(name: string): boolean {
+  return /\b(?:world|rpg|roleplay|scenario|simulator|simulation|sandbox)\b/iu.test(speakerAliases(name)[0] ?? name)
+}
+
 export function speakerAliases(value: string): string[] {
   const aliases: string[] = []
   const seen = new Set<string>()
@@ -1598,7 +1603,7 @@ export function mergeScannedCardCast(
   for (const card of cards) {
     for (const alias of speakerAliases(card.name)) cardsByName.set(alias.toLowerCase(), card)
   }
-  const detected = new Map(cards.map(card => [card.id, { ...card }] as const))
+  const detected = new Map<string, CharacterLike>()
   for (const member of cast) {
     const exactCard = cardsByName.get(normalizeSpeakerName(member.name).toLowerCase())
     const sourceCard = cardsById.get(member.cardId)
@@ -1607,7 +1612,7 @@ export function mergeScannedCardCast(
     const id = matchingCard?.id ?? npcSpeakerId(member.name)
     const existing = detected.get(id)
     if (!existing) {
-      detected.set(id, { id, name: member.name })
+      detected.set(id, { id, name: matchingCard ? combineSpeakerNames(matchingCard.name, member.name) : member.name })
     } else if (matchingCard) {
       detected.set(id, { ...existing, name: combineSpeakerNames(existing.name, member.name) })
     }
@@ -3105,6 +3110,29 @@ export function applyRelationshipSpeakerReview(plan: SpeakerDecisionPlan, answer
     answers[`speech_${speech.id}`] = result
     answers[`relationship_applied_${speech.id}`] = result
   }
+}
+
+/** Carry a clearly established speaker into an unresolved closing line when
+ * a bystander merely enters, rather than attributing speech to that person. */
+export function continueUncastClosingSpeech(plan: SpeakerDecisionPlan, answers: Record<string, SpeakerDecisionChoice>): void {
+  const speeches = plan.state.speeches
+  if (speeches.length < 3) return
+  const last = speeches.at(-1)!
+  const previous = speeches.at(-2)!
+  const before = speeches.at(-3)!
+  const current = evaluateSpeakerDecisionAnswer(answers[`speech_${last.id}`], plan.optionSpeakerIds).identity
+  const previousAnswer = answers[`speech_${previous.id}`]
+  const previousId = evaluateSpeakerDecisionAnswer(previousAnswer, plan.optionSpeakerIds).identity
+  const beforeId = evaluateSpeakerDecisionAnswer(answers[`speech_${before.id}`], plan.optionSpeakerIds).identity
+  if (current !== UNCAST_SPEAKER_ID || !previousId || previousId === UNCAST_SPEAKER_ID || previousId === USER_SPEAKER_ID || previousId !== beforeId || !previousAnswer) return
+  const bridge = plan.state.turns.find(turn => turn.speechId === last.id)?.bridge ?? last.narrativeBefore
+  const turn = answers[`turn_${last.id}`]
+  if (!/\b(?:enter(?:s|ed|ing)?|arriv(?:es|ed|ing)|steps?|mov(?:es|ed|ing)|walks?)\b/iu.test(bridge)
+    || hasAnonymousSpeechAttribution(bridge) || narrativeAttributionSpeaker(bridge, plan.state.speakers) || (turn && turn.confidence >= 0.65 && (turn.choice === TURN_RESPOND_OPTION || turn.choice === TURN_OTHER_OPTION))) return
+  answers[`relationship_original_${last.id}`] = answers[`speech_${last.id}`]
+  answers[`speech_${last.id}`] = previousAnswer
+  answers[`relationship_applied_${last.id}`] = previousAnswer
+  answers[`relationship_continuity_${last.id}`] = previousAnswer
 }
 
 export type TtsTagStyle = 'off' | 'gemini' | 'gemini38' | 'fish'

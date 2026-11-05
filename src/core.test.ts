@@ -6,6 +6,8 @@ import {
   addUnconfiguredDialogueSpeakers,
   addFavoriteVoice,
   mergeScannedCardCast,
+  isScenarioCardTitle,
+  continueUncastClosingSpeech,
   applyConfigToMetadata,
   applyCustomTtsEmotionCues,
   applyCustomTtsEmotionCuesWithModulation,
@@ -3355,6 +3357,24 @@ test('validates card-cast extraction and rejects unknown card IDs', () => {
     { cardId: 'card', name: 'Alice' },
     { cardId: 'card', name: 'Bob' },
   ])
+})
+
+test('world and RPG titles are not automatically added as speakers', () => {
+  assert.equal(isScenarioCardTitle('Free Use World / Free'), true)
+  assert.equal(isScenarioCardTitle('Alice Mercer / Alice'), false)
+  assert.deepEqual(mergeScannedCardCast([{ id: 'world', name: 'Free Use World' }], [{ cardId: 'world', name: 'Halloran' }]), [{ id: 'npc:halloran', name: 'Halloran' }])
+  assert.deepEqual(mergeScannedCardCast([{ id: 'world', name: 'Free Use World' }], []), [])
+})
+
+test('keeps the established speaker when a visitor enters before an uncast closing line', () => {
+  const plan = buildSpeakerDecisionPlan('"Keep that."\n\n"Hold the door."\n\nThe student moves into the office.\n\n"Sit. Name and ID."', [{ id: 'unconfigured:halloran', name: 'Halloran' }], false)
+  const answers: Record<string, SpeakerDecisionChoice> = { speech_s0: confidentDecision('known_0'), speech_s1: confidentDecision('known_0'), speech_s2: confidentDecision('uncast_character') }
+  continueUncastClosingSpeech(plan, answers)
+  assert.equal(answers.speech_s2.choice, 'known_0')
+  const different = buildSpeakerDecisionPlan('"Keep that."\n\n"Hold the door."\n\nThe clerk walks in and says, "Sit. Name and ID."', [{ id: 'unconfigured:halloran', name: 'Halloran' }], false)
+  const differentAnswers: Record<string, SpeakerDecisionChoice> = { speech_s0: confidentDecision('known_0'), speech_s1: confidentDecision('known_0'), speech_s2: confidentDecision('uncast_character') }
+  continueUncastClosingSpeech(different, differentAnswers)
+  assert.equal(differentAnswers.speech_s2.choice, 'uncast_character')
 })
 
 test('assigns quoted output to saved cast members using dialogue tags', () => {
