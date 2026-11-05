@@ -110,41 +110,6 @@ function purgeExpiredGhostContexts(ghosts, assistantMessageIds, lifetime) {
   }
   return changed;
 }
-function collectUncastVoiceGroups(segments) {
-  const groups = [];
-  const named = /* @__PURE__ */ new Map();
-  let anonymous = null;
-  for (let index = 0; index < segments.length; index++) {
-    const segment = segments[index];
-    const id = segment.speakerId;
-    if (segment.debugPath?.some((step) => step.startsWith("segment-type:narration"))) continue;
-    if (id === null) continue;
-    if (id !== UNCAST_SPEAKER_ID && !id.startsWith("unconfigured:") && !id.startsWith("ghost:")) {
-      anonymous = null;
-      continue;
-    }
-    if (id !== UNCAST_SPEAKER_ID) anonymous = null;
-    if (id === UNCAST_SPEAKER_ID && segments[index - 1]?.speakerId === null && segments[index - 1].text.length > 240) anonymous = null;
-    let group = id === UNCAST_SPEAKER_ID ? anonymous : named.get(id);
-    if (!group) {
-      group = { id: `g${groups.length}`, speakerId: id, segmentIndexes: [], speeches: [], context: [] };
-      groups.push(group);
-      if (id === UNCAST_SPEAKER_ID) anonymous = group;
-      else {
-        named.set(id, group);
-        anonymous = null;
-      }
-    }
-    group.segmentIndexes.push(index);
-    group.speeches.push(segment.text);
-    group.context.push([
-      segments[index - 1]?.speakerId === null ? segments[index - 1].text : "",
-      segment.text,
-      segments[index + 1]?.speakerId === null ? segments[index + 1].text : ""
-    ].filter(Boolean).join(" ").slice(0, 2e3));
-  }
-  return groups;
-}
 function canReserveAutomaticVoice(voiceId, reserved, ghosts, existingGhostId = "") {
   return !!voiceId && !reserved.has(voiceId) && !ghosts.some((ghost) => ghost.voiceId === voiceId && ghost.id !== existingGhostId);
 }
@@ -1282,12 +1247,6 @@ function hasNamedSpeakerSubject(content, speakers, skippedTrackerTagPairs = "") 
     return preferredMentionedSpeaker(paragraph.text, speakers, mentions) !== null;
   });
 }
-function eligibleCardFallbackSpeakerId(content, cardSpeakerId, speakers, skippedTrackerTagPairs = "") {
-  if (!cardSpeakerId) return null;
-  const alternativeSpeakers = speakers.filter((speaker) => speaker.id !== cardSpeakerId);
-  if (hasNamedSpeakerSubject(content, alternativeSpeakers, skippedTrackerTagPairs)) return null;
-  return hasExplicitUncastCue(content, skippedTrackerTagPairs) ? null : cardSpeakerId;
-}
 function currentParagraphSpeaker(before, after, speakers) {
   let paragraphStart = 0;
   for (const match of before.matchAll(/\n[^\S\n]*\n/gu)) {
@@ -1496,21 +1455,6 @@ function hasSustainedUnnamedNarration(paragraphs, startIndex, speakers) {
 function hasPronounSpeechAttribution(text) {
   const narration = cleanPlaybackText(narrativeOnly(text));
   return new RegExp(`\\b(?:he|she|they)\\b[^.!?\\n]{0,40}\\b${SPEECH_VERBS}\\b`, "iu").test(narration);
-}
-function pronounSpeechAttributionSubjects(text) {
-  const narration = cleanPlaybackText(narrativeOnly(text));
-  const subjects = /* @__PURE__ */ new Set();
-  const patterns = [
-    new RegExp(`\\b(he|she|they)\\b[^.!?\\n]{0,80}\\b${SPEECH_VERBS}\\b`, "giu"),
-    new RegExp(`\\b${SPEECH_VERBS}\\b\\s+(he|she|they)\\b`, "giu")
-  ];
-  for (const pattern of patterns) {
-    for (const match of narration.matchAll(pattern)) {
-      const subject = (match[1] ?? "").toLowerCase();
-      if (subject) subjects.add(subject);
-    }
-  }
-  return subjects;
 }
 function paragraphDialogueTurns(content, speakers, defaultSpeakerId) {
   const turns = /* @__PURE__ */ new Map();
@@ -1741,205 +1685,45 @@ function applyAssistantUserSpeakerReview(plan, answers, reviewed) {
     }
   }
 }
-function continuityRosterIdentity(id, context, speakers) {
-  if (!id?.startsWith("ghost:")) return id;
-  const ghost = context.ghosts.find((item) => `ghost:${item.id}` === id);
-  if (!ghost) return id;
-  const aliases = new Set(ghost.aliases.map((alias) => alias.toLowerCase()));
-  const matches = speakers.filter((speaker) => speaker.id !== USER_SPEAKER_ID && speakerAliases(speaker.name).some((alias) => aliases.has(alias.toLowerCase())));
-  return matches.length === 1 ? matches[0].id : id;
-}
-function previousContinuitySpeaker(messages, targetId, records) {
-  const index = messages.findIndex((message) => message.id === targetId);
-  if (index < 0 || !records || typeof records !== "object" || Array.isArray(records)) return null;
-  const prior = messages.slice(0, index).filter((message) => !message.is_user).at(-1);
-  if (!prior) return null;
-  const record = records[prior.id];
-  if (!record || typeof record !== "object" || Array.isArray(record)) return null;
-  const value = record;
-  return value.contentHash === hashMessageContent(prior.content ?? "") && typeof value.speakerId === "string" && value.speakerId ? value.speakerId : null;
-}
-function recoverPreviousGhostContinuity(messages, targetId, parsed, ghosts, skippedTags = "") {
-  const index = messages.findIndex((message) => message.id === targetId);
-  if (index < 0) return null;
-  const prior = messages.slice(0, index).filter((message) => !message.is_user).at(-1);
-  if (!prior) return null;
-  const segments = parsed[prior.id]?.segments;
-  const expected = buildSpeakerDecisionPlan(prior.content ?? "", [], false, skippedTags).state.speeches;
-  if (!expected.length || expected.length > 64) return null;
-  const recovered = ghosts.filter((ghost) => {
-    const reachable = /* @__PURE__ */ new Set([0]);
-    for (let start = 0; start < expected.length; start++) {
-      if (!reachable.has(start)) continue;
-      for (let end = start + 1; end <= expected.length; end++) {
-        const hash = hashMessageContent(expected.slice(start, end).map((speech) => speech.text).join("\n"));
-        if (ghost.occurrenceKeys.includes(`${prior.id}:${hash}`)) reachable.add(end);
-      }
-    }
-    return reachable.has(expected.length);
-  });
-  if (recovered.length === 1) return `ghost:${recovered[0].id}`;
-  if (recovered.length > 1 || !segments) return null;
-  const speeches = segments.filter((segment) => segment.speakerId !== null);
-  if (!speeches.length || speeches.length !== expected.length || speeches.some((segment, i) => segment.text.trim() !== expected[i].text.trim())) return null;
-  const groups = collectUncastVoiceGroups(segments);
-  if (groups.reduce((sum, group) => sum + group.speeches.length, 0) !== speeches.length) return null;
-  const matches = groups.map((group) => ghosts.filter((ghost) => ghost.occurrenceKeys.includes(`${prior.id}:${hashMessageContent(group.speeches.join("\n"))}`)));
-  if (matches.some((items) => items.length !== 1)) return null;
-  const ids = new Set(matches.map((items) => items[0].id));
-  return ids.size === 1 ? `ghost:${matches[0][0].id}` : null;
-}
-function previousNamedGhostContinuity(messages, targetId, ghosts, configured, skippedTags = "") {
-  const index = messages.findIndex((message) => message.id === targetId);
-  if (index < 0) return null;
-  const prior = messages.slice(0, index).filter((message) => !message.is_user).at(-1);
-  if (!prior || !buildSpeakerDecisionPlan(prior.content ?? "", [], false, skippedTags).state.speeches.length) return null;
-  const candidates = ghosts.flatMap((ghost) => {
-    const names = ghostCastAliases(ghost).filter((alias) => !isDescriptiveGhostLabel(alias));
-    return names.length ? [{ id: `ghost:${ghost.id}`, name: names.join(" / ") }] : [];
-  });
-  const active = candidates.filter((candidate) => hasNamedSpeakerSubject(prior.content ?? "", [candidate], skippedTags));
-  if (active.length !== 1) return null;
-  const otherCast = configured.filter((speaker) => speaker.id !== USER_SPEAKER_ID);
-  const priorNarration = narrativeOnly(preparePlaybackContent(prior.content ?? "", skippedTags));
-  if (hasSpeakerMentions(mentionedSpeakers(priorNarration, otherCast))) return null;
-  return active[0].id;
-}
-var CONTINUITY_LOOKBACK_BLOCKED = "__chat_voice_continuity_blocked__";
-var DEFAULT_SPEAKER_LOOKBACK = 5;
+var DEFAULT_SPEAKER_LOOKBACK = 6;
 var MAX_SPEAKER_LOOKBACK = 100;
-function lookbackSpeakerContinuity(messages, targetId, records, parsed, ghosts, configured, skippedTags = "", limit = DEFAULT_SPEAKER_LOOKBACK, diagnostics) {
-  const index = messages.findIndex((message) => message.id === targetId);
-  if (index < 0) return null;
-  const target = messages[index];
-  const count = Number.isFinite(limit) ? Math.max(1, Math.min(MAX_SPEAKER_LOOKBACK, Math.round(limit))) : DEFAULT_SPEAKER_LOOKBACK;
-  const preceding = messages.slice(0, index).filter((message) => !message.is_user).slice(-count).reverse();
-  for (const prior of preceding) {
-    if (!buildSpeakerDecisionPlan(prior.content ?? "", [], false, skippedTags).state.speeches.length) continue;
-    const view = [prior, target];
-    const priorIndex = messages.findIndex((message) => message.id === prior.id);
-    const availableGhosts = ghosts.filter((ghost) => {
-      const lastSeen = messages.findIndex((message) => message.id === ghost.lastSeenMessageId);
-      const earlierOccurrence = ghost.occurrenceKeys.some((key) => {
-        const occurrenceIndex = messages.findIndex((message) => message.id === key.split(":", 1)[0]);
-        return occurrenceIndex >= 0 && occurrenceIndex <= priorIndex;
-      });
-      const earlierHistory = ghost.conversationHistory?.some((entry) => {
-        const historyIndex = messages.findIndex((message) => message.id === entry.messageId);
-        return historyIndex >= 0 && historyIndex <= priorIndex;
-      }) ?? false;
-      const eligible = lastSeen >= 0 && lastSeen <= priorIndex || earlierOccurrence || earlierHistory;
-      diagnostics?.push(`${prior.id}/${ghost.id}: ${eligible ? "eligible" : "excluded"} (lastSeen=${ghost.lastSeenMessageId || "none"}, earlierOccurrence=${earlierOccurrence}, earlierHistory=${earlierHistory})`);
-      return eligible;
-    });
-    const cast = configured.filter((speaker) => speaker.id !== USER_SPEAKER_ID);
-    const record = previousContinuitySpeaker(view, targetId, records);
-    if (record) {
-      diagnostics?.push(`${prior.id}: saved continuity -> ${record}`);
-      return record;
-    }
-    const priorPlan = buildSpeakerDecisionPlan(prior.content ?? "", [], false, skippedTags);
-    const lastSpeech = priorPlan.state.speeches.at(-1);
-    const ghostSpeakers = availableGhosts.flatMap((ghost) => {
-      const aliases = ghostCastAliases(ghost).filter((alias) => !isDescriptiveGhostLabel(alias));
-      const overlapsCast = aliases.some((alias) => cast.some((speaker) => speakerAliases(speaker.name).some((name) => name.toLowerCase() === alias.toLowerCase())));
-      return aliases.length && !overlapsCast ? [{ id: `ghost:${ghost.id}`, name: aliases.join(" / ") }] : [];
-    });
-    if (lastSpeech) {
-      const candidates2 = [...cast, ...ghostSpeakers];
-      const context = `${lastSpeech.narrativeBefore} ${lastSpeech.narrativeAfter}`;
-      const namedCandidates = candidates2.filter((candidate) => speakerAliases(candidate.name).some((alias) => new RegExp(`\\b${alias.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "iu").test(context)));
-      const attributed = namedCandidates.length === 1 ? narrativeAttributionSpeaker(context, candidates2) : null;
-      if (attributed) {
-        diagnostics?.push(`${prior.id}: final speech attribution -> ${attributed}`);
-        return attributed;
-      }
-    }
-    const priorContent = preparePlaybackContent(prior.content ?? "", skippedTags);
-    const lastQuote = playbackQuotes(priorContent).at(-1);
-    const candidates = [...cast, ...ghostSpeakers];
-    if (lastQuote) {
-      const paragraphs = playbackParagraphs(priorContent.slice(0, lastQuote.end));
-      for (let i = paragraphs.length - 1; i >= 0; i--) {
-        const narration = narrativeOnly(paragraphs[i].text);
-        const mentions = mentionedSpeakers(narration, candidates);
-        const subject = unambiguousNarrativeSpeaker(narration, candidates);
-        if (subject) {
-          diagnostics?.push(`${prior.id}: closing named subject -> ${subject}`);
-          return subject;
-        }
-        if (hasAnonymousSpeechAttribution(narration)) {
-          diagnostics?.push(`${prior.id}: closing anonymous speaker blocks continuity`);
-          return CONTINUITY_LOOKBACK_BLOCKED;
-        }
-        if (mentions.clean.size > 1) break;
-      }
-    }
-    const named = previousNamedGhostContinuity(view, targetId, availableGhosts, cast, skippedTags);
-    if (named) {
-      diagnostics?.push(`${prior.id}: named subject -> ${named}`);
-      return named;
-    }
-    const matchedCast = cast.filter((speaker) => hasNamedSpeakerSubject(prior.content ?? "", [speaker], skippedTags));
-    const matchedGhosts = availableGhosts.filter((ghost) => ghostCastAliases(ghost).some((alias) => !isDescriptiveGhostLabel(alias) && hasNamedSpeakerSubject(prior.content ?? "", [{ id: `ghost:${ghost.id}`, name: alias }], skippedTags)));
-    if (matchedCast.length + matchedGhosts.length > 1) {
-      diagnostics?.push(`${prior.id}: conflicting named subjects`);
-      return CONTINUITY_LOOKBACK_BLOCKED;
-    }
-    if (matchedCast.length === 1) {
-      diagnostics?.push(`${prior.id}: named cast subject -> ${matchedCast[0].id}`);
-      return matchedCast[0].id;
-    }
-    if (matchedGhosts.length === 1) {
-      if (hasSpeakerMentions(mentionedSpeakers(narrativeOnly(preparePlaybackContent(prior.content ?? "", skippedTags)), cast))) {
-        diagnostics?.push(`${prior.id}: named cast conflict`);
-        return CONTINUITY_LOOKBACK_BLOCKED;
-      }
-      const id = `ghost:${matchedGhosts[0].id}`;
-      diagnostics?.push(`${prior.id}: named temporary subject -> ${id}`);
-      return id;
-    }
-    const recovered = recoverPreviousGhostContinuity(view, targetId, parsed, availableGhosts, skippedTags);
-    if (recovered) {
-      diagnostics?.push(`${prior.id}: recorded speech -> ${recovered}`);
-      return recovered;
-    }
-    const rawRecord = records && typeof records === "object" && !Array.isArray(records) ? records[prior.id] : null;
-    if (rawRecord && typeof rawRecord === "object" && rawRecord.contentHash === hashMessageContent(prior.content ?? "") && rawRecord.speakerId === null) {
-      diagnostics?.push(`${prior.id}: saved ambiguous or mixed speaker`);
-      return CONTINUITY_LOOKBACK_BLOCKED;
-    }
-    const discovered = addUnconfiguredDialogueSpeakers(prior.content ?? "", configured, skippedTags).filter((speaker) => speaker.id.startsWith("unconfigured:") && !/^(?:what|who|where|when|why|how)$/iu.test(speaker.name));
-    if (discovered.some((speaker) => hasNamedSpeakerSubject(prior.content ?? "", [speaker], skippedTags)) || hasAnonymousSpeechAttribution(preparePlaybackContent(prior.content ?? "", skippedTags))) {
-      diagnostics?.push(`${prior.id}: another unconfigured speaker`);
-      return CONTINUITY_LOOKBACK_BLOCKED;
-    }
-    diagnostics?.push(`${prior.id}: no clear speaker`);
-  }
-  return null;
-}
-function relationshipReviewContext(messages, targetId, ghosts, skippedTags = "") {
+function relationshipReviewContext(messages, targetId, ghosts, skippedTags = "", limit = DEFAULT_SPEAKER_LOOKBACK) {
   const target = messages.findIndex((message) => message.id === targetId);
   if (target < 0) return { previousMessages: [], ghosts: [] };
   const prior = messages.slice(0, target);
   const priorIds = new Set(prior.map((message) => message.id));
-  const previousMessages = prior.filter((message) => !message.is_user).slice(-2).map((message) => ({ id: message.id, text: preparePlaybackContent(message.content ?? "", skippedTags).slice(-4e3) }));
-  const safeGhosts = ghosts.flatMap((ghost) => {
+  const count = Number.isFinite(limit) ? Math.max(1, Math.min(MAX_SPEAKER_LOOKBACK, Math.round(limit))) : DEFAULT_SPEAKER_LOOKBACK;
+  let remaining = 24e3;
+  const previousMessages = prior.slice(-count).reverse().flatMap((message) => {
+    if (remaining <= 0) return [];
+    const text = preparePlaybackContent(message.content ?? "", skippedTags).slice(-Math.min(4e3, remaining));
+    remaining -= text.length;
+    return text ? [{ id: message.id, role: message.is_user ? "user" : "assistant", text }] : [];
+  }).reverse();
+  let ghostBudget = 12e3;
+  const takeGhostText = (text, limit2) => {
+    if (ghostBudget <= 0) return "";
+    const selected = preparePlaybackContent(text, skippedTags).slice(-Math.min(limit2, ghostBudget));
+    ghostBudget -= selected.length;
+    return selected;
+  };
+  const safeGhosts = ghosts.slice(0, 20).flatMap((ghost) => {
     const lastIndex = messages.findIndex((message) => message.id === ghost.lastSeenMessageId);
     const safeCurrent = lastIndex >= 0 && lastIndex <= target;
-    const history = (ghost.conversationHistory ?? []).filter((entry) => priorIds.has(entry.messageId)).map((entry) => ({ messageId: entry.messageId, text: preparePlaybackContent(entry.text, skippedTags).slice(0, 6e3) }));
-    if (!safeCurrent && !history.length) return [];
+    const historical = (ghost.conversationHistory ?? []).filter((entry) => priorIds.has(entry.messageId));
+    const history = historical.slice(-3).map((entry) => ({ messageId: entry.messageId, text: takeGhostText(entry.text, 1200) })).filter((entry) => entry.text);
+    if (!safeCurrent && !historical.length) return [];
     return [{
       id: ghost.id,
       label: safeCurrent ? ghost.label ?? "" : "",
       aliases: safeCurrent ? ghostCastAliases(ghost) : [],
-      context: safeCurrent ? preparePlaybackContent(ghost.context, skippedTags).slice(0, 2e3) : "",
+      context: safeCurrent ? takeGhostText(ghost.context, 1200) : "",
       conversationHistory: history
     }];
-  }).slice(0, 20);
+  });
   return { previousMessages, ghosts: safeGhosts };
 }
-function buildRelationshipSpeakerReview(plan, answers, context, continuitySpeakerId = null) {
+function buildRelationshipSpeakerReview(plan, answers, context, continuitySpeakerId = null, globalOptions) {
   const questions = {};
   const ghostOptions = {};
   const speakers = plan.state.speakers.map((speaker) => ({ id: speaker.id, name: speaker.name }));
@@ -1959,7 +1743,7 @@ function buildRelationshipSpeakerReview(plan, answers, context, continuitySpeake
       const attribution = narrativeAttributionSpeaker(`${speech.narrativeBefore} ${speech.narrativeAfter}`, speakers);
       if (attribution && local.identity === attribution) continue;
       const conflict = !!local.identity && !!paragraph.identity && local.identity !== paragraph.identity;
-      if (local.identity && local.identity !== UNCAST_SPEAKER_ID && !conflict && !phoneExchange) continue;
+      if (local.identity && local.identity !== UNCAST_SPEAKER_ID && !conflict && !phoneExchange && !globalOptions?.targets.includes(speech.id)) continue;
       questions[`relationship_${speech.id}`] = {
         type: "choice",
         instructions: `Who actually speaks quotation ${speech.id}? Compare names, actions and pronoun references in the current exchange with the earlier conversations and relevant relationships. Distinguish speakers from people addressed or mentioned, bystanders, and a caller or text sender from the person holding the phone. Pronouns are evidence, not proof of gender or identity. Consider whether a call or text thread continues, a different participant appears, or a person later arrives in person. Prefer explicit local attribution and select no_clear_identity when the evidence is insufficient.`,
@@ -1969,16 +1753,16 @@ function buildRelationshipSpeakerReview(plan, answers, context, continuitySpeake
     }
   }
   const continuityOption = continuitySpeakerId ? plan.state.speakers.find((speaker) => speaker.id === continuitySpeakerId)?.option : void 0;
-  if (plan.state.messageRole === "assistant" && (plan.state.speeches.length > 1 || plan.state.speeches.length === 1 && continuitySpeakerId) && (Object.keys(ghostOptions).length || continuityOption) && (Object.keys(questions).length || continuitySpeakerId)) {
+  if (!globalOptions && plan.state.messageRole === "assistant" && (plan.state.speeches.length > 1 || plan.state.speeches.length === 1 && continuitySpeakerId) && (Object.keys(ghostOptions).length || continuityOption) && (Object.keys(questions).length || continuitySpeakerId)) {
     questions.relationship_scene = {
       type: "choice",
       instructions: `Does one previously heard temporary character clearly speak every quotation in this message? Compare the entire scene and preceding conversation; distinguish scene changes, different speakers and people addressed. ${continuitySpeakerId ? `The immediately preceding assistant message ended with ${continuitySpeakerId}; treat this as a continuity clue, not proof.` : ""} Select no_clear_identity if any quotation may belong to another speaker or the continuity is uncertain.`,
       criteria: { no_clear_identity: "The scene has multiple speakers or the identity is uncertain.", ...Object.fromEntries([...Object.keys(ghostOptions), ...continuityOption ? [continuityOption] : []].map((option) => [option, criteria[option]])) }
     };
   }
-  return { state: { ...plan.state, previousMessages: context.previousMessages, ghosts: context.ghosts }, questions, ghostOptions };
+  return { state: { ...plan.state, previousMessages: context.previousMessages, ghosts: context.ghosts, ...globalOptions ? { cardSpeakerPrior: globalOptions.cardSpeakerId, contextPolicy: "Earlier messages are evidence, not automatic speaker assignments. A single-character card is a weak preference only. Distinguish user and assistant roles. Never assume a person is speaking merely because they spoke last." } : {} }, questions, ghostOptions };
 }
-function applyRelationshipSpeakerReview(plan, answers, reviewed, ghostOptions, cardSpeakerId = null, continuitySpeakerId = null) {
+function applyRelationshipSpeakerReview(plan, answers, reviewed, ghostOptions, cardSpeakerId = null, continuitySpeakerId = null, globalMode = false) {
   const options = { ...plan.optionSpeakerIds, ...ghostOptions };
   const scene = reviewed.relationship_scene;
   const sceneEvaluation = scene ? evaluateSpeakerDecisionAnswer(scene, options, { probability: 0.6, confidence: 0.45, margin: 0.3 }) : null;
@@ -2004,7 +1788,7 @@ function applyRelationshipSpeakerReview(plan, answers, reviewed, ghostOptions, c
     const result = reviewed[`relationship_${speech.id}`];
     const original = answers[`speech_${speech.id}`];
     const originalIdentity = evaluateSpeakerDecisionAnswer(original, plan.optionSpeakerIds).identity;
-    const chosen = preferredCard || inherited || (sceneIdentity && !conflictingAttribution && !conflictingTurn ? scene : null);
+    const chosen = globalMode ? null : preferredCard || inherited || (sceneIdentity && !conflictingAttribution && !conflictingTurn ? scene : null);
     if (chosen) {
       Object.assign(plan.optionSpeakerIds, ghostOptions);
       if (original) answers[`relationship_original_${speech.id}`] = original;
@@ -2017,7 +1801,7 @@ function applyRelationshipSpeakerReview(plan, answers, reviewed, ghostOptions, c
     }
     if (!result) continue;
     answers[`relationship_review_${speech.id}`] = result;
-    const reviewedIdentity = evaluateSpeakerDecisionAnswer(result, options, { probability: 0.85, confidence: 0.8, margin: 0.3 }).identity;
+    const reviewedIdentity = evaluateSpeakerDecisionAnswer(result, options, globalMode && (!originalIdentity || originalIdentity === UNCAST_SPEAKER_ID) ? SPEAKER_DECISION_THRESHOLDS.local : { probability: 0.85, confidence: 0.8, margin: 0.3 }).identity;
     if (!reviewedIdentity || reviewedIdentity === originalIdentity) continue;
     if (originalIdentity && originalIdentity !== UNCAST_SPEAKER_ID) {
       if (narrativeAttributionSpeaker(`${speech.narrativeBefore} ${speech.narrativeAfter}`, speakers) === originalIdentity) continue;
@@ -2026,29 +1810,9 @@ function applyRelationshipSpeakerReview(plan, answers, reviewed, ghostOptions, c
     if (original) answers[`relationship_original_${speech.id}`] = original;
     answers[`speech_${speech.id}`] = result;
     answers[`relationship_applied_${speech.id}`] = result;
-    if (reviewedIdentity === continuitySpeakerId) answers[`relationship_continuity_${speech.id}`] = result;
+    if (globalMode) answers[`relationship_global_${speech.id}`] = result;
+    if (globalMode || reviewedIdentity === continuitySpeakerId) answers[`relationship_continuity_${speech.id}`] = result;
   }
-}
-function continueUncastClosingSpeech(plan, answers) {
-  const speeches = plan.state.speeches;
-  if (speeches.length < 3) return;
-  const last = speeches.at(-1);
-  const previous = speeches.at(-2);
-  const before = speeches.at(-3);
-  const current = evaluateSpeakerDecisionAnswer(answers[`speech_${last.id}`], plan.optionSpeakerIds).identity;
-  const previousAnswer = answers[`speech_${previous.id}`];
-  const previousId = evaluateSpeakerDecisionAnswer(previousAnswer, plan.optionSpeakerIds).identity;
-  const beforeId = evaluateSpeakerDecisionAnswer(answers[`speech_${before.id}`], plan.optionSpeakerIds).identity;
-  if (current !== UNCAST_SPEAKER_ID && current !== null || !previousId || previousId === UNCAST_SPEAKER_ID || previousId === USER_SPEAKER_ID || previousId !== beforeId || !previousAnswer) return;
-  const start = plan.state.paragraphs.findIndex((paragraph) => paragraph.id === previous.paragraphId);
-  const end = plan.state.paragraphs.findIndex((paragraph) => paragraph.id === last.paragraphId);
-  const bridge = plan.state.turns.find((turn2) => turn2.speechId === last.id)?.bridge || (start >= 0 && end >= start ? plan.state.paragraphs.slice(start + 1, end + 1).map((paragraph) => paragraph.text).join("\n\n") : last.narrativeBefore);
-  const turn = answers[`turn_${last.id}`];
-  if (!/\b(?:enter(?:s|ed|ing)?|arriv(?:es|ed|ing)|steps?|mov(?:es|ed|ing)|walks?)\b/iu.test(bridge) || hasAnonymousSpeechAttribution(bridge) || narrativeAttributionSpeaker(bridge, plan.state.speakers) || turn && turn.confidence >= 0.65 && (turn.choice === TURN_RESPOND_OPTION || turn.choice === TURN_OTHER_OPTION)) return;
-  answers[`relationship_original_${last.id}`] = answers[`speech_${last.id}`];
-  answers[`speech_${last.id}`] = previousAnswer;
-  answers[`relationship_applied_${last.id}`] = previousAnswer;
-  answers[`relationship_continuity_${last.id}`] = previousAnswer;
 }
 var TTS_TAG_THRESHOLDS = {
   probability: 0.65,
@@ -3891,7 +3655,7 @@ function resolveSpeakerDecisionSegments(content, plan, answers, speakers, option
     }
     const baseIdentity = chainDecision?.identity ?? void 0 ?? identity;
     if (answers[`relationship_continuity_${speech.id}`]) {
-      discoursePathBySpeechIndex.set(index, "resolution:inherited previous assistant speaker (protected from discourse override)");
+      discoursePathBySpeechIndex.set(index, answers[`relationship_global_${speech.id}`] ? "resolution:global-context review (protected from local override)" : "resolution:inherited previous assistant speaker (protected from discourse override)");
       return identity;
     }
     const outcome = speech ? discourseOutcomes.get(speech.id) : void 0;
@@ -3971,7 +3735,7 @@ function resolveSpeakerDecisionSegments(content, plan, answers, speakers, option
       resolutionPaths.push([
         discoursePathBySpeechIndex.get(index) ?? chainPathBySpeechIndex.get(index) ?? "resolution:direct-speech-identity"
       ]);
-    } else if (upstreamIdentity && !clearSpeakerSwitch) {
+    } else if (upstreamIdentity && !clearSpeakerSwitch && !options.evidenceOnly) {
       speakerId = upstreamIdentity;
       resolutionPaths.push([`resolution:upstream-identity (${upstreamSource})`]);
     } else if (options.historicalSpeakerId && !clearSpeakerSwitch && (routingIdentities.slice(index + 1).some((identity) => identity !== void 0) || plan.state.paragraphs.slice(currentParagraphIndex + 1).some((paragraph) => routingIdentity(paragraphIdentities.get(paragraph.id)) !== void 0))) {
@@ -4239,82 +4003,6 @@ function parseRosterVoiceSegments(content, defaultSpeakerId, speakers, skippedTr
     includeDebug
   );
 }
-function previousAssistantSpeakerFallback(content, previousAssistantContent, previousDefaultSpeakerId, speakers, skippedTrackerTagPairs = "") {
-  const playbackContent = preparePlaybackContent(content, skippedTrackerTagPairs);
-  const quoteMatches = playbackQuotes(playbackContent).filter((quote) => !!cleanPlaybackText(quote.text));
-  if (quoteMatches.length === 0) return null;
-  const previousContent = preparePlaybackContent(previousAssistantContent, skippedTrackerTagPairs);
-  const previousParagraphs = playbackParagraphs(previousContent);
-  let previousSpeakerId = null;
-  for (let index = previousParagraphs.length - 1; index >= 0; index--) {
-    const paragraph = previousParagraphs[index];
-    const speakerId = preferredMentionedSpeaker(
-      paragraph.text,
-      speakers,
-      mentionedSpeakers(paragraph.text, speakers)
-    );
-    if (speakerId) {
-      previousSpeakerId = speakerId;
-      break;
-    }
-  }
-  if (!previousSpeakerId) {
-    const previousSegments = parseRosterVoiceSegmentsInternal(
-      previousAssistantContent,
-      previousDefaultSpeakerId,
-      speakers,
-      skippedTrackerTagPairs
-    );
-    for (let index = previousSegments.length - 1; index >= 0; index--) {
-      if (previousSegments[index].speakerId) {
-        previousSpeakerId = previousSegments[index].speakerId;
-        break;
-      }
-    }
-  }
-  if (!previousSpeakerId) return null;
-  const previousSpeaker = speakers.find((speaker) => speaker.id === previousSpeakerId);
-  const aliases = previousSpeaker ? speakerAliases(previousSpeaker.name) : [];
-  let priorPronoun = null;
-  for (let index = 0; index < previousParagraphs.length; index++) {
-    const paragraph = previousParagraphs[index];
-    const narrative = narrativeOnly(paragraph.text);
-    if (!aliases.some((alias) => new RegExp(`\\b${escapedPattern(alias)}\\b`, "iu").test(narrative))) continue;
-    const pronouns = new Set([...narrative.matchAll(/\b(he|she|they)\b/giu)].map((match) => match[1].toLowerCase()));
-    if (pronouns.size === 1) priorPronoun = [...pronouns][0];
-    else if (pronouns.size === 0) {
-      const following = narrativeOnly(previousParagraphs[index + 1]?.text ?? "").trimStart().match(/^(he|she|they)\b/iu);
-      if (following) priorPronoun = following[1].toLowerCase();
-    }
-  }
-  const opening = playbackContent.slice(0, Math.min(playbackContent.length, (quoteMatches[1]?.start ?? quoteMatches[0].end) + 300));
-  const openingNarration = narrativeOnly(opening);
-  const openingPronouns = new Set([...openingNarration.matchAll(/\b(he|she|they)\b/giu)].map((match) => match[1].toLowerCase()));
-  if (priorPronoun && openingPronouns.size === 1 && !openingPronouns.has(priorPronoun)) return null;
-  let hasOpeningContinuity = false;
-  let openingContinuityEnd = 0;
-  const currentParagraphs = playbackParagraphs(playbackContent);
-  for (const quote of quoteMatches) {
-    const inference = inferQuotedSpeaker(
-      playbackContent.slice(0, quote.start),
-      playbackContent.slice(quote.end),
-      quote.text,
-      speakers,
-      null
-    );
-    if (inference.source === "explicit" || inference.source === "paragraph") break;
-    if (inference.source === "history" && inference.speakerId && inference.speakerId !== previousSpeakerId) {
-      if (!hasOpeningContinuity) break;
-    }
-    hasOpeningContinuity = true;
-    openingContinuityEnd = currentParagraphs.find((paragraph) => quote.start >= paragraph.start && quote.start < paragraph.end)?.end ?? quote.end;
-  }
-  if (!hasOpeningContinuity) return null;
-  if (pronounSpeechAttributionSubjects(playbackContent.slice(0, openingContinuityEnd)).size > 1) {
-    return null;
-  }
-  return previousSpeakerId;
-}
 function applyConfigToMetadata(metadata, config) {
   const previousOverrides = readVoiceOverrides(metadata);
   const characters = { ...previousOverrides.characters ?? {} };
@@ -4489,56 +4177,6 @@ function appendSpeakerDebugReason(segments, reason, enabled) {
     ...segment,
     debugPath: [...segment.debugPath ?? [], reason]
   }));
-}
-async function reviewDiscourseEscalation(plan, answers, userId) {
-  try {
-    const assessment = assessSpeakerDiscourseEscalation(plan, answers);
-    if (!assessment.plan) {
-      return {
-        assessment,
-        evaluation: {
-          answers: null,
-          status: "not-requested (no dialogue run required discourse review)",
-          outcome: "not-escalated"
-        }
-      };
-    }
-    const result = await spindle.decisions.evaluate({
-      state: assessment.plan.state,
-      questions: assessment.plan.questions,
-      ...userId ? { userId } : {}
-    });
-    const discourseAnswers = {};
-    for (const [questionId, answer] of Object.entries(result.answers)) {
-      if (answer.type !== "choice") continue;
-      discourseAnswers[questionId] = {
-        choice: answer.choice,
-        probabilities: answer.probabilities,
-        confidence: answer.confidence
-      };
-    }
-    return {
-      assessment,
-      evaluation: {
-        answers: discourseAnswers,
-        status: `completed (${assessment.plan.targets.length} target speeches in ${assessment.plan.runIds.join(",")})`,
-        outcome: "completed"
-      }
-    };
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    spindle.log.warn(
-      `[Chat Voice] Discourse speaker review failed; keeping first-pass answers: ${message}`
-    );
-    return {
-      assessment: { plan: null, runs: [] },
-      evaluation: {
-        answers: null,
-        status: `failed (${message}); first-pass results retained`,
-        outcome: "failed"
-      }
-    };
-  }
 }
 async function evaluateTtsTagSelections(plan, style, userId, enableModulation = false) {
   const selections = /* @__PURE__ */ new Map();
@@ -4973,10 +4611,8 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
     const lifetime = Number.isFinite(payload.ghostVoiceLifetime) ? Math.min(1e3, Math.max(1, Math.round(payload.ghostVoiceLifetime))) : 10;
     const speakerLookback = Number.isFinite(payload.speakerLookback) ? Math.min(MAX_SPEAKER_LOOKBACK, Math.max(1, Math.round(payload.speakerLookback))) : DEFAULT_SPEAKER_LOOKBACK;
     const activeGhostsForReview = activeGhostVoices(readGhostVoices(chat.metadata?.chat_voice_ghost_cast), assistantIds, anchor, lifetime);
-    const relationshipContext = relationshipReviewContext(messages, message.id, activeGhostsForReview, skippedTrackerTags);
-    const lookbackDiagnostics = [];
-    const storedContinuity = !message.is_user ? lookbackSpeakerContinuity(messages, message.id, chat.metadata?.chat_voice_speaker_continuity, config.parsedMessages, activeGhostsForReview, configuredSpeakers, skippedTrackerTags, speakerLookback, payload.debug ? lookbackDiagnostics : void 0) : null;
-    let continuitySpeakerId = storedContinuity && (storedContinuity.startsWith("ghost:") ? activeGhostsForReview.some((ghost) => `ghost:${ghost.id}` === storedContinuity) : configuredSpeakers.some((speaker) => speaker.id === storedContinuity)) ? storedContinuity : null;
+    const relationshipContext = relationshipReviewContext(messages, message.id, activeGhostsForReview, skippedTrackerTags, speakerLookback);
+    const continuitySpeakerId = null;
     for (const ghost of activeGhostsForReview) {
       if (!ghost.speakerId.startsWith("unconfigured:")) continue;
       const safe = relationshipContext.ghosts.find((item) => item.id === ghost.id);
@@ -4990,7 +4626,6 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
       configuredSpeakers,
       skippedTrackerTags
     );
-    continuitySpeakerId = continuityRosterIdentity(continuitySpeakerId, relationshipContext, speakers);
     const namedSpeakerSubject = hasNamedSpeakerSubject(
       message.content ?? "",
       speakers,
@@ -4998,46 +4633,9 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
     );
     const messageCardId = !message.is_user ? defaultMessageSpeakerId(message, cards, cards.map((card) => card.id)) : null;
     const messageCard = messageCardId ? cards.find((card) => card.id === messageCardId) : void 0;
-    const titleMatchedCardSpeakerId = !message.is_user && messageCard && !scenarioCardIds.has(messageCard.id) ? speakerIdMatchingCardTitle(messageCard.name, configuredSpeakers.filter((speaker) => !speaker.id.startsWith("unconfigured:"))) : null;
-    const namelessCardSpeakerId = eligibleCardFallbackSpeakerId(
-      message.content ?? "",
-      titleMatchedCardSpeakerId,
-      speakers,
-      skippedTrackerTags
-    );
-    const defaultSpeakerId = message.is_user ? USER_SPEAKER_ID : namelessCardSpeakerId;
-    let previousAssistantMessage = null;
-    let historicalSpeakerId = null;
-    if (!message.is_user && !namelessCardSpeakerId && storedContinuity !== CONTINUITY_LOOKBACK_BLOCKED) {
-      const searchForLastClearIdentity = !namedSpeakerSubject;
-      let reviewedAssistantMessages = 0;
-      for (let index = messageIndex - 1; index >= 0 && reviewedAssistantMessages < speakerLookback; index--) {
-        const previous = messages[index];
-        if (previous.is_user) continue;
-        reviewedAssistantMessages += 1;
-        const previousSpeakers = searchForLastClearIdentity ? addUnconfiguredDialogueSpeakers(previous.content ?? "", speakers, skippedTrackerTags) : speakers;
-        const candidate = previousAssistantSpeakerFallback(
-          message.content ?? "",
-          previous.content ?? "",
-          searchForLastClearIdentity ? null : defaultMessageSpeakerId(previous, speakers, cards.map((card) => card.id)),
-          previousSpeakers,
-          skippedTrackerTags
-        );
-        if (candidate) {
-          previousAssistantMessage = previous;
-          historicalSpeakerId = candidate;
-          const historicalSpeaker = previousSpeakers.find((speaker) => speaker.id === candidate);
-          if (historicalSpeaker && !speakers.some((speaker) => speaker.id === candidate)) {
-            speakers.push(historicalSpeaker);
-          }
-          break;
-        }
-        if (!searchForLastClearIdentity) {
-          previousAssistantMessage = previous;
-          break;
-        }
-      }
-    }
+    const titleMatchedCardSpeakerId = !message.is_user && messageCard && !scenarioCardIds.has(messageCard.id) && configuredSpeakers.filter((speaker) => speaker.id !== USER_SPEAKER_ID && !speaker.id.startsWith("unconfigured:")).length === 1 ? speakerIdMatchingCardTitle(messageCard.name, configuredSpeakers.filter((speaker) => !speaker.id.startsWith("unconfigured:"))) : null;
+    const defaultSpeakerId = message.is_user ? USER_SPEAKER_ID : null;
+    const historicalSpeakerId = null;
     const deterministic = parseRosterVoiceSegments(
       message.content ?? "",
       defaultSpeakerId,
@@ -5081,8 +4679,7 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
           })),
           cardSpeakerId: titleMatchedCardSpeakerId,
           historicalSpeakerId,
-          relationshipReview: { version: "relationship-review-11", context: relationshipContext, continuitySpeakerId, speakerLookback },
-          previousAssistantMessageId: previousAssistantMessage?.id ?? null,
+          relationshipReview: { version: "global-context-1", context: relationshipContext, speakerLookback },
           skippedTrackerTags
         }));
         const cached = config.parsedMessages[payload.messageId];
@@ -5099,7 +4696,7 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
         const tagSelectionsPromise = tagStyle !== "off" ? evaluateTtsTagSelections(decisionPlan, tagStyle, userId, enableModulation) : null;
         try {
           const result = await spindle.decisions.evaluate({
-            state: { ...decisionPlan.state, previousMessages: relationshipContext.previousMessages },
+            state: { ...decisionPlan.state, previousMessages: relationshipContext.previousMessages, cardSpeakerPrior: titleMatchedCardSpeakerId, contextPolicy: "Earlier messages are context, not assignments. The single-character card is a weak preference, not proof. Respect names, actions, pronouns, roles, and channel changes; choose unclear when uncertain." },
             questions: decisionPlan.questions,
             ...userId ? { userId } : {}
           });
@@ -5127,10 +4724,15 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
               spindle.log.warn(`[Chat Voice] User speaker review failed; keeping original assignments: ${error instanceof Error ? error.message : String(error)}`);
             }
           }
-          const relationshipReview = buildRelationshipSpeakerReview(decisionPlan, answers, relationshipContext, continuitySpeakerId);
+          const discourseAssessment = assessSpeakerDiscourseEscalation(decisionPlan, answers);
+          const relationshipReview = buildRelationshipSpeakerReview(decisionPlan, answers, relationshipContext, null, {
+            cardSpeakerId: titleMatchedCardSpeakerId,
+            targets: [...new Set(discourseAssessment.runs.flatMap((run) => run.targets))]
+          });
           let relationshipReviewFailed = false;
-          let relationshipSceneDiagnostic = `continuity=${continuitySpeakerId ?? "none"}; lookback=${lookbackDiagnostics.join(" | ") || "none"}; candidates=${Object.entries(relationshipReview.ghostOptions).map(([option, id]) => `${option}=${id}`).join(",") || "none"}`;
+          let relationshipSceneDiagnostic = `global-context=${relationshipContext.previousMessages.length} messages, ${relationshipContext.previousMessages.reduce((sum, item) => sum + item.text.length, 0)} characters; candidates=${Object.entries(relationshipReview.ghostOptions).map(([option, id]) => `${option}=${id}`).join(",") || "none"}`;
           if (Object.keys(relationshipReview.questions).length) {
+            const reviewStartedAt = Date.now();
             try {
               const relationshipResult = await spindle.decisions.evaluate({ state: relationshipReview.state, questions: relationshipReview.questions, ...userId ? { userId } : {} });
               const reviewed = {};
@@ -5138,19 +4740,18 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
                 if (answer.type === "choice") reviewed[id] = { choice: answer.choice, probabilities: answer.probabilities, confidence: answer.confidence };
               }
               if (reviewed.relationship_scene) relationshipSceneDiagnostic += `; scene=${JSON.stringify(reviewed.relationship_scene)}`;
-              applyRelationshipSpeakerReview(decisionPlan, answers, reviewed, relationshipReview.ghostOptions, namelessCardSpeakerId, continuitySpeakerId);
-              relationshipSceneDiagnostic += `; applied=${Object.keys(answers).some((key) => key.startsWith("relationship_applied_"))}`;
+              applyRelationshipSpeakerReview(decisionPlan, answers, reviewed, relationshipReview.ghostOptions, null, null, true);
+              relationshipSceneDiagnostic += `; duration=${Date.now() - reviewStartedAt}ms; applied=${Object.keys(answers).some((key) => key.startsWith("relationship_applied_"))}`;
             } catch (error) {
               relationshipReviewFailed = true;
               spindle.log.warn(`[Chat Voice] Relationship speaker review failed; keeping original assignments: ${error instanceof Error ? error.message : String(error)}`);
             }
           }
-          continueUncastClosingSpeech(decisionPlan, answers);
-          const { assessment: discourseAssessment, evaluation: discourse } = await reviewDiscourseEscalation(
-            decisionPlan,
-            answers,
-            userId
-          );
+          const discourse = {
+            answers: null,
+            status: relationshipReviewFailed ? "global-context review failed; no forced inheritance" : "handled by targeted global-context review",
+            outcome: relationshipReviewFailed ? "failed" : Object.keys(relationshipReview.questions).length ? "completed" : "not-escalated"
+          };
           const segments = resolveSpeakerDecisionSegments(
             message.content ?? "",
             decisionPlan,
@@ -5158,8 +4759,9 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
             speakers,
             {
               isUserMessage: message.is_user,
-              cardSpeakerId: titleMatchedCardSpeakerId,
+              cardSpeakerId: null,
               historicalSpeakerId,
+              evidenceOnly: true,
               skippedTrackerTagPairs: skippedTrackerTags,
               includeDebug: payload.debug,
               discourse: {

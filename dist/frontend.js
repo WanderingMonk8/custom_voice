@@ -1209,7 +1209,7 @@ var TURN_RELATION_CRITERIA = {
   [TURN_OTHER_OPTION]: "A different participant addresses someone else in the scene, a third party, or an off-scene channel.",
   [TURN_UNCLEAR_OPTION]: "The text does not establish whether the speaker continues or changes."
 };
-var DEFAULT_SPEAKER_LOOKBACK = 5;
+var DEFAULT_SPEAKER_LOOKBACK = 6;
 var MAX_SPEAKER_LOOKBACK = 100;
 var TTS_EMOTION_OPTIONS = [
   { value: "happy", description: "Cheerful, upbeat." },
@@ -2431,7 +2431,7 @@ function setup(ctx) {
   const concurrentGenerationField = createField("Maximum concurrent generations");
   const rateLimitWaitField = createField("Rate-limit wait budget (seconds)");
   const ghostLifetimeField = createField("Uncast voice lifetime (assistant messages)");
-  const speakerLookbackField = createField("Speaker lookback (assistant messages)");
+  const speakerLookbackField = createField("Global speaker context (messages)");
   const autoCastingLabel = document.createElement("label");
   autoCastingLabel.className = "chat-voice-toggle";
   const autoCastingToggle = document.createElement("input");
@@ -2910,11 +2910,11 @@ function setup(ctx) {
     refreshLocalState();
   };
   ghostLifetimeInput.addEventListener("change", onGhostLifetimeInput);
-  const speakerLookbackInput = createNumberInput(DEFAULT_SPEAKER_LOOKBACK, MAX_SPEAKER_LOOKBACK, "Speaker lookback in assistant messages");
+  const speakerLookbackInput = createNumberInput(DEFAULT_SPEAKER_LOOKBACK, MAX_SPEAKER_LOOKBACK, "Previous messages used for global speaker context");
   speakerLookbackField.slot.appendChild(speakerLookbackInput);
   const speakerLookbackHint = document.createElement("div");
   speakerLookbackHint.className = "chat-voice-hint";
-  speakerLookbackHint.textContent = "Check up to this many previous assistant messages for the last clear speaker.";
+  speakerLookbackHint.textContent = "Include up to this many earlier user and assistant messages as context. Default: 6 messages (roughly 3 exchanges).";
   speakerLookbackField.slot.appendChild(speakerLookbackHint);
   const onSpeakerLookbackInput = () => {
     speakerLookback = clampIntegerSetting(speakerLookbackInput.valueAsNumber, DEFAULT_SPEAKER_LOOKBACK, MAX_SPEAKER_LOOKBACK);

@@ -2460,6 +2460,39 @@ test('relationship review preserves caller identity, excludes future context, an
   assert.equal(matches.find(match => groups.find(group => group.id === match.groupId)?.speakerId === 'ghost:mother')?.voiceId, 'mom-voice')
 })
 
+test('global context includes six preceding user and assistant messages in order without future leakage', () => {
+  const messages = Array.from({ length: 9 }, (_, index) => ({ id: String(index), is_user: index % 2 === 0, content: `message ${index}` }))
+  const context = relationshipReviewContext(messages, '7', [])
+  assert.deepEqual(context.previousMessages.map(item => [item.id, item.role]), [ ['1', 'assistant'], ['2', 'user'], ['3', 'assistant'], ['4', 'user'], ['5', 'assistant'], ['6', 'user'] ])
+  assert.deepEqual(relationshipReviewContext(messages, '4', [], '', 2).previousMessages.map(item => item.id), ['2', '3'])
+  assert.deepEqual(relationshipReviewContext(messages, 'missing', []).previousMessages, [])
+  const long = Array.from({ length: 9 }, (_, index) => ({ id: String(index), is_user: index % 2 === 0, content: 'x'.repeat(10_000) }))
+  const capped = relationshipReviewContext(long, '8', [], '', 8).previousMessages
+  assert.equal(capped.reduce((sum, item) => sum + item.text.length, 0), 24_000)
+  assert.deepEqual(capped.map(item => item.id), ['2', '3', '4', '5', '6', '7'])
+})
+
+test('global review avoids scene-wide inheritance and treats card as context only', () => {
+  const speakers = [{ id: 'tessa', name: 'Tessa' }, { id: 'ewan', name: 'Ewan' }]
+  const plan = buildSpeakerDecisionPlan('"Sacrifice."\n\nHe turns with the tray.\n\n"What are you sacrificing?"', speakers, false)
+  const answers: Record<string, SpeakerDecisionChoice> = { speech_s0: confidentDecision('no_clear_identity'), speech_s1: confidentDecision('no_clear_identity') }
+  const context = { previousMessages: [{ id: 'prior', role: 'user' as const, text: 'Ewan walks away with his tray.' }], ghosts: [] }
+  const review = buildRelationshipSpeakerReview(plan, answers, context, null, { cardSpeakerId: 'tessa', targets: ['s0', 's1'] })
+  assert.equal(review.questions.relationship_scene, undefined)
+  assert.ok(review.questions.relationship_s0)
+  assert.equal(review.state.cardSpeakerPrior, 'tessa')
+  applyRelationshipSpeakerReview(plan, answers, { relationship_s0: confidentDecision('known_1') }, review.ghostOptions, 'tessa', 'tessa', true)
+  assert.equal(answers.speech_s0.choice, 'known_1')
+  assert.equal(answers.speech_s1.choice, 'no_clear_identity')
+  const resolved = resolveSpeakerDecisionSegments(plan.state.message, plan, answers, speakers, { isUserMessage: false, cardSpeakerId: null, historicalSpeakerId: null, evidenceOnly: true })
+  assert.notEqual(resolved.find(segment => segment.text === 'What are you sacrificing?')?.speakerId, 'tessa')
+  const failed = buildSpeakerDecisionPlan('"What now?"', speakers, false)
+  const failedAnswers = { speech_s0: confidentDecision('no_clear_identity') }
+  applyRelationshipSpeakerReview(failed, failedAnswers, {}, {}, 'tessa', 'tessa', true)
+  assert.equal(failedAnswers.speech_s0.choice, 'no_clear_identity')
+  assert.equal(resolveSpeakerDecisionSegments(failed.state.message, failed, failedAnswers, speakers, { isUserMessage: false, cardSpeakerId: null, historicalSpeakerId: null, evidenceOnly: true }).find(segment => segment.text === 'What now?')?.speakerId, null)
+})
+
 test('relationship review keeps explicit attributions and rejects weak changes', () => {
   const content = '"Hello," Tessa says. "Someone is calling."'
   const speakers = [{ id: 'npc:tessa', name: 'Tessa' }, { id: USER_SPEAKER_ID, name: 'Ken' }]
@@ -2562,7 +2595,7 @@ test('looks back at most five assistant messages and stops at the nearest clear 
   const ambiguous = Array.from({ length: 4 }, (_, index) => ({ id: `amb-${index}`, is_user: false, content: 'She smiles. "Yes."' }))
   const target = { id: 'target', is_user: false, content: 'She speaks. "Again."' }
   const user = { id: 'user', is_user: true, content: 'I listen.' }
-  const find = (messages: typeof ambiguous) => lookbackSpeakerContinuity(messages, 'target', {}, {}, [ghost], cast)
+  const find = (messages: typeof ambiguous) => lookbackSpeakerContinuity(messages, 'target', {}, {}, [ghost], cast, '', 5)
   assert.equal(find([named, user, ...ambiguous, target]), 'ghost:tasha')
   assert.equal(find([named, ...ambiguous, { ...ambiguous[0], id: 'fifth' }, target]), null)
   assert.equal(lookbackSpeakerContinuity([named, ...ambiguous, { ...ambiguous[0], id: 'fifth' }, target], 'target', {}, {}, [ghost], cast, '', 6), 'ghost:tasha')

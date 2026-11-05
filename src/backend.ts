@@ -989,12 +989,8 @@ function queueSpeakerParse(
     const lifetime = Number.isFinite(payload.ghostVoiceLifetime) ? Math.min(1000, Math.max(1, Math.round(payload.ghostVoiceLifetime))) : 10
     const speakerLookback = Number.isFinite(payload.speakerLookback) ? Math.min(MAX_SPEAKER_LOOKBACK, Math.max(1, Math.round(payload.speakerLookback))) : DEFAULT_SPEAKER_LOOKBACK
     const activeGhostsForReview = activeGhostVoices(readGhostVoices(chat.metadata?.chat_voice_ghost_cast), assistantIds, anchor, lifetime)
-    const relationshipContext = relationshipReviewContext(messages, message.id, activeGhostsForReview, skippedTrackerTags)
-    const lookbackDiagnostics: string[] = []
-    const storedContinuity = !message.is_user ? lookbackSpeakerContinuity(messages, message.id, chat.metadata?.chat_voice_speaker_continuity, config.parsedMessages, activeGhostsForReview, configuredSpeakers, skippedTrackerTags, speakerLookback, payload.debug ? lookbackDiagnostics : undefined) : null
-    let continuitySpeakerId = storedContinuity && (storedContinuity.startsWith('ghost:')
-      ? activeGhostsForReview.some(ghost => `ghost:${ghost.id}` === storedContinuity)
-      : configuredSpeakers.some(speaker => speaker.id === storedContinuity)) ? storedContinuity : null
+    const relationshipContext = relationshipReviewContext(messages, message.id, activeGhostsForReview, skippedTrackerTags, speakerLookback)
+    const continuitySpeakerId: string | null = null
     for (const ghost of activeGhostsForReview) {
       if (!ghost.speakerId.startsWith('unconfigured:')) continue
       const safe = relationshipContext.ghosts.find(item => item.id === ghost.id)
@@ -1009,7 +1005,6 @@ function queueSpeakerParse(
       configuredSpeakers,
       skippedTrackerTags,
     )
-    continuitySpeakerId = continuityRosterIdentity(continuitySpeakerId, relationshipContext, speakers)
     const namedSpeakerSubject = hasNamedSpeakerSubject(
       message.content ?? '',
       speakers,
@@ -1021,54 +1016,13 @@ function queueSpeakerParse(
     const messageCard = messageCardId
       ? cards.find(card => card.id === messageCardId)
       : undefined
-    const titleMatchedCardSpeakerId = !message.is_user && messageCard && !scenarioCardIds.has(messageCard.id)
+    const titleMatchedCardSpeakerId = !message.is_user && messageCard && !scenarioCardIds.has(messageCard.id) && configuredSpeakers.filter(speaker => speaker.id !== USER_SPEAKER_ID && !speaker.id.startsWith('unconfigured:')).length === 1
       ? speakerIdMatchingCardTitle(messageCard.name, configuredSpeakers.filter(speaker => !speaker.id.startsWith('unconfigured:')))
       : null
-    const namelessCardSpeakerId = eligibleCardFallbackSpeakerId(
-      message.content ?? '',
-      titleMatchedCardSpeakerId,
-      speakers,
-      skippedTrackerTags,
-    )
     const defaultSpeakerId = message.is_user
       ? USER_SPEAKER_ID
-      : namelessCardSpeakerId
-    let previousAssistantMessage: typeof message | null = null
-    let historicalSpeakerId: string | null = null
-    if (!message.is_user && !namelessCardSpeakerId && storedContinuity !== CONTINUITY_LOOKBACK_BLOCKED) {
-      const searchForLastClearIdentity = !namedSpeakerSubject
-      let reviewedAssistantMessages = 0
-      for (let index = messageIndex - 1; index >= 0 && reviewedAssistantMessages < speakerLookback; index--) {
-        const previous = messages[index]
-        if (previous.is_user) continue
-        reviewedAssistantMessages += 1
-        const previousSpeakers = searchForLastClearIdentity
-          ? addUnconfiguredDialogueSpeakers(previous.content ?? '', speakers, skippedTrackerTags)
-          : speakers
-        const candidate = previousAssistantSpeakerFallback(
-          message.content ?? '',
-          previous.content ?? '',
-          searchForLastClearIdentity
-            ? null
-            : defaultMessageSpeakerId(previous, speakers, cards.map(card => card.id)),
-          previousSpeakers,
-          skippedTrackerTags,
-        )
-        if (candidate) {
-          previousAssistantMessage = previous
-          historicalSpeakerId = candidate
-          const historicalSpeaker = previousSpeakers.find(speaker => speaker.id === candidate)
-          if (historicalSpeaker && !speakers.some(speaker => speaker.id === candidate)) {
-            speakers.push(historicalSpeaker)
-          }
-          break
-        }
-        if (!searchForLastClearIdentity) {
-          previousAssistantMessage = previous
-          break
-        }
-      }
-    }
+      : null
+    const historicalSpeakerId: string | null = null
     const deterministic = parseRosterVoiceSegments(
       message.content ?? '',
       defaultSpeakerId,
@@ -1122,8 +1076,7 @@ function queueSpeakerParse(
           })),
           cardSpeakerId: titleMatchedCardSpeakerId,
           historicalSpeakerId,
-          relationshipReview: { version: 'relationship-review-11', context: relationshipContext, continuitySpeakerId, speakerLookback },
-          previousAssistantMessageId: previousAssistantMessage?.id ?? null,
+          relationshipReview: { version: 'global-context-1', context: relationshipContext, speakerLookback },
           skippedTrackerTags,
         }))
         const cached = config.parsedMessages[payload.messageId]
@@ -1142,7 +1095,7 @@ function queueSpeakerParse(
           : null
         try {
           const result = await spindle.decisions.evaluate({
-            state: { ...decisionPlan.state, previousMessages: relationshipContext.previousMessages },
+            state: { ...decisionPlan.state, previousMessages: relationshipContext.previousMessages, cardSpeakerPrior: titleMatchedCardSpeakerId, contextPolicy: 'Earlier messages are context, not assignments. The single-character card is a weak preference, not proof. Respect names, actions, pronouns, roles, and channel changes; choose unclear when uncertain.' },
             questions: decisionPlan.questions,
             ...(userId ? { userId } : {}),
           })
@@ -1170,10 +1123,15 @@ function queueSpeakerParse(
               spindle.log.warn(`[Chat Voice] User speaker review failed; keeping original assignments: ${error instanceof Error ? error.message : String(error)}`)
             }
           }
-          const relationshipReview = buildRelationshipSpeakerReview(decisionPlan, answers, relationshipContext, continuitySpeakerId)
+          const discourseAssessment = assessSpeakerDiscourseEscalation(decisionPlan, answers)
+          const relationshipReview = buildRelationshipSpeakerReview(decisionPlan, answers, relationshipContext, null, {
+            cardSpeakerId: titleMatchedCardSpeakerId,
+            targets: [...new Set(discourseAssessment.runs.flatMap(run => run.targets))],
+          })
           let relationshipReviewFailed = false
-          let relationshipSceneDiagnostic = `continuity=${continuitySpeakerId ?? 'none'}; lookback=${lookbackDiagnostics.join(' | ') || 'none'}; candidates=${Object.entries(relationshipReview.ghostOptions).map(([option, id]) => `${option}=${id}`).join(',') || 'none'}`
+          let relationshipSceneDiagnostic = `global-context=${relationshipContext.previousMessages.length} messages, ${relationshipContext.previousMessages.reduce((sum, item) => sum + item.text.length, 0)} characters; candidates=${Object.entries(relationshipReview.ghostOptions).map(([option, id]) => `${option}=${id}`).join(',') || 'none'}`
           if (Object.keys(relationshipReview.questions).length) {
+            const reviewStartedAt = Date.now()
             try {
               const relationshipResult = await spindle.decisions.evaluate({ state: relationshipReview.state, questions: relationshipReview.questions, ...(userId ? { userId } : {}) })
               const reviewed: Record<string, SpeakerDecisionChoice> = {}
@@ -1181,19 +1139,18 @@ function queueSpeakerParse(
                 if (answer.type === 'choice') reviewed[id] = { choice: answer.choice, probabilities: answer.probabilities, confidence: answer.confidence }
               }
               if (reviewed.relationship_scene) relationshipSceneDiagnostic += `; scene=${JSON.stringify(reviewed.relationship_scene)}`
-              applyRelationshipSpeakerReview(decisionPlan, answers, reviewed, relationshipReview.ghostOptions, namelessCardSpeakerId, continuitySpeakerId)
-              relationshipSceneDiagnostic += `; applied=${Object.keys(answers).some(key => key.startsWith('relationship_applied_'))}`
+              applyRelationshipSpeakerReview(decisionPlan, answers, reviewed, relationshipReview.ghostOptions, null, null, true)
+              relationshipSceneDiagnostic += `; duration=${Date.now() - reviewStartedAt}ms; applied=${Object.keys(answers).some(key => key.startsWith('relationship_applied_'))}`
             } catch (error) {
               relationshipReviewFailed = true
               spindle.log.warn(`[Chat Voice] Relationship speaker review failed; keeping original assignments: ${error instanceof Error ? error.message : String(error)}`)
             }
           }
-          continueUncastClosingSpeech(decisionPlan, answers)
-          const { assessment: discourseAssessment, evaluation: discourse } = await reviewDiscourseEscalation(
-            decisionPlan,
-            answers,
-            userId,
-          )
+          const discourse: DiscourseEvaluation = {
+            answers: null,
+            status: relationshipReviewFailed ? 'global-context review failed; no forced inheritance' : 'handled by targeted global-context review',
+            outcome: relationshipReviewFailed ? 'failed' : Object.keys(relationshipReview.questions).length ? 'completed' : 'not-escalated',
+          }
           const segments = resolveSpeakerDecisionSegments(
             message.content ?? '',
             decisionPlan,
@@ -1201,8 +1158,9 @@ function queueSpeakerParse(
             speakers,
             {
               isUserMessage: message.is_user,
-              cardSpeakerId: titleMatchedCardSpeakerId,
+              cardSpeakerId: null,
               historicalSpeakerId,
+              evidenceOnly: true,
               skippedTrackerTagPairs: skippedTrackerTags,
               includeDebug: payload.debug,
               discourse: {

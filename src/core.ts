@@ -2835,7 +2835,7 @@ export function applyAssistantUserSpeakerReview(plan: SpeakerDecisionPlan, answe
 }
 
 export interface RelationshipReviewContext {
-  previousMessages: Array<{ id: string; text: string }>
+  previousMessages: Array<{ id: string; text: string; role?: 'user' | 'assistant' }>
   ghosts: Array<{ id: string; label: string; aliases: string[]; context: string; conversationHistory: Array<{ messageId: string; text: string }> }>
 }
 
@@ -2914,7 +2914,7 @@ export function previousNamedGhostContinuity(messages: Array<{ id: string; is_us
 }
 
 export const CONTINUITY_LOOKBACK_BLOCKED = '__chat_voice_continuity_blocked__'
-export const DEFAULT_SPEAKER_LOOKBACK = 5
+export const DEFAULT_SPEAKER_LOOKBACK = 6
 export const MAX_SPEAKER_LOOKBACK = 100
 
 /** Look back through assistant turns, stopping at clear or conflicting evidence. */
@@ -3007,26 +3007,40 @@ export function lookbackSpeakerContinuity(messages: Array<{ id: string; is_user:
 }
 
 /** Prepare only earlier, tracker-free context, including when replaying old messages. */
-export function relationshipReviewContext(messages: Array<{ id: string; is_user: boolean; content?: string }>, targetId: string, ghosts: GhostVoice[], skippedTags = ''): RelationshipReviewContext {
+export function relationshipReviewContext(messages: Array<{ id: string; is_user: boolean; content?: string }>, targetId: string, ghosts: GhostVoice[], skippedTags = '', limit = DEFAULT_SPEAKER_LOOKBACK): RelationshipReviewContext {
   const target = messages.findIndex(message => message.id === targetId)
   if (target < 0) return { previousMessages: [], ghosts: [] }
   const prior = messages.slice(0, target)
   const priorIds = new Set(prior.map(message => message.id))
-  const previousMessages = prior.filter(message => !message.is_user).slice(-2).map(message => ({ id: message.id, text: preparePlaybackContent(message.content ?? '', skippedTags).slice(-4_000) }))
-  const safeGhosts = ghosts.flatMap(ghost => {
+  const count = Number.isFinite(limit) ? Math.max(1, Math.min(MAX_SPEAKER_LOOKBACK, Math.round(limit))) : DEFAULT_SPEAKER_LOOKBACK
+  let remaining = 24_000
+  const previousMessages = prior.slice(-count).reverse().flatMap(message => {
+    if (remaining <= 0) return []
+    const text = preparePlaybackContent(message.content ?? '', skippedTags).slice(-Math.min(4_000, remaining))
+    remaining -= text.length
+    return text ? [{ id: message.id, role: message.is_user ? 'user' as const : 'assistant' as const, text }] : []
+  }).reverse()
+  let ghostBudget = 12_000
+  const takeGhostText = (text: string, limit: number): string => {
+    if (ghostBudget <= 0) return ''
+    const selected = preparePlaybackContent(text, skippedTags).slice(-Math.min(limit, ghostBudget))
+    ghostBudget -= selected.length
+    return selected
+  }
+  const safeGhosts = ghosts.slice(0, 20).flatMap(ghost => {
     const lastIndex = messages.findIndex(message => message.id === ghost.lastSeenMessageId)
     const safeCurrent = lastIndex >= 0 && lastIndex <= target
-    const history = (ghost.conversationHistory ?? []).filter(entry => priorIds.has(entry.messageId))
-      .map(entry => ({ messageId: entry.messageId, text: preparePlaybackContent(entry.text, skippedTags).slice(0, 6_000) }))
-    if (!safeCurrent && !history.length) return []
+    const historical = (ghost.conversationHistory ?? []).filter(entry => priorIds.has(entry.messageId))
+    const history = historical.slice(-3).map(entry => ({ messageId: entry.messageId, text: takeGhostText(entry.text, 1_200) })).filter(entry => entry.text)
+    if (!safeCurrent && !historical.length) return []
     return [{ id: ghost.id, label: safeCurrent ? ghost.label ?? '' : '', aliases: safeCurrent ? ghostCastAliases(ghost) : [],
-      context: safeCurrent ? preparePlaybackContent(ghost.context, skippedTags).slice(0, 2_000) : '', conversationHistory: history }]
-  }).slice(0, 20)
+      context: safeCurrent ? takeGhostText(ghost.context, 1_200) : '', conversationHistory: history }]
+  })
   return { previousMessages, ghosts: safeGhosts }
 }
 
 /** Run relationship review only where local identity or an off-scene exchange needs context. */
-export function buildRelationshipSpeakerReview(plan: SpeakerDecisionPlan, answers: Record<string, SpeakerDecisionChoice>, context: RelationshipReviewContext, continuitySpeakerId: string | null = null) {
+export function buildRelationshipSpeakerReview(plan: SpeakerDecisionPlan, answers: Record<string, SpeakerDecisionChoice>, context: RelationshipReviewContext, continuitySpeakerId: string | null = null, globalOptions?: { cardSpeakerId: string | null; targets: string[] }) {
   const questions: SpeakerDecisionPlan['questions'] = {}
   const ghostOptions: Record<string, string> = {}
   const speakers = plan.state.speakers.map(speaker => ({ id: speaker.id, name: speaker.name }))
@@ -3047,7 +3061,7 @@ export function buildRelationshipSpeakerReview(plan: SpeakerDecisionPlan, answer
       const attribution = narrativeAttributionSpeaker(`${speech.narrativeBefore} ${speech.narrativeAfter}`, speakers)
       if (attribution && local.identity === attribution) continue
       const conflict = !!local.identity && !!paragraph.identity && local.identity !== paragraph.identity
-      if (local.identity && local.identity !== UNCAST_SPEAKER_ID && !conflict && !phoneExchange) continue
+      if (local.identity && local.identity !== UNCAST_SPEAKER_ID && !conflict && !phoneExchange && !globalOptions?.targets.includes(speech.id)) continue
       questions[`relationship_${speech.id}`] = {
         type: 'choice',
         instructions: `Who actually speaks quotation ${speech.id}? Compare names, actions and pronoun references in the current exchange with the earlier conversations and relevant relationships. Distinguish speakers from people addressed or mentioned, bystanders, and a caller or text sender from the person holding the phone. Pronouns are evidence, not proof of gender or identity. Consider whether a call or text thread continues, a different participant appears, or a person later arrives in person. Prefer explicit local attribution and select no_clear_identity when the evidence is insufficient.`,
@@ -3057,18 +3071,18 @@ export function buildRelationshipSpeakerReview(plan: SpeakerDecisionPlan, answer
     }
   }
   const continuityOption = continuitySpeakerId ? plan.state.speakers.find(speaker => speaker.id === continuitySpeakerId)?.option : undefined
-  if (plan.state.messageRole === 'assistant' && (plan.state.speeches.length > 1 || (plan.state.speeches.length === 1 && continuitySpeakerId)) && (Object.keys(ghostOptions).length || continuityOption) && (Object.keys(questions).length || continuitySpeakerId)) {
+  if (!globalOptions && plan.state.messageRole === 'assistant' && (plan.state.speeches.length > 1 || (plan.state.speeches.length === 1 && continuitySpeakerId)) && (Object.keys(ghostOptions).length || continuityOption) && (Object.keys(questions).length || continuitySpeakerId)) {
     questions.relationship_scene = {
       type: 'choice',
       instructions: `Does one previously heard temporary character clearly speak every quotation in this message? Compare the entire scene and preceding conversation; distinguish scene changes, different speakers and people addressed. ${continuitySpeakerId ? `The immediately preceding assistant message ended with ${continuitySpeakerId}; treat this as a continuity clue, not proof.` : ''} Select no_clear_identity if any quotation may belong to another speaker or the continuity is uncertain.`,
       criteria: { no_clear_identity: 'The scene has multiple speakers or the identity is uncertain.', ...Object.fromEntries([...Object.keys(ghostOptions), ...(continuityOption ? [continuityOption] : [])].map(option => [option, criteria[option]])) },
     }
   }
-  return { state: { ...plan.state, previousMessages: context.previousMessages, ghosts: context.ghosts }, questions, ghostOptions }
+  return { state: { ...plan.state, previousMessages: context.previousMessages, ghosts: context.ghosts, ...(globalOptions ? { cardSpeakerPrior: globalOptions.cardSpeakerId, contextPolicy: 'Earlier messages are evidence, not automatic speaker assignments. A single-character card is a weak preference only. Distinguish user and assistant roles. Never assume a person is speaking merely because they spoke last.' } : {}) }, questions, ghostOptions }
 }
 
 /** A strong independent decision is required before relationship evidence changes routing. */
-export function applyRelationshipSpeakerReview(plan: SpeakerDecisionPlan, answers: Record<string, SpeakerDecisionChoice>, reviewed: Record<string, SpeakerDecisionChoice>, ghostOptions: Record<string, string>, cardSpeakerId: string | null = null, continuitySpeakerId: string | null = null): void {
+export function applyRelationshipSpeakerReview(plan: SpeakerDecisionPlan, answers: Record<string, SpeakerDecisionChoice>, reviewed: Record<string, SpeakerDecisionChoice>, ghostOptions: Record<string, string>, cardSpeakerId: string | null = null, continuitySpeakerId: string | null = null, globalMode = false): void {
   const options = { ...plan.optionSpeakerIds, ...ghostOptions }
   const scene = reviewed.relationship_scene
   const sceneEvaluation = scene ? evaluateSpeakerDecisionAnswer(scene, options, { probability: 0.6, confidence: 0.45, margin: 0.3 }) : null
@@ -3097,7 +3111,7 @@ export function applyRelationshipSpeakerReview(plan: SpeakerDecisionPlan, answer
     const result = reviewed[`relationship_${speech.id}`]
     const original = answers[`speech_${speech.id}`]
     const originalIdentity = evaluateSpeakerDecisionAnswer(original, plan.optionSpeakerIds).identity
-    const chosen = preferredCard || inherited || (sceneIdentity && !conflictingAttribution && !conflictingTurn ? scene : null)
+    const chosen = globalMode ? null : preferredCard || inherited || (sceneIdentity && !conflictingAttribution && !conflictingTurn ? scene : null)
     if (chosen) {
       Object.assign(plan.optionSpeakerIds, ghostOptions)
       if (original) answers[`relationship_original_${speech.id}`] = original
@@ -3110,7 +3124,7 @@ export function applyRelationshipSpeakerReview(plan: SpeakerDecisionPlan, answer
     }
     if (!result) continue
     answers[`relationship_review_${speech.id}`] = result
-    const reviewedIdentity = evaluateSpeakerDecisionAnswer(result, options, { probability: 0.85, confidence: 0.8, margin: 0.3 }).identity
+    const reviewedIdentity = evaluateSpeakerDecisionAnswer(result, options, globalMode && (!originalIdentity || originalIdentity === UNCAST_SPEAKER_ID) ? SPEAKER_DECISION_THRESHOLDS.local : { probability: 0.85, confidence: 0.8, margin: 0.3 }).identity
     if (!reviewedIdentity || reviewedIdentity === originalIdentity) continue
     if (originalIdentity && originalIdentity !== UNCAST_SPEAKER_ID) {
       if (narrativeAttributionSpeaker(`${speech.narrativeBefore} ${speech.narrativeAfter}`, speakers) === originalIdentity) continue
@@ -3119,7 +3133,8 @@ export function applyRelationshipSpeakerReview(plan: SpeakerDecisionPlan, answer
     if (original) answers[`relationship_original_${speech.id}`] = original
     answers[`speech_${speech.id}`] = result
     answers[`relationship_applied_${speech.id}`] = result
-    if (reviewedIdentity === continuitySpeakerId) answers[`relationship_continuity_${speech.id}`] = result
+    if (globalMode) answers[`relationship_global_${speech.id}`] = result
+    if (globalMode || reviewedIdentity === continuitySpeakerId) answers[`relationship_continuity_${speech.id}`] = result
   }
 }
 
@@ -5804,6 +5819,7 @@ export function resolveSpeakerDecisionSegments(
     isUserMessage: boolean
     cardSpeakerId: string | null
     historicalSpeakerId: string | null
+    evidenceOnly?: boolean
     skippedTrackerTagPairs?: string
     includeDebug?: boolean
     /**
@@ -5846,7 +5862,9 @@ export function resolveSpeakerDecisionSegments(
     }
     const baseIdentity = (chainDecision?.identity ?? undefined) ?? identity
     if (answers[`relationship_continuity_${speech.id}`]) {
-      discoursePathBySpeechIndex.set(index, 'resolution:inherited previous assistant speaker (protected from discourse override)')
+      discoursePathBySpeechIndex.set(index, answers[`relationship_global_${speech.id}`]
+        ? 'resolution:global-context review (protected from local override)'
+        : 'resolution:inherited previous assistant speaker (protected from discourse override)')
       return identity
     }
     const outcome = speech ? discourseOutcomes.get(speech.id) : undefined
@@ -5959,7 +5977,7 @@ export function resolveSpeakerDecisionSegments(
           ?? chainPathBySpeechIndex.get(index)
           ?? 'resolution:direct-speech-identity',
       ])
-    } else if (upstreamIdentity && !clearSpeakerSwitch) {
+    } else if (upstreamIdentity && !clearSpeakerSwitch && !options.evidenceOnly) {
       speakerId = upstreamIdentity
       resolutionPaths.push([`resolution:upstream-identity (${upstreamSource})`])
     } else if (
