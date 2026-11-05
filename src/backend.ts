@@ -1325,8 +1325,9 @@ function queueSpeakerParse(
                 if (invalid.length) relationshipSceneDiagnostic += `; contrastive-shadow=incomplete (${invalid.length} invalid answers)`
                 else {
                   const pairs = Object.keys(backlinkReview.links).map(id => `${id}:live=${baselineLinks[id]?.choice ?? 'unavailable'},candidate=${reviewed[id].choice},confidence=${reviewed[id].confidence.toFixed(2)},probabilities=${JSON.stringify(reviewed[id].probabilities)}`)
+                  const focused = Object.keys(backlinkReview.links).map(id => `focused_${id}:target=${backlinkReview.links[id].targetId},anchor=${backlinkReview.links[id].anchorId},identity=${backlinkReview.links[id].identity},candidate=${reviewed[`focused_${id}`].choice},confidence=${reviewed[`focused_${id}`].confidence.toFixed(2)},probabilities=${JSON.stringify(reviewed[`focused_${id}`].probabilities)}`)
                   const controls = Object.entries(contrastive.expectedControls).map(([id, expected]) => `${id}:${reviewed[id].choice}/${expected}`)
-                  relationshipSceneDiagnostic += `; contrastive-shadow=${output.duration}ms, questions=${Object.keys(contrastive.questions).length}, pairs=[${pairs.join('; ')}], synthetic-controls=[${controls.join(', ')}] (candidate/expected; no routing changes)`
+                  relationshipSceneDiagnostic += `; contrastive-shadow=${output.duration}ms, questions=${Object.keys(contrastive.questions).length}, pairs=[${pairs.join('; ')}], focused=[${focused.join('; ')}], synthetic-controls=[${controls.join(', ')}] (candidate/expected; no routing changes)`
                 }
               }
               } catch {

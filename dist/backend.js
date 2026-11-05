@@ -2096,18 +2096,26 @@ function buildContrastiveOpeningLinkReview(review) {
       instructions: `Compare the two current-message quotations in pairEvidence.${id}: target ${link.targetId} and anchor ${link.anchorId}. Decide whether the actual speakers are the same or different, or whether that cannot be established. Read the intervening narration and previous exchange, including who is addressed, who acts, pronouns and topic. A response or repeated word does not itself establish either same or different speakers. The anchor identity is a provisional clue, not proof.`,
       criteria
     };
+    questions[`focused_${id}`] = {
+      type: "choice",
+      instructions: `Compare ONLY the actual speakers of current-message target ${link.targetId} and anchor ${link.anchorId}, using pairEvidence.${id} and the full current opening for the text surrounding both quotes. Follow the person who speaks the target through the intervening narration and dialogue: who acts, handles the same objects, is addressed, introduces themselves, or is explicitly attributed later? A later self-introduction or attribution can clarify an earlier unnamed speaker, but a name or pronoun alone cannot establish continuity. Consider whether an interruption, speaker change, a different person acting, or a new scene or channel breaks the link. The anchor identity is provisional, and the preceding user message is context, not the target speaker. Choose same, different, or no_clear_identity; do not guess.`,
+      criteria
+    };
   }
   const controls = [
     { id: "control_continuation", text: '"Rain," Mira says. She looks at the clouds. "The washing will get wet."', first: "Rain,", second: "The washing will get wet." },
     { id: "control_reply", text: '"Tea?" Mira asks. Rowan shakes his head. "Coffee, please," he replies.', first: "Tea?", second: "Coffee, please," },
-    { id: "control_uncertain", text: '"Wait." Someone moves behind the curtain. "Is the door open?"', first: "Wait.", second: "Is the door open?" }
+    { id: "control_uncertain", text: '"Wait." Someone moves behind the curtain. "Is the door open?"', first: "Wait.", second: "Is the door open?" },
+    { id: "focused_control_introduction", text: '"Bishop. Third floor." She balances her tray. "It is noisy." She sits. "Mira. Mira Lee. Nice to meet you."', first: "Bishop. Third floor.", second: "Mira. Mira Lee. Nice to meet you." },
+    { id: "focused_control_interruption", text: '"Bishop. Third floor," Rowan says. The woman sets down her tray. "Mira. Mira Lee. Nice to meet you," she says.', first: "Bishop. Third floor,", second: "Mira. Mira Lee. Nice to meet you," },
+    { id: "focused_control_unclear", text: '"Bishop. Third floor." Someone moves behind the table. "Mira. Mira Lee," the woman says.', first: "Bishop. Third floor.", second: "Mira. Mira Lee," }
   ];
   for (const control of controls) questions[control.id] = {
     type: "choice",
     instructions: `Evaluate only the synthetic control ${control.id} in controls. Are its first and second quotations spoken by the same person, different people, or is that unclear? Do not use the chat or other controls as evidence.`,
     criteria
   };
-  return { state: { ...review.state, controls }, questions, expectedControls: { control_continuation: "same", control_reply: "different", control_uncertain: "no_clear_identity" } };
+  return { state: { ...review.state, controls }, questions, expectedControls: { control_continuation: "same", control_reply: "different", control_uncertain: "no_clear_identity", focused_control_introduction: "same", focused_control_interruption: "different", focused_control_unclear: "no_clear_identity" } };
 }
 function applyOpeningBacklinkReview(plan, answers, reviewed, links) {
   const checked = [];
@@ -5355,8 +5363,9 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
                   if (invalid.length) relationshipSceneDiagnostic += `; contrastive-shadow=incomplete (${invalid.length} invalid answers)`;
                   else {
                     const pairs = Object.keys(backlinkReview.links).map((id) => `${id}:live=${baselineLinks[id]?.choice ?? "unavailable"},candidate=${reviewed[id].choice},confidence=${reviewed[id].confidence.toFixed(2)},probabilities=${JSON.stringify(reviewed[id].probabilities)}`);
+                    const focused = Object.keys(backlinkReview.links).map((id) => `focused_${id}:target=${backlinkReview.links[id].targetId},anchor=${backlinkReview.links[id].anchorId},identity=${backlinkReview.links[id].identity},candidate=${reviewed[`focused_${id}`].choice},confidence=${reviewed[`focused_${id}`].confidence.toFixed(2)},probabilities=${JSON.stringify(reviewed[`focused_${id}`].probabilities)}`);
                     const controls = Object.entries(contrastive.expectedControls).map(([id, expected]) => `${id}:${reviewed[id].choice}/${expected}`);
-                    relationshipSceneDiagnostic += `; contrastive-shadow=${output.duration}ms, questions=${Object.keys(contrastive.questions).length}, pairs=[${pairs.join("; ")}], synthetic-controls=[${controls.join(", ")}] (candidate/expected; no routing changes)`;
+                    relationshipSceneDiagnostic += `; contrastive-shadow=${output.duration}ms, questions=${Object.keys(contrastive.questions).length}, pairs=[${pairs.join("; ")}], focused=[${focused.join("; ")}], synthetic-controls=[${controls.join(", ")}] (candidate/expected; no routing changes)`;
                   }
                 }
               } catch {

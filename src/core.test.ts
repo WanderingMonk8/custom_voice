@@ -2924,6 +2924,20 @@ test('backward links require a strong independent same-speaker answer and a vali
   assert.equal(buildOpeningBacklinkReview(explicitlyDifferent, sceneAnswers, context, null), null)
 })
 
+test('focused shadow compares the earlier unnamed reply to a validated later anchor', () => {
+  const speakers = [{ id: 'npc:tessa', name: 'Tessa' }, { id: USER_SPEAKER_ID, name: 'Ken' }]
+  const plan = buildSpeakerDecisionPlan('"Bishop. Third floor."\n\nShe balances her tray. "It is noisy."\n\n"Tessa. Tessa Doyle." She sits down.', speakers, false)
+  const answers: Record<string, SpeakerDecisionChoice> = { speech_s0: confidentDecision('no_clear_identity'), global_uncertain_s0: confidentDecision('no_clear_identity'), speech_s1: confidentDecision('known_0'), relationship_confirmed_s1: confidentDecision('known_0') }
+  const review = buildOpeningBacklinkReview(plan, answers, { previousMessages: [{ id: 'prior', role: 'user' as const, text: 'I ask her, "Where do you live?"' }], ghosts: [] }, null)!
+  const before = JSON.stringify(answers)
+  const shadow = buildContrastiveOpeningLinkReview(review)
+  assert.equal(review.links.backlink_s0.identity, 'npc:tessa')
+  assert.match(shadow.state.pairEvidence.backlink_s0.between, /balances her tray/u)
+  assert.match(shadow.state.message, /Tessa Doyle/u)
+  assert.ok(shadow.questions.focused_backlink_s0)
+  assert.equal(JSON.stringify(answers), before)
+})
+
 test('opening links consider adjacent validated speakers in both directions without forcing continuity', () => {
   const speakers = [{ id: 'npc:ewan', name: 'Ewan' }, { id: USER_SPEAKER_ID, name: 'Ken' }]
   const plan = buildSpeakerDecisionPlan('"Sacrifice."\n\nHe turns with the tray.\n\n"The noodles?"\n\n"No, I know what you meant."', speakers, false)
@@ -2936,6 +2950,10 @@ test('opening links consider adjacent validated speakers in both directions with
   const reviewBefore = JSON.stringify(review)
   const contrastive = buildContrastiveOpeningLinkReview(review)
   assert.deepEqual(Object.keys(contrastive.questions.forwardlink_s1.criteria), ['same', 'different', 'no_clear_identity'])
+  assert.match(contrastive.questions.focused_backlink_s1.instructions, /self-introduction/u)
+  assert.equal(contrastive.expectedControls.focused_control_introduction, 'same')
+  assert.equal(contrastive.expectedControls.focused_control_interruption, 'different')
+  assert.equal(contrastive.expectedControls.focused_control_unclear, 'no_clear_identity')
   assert.ok(contrastive.questions.control_continuation)
   assert.ok(contrastive.questions.control_reply)
   assert.ok(contrastive.questions.control_uncertain)
