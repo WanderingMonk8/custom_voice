@@ -21,6 +21,8 @@ import {
   buildAssistantUserSpeakerReview,
   buildRelationshipSpeakerReview,
   buildOpeningSpeakerReview,
+  buildOpeningBacklinkReview,
+  applyOpeningBacklinkReview,
   invalidSpeakerReviewAnswers,
   applyRelationshipSpeakerReview,
   previousContinuitySpeaker,
@@ -2670,6 +2672,37 @@ test('agreement retains a clear first-pass identity without requiring override t
   applyRelationshipSpeakerReview(conflict.plan, conflict.answers, { relationship_s0: { choice: 'known_1', probabilities: { known_1: 0.75, known_0: 0.20, no_clear_identity: 0.05 }, confidence: 0.70 } }, {}, null, null, true)
   assert.ok(conflict.answers.global_uncertain_s0)
   assert.equal(conflict.answers.relationship_confirmed_s0, undefined)
+})
+
+test('backward links require a strong independent same-speaker answer and a validated later anchor', () => {
+  const speakers = [{ id: 'npc:ewan', name: 'Ewan' }, { id: USER_SPEAKER_ID, name: 'Ken' }]
+  const message = '"Sacrifice."\n\nHe turns with the tray.\n\n"What are you sacrificing?"\n\n"No, I know what you meant."'
+  const plan = buildSpeakerDecisionPlan(message, speakers, false)
+  const context = { previousMessages: [{ id: 'user', role: 'user' as const, text: 'I turn to Ewan. "Sometimes you sacrifice."' }], ghosts: [] }
+  const make = () => ({ speech_s0: confidentDecision('known_1'), speech_s1: confidentDecision('no_clear_identity'), speech_s2: confidentDecision('known_0'), global_uncertain_s0: confidentDecision('no_clear_identity'), global_uncertain_s1: confidentDecision('no_clear_identity'), relationship_applied_s2: confidentDecision('known_0') } as Record<string, SpeakerDecisionChoice>)
+  const answers = make()
+  const review = buildOpeningBacklinkReview(plan, answers, context, null)!
+  assert.equal(review.links.backlink_s0.anchorId, 's2')
+  assert.equal(review.links.backlink_s1.identity, 'npc:ewan')
+  applyOpeningBacklinkReview(plan, answers, { backlink_s0: confidentDecision('same'), backlink_s1: confidentDecision('different_or_unclear') }, review.links)
+  assert.equal(answers.speech_s0.choice, 'known_0')
+  assert.equal(answers.global_uncertain_s0, undefined)
+  assert.ok(answers.global_uncertain_s1)
+  const weak = make()
+  applyOpeningBacklinkReview(plan, weak, { backlink_s0: { choice: 'same', probabilities: { same: 0.70, different_or_unclear: 0.30 }, confidence: 0.7 } }, review.links)
+  assert.ok(weak.global_uncertain_s0)
+  const stale = make()
+  stale.speech_s2 = confidentDecision('known_1')
+  applyOpeningBacklinkReview(plan, stale, { backlink_s0: confidentDecision('same') }, review.links)
+  assert.ok(stale.global_uncertain_s0)
+  const unvalidated = make()
+  delete unvalidated.relationship_applied_s2
+  assert.equal(buildOpeningBacklinkReview(plan, unvalidated, context, null), null)
+  const changedScene = buildSpeakerDecisionPlan('"First."\n\nHours later, the room is empty.\n\n"Second," Ewan says.', speakers, false)
+  const sceneAnswers: Record<string, SpeakerDecisionChoice> = { speech_s0: confidentDecision('no_clear_identity'), global_uncertain_s0: confidentDecision('no_clear_identity'), speech_s1: confidentDecision('known_0'), relationship_applied_s1: confidentDecision('known_0') }
+  assert.equal(buildOpeningBacklinkReview(changedScene, sceneAnswers, context, null), null)
+  const explicitlyDifferent = buildSpeakerDecisionPlan('"First," Ken says.\n\n"Second," Ewan says.', speakers, false)
+  assert.equal(buildOpeningBacklinkReview(explicitlyDifferent, sceneAnswers, context, null), null)
 })
 
 test('uncertain global review blocks chain guessing and uses unresolved speech voice, not narration', () => {

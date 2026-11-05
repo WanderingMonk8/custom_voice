@@ -3230,6 +3230,56 @@ export function buildOpeningSpeakerReview(plan: SpeakerDecisionPlan, answers: Re
   }
 }
 
+/** Ask for per-quote links to later, contextually validated speakers in the same run. */
+export function buildOpeningBacklinkReview(plan: SpeakerDecisionPlan, answers: Record<string, SpeakerDecisionChoice>, context: RelationshipReviewContext, cardSpeakerId: string | null) {
+  const base = buildOpeningSpeakerReview(plan, answers, context, cardSpeakerId)
+  const run = plan.state.runs.find(item => item.speechIds.includes('s0'))
+  if (!base || !run) return null
+  const questions: SpeakerDecisionPlan['questions'] = {}
+  const links: Record<string, { targetId: string; anchorId: string; identity: string }> = {}
+  const speakers = plan.state.speakers.map(speaker => ({ id: speaker.id, name: speaker.name }))
+  for (const [index, targetId] of run.speechIds.entries()) {
+    if (!answers[`global_uncertain_${targetId}`] || Object.keys(questions).length >= 12) continue
+    const target = plan.state.speeches.find(speech => speech.id === targetId)
+    if (!target) continue
+    for (const anchorId of run.speechIds.slice(index + 1)) {
+      if (answers[`global_uncertain_${anchorId}`]) continue
+      if (!answers[`relationship_applied_${anchorId}`] && !answers[`relationship_confirmed_${anchorId}`]) continue
+      const identity = evaluateSpeakerDecisionAnswer(answers[`speech_${anchorId}`], plan.optionSpeakerIds).identity
+      if (!identity || identity === UNCAST_SPEAKER_ID) continue
+      const explicit = narrativeAttributionSpeaker(`${target.narrativeBefore} ${target.narrativeAfter}`, speakers)
+      if (explicit && explicit !== identity) break
+      const id = `backlink_${targetId}`
+      questions[id] = {
+        type: 'choice',
+        instructions: `Do quotations ${targetId} and ${anchorId} have the same actual speaker? The later quotation ${anchorId} has a provisional supported identity, but that is not proof about ${targetId}. Read the preceding exchange and all intervening text and speech. Consider topic, pronouns, actions, turn changes, new entrants, channels and later clarification. A person addressed or merely passing by is not automatically speaking. Choose same only when the link is clear; otherwise choose different_or_unclear.`,
+        criteria: { same: 'Both quotations are spoken by the same person.', different_or_unclear: 'They have different speakers or the evidence is not clear.' },
+      }
+      links[id] = { targetId, anchorId, identity }
+      break
+    }
+  }
+  if (!Object.keys(questions).length) return null
+  return { state: { ...base.state, backlinkCandidates: links }, questions, links }
+}
+
+/** Apply only clear links to anchors that remain validated and unchanged. */
+export function applyOpeningBacklinkReview(plan: SpeakerDecisionPlan, answers: Record<string, SpeakerDecisionChoice>, reviewed: Record<string, SpeakerDecisionChoice>, links: Record<string, { targetId: string; anchorId: string; identity: string }>): void {
+  for (const [id, link] of Object.entries(links)) {
+    const result = reviewed[id]
+    if (result) answers[`backlink_review_${link.targetId}`] = result
+    const decision = evaluateSpeakerDecisionAnswer(result, { same: 'same', different_or_unclear: 'different_or_unclear' }, { probability: 0.85, confidence: 0.8, margin: 0.3 })
+    const anchor = answers[`speech_${link.anchorId}`]
+    if (!answers[`global_uncertain_${link.targetId}`] || answers[`global_uncertain_${link.anchorId}`] || (!answers[`relationship_applied_${link.anchorId}`] && !answers[`relationship_confirmed_${link.anchorId}`]) || decision.identity !== 'same' || evaluateSpeakerDecisionAnswer(anchor, plan.optionSpeakerIds).identity !== link.identity) continue
+    answers[`relationship_original_${link.targetId}`] = answers[`speech_${link.targetId}`]
+    answers[`speech_${link.targetId}`] = anchor
+    answers[`relationship_backlink_${link.targetId}`] = result
+    answers[`relationship_continuity_${link.targetId}`] = anchor
+    answers[`relationship_global_${link.targetId}`] = anchor
+    delete answers[`global_uncertain_${link.targetId}`]
+  }
+}
+
 /** A strong independent decision is required before relationship evidence changes routing. */
 export function applyRelationshipSpeakerReview(plan: SpeakerDecisionPlan, answers: Record<string, SpeakerDecisionChoice>, reviewed: Record<string, SpeakerDecisionChoice>, ghostOptions: Record<string, string>, cardSpeakerId: string | null = null, continuitySpeakerId: string | null = null, globalMode = false): void {
   const options = { ...plan.optionSpeakerIds, ...ghostOptions }
@@ -6262,6 +6312,8 @@ export function resolveSpeakerDecisionSegments(
           ...(answers[`relationship_inherited_${speech.id}`] ? ['jev-relationship-review:inherited established previous speaker'] : []),
           ...(answers[`relationship_applied_${speech.id}`] ? ['jev-relationship-review:strong alternative applied'] : []),
           ...(answers[`relationship_confirmed_${speech.id}`] ? ['jev-relationship-review:accepted first-pass identity confirmed'] : []),
+          ...decisionAnswerDebug('jev-opening-backlink', answers[`backlink_review_${speech.id}`], { same: 'same', different_or_unclear: 'different_or_unclear' }),
+          ...(answers[`relationship_backlink_${speech.id}`] ? ['jev-opening-backlink:accepted same-speaker link to later validated quote'] : []),
           ...(answers[`global_uncertain_${speech.id}`] ? ['jev-global-review:uncertain; unsupported identity and chain fill suppressed'] : []),
           ...decisionAnswerDebug('jev-user-review-original', answers[`user_review_original_${speech.id}`], plan.optionSpeakerIds),
           ...decisionAnswerDebug('jev-user-review', answers[`user_review_${speech.id}`], plan.optionSpeakerIds),

@@ -1891,6 +1891,52 @@ function buildOpeningSpeakerReview(plan, answers, context, cardSpeakerId) {
     state: { ...review.state, message: paragraphs.map((paragraph) => paragraph.text).join("\n\n"), paragraphs, speeches: plan.state.speeches.filter((speech) => paragraphIds.has(speech.paragraphId)), runs: [openingRun], turns: plan.state.turns.filter((turn) => openingRun.speechIds.includes(turn.speechId)), reviewedRuns: [openingRun] }
   };
 }
+function buildOpeningBacklinkReview(plan, answers, context, cardSpeakerId) {
+  const base = buildOpeningSpeakerReview(plan, answers, context, cardSpeakerId);
+  const run = plan.state.runs.find((item) => item.speechIds.includes("s0"));
+  if (!base || !run) return null;
+  const questions = {};
+  const links = {};
+  const speakers = plan.state.speakers.map((speaker) => ({ id: speaker.id, name: speaker.name }));
+  for (const [index, targetId] of run.speechIds.entries()) {
+    if (!answers[`global_uncertain_${targetId}`] || Object.keys(questions).length >= 12) continue;
+    const target = plan.state.speeches.find((speech) => speech.id === targetId);
+    if (!target) continue;
+    for (const anchorId of run.speechIds.slice(index + 1)) {
+      if (answers[`global_uncertain_${anchorId}`]) continue;
+      if (!answers[`relationship_applied_${anchorId}`] && !answers[`relationship_confirmed_${anchorId}`]) continue;
+      const identity = evaluateSpeakerDecisionAnswer(answers[`speech_${anchorId}`], plan.optionSpeakerIds).identity;
+      if (!identity || identity === UNCAST_SPEAKER_ID) continue;
+      const explicit = narrativeAttributionSpeaker(`${target.narrativeBefore} ${target.narrativeAfter}`, speakers);
+      if (explicit && explicit !== identity) break;
+      const id = `backlink_${targetId}`;
+      questions[id] = {
+        type: "choice",
+        instructions: `Do quotations ${targetId} and ${anchorId} have the same actual speaker? The later quotation ${anchorId} has a provisional supported identity, but that is not proof about ${targetId}. Read the preceding exchange and all intervening text and speech. Consider topic, pronouns, actions, turn changes, new entrants, channels and later clarification. A person addressed or merely passing by is not automatically speaking. Choose same only when the link is clear; otherwise choose different_or_unclear.`,
+        criteria: { same: "Both quotations are spoken by the same person.", different_or_unclear: "They have different speakers or the evidence is not clear." }
+      };
+      links[id] = { targetId, anchorId, identity };
+      break;
+    }
+  }
+  if (!Object.keys(questions).length) return null;
+  return { state: { ...base.state, backlinkCandidates: links }, questions, links };
+}
+function applyOpeningBacklinkReview(plan, answers, reviewed, links) {
+  for (const [id, link] of Object.entries(links)) {
+    const result = reviewed[id];
+    if (result) answers[`backlink_review_${link.targetId}`] = result;
+    const decision = evaluateSpeakerDecisionAnswer(result, { same: "same", different_or_unclear: "different_or_unclear" }, { probability: 0.85, confidence: 0.8, margin: 0.3 });
+    const anchor = answers[`speech_${link.anchorId}`];
+    if (!answers[`global_uncertain_${link.targetId}`] || answers[`global_uncertain_${link.anchorId}`] || !answers[`relationship_applied_${link.anchorId}`] && !answers[`relationship_confirmed_${link.anchorId}`] || decision.identity !== "same" || evaluateSpeakerDecisionAnswer(anchor, plan.optionSpeakerIds).identity !== link.identity) continue;
+    answers[`relationship_original_${link.targetId}`] = answers[`speech_${link.targetId}`];
+    answers[`speech_${link.targetId}`] = anchor;
+    answers[`relationship_backlink_${link.targetId}`] = result;
+    answers[`relationship_continuity_${link.targetId}`] = anchor;
+    answers[`relationship_global_${link.targetId}`] = anchor;
+    delete answers[`global_uncertain_${link.targetId}`];
+  }
+}
 function applyRelationshipSpeakerReview(plan, answers, reviewed, ghostOptions, cardSpeakerId = null, continuitySpeakerId = null, globalMode = false) {
   const options = { ...plan.optionSpeakerIds, ...ghostOptions };
   if (globalMode) Object.assign(plan.optionSpeakerIds, ghostOptions);
@@ -3978,6 +4024,8 @@ function resolveSpeakerDecisionSegments(content, plan, answers, speakers, option
           ...answers[`relationship_inherited_${speech.id}`] ? ["jev-relationship-review:inherited established previous speaker"] : [],
           ...answers[`relationship_applied_${speech.id}`] ? ["jev-relationship-review:strong alternative applied"] : [],
           ...answers[`relationship_confirmed_${speech.id}`] ? ["jev-relationship-review:accepted first-pass identity confirmed"] : [],
+          ...decisionAnswerDebug("jev-opening-backlink", answers[`backlink_review_${speech.id}`], { same: "same", different_or_unclear: "different_or_unclear" }),
+          ...answers[`relationship_backlink_${speech.id}`] ? ["jev-opening-backlink:accepted same-speaker link to later validated quote"] : [],
           ...answers[`global_uncertain_${speech.id}`] ? ["jev-global-review:uncertain; unsupported identity and chain fill suppressed"] : [],
           ...decisionAnswerDebug("jev-user-review-original", answers[`user_review_original_${speech.id}`], plan.optionSpeakerIds),
           ...decisionAnswerDebug("jev-user-review", answers[`user_review_${speech.id}`], plan.optionSpeakerIds),
@@ -4871,7 +4919,7 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
           })),
           cardSpeakerId: titleMatchedCardSpeakerId,
           historicalSpeakerId,
-          relationshipReview: { version: "cross-message-run-6", context: relationshipContext, speakerLookback, strategy: payload.runReview === true ? "run" : "scene" },
+          relationshipReview: { version: "cross-message-run-7", context: relationshipContext, speakerLookback, strategy: payload.runReview === true ? "run" : "scene" },
           skippedTrackerTags
         }));
         const cached = config.parsedMessages[payload.messageId];
@@ -4995,6 +5043,28 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
               relationshipSceneDiagnostic += `; opening-reread=failed/${Date.now() - startedAt}ms`;
             }
           }
+          const backlinkReview = !relationshipReviewFailed ? buildOpeningBacklinkReview(decisionPlan, answers, relationshipContext, titleMatchedCardSpeakerId) : null;
+          if (backlinkReview) {
+            const startedAt = Date.now();
+            try {
+              const result2 = await spindle.decisions.evaluate({ state: backlinkReview.state, questions: backlinkReview.questions, ...userId ? { userId } : {} });
+              const reviewed = {};
+              for (const [id, answer] of Object.entries(result2.answers)) {
+                if (answer.type === "choice") reviewed[id] = { choice: answer.choice, probabilities: answer.probabilities, confidence: answer.confidence };
+              }
+              const invalid = invalidSpeakerReviewAnswers(backlinkReview.questions, reviewed);
+              if (invalid.length) {
+                relationshipReviewFailed = true;
+                relationshipSceneDiagnostic += `; opening-backlink=incomplete (${invalid.length} invalid answers)`;
+              } else {
+                applyOpeningBacklinkReview(decisionPlan, answers, reviewed, backlinkReview.links);
+                relationshipSceneDiagnostic += `; opening-backlink=${Object.keys(backlinkReview.questions).length} questions/${Date.now() - startedAt}ms`;
+              }
+            } catch {
+              relationshipReviewFailed = true;
+              relationshipSceneDiagnostic += `; opening-backlink=failed/${Date.now() - startedAt}ms`;
+            }
+          }
           const discourse = {
             answers: null,
             status: relationshipReviewFailed ? "global-context review failed; no forced inheritance" : "handled by targeted global-context review",
@@ -5043,7 +5113,7 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
                   });
                   const aligned = segments.length === shadowSegments.length && segments.every((segment, index) => segment.text === shadowSegments[index].text);
                   const changes = aligned ? segments.flatMap((segment, index) => segment.speakerId !== shadowSegments[index].speakerId ? [`${index + 1}:${segment.speakerId ?? "none"}->${shadowSegments[index].speakerId ?? "none"}`] : []) : [];
-                  relationshipSceneDiagnostic += `; shadow=completed, questions=${Object.keys(shadowReview.questions).length}, duration=${shadowResult.duration}ms, changed-segments=${aligned ? changes.length : "unaligned"}${changes.length ? ` (${changes.join(", ")})` : ""}${openingReview ? "; shadow excludes opening re-read" : ""}`;
+                  relationshipSceneDiagnostic += `; shadow=completed, questions=${Object.keys(shadowReview.questions).length}, duration=${shadowResult.duration}ms, changed-segments=${aligned ? changes.length : "unaligned"}${changes.length ? ` (${changes.join(", ")})` : ""}${openingReview || backlinkReview ? "; shadow excludes opening re-read and backlink" : ""}`;
                 } catch {
                   relationshipSceneDiagnostic += "; shadow=resolution failed";
                 }

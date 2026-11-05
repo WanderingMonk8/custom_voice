@@ -17,6 +17,8 @@ import {
   buildAssistantUserSpeakerReview,
   buildRelationshipSpeakerReview,
   buildOpeningSpeakerReview,
+  buildOpeningBacklinkReview,
+  applyOpeningBacklinkReview,
   invalidSpeakerReviewAnswers,
   applyRelationshipSpeakerReview,
   markUnresolvedSpeechSegments,
@@ -1086,7 +1088,7 @@ function queueSpeakerParse(
           })),
           cardSpeakerId: titleMatchedCardSpeakerId,
           historicalSpeakerId,
-          relationshipReview: { version: 'cross-message-run-6', context: relationshipContext, speakerLookback, strategy: payload.runReview === true ? 'run' : 'scene' },
+          relationshipReview: { version: 'cross-message-run-7', context: relationshipContext, speakerLookback, strategy: payload.runReview === true ? 'run' : 'scene' },
           skippedTrackerTags,
         }))
         const cached = config.parsedMessages[payload.messageId]
@@ -1216,6 +1218,28 @@ function queueSpeakerParse(
               relationshipSceneDiagnostic += `; opening-reread=failed/${Date.now() - startedAt}ms`
             }
           }
+          const backlinkReview = !relationshipReviewFailed ? buildOpeningBacklinkReview(decisionPlan, answers, relationshipContext, titleMatchedCardSpeakerId) : null
+          if (backlinkReview) {
+            const startedAt = Date.now()
+            try {
+              const result = await spindle.decisions.evaluate({ state: backlinkReview.state, questions: backlinkReview.questions, ...(userId ? { userId } : {}) })
+              const reviewed: Record<string, SpeakerDecisionChoice> = {}
+              for (const [id, answer] of Object.entries(result.answers)) {
+                if (answer.type === 'choice') reviewed[id] = { choice: answer.choice, probabilities: answer.probabilities, confidence: answer.confidence }
+              }
+              const invalid = invalidSpeakerReviewAnswers(backlinkReview.questions, reviewed)
+              if (invalid.length) {
+                relationshipReviewFailed = true
+                relationshipSceneDiagnostic += `; opening-backlink=incomplete (${invalid.length} invalid answers)`
+              } else {
+                applyOpeningBacklinkReview(decisionPlan, answers, reviewed, backlinkReview.links)
+                relationshipSceneDiagnostic += `; opening-backlink=${Object.keys(backlinkReview.questions).length} questions/${Date.now() - startedAt}ms`
+              }
+            } catch {
+              relationshipReviewFailed = true
+              relationshipSceneDiagnostic += `; opening-backlink=failed/${Date.now() - startedAt}ms`
+            }
+          }
           const discourse: DiscourseEvaluation = {
             answers: null,
             status: relationshipReviewFailed ? 'global-context review failed; no forced inheritance' : 'handled by targeted global-context review',
@@ -1261,7 +1285,7 @@ function queueSpeakerParse(
                   const aligned = segments.length === shadowSegments.length && segments.every((segment, index) => segment.text === shadowSegments[index].text)
                   const changes = aligned ? segments.flatMap((segment, index) => segment.speakerId !== shadowSegments[index].speakerId
                     ? [`${index + 1}:${segment.speakerId ?? 'none'}->${shadowSegments[index].speakerId ?? 'none'}`] : []) : []
-                  relationshipSceneDiagnostic += `; shadow=completed, questions=${Object.keys(shadowReview.questions).length}, duration=${shadowResult.duration}ms, changed-segments=${aligned ? changes.length : 'unaligned'}${changes.length ? ` (${changes.join(', ')})` : ''}${openingReview ? '; shadow excludes opening re-read' : ''}`
+                  relationshipSceneDiagnostic += `; shadow=completed, questions=${Object.keys(shadowReview.questions).length}, duration=${shadowResult.duration}ms, changed-segments=${aligned ? changes.length : 'unaligned'}${changes.length ? ` (${changes.join(', ')})` : ''}${openingReview || backlinkReview ? '; shadow excludes opening re-read and backlink' : ''}`
                 } catch {
                   relationshipSceneDiagnostic += '; shadow=resolution failed'
                 }
