@@ -3223,10 +3223,19 @@ export function buildOpeningSpeakerReview(plan: SpeakerDecisionPlan, answers: Re
   const lastParagraph = plan.state.paragraphs.findIndex(paragraph => paragraph.id === lastSpeech?.paragraphId)
   const paragraphs = plan.state.paragraphs.slice(0, lastParagraph >= 0 ? lastParagraph + 2 : 1)
   const paragraphIds = new Set(paragraphs.map(paragraph => paragraph.id))
+  const prior = localContext.previousMessages.at(-1)!
+  const priorQuote = playbackQuotes(prior.text).at(-1)
+  const boundaryEvidence = priorQuote ? {
+    messageId: prior.id, role: prior.role ?? 'assistant',
+    lead: prior.text.slice(Math.max(0, priorQuote.start - 600), priorQuote.start),
+    quotation: priorQuote.text.slice(-1_200),
+    after: prior.text.slice(priorQuote.end, priorQuote.end + 600),
+    currentOpening: plan.state.speeches[0]?.text ?? '',
+  } : null
   return {
     ...review,
     questions,
-    state: { ...review.state, message: paragraphs.map(paragraph => paragraph.text).join('\n\n'), paragraphs, speeches: plan.state.speeches.filter(speech => paragraphIds.has(speech.paragraphId)), runs: [openingRun], turns: plan.state.turns.filter(turn => openingRun.speechIds.includes(turn.speechId)), reviewedRuns: [openingRun] },
+    state: { ...review.state, message: paragraphs.map(paragraph => paragraph.text).join('\n\n'), paragraphs, speeches: plan.state.speeches.filter(speech => paragraphIds.has(speech.paragraphId)), runs: [openingRun], turns: plan.state.turns.filter(turn => openingRun.speechIds.includes(turn.speechId)), reviewedRuns: [openingRun], boundaryEvidence },
   }
 }
 
@@ -3237,7 +3246,9 @@ export function buildOpeningBacklinkReview(plan: SpeakerDecisionPlan, answers: R
   if (!base || !run) return null
   const questions: SpeakerDecisionPlan['questions'] = {}
   const links: Record<string, { targetId: string; anchorId: string; identity: string }> = {}
+  const pairEvidence: Record<string, { target: string; anchor: string; between: string }> = {}
   const speakers = plan.state.speakers.map(speaker => ({ id: speaker.id, name: speaker.name }))
+  const quotes = playbackQuotes(plan.state.message)
   for (const [index, targetId] of run.speechIds.entries()) {
     if (!answers[`global_uncertain_${targetId}`] || Object.keys(questions).length >= 12) continue
     const target = plan.state.speeches.find(speech => speech.id === targetId)
@@ -3252,15 +3263,20 @@ export function buildOpeningBacklinkReview(plan: SpeakerDecisionPlan, answers: R
       const id = `backlink_${targetId}`
       questions[id] = {
         type: 'choice',
-        instructions: `Do quotations ${targetId} and ${anchorId} have the same actual speaker? The later quotation ${anchorId} has a provisional supported identity, but that is not proof about ${targetId}. Read the preceding exchange and all intervening text and speech. Consider topic, pronouns, actions, turn changes, new entrants, channels and later clarification. A person addressed or merely passing by is not automatically speaking. Choose same only when the link is clear; otherwise choose different_or_unclear.`,
+        instructions: `Do quotations ${targetId} and ${anchorId} in pairEvidence have the same actual speaker? Both quotations are from the CURRENT message. boundaryEvidence, if present, separately shows the final quotation from the PREVIOUS message, its surrounding narration and the current opening. Do not confuse an echo or response in the current opening with the earlier quotation or automatically assign it to the earlier speaker. The later quotation ${anchorId} has a provisional supported identity, but that is not proof about ${targetId}. Read the preceding exchange and all intervening text and speech. Consider topic, pronouns, actions, turn changes, new entrants, channels and later clarification. A person addressed or merely passing by is not automatically speaking. Choose same only when the link is clear; otherwise choose different_or_unclear.`,
         criteria: { same: 'Both quotations are spoken by the same person.', different_or_unclear: 'They have different speakers or the evidence is not clear.' },
       }
       links[id] = { targetId, anchorId, identity }
+      const targetIndex = plan.state.speeches.findIndex(speech => speech.id === targetId)
+      const anchorIndex = plan.state.speeches.findIndex(speech => speech.id === anchorId)
+      const targetQuote = quotes[targetIndex]
+      const anchorQuote = quotes[anchorIndex]
+      pairEvidence[id] = { target: target.text, anchor: plan.state.speeches[anchorIndex]?.text ?? '', between: targetQuote && anchorQuote ? plan.state.message.slice(targetQuote.end, anchorQuote.start).slice(0, 4_000) : '' }
       break
     }
   }
   if (!Object.keys(questions).length) return null
-  return { state: { ...base.state, backlinkCandidates: links }, questions, links }
+  return { state: { ...base.state, backlinkCandidates: links, pairEvidence }, questions, links }
 }
 
 /** Apply only clear links to anchors that remain validated and unchanged. */

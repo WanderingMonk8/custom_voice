@@ -2684,6 +2684,13 @@ test('backward links require a strong independent same-speaker answer and a vali
   const review = buildOpeningBacklinkReview(plan, answers, context, null)!
   assert.equal(review.links.backlink_s0.anchorId, 's2')
   assert.equal(review.links.backlink_s1.identity, 'npc:ewan')
+  assert.equal(review.state.boundaryEvidence?.quotation, 'Sometimes you sacrifice.')
+  assert.equal(review.state.boundaryEvidence?.role, 'user')
+  assert.match(review.state.boundaryEvidence?.lead ?? '', /turn to Ewan/u)
+  assert.equal(review.state.pairEvidence.backlink_s0.target, 'Sacrifice.')
+  assert.equal(review.state.pairEvidence.backlink_s0.anchor, 'No, I know what you meant.')
+  assert.match(review.state.pairEvidence.backlink_s0.between, /tray/u)
+  assert.match(review.questions.backlink_s0.instructions, /Both quotations are from the CURRENT message/u)
   applyOpeningBacklinkReview(plan, answers, { backlink_s0: confidentDecision('same'), backlink_s1: confidentDecision('different_or_unclear') }, review.links)
   assert.equal(answers.speech_s0.choice, 'known_0')
   assert.equal(answers.global_uncertain_s0, undefined)
