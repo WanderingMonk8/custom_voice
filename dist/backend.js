@@ -1868,6 +1868,29 @@ function invalidSpeakerReviewAnswers(questions, answers) {
     return [];
   });
 }
+function buildOpeningSpeakerReview(plan, answers, context, cardSpeakerId) {
+  const openingRun = plan.state.runs.find((run) => run.speechIds.includes("s0"));
+  const targets = openingRun?.speechIds.filter((id) => !!answers[`global_uncertain_${id}`]).slice(0, 12) ?? [];
+  if (!context.previousMessages.length || !targets.length || !openingRun) return null;
+  const localContext = { ...context, previousMessages: context.previousMessages.slice(-2) };
+  const review = buildRelationshipSpeakerReview(plan, answers, localContext, null, { cardSpeakerId, targets, strategy: "run" });
+  const questions = {};
+  for (const id of targets) {
+    const question = review.questions[`relationship_${id}`];
+    if (!question) continue;
+    questions[`relationship_${id}`] = { ...question, instructions: `Re-read the opening exchange carefully. ${question.instructions} Identify the speaker of ${id} itself, not the user who authored an earlier message or an incidental person mentioned in narration. Use the preceding exchange and opening passage as evidence; choose no_clear_identity when they do not establish the speaker.` };
+  }
+  if (!Object.keys(questions).length) return null;
+  const lastSpeech = plan.state.speeches.find((speech) => speech.id === openingRun.speechIds.at(-1));
+  const lastParagraph = plan.state.paragraphs.findIndex((paragraph) => paragraph.id === lastSpeech?.paragraphId);
+  const paragraphs = plan.state.paragraphs.slice(0, lastParagraph >= 0 ? lastParagraph + 2 : 1);
+  const paragraphIds = new Set(paragraphs.map((paragraph) => paragraph.id));
+  return {
+    ...review,
+    questions,
+    state: { ...review.state, message: paragraphs.map((paragraph) => paragraph.text).join("\n\n"), paragraphs, speeches: plan.state.speeches.filter((speech) => paragraphIds.has(speech.paragraphId)), runs: [openingRun], turns: plan.state.turns.filter((turn) => openingRun.speechIds.includes(turn.speechId)), reviewedRuns: [openingRun] }
+  };
+}
 function applyRelationshipSpeakerReview(plan, answers, reviewed, ghostOptions, cardSpeakerId = null, continuitySpeakerId = null, globalMode = false) {
   const options = { ...plan.optionSpeakerIds, ...ghostOptions };
   if (globalMode) Object.assign(plan.optionSpeakerIds, ghostOptions);
@@ -1938,6 +1961,7 @@ function applyRelationshipSpeakerReview(plan, answers, reviewed, ghostOptions, c
     answers[`relationship_review_${speech.id}`] = result;
     const confirmingIdentity = evaluateSpeakerDecisionAnswer(result, options, SPEAKER_DECISION_THRESHOLDS.local).identity;
     if (globalMode && originalIdentity && originalIdentity !== UNCAST_SPEAKER_ID && confirmingIdentity === originalIdentity) {
+      delete answers[`global_uncertain_${speech.id}`];
       answers[`relationship_confirmed_${speech.id}`] = result;
       continue;
     }
@@ -1952,6 +1976,7 @@ function applyRelationshipSpeakerReview(plan, answers, reviewed, ghostOptions, c
     }
     Object.assign(plan.optionSpeakerIds, ghostOptions);
     if (original) answers[`relationship_original_${speech.id}`] = original;
+    delete answers[`global_uncertain_${speech.id}`];
     answers[`speech_${speech.id}`] = result;
     answers[`relationship_applied_${speech.id}`] = result;
     if (globalMode) answers[`relationship_global_${speech.id}`] = result;
@@ -4846,7 +4871,7 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
           })),
           cardSpeakerId: titleMatchedCardSpeakerId,
           historicalSpeakerId,
-          relationshipReview: { version: "cross-message-run-5", context: relationshipContext, speakerLookback, strategy: payload.runReview === true ? "run" : "scene" },
+          relationshipReview: { version: "cross-message-run-6", context: relationshipContext, speakerLookback, strategy: payload.runReview === true ? "run" : "scene" },
           skippedTrackerTags
         }));
         const cached = config.parsedMessages[payload.messageId];
@@ -4948,6 +4973,28 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
               spindle.log.warn(`[Chat Voice] Relationship speaker review failed; preserving validated assignments and marking uncertain targets: ${error instanceof Error ? error.message : String(error)}`);
             }
           }
+          const openingReview = !relationshipReviewFailed ? buildOpeningSpeakerReview(decisionPlan, answers, relationshipContext, titleMatchedCardSpeakerId) : null;
+          if (openingReview) {
+            const startedAt = Date.now();
+            try {
+              const result2 = await spindle.decisions.evaluate({ state: openingReview.state, questions: openingReview.questions, ...userId ? { userId } : {} });
+              const reviewed = {};
+              for (const [id, answer] of Object.entries(result2.answers)) {
+                if (answer.type === "choice") reviewed[id] = { choice: answer.choice, probabilities: answer.probabilities, confidence: answer.confidence };
+              }
+              const invalid = invalidSpeakerReviewAnswers(openingReview.questions, reviewed);
+              if (invalid.length) {
+                relationshipReviewFailed = true;
+                relationshipSceneDiagnostic += `; opening-reread=incomplete (${invalid.length} invalid answers)`;
+              } else {
+                applyRelationshipSpeakerReview(decisionPlan, answers, reviewed, openingReview.ghostOptions, null, null, true);
+                relationshipSceneDiagnostic += `; opening-reread=${Object.keys(openingReview.questions).length} questions/${Date.now() - startedAt}ms`;
+              }
+            } catch {
+              relationshipReviewFailed = true;
+              relationshipSceneDiagnostic += `; opening-reread=failed/${Date.now() - startedAt}ms`;
+            }
+          }
           const discourse = {
             answers: null,
             status: relationshipReviewFailed ? "global-context review failed; no forced inheritance" : "handled by targeted global-context review",
@@ -4996,7 +5043,7 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
                   });
                   const aligned = segments.length === shadowSegments.length && segments.every((segment, index) => segment.text === shadowSegments[index].text);
                   const changes = aligned ? segments.flatMap((segment, index) => segment.speakerId !== shadowSegments[index].speakerId ? [`${index + 1}:${segment.speakerId ?? "none"}->${shadowSegments[index].speakerId ?? "none"}`] : []) : [];
-                  relationshipSceneDiagnostic += `; shadow=completed, questions=${Object.keys(shadowReview.questions).length}, duration=${shadowResult.duration}ms, changed-segments=${aligned ? changes.length : "unaligned"}${changes.length ? ` (${changes.join(", ")})` : ""}`;
+                  relationshipSceneDiagnostic += `; shadow=completed, questions=${Object.keys(shadowReview.questions).length}, duration=${shadowResult.duration}ms, changed-segments=${aligned ? changes.length : "unaligned"}${changes.length ? ` (${changes.join(", ")})` : ""}${openingReview ? "; shadow excludes opening re-read" : ""}`;
                 } catch {
                   relationshipSceneDiagnostic += "; shadow=resolution failed";
                 }

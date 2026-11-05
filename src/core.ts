@@ -3205,6 +3205,31 @@ export function invalidSpeakerReviewAnswers(questions: SpeakerDecisionPlan['ques
   })
 }
 
+/** A small, prior-only re-read for an unresolved opening exchange. */
+export function buildOpeningSpeakerReview(plan: SpeakerDecisionPlan, answers: Record<string, SpeakerDecisionChoice>, context: RelationshipReviewContext, cardSpeakerId: string | null) {
+  const openingRun = plan.state.runs.find(run => run.speechIds.includes('s0'))
+  const targets = openingRun?.speechIds.filter(id => !!answers[`global_uncertain_${id}`]).slice(0, 12) ?? []
+  if (!context.previousMessages.length || !targets.length || !openingRun) return null
+  const localContext = { ...context, previousMessages: context.previousMessages.slice(-2) }
+  const review = buildRelationshipSpeakerReview(plan, answers, localContext, null, { cardSpeakerId, targets, strategy: 'run' })
+  const questions: SpeakerDecisionPlan['questions'] = {}
+  for (const id of targets) {
+    const question = review.questions[`relationship_${id}`]
+    if (!question) continue
+    questions[`relationship_${id}`] = { ...question, instructions: `Re-read the opening exchange carefully. ${question.instructions} Identify the speaker of ${id} itself, not the user who authored an earlier message or an incidental person mentioned in narration. Use the preceding exchange and opening passage as evidence; choose no_clear_identity when they do not establish the speaker.` }
+  }
+  if (!Object.keys(questions).length) return null
+  const lastSpeech = plan.state.speeches.find(speech => speech.id === openingRun.speechIds.at(-1))
+  const lastParagraph = plan.state.paragraphs.findIndex(paragraph => paragraph.id === lastSpeech?.paragraphId)
+  const paragraphs = plan.state.paragraphs.slice(0, lastParagraph >= 0 ? lastParagraph + 2 : 1)
+  const paragraphIds = new Set(paragraphs.map(paragraph => paragraph.id))
+  return {
+    ...review,
+    questions,
+    state: { ...review.state, message: paragraphs.map(paragraph => paragraph.text).join('\n\n'), paragraphs, speeches: plan.state.speeches.filter(speech => paragraphIds.has(speech.paragraphId)), runs: [openingRun], turns: plan.state.turns.filter(turn => openingRun.speechIds.includes(turn.speechId)), reviewedRuns: [openingRun] },
+  }
+}
+
 /** A strong independent decision is required before relationship evidence changes routing. */
 export function applyRelationshipSpeakerReview(plan: SpeakerDecisionPlan, answers: Record<string, SpeakerDecisionChoice>, reviewed: Record<string, SpeakerDecisionChoice>, ghostOptions: Record<string, string>, cardSpeakerId: string | null = null, continuitySpeakerId: string | null = null, globalMode = false): void {
   const options = { ...plan.optionSpeakerIds, ...ghostOptions }
@@ -3282,6 +3307,7 @@ export function applyRelationshipSpeakerReview(plan: SpeakerDecisionPlan, answer
     // Missing, unclear or conflicting reviews still follow the uncertainty path.
     const confirmingIdentity = evaluateSpeakerDecisionAnswer(result, options, SPEAKER_DECISION_THRESHOLDS.local).identity
     if (globalMode && originalIdentity && originalIdentity !== UNCAST_SPEAKER_ID && confirmingIdentity === originalIdentity) {
+      delete answers[`global_uncertain_${speech.id}`]
       answers[`relationship_confirmed_${speech.id}`] = result
       continue
     }
@@ -3296,6 +3322,7 @@ export function applyRelationshipSpeakerReview(plan: SpeakerDecisionPlan, answer
     }
     Object.assign(plan.optionSpeakerIds, ghostOptions)
     if (original) answers[`relationship_original_${speech.id}`] = original
+    delete answers[`global_uncertain_${speech.id}`]
     answers[`speech_${speech.id}`] = result
     answers[`relationship_applied_${speech.id}`] = result
     if (globalMode) answers[`relationship_global_${speech.id}`] = result

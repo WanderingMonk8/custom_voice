@@ -16,6 +16,7 @@ import {
   buildSpeakerDecisionPlan,
   buildAssistantUserSpeakerReview,
   buildRelationshipSpeakerReview,
+  buildOpeningSpeakerReview,
   invalidSpeakerReviewAnswers,
   applyRelationshipSpeakerReview,
   markUnresolvedSpeechSegments,
@@ -1085,7 +1086,7 @@ function queueSpeakerParse(
           })),
           cardSpeakerId: titleMatchedCardSpeakerId,
           historicalSpeakerId,
-          relationshipReview: { version: 'cross-message-run-5', context: relationshipContext, speakerLookback, strategy: payload.runReview === true ? 'run' : 'scene' },
+          relationshipReview: { version: 'cross-message-run-6', context: relationshipContext, speakerLookback, strategy: payload.runReview === true ? 'run' : 'scene' },
           skippedTrackerTags,
         }))
         const cached = config.parsedMessages[payload.messageId]
@@ -1191,6 +1192,30 @@ function queueSpeakerParse(
               spindle.log.warn(`[Chat Voice] Relationship speaker review failed; preserving validated assignments and marking uncertain targets: ${error instanceof Error ? error.message : String(error)}`)
             }
           }
+          // Re-read only unresolved opening quotations with the nearest exchange.
+          // This is a fresh bounded decision, never an unconditional inheritance.
+          const openingReview = !relationshipReviewFailed ? buildOpeningSpeakerReview(decisionPlan, answers, relationshipContext, titleMatchedCardSpeakerId) : null
+          if (openingReview) {
+            const startedAt = Date.now()
+            try {
+              const result = await spindle.decisions.evaluate({ state: openingReview.state, questions: openingReview.questions, ...(userId ? { userId } : {}) })
+              const reviewed: Record<string, SpeakerDecisionChoice> = {}
+              for (const [id, answer] of Object.entries(result.answers)) {
+                if (answer.type === 'choice') reviewed[id] = { choice: answer.choice, probabilities: answer.probabilities, confidence: answer.confidence }
+              }
+              const invalid = invalidSpeakerReviewAnswers(openingReview.questions, reviewed)
+              if (invalid.length) {
+                relationshipReviewFailed = true
+                relationshipSceneDiagnostic += `; opening-reread=incomplete (${invalid.length} invalid answers)`
+              } else {
+                applyRelationshipSpeakerReview(decisionPlan, answers, reviewed, openingReview.ghostOptions, null, null, true)
+                relationshipSceneDiagnostic += `; opening-reread=${Object.keys(openingReview.questions).length} questions/${Date.now() - startedAt}ms`
+              }
+            } catch {
+              relationshipReviewFailed = true
+              relationshipSceneDiagnostic += `; opening-reread=failed/${Date.now() - startedAt}ms`
+            }
+          }
           const discourse: DiscourseEvaluation = {
             answers: null,
             status: relationshipReviewFailed ? 'global-context review failed; no forced inheritance' : 'handled by targeted global-context review',
@@ -1236,7 +1261,7 @@ function queueSpeakerParse(
                   const aligned = segments.length === shadowSegments.length && segments.every((segment, index) => segment.text === shadowSegments[index].text)
                   const changes = aligned ? segments.flatMap((segment, index) => segment.speakerId !== shadowSegments[index].speakerId
                     ? [`${index + 1}:${segment.speakerId ?? 'none'}->${shadowSegments[index].speakerId ?? 'none'}`] : []) : []
-                  relationshipSceneDiagnostic += `; shadow=completed, questions=${Object.keys(shadowReview.questions).length}, duration=${shadowResult.duration}ms, changed-segments=${aligned ? changes.length : 'unaligned'}${changes.length ? ` (${changes.join(', ')})` : ''}`
+                  relationshipSceneDiagnostic += `; shadow=completed, questions=${Object.keys(shadowReview.questions).length}, duration=${shadowResult.duration}ms, changed-segments=${aligned ? changes.length : 'unaligned'}${changes.length ? ` (${changes.join(', ')})` : ''}${openingReview ? '; shadow excludes opening re-read' : ''}`
                 } catch {
                   relationshipSceneDiagnostic += '; shadow=resolution failed'
                 }

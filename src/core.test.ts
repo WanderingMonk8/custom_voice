@@ -20,6 +20,7 @@ import {
   buildSpeakerDecisionPlan,
   buildAssistantUserSpeakerReview,
   buildRelationshipSpeakerReview,
+  buildOpeningSpeakerReview,
   invalidSpeakerReviewAnswers,
   applyRelationshipSpeakerReview,
   previousContinuitySpeaker,
@@ -2626,6 +2627,29 @@ test('cross-message review links a user exchange to each quote in the Ewan openi
   const resolved = resolveSpeakerDecisionSegments(content, plan, answers, speakers, { isUserMessage: false, cardSpeakerId: null, historicalSpeakerId: null, evidenceOnly: true, includeDebug: true })
   assert.deepEqual(resolved.filter(segment => segment.speakerId !== null).map(segment => segment.speakerId), ['npc:ewan', 'npc:ewan', 'npc:ewan', 'npc:ewan'])
   assert.ok(resolved[0].debugPath?.some(item => item.startsWith('jev-boundary-relation-choice:response')))
+})
+
+test('opening re-read uses bounded prior dialogue and only changes supported unresolved targets', () => {
+  const speakers = [{ id: 'npc:ewan', name: 'Ewan' }, { id: USER_SPEAKER_ID, name: 'Ken' }]
+  const message = '"Sacrifice."\n\nHe turns with the tray.\n\n"What are you sacrificing?"\n\nThe phone buzzes.\n\n"A different conversation."'
+  const plan = buildSpeakerDecisionPlan(message, speakers, false)
+  const answers: Record<string, SpeakerDecisionChoice> = { speech_s0: confidentDecision('known_1'), speech_s1: confidentDecision('no_clear_identity'), global_uncertain_s0: confidentDecision('no_clear_identity'), global_uncertain_s1: confidentDecision('no_clear_identity') }
+  const context = { previousMessages: [{ id: 'old', role: 'assistant' as const, text: 'Old context.' }, { id: 'prior', role: 'assistant' as const, text: 'Ewan takes his tray.' }, { id: 'user', role: 'user' as const, text: 'I turn to Ewan. "Sometimes you sacrifice."' }], ghosts: [] }
+  const review = buildOpeningSpeakerReview(plan, answers, context, null)!
+  assert.deepEqual(review.state.previousMessages.map(item => item.id), ['prior', 'user'])
+  assert.ok(review.questions.relationship_s0)
+  assert.ok(review.questions.relationship_s1)
+  assert.match(review.questions.relationship_s0.instructions, /not the user who authored/u)
+  applyRelationshipSpeakerReview(plan, answers, { relationship_s0: confidentDecision('known_0'), relationship_s1: confidentDecision('known_0') }, review.ghostOptions, null, null, true)
+  assert.equal(answers.global_uncertain_s0, undefined)
+  assert.equal(answers.global_uncertain_s1, undefined)
+  assert.equal(answers.speech_s0.choice, 'known_0')
+  assert.equal(answers.speech_s1.choice, 'known_0')
+  assert.equal(buildOpeningSpeakerReview(plan, answers, context, null), null)
+  const unresolved = { ...answers, speech_s1: confidentDecision('no_clear_identity'), global_uncertain_s1: confidentDecision('no_clear_identity') }
+  applyRelationshipSpeakerReview(plan, unresolved, { relationship_s1: { choice: 'known_0', probabilities: { known_0: 0.4, no_clear_identity: 0.6 }, confidence: 0.4 } }, {}, null, null, true)
+  assert.ok(unresolved.global_uncertain_s1)
+  assert.equal(buildOpeningSpeakerReview(plan, unresolved, { previousMessages: [], ghosts: [] }, null), null)
 })
 
 test('agreement retains a clear first-pass identity without requiring override thresholds', () => {
