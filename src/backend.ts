@@ -27,6 +27,8 @@ import {
   applyFocusedOpeningFallback,
   buildBestAvailableSpeakerReview,
   applyBestAvailableSpeakerReview,
+  buildSelfIntroductionReview,
+  applySelfIntroductionReview,
   applyOpeningBacklinkReview,
   invalidSpeakerReviewAnswers,
   applyRelationshipSpeakerReview,
@@ -1099,7 +1101,7 @@ function queueSpeakerParse(
           })),
           cardSpeakerId: titleMatchedCardSpeakerId,
           historicalSpeakerId,
-          relationshipReview: { version: 'cross-message-run-13', context: relationshipContext, speakerLookback, strategy: payload.runReview === true ? 'run' : 'scene', focusedOpeningFallback: payload.focusedOpeningFallback === true, bestAvailableSpeaker: payload.bestAvailableSpeaker === true },
+          relationshipReview: { version: 'cross-message-run-14', context: relationshipContext, speakerLookback, strategy: payload.runReview === true ? 'run' : 'scene', focusedOpeningFallback: payload.focusedOpeningFallback === true, bestAvailableSpeaker: payload.bestAvailableSpeaker === true },
           skippedTrackerTags,
         }))
         const cached = config.parsedMessages[payload.messageId]
@@ -1175,6 +1177,7 @@ function queueSpeakerParse(
           let relationshipReviewFailed = false
           let focusedFallbackRetry = false
           let bestAvailableRetry = false
+          let selfIntroductionRetry = false
           let relationshipSceneDiagnostic = `strategy=${payload.runReview === true ? 'run' : 'scene'}; global-context=${relationshipContext.previousMessages.length} messages, ${relationshipContext.previousMessages.reduce((sum, item) => sum + item.text.length, 0)} characters; target=${decisionPlan.state.message.length} characters; first-pass=${decisionQuestionCount} questions/${firstPassDuration}ms; review=${Object.keys(relationshipReview.questions).length} questions; candidates=${Object.entries(relationshipReview.ghostOptions).map(([option, id]) => `${option}=${id}`).join(',') || 'none'}`
           if (Object.keys(relationshipReview.questions).length) {
             const reviewStartedAt = Date.now()
@@ -1357,6 +1360,30 @@ function queueSpeakerParse(
               }
             }
           }
+          if (!relationshipReviewFailed && !userReviewFailed) {
+            const introReview = buildSelfIntroductionReview(decisionPlan, relationshipContext)
+            if (Object.keys(introReview.questions).length) {
+              let timer: ReturnType<typeof setTimeout> | undefined
+              try {
+                const result = await Promise.race([
+                  Promise.resolve().then(() => spindle.decisions.evaluate({ state: introReview.state, questions: introReview.questions, ...(userId ? { userId } : {}) })),
+                  new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error('timed out after 5s')), 5000) }),
+                ])
+                const reviewed: Record<string, SpeakerDecisionChoice> = {}
+                for (const [id, answer] of Object.entries(result.answers)) if (answer.type === 'choice') reviewed[id] = { choice: answer.choice, probabilities: answer.probabilities, confidence: answer.confidence }
+                const invalid = invalidSpeakerReviewAnswers(introReview.questions, reviewed)
+                if (invalid.length) { selfIntroductionRetry = true; relationshipSceneDiagnostic += `; self-introduction=incomplete (${invalid.length} invalid answers)` }
+                else {
+                  applySelfIntroductionReview(decisionPlan, answers, introReview, reviewed)
+                  relationshipSceneDiagnostic += `; self-introduction=${Object.keys(answers).filter(id => id.startsWith('self_intro_reconciled_')).length} reconciled`
+                  if (payload.debug) relationshipSceneDiagnostic += `; self-introduction-decisions=${JSON.stringify(Object.fromEntries(Object.entries(reviewed).map(([id, value]) => [id, { choice: value.choice, confidence: value.confidence, probabilities: value.probabilities }])))}`
+                }
+              } catch {
+                selfIntroductionRetry = true
+                relationshipSceneDiagnostic += '; self-introduction=failed or timed out'
+              } finally { if (timer) clearTimeout(timer) }
+            }
+          }
           if (payload.bestAvailableSpeaker && !relationshipReviewFailed && !userReviewFailed) {
             const bestReview = buildBestAvailableSpeakerReview(decisionPlan, answers, relationshipContext)
             if (Object.keys(bestReview.questions).length) {
@@ -1464,7 +1491,7 @@ function queueSpeakerParse(
           const stableContinuity = !Object.keys(answers).some(key => key.startsWith('best_guess_')) && continuityCandidate && continuityCandidate !== UNCAST_SPEAKER_ID && continuityCandidate !== UNRESOLVED_SPEAKER_ID && continuityCandidate !== USER_SPEAKER_ID
             && (continuityCandidate === continuitySpeakerId || namedSpeakerSubject || Object.keys(answers).some(key => key.startsWith('relationship_applied_')))
             ? continuityCandidate : null
-          if (!tagResult.tagFailed && !userReviewFailed && !relationshipReviewFailed && !focusedFallbackRetry && !bestAvailableRetry) {
+          if (!tagResult.tagFailed && !userReviewFailed && !relationshipReviewFailed && !focusedFallbackRetry && !bestAvailableRetry && !selfIntroductionRetry) {
             const nextConfig: ChatVoiceConfig = {
               ...config,
               parsedMessages: {

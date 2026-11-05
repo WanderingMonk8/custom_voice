@@ -33,6 +33,8 @@ import {
   enabledUnlessExplicitlyDisabled,
   buildBestAvailableSpeakerReview,
   applyBestAvailableSpeakerReview,
+  buildSelfIntroductionReview,
+  applySelfIntroductionReview,
   applyOpeningBacklinkReview,
   invalidSpeakerReviewAnswers,
   applyRelationshipSpeakerReview,
@@ -2932,6 +2934,44 @@ test('speaker feature defaults enable unset values while preserving explicit opt
   assert.equal(enabledUnlessExplicitlyDisabled(undefined), true)
   assert.equal(enabledUnlessExplicitlyDisabled(true), true)
   assert.equal(enabledUnlessExplicitlyDisabled(false), false)
+})
+
+test('verified self-introduction reconciles earlier uncertain identities without crossing scene changes or explicit speakers', () => {
+  const speakers = [{ id: 'npc:zara', name: 'Zara' }, { id: 'npc:sarah', name: 'Sarah' }, { id: USER_SPEAKER_ID, name: 'Ken' }]
+  const text = '"Dear." She tries the word. "Okay, big caa."\n\nShe walks to the rail. "Come on, then."\n\nA woman in scrubs waits nearby. "Fair is fair." She turns to him. "Maeve. My friend is Erin."'
+  const plan = buildSpeakerDecisionPlan(text, speakers, false)
+  const answers: Record<string, SpeakerDecisionChoice> = {}
+  for (const speech of plan.state.speeches) {
+    answers[`speech_${speech.id}`] = confidentDecision('known_0')
+    answers[`relationship_original_${speech.id}`] = confidentDecision('uncast_character')
+  }
+  const context = { previousMessages: [{ id: 'previous', role: 'user' as const, text: 'I follow her outside.' }], ghosts: [] }
+  const review = buildSelfIntroductionReview(plan, context)
+  const anchor = plan.state.speeches.at(-1)!
+  assert.equal(review.candidates[`intro_${anchor.id}`].name, 'Maeve')
+  const results: Record<string, SpeakerDecisionChoice> = { [`intro_${anchor.id}`]: confidentDecision('self') }
+  for (const id of review.candidates[`intro_${anchor.id}`].targetIds) results[`intro_link_${anchor.id}_${id}`] = confidentDecision('same')
+  applySelfIntroductionReview(plan, answers, review, results)
+  assert.ok(plan.state.speeches.every(speech => answers[`self_intro_reconciled_${speech.id}`]))
+  const segments = resolveSpeakerDecisionSegments(text, plan, answers, speakers, { isUserMessage: false, cardSpeakerId: null, historicalSpeakerId: null, evidenceOnly: true, includeDebug: true })
+  assert.ok(segments.filter(segment => segment.speakerId !== null).every(segment => segment.speakerId === 'unconfigured:maeve'))
+  const notSelf: Record<string, SpeakerDecisionChoice> = { [`intro_${anchor.id}`]: confidentDecision('other_or_unclear') }
+  const unchanged: Record<string, SpeakerDecisionChoice> = { speech_s0: confidentDecision('known_0'), relationship_original_s0: confidentDecision('uncast_character') }
+  applySelfIntroductionReview(plan, unchanged, review, notSelf)
+  assert.equal(unchanged.speech_s0.choice, 'known_0')
+  const mixed = buildSpeakerDecisionPlan('"Hello," Sarah says.\n\n"Maeve. My friend is Erin."', speakers, false)
+  const mixedReview = buildSelfIntroductionReview(mixed, context)
+  const mixedAnswers: Record<string, SpeakerDecisionChoice> = { speech_s0: confidentDecision('known_1'), relationship_original_s0: confidentDecision('known_1') }
+  applySelfIntroductionReview(mixed, mixedAnswers, mixedReview, { intro_s1: confidentDecision('self'), intro_link_s1_s0: confidentDecision('same') })
+  assert.equal(mixedAnswers.speech_s0.choice, 'known_1')
+  const interrupt = buildSpeakerDecisionPlan('"Hello." A stranger steps in. "Maeve. My friend is Erin."', speakers, false)
+  const interruptReview = buildSelfIntroductionReview(interrupt, context)
+  const interruptAnswers: Record<string, SpeakerDecisionChoice> = { speech_s0: confidentDecision('uncast_character'), global_uncertain_s0: confidentDecision('no_clear_identity') }
+  applySelfIntroductionReview(interrupt, interruptAnswers, interruptReview, { intro_s1: confidentDecision('self'), intro_link_s1_s0: confidentDecision('different_or_unclear') })
+  assert.ok(interruptAnswers.global_uncertain_s0)
+  assert.equal(interruptAnswers.self_intro_reconciled_s0, undefined)
+  const cut = buildSpeakerDecisionPlan('"Hello."\n\nHours later, she arrives.\n\n"Maeve. My friend is Erin."', speakers, false)
+  assert.equal(Object.keys(buildSelfIntroductionReview(cut, context).questions).length, 0)
 })
 
 test('best-available guesses use scene candidates and never become validated anchors', () => {

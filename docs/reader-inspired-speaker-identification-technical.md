@@ -317,6 +317,8 @@ The best-available setting is on by default when no preference exists; an explic
 
 Run-focused speaker review also defaults on for unset preferences, preserving explicit opt-outs. Comparison remains independently opt-in and runs only while speaker debug is enabled.
 
+When a later quote contains a possible self-introduction, a bounded Jev review separately checks whether the name is the speaker's own and whether each earlier quote shares that speaker. Only strong answers can reconcile a line, and a conflicting explicit attribution, a previously clear different speaker, or a hard scene boundary blocks it. Newly identified people use unconfigured-speaker matching. This is not blanket inheritance; errors or incomplete answers retain the ordinary review and are retried rather than cached. It adds a conditional request and may wait up to five seconds.
+
 When both speaker-assignment debug and experimental comparison are enabled, an eligible opening-link review also runs a separate, non-routing Jev comparison. It asks whether the two current-message speakers are the same, different, or unclear, and includes synthetic continuation, reply, and ambiguous controls. The expected control labels are kept outside the request. The debug log reports the live answer, candidate probabilities, and control answers; the two formulations have different answer categories and are not directly interchangeable.
 
 This uses the configured Jev connection, not a separate model. It is a diagnostic sanity check, not an accuracy measurement or a replacement for testing real conversations. It can add cost and up to five seconds of waiting; a timed-out host request may continue in the background. It does not change routing, cast, or the live decision cache.
