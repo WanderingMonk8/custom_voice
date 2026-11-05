@@ -361,6 +361,7 @@ interface PlaybackPreferences {
   autoVoiceCasting: boolean
   speakerAssignmentDebug: boolean
   speakerShadowEvaluation: boolean
+  speakerRunReview: boolean
   defaultNarratorVoice: string
   defaultUserVoice: string
   favoriteVoices: FavoriteVoice[]
@@ -433,6 +434,7 @@ async function loadPlaybackPreferences(): Promise<PlaybackPreferences> {
     autoVoiceCasting: true,
     speakerAssignmentDebug: false,
     speakerShadowEvaluation: false,
+    speakerRunReview: false,
     defaultNarratorVoice: '',
     defaultUserVoice: '',
     favoriteVoices: [],
@@ -489,6 +491,7 @@ async function loadPlaybackPreferences(): Promise<PlaybackPreferences> {
     autoVoiceCasting: row.value?.chatVoiceAutoCasting !== false,
     speakerAssignmentDebug: row.value?.chatVoiceSpeakerAssignmentDebug === true,
     speakerShadowEvaluation: row.value?.chatVoiceSpeakerShadowEvaluation === true,
+    speakerRunReview: row.value?.chatVoiceSpeakerRunReview === true,
     defaultNarratorVoice: typeof row.value?.chatVoiceDefaultNarratorVoice === 'string'
       ? row.value.chatVoiceDefaultNarratorVoice.trim().slice(0, 512)
       : '',
@@ -578,6 +581,7 @@ function saveAdvancedPlaybackPreferences(
   autoVoiceCasting: boolean,
   speakerLookback: number,
   speakerShadowEvaluation: boolean,
+  speakerRunReview: boolean,
 ): Promise<void> {
   return updateVoiceSettings(current => ({
     ...current,
@@ -598,6 +602,7 @@ function saveAdvancedPlaybackPreferences(
     ),
     chatVoiceSpeakerAssignmentDebug: speakerAssignmentDebug,
     chatVoiceSpeakerShadowEvaluation: speakerShadowEvaluation,
+    chatVoiceSpeakerRunReview: speakerRunReview,
     chatVoiceAutoCasting: autoVoiceCasting,
     chatVoiceGhostVoiceLifetime: clampIntegerSetting(ghostVoiceLifetime, GHOST_VOICE_LIFETIME_MESSAGES, 1000),
     chatVoiceSpeakerLookback: clampIntegerSetting(speakerLookback, DEFAULT_SPEAKER_LOOKBACK, MAX_SPEAKER_LOOKBACK),
@@ -1342,6 +1347,19 @@ export function setup(ctx: SpindleFrontendContext) {
   speakerShadowHint.textContent = 'Runs an extra Jev review without changing audio or cast. Enable the debug log to see comparisons. May increase cost and delay.'
   speakerShadowCopy.append(speakerShadowText, speakerShadowHint)
   speakerShadowLabel.append(speakerShadowToggle, speakerShadowCopy)
+  const speakerRunLabel = document.createElement('label')
+  speakerRunLabel.className = 'chat-voice-toggle'
+  const speakerRunToggle = document.createElement('input')
+  speakerRunToggle.type = 'checkbox'
+  const speakerRunCopy = document.createElement('span')
+  speakerRunCopy.className = 'chat-voice-toggle-copy'
+  const speakerRunText = document.createElement('span')
+  speakerRunText.textContent = 'Use experimental run-focused speaker review'
+  const speakerRunHint = document.createElement('span')
+  speakerRunHint.className = 'chat-voice-toggle-hint'
+  speakerRunHint.textContent = 'Changes live speaker assignments. Turn off to restore scene-focused review. Accuracy and latency have not yet been validated.'
+  speakerRunCopy.append(speakerRunText, speakerRunHint)
+  speakerRunLabel.append(speakerRunToggle, speakerRunCopy)
   const speakerDebugOutput = document.createElement('textarea')
   speakerDebugOutput.className = 'chat-voice-debug-output'
   speakerDebugOutput.readOnly = true
@@ -1360,6 +1378,7 @@ export function setup(ctx: SpindleFrontendContext) {
     speakerLookbackField.field,
     autoCastingLabel,
     speakerDebugLabel,
+    speakerRunLabel,
     speakerShadowLabel,
     speakerDebugOutput,
     advancedHint,
@@ -1432,6 +1451,7 @@ export function setup(ctx: SpindleFrontendContext) {
   let ghostLifetimeLoaded = false
   let speakerAssignmentDebug = false
   let speakerShadowEvaluation = false
+  let speakerRunReview = false
   let advancedSettingsSaveTimer: ReturnType<typeof setTimeout> | null = null
   let savingAdvancedSettings = false
   let saveTimer: ReturnType<typeof setTimeout> | null = null
@@ -1885,6 +1905,7 @@ export function setup(ctx: SpindleFrontendContext) {
   rateLimitWaitInput.addEventListener('change', onRateLimitWaitInput)
   speakerDebugToggle.addEventListener('change', onSpeakerDebugChanged)
   speakerShadowToggle.addEventListener('change', onSpeakerShadowChanged)
+  speakerRunToggle.addEventListener('change', onSpeakerRunChanged)
   autoCastingToggle.addEventListener('change', () => { autoVoiceCasting = autoCastingToggle.checked; scheduleAdvancedSettingsSave() })
 
   const addNpcInput = ctx.components.mountTextInput(addNpcInputSlot, {
@@ -2068,6 +2089,7 @@ export function setup(ctx: SpindleFrontendContext) {
         speakerLookback: preferences.speakerLookback,
         debug: preferences.speakerAssignmentDebug,
         shadowEvaluation: preferences.speakerShadowEvaluation,
+        runReview: preferences.speakerRunReview,
       })
     })
   }
@@ -2793,12 +2815,14 @@ export function setup(ctx: SpindleFrontendContext) {
       preferences.autoVoiceCasting = autoVoiceCasting
       preferences.speakerAssignmentDebug = speakerAssignmentDebug
       preferences.speakerShadowEvaluation = speakerShadowEvaluation
+      preferences.speakerRunReview = speakerRunReview
     } else {
       playbackBufferSegments = preferences.playbackBufferSegments
       concurrentGenerationLimit = preferences.concurrentGenerations
       rateLimitWaitSeconds = preferences.rateLimitWaitSeconds
       speakerAssignmentDebug = preferences.speakerAssignmentDebug
       speakerShadowEvaluation = preferences.speakerShadowEvaluation
+      speakerRunReview = preferences.speakerRunReview
     }
     const connectionId = config.connectionId
       || (connections.some(connection => connection.id === preferences.connectionId)
@@ -4490,6 +4514,8 @@ export function setup(ctx: SpindleFrontendContext) {
         speakerDebugToggle.checked = speakerAssignmentDebug
         speakerShadowEvaluation = preferences.speakerShadowEvaluation
         speakerShadowToggle.checked = speakerShadowEvaluation
+        speakerRunReview = preferences.speakerRunReview
+        speakerRunToggle.checked = speakerRunReview
         speakerDebugOutput.hidden = !speakerAssignmentDebug
       }
       lumiverseConnectionId = connections.some(connection => connection.id === preferences.connectionId)
@@ -4624,6 +4650,11 @@ export function setup(ctx: SpindleFrontendContext) {
     scheduleAdvancedSettingsSave()
   }
 
+  function onSpeakerRunChanged(): void {
+    speakerRunReview = speakerRunToggle.checked
+    scheduleAdvancedSettingsSave()
+  }
+
   async function persistAdvancedSettings(): Promise<void> {
     savingAdvancedSettings = true
     setStatus('Saving global advanced playback settings…')
@@ -4637,6 +4668,7 @@ export function setup(ctx: SpindleFrontendContext) {
         autoVoiceCasting,
         speakerLookback,
         speakerShadowEvaluation,
+        speakerRunReview,
       )
       setStatus('Advanced playback settings saved globally.', 'saved')
     } catch (error) {
@@ -5143,6 +5175,7 @@ export function setup(ctx: SpindleFrontendContext) {
         autoVoiceCasting,
         speakerLookback,
         speakerShadowEvaluation,
+        speakerRunReview,
       )
     }
     skippedTrackerTagsInput.destroy()
@@ -5158,6 +5191,7 @@ export function setup(ctx: SpindleFrontendContext) {
     speakerLookbackInput.removeEventListener('change', onSpeakerLookbackInput)
     speakerDebugToggle.removeEventListener('change', onSpeakerDebugChanged)
     speakerShadowToggle.removeEventListener('change', onSpeakerShadowChanged)
+    speakerRunToggle.removeEventListener('change', onSpeakerRunChanged)
     addNpcInput.destroy()
     addNpcButton.removeEventListener('click', onAddNpc)
     addNpcInputSlot.removeEventListener('keydown', onAddNpcKeyDown)

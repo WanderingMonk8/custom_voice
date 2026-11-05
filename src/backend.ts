@@ -16,6 +16,7 @@ import {
   buildSpeakerDecisionPlan,
   buildAssistantUserSpeakerReview,
   buildRelationshipSpeakerReview,
+  invalidSpeakerReviewAnswers,
   applyRelationshipSpeakerReview,
   markUnresolvedSpeechSegments,
   recordGhostOccurrence,
@@ -140,6 +141,7 @@ type FrontendMessage =
       speakerLookback: number
       debug: boolean
       shadowEvaluation?: boolean
+      runReview?: boolean
     }
   | {
       type: 'chat_voice_place_tags'
@@ -1083,7 +1085,7 @@ function queueSpeakerParse(
           })),
           cardSpeakerId: titleMatchedCardSpeakerId,
           historicalSpeakerId,
-          relationshipReview: { version: 'cross-message-run-3', context: relationshipContext, speakerLookback },
+          relationshipReview: { version: 'cross-message-run-4', context: relationshipContext, speakerLookback, strategy: payload.runReview === true ? 'run' : 'scene' },
           skippedTrackerTags,
         }))
         const cached = config.parsedMessages[payload.messageId]
@@ -1136,6 +1138,7 @@ function queueSpeakerParse(
           const relationshipReview = buildRelationshipSpeakerReview(decisionPlan, answers, relationshipContext, null, {
             cardSpeakerId: titleMatchedCardSpeakerId,
             targets: [...new Set(discourseAssessment.runs.flatMap(run => run.targets))],
+            strategy: payload.runReview === true ? 'run' : 'scene',
           })
           // The experimental review owns its answers and option map. It must never
           // affect the live plan, cache, cast, or ghost assignment pipeline.
@@ -1144,7 +1147,7 @@ function queueSpeakerParse(
           const shadowReview = payload.shadowEvaluation ? buildRelationshipSpeakerReview(shadowPlan, shadowAnswers, relationshipContext, null, {
             cardSpeakerId: titleMatchedCardSpeakerId,
             targets: [...new Set(discourseAssessment.runs.flatMap(run => run.targets))],
-            strategy: 'run',
+            strategy: payload.runReview === true ? 'scene' : 'run',
           }) : null
           const shadowStartedAt = Date.now()
           let shadowTimer: ReturnType<typeof setTimeout> | undefined
@@ -1155,7 +1158,7 @@ function queueSpeakerParse(
             new Promise<{ result: null; error: string; duration: number }>(resolve => { shadowTimer = setTimeout(() => resolve({ result: null, error: 'timed out after 5s', duration: Date.now() - shadowStartedAt }), 5000) }),
           ]).finally(() => { if (shadowTimer) clearTimeout(shadowTimer) }) : null
           let relationshipReviewFailed = false
-          let relationshipSceneDiagnostic = `global-context=${relationshipContext.previousMessages.length} messages, ${relationshipContext.previousMessages.reduce((sum, item) => sum + item.text.length, 0)} characters; target=${decisionPlan.state.message.length} characters; first-pass=${decisionQuestionCount} questions/${firstPassDuration}ms; review=${Object.keys(relationshipReview.questions).length} questions; candidates=${Object.entries(relationshipReview.ghostOptions).map(([option, id]) => `${option}=${id}`).join(',') || 'none'}`
+          let relationshipSceneDiagnostic = `strategy=${payload.runReview === true ? 'run' : 'scene'}; global-context=${relationshipContext.previousMessages.length} messages, ${relationshipContext.previousMessages.reduce((sum, item) => sum + item.text.length, 0)} characters; target=${decisionPlan.state.message.length} characters; first-pass=${decisionQuestionCount} questions/${firstPassDuration}ms; review=${Object.keys(relationshipReview.questions).length} questions; candidates=${Object.entries(relationshipReview.ghostOptions).map(([option, id]) => `${option}=${id}`).join(',') || 'none'}`
           if (Object.keys(relationshipReview.questions).length) {
             const reviewStartedAt = Date.now()
             try {
@@ -1164,18 +1167,28 @@ function queueSpeakerParse(
               for (const [id, answer] of Object.entries(relationshipResult.answers)) {
                 if (answer.type === 'choice') reviewed[id] = { choice: answer.choice, probabilities: answer.probabilities, confidence: answer.confidence }
               }
-              const missingSpeechQuestions = Object.keys(relationshipReview.questions).filter(id => id.startsWith('relationship_s') && !reviewed[id])
-              if (missingSpeechQuestions.length) {
+              const invalidQuestions = invalidSpeakerReviewAnswers(relationshipReview.questions, reviewed)
+              if (invalidQuestions.length) {
                 relationshipReviewFailed = true
-                relationshipSceneDiagnostic += `; missing speech answers=${missingSpeechQuestions.join(',')}`
-                for (const id of missingSpeechQuestions) reviewed[id] = { choice: 'no_clear_identity', probabilities: {}, confidence: 0 }
+                relationshipSceneDiagnostic += `; invalid or missing answers=${invalidQuestions.join(',')}`
+                for (const id of invalidQuestions) {
+                  if (id.startsWith('relationship_s')) reviewed[id] = { choice: 'no_clear_identity', probabilities: {}, confidence: 0 }
+                  else delete reviewed[id]
+                }
               }
               if (reviewed.relationship_scene) relationshipSceneDiagnostic += `; scene=${JSON.stringify(reviewed.relationship_scene)}`
               applyRelationshipSpeakerReview(decisionPlan, answers, reviewed, relationshipReview.ghostOptions, null, null, true)
               relationshipSceneDiagnostic += `; duration=${Date.now() - reviewStartedAt}ms; applied=${Object.keys(answers).some(key => key.startsWith('relationship_applied_'))}`
             } catch (error) {
               relationshipReviewFailed = true
-              spindle.log.warn(`[Chat Voice] Relationship speaker review failed; keeping original assignments: ${error instanceof Error ? error.message : String(error)}`)
+              // A failed review must not let the chain turn an uncertain target
+              // into a confident assignment merely because no answer arrived.
+              const unavailable: Record<string, SpeakerDecisionChoice> = {}
+              for (const id of Object.keys(relationshipReview.questions)) {
+                if (id.startsWith('relationship_s')) unavailable[id] = { choice: 'no_clear_identity', probabilities: {}, confidence: 0 }
+              }
+              applyRelationshipSpeakerReview(decisionPlan, answers, unavailable, relationshipReview.ghostOptions, null, null, true)
+              spindle.log.warn(`[Chat Voice] Relationship speaker review failed; preserving validated assignments and marking uncertain targets: ${error instanceof Error ? error.message : String(error)}`)
             }
           }
           const discourse: DiscourseEvaluation = {
@@ -1209,7 +1222,7 @@ function queueSpeakerParse(
               for (const [id, answer] of Object.entries(shadowResult.result.answers)) {
                 if (answer.type === 'choice') reviewed[id] = { choice: answer.choice, probabilities: answer.probabilities, confidence: answer.confidence }
               }
-              const missing = Object.keys(shadowReview.questions).filter(id => id.startsWith('relationship_s') && !reviewed[id])
+              const missing = invalidSpeakerReviewAnswers(shadowReview.questions, reviewed)
               if (missing.length) {
                 relationshipSceneDiagnostic += `; shadow=incomplete (${missing.length} missing answers)`
               } else {
@@ -1232,7 +1245,7 @@ function queueSpeakerParse(
               relationshipSceneDiagnostic += `; shadow=${shadowResult?.error ?? 'not needed'}`
             }
           }
-          const relationshipStatus = relationshipReviewFailed ? 'failed; original assignments retained'
+          const relationshipStatus = relationshipReviewFailed ? `failed; validated assignments retained, uncertain targets protected; ${relationshipSceneDiagnostic}`
             : `${Object.keys(relationshipReview.questions).length} question(s) reviewed; ${relationshipSceneDiagnostic}`
           const reviewedSegments = payload.debug ? segments.map(segment => segment.debugPath ? {
             ...segment, debugPath: [...segment.debugPath, `relationship-review-status:${relationshipStatus}`],

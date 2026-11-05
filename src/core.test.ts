@@ -20,6 +20,7 @@ import {
   buildSpeakerDecisionPlan,
   buildAssistantUserSpeakerReview,
   buildRelationshipSpeakerReview,
+  invalidSpeakerReviewAnswers,
   applyRelationshipSpeakerReview,
   previousContinuitySpeaker,
   previousNamedGhostContinuity,
@@ -2540,6 +2541,14 @@ test('offline speaker evaluation scores paired cases and validates alignment', (
   assert.throws(() => evaluateSpeakerReviews([{ ...cases[0], candidate: [] }]), /aligned/u)
   assert.throws(() => evaluateSpeakerReviews([cases[0], cases[0]]), /unique/u)
   assert.throws(() => evaluateSpeakerReviews([{ ...cases[0], candidateMs: Infinity }]), /finite/u)
+})
+
+test('speaker review rejects missing, malformed and out-of-scope answers', () => {
+  const questions = { relationship_s0: { type: 'choice' as const, instructions: '', criteria: { known_0: 'A', no_clear_identity: 'Unknown' } } }
+  assert.deepEqual(invalidSpeakerReviewAnswers(questions, {}), ['relationship_s0'])
+  assert.deepEqual(invalidSpeakerReviewAnswers(questions, { relationship_s0: confidentDecision('other') }), ['relationship_s0'])
+  assert.deepEqual(invalidSpeakerReviewAnswers(questions, { relationship_s0: { choice: 'known_0', probabilities: { known_0: NaN }, confidence: 1 } }), ['relationship_s0'])
+  assert.deepEqual(invalidSpeakerReviewAnswers(questions, { relationship_s0: confidentDecision('no_clear_identity') }), [])
 })
 
 test('run-focused shadow review keeps context while leaving the live plan and answers untouched', () => {

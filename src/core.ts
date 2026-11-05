@@ -3191,6 +3191,20 @@ export function buildRelationshipSpeakerReview(plan: SpeakerDecisionPlan, answer
   return { state: { ...plan.state, previousMessages: context.previousMessages, ghosts: context.ghosts, ...(globalOptions ? { sceneReferences, reviewedRuns, boundaryExchange: previousExchange ? { messageId: previousExchange.id, role: previousExchange.role ?? 'assistant', text: previousExchange.text, openingRunId: openingRun?.id ?? null, speechIds: openingRun?.speechIds ?? [] } : null, cardSpeakerPrior: globalOptions.cardSpeakerId, contextPolicy: 'Earlier messages are evidence, not automatic speaker assignments. A single-character card is a weak preference only. Distinguish user and assistant roles. Never assume a person is speaking merely because they spoke last.' } : {}) }, questions, ghostOptions }
 }
 
+/** Reject malformed or incomplete review results before they can enter the cache. */
+export function invalidSpeakerReviewAnswers(questions: SpeakerDecisionPlan['questions'], answers: Record<string, SpeakerDecisionChoice>): string[] {
+  return Object.entries(questions).flatMap(([id, question]) => {
+    const answer = answers[id]
+    const probabilities = answer?.probabilities
+    if (!answer || typeof answer.choice !== 'string' || !Object.hasOwn(question.criteria, answer.choice)
+      || !probabilities || typeof probabilities !== 'object' || Array.isArray(probabilities)
+      || !Number.isFinite(answer.confidence) || answer.confidence < 0 || answer.confidence > 1
+      || !Object.hasOwn(probabilities, answer.choice)
+      || Object.entries(probabilities).some(([key, value]) => !Object.hasOwn(question.criteria, key) || !Number.isFinite(value) || value < 0 || value > 1)) return [id]
+    return []
+  })
+}
+
 /** A strong independent decision is required before relationship evidence changes routing. */
 export function applyRelationshipSpeakerReview(plan: SpeakerDecisionPlan, answers: Record<string, SpeakerDecisionChoice>, reviewed: Record<string, SpeakerDecisionChoice>, ghostOptions: Record<string, string>, cardSpeakerId: string | null = null, continuitySpeakerId: string | null = null, globalMode = false): void {
   const options = { ...plan.optionSpeakerIds, ...ghostOptions }

@@ -1647,6 +1647,7 @@ async function loadPlaybackPreferences() {
     autoVoiceCasting: true,
     speakerAssignmentDebug: false,
     speakerShadowEvaluation: false,
+    speakerRunReview: false,
     defaultNarratorVoice: "",
     defaultUserVoice: "",
     favoriteVoices: []
@@ -1689,6 +1690,7 @@ async function loadPlaybackPreferences() {
     autoVoiceCasting: row.value?.chatVoiceAutoCasting !== false,
     speakerAssignmentDebug: row.value?.chatVoiceSpeakerAssignmentDebug === true,
     speakerShadowEvaluation: row.value?.chatVoiceSpeakerShadowEvaluation === true,
+    speakerRunReview: row.value?.chatVoiceSpeakerRunReview === true,
     defaultNarratorVoice: typeof row.value?.chatVoiceDefaultNarratorVoice === "string" ? row.value.chatVoiceDefaultNarratorVoice.trim().slice(0, 512) : "",
     defaultUserVoice: typeof row.value?.chatVoiceDefaultUserVoice === "string" ? row.value.chatVoiceDefaultUserVoice.trim().slice(0, 512) : "",
     favoriteVoices: readFavoriteVoices(row.value?.chatVoiceFavoriteVoices)
@@ -1748,7 +1750,7 @@ function saveTtsTagPreferences(style, placement, connectionId, model) {
     chatVoiceTagLlmModel: model.trim().slice(0, 256)
   }));
 }
-function saveAdvancedPlaybackPreferences(bufferSegments, concurrentGenerations, rateLimitWaitSeconds, speakerAssignmentDebug, ghostVoiceLifetime, autoVoiceCasting, speakerLookback, speakerShadowEvaluation) {
+function saveAdvancedPlaybackPreferences(bufferSegments, concurrentGenerations, rateLimitWaitSeconds, speakerAssignmentDebug, ghostVoiceLifetime, autoVoiceCasting, speakerLookback, speakerShadowEvaluation, speakerRunReview) {
   return updateVoiceSettings((current) => ({
     ...current,
     chatVoicePlaybackBufferSegments: clampIntegerSetting(
@@ -1768,6 +1770,7 @@ function saveAdvancedPlaybackPreferences(bufferSegments, concurrentGenerations, 
     ),
     chatVoiceSpeakerAssignmentDebug: speakerAssignmentDebug,
     chatVoiceSpeakerShadowEvaluation: speakerShadowEvaluation,
+    chatVoiceSpeakerRunReview: speakerRunReview,
     chatVoiceAutoCasting: autoVoiceCasting,
     chatVoiceGhostVoiceLifetime: clampIntegerSetting(ghostVoiceLifetime, GHOST_VOICE_LIFETIME_MESSAGES, 1e3),
     chatVoiceSpeakerLookback: clampIntegerSetting(speakerLookback, DEFAULT_SPEAKER_LOOKBACK, MAX_SPEAKER_LOOKBACK)
@@ -2450,6 +2453,19 @@ function setup(ctx) {
   speakerShadowHint.textContent = "Runs an extra Jev review without changing audio or cast. Enable the debug log to see comparisons. May increase cost and delay.";
   speakerShadowCopy.append(speakerShadowText, speakerShadowHint);
   speakerShadowLabel.append(speakerShadowToggle, speakerShadowCopy);
+  const speakerRunLabel = document.createElement("label");
+  speakerRunLabel.className = "chat-voice-toggle";
+  const speakerRunToggle = document.createElement("input");
+  speakerRunToggle.type = "checkbox";
+  const speakerRunCopy = document.createElement("span");
+  speakerRunCopy.className = "chat-voice-toggle-copy";
+  const speakerRunText = document.createElement("span");
+  speakerRunText.textContent = "Use experimental run-focused speaker review";
+  const speakerRunHint = document.createElement("span");
+  speakerRunHint.className = "chat-voice-toggle-hint";
+  speakerRunHint.textContent = "Changes live speaker assignments. Turn off to restore scene-focused review. Accuracy and latency have not yet been validated.";
+  speakerRunCopy.append(speakerRunText, speakerRunHint);
+  speakerRunLabel.append(speakerRunToggle, speakerRunCopy);
   const speakerDebugOutput = document.createElement("textarea");
   speakerDebugOutput.className = "chat-voice-debug-output";
   speakerDebugOutput.readOnly = true;
@@ -2468,6 +2484,7 @@ function setup(ctx) {
     speakerLookbackField.field,
     autoCastingLabel,
     speakerDebugLabel,
+    speakerRunLabel,
     speakerShadowLabel,
     speakerDebugOutput,
     advancedHint
@@ -2538,6 +2555,7 @@ function setup(ctx) {
   let ghostLifetimeLoaded = false;
   let speakerAssignmentDebug = false;
   let speakerShadowEvaluation = false;
+  let speakerRunReview = false;
   let advancedSettingsSaveTimer = null;
   let savingAdvancedSettings = false;
   let saveTimer = null;
@@ -2931,6 +2949,7 @@ function setup(ctx) {
   rateLimitWaitInput.addEventListener("change", onRateLimitWaitInput);
   speakerDebugToggle.addEventListener("change", onSpeakerDebugChanged);
   speakerShadowToggle.addEventListener("change", onSpeakerShadowChanged);
+  speakerRunToggle.addEventListener("change", onSpeakerRunChanged);
   autoCastingToggle.addEventListener("change", () => {
     autoVoiceCasting = autoCastingToggle.checked;
     scheduleAdvancedSettingsSave();
@@ -3099,7 +3118,8 @@ function setup(ctx) {
         ghostVoiceLifetime: preferences.ghostVoiceLifetime,
         speakerLookback: preferences.speakerLookback,
         debug: preferences.speakerAssignmentDebug,
-        shadowEvaluation: preferences.speakerShadowEvaluation
+        shadowEvaluation: preferences.speakerShadowEvaluation,
+        runReview: preferences.speakerRunReview
       });
     });
   }
@@ -3646,12 +3666,14 @@ function setup(ctx) {
       preferences.autoVoiceCasting = autoVoiceCasting;
       preferences.speakerAssignmentDebug = speakerAssignmentDebug;
       preferences.speakerShadowEvaluation = speakerShadowEvaluation;
+      preferences.speakerRunReview = speakerRunReview;
     } else {
       playbackBufferSegments = preferences.playbackBufferSegments;
       concurrentGenerationLimit = preferences.concurrentGenerations;
       rateLimitWaitSeconds = preferences.rateLimitWaitSeconds;
       speakerAssignmentDebug = preferences.speakerAssignmentDebug;
       speakerShadowEvaluation = preferences.speakerShadowEvaluation;
+      speakerRunReview = preferences.speakerRunReview;
     }
     const connectionId = config.connectionId || (connections.some((connection) => connection.id === preferences.connectionId) ? preferences.connectionId : connections.find((connection) => connection.is_default)?.id ?? lumiverseConnectionId);
     if (!connectionId) {
@@ -5189,6 +5211,8 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
         speakerDebugToggle.checked = speakerAssignmentDebug;
         speakerShadowEvaluation = preferences.speakerShadowEvaluation;
         speakerShadowToggle.checked = speakerShadowEvaluation;
+        speakerRunReview = preferences.speakerRunReview;
+        speakerRunToggle.checked = speakerRunReview;
         speakerDebugOutput.hidden = !speakerAssignmentDebug;
       }
       lumiverseConnectionId = connections.some((connection) => connection.id === preferences.connectionId) ? preferences.connectionId : connections.find((connection) => connection.is_default)?.id ?? "";
@@ -5306,6 +5330,10 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
     speakerShadowEvaluation = speakerShadowToggle.checked;
     scheduleAdvancedSettingsSave();
   }
+  function onSpeakerRunChanged() {
+    speakerRunReview = speakerRunToggle.checked;
+    scheduleAdvancedSettingsSave();
+  }
   async function persistAdvancedSettings() {
     savingAdvancedSettings = true;
     setStatus("Saving global advanced playback settings\u2026");
@@ -5318,7 +5346,8 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
         ghostVoiceLifetime,
         autoVoiceCasting,
         speakerLookback,
-        speakerShadowEvaluation
+        speakerShadowEvaluation,
+        speakerRunReview
       );
       setStatus("Advanced playback settings saved globally.", "saved");
     } catch (error) {
@@ -5790,7 +5819,8 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
         ghostVoiceLifetime,
         autoVoiceCasting,
         speakerLookback,
-        speakerShadowEvaluation
+        speakerShadowEvaluation,
+        speakerRunReview
       );
     }
     skippedTrackerTagsInput.destroy();
@@ -5806,6 +5836,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
     speakerLookbackInput.removeEventListener("change", onSpeakerLookbackInput);
     speakerDebugToggle.removeEventListener("change", onSpeakerDebugChanged);
     speakerShadowToggle.removeEventListener("change", onSpeakerShadowChanged);
+    speakerRunToggle.removeEventListener("change", onSpeakerRunChanged);
     addNpcInput.destroy();
     addNpcButton.removeEventListener("click", onAddNpc);
     addNpcInputSlot.removeEventListener("keydown", onAddNpcKeyDown);
