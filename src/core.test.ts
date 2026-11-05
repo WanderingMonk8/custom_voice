@@ -2620,10 +2620,32 @@ test('cross-message review links a user exchange to each quote in the Ewan openi
   assert.ok(review.questions.boundary_relation)
   assert.ok(review.questions.boundary_addressee)
   for (const speech of plan.state.speeches) assert.ok(review.questions[`relationship_${speech.id}`])
+  assert.match(review.questions.relationship_s0.instructions, /recipient of the preceding relevant utterance/u)
+  assert.match(review.questions.relationship_s0.instructions, /do not assume the addressee responds/u)
   applyRelationshipSpeakerReview(plan, answers, { boundary_relation: confidentDecision('response'), boundary_addressee: confidentDecision('known_0'), relationship_s0: confidentDecision('known_0'), relationship_s1: confidentDecision('known_0'), relationship_s2: confidentDecision('known_0'), relationship_s3: confidentDecision('known_0') }, review.ghostOptions, null, null, true)
   const resolved = resolveSpeakerDecisionSegments(content, plan, answers, speakers, { isUserMessage: false, cardSpeakerId: null, historicalSpeakerId: null, evidenceOnly: true, includeDebug: true })
   assert.deepEqual(resolved.filter(segment => segment.speakerId !== null).map(segment => segment.speakerId), ['npc:ewan', 'npc:ewan', 'npc:ewan', 'npc:ewan'])
   assert.ok(resolved[0].debugPath?.some(item => item.startsWith('jev-boundary-relation-choice:response')))
+})
+
+test('agreement retains a clear first-pass identity without requiring override thresholds', () => {
+  const speakers = [{ id: 'npc:zadie', name: 'Zadie' }, { id: 'npc:tessa', name: 'Tessa' }]
+  const message = '"Dinner is handled."'
+  const make = () => ({ plan: buildSpeakerDecisionPlan(message, speakers, false), answers: { speech_s0: { choice: 'known_0', probabilities: { known_0: 0.93, known_1: 0.05, no_clear_identity: 0.02 }, confidence: 0.92 } } as Record<string, SpeakerDecisionChoice> })
+  const agreeing = make()
+  applyRelationshipSpeakerReview(agreeing.plan, agreeing.answers, { relationship_s0: { choice: 'known_0', probabilities: { known_0: 0.81, known_1: 0.16, no_clear_identity: 0.03 }, confidence: 0.80 } }, {}, null, null, true)
+  assert.ok(agreeing.answers.relationship_confirmed_s0)
+  assert.equal(agreeing.answers.global_uncertain_s0, undefined)
+  const segments = resolveSpeakerDecisionSegments(message, agreeing.plan, agreeing.answers, speakers, { isUserMessage: false, cardSpeakerId: null, historicalSpeakerId: null, evidenceOnly: true, includeDebug: true })
+  assert.equal(segments[0].speakerId, 'npc:zadie')
+  assert.ok(segments[0].debugPath?.includes('jev-relationship-review:accepted first-pass identity confirmed'))
+  const weak = make()
+  applyRelationshipSpeakerReview(weak.plan, weak.answers, { relationship_s0: { choice: 'known_0', probabilities: { known_0: 0.50, known_1: 0.30, no_clear_identity: 0.20 }, confidence: 0.40 } }, {}, null, null, true)
+  assert.ok(weak.answers.global_uncertain_s0)
+  const conflict = make()
+  applyRelationshipSpeakerReview(conflict.plan, conflict.answers, { relationship_s0: { choice: 'known_1', probabilities: { known_1: 0.75, known_0: 0.20, no_clear_identity: 0.05 }, confidence: 0.70 } }, {}, null, null, true)
+  assert.ok(conflict.answers.global_uncertain_s0)
+  assert.equal(conflict.answers.relationship_confirmed_s0, undefined)
 })
 
 test('uncertain global review blocks chain guessing and uses unresolved speech voice, not narration', () => {

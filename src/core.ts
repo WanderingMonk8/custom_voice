@@ -3124,7 +3124,7 @@ export function buildRelationshipSpeakerReview(plan: SpeakerDecisionPlan, answer
       if (local.identity && local.identity !== UNCAST_SPEAKER_ID && !conflict && !phoneExchange && !globalOptions?.targets.includes(speech.id) && !openingTargets.has(speech.id)) continue
       questions[`relationship_${speech.id}`] = {
         type: 'choice',
-        instructions: `Who actually speaks quotation ${speech.id}? Read its entire dialogue run together, including later quotations and narration in the current message. Compare the topic and wording with the preceding role-labeled exchange, including user messages: identify who spoke, whom they addressed, and whether this quote responds or continues. Connect people across messages using names, aliases, actions, pronouns and carried objects. A person who merely observes, is addressed, or passes by is not automatically speaking. Distinguish in-person dialogue from a caller or text sender. Pronouns are evidence, not proof of gender or identity. Prefer explicit attribution and select no_clear_identity when evidence is insufficient.`,
+        instructions: `Who actually speaks quotation ${speech.id}? Read its entire dialogue run together, including later quotations and narration in the current message. Compare the topic and wording with the preceding role-labeled exchange, including user messages: identify who spoke, whom they addressed, and whether this quote responds or continues. For an opening reply, consider the recipient of the preceding relevant utterance as a candidate, and trace distinctive objects, actions and pronouns into the current scene. A user message may contain several utterances or descriptions: identify the relevant exchange, not just its last name or the message author. Weigh semantic continuity and the whole run, but do not assume the addressee responds or that all quotes share a speaker. Connect people across messages using names, aliases, actions, pronouns and carried objects. A person who merely observes, is addressed, or passes by is not automatically speaking. Distinguish in-person dialogue from a caller or text sender. Pronouns are evidence, not proof of gender or identity. Prefer explicit attribution and select no_clear_identity when evidence is insufficient.`,
         criteria,
       }
       if (globalOptions && globalOptions.strategy !== 'run') {
@@ -3277,6 +3277,14 @@ export function applyRelationshipSpeakerReview(plan: SpeakerDecisionPlan, answer
     }
     if (!result) continue
     answers[`relationship_review_${speech.id}`] = result
+    // Agreement is not an override. Apply the ordinary acceptance gates to a
+    // confirming review, rather than the stricter gates for changing identity.
+    // Missing, unclear or conflicting reviews still follow the uncertainty path.
+    const confirmingIdentity = evaluateSpeakerDecisionAnswer(result, options, SPEAKER_DECISION_THRESHOLDS.local).identity
+    if (globalMode && originalIdentity && originalIdentity !== UNCAST_SPEAKER_ID && confirmingIdentity === originalIdentity) {
+      answers[`relationship_confirmed_${speech.id}`] = result
+      continue
+    }
     const reviewedIdentity = evaluateSpeakerDecisionAnswer(result, options, globalMode && (!originalIdentity || originalIdentity === UNCAST_SPEAKER_ID) ? SPEAKER_DECISION_THRESHOLDS.local : { probability: 0.85, confidence: 0.8, margin: 0.3 }).identity
     const explicitAttribution = narrativeAttributionSpeaker(`${speech.narrativeBefore} ${speech.narrativeAfter}`, speakers)
     if (globalMode && !reviewedIdentity && (!originalIdentity || originalIdentity === UNCAST_SPEAKER_ID || explicitAttribution !== originalIdentity)) {
@@ -6025,6 +6033,10 @@ export function resolveSpeakerDecisionSegments(
         : 'resolution:chain-identity (filled unresolved span)')
     }
     const baseIdentity = (chainDecision?.identity ?? undefined) ?? identity
+    if (answers[`relationship_confirmed_${speech.id}`]) {
+      discoursePathBySpeechIndex.set(index, 'resolution:global-context confirmed first pass (protected from local override)')
+      return identity
+    }
     if (answers[`relationship_continuity_${speech.id}`]) {
       discoursePathBySpeechIndex.set(index, answers[`relationship_global_${speech.id}`]
         ? 'resolution:global-context review (protected from local override)'
@@ -6222,6 +6234,7 @@ export function resolveSpeakerDecisionSegments(
           ...(answers[`scene_applied_${speech.id}`] ? ['jev-scene-reference:actor linked to this speech by independent review'] : []),
           ...(answers[`relationship_inherited_${speech.id}`] ? ['jev-relationship-review:inherited established previous speaker'] : []),
           ...(answers[`relationship_applied_${speech.id}`] ? ['jev-relationship-review:strong alternative applied'] : []),
+          ...(answers[`relationship_confirmed_${speech.id}`] ? ['jev-relationship-review:accepted first-pass identity confirmed'] : []),
           ...(answers[`global_uncertain_${speech.id}`] ? ['jev-global-review:uncertain; unsupported identity and chain fill suppressed'] : []),
           ...decisionAnswerDebug('jev-user-review-original', answers[`user_review_original_${speech.id}`], plan.optionSpeakerIds),
           ...decisionAnswerDebug('jev-user-review', answers[`user_review_${speech.id}`], plan.optionSpeakerIds),
