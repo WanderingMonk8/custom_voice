@@ -139,6 +139,7 @@ type FrontendMessage =
       ghostVoiceLifetime: number
       speakerLookback: number
       debug: boolean
+      shadowEvaluation?: boolean
     }
   | {
       type: 'chat_voice_place_tags'
@@ -1086,7 +1087,7 @@ function queueSpeakerParse(
           skippedTrackerTags,
         }))
         const cached = config.parsedMessages[payload.messageId]
-        if (!payload.debug && cached?.contentHash === decisionCacheHash) {
+        if (!payload.debug && !payload.shadowEvaluation && cached?.contentHash === decisionCacheHash) {
           sendSpeakerParse({
             requestId: payload.requestId,
             chatId: chat.id,
@@ -1136,6 +1137,23 @@ function queueSpeakerParse(
             cardSpeakerId: titleMatchedCardSpeakerId,
             targets: [...new Set(discourseAssessment.runs.flatMap(run => run.targets))],
           })
+          // The experimental review owns its answers and option map. It must never
+          // affect the live plan, cache, cast, or ghost assignment pipeline.
+          const shadowPlan = { ...decisionPlan, optionSpeakerIds: { ...decisionPlan.optionSpeakerIds } }
+          const shadowAnswers = { ...answers }
+          const shadowReview = payload.shadowEvaluation ? buildRelationshipSpeakerReview(shadowPlan, shadowAnswers, relationshipContext, null, {
+            cardSpeakerId: titleMatchedCardSpeakerId,
+            targets: [...new Set(discourseAssessment.runs.flatMap(run => run.targets))],
+            strategy: 'run',
+          }) : null
+          const shadowStartedAt = Date.now()
+          let shadowTimer: ReturnType<typeof setTimeout> | undefined
+          const shadowPromise = shadowReview && Object.keys(shadowReview.questions).length ? Promise.race([
+            spindle.decisions.evaluate({ state: shadowReview.state, questions: shadowReview.questions, ...(userId ? { userId } : {}) })
+              .then(result => ({ result, error: '', duration: Date.now() - shadowStartedAt }))
+              .catch(() => ({ result: null, error: 'request failed', duration: Date.now() - shadowStartedAt })),
+            new Promise<{ result: null; error: string; duration: number }>(resolve => { shadowTimer = setTimeout(() => resolve({ result: null, error: 'timed out after 5s', duration: Date.now() - shadowStartedAt }), 5000) }),
+          ]).finally(() => { if (shadowTimer) clearTimeout(shadowTimer) }) : null
           let relationshipReviewFailed = false
           let relationshipSceneDiagnostic = `global-context=${relationshipContext.previousMessages.length} messages, ${relationshipContext.previousMessages.reduce((sum, item) => sum + item.text.length, 0)} characters; target=${decisionPlan.state.message.length} characters; first-pass=${decisionQuestionCount} questions/${firstPassDuration}ms; review=${Object.keys(relationshipReview.questions).length} questions; candidates=${Object.entries(relationshipReview.ghostOptions).map(([option, id]) => `${option}=${id}`).join(',') || 'none'}`
           if (Object.keys(relationshipReview.questions).length) {
@@ -1184,6 +1202,36 @@ function queueSpeakerParse(
               },
             },
           )
+          if (shadowReview) {
+            const shadowResult = shadowPromise ? await shadowPromise : null
+            if (shadowResult?.result) {
+              const reviewed: Record<string, SpeakerDecisionChoice> = {}
+              for (const [id, answer] of Object.entries(shadowResult.result.answers)) {
+                if (answer.type === 'choice') reviewed[id] = { choice: answer.choice, probabilities: answer.probabilities, confidence: answer.confidence }
+              }
+              const missing = Object.keys(shadowReview.questions).filter(id => id.startsWith('relationship_s') && !reviewed[id])
+              if (missing.length) {
+                relationshipSceneDiagnostic += `; shadow=incomplete (${missing.length} missing answers)`
+              } else {
+                try {
+                  applyRelationshipSpeakerReview(shadowPlan, shadowAnswers, reviewed, shadowReview.ghostOptions, null, null, true)
+                  const shadowSegments = resolveSpeakerDecisionSegments(message.content ?? '', shadowPlan, shadowAnswers, speakers, {
+                    isUserMessage: message.is_user, cardSpeakerId: null, historicalSpeakerId, evidenceOnly: true,
+                    skippedTrackerTagPairs: skippedTrackerTags, includeDebug: payload.debug,
+                    discourse: { assessment: discourseAssessment, answers: discourse.answers, status: discourse.status },
+                  })
+                  const aligned = segments.length === shadowSegments.length && segments.every((segment, index) => segment.text === shadowSegments[index].text)
+                  const changes = aligned ? segments.flatMap((segment, index) => segment.speakerId !== shadowSegments[index].speakerId
+                    ? [`${index + 1}:${segment.speakerId ?? 'none'}->${shadowSegments[index].speakerId ?? 'none'}`] : []) : []
+                  relationshipSceneDiagnostic += `; shadow=completed, questions=${Object.keys(shadowReview.questions).length}, duration=${shadowResult.duration}ms, changed-segments=${aligned ? changes.length : 'unaligned'}${changes.length ? ` (${changes.join(', ')})` : ''}`
+                } catch {
+                  relationshipSceneDiagnostic += '; shadow=resolution failed'
+                }
+              }
+            } else {
+              relationshipSceneDiagnostic += `; shadow=${shadowResult?.error ?? 'not needed'}`
+            }
+          }
           const relationshipStatus = relationshipReviewFailed ? 'failed; original assignments retained'
             : `${Object.keys(relationshipReview.questions).length} question(s) reviewed; ${relationshipSceneDiagnostic}`
           const reviewedSegments = payload.debug ? segments.map(segment => segment.debugPath ? {

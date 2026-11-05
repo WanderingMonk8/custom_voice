@@ -1799,7 +1799,7 @@ function buildRelationshipSpeakerReview(plan, answers, context, continuitySpeake
         instructions: `Who actually speaks quotation ${speech.id}? Read its entire dialogue run together, including later quotations and narration in the current message. Compare the topic and wording with the preceding role-labeled exchange, including user messages: identify who spoke, whom they addressed, and whether this quote responds or continues. Connect people across messages using names, aliases, actions, pronouns and carried objects. A person who merely observes, is addressed, or passes by is not automatically speaking. Distinguish in-person dialogue from a caller or text sender. Pronouns are evidence, not proof of gender or identity. Prefer explicit attribution and select no_clear_identity when evidence is insufficient.`,
         criteria
       };
-      if (globalOptions) {
+      if (globalOptions && globalOptions.strategy !== "run") {
         const paragraphIndex = plan.state.paragraphs.findIndex((paragraph2) => paragraph2.id === speech.paragraphId);
         const narration = plan.state.paragraphs.slice(Math.max(0, paragraphIndex - 1), paragraphIndex + 2).map((paragraph2) => cleanPlaybackText(narrativeOnly(paragraph2.text))).filter(Boolean).join("\n").slice(0, 2e3);
         if (narration) {
@@ -4832,7 +4832,7 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
           skippedTrackerTags
         }));
         const cached = config.parsedMessages[payload.messageId];
-        if (!payload.debug && cached?.contentHash === decisionCacheHash) {
+        if (!payload.debug && !payload.shadowEvaluation && cached?.contentHash === decisionCacheHash) {
           sendSpeakerParse({
             requestId: payload.requestId,
             chatId: chat.id,
@@ -4880,6 +4880,23 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
             cardSpeakerId: titleMatchedCardSpeakerId,
             targets: [...new Set(discourseAssessment.runs.flatMap((run) => run.targets))]
           });
+          const shadowPlan = { ...decisionPlan, optionSpeakerIds: { ...decisionPlan.optionSpeakerIds } };
+          const shadowAnswers = { ...answers };
+          const shadowReview = payload.shadowEvaluation ? buildRelationshipSpeakerReview(shadowPlan, shadowAnswers, relationshipContext, null, {
+            cardSpeakerId: titleMatchedCardSpeakerId,
+            targets: [...new Set(discourseAssessment.runs.flatMap((run) => run.targets))],
+            strategy: "run"
+          }) : null;
+          const shadowStartedAt = Date.now();
+          let shadowTimer;
+          const shadowPromise = shadowReview && Object.keys(shadowReview.questions).length ? Promise.race([
+            spindle.decisions.evaluate({ state: shadowReview.state, questions: shadowReview.questions, ...userId ? { userId } : {} }).then((result2) => ({ result: result2, error: "", duration: Date.now() - shadowStartedAt })).catch(() => ({ result: null, error: "request failed", duration: Date.now() - shadowStartedAt })),
+            new Promise((resolve) => {
+              shadowTimer = setTimeout(() => resolve({ result: null, error: "timed out after 5s", duration: Date.now() - shadowStartedAt }), 5e3);
+            })
+          ]).finally(() => {
+            if (shadowTimer) clearTimeout(shadowTimer);
+          }) : null;
           let relationshipReviewFailed = false;
           let relationshipSceneDiagnostic = `global-context=${relationshipContext.previousMessages.length} messages, ${relationshipContext.previousMessages.reduce((sum, item) => sum + item.text.length, 0)} characters; target=${decisionPlan.state.message.length} characters; first-pass=${decisionQuestionCount} questions/${firstPassDuration}ms; review=${Object.keys(relationshipReview.questions).length} questions; candidates=${Object.entries(relationshipReview.ghostOptions).map(([option, id]) => `${option}=${id}`).join(",") || "none"}`;
           if (Object.keys(relationshipReview.questions).length) {
@@ -4928,6 +4945,39 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
               }
             }
           );
+          if (shadowReview) {
+            const shadowResult = shadowPromise ? await shadowPromise : null;
+            if (shadowResult?.result) {
+              const reviewed = {};
+              for (const [id, answer] of Object.entries(shadowResult.result.answers)) {
+                if (answer.type === "choice") reviewed[id] = { choice: answer.choice, probabilities: answer.probabilities, confidence: answer.confidence };
+              }
+              const missing = Object.keys(shadowReview.questions).filter((id) => id.startsWith("relationship_s") && !reviewed[id]);
+              if (missing.length) {
+                relationshipSceneDiagnostic += `; shadow=incomplete (${missing.length} missing answers)`;
+              } else {
+                try {
+                  applyRelationshipSpeakerReview(shadowPlan, shadowAnswers, reviewed, shadowReview.ghostOptions, null, null, true);
+                  const shadowSegments = resolveSpeakerDecisionSegments(message.content ?? "", shadowPlan, shadowAnswers, speakers, {
+                    isUserMessage: message.is_user,
+                    cardSpeakerId: null,
+                    historicalSpeakerId,
+                    evidenceOnly: true,
+                    skippedTrackerTagPairs: skippedTrackerTags,
+                    includeDebug: payload.debug,
+                    discourse: { assessment: discourseAssessment, answers: discourse.answers, status: discourse.status }
+                  });
+                  const aligned = segments.length === shadowSegments.length && segments.every((segment, index) => segment.text === shadowSegments[index].text);
+                  const changes = aligned ? segments.flatMap((segment, index) => segment.speakerId !== shadowSegments[index].speakerId ? [`${index + 1}:${segment.speakerId ?? "none"}->${shadowSegments[index].speakerId ?? "none"}`] : []) : [];
+                  relationshipSceneDiagnostic += `; shadow=completed, questions=${Object.keys(shadowReview.questions).length}, duration=${shadowResult.duration}ms, changed-segments=${aligned ? changes.length : "unaligned"}${changes.length ? ` (${changes.join(", ")})` : ""}`;
+                } catch {
+                  relationshipSceneDiagnostic += "; shadow=resolution failed";
+                }
+              }
+            } else {
+              relationshipSceneDiagnostic += `; shadow=${shadowResult?.error ?? "not needed"}`;
+            }
+          }
           const relationshipStatus = relationshipReviewFailed ? "failed; original assignments retained" : `${Object.keys(relationshipReview.questions).length} question(s) reviewed; ${relationshipSceneDiagnostic}`;
           const reviewedSegments = payload.debug ? segments.map((segment) => segment.debugPath ? {
             ...segment,

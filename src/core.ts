@@ -3096,7 +3096,7 @@ export function relationshipReviewContext(messages: Array<{ id: string; is_user:
 }
 
 /** Run relationship review only where local identity or an off-scene exchange needs context. */
-export function buildRelationshipSpeakerReview(plan: SpeakerDecisionPlan, answers: Record<string, SpeakerDecisionChoice>, context: RelationshipReviewContext, continuitySpeakerId: string | null = null, globalOptions?: { cardSpeakerId: string | null; targets: string[] }) {
+export function buildRelationshipSpeakerReview(plan: SpeakerDecisionPlan, answers: Record<string, SpeakerDecisionChoice>, context: RelationshipReviewContext, continuitySpeakerId: string | null = null, globalOptions?: { cardSpeakerId: string | null; targets: string[]; strategy?: 'scene' | 'run' }) {
   const questions: SpeakerDecisionPlan['questions'] = {}
   const ghostOptions: Record<string, string> = {}
   const sceneReferences: Array<{ speechId: string; narration: string; quotation: string }> = []
@@ -3127,7 +3127,7 @@ export function buildRelationshipSpeakerReview(plan: SpeakerDecisionPlan, answer
         instructions: `Who actually speaks quotation ${speech.id}? Read its entire dialogue run together, including later quotations and narration in the current message. Compare the topic and wording with the preceding role-labeled exchange, including user messages: identify who spoke, whom they addressed, and whether this quote responds or continues. Connect people across messages using names, aliases, actions, pronouns and carried objects. A person who merely observes, is addressed, or passes by is not automatically speaking. Distinguish in-person dialogue from a caller or text sender. Pronouns are evidence, not proof of gender or identity. Prefer explicit attribution and select no_clear_identity when evidence is insufficient.`,
         criteria,
       }
-      if (globalOptions) {
+      if (globalOptions && globalOptions.strategy !== 'run') {
         const paragraphIndex = plan.state.paragraphs.findIndex(paragraph => paragraph.id === speech.paragraphId)
         const narration = plan.state.paragraphs.slice(Math.max(0, paragraphIndex - 1), paragraphIndex + 2)
           .map(paragraph => cleanPlaybackText(narrativeOnly(paragraph.text)))
