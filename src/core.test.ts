@@ -41,6 +41,7 @@ import {
   uncastIdentityLabels,
   mergeGhostAliases,
   readGhostVoices,
+  recordGhostOccurrence,
   buildUncastVoiceDecision,
   buildUncastIdentityReview,
   resolveUncastVoiceDecisions,
@@ -57,6 +58,7 @@ import {
   hasNamedSpeakerMention,
   hasNamedSpeakerSubject,
   mergeVoicePlan,
+  markUnresolvedSpeechSegments,
   normalizeSpeechBoundaryDashes,
   normalizeTtsTags,
   normalizeCustomTtsEmotionTag,
@@ -95,6 +97,7 @@ import {
   stripTtsTags,
   unconfiguredSpeakerId,
   UNCAST_SPEAKER_ID,
+  UNRESOLVED_SPEAKER_ID,
   USER_SPEAKER_ID,
   upsertSavedAudioRecord,
   validateTtsSpeechPlacement,
@@ -1062,6 +1065,9 @@ test('gates a decision answer on probability, confidence, and winner margin', ()
     optionSpeakerIds,
   )
   assert.equal(uncast.identity, UNCAST_SPEAKER_ID)
+  assert.equal(evaluateSpeakerDecisionAnswer({ choice: 'known_0', probabilities: { known_0: Infinity }, confidence: 1 }, optionSpeakerIds).resolved, false)
+  assert.equal(evaluateSpeakerDecisionAnswer({ choice: 'known_0', probabilities: { known_0: 1.1 }, confidence: 1 }, optionSpeakerIds).resolved, false)
+  assert.equal(evaluateSpeakerDecisionAnswer({ choice: 'known_0', probabilities: { known_0: 0.9 }, confidence: NaN }, optionSpeakerIds).resolved, false)
 })
 
 test('applies per-segment gain while assembling PCM WAV audio', () => {
@@ -2113,7 +2119,7 @@ test('strong pairwise identity links override conflicting cached turn voices', (
     { speakerId: UNCAST_SPEAKER_ID, text: 'Second.' },
   ])
   const ghosts = groups.map((group, index) => ({ id: `ghost-${index}`, speakerId: UNCAST_SPEAKER_ID, voiceId: `voice-${index}`, context: 'The clerk.', occurrenceKeys: [`message:${hashMessageContent(group.speeches.join('\n'))}`], lastSeenMessageId: 'message' }))
-  const answers = { same_g1_g0: confidentDecision('same') }
+  const answers = { same_g1_g0: confidentDecision('same'), review_occurrence_g0_0: confidentDecision('same') }
   const matches = resolveUncastVoiceDecisions(groups, [], answers, ghosts, [], 'message')
   assert.deepEqual(matches.map(match => match.voiceId), ['voice-0', 'voice-0'])
   assert.match(buildUncastVoiceDecision(groups, [], 'The clerk and Watt.').questions.same_g1_g0.instructions, /same individual/u)
@@ -2266,6 +2272,15 @@ test('retains confirmed ghost aliases for matching and promotion', () => {
   assert.deepEqual(ambiguous, [])
 })
 
+test('keeps bounded occurrence provenance while preserving legacy occurrence keys', () => {
+  const ghost = readGhostVoices([{ id: 'g', speakerId: UNCAST_SPEAKER_ID, voiceId: 'v', context: '', occurrenceKeys: ['old:legacy'], lastSeenMessageId: 'old' }])[0]
+  recordGhostOccurrence(ghost, 'new', 'message-hash', 'speech-hash', 'Jev identity match')
+  recordGhostOccurrence(ghost, 'new', 'message-hash', 'speech-hash', 'confirmed')
+  const restored = readGhostVoices([ghost])[0]
+  assert.deepEqual(restored.occurrenceKeys, ['old:legacy'])
+  assert.deepEqual(restored.occurrenceEvidence, [{ messageId: 'new', messageHash: 'message-hash', speechHash: 'speech-hash', version: 'occurrence-1', reason: 'confirmed' }])
+})
+
 test('requires identity review before matching broad person descriptions to earlier ghosts', () => {
   const group = collectUncastVoiceGroups([{ speakerId: 'unconfigured:the woman', text: 'Sit anywhere.' }])
   const ghost = { id: 'old', speakerId: 'unconfigured:the woman', label: 'the woman', voiceId: 'old-voice', context: 'A woman at another location.', occurrenceKeys: [], lastSeenMessageId: 'previous' }
@@ -2278,7 +2293,22 @@ test('requires identity review before matching broad person descriptions to earl
   assert.match(reviewed[0].matchReason!, /Jev identity match: old/u)
   const occurrence = { ...ghost, occurrenceKeys: [`current:${hashMessageContent('Sit anywhere.')}`] }
   const replay = resolveUncastVoiceDecisions(group, voices, {}, [occurrence], [], 'current')
-  assert.match(replay[0].matchReason!, /exact message occurrence/u)
+  assert.deepEqual(replay, [])
+  const confirmedReplay = resolveUncastVoiceDecisions(group, voices, { review_occurrence_g0_0: confidentDecision('same') }, [occurrence], [], 'current')
+  assert.match(confirmedReplay[0].matchReason!, /exact message occurrence/u)
+})
+
+test('a contested saved occurrence is reviewed and does not force a voice or overwrite the ghost', () => {
+  const group = collectUncastVoiceGroups([{ speakerId: UNCAST_SPEAKER_ID, text: 'No, I know what you meant.' }])
+  const ghost = { id: 'halloran', speakerId: 'unconfigured:halloran', label: 'Halloran', voiceId: 'halloran-voice', context: 'Halloran works in an office.', occurrenceKeys: [`current:${hashMessageContent('No, I know what you meant.')}`], lastSeenMessageId: 'current' }
+  const answers: Record<string, SpeakerDecisionChoice> = { identity_g0: { choice: 'ghost_0', confidence: 0.55, probabilities: { ghost_0: 0.65, new_or_unclear: 0.35 } } }
+  const review = buildUncastIdentityReview(group, answers, 'A speaker with a tray turns back.', [ghost], 'current')
+  assert.ok(review.questions.review_occurrence_g0_0)
+  const before = structuredClone(ghost)
+  assert.deepEqual(resolveUncastVoiceDecisions(group, readFavoriteVoices([{ id: 'other-voice' }]), { ...answers, review_occurrence_g0_0: confidentDecision('different_or_unclear') }, [ghost], [], 'current'), [])
+  assert.deepEqual(ghost, before)
+  const confirmed = resolveUncastVoiceDecisions(group, [], { ...answers, review_occurrence_g0_0: confidentDecision('same') }, [ghost], [], 'current')
+  assert.equal(confirmed[0]?.ghostId, 'halloran')
 })
 
 test('reviews borderline opening dialogue against a later clearly labeled speaker', () => {
@@ -2490,7 +2520,7 @@ test('global review avoids scene-wide inheritance and treats card as context onl
   const failedAnswers = { speech_s0: confidentDecision('no_clear_identity') }
   applyRelationshipSpeakerReview(failed, failedAnswers, {}, {}, 'tessa', 'tessa', true)
   assert.equal(failedAnswers.speech_s0.choice, 'no_clear_identity')
-  assert.equal(resolveSpeakerDecisionSegments(failed.state.message, failed, failedAnswers, speakers, { isUserMessage: false, cardSpeakerId: null, historicalSpeakerId: null, evidenceOnly: true }).find(segment => segment.text === 'What now?')?.speakerId, null)
+  assert.equal(resolveSpeakerDecisionSegments(failed.state.message, failed, failedAnswers, speakers, { isUserMessage: false, cardSpeakerId: null, historicalSpeakerId: null, evidenceOnly: true }).find(segment => segment.text === 'What now?')?.speakerId, UNRESOLVED_SPEAKER_ID)
 })
 
 test('scene references link Ewan to the tray without making a bystander the speaker', () => {
@@ -2531,6 +2561,43 @@ test('scene references link Ewan to the tray without making a bystander the spea
   applyRelationshipSpeakerReview(contradictory.plan, contradictory.answers, { relationship_s0: confidentDecision('known_1'), scene_reference_s0: confidentDecision('known_0'), scene_link_s0: confidentDecision('same_speaker') }, contradictory.review.ghostOptions, null, null, true)
   assert.equal(contradictory.answers.speech_s0.choice, 'known_1')
   assert.equal(contradictory.answers.scene_applied_s0, undefined)
+})
+
+test('cross-message review links a user exchange to each quote in the Ewan opening run', () => {
+  const speakers = [{ id: 'npc:ewan', name: 'Ewan' }, { id: 'npc:tessa', name: 'Tessa' }, { id: USER_SPEAKER_ID, name: 'Ken' }, { id: 'unconfigured:halloran', name: 'Halloran' }]
+  const content = '"Sacrifice."\n\nHe is ten paces off with the tray and turns halfway around.\n\n"What are you sacrificing? The noodles?"\n\nSomebody behind him has to sidestep the tray, and he shifts without looking.\n\n"No, I know what you meant."\n\nHe lifts one shoulder.\n\n"Whatever. Text her."'
+  const plan = buildSpeakerDecisionPlan(content, speakers, false)
+  const context = { previousMessages: [{ id: 'a', role: 'assistant' as const, text: 'Ewan gets the tray up and stands.' }, { id: 'u', role: 'user' as const, text: 'I turn to Ewan again. "Sometimes you gotta sacrifice a little for someone you like, you know?"' }], ghosts: [] }
+  const answers: Record<string, SpeakerDecisionChoice> = { speech_s0: confidentDecision('known_2'), speech_s1: confidentDecision('no_clear_identity'), speech_s2: confidentDecision('no_clear_identity'), speech_s3: confidentDecision('no_clear_identity') }
+  const review = buildRelationshipSpeakerReview(plan, answers, context, null, { cardSpeakerId: null, targets: ['s1', 's2', 's3'] })
+  assert.equal(review.state.boundaryExchange!.role, 'user')
+  assert.ok(review.questions.boundary_relation)
+  assert.ok(review.questions.boundary_addressee)
+  for (const speech of plan.state.speeches) assert.ok(review.questions[`relationship_${speech.id}`])
+  applyRelationshipSpeakerReview(plan, answers, { boundary_relation: confidentDecision('response'), boundary_addressee: confidentDecision('known_0'), relationship_s0: confidentDecision('known_0'), relationship_s1: confidentDecision('known_0'), relationship_s2: confidentDecision('known_0'), relationship_s3: confidentDecision('known_0') }, review.ghostOptions, null, null, true)
+  const resolved = resolveSpeakerDecisionSegments(content, plan, answers, speakers, { isUserMessage: false, cardSpeakerId: null, historicalSpeakerId: null, evidenceOnly: true, includeDebug: true })
+  assert.deepEqual(resolved.filter(segment => segment.speakerId !== null).map(segment => segment.speakerId), ['npc:ewan', 'npc:ewan', 'npc:ewan', 'npc:ewan'])
+  assert.ok(resolved[0].debugPath?.some(item => item.startsWith('jev-boundary-relation-choice:response')))
+})
+
+test('uncertain global review blocks chain guessing and uses unresolved speech voice, not narration', () => {
+  const speakers = [{ id: USER_SPEAKER_ID, name: 'Ken' }, { id: 'npc:ewan', name: 'Ewan' }]
+  const content = '"Sacrifice."\n\nHe turns with the tray.\n\n"What are you sacrificing?"'
+  const plan = buildSpeakerDecisionPlan(content, speakers, false)
+  const answers: Record<string, SpeakerDecisionChoice> = { speech_s0: confidentDecision('known_0'), speech_s1: confidentDecision('no_clear_identity'), turn_s1: confidentDecision('continues_previous_turn') }
+  applyRelationshipSpeakerReview(plan, answers, { relationship_s0: confidentDecision('no_clear_identity'), relationship_s1: confidentDecision('no_clear_identity') }, {}, null, null, true)
+  const segments = resolveSpeakerDecisionSegments(content, plan, answers, speakers, { isUserMessage: false, cardSpeakerId: null, historicalSpeakerId: null, evidenceOnly: true })
+  assert.deepEqual(segments.filter(segment => segment.speakerId !== null).map(segment => segment.speakerId), [UNRESOLVED_SPEAKER_ID, UNRESOLVED_SPEAKER_ID])
+  assert.equal(playbackVoiceForSpeaker(UNRESOLVED_SPEAKER_ID, false, {}, 'narrator', 'user'), '')
+  assert.deepEqual(collectUncastVoiceGroups(segments), [])
+})
+
+test('local parser fallback keeps unresolved quotes distinct from narration', () => {
+  const content = 'The curtain moves.\n\n"Who is there?"'
+  const segments = markUnresolvedSpeechSegments(parseRosterVoiceSegments(content, null, [], '', null, true))
+  assert.equal(segments.find(segment => segment.text === 'The curtain moves.')?.speakerId, null)
+  assert.equal(segments.find(segment => segment.text === 'Who is there?')?.speakerId, UNRESOLVED_SPEAKER_ID)
+  assert.equal(playbackVoiceForSpeaker(UNRESOLVED_SPEAKER_ID, false, {}, 'narrator', 'user'), '')
 })
 
 test('relationship review keeps explicit attributions and rejects weak changes', () => {

@@ -1,6 +1,7 @@
 // src/core.ts
 var USER_SPEAKER_ID = "__chat_voice_user__";
 var UNCAST_SPEAKER_ID = "__chat_voice_uncast__";
+var UNRESOLVED_SPEAKER_ID = "__chat_voice_unresolved__";
 var DEFAULT_SAVED_AUDIO_LIMIT = 50;
 var MAX_SAVED_AUDIO_LIMIT = 1e4;
 function readFavoriteVoices(value) {
@@ -94,6 +95,14 @@ function playbackVoiceForSpeaker(speakerId, isUserMessage, characterVoices, narr
   if (speakerId === USER_SPEAKER_ID) return userVoice;
   if (speakerId) return characterVoices[speakerId] || "";
   return narratorVoice;
+}
+function markUnresolvedSpeechSegments(segments, includeDebug = false) {
+  return segments.map((segment) => {
+    const isSpeech = segment.debugPath?.some((step) => step.startsWith("segment-type:speech")) ?? false;
+    const { debugPath, ...plain } = segment;
+    const speakerId = isSpeech && segment.speakerId === null ? UNRESOLVED_SPEAKER_ID : segment.speakerId;
+    return includeDebug ? { ...segment, speakerId } : { ...plain, speakerId };
+  });
 }
 function shouldPersistMessageAudio(isUserMessage, saveGeneratedAudio, regeneratingSavedAudio) {
   return !isUserMessage && (saveGeneratedAudio || regeneratingSavedAudio);
@@ -520,16 +529,6 @@ function addUnconfiguredDialogueSpeakers(content, speakers, skippedTrackerTagPai
   }
   return result;
 }
-function preferredCardSpeakerId(message, speakers, cardCharacterIds) {
-  const speakerIds = new Set(speakers.map((speaker) => speaker.id));
-  const explicitId = typeof message.extra?.character_id === "string" ? message.extra.character_id : "";
-  if (explicitId && speakerIds.has(explicitId)) return explicitId;
-  const messageName = normalizeSpeakerName(message.name ?? "").toLowerCase();
-  const namedSpeaker = messageName ? speakers.find((speaker) => speakerAliases(speaker.name).some((alias) => alias.toLowerCase() === messageName)) : void 0;
-  if (namedSpeaker) return namedSpeaker.id;
-  const availableCardIds = [...new Set(cardCharacterIds)].filter((characterId) => speakerIds.has(characterId));
-  return availableCardIds.length === 1 ? availableCardIds[0] : null;
-}
 function npcSpeakerId(name) {
   return `npc:${normalizeSpeakerName(name).toLowerCase()}`;
 }
@@ -891,19 +890,6 @@ function hasAnonymousSpeechAttribution(text) {
 }
 function hasLeadingPronounSubject(text) {
   return /^(?:he|she|they)\b/iu.test(narrativeOnly(text).trimStart());
-}
-function hasNamedSpeakerSubject(content, speakers, skippedTrackerTagPairs = "") {
-  const playbackContent = preparePlaybackContent(content, skippedTrackerTagPairs);
-  return playbackParagraphs(playbackContent).some((paragraph) => {
-    const mentions = mentionedSpeakers(paragraph.text, speakers);
-    return preferredMentionedSpeaker(paragraph.text, speakers, mentions) !== null;
-  });
-}
-function eligibleCardFallbackSpeakerId(content, cardSpeakerId, speakers, skippedTrackerTagPairs = "") {
-  if (!cardSpeakerId) return null;
-  const alternativeSpeakers = speakers.filter((speaker) => speaker.id !== cardSpeakerId);
-  if (hasNamedSpeakerSubject(content, alternativeSpeakers, skippedTrackerTagPairs)) return null;
-  return hasExplicitUncastCue(content, skippedTrackerTagPairs) ? null : cardSpeakerId;
 }
 function currentParagraphSpeaker(before, after, speakers) {
   let paragraphStart = 0;
@@ -1366,16 +1352,10 @@ var TTS_TAG_NAMES = /* @__PURE__ */ new Set([
   ...TTS_PAUSE_NAMES,
   ...TTS_STYLE_NAMES
 ]);
-var SPEAKER_TURN_SWITCH_PATTERN = /\b(?:(?:another|a second|a third|a new|the other)\s+(?:voice|woman|man|person|speaker|figure|kid|girl|boy)|(?:someone|somebody)\s+(?:else\s+)?(?:says|said|asks|asked|replies|replied|answers|answered|calls|called|whispers|whispered|shouts|shouted)|(?:a|another)\s+voice\s+(?:from|behind|near|across)|from (?:across the room|the (?:hallway|doorway|next room|other room|shadows)))\b/iu;
 var NARRATIVE_SPEECH_VERB_PATTERN = new RegExp(
   `\\b(?:${SPEECH_VERBS}|blurt(?:s|ed)|laugh(?:s|ed)|mutter(?:s|ed)|hiss(?:es|ed)|snap(?:s|ped))\\b`,
   "iu"
 );
-function hasExplicitUncastCue(content, skippedTrackerTagPairs = "") {
-  const playbackContent = preparePlaybackContent(content, skippedTrackerTagPairs);
-  const narration = cleanPlaybackText(narrativeOnly(playbackContent));
-  return ANONYMOUS_ROLE_IDENTITY_PATTERN.test(narration) || hasAnonymousHumanSubject(narration) || SPEAKER_TURN_SWITCH_PATTERN.test(narration);
-}
 function parseRosterVoiceSegmentsInternal(content, defaultSpeakerId, speakers, skippedTrackerTagPairs = "", quoteSpeakerOverrides, historicalSpeakerId = null, preserveLocalOnNullOverride = false, lowConfidenceQuoteIndexes, includeDebug = false) {
   const playbackContent = preparePlaybackContent(content, skippedTrackerTagPairs);
   const result = [];
@@ -3115,7 +3095,7 @@ function setup(ctx) {
       ctx.sendToBackend({ type: "chat_voice_auto_cast", requestId, chatId, voices, reserved, narratorMissing, userMissing, ghostLifetime: ghostVoiceLifetime });
     });
   }
-  function requestUncastVoiceMatches(chatId, messageId, message, groups, voices, reserved, lifetime) {
+  function requestUncastVoiceMatches(chatId, messageId, message, sourceHash, groups, voices, reserved, lifetime) {
     const requestId = `uncast-${Date.now().toString(36)}-${++uncastRequestSequence}`;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -3123,13 +3103,14 @@ function setup(ctx) {
         reject(new Error("Uncast voice matching timed out."));
       }, 35e3);
       pendingUncastRequests.set(requestId, { resolve, reject, timer });
-      ctx.sendToBackend({ type: "chat_voice_match_uncast", requestId, chatId, messageId, message, groups, voices, reserved, lifetime });
+      ctx.sendToBackend({ type: "chat_voice_match_uncast", requestId, chatId, messageId, message, sourceHash, groups, voices, reserved, lifetime });
     });
   }
   function speakerDebugName(speakerId, speakers) {
     if (speakerId === null) return "narrator";
     if (speakerId === USER_SPEAKER_ID) return "user persona";
     if (speakerId === UNCAST_SPEAKER_ID) return "uncast character";
+    if (speakerId === UNRESOLVED_SPEAKER_ID) return "unresolved speech";
     const speaker = speakers.find((candidate) => candidate.id === speakerId);
     return speaker ? `${speaker.name} [${speakerId}]` : speakerId;
   }
@@ -3163,6 +3144,7 @@ function setup(ctx) {
     if (resolution?.startsWith("resolution:previous-assistant")) return "previous-assistant";
     if (resolution?.startsWith("resolution:unique card-title")) return "card-title";
     if (resolution?.startsWith("resolution:user-role")) return "role-fallback";
+    if (resolution?.startsWith("resolution:unresolved speech")) return "role-fallback";
     if (resolution?.startsWith("resolution:assistant connection-default")) return "role-fallback";
     if (review.failed || review.usedLlm === false || parsingMode === "off") return "local-parser";
     if (speakerDebugStep(segment, "jev-fallback:") || speakerDebugStep(segment, "jev-disabled:")) {
@@ -3714,25 +3696,16 @@ function setup(ctx) {
         ),
         preferences.skippedTrackerTags
       );
-      const defaultSpeakerId = message.is_user ? USER_SPEAKER_ID : eligibleCardFallbackSpeakerId(
-        message.content,
-        preferredCardSpeakerId(
-          message,
-          playbackChat.characters,
-          playbackChat.cardCharacterIds ?? []
-        ),
-        playbackSpeakers,
-        preferences.skippedTrackerTags
-      );
+      const defaultSpeakerId = message.is_user ? USER_SPEAKER_ID : null;
       const aliases = speakerAliasIdLookup(playbackChat.characters);
-      const localSegments = parseRosterVoiceSegments(
+      const localSegments = markUnresolvedSpeechSegments(parseRosterVoiceSegments(
         message.content,
         defaultSpeakerId,
         playbackSpeakers,
         preferences.skippedTrackerTags,
         null,
-        preferences.speakerAssignmentDebug
-      );
+        true
+      ), preferences.speakerAssignmentDebug);
       let review = { segments: localSegments, usedLlm: null, failed: false };
       if (preferences.speakerParsingMode !== "off" || preferences.ttsTagStyle !== "off") {
         setStatus(
@@ -3742,8 +3715,9 @@ function setup(ctx) {
       try {
         review = await requestSpeakerReviewedSegments(playbackChat.id, messageId, preferences);
       } catch (error) {
-        console.warn("[Chat Voice] Backend speaker parsing failed; using the message-local parser.", error);
         if (playback.controller.signal.aborted) throw new DOMException("Playback stopped.", "AbortError");
+        if (error instanceof Error && error.message.includes("changed during speaker review")) throw error;
+        console.warn("[Chat Voice] Backend speaker parsing failed; using the message-local parser.", error);
         review = { segments: localSegments, usedLlm: null, failed: true };
         setStatus("Historical speaker lookup unavailable; using the message-local parser.");
       }
@@ -3778,6 +3752,7 @@ function setup(ctx) {
         playbackChat.id,
         messageId,
         preparePlaybackContent(message.content, preferences.skippedTrackerTags),
+        hashMessageContent(message.content),
         uncastGroups,
         uncastVoices,
         reservedVoices,

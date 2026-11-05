@@ -20,6 +20,7 @@ import {
   expiredSavedAudioRecords,
   hashMessageContent,
   mergeVoicePlan,
+  markUnresolvedSpeechSegments,
   npcSpeakerId,
   normalizeSpeechBoundaryDashes,
   normalizeSpeakerName,
@@ -37,6 +38,7 @@ import {
   splitLargeVoicePlanSegments,
   shouldPersistMessageAudio,
   UNCAST_SPEAKER_ID,
+  UNRESOLVED_SPEAKER_ID,
   USER_SPEAKER_ID,
   upsertSavedAudioRecord,
   type GhostVoice,
@@ -2058,7 +2060,7 @@ export function setup(ctx: SpindleFrontendContext) {
     })
   }
 
-  function requestUncastVoiceMatches(chatId: string, messageId: string, message: string, groups: UncastVoiceGroup[], voices: FavoriteVoice[], reserved: string[], lifetime: number): Promise<UncastVoiceAssignment[]> {
+  function requestUncastVoiceMatches(chatId: string, messageId: string, message: string, sourceHash: string, groups: UncastVoiceGroup[], voices: FavoriteVoice[], reserved: string[], lifetime: number): Promise<UncastVoiceAssignment[]> {
     const requestId = `uncast-${Date.now().toString(36)}-${++uncastRequestSequence}`
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -2066,7 +2068,7 @@ export function setup(ctx: SpindleFrontendContext) {
         reject(new Error('Uncast voice matching timed out.'))
       }, 35_000)
       pendingUncastRequests.set(requestId, { resolve, reject, timer })
-      ctx.sendToBackend({ type: 'chat_voice_match_uncast', requestId, chatId, messageId, message, groups, voices, reserved, lifetime })
+      ctx.sendToBackend({ type: 'chat_voice_match_uncast', requestId, chatId, messageId, message, sourceHash, groups, voices, reserved, lifetime })
     })
   }
 
@@ -2074,6 +2076,7 @@ export function setup(ctx: SpindleFrontendContext) {
     if (speakerId === null) return 'narrator'
     if (speakerId === USER_SPEAKER_ID) return 'user persona'
     if (speakerId === UNCAST_SPEAKER_ID) return 'uncast character'
+    if (speakerId === UNRESOLVED_SPEAKER_ID) return 'unresolved speech'
     const speaker = speakers.find(candidate => candidate.id === speakerId)
     return speaker ? `${speaker.name} [${speakerId}]` : speakerId
   }
@@ -2129,6 +2132,7 @@ export function setup(ctx: SpindleFrontendContext) {
     if (resolution?.startsWith('resolution:previous-assistant')) return 'previous-assistant'
     if (resolution?.startsWith('resolution:unique card-title')) return 'card-title'
     if (resolution?.startsWith('resolution:user-role')) return 'role-fallback'
+    if (resolution?.startsWith('resolution:unresolved speech')) return 'role-fallback'
     if (resolution?.startsWith('resolution:assistant connection-default')) return 'role-fallback'
     if (review.failed || review.usedLlm === false || parsingMode === 'off') return 'local-parser'
     if (speakerDebugStep(segment, 'jev-fallback:') || speakerDebugStep(segment, 'jev-disabled:')) {
@@ -2855,25 +2859,16 @@ export function setup(ctx: SpindleFrontendContext) {
       )
       const defaultSpeakerId = message.is_user
         ? USER_SPEAKER_ID
-        : eligibleCardFallbackSpeakerId(
-            message.content,
-            preferredCardSpeakerId(
-              message,
-              playbackChat.characters,
-              playbackChat.cardCharacterIds ?? [],
-            ),
-            playbackSpeakers,
-            preferences.skippedTrackerTags,
-          )
+        : null
       const aliases = speakerAliasIdLookup(playbackChat.characters)
-      const localSegments = parseRosterVoiceSegments(
+      const localSegments = markUnresolvedSpeechSegments(parseRosterVoiceSegments(
         message.content,
         defaultSpeakerId,
         playbackSpeakers,
         preferences.skippedTrackerTags,
         null,
-        preferences.speakerAssignmentDebug,
-      )
+        true,
+      ), preferences.speakerAssignmentDebug)
       let review: SpeakerParseReview = { segments: localSegments, usedLlm: null, failed: false }
       if (preferences.speakerParsingMode !== 'off' || preferences.ttsTagStyle !== 'off') {
         setStatus(
@@ -2885,8 +2880,9 @@ export function setup(ctx: SpindleFrontendContext) {
       try {
         review = await requestSpeakerReviewedSegments(playbackChat.id, messageId, preferences)
       } catch (error) {
-        console.warn('[Chat Voice] Backend speaker parsing failed; using the message-local parser.', error)
         if (playback.controller.signal.aborted) throw new DOMException('Playback stopped.', 'AbortError')
+        if (error instanceof Error && error.message.includes('changed during speaker review')) throw error
+        console.warn('[Chat Voice] Backend speaker parsing failed; using the message-local parser.', error)
         review = { segments: localSegments, usedLlm: null, failed: true }
         setStatus('Historical speaker lookup unavailable; using the message-local parser.')
       }
@@ -2916,7 +2912,7 @@ export function setup(ctx: SpindleFrontendContext) {
       const uncastVoices = availableUncastVoices(favoriteVoices, reservedVoices)
       const uncastMatchPromise = preferences.autoVoiceCasting && uncastGroups.length
         ? requestUncastVoiceMatches(
-            playbackChat.id, messageId, preparePlaybackContent(message.content, preferences.skippedTrackerTags),
+            playbackChat.id, messageId, preparePlaybackContent(message.content, preferences.skippedTrackerTags), hashMessageContent(message.content),
             uncastGroups, uncastVoices, reservedVoices, preferences.ghostVoiceLifetime,
           ).catch(error => {
             appendSpeakerDebugLog(`Uncast voice matching failed; using connection default: ${error instanceof Error ? error.message : String(error)}`)

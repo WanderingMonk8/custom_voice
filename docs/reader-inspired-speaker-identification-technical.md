@@ -2,7 +2,7 @@
 
 ## Status and scope
 
-**Proposed design; not implemented.** This document translates [the reader-inspired proposal](reader-inspired-speaker-identification.md) into an implementation plan for the `global-context` branch. The current system remains authoritative until a measured rollout promotes a replacement.
+**In progress.** This document translates [the reader-inspired proposal](reader-inspired-speaker-identification.md) into an implementation plan for the `global-context` branch. The cross-message opening review, run-level context questions, explicit unresolved-speech routing, contested-occurrence checks, and bounded provenance for newly saved occurrences are implemented experimentally. Legacy occurrence keys remain readable; full migration/rollback protection across older clients, an exhaustive scene model, opt-in shadow evaluation, optional LLM escalation, and a measured rollout remain proposed. Current code and tests are authoritative.
 
 The immediate target is accurate attribution of ambiguous dialogue across the boundary between a preceding user or assistant message and the target message. The system should use scene participants, actions, addressees, dialogue content, pronoun references, channels, and later clarification within the target. It must not assume that a person mentioned in narration is the speaker, that the message author speaks every quotation, or that the prior speaker continues.
 

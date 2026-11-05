@@ -1,6 +1,8 @@
 export const CONFIG_KEY = 'chat_voice'
 export const USER_SPEAKER_ID = '__chat_voice_user__'
 export const UNCAST_SPEAKER_ID = '__chat_voice_uncast__'
+/** A speech span whose identity is unknown; unlike null, this is not narration. */
+export const UNRESOLVED_SPEAKER_ID = '__chat_voice_unresolved__'
 export const DEFAULT_MESSAGE_LIMIT = 20
 export const MIN_MESSAGE_LIMIT = 1
 export const MAX_MESSAGE_LIMIT = 500
@@ -46,7 +48,8 @@ export function addFavoriteVoice(existing: FavoriteVoice[], voice: FavoriteVoice
 }
 
 export interface UncastVoiceGroup { id: string; speakerId: string; segmentIndexes: number[]; speeches: string[]; context: string[] }
-export interface GhostVoice { id: string; speakerId: string; voiceId: string; context: string; occurrenceKeys: string[]; lastSeenMessageId: string; label?: string; createdAtMessageId?: string; lastInvokedAtMessageId?: string; invokedMessageIds?: string[]; aliases?: string[]; conversationHistory?: Array<{ messageId: string; text: string }> }
+export interface GhostOccurrenceEvidence { messageId: string; messageHash: string; speechHash: string; version: 'occurrence-1'; reason: string }
+export interface GhostVoice { id: string; speakerId: string; voiceId: string; context: string; occurrenceKeys: string[]; lastSeenMessageId: string; label?: string; createdAtMessageId?: string; lastInvokedAtMessageId?: string; invokedMessageIds?: string[]; aliases?: string[]; conversationHistory?: Array<{ messageId: string; text: string }>; occurrenceEvidence?: GhostOccurrenceEvidence[] }
 export const GHOST_VOICE_LIFETIME_MESSAGES = 10
 
 export function readGhostVoices(value: unknown): GhostVoice[] {
@@ -60,6 +63,12 @@ export function readGhostVoices(value: unknown): GhostVoice[] {
       aliases: mergeGhostAliases(Array.isArray(row.aliases) ? row.aliases.filter((value): value is string => typeof value === 'string') : []),
       context: typeof row.context === 'string' ? row.context.slice(0, 2_000) : '',
       occurrenceKeys: Array.isArray(row.occurrenceKeys) ? row.occurrenceKeys.filter((key): key is string => typeof key === 'string').slice(-100) : [],
+      occurrenceEvidence: Array.isArray(row.occurrenceEvidence) ? row.occurrenceEvidence.flatMap(entry => {
+        if (!entry || typeof entry !== 'object') return []
+        const item = entry as Record<string, unknown>
+        if (item.version !== 'occurrence-1' || typeof item.messageId !== 'string' || !item.messageId || typeof item.messageHash !== 'string' || !item.messageHash || typeof item.speechHash !== 'string' || !item.speechHash || typeof item.reason !== 'string') return []
+        return [{ messageId: item.messageId.slice(0, 256), messageHash: item.messageHash.slice(0, 128), speechHash: item.speechHash.slice(0, 128), version: 'occurrence-1' as const, reason: item.reason.slice(0, 256) }]
+      }).slice(-100) : [],
       lastSeenMessageId: typeof row.lastSeenMessageId === 'string' ? row.lastSeenMessageId : '',
       invokedMessageIds: Array.isArray(row.invokedMessageIds) ? row.invokedMessageIds.filter((id): id is string => typeof id === 'string') : [],
       conversationHistory: Array.isArray(row.conversationHistory) ? row.conversationHistory.flatMap(entry => {
@@ -71,6 +80,14 @@ export function readGhostVoices(value: unknown): GhostVoice[] {
       ...(typeof row.createdAtMessageId === 'string' && row.createdAtMessageId ? { createdAtMessageId: row.createdAtMessageId } : {}),
       ...(typeof row.lastInvokedAtMessageId === 'string' && row.lastInvokedAtMessageId ? { lastInvokedAtMessageId: row.lastInvokedAtMessageId } : {}) }]
   })
+}
+
+/** Add bounded provenance without deleting legacy occurrence keys or user data. */
+export function recordGhostOccurrence(ghost: GhostVoice, messageId: string, messageHash: string, speechHash: string, reason: string): void {
+  if (!messageId || !messageHash || !speechHash) return
+  const entries = (ghost.occurrenceEvidence ?? []).filter(item => item.messageId !== messageId || item.speechHash !== speechHash)
+  entries.push({ messageId: messageId.slice(0, 256), messageHash: messageHash.slice(0, 128), speechHash: speechHash.slice(0, 128), version: 'occurrence-1', reason: reason.slice(0, 256) })
+  ghost.occurrenceEvidence = entries.slice(-100)
 }
 
 /** Preserve recent complete exchanges without moving an older replay to the present. */
@@ -262,11 +279,25 @@ function revealedUncastName(group: UncastVoiceGroup): string {
 }
 
 /** Review borderline same-speaker links when a later turn has a clear label. */
-export function buildUncastIdentityReview(groups: UncastVoiceGroup[], answers: Record<string, SpeakerDecisionChoice>, message: string, ghosts: GhostVoice[] = []) {
+export function buildUncastIdentityReview(groups: UncastVoiceGroup[], answers: Record<string, SpeakerDecisionChoice>, message: string, ghosts: GhostVoice[] = [], messageId = '') {
   const labels = uncastIdentityLabels(message, ghosts)
   const questions: Record<string, { type: 'choice'; instructions: string; criteria: Record<string, string> }> = {}
   for (const [index, group] of groups.entries()) {
     if (Object.keys(questions).length >= 16) break
+    const occurrenceKey = messageId ? `${messageId}:${hashMessageContent(group.speeches.join('\n'))}` : ''
+    const occurrenceIndex = occurrenceKey ? ghosts.findIndex(ghost => ghost.occurrenceKeys.includes(occurrenceKey)) : -1
+    const initialIdentity = answers[`identity_${group.id}`]
+    const confirmedOccurrence = occurrenceIndex >= 0 && initialIdentity?.choice === `ghost_${occurrenceIndex}`
+      && initialIdentity.confidence >= 0.8 && (initialIdentity.probabilities[initialIdentity.choice] ?? 0) >= 0.8
+      && (initialIdentity.probabilities[initialIdentity.choice] ?? 0) - Math.max(0, ...Object.entries(initialIdentity.probabilities).filter(([key]) => key !== initialIdentity.choice).map(([, value]) => value)) >= 0.25
+    if (occurrenceIndex >= 0 && !confirmedOccurrence) {
+      questions[`review_occurrence_${group.id}_${occurrenceIndex}`] = {
+        type: 'choice',
+        instructions: `A previous generation assigned current group ${group.id} to ghost_${occurrenceIndex}. The saved occurrence may be wrong. Compare the current speaker, narrative actions and prior character context. Is this clearly the same individual? Do not infer identity from the name, gender, or the saved occurrence alone.`,
+        criteria: { same: 'The current speaker and saved character are clearly the same person.', different_or_unclear: 'They differ, or there is insufficient evidence to confirm identity.' },
+      }
+      if (Object.keys(questions).length >= 16) break
+    }
     const identity = answers[`identity_${group.id}`]
     const ghostChoice = identity?.choice.match(/^ghost_(\d+)$/u)
     const candidate = ghostChoice ? ghosts[Number(ghostChoice[1])] : undefined
@@ -345,12 +376,14 @@ export function resolveUncastVoiceDecisions(
   const assignments: UncastVoiceAssignment[] = []
   const roots = new Map<string, string>()
   const linkedGhosts = new Map<string, GhostVoice>()
+  const conflictedRoots = new Set<string>()
   const linkReasons = new Map<string, string>()
   const labels = uncastIdentityLabels(message, ghosts)
   const groupLabels = new Map<string, string>()
   const rootByLabel = new Map<string, string>()
   const strongChoice = (answer: SpeakerDecisionChoice | undefined): boolean => {
     if (!answer || answer.choice === 'new_or_unclear') return false
+    if (!Number.isFinite(answer.confidence) || answer.confidence < 0 || answer.confidence > 1 || !answer.probabilities || Object.values(answer.probabilities).some(value => !Number.isFinite(value) || value < 0 || value > 1)) return false
     const probability = answer.probabilities[answer.choice] ?? 0
     const runnerUp = Math.max(0, ...Object.entries(answer.probabilities).filter(([key]) => key !== answer.choice).map(([, p]) => p))
     return answer.confidence >= 0.8 && probability >= 0.8 && probability - runnerUp >= 0.25
@@ -363,6 +396,14 @@ export function resolveUncastVoiceDecisions(
     const name = group.speakerId.startsWith('unconfigured:') ? group.speakerId.slice('unconfigured:'.length).toLowerCase() : ''
     const aliasMatches = name && !isBroadPersonLabel(name) ? ghosts.filter(item => ghostCastAliases(item).some(alias => alias.toLowerCase() === name)) : []
     const occurrence = ghosts.find(item => occurrenceKey && item.occurrenceKeys.includes(occurrenceKey))
+    const occurrenceIndex = occurrence ? ghosts.indexOf(occurrence) : -1
+    const occurrenceReview = occurrenceIndex >= 0 ? answers[`review_occurrence_${group.id}_${occurrenceIndex}`] : undefined
+    const identityAnswer = answers[`identity_${group.id}`]
+    const reviewedAsGhost = occurrence && group.speakerId === `ghost:${occurrence.id}`
+    const occurrenceConfirmed = !!occurrence && (reviewedAsGhost
+      || (identityAnswer?.choice === `ghost_${occurrenceIndex}` && strongChoice(identityAnswer))
+      || (occurrenceReview?.choice === 'same' && strongChoice(occurrenceReview)))
+    const occurrenceConflict = !!occurrence && !occurrenceConfirmed
     const exact = occurrence
       ?? (group.speakerId !== UNCAST_SPEAKER_ID && !isBroadPersonLabel(name) ? ghosts.find(item => item.speakerId === group.speakerId) : undefined)
       ?? (aliasMatches.length === 1 ? aliasMatches[0] : undefined)
@@ -425,12 +466,17 @@ export function resolveUncastVoiceDecisions(
       if (sameLabel.length === 1) { ghost = sameLabel[0]; reason = 'repeated unnamed label' }
     }
     roots.set(group.id, root)
+    if (occurrenceConflict && ghost?.id === occurrence?.id && !linkedGhosts.has(root)) {
+      conflictedRoots.add(root)
+      continue
+    }
     if (label && !rootByLabel.has(label)) rootByLabel.set(label, root)
     // A matching earlier group owns the voice, even if a previous replay
     // cached a different voice for this individual turn.
     if (ghost && !reserved.includes(ghost.voiceId) && !linkedGhosts.has(root)) { linkedGhosts.set(root, ghost); linkReasons.set(root, `${reason}: ${ghost.id} (${ghost.label || ghost.speakerId})`) }
   }
   for (const root of new Set(roots.values())) {
+    if (conflictedRoots.has(root)) continue
     const members = groups.filter(group => roots.get(group.id) === root)
     const genderVotes = members.map(group => answers[`gender_${group.id}`]).filter(answer => answer && (answer.choice === 'male' || answer.choice === 'female') && answer.confidence >= 0.6 && (answer.probabilities[answer.choice] ?? 0) >= 0.6)
     const genders = new Set(genderVotes.map(answer => answer.choice))
@@ -629,6 +675,16 @@ export function playbackVoiceForSpeaker(
   if (speakerId === USER_SPEAKER_ID) return userVoice
   if (speakerId) return characterVoices[speakerId] || ''
   return narratorVoice
+}
+
+/** Preserve the distinction between narration and an unidentified speech span. */
+export function markUnresolvedSpeechSegments(segments: PlaybackSegment[], includeDebug = false): PlaybackSegment[] {
+  return segments.map(segment => {
+    const isSpeech = segment.debugPath?.some(step => step.startsWith('segment-type:speech')) ?? false
+    const { debugPath, ...plain } = segment
+    const speakerId = isSpeech && segment.speakerId === null ? UNRESOLVED_SPEAKER_ID : segment.speakerId
+    return includeDebug ? { ...segment, speakerId } : { ...plain, speakerId }
+  })
 }
 
 export interface PcmAudioSegment {
@@ -3055,6 +3111,9 @@ export function buildRelationshipSpeakerReview(plan: SpeakerDecisionPlan, answer
     criteria[option] = `Previously heard temporary character ${ghost.label || ghost.aliases.join(' / ') || `ghost ${index + 1}`}; use the supplied prior conversation, not the label alone.`
   })
   const phoneExchange = /\b(?:phone|telephone|caller|call|earpiece|voicemail|speakerphone)\b/iu.test(plan.state.message)
+  const previousExchange = context.previousMessages.at(-1)
+  const openingRun = plan.state.runs.find(run => run.speechIds.includes('s0'))
+  const openingTargets = new Set(globalOptions && previousExchange && openingRun ? openingRun.speechIds : [])
   if (context.previousMessages.length || context.ghosts.length) {
     for (const speech of plan.state.speeches) {
       const local = evaluateSpeakerDecisionAnswer(answers[`speech_${speech.id}`], plan.optionSpeakerIds)
@@ -3062,10 +3121,10 @@ export function buildRelationshipSpeakerReview(plan: SpeakerDecisionPlan, answer
       const attribution = narrativeAttributionSpeaker(`${speech.narrativeBefore} ${speech.narrativeAfter}`, speakers)
       if (attribution && local.identity === attribution) continue
       const conflict = !!local.identity && !!paragraph.identity && local.identity !== paragraph.identity
-      if (local.identity && local.identity !== UNCAST_SPEAKER_ID && !conflict && !phoneExchange && !globalOptions?.targets.includes(speech.id)) continue
+      if (local.identity && local.identity !== UNCAST_SPEAKER_ID && !conflict && !phoneExchange && !globalOptions?.targets.includes(speech.id) && !openingTargets.has(speech.id)) continue
       questions[`relationship_${speech.id}`] = {
         type: 'choice',
-        instructions: `Who actually speaks quotation ${speech.id}? Compare names, actions and pronoun references in the current exchange with the earlier conversations and relevant relationships. Distinguish speakers from people addressed or mentioned, bystanders, and a caller or text sender from the person holding the phone. Pronouns are evidence, not proof of gender or identity. Consider whether a call or text thread continues, a different participant appears, or a person later arrives in person. Prefer explicit local attribution and select no_clear_identity when the evidence is insufficient.`,
+        instructions: `Who actually speaks quotation ${speech.id}? Read its entire dialogue run together, including later quotations and narration in the current message. Compare the topic and wording with the preceding role-labeled exchange, including user messages: identify who spoke, whom they addressed, and whether this quote responds or continues. Connect people across messages using names, aliases, actions, pronouns and carried objects. A person who merely observes, is addressed, or passes by is not automatically speaking. Distinguish in-person dialogue from a caller or text sender. Pronouns are evidence, not proof of gender or identity. Prefer explicit attribution and select no_clear_identity when evidence is insufficient.`,
         criteria,
       }
       if (globalOptions) {
@@ -3095,6 +3154,32 @@ export function buildRelationshipSpeakerReview(plan: SpeakerDecisionPlan, answer
       if (Object.keys(questions).filter(id => id.startsWith('relationship_s')).length >= 32) break
     }
   }
+  if (globalOptions && previousExchange && openingRun && openingRun.speechIds.length && Object.keys(questions).length < MAX_DECISION_QUESTIONS - 2) {
+    questions.boundary_relation = {
+      type: 'choice',
+      instructions: 'Compare the first quotation in the target message with the relevant preceding exchange in previousMessages, including a user message if present. Is it a continuation by the same speaker, a response by a different participant, a third-party interjection, an unrelated/new scene, or unclear? Identify the preceding actual speaker and addressee from the text; do not assume the message author speaks every quotation.',
+      criteria: { continuation: 'The same person continues speaking.', response: 'A different participant responds to the preceding exchange.', interjection: 'Another person interjects in the exchange.', new_exchange: 'The quotation starts an unrelated exchange or scene.', no_clear_identity: 'The relationship is unclear.' },
+    }
+    questions.boundary_addressee = {
+      type: 'choice',
+      instructions: 'Who is addressed in the relevant preceding exchange immediately before the target opening dialogue? Use names, aliases, actions and role-labeled prior messages; do not equate the author or a bystander with the addressee. Choose no_clear_identity if uncertain.',
+      criteria,
+    }
+  }
+  const reviewedRuns = globalOptions ? plan.state.runs.filter(run => run.speechIds.some(id => !!questions[`relationship_${id}`])) : []
+  for (const run of reviewedRuns) {
+    if (Object.keys(questions).length > MAX_DECISION_QUESTIONS - 2) break
+    questions[`run_channel_${run.id}`] = {
+      type: 'choice',
+      instructions: `What communication channel is used for the selected dialogue run ${run.id}? Consider the complete current message and preceding exchanges. If the run contains multiple channels or the channel is uncertain, select no_clear_identity.`,
+      criteria: { in_person: 'People speak in the same physical scene.', phone: 'A telephone or voice call.', text_message: 'Written messages on a phone or another device.', no_clear_identity: 'Mixed, different, or unclear channel.' },
+    }
+    questions[`run_participant_${run.id}`] = {
+      type: 'choice',
+      instructions: `Which person is most clearly established as an active participant in dialogue run ${run.id}? Compare the full exchange and role-labeled prior messages. An actor, addressee, or bystander is not necessarily speaking; if there is no single clearly established participant, choose no_clear_identity. This does not assign any quotation.`,
+      criteria,
+    }
+  }
   const continuityOption = continuitySpeakerId ? plan.state.speakers.find(speaker => speaker.id === continuitySpeakerId)?.option : undefined
   if (!globalOptions && plan.state.messageRole === 'assistant' && (plan.state.speeches.length > 1 || (plan.state.speeches.length === 1 && continuitySpeakerId)) && (Object.keys(ghostOptions).length || continuityOption) && (Object.keys(questions).length || continuitySpeakerId)) {
     questions.relationship_scene = {
@@ -3103,13 +3188,19 @@ export function buildRelationshipSpeakerReview(plan: SpeakerDecisionPlan, answer
       criteria: { no_clear_identity: 'The scene has multiple speakers or the identity is uncertain.', ...Object.fromEntries([...Object.keys(ghostOptions), ...(continuityOption ? [continuityOption] : [])].map(option => [option, criteria[option]])) },
     }
   }
-  return { state: { ...plan.state, previousMessages: context.previousMessages, ghosts: context.ghosts, ...(globalOptions ? { sceneReferences, cardSpeakerPrior: globalOptions.cardSpeakerId, contextPolicy: 'Earlier messages are evidence, not automatic speaker assignments. A single-character card is a weak preference only. Distinguish user and assistant roles. Never assume a person is speaking merely because they spoke last.' } : {}) }, questions, ghostOptions }
+  return { state: { ...plan.state, previousMessages: context.previousMessages, ghosts: context.ghosts, ...(globalOptions ? { sceneReferences, reviewedRuns, boundaryExchange: previousExchange ? { messageId: previousExchange.id, role: previousExchange.role ?? 'assistant', text: previousExchange.text, openingRunId: openingRun?.id ?? null, speechIds: openingRun?.speechIds ?? [] } : null, cardSpeakerPrior: globalOptions.cardSpeakerId, contextPolicy: 'Earlier messages are evidence, not automatic speaker assignments. A single-character card is a weak preference only. Distinguish user and assistant roles. Never assume a person is speaking merely because they spoke last.' } : {}) }, questions, ghostOptions }
 }
 
 /** A strong independent decision is required before relationship evidence changes routing. */
 export function applyRelationshipSpeakerReview(plan: SpeakerDecisionPlan, answers: Record<string, SpeakerDecisionChoice>, reviewed: Record<string, SpeakerDecisionChoice>, ghostOptions: Record<string, string>, cardSpeakerId: string | null = null, continuitySpeakerId: string | null = null, globalMode = false): void {
   const options = { ...plan.optionSpeakerIds, ...ghostOptions }
   if (globalMode) Object.assign(plan.optionSpeakerIds, ghostOptions)
+  if (globalMode && reviewed.boundary_relation) answers.boundary_relation = reviewed.boundary_relation
+  if (globalMode && reviewed.boundary_addressee) answers.boundary_addressee = reviewed.boundary_addressee
+  if (globalMode) for (const run of plan.state.runs) {
+    if (reviewed[`run_channel_${run.id}`]) answers[`run_channel_${run.id}`] = reviewed[`run_channel_${run.id}`]
+    if (reviewed[`run_participant_${run.id}`]) answers[`run_participant_${run.id}`] = reviewed[`run_participant_${run.id}`]
+  }
   const scene = reviewed.relationship_scene
   const sceneEvaluation = scene ? evaluateSpeakerDecisionAnswer(scene, options, { probability: 0.6, confidence: 0.45, margin: 0.3 }) : null
   const sceneOptionIdentity = scene ? options[scene.choice] : null
@@ -3173,6 +3264,10 @@ export function applyRelationshipSpeakerReview(plan: SpeakerDecisionPlan, answer
     if (!result) continue
     answers[`relationship_review_${speech.id}`] = result
     const reviewedIdentity = evaluateSpeakerDecisionAnswer(result, options, globalMode && (!originalIdentity || originalIdentity === UNCAST_SPEAKER_ID) ? SPEAKER_DECISION_THRESHOLDS.local : { probability: 0.85, confidence: 0.8, margin: 0.3 }).identity
+    const explicitAttribution = narrativeAttributionSpeaker(`${speech.narrativeBefore} ${speech.narrativeAfter}`, speakers)
+    if (globalMode && !reviewedIdentity && (!originalIdentity || originalIdentity === UNCAST_SPEAKER_ID || explicitAttribution !== originalIdentity)) {
+      answers[`global_uncertain_${speech.id}`] = result
+    }
     if (!reviewedIdentity || reviewedIdentity === originalIdentity) continue
     if (originalIdentity && originalIdentity !== UNCAST_SPEAKER_ID) {
       if (narrativeAttributionSpeaker(`${speech.narrativeBefore} ${speech.narrativeAfter}`, speakers) === originalIdentity) continue
@@ -4607,7 +4702,7 @@ export function applyTtsSpeakerContinuity(
     const boundary = SPEAKER_HARD_BOUNDARY_PATTERNS.find(item => item.pattern.test(bridge))
     if (boundary) history.clear()
     if (!selection) continue
-    if (!speaker || speaker === UNCAST_SPEAKER_ID) {
+    if (!speaker || speaker === UNCAST_SPEAKER_ID || speaker === UNRESOLVED_SPEAKER_ID) {
       result.set(speech.id, { ...selection, continuity: 'skipped: unresolved or uncast speaker' })
       continue
     }
@@ -4739,13 +4834,16 @@ export function evaluateSpeakerDecisionAnswer(
   optionSpeakerIds: Record<string, string>,
   thresholds: SpeakerDecisionThresholds = SPEAKER_DECISION_THRESHOLDS.local,
 ): SpeakerDecisionEvaluation {
+  const probabilities = answer?.probabilities && typeof answer.probabilities === 'object' && !Array.isArray(answer.probabilities) ? answer.probabilities : {}
+  const validScores = Boolean(answer && answer.probabilities === probabilities && Number.isFinite(answer.confidence) && answer.confidence >= 0 && answer.confidence <= 1
+    && Object.values(probabilities).every(value => Number.isFinite(value) && value >= 0 && value <= 1))
   const ranked = answer
-    ? Object.entries(answer.probabilities)
+    ? Object.entries(probabilities)
       .filter((entry): entry is [string, number] => Number.isFinite(entry[1]))
       .sort((left, right) => right[1] - left[1])
     : []
   const choice = answer?.choice ?? null
-  const choiceProbability = choice === null ? 0 : answer?.probabilities[choice] ?? 0
+  const choiceProbability = choice === null ? 0 : probabilities[choice] ?? 0
   const runnerUpProbability = ranked.find(([option]) => option !== choice)?.[1] ?? 0
   const leadingChoice = ranked[0]?.[0] ?? null
   const leadingProbability = ranked[0]?.[1] ?? 0
@@ -4754,7 +4852,7 @@ export function evaluateSpeakerDecisionAnswer(
     || choice === DECISION_UNCLEAR_OPTION
     || (choice !== null && optionSpeakerIds[choice] !== undefined)
   const clearsGates = Boolean(
-    answer
+    answer && validScores
     && usableChoice
     && choice !== DECISION_UNCLEAR_OPTION
     && choiceProbability >= thresholds.probability
@@ -5902,6 +6000,10 @@ export function resolveSpeakerDecisionSegments(
   const chainPathBySpeechIndex = new Map<number, string>()
   const speechIdentities = firstPassSpeechIdentities.map((identity, index) => {
     const speech = plan.state.speeches[index]
+    if (options.evidenceOnly && answers[`global_uncertain_${speech.id}`]) {
+      discoursePathBySpeechIndex.set(index, 'resolution:global-context unresolved (chain fill suppressed)')
+      return undefined
+    }
     const chainDecision = speech ? chain.get(speech.id) : undefined
     if (chainDecision?.filled || chainDecision?.overrode) {
       chainPathBySpeechIndex.set(index, chainDecision.overrode
@@ -6049,9 +6151,11 @@ export function resolveSpeakerDecisionSegments(
       speakerId = options.historicalSpeakerId
       resolutionPaths.push(['resolution:previous-assistant identity (no local identity or card match)'])
     } else {
-      speakerId = options.isUserMessage ? USER_SPEAKER_ID : null
+      speakerId = options.evidenceOnly ? UNRESOLVED_SPEAKER_ID : (options.isUserMessage ? USER_SPEAKER_ID : null)
       resolutionPaths.push([
-        options.isUserMessage
+        options.evidenceOnly
+          ? 'resolution:unresolved speech (connection-default fallback)'
+          : options.isUserMessage
           ? 'resolution:user-role fallback (no clear identity)'
           : 'resolution:assistant connection-default fallback (no clear identity)',
       ])
@@ -6097,9 +6201,14 @@ export function resolveSpeakerDecisionSegments(
           ...decisionAnswerDebug('jev-scene-reference', answers[`scene_reference_${speech.id}`], plan.optionSpeakerIds),
           ...decisionAnswerDebug('jev-scene-secondary', answers[`scene_secondary_${speech.id}`], plan.optionSpeakerIds),
           ...decisionAnswerDebug('jev-scene-link', answers[`scene_link_${speech.id}`], { same_speaker: 'same_speaker', different_person: 'different_person' }),
+          ...(index === 0 ? decisionAnswerDebug('jev-boundary-relation', answers.boundary_relation, { continuation: 'continuation', response: 'response', interjection: 'interjection', new_exchange: 'new_exchange' }) : []),
+          ...(index === 0 ? decisionAnswerDebug('jev-boundary-addressee', answers.boundary_addressee, plan.optionSpeakerIds) : []),
+          ...(run && run.speechIds[0] === speech.id ? decisionAnswerDebug(`jev-run-${run.id}-channel`, answers[`run_channel_${run.id}`], { in_person: 'in_person', phone: 'phone', text_message: 'text_message' }) : []),
+          ...(run && run.speechIds[0] === speech.id ? decisionAnswerDebug(`jev-run-${run.id}-participant`, answers[`run_participant_${run.id}`], plan.optionSpeakerIds) : []),
           ...(answers[`scene_applied_${speech.id}`] ? ['jev-scene-reference:actor linked to this speech by independent review'] : []),
           ...(answers[`relationship_inherited_${speech.id}`] ? ['jev-relationship-review:inherited established previous speaker'] : []),
           ...(answers[`relationship_applied_${speech.id}`] ? ['jev-relationship-review:strong alternative applied'] : []),
+          ...(answers[`global_uncertain_${speech.id}`] ? ['jev-global-review:uncertain; unsupported identity and chain fill suppressed'] : []),
           ...decisionAnswerDebug('jev-user-review-original', answers[`user_review_original_${speech.id}`], plan.optionSpeakerIds),
           ...decisionAnswerDebug('jev-user-review', answers[`user_review_${speech.id}`], plan.optionSpeakerIds),
           ...(answers[`user_review_applied_${speech.id}`] ? ['jev-user-review:strong alternative applied'] : []),
