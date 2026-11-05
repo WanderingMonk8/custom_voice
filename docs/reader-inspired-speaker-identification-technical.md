@@ -303,3 +303,9 @@ Every phase should run `npm run typecheck`, `npm test` and the repository's exte
 - What evidence and consent are sufficient before automatically replacing a previously saved occurrence, and how long should reversible provenance be retained?
 - Should an optional retrospective mode ever use later chat messages? If so, it requires separate user control, branch/swipe isolation and spoiler/privacy expectations.
 - What exact latency, cost and accuracy targets should gate promotion? These must be chosen after baseline measurements.
+# Opening-link formulation comparison
+
+When both speaker-assignment debug and experimental comparison are enabled, an eligible opening-link review also runs a separate, non-routing Jev comparison. It asks whether the two current-message speakers are the same, different, or unclear, and includes synthetic continuation, reply, and ambiguous controls. The expected control labels are kept outside the request. The debug log reports the live answer, candidate probabilities, and control answers; the two formulations have different answer categories and are not directly interchangeable.
+
+This uses the configured Jev connection, not a separate model. It is a diagnostic sanity check, not an accuracy measurement or a replacement for testing real conversations. It can add cost and up to five seconds of waiting; a timed-out host request may continue in the background. It does not change routing, cast, or the live decision cache.
+

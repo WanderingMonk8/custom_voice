@@ -27,6 +27,7 @@ import {
   buildOpeningSpeakerReview,
   applyOpeningExchangeReview,
   buildOpeningBacklinkReview,
+  buildContrastiveOpeningLinkReview,
   applyOpeningBacklinkReview,
   invalidSpeakerReviewAnswers,
   applyRelationshipSpeakerReview,
@@ -2904,6 +2905,15 @@ test('opening links consider adjacent validated speakers in both directions with
   const review = buildOpeningBacklinkReview(plan, answers, context, null)!
   assert.equal(review.links.forwardlink_s1.anchorId, 's0')
   assert.equal(review.links.backlink_s1.anchorId, 's2')
+  const reviewBefore = JSON.stringify(review)
+  const contrastive = buildContrastiveOpeningLinkReview(review)
+  assert.deepEqual(Object.keys(contrastive.questions.forwardlink_s1.criteria), ['same', 'different', 'no_clear_identity'])
+  assert.ok(contrastive.questions.control_continuation)
+  assert.ok(contrastive.questions.control_reply)
+  assert.ok(contrastive.questions.control_uncertain)
+  assert.equal(contrastive.expectedControls.control_reply, 'different')
+  assert.equal('expectedControls' in contrastive.state, false)
+  assert.equal(JSON.stringify(review), reviewBefore)
   assert.match(review.state.pairEvidence.forwardlink_s1.between, /tray/u)
   assert.match(review.questions.forwardlink_s1.instructions, /earlier quotation s0/u)
   applyOpeningBacklinkReview(plan, answers, { forwardlink_s1: confidentDecision('same'), backlink_s1: { choice: 'different_or_unclear', probabilities: { different_or_unclear: 0.62, same: 0.38 }, confidence: 0.24 } }, review.links)

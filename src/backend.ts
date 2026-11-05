@@ -22,6 +22,7 @@ import {
   buildOpeningSpeakerReview,
   applyOpeningExchangeReview,
   buildOpeningBacklinkReview,
+  buildContrastiveOpeningLinkReview,
   applyOpeningBacklinkReview,
   invalidSpeakerReviewAnswers,
   applyRelationshipSpeakerReview,
@@ -1252,14 +1253,29 @@ function queueSpeakerParse(
           const backlinkReview = !relationshipReviewFailed ? buildOpeningBacklinkReview(decisionPlan, answers, relationshipContext, titleMatchedCardSpeakerId) : null
           if (backlinkReview) {
             const startedAt = Date.now()
+            // Only the existing opt-in comparison plus explicit debug enables
+            // this experimental request. Its output never changes routing.
+            const contrastive = payload.shadowEvaluation && payload.debug ? buildContrastiveOpeningLinkReview(backlinkReview) : null
+            let contrastiveTimer: ReturnType<typeof setTimeout> | undefined
+            const contrastivePromise = contrastive ? Promise.race([
+              Promise.resolve().then(() => spindle.decisions.evaluate({ state: contrastive.state, questions: contrastive.questions, ...(userId ? { userId } : {}) }))
+                .then(result => ({ result, error: '', duration: Date.now() - startedAt }))
+                .catch(() => ({ result: null, error: 'request failed', duration: Date.now() - startedAt })),
+              new Promise<{ result: null; error: string; duration: number }>(resolve => { contrastiveTimer = setTimeout(() => resolve({ result: null, error: 'timed out after 5s', duration: Date.now() - startedAt }), 5000) }),
+            ]).finally(() => { if (contrastiveTimer) clearTimeout(contrastiveTimer) }) : null
+            const baselineLinks: Record<string, SpeakerDecisionChoice> = {}
             try {
               const result = await spindle.decisions.evaluate({ state: backlinkReview.state, questions: backlinkReview.questions, ...(userId ? { userId } : {}) })
               const reviewed: Record<string, SpeakerDecisionChoice> = {}
               for (const [id, answer] of Object.entries(result.answers)) {
-                if (answer.type === 'choice') reviewed[id] = { choice: answer.choice, probabilities: answer.probabilities, confidence: answer.confidence }
+                if (answer.type === 'choice') {
+                  reviewed[id] = { choice: answer.choice, probabilities: answer.probabilities, confidence: answer.confidence }
+                  baselineLinks[id] = reviewed[id]
+                }
               }
               const invalid = invalidSpeakerReviewAnswers(backlinkReview.questions, reviewed)
               if (invalid.length) {
+                for (const id of invalid) delete baselineLinks[id]
                 relationshipReviewFailed = true
                 relationshipSceneDiagnostic += `; opening-links=incomplete (${invalid.length} invalid answers)`
               } else {
@@ -1269,6 +1285,27 @@ function queueSpeakerParse(
             } catch {
               relationshipReviewFailed = true
               relationshipSceneDiagnostic += `; opening-links=failed/${Date.now() - startedAt}ms`
+            }
+            if (contrastive && contrastivePromise) {
+              try {
+              const output = await contrastivePromise
+              if (!output.result) relationshipSceneDiagnostic += `; contrastive-shadow=${output.error}`
+              else {
+                const reviewed: Record<string, SpeakerDecisionChoice> = {}
+                for (const [id, answer] of Object.entries(output.result.answers)) {
+                  if (answer.type === 'choice') reviewed[id] = { choice: answer.choice, probabilities: answer.probabilities, confidence: answer.confidence }
+                }
+                const invalid = invalidSpeakerReviewAnswers(contrastive.questions, reviewed)
+                if (invalid.length) relationshipSceneDiagnostic += `; contrastive-shadow=incomplete (${invalid.length} invalid answers)`
+                else {
+                  const pairs = Object.keys(backlinkReview.links).map(id => `${id}:live=${baselineLinks[id]?.choice ?? 'unavailable'},candidate=${reviewed[id].choice},confidence=${reviewed[id].confidence.toFixed(2)},probabilities=${JSON.stringify(reviewed[id].probabilities)}`)
+                  const controls = Object.entries(contrastive.expectedControls).map(([id, expected]) => `${id}:${reviewed[id].choice}/${expected}`)
+                  relationshipSceneDiagnostic += `; contrastive-shadow=${output.duration}ms, questions=${Object.keys(contrastive.questions).length}, pairs=[${pairs.join('; ')}], synthetic-controls=[${controls.join(', ')}] (candidate/expected; no routing changes)`
+                }
+              }
+              } catch {
+                relationshipSceneDiagnostic += '; contrastive-shadow=invalid response'
+              }
             }
           }
           const discourse: DiscourseEvaluation = {

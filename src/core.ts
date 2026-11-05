@@ -3432,6 +3432,30 @@ export function buildOpeningBacklinkReview(plan: SpeakerDecisionPlan, answers: R
   return { state: { ...base.state, backlinkCandidates: links, pairEvidence }, questions, links }
 }
 
+/** Build an isolated three-way formulation and unlabeled synthetic controls. */
+export function buildContrastiveOpeningLinkReview(review: NonNullable<ReturnType<typeof buildOpeningBacklinkReview>>) {
+  const questions: SpeakerDecisionPlan['questions'] = {}
+  const criteria = { same: 'The same person speaks both quotations.', different: 'Different people speak the quotations.', no_clear_identity: 'The evidence does not establish whether the speakers are the same.' }
+  for (const [id, link] of Object.entries(review.links)) {
+    questions[id] = {
+      type: 'choice',
+      instructions: `Compare the two current-message quotations in pairEvidence.${id}: target ${link.targetId} and anchor ${link.anchorId}. Decide whether the actual speakers are the same or different, or whether that cannot be established. Read the intervening narration and previous exchange, including who is addressed, who acts, pronouns and topic. A response or repeated word does not itself establish either same or different speakers. The anchor identity is a provisional clue, not proof.`,
+      criteria,
+    }
+  }
+  const controls = [
+    { id: 'control_continuation', text: '"Rain," Mira says. She looks at the clouds. "The washing will get wet."', first: 'Rain,', second: 'The washing will get wet.' },
+    { id: 'control_reply', text: '"Tea?" Mira asks. Rowan shakes his head. "Coffee, please," he replies.', first: 'Tea?', second: 'Coffee, please,' },
+    { id: 'control_uncertain', text: '"Wait." Someone moves behind the curtain. "Is the door open?"', first: 'Wait.', second: 'Is the door open?' },
+  ]
+  for (const control of controls) questions[control.id] = {
+    type: 'choice',
+    instructions: `Evaluate only the synthetic control ${control.id} in controls. Are its first and second quotations spoken by the same person, different people, or is that unclear? Do not use the chat or other controls as evidence.`,
+    criteria,
+  }
+  return { state: { ...review.state, controls }, questions, expectedControls: { control_continuation: 'same', control_reply: 'different', control_uncertain: 'no_clear_identity' } }
+}
+
 /** Apply only clear links to anchors that remain validated and unchanged. */
 export function applyOpeningBacklinkReview(plan: SpeakerDecisionPlan, answers: Record<string, SpeakerDecisionChoice>, reviewed: Record<string, SpeakerDecisionChoice>, links: Record<string, { targetId: string; anchorId: string; identity: string }>): void {
   const checked: Array<{ id: string; link: { targetId: string; anchorId: string; identity: string }; decision: string | null; result: SpeakerDecisionChoice }> = []

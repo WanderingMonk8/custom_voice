@@ -2049,6 +2049,28 @@ function buildOpeningBacklinkReview(plan, answers, context, cardSpeakerId) {
   if (!Object.keys(questions).length) return null;
   return { state: { ...base.state, backlinkCandidates: links, pairEvidence }, questions, links };
 }
+function buildContrastiveOpeningLinkReview(review) {
+  const questions = {};
+  const criteria = { same: "The same person speaks both quotations.", different: "Different people speak the quotations.", no_clear_identity: "The evidence does not establish whether the speakers are the same." };
+  for (const [id, link] of Object.entries(review.links)) {
+    questions[id] = {
+      type: "choice",
+      instructions: `Compare the two current-message quotations in pairEvidence.${id}: target ${link.targetId} and anchor ${link.anchorId}. Decide whether the actual speakers are the same or different, or whether that cannot be established. Read the intervening narration and previous exchange, including who is addressed, who acts, pronouns and topic. A response or repeated word does not itself establish either same or different speakers. The anchor identity is a provisional clue, not proof.`,
+      criteria
+    };
+  }
+  const controls = [
+    { id: "control_continuation", text: '"Rain," Mira says. She looks at the clouds. "The washing will get wet."', first: "Rain,", second: "The washing will get wet." },
+    { id: "control_reply", text: '"Tea?" Mira asks. Rowan shakes his head. "Coffee, please," he replies.', first: "Tea?", second: "Coffee, please," },
+    { id: "control_uncertain", text: '"Wait." Someone moves behind the curtain. "Is the door open?"', first: "Wait.", second: "Is the door open?" }
+  ];
+  for (const control of controls) questions[control.id] = {
+    type: "choice",
+    instructions: `Evaluate only the synthetic control ${control.id} in controls. Are its first and second quotations spoken by the same person, different people, or is that unclear? Do not use the chat or other controls as evidence.`,
+    criteria
+  };
+  return { state: { ...review.state, controls }, questions, expectedControls: { control_continuation: "same", control_reply: "different", control_uncertain: "no_clear_identity" } };
+}
 function applyOpeningBacklinkReview(plan, answers, reviewed, links) {
   const checked = [];
   for (const [id, link] of Object.entries(links)) {
@@ -5222,14 +5244,29 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
           const backlinkReview = !relationshipReviewFailed ? buildOpeningBacklinkReview(decisionPlan, answers, relationshipContext, titleMatchedCardSpeakerId) : null;
           if (backlinkReview) {
             const startedAt = Date.now();
+            const contrastive = payload.shadowEvaluation && payload.debug ? buildContrastiveOpeningLinkReview(backlinkReview) : null;
+            let contrastiveTimer;
+            const contrastivePromise = contrastive ? Promise.race([
+              Promise.resolve().then(() => spindle.decisions.evaluate({ state: contrastive.state, questions: contrastive.questions, ...userId ? { userId } : {} })).then((result2) => ({ result: result2, error: "", duration: Date.now() - startedAt })).catch(() => ({ result: null, error: "request failed", duration: Date.now() - startedAt })),
+              new Promise((resolve) => {
+                contrastiveTimer = setTimeout(() => resolve({ result: null, error: "timed out after 5s", duration: Date.now() - startedAt }), 5e3);
+              })
+            ]).finally(() => {
+              if (contrastiveTimer) clearTimeout(contrastiveTimer);
+            }) : null;
+            const baselineLinks = {};
             try {
               const result2 = await spindle.decisions.evaluate({ state: backlinkReview.state, questions: backlinkReview.questions, ...userId ? { userId } : {} });
               const reviewed = {};
               for (const [id, answer] of Object.entries(result2.answers)) {
-                if (answer.type === "choice") reviewed[id] = { choice: answer.choice, probabilities: answer.probabilities, confidence: answer.confidence };
+                if (answer.type === "choice") {
+                  reviewed[id] = { choice: answer.choice, probabilities: answer.probabilities, confidence: answer.confidence };
+                  baselineLinks[id] = reviewed[id];
+                }
               }
               const invalid = invalidSpeakerReviewAnswers(backlinkReview.questions, reviewed);
               if (invalid.length) {
+                for (const id of invalid) delete baselineLinks[id];
                 relationshipReviewFailed = true;
                 relationshipSceneDiagnostic += `; opening-links=incomplete (${invalid.length} invalid answers)`;
               } else {
@@ -5239,6 +5276,27 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
             } catch {
               relationshipReviewFailed = true;
               relationshipSceneDiagnostic += `; opening-links=failed/${Date.now() - startedAt}ms`;
+            }
+            if (contrastive && contrastivePromise) {
+              try {
+                const output = await contrastivePromise;
+                if (!output.result) relationshipSceneDiagnostic += `; contrastive-shadow=${output.error}`;
+                else {
+                  const reviewed = {};
+                  for (const [id, answer] of Object.entries(output.result.answers)) {
+                    if (answer.type === "choice") reviewed[id] = { choice: answer.choice, probabilities: answer.probabilities, confidence: answer.confidence };
+                  }
+                  const invalid = invalidSpeakerReviewAnswers(contrastive.questions, reviewed);
+                  if (invalid.length) relationshipSceneDiagnostic += `; contrastive-shadow=incomplete (${invalid.length} invalid answers)`;
+                  else {
+                    const pairs = Object.keys(backlinkReview.links).map((id) => `${id}:live=${baselineLinks[id]?.choice ?? "unavailable"},candidate=${reviewed[id].choice},confidence=${reviewed[id].confidence.toFixed(2)},probabilities=${JSON.stringify(reviewed[id].probabilities)}`);
+                    const controls = Object.entries(contrastive.expectedControls).map(([id, expected]) => `${id}:${reviewed[id].choice}/${expected}`);
+                    relationshipSceneDiagnostic += `; contrastive-shadow=${output.duration}ms, questions=${Object.keys(contrastive.questions).length}, pairs=[${pairs.join("; ")}], synthetic-controls=[${controls.join(", ")}] (candidate/expected; no routing changes)`;
+                  }
+                }
+              } catch {
+                relationshipSceneDiagnostic += "; contrastive-shadow=invalid response";
+              }
             }
           }
           const discourse = {
