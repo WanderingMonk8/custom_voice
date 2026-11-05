@@ -6,6 +6,7 @@
   "scripts": {
     "build": "node scripts/build.mjs",
     "test": "node scripts/test.mjs",
+    "evaluate:speakers": "node scripts/evaluate-speakers.mjs",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {

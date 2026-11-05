@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
+import { evaluateSpeakerReviews } from './speaker-review-evaluation'
 import {
   adaptiveGenerationConcurrency,
   addScannedFirstNameAliases,
@@ -2521,6 +2522,24 @@ test('global review avoids scene-wide inheritance and treats card as context onl
   applyRelationshipSpeakerReview(failed, failedAnswers, {}, {}, 'tessa', 'tessa', true)
   assert.equal(failedAnswers.speech_s0.choice, 'no_clear_identity')
   assert.equal(resolveSpeakerDecisionSegments(failed.state.message, failed, failedAnswers, speakers, { isUserMessage: false, cardSpeakerId: null, historicalSpeakerId: null, evidenceOnly: true }).find(segment => segment.text === 'What now?')?.speakerId, UNRESOLVED_SPEAKER_ID)
+})
+
+test('offline speaker evaluation scores paired cases and validates alignment', () => {
+  const cases = [
+    { id: 'reply', conversation: 'exchange-a', expected: ['ewan', 'ewan', null], baseline: ['user', null, null], candidate: ['ewan', 'ewan', 'ewan'], baselineMs: 100, candidateMs: 160 },
+    { id: 'phone', conversation: 'exchange-b', expected: ['mother', 'daughter'], baseline: ['mother', 'daughter'], candidate: ['mother', 'daughter'], baselineMs: 200, candidateMs: 250 },
+  ]
+  const result = evaluateSpeakerReviews(cases)
+  assert.equal(result.conversations, 2)
+  assert.equal(result.baseline.exactMatches, 3)
+  assert.equal(result.candidate.exactMatches, 4)
+  assert.equal(result.changed, 3)
+  assert.equal(result.improved, 2)
+  assert.equal(result.regressed, 1)
+  assert.equal(result.candidate.p95Ms, 250)
+  assert.throws(() => evaluateSpeakerReviews([{ ...cases[0], candidate: [] }]), /aligned/u)
+  assert.throws(() => evaluateSpeakerReviews([cases[0], cases[0]]), /unique/u)
+  assert.throws(() => evaluateSpeakerReviews([{ ...cases[0], candidateMs: Infinity }]), /finite/u)
 })
 
 test('run-focused shadow review keeps context while leaving the live plan and answers untouched', () => {
