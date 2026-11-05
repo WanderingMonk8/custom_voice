@@ -64,6 +64,7 @@ import {
   hasNamedSpeakerMention,
   hasNamedSpeakerSubject,
   mergeVoicePlan,
+  filterNarrationSegments,
   markUnresolvedSpeechSegments,
   normalizeSpeechBoundaryDashes,
   normalizeTtsTags,
@@ -2529,6 +2530,20 @@ test('global review avoids scene-wide inheritance and treats card as context onl
   assert.equal(resolveSpeakerDecisionSegments(failed.state.message, failed, failedAnswers, speakers, { isUserMessage: false, cardSpeakerId: null, historicalSpeakerId: null, evidenceOnly: true }).find(segment => segment.text === 'What now?')?.speakerId, UNRESOLVED_SPEAKER_ID)
 })
 
+test('dialogue-only filtering removes narration but keeps cast, user and unresolved speech', () => {
+  const segments = [
+    { text: 'Narration.', speakerId: null },
+    { text: 'A line.', speakerId: 'npc:ewan' },
+    { text: 'Unknown line.', speakerId: UNRESOLVED_SPEAKER_ID },
+    { text: 'User line.', speakerId: USER_SPEAKER_ID },
+    { text: 'Another narrator beat.', speakerId: null },
+  ]
+  assert.deepEqual(filterNarrationSegments(segments, true).map(item => item.text), ['A line.', 'Unknown line.', 'User line.'])
+  assert.deepEqual(filterNarrationSegments(segments, false), segments)
+  assert.deepEqual(filterNarrationSegments([{ text: 'Only narration.', speakerId: null }], true), [])
+  assert.equal(segments.length, 5)
+})
+
 test('offline speaker evaluation scores paired cases and validates alignment', () => {
   const cases = [
     { id: 'reply', conversation: 'exchange-a', expected: ['ewan', 'ewan', null], baseline: ['user', null, null], candidate: ['ewan', 'ewan', 'ewan'], baselineMs: 100, candidateMs: 160 },
@@ -2678,6 +2693,11 @@ test('agreement retains a clear first-pass identity without requiring override t
   applyRelationshipSpeakerReview(conflict.plan, conflict.answers, { relationship_s0: { choice: 'known_1', probabilities: { known_1: 0.75, known_0: 0.20, no_clear_identity: 0.05 }, confidence: 0.70 } }, {}, null, null, true)
   assert.ok(conflict.answers.global_uncertain_s0)
   assert.equal(conflict.answers.relationship_confirmed_s0, undefined)
+  const userPlan = buildSpeakerDecisionPlan('"Sacrifice."', [{ id: USER_SPEAKER_ID, name: 'Ken' }, { id: 'npc:ewan', name: 'Ewan' }], false)
+  const userAnswers: Record<string, SpeakerDecisionChoice> = { speech_s0: { choice: 'known_0', probabilities: { known_0: 0.75, known_1: 0.1, no_clear_identity: 0.15 }, confidence: 0.72 } }
+  applyRelationshipSpeakerReview(userPlan, userAnswers, { relationship_s0: { choice: 'known_0', probabilities: { known_0: 0.51, known_1: 0.16, no_clear_identity: 0.33 }, confidence: 0.48 } }, {}, null, null, true)
+  assert.ok(userAnswers.global_uncertain_s0)
+  assert.equal(userAnswers.relationship_confirmed_s0, undefined)
 })
 
 test('opening exchange review fills uncertain lines only for a strongly supported coherent speaker', () => {

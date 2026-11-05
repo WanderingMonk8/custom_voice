@@ -639,6 +639,11 @@ export interface PlaybackSegment {
   debugPath?: string[]
 }
 
+/** Suppress narration only after speaker classification; unresolved speech stays audible. */
+export function filterNarrationSegments(segments: PlaybackSegment[], skipNarration: boolean): PlaybackSegment[] {
+  return skipNarration ? segments.filter(segment => segment.speakerId !== null) : segments
+}
+
 export interface VoicePlanSegment {
   text: string
   voice: string
@@ -3425,7 +3430,7 @@ export function applyRelationshipSpeakerReview(plan: SpeakerDecisionPlan, answer
     const weakAgreement = evaluateSpeakerDecisionAnswer(result, options, { probability: 0.5, confidence: 0.45, margin: 0.05 }).identity
     const explicitAttribution = narrativeAttributionSpeaker(`${speech.narrativeBefore} ${speech.narrativeAfter}`, speakers)
     const confirmingIdentity = evaluateSpeakerDecisionAnswer(result, options, SPEAKER_DECISION_THRESHOLDS.local).identity
-      ?? (localOriginal && weakAgreement === localOriginal && (!explicitAttribution || explicitAttribution === localOriginal) ? localOriginal : null)
+      ?? (localOriginal && (localOriginal !== USER_SPEAKER_ID || plan.state.messageRole === 'user') && weakAgreement === localOriginal && (!explicitAttribution || explicitAttribution === localOriginal) ? localOriginal : null)
     if (globalMode && originalIdentity && originalIdentity !== UNCAST_SPEAKER_ID && confirmingIdentity === originalIdentity) {
       delete answers[`global_uncertain_${speech.id}`]
       answers[`relationship_confirmed_${speech.id}`] = result

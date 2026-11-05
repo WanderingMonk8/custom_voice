@@ -2071,7 +2071,7 @@ function applyRelationshipSpeakerReview(plan, answers, reviewed, ghostOptions, c
     const localOriginal = evaluateSpeakerDecisionAnswer(original, plan.optionSpeakerIds, { probability: 0.6, confidence: 0.55, margin: 0.3 }).identity;
     const weakAgreement = evaluateSpeakerDecisionAnswer(result, options, { probability: 0.5, confidence: 0.45, margin: 0.05 }).identity;
     const explicitAttribution = narrativeAttributionSpeaker(`${speech.narrativeBefore} ${speech.narrativeAfter}`, speakers);
-    const confirmingIdentity = evaluateSpeakerDecisionAnswer(result, options, SPEAKER_DECISION_THRESHOLDS.local).identity ?? (localOriginal && weakAgreement === localOriginal && (!explicitAttribution || explicitAttribution === localOriginal) ? localOriginal : null);
+    const confirmingIdentity = evaluateSpeakerDecisionAnswer(result, options, SPEAKER_DECISION_THRESHOLDS.local).identity ?? (localOriginal && (localOriginal !== USER_SPEAKER_ID || plan.state.messageRole === "user") && weakAgreement === localOriginal && (!explicitAttribution || explicitAttribution === localOriginal) ? localOriginal : null);
     if (globalMode && originalIdentity && originalIdentity !== UNCAST_SPEAKER_ID && confirmingIdentity === originalIdentity) {
       delete answers[`global_uncertain_${speech.id}`];
       answers[`relationship_confirmed_${speech.id}`] = result;
@@ -4987,7 +4987,7 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
           })),
           cardSpeakerId: titleMatchedCardSpeakerId,
           historicalSpeakerId,
-          relationshipReview: { version: "cross-message-run-10", context: relationshipContext, speakerLookback, strategy: payload.runReview === true ? "run" : "scene" },
+          relationshipReview: { version: "cross-message-run-11", context: relationshipContext, speakerLookback, strategy: payload.runReview === true ? "run" : "scene" },
           skippedTrackerTags
         }));
         const cached = config.parsedMessages[payload.messageId];
