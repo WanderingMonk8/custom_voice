@@ -17,6 +17,7 @@ import {
   buildAssistantUserSpeakerReview,
   buildRelationshipSpeakerReview,
   buildOpeningSpeakerReview,
+  applyOpeningExchangeReview,
   buildOpeningBacklinkReview,
   applyOpeningBacklinkReview,
   invalidSpeakerReviewAnswers,
@@ -1088,7 +1089,7 @@ function queueSpeakerParse(
           })),
           cardSpeakerId: titleMatchedCardSpeakerId,
           historicalSpeakerId,
-          relationshipReview: { version: 'cross-message-run-8', context: relationshipContext, speakerLookback, strategy: payload.runReview === true ? 'run' : 'scene' },
+          relationshipReview: { version: 'cross-message-run-9', context: relationshipContext, speakerLookback, strategy: payload.runReview === true ? 'run' : 'scene' },
           skippedTrackerTags,
         }))
         const cached = config.parsedMessages[payload.messageId]
@@ -1211,6 +1212,7 @@ function queueSpeakerParse(
                 relationshipSceneDiagnostic += `; opening-reread=incomplete (${invalid.length} invalid answers)`
               } else {
                 applyRelationshipSpeakerReview(decisionPlan, answers, reviewed, openingReview.ghostOptions, null, null, true)
+                applyOpeningExchangeReview(decisionPlan, answers, reviewed)
                 relationshipSceneDiagnostic += `; opening-reread=${Object.keys(openingReview.questions).length} questions/${Date.now() - startedAt}ms`
               }
             } catch {

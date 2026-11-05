@@ -3219,6 +3219,19 @@ export function buildOpeningSpeakerReview(plan: SpeakerDecisionPlan, answers: Re
     questions[`relationship_${id}`] = { ...question, instructions: `Re-read the opening exchange carefully. ${question.instructions} Identify the speaker of ${id} itself, not the user who authored an earlier message or an incidental person mentioned in narration. Use the preceding exchange and opening passage as evidence; choose no_clear_identity when they do not establish the speaker.` }
   }
   if (!Object.keys(questions).length) return null
+  if (openingRun.speechIds.length > 1) {
+    const criteria = questions[Object.keys(questions)[0]].criteria
+    questions.opening_exchange_pattern = {
+      type: 'choice',
+      instructions: 'Consider the complete opening dialogue run in the CURRENT message, together with the preceding exchange and narration. Do all quotations in this opening run belong to one actual speaker, or does a different person take a turn? A quoted response may echo the previous message without being spoken by its author. Consider interruptions, new entrants, changes of scene or channel, later clarification, and people merely mentioned or addressed. Select unclear if a speaker change cannot be ruled out.',
+      criteria: { single_speaker: 'All quotations in this opening run are spoken by one person.', multiple_speakers: 'At least two people speak in this opening run.', no_clear_identity: 'The number of speakers is unclear.' },
+    }
+    questions.opening_exchange_speaker = {
+      type: 'choice',
+      instructions: 'Identify the person who speaks the entire opening dialogue run in the CURRENT message, only if one speaker clearly accounts for every quotation. Compare the preceding user and assistant exchange, the opening reply, carried objects, pronouns, intervening actions and later dialogue. A message author, addressee or bystander is not automatically the speaker. If the run contains multiple speakers or identity is uncertain, choose no_clear_identity.',
+      criteria,
+    }
+  }
   const lastSpeech = plan.state.speeches.find(speech => speech.id === openingRun.speechIds.at(-1))
   const lastParagraph = plan.state.paragraphs.findIndex(paragraph => paragraph.id === lastSpeech?.paragraphId)
   const paragraphs = plan.state.paragraphs.slice(0, lastParagraph >= 0 ? lastParagraph + 2 : 1)
@@ -3236,6 +3249,41 @@ export function buildOpeningSpeakerReview(plan: SpeakerDecisionPlan, answers: Re
     ...review,
     questions,
     state: { ...review.state, message: paragraphs.map(paragraph => paragraph.text).join('\n\n'), paragraphs, speeches: plan.state.speeches.filter(speech => paragraphIds.has(speech.paragraphId)), runs: [openingRun], turns: plan.state.turns.filter(turn => openingRun.speechIds.includes(turn.speechId)), reviewedRuns: [openingRun], boundaryEvidence },
+  }
+}
+
+/** Reconcile an explicitly evaluated single-speaker opening without blanket inheritance. */
+export function applyOpeningExchangeReview(plan: SpeakerDecisionPlan, answers: Record<string, SpeakerDecisionChoice>, reviewed: Record<string, SpeakerDecisionChoice>): void {
+  const run = plan.state.runs.find(item => item.speechIds.includes('s0'))
+  if (!run || run.speechIds.length < 2) return
+  for (const id of run.speechIds) {
+    if (!answers[`global_uncertain_${id}`]) continue
+    if (reviewed.opening_exchange_pattern) answers[`opening_pattern_${id}`] = reviewed.opening_exchange_pattern
+    if (reviewed.opening_exchange_speaker) answers[`opening_speaker_${id}`] = reviewed.opening_exchange_speaker
+  }
+  const pattern = evaluateSpeakerDecisionAnswer(reviewed.opening_exchange_pattern, { single_speaker: 'single_speaker', multiple_speakers: 'multiple_speakers' }, { probability: 0.85, confidence: 0.8, margin: 0.3 })
+  const identity = evaluateSpeakerDecisionAnswer(reviewed.opening_exchange_speaker, plan.optionSpeakerIds, { probability: 0.85, confidence: 0.8, margin: 0.3 }).identity
+  if (pattern.identity !== 'single_speaker' || !identity || identity === UNCAST_SPEAKER_ID) return
+  const speakers = plan.state.speakers.map(speaker => ({ id: speaker.id, name: speaker.name }))
+  for (const id of run.speechIds) {
+    const speech = plan.state.speeches.find(item => item.id === id)
+    if (!speech) return
+    const explicit = narrativeAttributionSpeaker(`${speech.narrativeBefore} ${speech.narrativeAfter}`, speakers)
+    if (explicit && explicit !== identity) return
+    const existing = evaluateSpeakerDecisionAnswer(answers[`speech_${id}`], plan.optionSpeakerIds).identity
+    if (!answers[`global_uncertain_${id}`] && existing && existing !== UNCAST_SPEAKER_ID && existing !== identity) return
+    const reviewIdentity = evaluateSpeakerDecisionAnswer(reviewed[`relationship_${id}`], plan.optionSpeakerIds).identity
+    if (reviewIdentity && reviewIdentity !== UNCAST_SPEAKER_ID && reviewIdentity !== identity) return
+  }
+  for (const id of run.speechIds) {
+    if (!answers[`global_uncertain_${id}`]) continue
+    const choice = reviewed.opening_exchange_speaker
+    answers[`relationship_original_${id}`] = answers[`speech_${id}`]
+    answers[`speech_${id}`] = choice
+    answers[`relationship_exchange_${id}`] = choice
+    answers[`relationship_continuity_${id}`] = choice
+    answers[`relationship_global_${id}`] = choice
+    delete answers[`global_uncertain_${id}`]
   }
 }
 
@@ -6330,6 +6378,9 @@ export function resolveSpeakerDecisionSegments(
           ...(answers[`relationship_confirmed_${speech.id}`] ? ['jev-relationship-review:accepted first-pass identity confirmed'] : []),
           ...decisionAnswerDebug('jev-opening-backlink', answers[`backlink_review_${speech.id}`], { same: 'same', different_or_unclear: 'different_or_unclear' }),
           ...(answers[`relationship_backlink_${speech.id}`] ? ['jev-opening-backlink:accepted same-speaker link to later validated quote'] : []),
+          ...(answers[`relationship_exchange_${speech.id}`] ? ['jev-opening-exchange:strong single-speaker review applied'] : []),
+          ...decisionAnswerDebug('jev-opening-exchange-pattern', answers[`opening_pattern_${speech.id}`], { single_speaker: 'single_speaker', multiple_speakers: 'multiple_speakers' }),
+          ...decisionAnswerDebug('jev-opening-exchange-speaker', answers[`opening_speaker_${speech.id}`], plan.optionSpeakerIds),
           ...(answers[`global_uncertain_${speech.id}`] ? ['jev-global-review:uncertain; unsupported identity and chain fill suppressed'] : []),
           ...decisionAnswerDebug('jev-user-review-original', answers[`user_review_original_${speech.id}`], plan.optionSpeakerIds),
           ...decisionAnswerDebug('jev-user-review', answers[`user_review_${speech.id}`], plan.optionSpeakerIds),

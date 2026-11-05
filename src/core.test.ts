@@ -21,6 +21,7 @@ import {
   buildAssistantUserSpeakerReview,
   buildRelationshipSpeakerReview,
   buildOpeningSpeakerReview,
+  applyOpeningExchangeReview,
   buildOpeningBacklinkReview,
   applyOpeningBacklinkReview,
   invalidSpeakerReviewAnswers,
@@ -2672,6 +2673,37 @@ test('agreement retains a clear first-pass identity without requiring override t
   applyRelationshipSpeakerReview(conflict.plan, conflict.answers, { relationship_s0: { choice: 'known_1', probabilities: { known_1: 0.75, known_0: 0.20, no_clear_identity: 0.05 }, confidence: 0.70 } }, {}, null, null, true)
   assert.ok(conflict.answers.global_uncertain_s0)
   assert.equal(conflict.answers.relationship_confirmed_s0, undefined)
+})
+
+test('opening exchange review fills uncertain lines only for a strongly supported coherent speaker', () => {
+  const speakers = [{ id: 'npc:ewan', name: 'Ewan' }, { id: USER_SPEAKER_ID, name: 'Ken' }]
+  const plan = buildSpeakerDecisionPlan('"Sacrifice."\n\nHe turns with the tray.\n\n"The noodles?"\n\n"No, I know what you meant."', speakers, false)
+  const context = { previousMessages: [{ id: 'prior', role: 'user' as const, text: 'I turn to Ewan. "Sometimes you sacrifice."' }], ghosts: [] }
+  const make = () => ({ speech_s0: confidentDecision('known_1'), speech_s1: confidentDecision('no_clear_identity'), speech_s2: confidentDecision('known_0'), global_uncertain_s0: confidentDecision('no_clear_identity'), global_uncertain_s1: confidentDecision('no_clear_identity') } as Record<string, SpeakerDecisionChoice>)
+  const answers = make()
+  const review = buildOpeningSpeakerReview(plan, answers, context, null)!
+  assert.ok(review.questions.opening_exchange_pattern)
+  assert.ok(review.questions.opening_exchange_speaker)
+  const supported = { opening_exchange_pattern: confidentDecision('single_speaker'), opening_exchange_speaker: confidentDecision('known_0') }
+  applyOpeningExchangeReview(plan, answers, supported)
+  assert.equal(answers.speech_s0.choice, 'known_0')
+  assert.equal(answers.speech_s1.choice, 'known_0')
+  assert.equal(answers.global_uncertain_s0, undefined)
+  assert.ok(answers.relationship_exchange_s0)
+  const mixed = make()
+  applyOpeningExchangeReview(plan, mixed, { ...supported, opening_exchange_pattern: confidentDecision('multiple_speakers') })
+  assert.ok(mixed.global_uncertain_s0)
+  assert.equal(mixed.opening_pattern_s0.choice, 'multiple_speakers')
+  const weak = make()
+  applyOpeningExchangeReview(plan, weak, { ...supported, opening_exchange_speaker: { choice: 'known_0', probabilities: { known_0: 0.60, known_1: 0.40 }, confidence: 0.55 } })
+  assert.ok(weak.global_uncertain_s0)
+  const conflict = make()
+  conflict.speech_s2 = confidentDecision('known_1')
+  applyOpeningExchangeReview(plan, conflict, supported)
+  assert.ok(conflict.global_uncertain_s0)
+  const perSpeechConflict = make()
+  applyOpeningExchangeReview(plan, perSpeechConflict, { ...supported, relationship_s1: confidentDecision('known_1') })
+  assert.ok(perSpeechConflict.global_uncertain_s1)
 })
 
 test('backward links require a strong independent same-speaker answer and a validated later anchor', () => {
