@@ -30,6 +30,7 @@ import {
   applyBestAvailableSpeakerReview,
   buildSelfIntroductionReview,
   applySelfIntroductionReview,
+  applyExplicitPostQuoteVoiceAttributions,
   buildSpeakerSwitchContradictionReview,
   applySpeakerSwitchContradictionReview,
   applyOpeningBacklinkReview,
@@ -1104,7 +1105,7 @@ function queueSpeakerParse(
           })),
           cardSpeakerId: titleMatchedCardSpeakerId,
           historicalSpeakerId,
-          relationshipReview: { version: 'cross-message-run-16', context: relationshipContext, speakerLookback, strategy: payload.runReview === true ? 'run' : 'scene', focusedOpeningFallback: payload.focusedOpeningFallback === true, bestAvailableSpeaker: payload.bestAvailableSpeaker === true },
+          relationshipReview: { version: 'cross-message-run-17', context: relationshipContext, speakerLookback, strategy: payload.runReview === true ? 'run' : 'scene', focusedOpeningFallback: payload.focusedOpeningFallback === true, bestAvailableSpeaker: payload.bestAvailableSpeaker === true },
           skippedTrackerTags,
         }))
         const cached = config.parsedMessages[payload.messageId]
@@ -1240,6 +1241,7 @@ function queueSpeakerParse(
             applyContextualUserReconciliation(decisionPlan, answers, reviewed, personaReview.questions)
           }
           answers.persona_phase_complete = { choice: 'complete', probabilities: {}, confidence: 0 }
+          applyExplicitPostQuoteVoiceAttributions(decisionPlan, answers)
           // Re-read only unresolved opening quotations with the nearest exchange.
           // This is a fresh bounded decision, never an unconditional inheritance.
           const openingReview = !relationshipReviewFailed ? buildOpeningSpeakerReview(decisionPlan, answers, relationshipContext, titleMatchedCardSpeakerId) : null
@@ -1405,7 +1407,7 @@ function queueSpeakerParse(
                 else {
                   applySpeakerSwitchContradictionReview(decisionPlan, answers, switchReview, reviewed)
                   relationshipSceneDiagnostic += `; speaker-switch-review=${switchReview.runs.length} runs, ${Object.keys(answers).filter(id => id.startsWith('switch_reconciled_')).length} reconciled`
-                  if (payload.debug) relationshipSceneDiagnostic += `; speaker-switch-decisions=${JSON.stringify(Object.fromEntries(Object.entries(reviewed).map(([id, value]) => [id, { choice: value.choice, confidence: value.confidence, probabilities: value.probabilities }])))}`
+                  if (payload.debug) relationshipSceneDiagnostic += `; speaker-switch-candidates=${JSON.stringify(switchReview.ghostOptions)}; speaker-switch-decisions=${JSON.stringify(Object.fromEntries(Object.entries(reviewed).map(([id, value]) => [id, { choice: value.choice, confidence: value.confidence, probabilities: value.probabilities }])))}`
                 }
               } catch {
                 speakerSwitchRetry = true

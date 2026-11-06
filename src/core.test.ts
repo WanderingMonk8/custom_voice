@@ -39,6 +39,7 @@ import {
   applyBestAvailableSpeakerReview,
   buildSelfIntroductionReview,
   applySelfIntroductionReview,
+  applyExplicitPostQuoteVoiceAttributions,
   buildSpeakerSwitchContradictionReview,
   applySpeakerSwitchContradictionReview,
   applyOpeningBacklinkReview,
@@ -2951,6 +2952,64 @@ test('speaker feature defaults enable unset values while preserving explicit opt
   assert.equal(enabledUnlessExplicitlyDisabled(undefined), true)
   assert.equal(enabledUnlessExplicitlyDisabled(true), true)
   assert.equal(enabledUnlessExplicitlyDisabled(false), false)
+})
+
+test('immediate named voice attribution anchors the preceding quote but not an introduced next quote', () => {
+  const speakers = [{ id: 'unconfigured:maeve', name: 'Maeve' }, { id: 'unconfigured:erin', name: 'Erin' }, { id: USER_SPEAKER_ID, name: 'Ken' }]
+  const text = '"Decided what?"\n\nMaeve’s voice comes from the other side of Erin, flat and absolutely awake.\n\n"Whether I sleep in my boots."'
+  const plan = buildSpeakerDecisionPlan(text, speakers, false)
+  const answers: Record<string, SpeakerDecisionChoice> = { speech_s0: confidentDecision('known_1'), global_uncertain_s0: confidentDecision('no_clear_identity') }
+  applyExplicitPostQuoteVoiceAttributions(plan, answers)
+  assert.equal(answers.speech_s0.choice, 'known_0')
+  assert.ok(answers.explicit_voice_attribution_s0)
+  assert.equal(answers.global_uncertain_s0, undefined)
+  const nextQuote = buildSpeakerDecisionPlan('"Hello."\n\nMaeve’s voice comes over the phone. "I am here."', speakers, false)
+  const unchanged: Record<string, SpeakerDecisionChoice> = { speech_s0: confidentDecision('known_1') }
+  applyExplicitPostQuoteVoiceAttributions(nextQuote, unchanged)
+  assert.equal(unchanged.speech_s0.choice, 'known_1')
+  assert.equal(unchanged.explicit_voice_attribution_s0, undefined)
+})
+
+test('an explicit named-voice anchor can resolve a strong switch and independently linked smoker lines', () => {
+  const speakers = [{ id: 'unconfigured:maeve', name: 'Maeve' }, { id: 'unconfigured:erin', name: 'Erin' }, { id: USER_SPEAKER_ID, name: 'Ken' }]
+  const text = 'The smoker sits by the window. "Lamp is out," she says. "I did not light it."\n\n"Decided what?"\n\nMaeve’s voice comes from the other side of Erin.\n\n"Whether I sleep in my boots." The smoker puts her boots down. "Boots stay."'
+  const plan = buildSpeakerDecisionPlan(text, speakers, false)
+  const answers: Record<string, SpeakerDecisionChoice> = {}
+  for (const speech of plan.state.speeches) answers[`speech_${speech.id}`] = confidentDecision('known_0')
+  answers.speech_s2 = { choice: 'known_0', probabilities: { known_0: 0.34, known_1: 0.22, no_clear_identity: 0.44 }, confidence: 0.27 }
+  answers.turn_s2 = confidentDecision('responds_to_previous_speaker')
+  answers.global_uncertain_s2 = confidentDecision('no_clear_identity')
+  applyExplicitPostQuoteVoiceAttributions(plan, answers)
+  assert.ok(answers.explicit_voice_attribution_s2)
+  const context = { previousMessages: [{ id: 'prior', role: 'user' as const, text: 'Erin lies beside me.' }], ghosts: [] }
+  const review = buildSpeakerSwitchContradictionReview(plan, answers, context)
+  assert.equal(review.runs.length, 1)
+  const run = review.runs[0]
+  const results: Record<string, SpeakerDecisionChoice> = {
+    [`switch_${run.id}`]: { choice: 'different', probabilities: { different: 0.73, same_or_unclear: 0.27 }, confidence: 0.46 },
+    [`switch_speaker_${run.id}_s1`]: { choice: 'uncast_character', probabilities: { uncast_character: 0.8, known_0: 0.2 }, confidence: 0.77 },
+    [`switch_speaker_${run.id}_s2`]: confidentDecision('known_1'),
+    [`switch_speaker_${run.id}_s0`]: confidentDecision('no_clear_identity'),
+    [`switch_speaker_${run.id}_s3`]: confidentDecision('no_clear_identity'),
+    [`switch_speaker_${run.id}_s4`]: confidentDecision('no_clear_identity'),
+    [`switch_link_${run.id}_s0`]: confidentDecision('previous'),
+    [`switch_link_${run.id}_s3`]: confidentDecision('previous'),
+    [`switch_link_${run.id}_s4`]: confidentDecision('previous'),
+  }
+  applySpeakerSwitchContradictionReview(plan, answers, review, results)
+  const segments = resolveSpeakerDecisionSegments(text, plan, answers, speakers, { isUserMessage: false, cardSpeakerId: null, historicalSpeakerId: null, evidenceOnly: true })
+  assert.deepEqual(segments.filter(segment => segment.speakerId !== null).map(segment => segment.speakerId), [UNCAST_SPEAKER_ID, UNCAST_SPEAKER_ID, 'unconfigured:maeve', UNCAST_SPEAKER_ID, UNCAST_SPEAKER_ID])
+  assert.ok(answers.switch_link_reconciled_s3)
+  const duplicatePlan = buildSpeakerDecisionPlan(text, speakers, false)
+  const duplicateAnswers: Record<string, SpeakerDecisionChoice> = {}
+  for (const speech of duplicatePlan.state.speeches) duplicateAnswers[`speech_${speech.id}`] = confidentDecision('known_0')
+  duplicateAnswers.turn_s2 = confidentDecision('responds_to_previous_speaker')
+  applyExplicitPostQuoteVoiceAttributions(duplicatePlan, duplicateAnswers)
+  const duplicateContext = { ...context, ghosts: [{ id: 'same-maeve', label: 'Maeve', aliases: ['Maeve'], context: '', conversationHistory: [{ messageId: 'prior', text: 'Maeve is present.' }] }] }
+  const duplicateReview = buildSpeakerSwitchContradictionReview(duplicatePlan, duplicateAnswers, duplicateContext)
+  const duplicateResults = { ...results, [`switch_speaker_${run.id}_s1`]: { choice: 'switch_ghost_0', probabilities: { switch_ghost_0: 0.8, known_0: 0.2 }, confidence: 0.77 } }
+  applySpeakerSwitchContradictionReview(duplicatePlan, duplicateAnswers, duplicateReview, duplicateResults)
+  assert.equal(duplicateAnswers.speech_s1.choice, 'known_0')
 })
 
 test('speaker-switch review separates an unnamed respondent from a named speaker without forcing ambiguous switches', () => {
