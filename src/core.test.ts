@@ -2557,12 +2557,22 @@ test('reviews a name introduced in narration for an otherwise uncast speaker', (
   assert.ok(plan.questions.narrative_name_g0)
   const answers: Record<string, SpeakerDecisionChoice> = { narrative_name_g0: confidentDecision(`name_${index}`), identity_g0: confidentDecision('new_or_unclear') }
   const review = buildUncastIdentityReview(groups, answers, current, ghosts, 'current', context.previousMessages)
+  assert.ok(review.questions.review_continuity_g0_0)
+  assert.match(review.questions.review_continuity_g0_0.instructions, /intervening user message/u)
   assert.ok(review.questions.review_reveal_g0_0)
   assert.ok(review.questions.review_scene_g0_0)
   const linked = resolveUncastVoiceDecisions(groups, [], { ...answers, review_scene_g0_0: confidentDecision('same') }, ghosts, [], 'current', current, ['first'])
   assert.equal(linked[0]?.ghostId, 'woman')
   assert.equal(linked[0]?.voiceId, 'original-voice')
   assert.ok(linked[0]?.aliases?.includes('leah'))
+  const doubtful = { ...answers, review_reveal_g0_0: confidentDecision('different_or_unclear'), review_scene_g0_0: confidentDecision('different_or_unclear') }
+  const continuity = resolveUncastVoiceDecisions(groups, [], { ...doubtful, review_continuity_g0_0: confidentDecision('same') }, ghosts, [], 'current', current, ['first'])
+  assert.equal(continuity[0]?.voiceId, 'original-voice')
+  assert.ok(continuity[0]?.aliases?.includes('leah'))
+  assert.equal(resolveUncastVoiceDecisions(groups, [], { ...doubtful, review_continuity_g0_0: confidentDecision('unclear') }, ghosts, [], 'current', current, ['first']).length, 0)
+  assert.equal(resolveUncastVoiceDecisions(groups, [], { ...answers, review_scene_g0_0: confidentDecision('same'), review_continuity_g0_0: confidentDecision('different') }, ghosts, [], 'current', current, ['first']).length, 0)
+  const competing = { ...ghosts[0], id: 'other', voiceId: 'other-voice' }
+  assert.equal(resolveUncastVoiceDecisions(groups, [], { ...doubtful, review_continuity_g0_0: confidentDecision('same'), review_continuity_g0_1: confidentDecision('same') }, [...ghosts, competing], [], 'current', current, ['first']).length, 0)
   const stale = { ...ghosts[0], id: 'stale-current', voiceId: 'wrong-voice', occurrenceKeys: [`current:${hashMessageContent('Morning’s been morning.')}`], lastSeenMessageId: 'current', conversationHistory: [] }
   const recovered = resolveUncastVoiceDecisions(groups, [], { ...answers, review_occurrence_g0_1: confidentDecision('different_or_unclear'), review_scene_g0_0: confidentDecision('same') }, [...ghosts, stale], [], 'current', current, ['first'])
   assert.equal(recovered[0]?.ghostId, 'woman')

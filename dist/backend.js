@@ -278,6 +278,18 @@ function buildUncastIdentityReview(groups, answers, message, ghosts = [], messag
         if (Object.keys(questions).length >= 16) break;
         const aliases = ghostCastAliases(ghost);
         if (aliases.some((alias) => !isDescriptiveGhostLabel(alias))) continue;
+        const priorAssistant = [...previousMessages].reverse().find((item) => item.role === "assistant");
+        const priorAssistantIndex = priorAssistant ? previousMessages.indexOf(priorAssistant) : -1;
+        const interveningUser = priorAssistantIndex >= 0 && previousMessages.slice(priorAssistantIndex + 1).some((item) => item.role === "user");
+        const linkedToPrior = !!priorAssistant && (ghost.lastSeenMessageId === priorAssistant.id || (ghost.conversationHistory ?? []).some((item) => item.messageId === priorAssistant.id));
+        if (interveningUser && linkedToPrior) {
+          questions[`review_continuity_${group.id}_${ghostIndex}`] = {
+            type: "choice",
+            instructions: `Compare ghost_${ghostIndex}'s actual speech in the immediately preceding assistant message with the intervening user message and current group ${group.id}, now identified as ${revealedName}. The user may address the earlier speaker and the current dialogue may directly answer that user's question: follow the conversation and narrative actions across all three messages. Do not assume every speaker in the earlier message is this ghost, or that the same setting alone proves identity. Is this clearly the same person, clearly a different person, or genuinely uncertain?`,
+            criteria: { same: "The conversation and scene clearly identify the same person.", different: "The evidence clearly establishes different people.", unclear: "There is not enough evidence to decide." }
+          };
+          if (Object.keys(questions).length >= 16) break;
+        }
         const key = `review_reveal_${group.id}_${ghostIndex}`;
         questions[key] = {
           type: "choice",
@@ -391,8 +403,10 @@ function resolveUncastVoiceDecisions(groups, voices, answers, ghosts = [], reser
         if (candidate.id === occurrence.id) return [];
         const reveal = answers[`review_reveal_${group.id}_${index}`];
         const scene = answers[`review_scene_${group.id}_${index}`];
-        const rejected = [reveal, scene].some((review) => review?.choice === "different_or_unclear" && strongChoice(review));
-        const confirmed = [reveal, scene].some((review) => review?.choice === "same" && strongChoice(review)) || identityAnswer?.choice === `ghost_${index}` && strongChoice(identityAnswer);
+        const continuity = answers[`review_continuity_${group.id}_${index}`];
+        const continuitySame = continuity?.choice === "same" && strongChoice(continuity);
+        const rejected = continuity?.choice === "different" && strongChoice(continuity) || !continuitySame && [reveal, scene].some((review) => review?.choice === "different_or_unclear" && strongChoice(review));
+        const confirmed = continuitySame || [reveal, scene].some((review) => review?.choice === "same" && strongChoice(review)) || identityAnswer?.choice === `ghost_${index}` && strongChoice(identityAnswer);
         return !rejected && confirmed ? [candidate] : [];
       });
       if (alternatives.length === 1) {
@@ -426,8 +440,10 @@ function resolveUncastVoiceDecisions(groups, voices, answers, ghosts = [], reser
         if (confirmedNew && candidate.id === occurrence?.id) return [];
         const reveal = answers[`review_reveal_${group.id}_${index}`];
         const scene = answers[`review_scene_${group.id}_${index}`];
-        const rejected = [reveal, scene].some((review) => review?.choice === "different_or_unclear" && strongChoice(review));
-        return !rejected && [reveal, scene].some((review) => review?.choice === "same" && strongChoice(review)) ? [candidate] : [];
+        const continuity = answers[`review_continuity_${group.id}_${index}`];
+        const continuitySame = continuity?.choice === "same" && strongChoice(continuity);
+        const rejected = continuity?.choice === "different" && strongChoice(continuity) || !continuitySame && [reveal, scene].some((review) => review?.choice === "different_or_unclear" && strongChoice(review));
+        return !rejected && (continuitySame || [reveal, scene].some((review) => review?.choice === "same" && strongChoice(review))) ? [candidate] : [];
       });
       if (confirmed.length === 1) {
         ghost = confirmed[0];
@@ -6528,13 +6544,14 @@ spindle.onFrontendMessage(async (rawPayload, userId, frontendSessionId) => {
             const identity = answers[`identity_${group.id}`];
             const label = answers[`label_${group.id}`];
             const voice = answers[`voice_${group.id}`];
-            const comparisons = Object.entries(answers).filter(([key]) => key.startsWith(`same_${group.id}_`) || key.startsWith(`review_same_${group.id}_`) || key.startsWith(`review_ghost_${group.id}_`) || key.startsWith(`review_occurrence_${group.id}_`) || key.startsWith(`review_occurrence_disposition_${group.id}_`) || key.startsWith(`review_reveal_${group.id}_`) || key.startsWith(`review_scene_${group.id}_`)).map(([key, answer]) => `${key}=${answer.choice} confidence=${answer.confidence} probabilities=${JSON.stringify(answer.probabilities)}`).join(";") || "none";
+            const comparisons = Object.entries(answers).filter(([key]) => key.startsWith(`same_${group.id}_`) || key.startsWith(`review_same_${group.id}_`) || key.startsWith(`review_ghost_${group.id}_`) || key.startsWith(`review_occurrence_${group.id}_`) || key.startsWith(`review_occurrence_disposition_${group.id}_`) || key.startsWith(`review_reveal_${group.id}_`) || key.startsWith(`review_scene_${group.id}_`) || key.startsWith(`review_continuity_${group.id}_`)).map(([key, answer]) => `${key}=${answer.choice} confidence=${answer.confidence} probabilities=${JSON.stringify(answer.probabilities)}`).join(";") || "none";
             const narrativeName = answers[`narrative_name_${group.id}`];
             const assignment = assignments.find((item) => item.groupId === group.id);
             const proposed = proposedAssignments.find((item) => item.groupId === group.id);
             return `${group.id} segments=${group.segmentIndexes.map((index) => index + 1).join(",")} identity=${identity ? `${identity.choice} confidence=${identity.confidence} probabilities=${JSON.stringify(identity.probabilities)}` : "none"} label=${label ? `${label.choice} confidence=${label.confidence} probabilities=${JSON.stringify(label.probabilities)}` : "none"} narrative-name=${narrativeName ? `${narrativeName.choice} (${plan.state.narrativeNames[Number(narrativeName.choice.replace("name_", ""))] ?? "none"}) confidence=${narrativeName.confidence} probabilities=${JSON.stringify(narrativeName.probabilities)}` : "none"} comparisons=${comparisons} proposed=${proposed ? `${proposed.ghostId} / ${proposed.voiceId} / ${proposed.gender}` : "none"} match-reason=${proposed?.matchReason ?? "none"} voice-choice=${voice ? `${voice.choice} confidence=${voice.confidence} probabilities=${JSON.stringify(voice.probabilities)}` : "none"} final=${assignment ? `${assignment.label || "unnamed"} / ${assignment.ghostId} / ${assignment.voiceId}` : "connection default"}`;
           });
           diagnostics.unshift(`Available favorites=${voices.length}, historical ghosts=${ghosts.length}, current ghosts=${currentGhosts.length}; prior messages=${matchingContext.previousMessages.length}${decisionError ? `; Jev failed: ${decisionError}` : ""}; identity review questions=${Object.keys(review.questions).length}${reviewError ? `; review failed: ${reviewError}` : ""}.`);
+          diagnostics.splice(1, 0, `Candidate context: ${ghosts.map((ghost, index) => `ghost_${index}=${ghost.id} last=${ghost.lastSeenMessageId || "none"} history=${(ghost.conversationHistory ?? []).map((entry) => `${entry.messageId}(${entry.text.length} chars)`).join(",") || "none"} context=${ghost.context.length} chars`).join("; ") || "none"}; prior=${matchingContext.previousMessages.map((item) => `${item.role ?? "unknown"}:${item.id}(${item.text.length} chars)`).join(",") || "none"}.`);
           sendFrontend({ type: "chat_voice_uncast_matches", requestId: payload.requestId, assignments, diagnostics }, userId, frontendSessionId);
           if (assignments.length) await sendState(userId, void 0, payload.chatId, frontendSessionId);
         }

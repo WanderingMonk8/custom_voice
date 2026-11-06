@@ -404,6 +404,18 @@ export function buildUncastIdentityReview(groups: UncastVoiceGroup[], answers: R
         if (Object.keys(questions).length >= 16) break
         const aliases = ghostCastAliases(ghost)
         if (aliases.some(alias => !isDescriptiveGhostLabel(alias))) continue
+        const priorAssistant = [...previousMessages].reverse().find(item => item.role === 'assistant')
+        const priorAssistantIndex = priorAssistant ? previousMessages.indexOf(priorAssistant) : -1
+        const interveningUser = priorAssistantIndex >= 0 && previousMessages.slice(priorAssistantIndex + 1).some(item => item.role === 'user')
+        const linkedToPrior = !!priorAssistant && (ghost.lastSeenMessageId === priorAssistant.id || (ghost.conversationHistory ?? []).some(item => item.messageId === priorAssistant.id))
+        if (interveningUser && linkedToPrior) {
+          questions[`review_continuity_${group.id}_${ghostIndex}`] = {
+            type: 'choice',
+            instructions: `Compare ghost_${ghostIndex}'s actual speech in the immediately preceding assistant message with the intervening user message and current group ${group.id}, now identified as ${revealedName}. The user may address the earlier speaker and the current dialogue may directly answer that user's question: follow the conversation and narrative actions across all three messages. Do not assume every speaker in the earlier message is this ghost, or that the same setting alone proves identity. Is this clearly the same person, clearly a different person, or genuinely uncertain?`,
+            criteria: { same: 'The conversation and scene clearly identify the same person.', different: 'The evidence clearly establishes different people.', unclear: 'There is not enough evidence to decide.' },
+          }
+          if (Object.keys(questions).length >= 16) break
+        }
         const key = `review_reveal_${group.id}_${ghostIndex}`
         questions[key] = {
           type: 'choice',
@@ -536,8 +548,10 @@ export function resolveUncastVoiceDecisions(
         if (candidate.id === occurrence.id) return []
         const reveal = answers[`review_reveal_${group.id}_${index}`]
         const scene = answers[`review_scene_${group.id}_${index}`]
-        const rejected = [reveal, scene].some(review => review?.choice === 'different_or_unclear' && strongChoice(review))
-        const confirmed = [reveal, scene].some(review => review?.choice === 'same' && strongChoice(review))
+        const continuity = answers[`review_continuity_${group.id}_${index}`]
+        const continuitySame = continuity?.choice === 'same' && strongChoice(continuity)
+        const rejected = continuity?.choice === 'different' && strongChoice(continuity) || (!continuitySame && [reveal, scene].some(review => review?.choice === 'different_or_unclear' && strongChoice(review)))
+        const confirmed = continuitySame || [reveal, scene].some(review => review?.choice === 'same' && strongChoice(review))
           || (identityAnswer?.choice === `ghost_${index}` && strongChoice(identityAnswer))
         return !rejected && confirmed ? [candidate] : []
       })
@@ -566,8 +580,10 @@ export function resolveUncastVoiceDecisions(
         if (confirmedNew && candidate.id === occurrence?.id) return []
         const reveal = answers[`review_reveal_${group.id}_${index}`]
         const scene = answers[`review_scene_${group.id}_${index}`]
-        const rejected = [reveal, scene].some(review => review?.choice === 'different_or_unclear' && strongChoice(review))
-        return !rejected && [reveal, scene].some(review => review?.choice === 'same' && strongChoice(review)) ? [candidate] : []
+        const continuity = answers[`review_continuity_${group.id}_${index}`]
+        const continuitySame = continuity?.choice === 'same' && strongChoice(continuity)
+        const rejected = continuity?.choice === 'different' && strongChoice(continuity) || (!continuitySame && [reveal, scene].some(review => review?.choice === 'different_or_unclear' && strongChoice(review)))
+        return !rejected && (continuitySame || [reveal, scene].some(review => review?.choice === 'same' && strongChoice(review))) ? [candidate] : []
       })
       if (confirmed.length === 1) { ghost = confirmed[0]; reason = 'Jev name-reveal review' }
     }
