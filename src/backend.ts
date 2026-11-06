@@ -1109,7 +1109,7 @@ function queueSpeakerParse(
           })),
           cardSpeakerId: titleMatchedCardSpeakerId,
           historicalSpeakerId,
-          relationshipReview: { version: 'cross-message-run-22', context: relationshipContext, speakerLookback, strategy: payload.runReview === true ? 'run' : 'scene', focusedOpeningFallback: payload.focusedOpeningFallback === true, bestAvailableSpeaker: payload.bestAvailableSpeaker === true },
+          relationshipReview: { version: 'cross-message-run-22', context: relationshipContext, speakerLookback, strategy: payload.runReview !== false ? 'run' : 'scene', focusedOpeningFallback: payload.focusedOpeningFallback === true, bestAvailableSpeaker: payload.bestAvailableSpeaker !== false },
           skippedTrackerTags,
         }))
         const cached = config.parsedMessages[payload.messageId]
@@ -1164,7 +1164,7 @@ function queueSpeakerParse(
           const relationshipReview = buildRelationshipSpeakerReview(decisionPlan, answers, relationshipContext, null, {
             cardSpeakerId: titleMatchedCardSpeakerId,
             targets: [...new Set(discourseAssessment.runs.flatMap(run => run.targets))],
-            strategy: payload.runReview === true ? 'run' : 'scene',
+            strategy: payload.runReview !== false ? 'run' : 'scene',
           })
           // The experimental review owns its answers and option map. It must never
           // affect the live plan, cache, cast, or ghost assignment pipeline.
@@ -1173,7 +1173,7 @@ function queueSpeakerParse(
           const shadowReview = payload.shadowEvaluation ? buildRelationshipSpeakerReview(shadowPlan, shadowAnswers, relationshipContext, null, {
             cardSpeakerId: titleMatchedCardSpeakerId,
             targets: [...new Set(discourseAssessment.runs.flatMap(run => run.targets))],
-            strategy: payload.runReview === true ? 'scene' : 'run',
+            strategy: payload.runReview !== false ? 'scene' : 'run',
           }) : null
           const shadowStartedAt = Date.now()
           let shadowTimer: ReturnType<typeof setTimeout> | undefined
@@ -1188,7 +1188,7 @@ function queueSpeakerParse(
           let bestAvailableRetry = false
           let selfIntroductionRetry = false
           let speakerSwitchRetry = false
-          let relationshipSceneDiagnostic = `strategy=${payload.runReview === true ? 'run' : 'scene'}; global-context=${relationshipContext.previousMessages.length} messages, ${relationshipContext.previousMessages.reduce((sum, item) => sum + item.text.length, 0)} characters; target=${decisionPlan.state.message.length} characters; first-pass=${decisionQuestionCount} questions/${firstPassDuration}ms; review=${Object.keys(relationshipReview.questions).length} questions; candidates=${Object.entries(relationshipReview.ghostOptions).map(([option, id]) => `${option}=${id}`).join(',') || 'none'}`
+          let relationshipSceneDiagnostic = `strategy=${payload.runReview !== false ? 'run' : 'scene'}; global-context=${relationshipContext.previousMessages.length} messages, ${relationshipContext.previousMessages.reduce((sum, item) => sum + item.text.length, 0)} characters; target=${decisionPlan.state.message.length} characters; first-pass=${decisionQuestionCount} questions/${firstPassDuration}ms; review=${Object.keys(relationshipReview.questions).length} questions; candidates=${Object.entries(relationshipReview.ghostOptions).map(([option, id]) => `${option}=${id}`).join(',') || 'none'}`
           if (Object.keys(relationshipReview.questions).length) {
             const reviewStartedAt = Date.now()
             try {
@@ -1428,7 +1428,7 @@ function queueSpeakerParse(
               } finally { if (timer) clearTimeout(timer) }
             }
           }
-          if (payload.bestAvailableSpeaker && !relationshipReviewFailed && !userReviewFailed) {
+          if (payload.bestAvailableSpeaker !== false && !relationshipReviewFailed && !userReviewFailed) {
             const bestReview = buildBestAvailableSpeakerReview(decisionPlan, answers, relationshipContext, titleMatchedCardSpeakerId)
             if (Object.keys(bestReview.questions).length) {
               let timer: ReturnType<typeof setTimeout> | undefined

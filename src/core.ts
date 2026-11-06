@@ -1,8 +1,10 @@
 export const CONFIG_KEY = 'chat_voice'
 export const USER_SPEAKER_ID = '__chat_voice_user__'
 export const UNCAST_SPEAKER_ID = '__chat_voice_uncast__'
-/** New defaults should not override an existing explicit opt-out. */
-export const enabledUnlessExplicitlyDisabled = (value: unknown): boolean => value !== false
+/** Standard Jev review policy, independent of retired per-user experiment flags. */
+export function standardSpeakerReviewPolicy() {
+  return { runReview: true, bestAvailableSpeaker: true, shadowEvaluation: false, focusedOpeningFallback: false } as const
+}
 /** Choose a global extension preference, then Lumiverse's global default. */
 export function globalTtsConnectionPreference(value: Record<string, unknown>): string {
   const chosen = typeof value.chatVoiceTtsConnectionId === 'string' ? value.chatVoiceTtsConnectionId : value.ttsConnectionId

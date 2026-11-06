@@ -32,7 +32,7 @@ import {
   buildOpeningBacklinkReview,
   buildContrastiveOpeningLinkReview,
   applyFocusedOpeningFallback,
-  enabledUnlessExplicitlyDisabled,
+  standardSpeakerReviewPolicy,
   globalTtsConnectionPreference,
   resolveGlobalTtsConnection,
   buildBestAvailableSpeakerReview,
@@ -2952,10 +2952,8 @@ test('global TTS connection preference overrides the host default without per-ch
   assert.equal(resolveGlobalTtsConnection('', []), '')
 })
 
-test('speaker feature defaults enable unset values while preserving explicit opt-outs', () => {
-  assert.equal(enabledUnlessExplicitlyDisabled(undefined), true)
-  assert.equal(enabledUnlessExplicitlyDisabled(true), true)
-  assert.equal(enabledUnlessExplicitlyDisabled(false), false)
+test('standard speaker review enables the production pipeline without comparison calls', () => {
+  assert.deepEqual(standardSpeakerReviewPolicy(), { runReview: true, bestAvailableSpeaker: true, shadowEvaluation: false, focusedOpeningFallback: false })
 })
 
 test('immediate named voice attribution anchors the preceding quote but not an introduced next quote', () => {
