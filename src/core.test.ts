@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
+import { syncPlaybackButtons, type PlaybackButtonState } from './playback-ui'
 import { evaluateSpeakerReviews } from './speaker-review-evaluation'
 import {
   adaptiveGenerationConcurrency,
@@ -2963,6 +2964,48 @@ test('autoplay only selects new assistant message IDs after a baseline exists', 
   assert.deepEqual(newAssistantMessageIds(new Set(['old', 'existing']), ['old', 'existing']), [])
   assert.deepEqual(newAssistantMessageIds(new Set(['old', 'existing']), ['old', 'existing', 'new', 'new', 'later']), ['new', 'later'])
   assert.deepEqual(newAssistantMessageIds(new Set(['new', 'later']), ['new', 'later']), [])
+})
+
+test('playback controls follow shared playback state, including menus rendered later', () => {
+  class FakeButton {
+    dataset: Record<string, string> = {}
+    attributes = new Map<string, string>()
+    writes = 0
+    constructor(public messageId: string, private html: string, title: string) { this.attributes.set('title', title) }
+    get innerHTML() { return this.html }
+    set innerHTML(value: string) { this.writes++; this.html = value }
+    get title() { return this.attributes.get('title') ?? '' }
+    set title(value: string) { this.attributes.set('title', value) }
+    getAttribute(name: string) { return this.attributes.get(name) ?? null }
+    setAttribute(name: string, value: string) { this.attributes.set(name, value) }
+    removeAttribute(name: string) { this.attributes.delete(name) }
+    querySelector(selector: string) { return (selector === ':scope > span' ? this.html.includes('<span>') : selector === '[data-chat-voice-stop]' && this.html.includes('data-chat-voice-stop')) ? {} : null }
+  }
+  const bubble = new FakeButton('new', '<svg></svg>', 'Play audio')
+  const other = new FakeButton('old', '<svg></svg>', 'Play other')
+  const menu = new FakeButton('new', '<svg></svg><span>Play audio</span>', 'Play audio')
+  const states = new Map<HTMLButtonElement, PlaybackButtonState>()
+  const native = (button: FakeButton) => button as unknown as HTMLButtonElement
+  const id = (button: HTMLButtonElement) => (button as unknown as FakeButton).messageId
+  const icon = '<svg data-chat-voice-stop="true"></svg>'
+  syncPlaybackButtons([native(bubble), native(other)], 'new', id, states, icon)
+  assert.equal(bubble.dataset.playing, 'true')
+  assert.equal(bubble.getAttribute('aria-label'), 'Stop custom voice playback')
+  assert.equal(other.dataset.playing, undefined)
+  const writes = bubble.writes
+  syncPlaybackButtons([native(bubble), native(other), native(menu)], 'new', id, states, icon)
+  assert.equal(bubble.writes, writes)
+  assert.equal(menu.dataset.playing, 'true')
+  assert.match(menu.innerHTML, /Stop custom voice playback/u)
+  bubble.innerHTML = '<svg></svg>' // The host re-rendered the existing control.
+  syncPlaybackButtons([native(bubble), native(other), native(menu)], 'new', id, states, icon)
+  assert.match(bubble.innerHTML, /data-chat-voice-stop/u)
+  syncPlaybackButtons([native(bubble), native(other), native(menu)], null, id, states, icon)
+  assert.equal(bubble.innerHTML, '<svg></svg>')
+  assert.equal(bubble.title, 'Play audio')
+  assert.equal(bubble.getAttribute('aria-pressed'), null)
+  assert.equal(menu.innerHTML, '<svg></svg><span>Play audio</span>')
+  assert.equal(states.size, 0)
 })
 
 test('automatic casting defaults on and autoplay requires explicit opt-in', () => {

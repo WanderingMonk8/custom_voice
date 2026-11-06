@@ -1,3 +1,42 @@
+// src/playback-ui.ts
+function syncPlaybackButtons(buttons, activeMessageId, getMessageId, states, stopIcon) {
+  for (const button of buttons) {
+    const messageId = getMessageId(button);
+    if (!messageId) continue;
+    const playing = activeMessageId === messageId;
+    const idle = states.get(button);
+    if (!playing) {
+      if (!idle) continue;
+      button.innerHTML = idle.html;
+      if (idle.title === null) button.removeAttribute("title");
+      else button.setAttribute("title", idle.title);
+      if (idle.ariaLabel === null) button.removeAttribute("aria-label");
+      else button.setAttribute("aria-label", idle.ariaLabel);
+      if (idle.ariaPressed === null) button.removeAttribute("aria-pressed");
+      else button.setAttribute("aria-pressed", idle.ariaPressed);
+      delete button.dataset.chatVoiceNativeTts;
+      delete button.dataset.playing;
+      states.delete(button);
+      continue;
+    }
+    if (!idle) states.set(button, {
+      html: button.innerHTML,
+      title: button.getAttribute("title"),
+      ariaLabel: button.getAttribute("aria-label"),
+      ariaPressed: button.getAttribute("aria-pressed")
+    });
+    if (button.dataset.playing === "true" && button.querySelector("[data-chat-voice-stop]")) continue;
+    const label = "Stop custom voice playback";
+    const hasText = !!button.querySelector(":scope > span");
+    button.dataset.chatVoiceNativeTts = "true";
+    button.dataset.playing = "true";
+    button.innerHTML = `${stopIcon}${hasText ? `<span>${label}</span>` : ""}`;
+    button.title = label;
+    button.setAttribute("aria-label", label);
+    button.setAttribute("aria-pressed", "true");
+  }
+}
+
 // src/core.ts
 var USER_SPEAKER_ID = "__chat_voice_user__";
 var UNCAST_SPEAKER_ID = "__chat_voice_uncast__";
@@ -1648,7 +1687,7 @@ var MICROPHONE_ICON = `
     <path d="M5 11a7 7 0 0 0 14 0M12 18v4M9 22h6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
   </svg>
 `;
-var STOP_ACTION_ICON = `<svg viewBox="0 0 24 24" width="13" height="13" fill="currentColor" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="1"/></svg>`;
+var STOP_ACTION_ICON = `<svg data-chat-voice-stop="true" viewBox="0 0 24 24" width="13" height="13" fill="currentColor" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="1"/></svg>`;
 var PLAY_TTS_ACTION_ICON = `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" aria-hidden="true"><path d="M11 5 6 9H3v6h3l5 4V5Z" fill="currentColor"/><path d="M15 9.5a4 4 0 0 1 0 5M18 7a7.5 7.5 0 0 1 0 10" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>`;
 var RENAME_ICON = `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" aria-hidden="true"><path d="M4 20h4l11-11-4-4L4 16v4Zm9.5-13.5 4 4" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
 async function listAllTtsConnections() {
@@ -3122,42 +3161,7 @@ function setup(ctx) {
   narratorDefaultToggle.addEventListener("change", onNarratorDefaultChange);
   userDefaultToggle.addEventListener("change", onUserDefaultChange);
   function updatePlaybackButtons() {
-    for (const button of hostDocument.querySelectorAll("button")) {
-      const messageId = nativeTtsMessageId(button);
-      if (!messageId) continue;
-      const playing = activePlayback?.messageId === messageId;
-      const idle = nativeButtonStates.get(button);
-      if (!playing) {
-        if (!idle) continue;
-        button.innerHTML = idle.html;
-        if (idle.title === null) button.removeAttribute("title");
-        else button.setAttribute("title", idle.title);
-        if (idle.ariaLabel === null) button.removeAttribute("aria-label");
-        else button.setAttribute("aria-label", idle.ariaLabel);
-        if (idle.ariaPressed === null) button.removeAttribute("aria-pressed");
-        else button.setAttribute("aria-pressed", idle.ariaPressed);
-        delete button.dataset.chatVoiceNativeTts;
-        delete button.dataset.playing;
-        nativeButtonStates.delete(button);
-        continue;
-      }
-      if (!idle) {
-        nativeButtonStates.set(button, {
-          html: button.innerHTML,
-          title: button.getAttribute("title"),
-          ariaLabel: button.getAttribute("aria-label"),
-          ariaPressed: button.getAttribute("aria-pressed")
-        });
-      }
-      const label = "Stop custom voice playback";
-      const hasText = !!button.querySelector(":scope > span");
-      button.dataset.chatVoiceNativeTts = "true";
-      button.dataset.playing = "true";
-      button.innerHTML = `${STOP_ACTION_ICON}${hasText ? `<span>${label}</span>` : ""}`;
-      button.title = label;
-      button.setAttribute("aria-label", label);
-      button.setAttribute("aria-pressed", "true");
-    }
+    syncPlaybackButtons(hostDocument.querySelectorAll("button"), activePlayback?.messageId ?? null, nativeTtsMessageId, nativeButtonStates, STOP_ACTION_ICON);
   }
   function restoreNativePlaybackButtons() {
     activePlayback = null;
@@ -5814,7 +5818,16 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
       });
     }
   };
-  const savedUserControlObserver = new hostWindow.MutationObserver(() => ensureSavedUserBubbleControls());
+  let playbackButtonsFrame = null;
+  const savedUserControlObserver = new hostWindow.MutationObserver(() => {
+    ensureSavedUserBubbleControls();
+    if (activePlayback && playbackButtonsFrame === null) {
+      playbackButtonsFrame = hostWindow.requestAnimationFrame(() => {
+        playbackButtonsFrame = null;
+        updatePlaybackButtons();
+      });
+    }
+  });
   savedUserControlObserver.observe(hostDocument.body, { childList: true, subtree: true });
   ensureSavedUserBubbleControls();
   const unsubscribeChatSwitched = ctx.events.on("CHAT_SWITCHED", (rawPayload) => {
@@ -5975,6 +5988,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
     hostWindow.removeEventListener("contextmenu", onNativeContextMenu, true);
     hostWindow.removeEventListener("click", onNativeTtsClick, true);
     savedUserControlObserver.disconnect();
+    if (playbackButtonsFrame !== null) hostWindow.cancelAnimationFrame(playbackButtonsFrame);
     restoreNativePlaybackButtons();
     tab.destroy();
     removeStyle();
