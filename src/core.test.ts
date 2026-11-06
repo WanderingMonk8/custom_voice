@@ -34,7 +34,8 @@ import {
   buildContrastiveOpeningLinkReview,
   applyFocusedOpeningFallback,
   standardSpeakerReviewPolicy,
-  newAssistantMessageIds,
+  autoplayGenerationEvent,
+  claimAutoplayGeneration,
   readAutomaticVoicePreferences,
   globalTtsConnectionPreference,
   resolveGlobalTtsConnection,
@@ -2995,11 +2996,22 @@ test('standard speaker review enables the production pipeline without comparison
   assert.deepEqual(standardSpeakerReviewPolicy(), { runReview: true, bestAvailableSpeaker: true, shadowEvaluation: false, focusedOpeningFallback: false })
 })
 
-test('autoplay only selects new assistant message IDs after a baseline exists', () => {
-  assert.deepEqual(newAssistantMessageIds(null, ['old']), [])
-  assert.deepEqual(newAssistantMessageIds(new Set(['old', 'existing']), ['old', 'existing']), [])
-  assert.deepEqual(newAssistantMessageIds(new Set(['old', 'existing']), ['old', 'existing', 'new', 'new', 'later']), ['new', 'later'])
-  assert.deepEqual(newAssistantMessageIds(new Set(['new', 'later']), ['new', 'later']), [])
+test('autoplay selects successful new-message generation completions in the active chat', () => {
+  const event = { chatId: 'chat', generationId: 'gen', messageId: 'new', content: 'Finished text', generationType: 'normal' }
+  assert.deepEqual(autoplayGenerationEvent(event, 'chat'), { chatId: 'chat', generationId: 'gen', messageId: 'new' })
+  assert.deepEqual(autoplayGenerationEvent({ ...event, generationType: undefined }, 'chat'), { chatId: 'chat', generationId: 'gen', messageId: 'new' })
+  assert.equal(autoplayGenerationEvent(event, 'another-chat'), null)
+  assert.equal(autoplayGenerationEvent({ ...event, error: 'generation failed' }, 'chat'), null)
+  assert.equal(autoplayGenerationEvent({ ...event, messageId: undefined }, 'chat'), null)
+  assert.equal(autoplayGenerationEvent({ ...event, generationId: '' }, 'chat'), null)
+  assert.equal(autoplayGenerationEvent({ ...event, backgroundSwipe: true }, 'chat'), null)
+  for (const generationType of ['continue', 'regenerate', 'swipe', 'impersonate']) assert.equal(autoplayGenerationEvent({ ...event, generationType }, 'chat'), null)
+  const generations = new Set<string>()
+  const messages = new Set<string>()
+  assert.equal(claimAutoplayGeneration(event, generations, messages), true)
+  assert.equal(claimAutoplayGeneration(event, generations, messages), false)
+  assert.equal(claimAutoplayGeneration({ ...event, generationId: 'retry' }, generations, messages), false)
+  assert.equal(claimAutoplayGeneration({ ...event, chatId: 'other' }, generations, messages), true)
 })
 
 test('playback controls follow shared playback state, including menus rendered later', () => {

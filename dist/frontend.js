@@ -43,14 +43,23 @@ var UNCAST_SPEAKER_ID = "__chat_voice_uncast__";
 function standardSpeakerReviewPolicy() {
   return { runReview: true, bestAvailableSpeaker: true, shadowEvaluation: false, focusedOpeningFallback: false };
 }
-function newAssistantMessageIds(previous, current) {
-  if (!previous) return [];
-  const seen = new Set(previous);
-  return current.filter((id) => {
-    if (!id || seen.has(id)) return false;
-    seen.add(id);
-    return true;
-  });
+function autoplayGenerationEvent(value, activeChatId) {
+  if (!value || typeof value !== "object" || Array.isArray(value) || !activeChatId) return null;
+  const event = value;
+  if (event.chatId !== activeChatId || typeof event.messageId !== "string" || !event.messageId.trim() || typeof event.generationId !== "string" || !event.generationId.trim() || event.error || event.backgroundSwipe === true) return null;
+  const kind = typeof event.generationType === "string" ? event.generationType.trim().toLowerCase() : "";
+  if (["continue", "regenerate", "swipe", "impersonate"].includes(kind)) return null;
+  return { chatId: activeChatId, messageId: event.messageId, generationId: event.generationId };
+}
+function claimAutoplayGeneration(event, generations, messages) {
+  const generationKey = `${event.chatId}\0${event.generationId}`;
+  const messageKey = `${event.chatId}\0${event.messageId}`;
+  if (generations.has(generationKey) || messages.has(messageKey)) return false;
+  generations.add(generationKey);
+  messages.add(messageKey);
+  if (generations.size > 512) generations.delete(generations.values().next().value);
+  if (messages.size > 512) messages.delete(messages.values().next().value);
+  return true;
 }
 function readAutomaticVoicePreferences(value) {
   return { autoVoiceCasting: value.chatVoiceAutoCasting !== false, autoPlayback: value.chatVoiceAutoPlayback === true };
@@ -2578,9 +2587,8 @@ function setup(ctx) {
   );
   let applyingState = false;
   let activeChat = null;
-  let autoPlaybackSeenChatId = null;
-  let autoPlaybackSeenIds = null;
-  let autoPlaybackEventQueue = Promise.resolve();
+  const autoPlaybackSeenGenerations = /* @__PURE__ */ new Set();
+  const autoPlaybackSeenMessages = /* @__PURE__ */ new Set();
   let autoPlaybackQueue = Promise.resolve();
   let autoPlaybackDisposed = false;
   let autoPlaybackEpoch = 0;
@@ -5183,10 +5191,6 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
   }
   function renderState(next) {
     applyingState = true;
-    if ((next?.id ?? null) !== autoPlaybackSeenChatId || !autoPlaybackSeenIds) {
-      autoPlaybackSeenChatId = next?.id ?? null;
-      autoPlaybackSeenIds = next ? new Set(next.assistantMessageIds ?? []) : null;
-    }
     const keepVoiceEditor = !!editingCharacterVoiceId && !!next && activeChat?.id === next.id;
     const keepRoleEditor = !!editingRoleVoice && !!next && activeChat?.id === next.id;
     if (!keepVoiceEditor) editingCharacterVoiceId = null;
@@ -5835,35 +5839,25 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
   const unsubscribeChatSwitched = ctx.events.on("CHAT_SWITCHED", (rawPayload) => {
     const switchedChatId = rawPayload?.chatId ?? null;
     autoPlaybackEpoch += 1;
-    autoPlaybackSeenChatId = null;
-    autoPlaybackSeenIds = null;
     hostWindow.requestAnimationFrame(() => {
       if (ctx.getActiveChat().chatId === switchedChatId) refreshLocalState();
     });
   });
   const unsubscribeMessageRendered = ctx.events.on("CHARACTER_MESSAGE_RENDERED", () => {
-    const chatId = ctx.getActiveChat().chatId;
-    if (!chatId || activeChat?.id !== chatId || autoPlaybackSeenChatId !== chatId || !autoPlaybackSeenIds) return;
+    if (activeChat?.id === ctx.getActiveChat().chatId) refreshLocalState();
+  });
+  const unsubscribeGenerationEnded = ctx.events.on("GENERATION_ENDED", (payload) => {
+    const event = autoplayGenerationEvent(payload, ctx.getActiveChat().chatId);
+    if (!event || autoPlaybackDisposed) return;
+    if (!claimAutoplayGeneration(event, autoPlaybackSeenGenerations, autoPlaybackSeenMessages)) return;
+    if (!autoPlayback) return;
     const eventEpoch = autoPlaybackEpoch;
-    const seenAtEvent = autoPlaybackSeenIds;
-    autoPlaybackEventQueue = autoPlaybackEventQueue.catch(() => void 0).then(async () => {
-      if (autoPlaybackDisposed || ctx.getActiveChat().chatId !== chatId || autoPlaybackSeenChatId !== chatId || autoPlaybackSeenIds !== seenAtEvent) return;
-      const state = await requestLocalState();
-      if (autoPlaybackDisposed || !state || state.id !== chatId || ctx.getActiveChat().chatId !== chatId || autoPlaybackSeenChatId !== chatId || autoPlaybackSeenIds !== seenAtEvent) return;
-      const newIds = newAssistantMessageIds(autoPlaybackSeenIds, state.assistantMessageIds ?? []);
-      for (const id of state.assistantMessageIds ?? []) autoPlaybackSeenIds.add(id);
-      if (!autoPlayback || eventEpoch !== autoPlaybackEpoch) return;
-      for (const id of newIds) {
-        autoPlaybackQueue = autoPlaybackQueue.catch(() => void 0).then(async () => {
-          while (activePlayback && !autoPlaybackDisposed && autoPlayback && eventEpoch === autoPlaybackEpoch && ctx.getActiveChat().chatId === chatId) await activePlayback.audibleDone;
-          if (autoPlaybackDisposed || !autoPlayback || eventEpoch !== autoPlaybackEpoch || ctx.getActiveChat().chatId !== chatId) return;
-          await playMessage(id, false, true);
-        }).catch((error) => {
-          if (!autoPlaybackDisposed) setStatus(error instanceof Error ? error.message : "Automatic playback failed.", "error");
-        });
-      }
+    autoPlaybackQueue = autoPlaybackQueue.catch(() => void 0).then(async () => {
+      while (activePlayback && !autoPlaybackDisposed && autoPlayback && eventEpoch === autoPlaybackEpoch && ctx.getActiveChat().chatId === event.chatId) await activePlayback.audibleDone;
+      if (autoPlaybackDisposed || !autoPlayback || eventEpoch !== autoPlaybackEpoch || ctx.getActiveChat().chatId !== event.chatId) return;
+      await playMessage(event.messageId, false, true);
     }).catch((error) => {
-      if (!autoPlaybackDisposed) console.warn("[Chat Voice] Could not check new messages for automatic playback.", error);
+      if (!autoPlaybackDisposed) setStatus(error instanceof Error ? error.message : "Automatic playback failed.", "error");
     });
   });
   const unsubscribeActivate = tab.onActivate(() => {
@@ -5888,6 +5882,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
     unsubscribeActivate();
     unsubscribeChatSwitched();
     unsubscribeMessageRendered();
+    unsubscribeGenerationEnded();
     unsubscribeBackend();
     for (const input of characterInputs.values()) input.destroy();
     for (const { input } of ghostVoiceEditors.values()) input.destroy();

@@ -6,15 +6,27 @@ export function standardSpeakerReviewPolicy() {
   return { runReview: true, bestAvailableSpeaker: true, shadowEvaluation: false, focusedOpeningFallback: false } as const
 }
 
-/** Return genuinely new assistant message IDs in conversation order, once a baseline exists. */
-export function newAssistantMessageIds(previous: ReadonlySet<string> | null, current: readonly string[]): string[] {
-  if (!previous) return []
-  const seen = new Set(previous)
-  return current.filter(id => {
-    if (!id || seen.has(id)) return false
-    seen.add(id)
-    return true
-  })
+/** Accept only successful, foreground new-message generation events for the active chat. */
+export function autoplayGenerationEvent(value: unknown, activeChatId: string | null): { chatId: string; messageId: string; generationId: string } | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value) || !activeChatId) return null
+  const event = value as Record<string, unknown>
+  if (event.chatId !== activeChatId || typeof event.messageId !== 'string' || !event.messageId.trim()
+    || typeof event.generationId !== 'string' || !event.generationId.trim() || event.error || event.backgroundSwipe === true) return null
+  const kind = typeof event.generationType === 'string' ? event.generationType.trim().toLowerCase() : ''
+  if (['continue', 'regenerate', 'swipe', 'impersonate'].includes(kind)) return null
+  return { chatId: activeChatId, messageId: event.messageId, generationId: event.generationId }
+}
+
+/** Deduplicate reconnect/repeated notifications while bounding in-memory state. */
+export function claimAutoplayGeneration(event: { chatId: string; messageId: string; generationId: string }, generations: Set<string>, messages: Set<string>): boolean {
+  const generationKey = `${event.chatId}\u0000${event.generationId}`
+  const messageKey = `${event.chatId}\u0000${event.messageId}`
+  if (generations.has(generationKey) || messages.has(messageKey)) return false
+  generations.add(generationKey)
+  messages.add(messageKey)
+  if (generations.size > 512) generations.delete(generations.values().next().value!)
+  if (messages.size > 512) messages.delete(messages.values().next().value!)
+  return true
 }
 
 /** Preserve explicit casting opt-outs; automatic playback requires an opt-in. */

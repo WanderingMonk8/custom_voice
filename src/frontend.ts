@@ -19,7 +19,8 @@ import {
   eligibleCardFallbackSpeakerId,
   globalTtsConnectionPreference,
   standardSpeakerReviewPolicy,
-  newAssistantMessageIds,
+  autoplayGenerationEvent,
+  claimAutoplayGeneration,
   readAutomaticVoicePreferences,
   resolveGlobalTtsConnection,
   encodeConcatenatedWav,
@@ -1395,9 +1396,8 @@ export function setup(ctx: SpindleFrontendContext) {
 
   let applyingState = false
   let activeChat: ActiveChatState | null = null
-  let autoPlaybackSeenChatId: string | null = null
-  let autoPlaybackSeenIds: Set<string> | null = null
-  let autoPlaybackEventQueue: Promise<void> = Promise.resolve()
+  const autoPlaybackSeenGenerations = new Set<string>()
+  const autoPlaybackSeenMessages = new Set<string>()
   let autoPlaybackQueue: Promise<void> = Promise.resolve()
   let autoPlaybackDisposed = false
   let autoPlaybackEpoch = 0
@@ -4371,10 +4371,6 @@ export function setup(ctx: SpindleFrontendContext) {
 
   function renderState(next: ActiveChatState | null) {
     applyingState = true
-    if ((next?.id ?? null) !== autoPlaybackSeenChatId || !autoPlaybackSeenIds) {
-      autoPlaybackSeenChatId = next?.id ?? null
-      autoPlaybackSeenIds = next ? new Set(next.assistantMessageIds ?? []) : null
-    }
     const keepVoiceEditor = !!editingCharacterVoiceId && !!next && activeChat?.id === next.id
     const keepRoleEditor = !!editingRoleVoice && !!next && activeChat?.id === next.id
     if (!keepVoiceEditor) editingCharacterVoiceId = null
@@ -5080,33 +5076,26 @@ export function setup(ctx: SpindleFrontendContext) {
   const unsubscribeChatSwitched = ctx.events.on('CHAT_SWITCHED', (rawPayload: unknown) => {
     const switchedChatId = (rawPayload as { chatId?: string | null })?.chatId ?? null
     autoPlaybackEpoch += 1
-    autoPlaybackSeenChatId = null
-    autoPlaybackSeenIds = null
     hostWindow.requestAnimationFrame(() => {
       if (ctx.getActiveChat().chatId === switchedChatId) refreshLocalState()
     })
   })
 
   const unsubscribeMessageRendered = ctx.events.on('CHARACTER_MESSAGE_RENDERED', () => {
-    const chatId = ctx.getActiveChat().chatId
-    if (!chatId || activeChat?.id !== chatId || autoPlaybackSeenChatId !== chatId || !autoPlaybackSeenIds) return
+    if (activeChat?.id === ctx.getActiveChat().chatId) refreshLocalState()
+  })
+
+  const unsubscribeGenerationEnded = ctx.events.on('GENERATION_ENDED', (payload: unknown) => {
+    const event = autoplayGenerationEvent(payload, ctx.getActiveChat().chatId)
+    if (!event || autoPlaybackDisposed) return
+    if (!claimAutoplayGeneration(event, autoPlaybackSeenGenerations, autoPlaybackSeenMessages)) return
+    if (!autoPlayback) return
     const eventEpoch = autoPlaybackEpoch
-    const seenAtEvent = autoPlaybackSeenIds
-    autoPlaybackEventQueue = autoPlaybackEventQueue.catch(() => undefined).then(async () => {
-      if (autoPlaybackDisposed || ctx.getActiveChat().chatId !== chatId || autoPlaybackSeenChatId !== chatId || autoPlaybackSeenIds !== seenAtEvent) return
-      const state = await requestLocalState()
-      if (autoPlaybackDisposed || !state || state.id !== chatId || ctx.getActiveChat().chatId !== chatId || autoPlaybackSeenChatId !== chatId || autoPlaybackSeenIds !== seenAtEvent) return
-      const newIds = newAssistantMessageIds(autoPlaybackSeenIds, state.assistantMessageIds ?? [])
-      for (const id of state.assistantMessageIds ?? []) autoPlaybackSeenIds.add(id)
-      if (!autoPlayback || eventEpoch !== autoPlaybackEpoch) return
-      for (const id of newIds) {
-        autoPlaybackQueue = autoPlaybackQueue.catch(() => undefined).then(async () => {
-          while (activePlayback && !autoPlaybackDisposed && autoPlayback && eventEpoch === autoPlaybackEpoch && ctx.getActiveChat().chatId === chatId) await activePlayback.audibleDone
-          if (autoPlaybackDisposed || !autoPlayback || eventEpoch !== autoPlaybackEpoch || ctx.getActiveChat().chatId !== chatId) return
-          await playMessage(id, false, true)
-        }).catch(error => { if (!autoPlaybackDisposed) setStatus(error instanceof Error ? error.message : 'Automatic playback failed.', 'error') })
-      }
-    }).catch(error => { if (!autoPlaybackDisposed) console.warn('[Chat Voice] Could not check new messages for automatic playback.', error) })
+    autoPlaybackQueue = autoPlaybackQueue.catch(() => undefined).then(async () => {
+      while (activePlayback && !autoPlaybackDisposed && autoPlayback && eventEpoch === autoPlaybackEpoch && ctx.getActiveChat().chatId === event.chatId) await activePlayback.audibleDone
+      if (autoPlaybackDisposed || !autoPlayback || eventEpoch !== autoPlaybackEpoch || ctx.getActiveChat().chatId !== event.chatId) return
+      await playMessage(event.messageId, false, true)
+    }).catch(error => { if (!autoPlaybackDisposed) setStatus(error instanceof Error ? error.message : 'Automatic playback failed.', 'error') })
   })
 
   const unsubscribeActivate = tab.onActivate(() => {
@@ -5133,6 +5122,7 @@ export function setup(ctx: SpindleFrontendContext) {
     unsubscribeActivate()
     unsubscribeChatSwitched()
     unsubscribeMessageRendered()
+    unsubscribeGenerationEnded()
     unsubscribeBackend()
     for (const input of characterInputs.values()) input.destroy()
     for (const { input } of ghostVoiceEditors.values()) input.destroy()
