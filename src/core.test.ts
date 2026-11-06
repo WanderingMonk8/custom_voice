@@ -44,6 +44,7 @@ import {
   applySpeakerSwitchContradictionReview,
   applyNarrativeRoleSpeakerReview,
   applyNarrativeExchangeSpeakerReview,
+  applyNarrativeLocalEvidenceReview,
   applyOpeningBacklinkReview,
   invalidSpeakerReviewAnswers,
   applyRelationshipSpeakerReview,
@@ -3026,6 +3027,10 @@ test('narrative role review separates the smoker from a named reply without assi
   const review = buildSpeakerSwitchContradictionReview(plan, answers, context)
   const role = review.roles.find(item => item.label === 'the smoker')!
   assert.ok(role)
+  assert.ok(review.localEvidence.some(item => item.speechId === 's0' && item.cues.some(cue => cue.includes('pronoun speech tag'))))
+  assert.ok(review.localEvidence.some(item => item.speechId === 's1' && item.cues.some(cue => cue.includes('follows a pronoun speech tag'))))
+  assert.ok(review.localEvidence.some(item => item.speechId === 's3' && item.cues.some(cue => cue.includes('role action immediately follows'))))
+  assert.ok(review.localEvidence.some(item => item.speechId === 's4' && item.cues.some(cue => cue.includes('role action immediately precedes'))))
   const results: Record<string, SpeakerDecisionChoice> = { [`${role.id}_distinct`]: confidentDecision('different') }
   for (const id of role.speechIds) if (id !== role.anchorId) results[`${role.id}_speech_${id}`] = confidentDecision(['s0', 's1', 's3', 's4'].includes(id) ? 'role' : 'other_or_unclear')
   applyNarrativeRoleSpeakerReview(plan, answers, review, results)
@@ -3049,6 +3054,40 @@ test('narrative role review separates the smoker from a named reply without assi
   const exchangeSegments = resolveSpeakerDecisionSegments(text, plan, exchangeAnswers, speakers, { isUserMessage: false, cardSpeakerId: null, historicalSpeakerId: null, evidenceOnly: true, includeDebug: true })
   assert.deepEqual(exchangeSegments.filter(segment => segment.speakerId !== null).map(segment => segment.speakerId), ['ghost:smoker', 'ghost:smoker', 'unconfigured:maeve', 'ghost:smoker', 'ghost:smoker', 'unconfigured:maeve'])
   assert.ok(exchangeAnswers.narrative_exchange_reconciled_s3)
+  const localAnswers: Record<string, SpeakerDecisionChoice> = {}
+  for (const speech of plan.state.speeches) localAnswers[`speech_${speech.id}`] = confidentDecision('known_0')
+  localAnswers.turn_s2 = confidentDecision('responds_to_previous_speaker')
+  applyExplicitPostQuoteVoiceAttributions(plan, localAnswers)
+  const localReview = buildSpeakerSwitchContradictionReview(plan, localAnswers, context)
+  const localResults: Record<string, SpeakerDecisionChoice> = { [`${role.id}_distinct`]: { choice: 'different', probabilities: { different: 0.67, same_or_unclear: 0.33 }, confidence: 0.34 } }
+  for (const item of localReview.localEvidence) localResults[`${role.id}_local_${item.speechId}`] = confidentDecision('role', 0.75, 0.65)
+  applyNarrativeLocalEvidenceReview(plan, localAnswers, localReview, localResults)
+  assert.ok(localAnswers.narrative_local_reconciled_s0)
+  assert.ok(localAnswers.narrative_local_reconciled_s1)
+  assert.ok(localAnswers.narrative_local_reconciled_s3)
+  assert.ok(localAnswers.narrative_local_reconciled_s4)
+  assert.equal(localAnswers.speech_s2.choice, 'known_0')
+  const localRejected: Record<string, SpeakerDecisionChoice> = { ...localAnswers, speech_s3: confidentDecision('known_0') }
+  delete localRejected.narrative_role_reconciled_s3
+  const listenerResults = { ...localResults, [`${role.id}_local_s3`]: confidentDecision('other_or_unclear') }
+  applyNarrativeLocalEvidenceReview(plan, localRejected, localReview, listenerResults)
+  assert.equal(localRejected.speech_s3.choice, 'known_0')
+  const ambiguousText = text.replace('The smoker’s sitting upright in it, blanket pooled at her waist, boots back on and laced.', 'The smoker’s sitting beside Erin, both women awake.')
+  const ambiguousPlan = buildSpeakerDecisionPlan(ambiguousText, speakers, false)
+  const ambiguousAnswers: Record<string, SpeakerDecisionChoice> = {}
+  for (const speech of ambiguousPlan.state.speeches) ambiguousAnswers[`speech_${speech.id}`] = confidentDecision('known_0')
+  ambiguousAnswers.turn_s2 = confidentDecision('responds_to_previous_speaker')
+  applyExplicitPostQuoteVoiceAttributions(ambiguousPlan, ambiguousAnswers)
+  const ambiguousReview = buildSpeakerSwitchContradictionReview(ambiguousPlan, ambiguousAnswers, context)
+  assert.ok(!ambiguousReview.localEvidence.some(item => item.speechId === 's0' && item.cues.some(cue => cue.includes('pronoun speech tag'))))
+  const interruptedText = text.replace('The smoker’s boot heels come down onto the boards.', 'The smoker’s boot heels come down onto the boards. Another woman says,')
+  const interruptedPlan = buildSpeakerDecisionPlan(interruptedText, speakers, false)
+  const interruptedAnswers: Record<string, SpeakerDecisionChoice> = {}
+  for (const speech of interruptedPlan.state.speeches) interruptedAnswers[`speech_${speech.id}`] = confidentDecision('known_0')
+  interruptedAnswers.turn_s2 = confidentDecision('responds_to_previous_speaker')
+  applyExplicitPostQuoteVoiceAttributions(interruptedPlan, interruptedAnswers)
+  const interruptedReview = buildSpeakerSwitchContradictionReview(interruptedPlan, interruptedAnswers, context)
+  assert.ok(!interruptedReview.localEvidence.some(item => item.speechId === 's4' && item.cues.some(cue => cue.includes('role action immediately precedes'))))
   // Earlier speeches have already been resolved to the smoker, so the first
   // same-identity response contradiction is later than Maeve's attributed line.
   const partiallyResolved: Record<string, SpeakerDecisionChoice> = {}

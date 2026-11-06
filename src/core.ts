@@ -3502,6 +3502,7 @@ export function buildSpeakerSwitchContradictionReview(plan: SpeakerDecisionPlan,
   const questions: SpeakerDecisionPlan['questions'] = {}
   const runs: Array<{ id: string; speechIds: string[]; previousId: string; currentId: string }> = []
   const roles: Array<{ id: string; runId: string; label: string; anchorId: string; speechIds: string[] }> = []
+  const localEvidence: Array<{ roleId: string; speechId: string; cues: string[] }> = []
   const grounded = independentlyGroundedSpeakerIds(plan, context, cardSpeakerId)
   const criteria = speakerDecisionCriteria(plan.state.speakers.slice(0, 220))
   for (const speaker of plan.state.speakers) if (!grounded.has(speaker.id)) delete criteria[speaker.option]
@@ -3551,6 +3552,27 @@ export function buildSpeakerSwitchContradictionReview(plan: SpeakerDecisionPlan,
         if (count < 2 || roles.filter(item => item.runId === run.id).length >= 2) continue
         const roleId = `role_${run.id}_${roles.filter(item => item.runId === run.id).length}`
         roles.push({ id: roleId, runId: run.id, label, anchorId, speechIds })
+        const labelPattern = label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+        const roleMention = new RegExp(`\\b${labelPattern}(?:['’]s)?\\b`, 'iu')
+        for (const id of speechIds) {
+          if (id === anchorId || localEvidence.filter(item => item.roleId === roleId).length >= 4) continue
+          const speech = plan.state.speeches.find(item => item.id === id)
+          if (!speech) continue
+          const paragraphIndex = plan.state.paragraphs.findIndex(item => item.id === speech.paragraphId)
+          const preceding = paragraphIndex > 0 ? narrativeOnly(plan.state.paragraphs[paragraphIndex - 1].text) : ''
+          const cues: string[] = []
+          const tag = /^\s*(?:he|she|they)\s+(?:says|said|asks|asked|replies|replied|answers|answered|whispers|whispered|murmurs|murmured)\b/iu
+          const localSubject = `${preceding} ${speech.narrativeBefore}`
+          const competingPerson = /\b(?:another|other|second|third)\s+(?:woman|man|person|speaker|girl|boy)\b/iu.test(localSubject) || hasSpeakerMentions(mentionedSpeakers(localSubject, plan.state.speakers.map(item => ({ id: item.id, name: item.name }))))
+          if (roleMention.test(localSubject) && !competingPerson && tag.test(speech.narrativeAfter) && !SPEAKER_HARD_BOUNDARY_PATTERNS.some(item => item.pattern.test(localSubject))) cues.push(/[,，]\s*$/u.test(speech.text) ? 'recent role followed by pronoun speech tag after comma-ended quotation' : 'recent role followed by pronoun speech tag')
+          const precedingSpeech = plan.state.speeches[plan.state.speeches.findIndex(item => item.id === id) - 1]
+          if (precedingSpeech?.paragraphId === speech.paragraphId && roleMention.test(preceding) && !competingPerson && tag.test(speech.narrativeBefore) && !SPEAKER_HARD_BOUNDARY_PATTERNS.some(item => item.pattern.test(preceding))) cues.push(/[,，]\s*$/u.test(precedingSpeech.text) ? 'quotation follows a pronoun speech tag and comma-ended quotation near the role' : 'quotation follows a pronoun speech tag near the role')
+          if (roleMention.test(speech.narrativeAfter) && speech.narrativeAfter.length <= 250 && !SPEAKER_TURN_SWITCH_PATTERN.test(speech.narrativeAfter)) cues.push('role action immediately follows quotation, before the next quotation')
+          if (roleMention.test(speech.narrativeBefore) && speech.narrativeBefore.length <= 250 && !SPEAKER_TURN_SWITCH_PATTERN.test(speech.narrativeBefore)) cues.push('role action immediately precedes quotation, after the previous quotation')
+          if (!cues.length) continue
+          localEvidence.push({ roleId, speechId: id, cues })
+          questions[`${roleId}_local_${id}`] = { type: 'choice', instructions: `Consider the local evidence listed for ${id} in narrativeRoleEvidence, together with the entire CURRENT exchange. Is the person described as ${label} the actual speaker of ${id}? A pronoun or action near a quote is suggestive, not proof: check whether another person could be referenced, whether the action belongs to a listener, whether speech is interrupted, and whether named speech attribution or context contradicts it. Consider the quotation's content and dialogue responses. Choose other_or_unclear when the evidence does not establish the speaker.`, criteria: { role: `The person described as ${label} speaks ${id}.`, other_or_unclear: 'Another person speaks or identity is uncertain.' } }
+        }
         questions[`${roleId}_distinct`] = { type: 'choice', instructions: `In the CURRENT dialogue run, is the person described as ${label} a different person from the actual speaker of ${anchorId}? The name or role in narration might be a bystander, an addressee, an alias for the named speaker, or a different participant. Compare the whole scene and their physical positions and actions. Select different only when it is clear they are distinct people.`, criteria: { different: 'The described person and the named quote speaker are distinct people.', same_or_unclear: 'They are the same person, or their relationship is unclear.' } }
         questions[`${roleId}_exchange`] = { type: 'choice', instructions: `Read the entire CURRENT run as an exchange, especially the meaning of each quotation, clarifying questions and their answers, speech tags, physical actions, positions and later evidence. Is ${label} a distinct active speaker in conversation with the explicitly attributed speaker of ${anchorId}? Do not assume a question means a speaker change; a self-question, interruption, third speaker, bystander, or alias can make this uncertain.`, criteria: { two_speakers: `The described ${label} and the speaker of ${anchorId} are distinct and both actually speak in this exchange.`, other_or_unclear: 'That two-person exchange is not established.' } }
         for (const id of speechIds) if (id !== anchorId) {
@@ -3565,7 +3587,7 @@ export function buildSpeakerSwitchContradictionReview(plan: SpeakerDecisionPlan,
     const answer = answers[`explicit_voice_attribution_${speech.id}`]
     return answer ? [[speech.id, plan.optionSpeakerIds[answer.choice]]] : []
   }))
-  return { state: { ...plan.state, previousMessages: context.previousMessages, ghosts: context.ghosts, switchRuns: runs, explicitAttributions, narrativeRoles: roles }, questions, runs, ghostOptions, roles }
+  return { state: { ...plan.state, previousMessages: context.previousMessages, ghosts: context.ghosts, switchRuns: runs, explicitAttributions, narrativeRoles: roles, narrativeRoleEvidence: localEvidence }, questions, runs, ghostOptions, roles, localEvidence }
 }
 
 /** Apply a confirmed switch only when both sides resolve strongly and differently. */
@@ -3642,7 +3664,7 @@ export function applySpeakerSwitchContradictionReview(plan: SpeakerDecisionPlan,
 }
 
 /** Apply separately verified narrative-role links; a nearby bystander is not enough. */
-export function applyNarrativeRoleSpeakerReview(plan: SpeakerDecisionPlan, answers: Record<string, SpeakerDecisionChoice>, review: ReturnType<typeof buildSpeakerSwitchContradictionReview>, results: Record<string, SpeakerDecisionChoice>, distinctThresholds = { probability: 0.85, confidence: 0.75, margin: 0.4 }): void {
+export function applyNarrativeRoleSpeakerReview(plan: SpeakerDecisionPlan, answers: Record<string, SpeakerDecisionChoice>, review: ReturnType<typeof buildSpeakerSwitchContradictionReview>, results: Record<string, SpeakerDecisionChoice>, distinctThresholds = { probability: 0.85, confidence: 0.75, margin: 0.4 }, speechThresholds = { probability: 0.8, confidence: 0.7, margin: 0.3 }): void {
   const speakers = plan.state.speakers.map(speaker => ({ id: speaker.id, name: speaker.name }))
   const candidates = new Map<string, Array<{ role: typeof review.roles[number]; identity: string; option: string; result: SpeakerDecisionChoice }>>()
   for (const role of review.roles) {
@@ -3665,7 +3687,7 @@ export function applyNarrativeRoleSpeakerReview(plan: SpeakerDecisionPlan, answe
       const existing = evaluateSpeakerDecisionAnswer(answers[`speech_${id}`], plan.optionSpeakerIds).identity
       if ((answers[`persona_confirmed_${id}`] && existing === USER_SPEAKER_ID) || ((answers[`self_intro_reconciled_${id}`] || answers[`switch_reconciled_${id}`]) && existing !== identity)) continue
       const result = results[`${role.id}_speech_${id}`]
-      if (evaluateSpeakerDecisionAnswer(result, { role: 'role', other_or_unclear: 'other_or_unclear' }, { probability: 0.8, confidence: 0.7, margin: 0.3 }).identity !== 'role') continue
+      if (evaluateSpeakerDecisionAnswer(result, { role: 'role', other_or_unclear: 'other_or_unclear' }, speechThresholds).identity !== 'role') continue
       const speech = plan.state.speeches.find(item => item.id === id)
       if (!speech) continue
       const explicit = narrativeAttributionSpeaker(`${speech.narrativeBefore} ${speech.narrativeAfter}`, speakers)
@@ -3690,6 +3712,27 @@ export function applyNarrativeRoleSpeakerReview(plan: SpeakerDecisionPlan, answe
     answers[`relationship_global_${id}`] = assignment
     delete answers[`relationship_confirmed_${id}`]
     delete answers[`global_uncertain_${id}`]
+  }
+}
+
+/** Reconsider only lines with concrete local cues and an affirmative semantic review. */
+export function applyNarrativeLocalEvidenceReview(plan: SpeakerDecisionPlan, answers: Record<string, SpeakerDecisionChoice>, review: ReturnType<typeof buildSpeakerSwitchContradictionReview>, results: Record<string, SpeakerDecisionChoice>): void {
+  for (const role of review.roles) {
+    const distinct = results[`${role.id}_distinct`]
+    if (evaluateSpeakerDecisionAnswer(distinct, { different: 'different', same_or_unclear: 'same_or_unclear' }, { probability: 0.6, confidence: 0.2, margin: 0.2 }).identity !== 'different') continue
+    const combined: Record<string, SpeakerDecisionChoice> = { [`${role.id}_distinct`]: distinct }
+    const included: string[] = []
+    for (const evidence of review.localEvidence.filter(item => item.roleId === role.id)) {
+      const local = results[`${role.id}_local_${evidence.speechId}`]
+      if (evaluateSpeakerDecisionAnswer(local, { role: 'role', other_or_unclear: 'other_or_unclear' }, { probability: 0.7, confidence: 0.6, margin: 0.4 }).identity !== 'role') continue
+      const existingReview = results[`${role.id}_speech_${evidence.speechId}`]
+      if (evaluateSpeakerDecisionAnswer(existingReview, { role: 'role', other_or_unclear: 'other_or_unclear' }, { probability: 0.9, confidence: 0.8, margin: 0.5 }).identity === 'other_or_unclear') continue
+      combined[`${role.id}_speech_${evidence.speechId}`] = local
+      included.push(evidence.speechId)
+    }
+    const before = new Set(Object.keys(answers).filter(id => id.startsWith('narrative_role_reconciled_')))
+    applyNarrativeRoleSpeakerReview(plan, answers, { ...review, roles: [role] }, combined, { probability: 0.6, confidence: 0.2, margin: 0.2 }, { probability: 0.7, confidence: 0.6, margin: 0.4 })
+    for (const id of included) if (!before.has(`narrative_role_reconciled_${id}`) && answers[`narrative_role_reconciled_${id}`]) answers[`narrative_local_reconciled_${id}`] = results[`${role.id}_local_${id}`]
   }
 }
 
@@ -7032,6 +7075,7 @@ export function resolveSpeakerDecisionSegments(
           ...decisionAnswerDebug('jev-speaker-switch-review', answers[`switch_reconciled_${speech.id}`], plan.optionSpeakerIds),
           ...decisionAnswerDebug('jev-narrative-role-review', answers[`narrative_role_reconciled_${speech.id}`], { role: 'role', other_or_unclear: 'other_or_unclear' }),
           ...decisionAnswerDebug('jev-narrative-exchange-review', answers[`narrative_exchange_reconciled_${speech.id}`], { role: 'role', anchor: 'anchor', other_or_unclear: 'other_or_unclear' }),
+          ...decisionAnswerDebug('jev-narrative-local-review', answers[`narrative_local_reconciled_${speech.id}`], { role: 'role', other_or_unclear: 'other_or_unclear' }),
           ...decisionAnswerDebug('jev-speaker-switch-link', answers[`switch_link_reconciled_${speech.id}`], { previous: 'previous', current: 'current', other_or_unclear: 'other_or_unclear' }),
           ...(answers[`relationship_confirmed_${speech.id}`] ? ['jev-relationship-review:accepted first-pass identity confirmed'] : []),
           ...decisionAnswerDebug('jev-contextual-user-review', answers[`persona_check_${speech.id}`], { user: USER_SPEAKER_ID, other: 'other' }),
