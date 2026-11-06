@@ -43,6 +43,7 @@ import {
   buildSpeakerSwitchContradictionReview,
   applySpeakerSwitchContradictionReview,
   applyNarrativeRoleSpeakerReview,
+  applyNarrativeExchangeSpeakerReview,
   applyOpeningBacklinkReview,
   invalidSpeakerReviewAnswers,
   applyRelationshipSpeakerReview,
@@ -3015,7 +3016,7 @@ test('an explicit named-voice anchor can resolve a strong switch and independent
 
 test('narrative role review separates the smoker from a named reply without assigning bystanders', () => {
   const speakers = [{ id: 'unconfigured:maeve', name: 'Maeve' }, { id: 'unconfigured:erin', name: 'Erin' }, { id: USER_SPEAKER_ID, name: 'Ken' }]
-  const text = 'The smoker’s sitting in the chair, her boots on.\n\n"Lamp is out," she says. "I did not light it."\n\n"Decided what?"\n\nMaeve’s voice comes from the other side of Erin.\n\n"Whether I sleep in my boots." The smoker’s boot heels hit the boards. "Boots stay."\n\n"Suit yourself."'
+  const text = 'The smoker’s sitting upright in it, blanket pooled at her waist, boots back on and laced.\n\n"Lamp’s out," she says, to nobody in particular. "I didn’t light it. Wanted to see the room dark before I decided anything about it." "Decided what?"\n\nMaeve’s voice comes from the other side of Erin.\n\n"Whether it was a night where I sleep in my boots or a night where I take them off and trust the stair." The smoker’s boot heels come down onto the boards. "I’ve decided. Boots stay." "Suit yourself."'
   const plan = buildSpeakerDecisionPlan(text, speakers, false)
   const answers: Record<string, SpeakerDecisionChoice> = {}
   for (const speech of plan.state.speeches) answers[`speech_${speech.id}`] = confidentDecision('known_0')
@@ -3031,6 +3032,28 @@ test('narrative role review separates the smoker from a named reply without assi
   const segments = resolveSpeakerDecisionSegments(text, plan, answers, speakers, { isUserMessage: false, cardSpeakerId: null, historicalSpeakerId: null, evidenceOnly: true, includeDebug: true })
   assert.deepEqual(segments.filter(segment => segment.speakerId !== null).map(segment => segment.speakerId), ['ghost:smoker', 'ghost:smoker', 'unconfigured:maeve', 'ghost:smoker', 'ghost:smoker', 'unconfigured:maeve'])
   assert.ok(answers.narrative_role_reconciled_s0)
+  const exchangeAnswers: Record<string, SpeakerDecisionChoice> = {}
+  for (const speech of plan.state.speeches) exchangeAnswers[`speech_${speech.id}`] = confidentDecision('known_0')
+  exchangeAnswers.turn_s2 = confidentDecision('responds_to_previous_speaker')
+  applyExplicitPostQuoteVoiceAttributions(plan, exchangeAnswers)
+  const exchangeReview = buildSpeakerSwitchContradictionReview(plan, exchangeAnswers, context)
+  const exchangeResults: Record<string, SpeakerDecisionChoice> = {
+    [`${role.id}_distinct`]: { choice: 'different', probabilities: { different: 0.72, same_or_unclear: 0.28 }, confidence: 0.44 },
+    [`${role.id}_exchange`]: confidentDecision('two_speakers'),
+  }
+  for (const id of role.speechIds) if (id !== role.anchorId) {
+    exchangeResults[`${role.id}_speech_${id}`] = { choice: 'other_or_unclear', probabilities: { role: 0.31, other_or_unclear: 0.69 }, confidence: 0.38 }
+    exchangeResults[`${role.id}_exchange_${id}`] = confidentDecision(['s0', 's1', 's3', 's4'].includes(id) ? 'role' : 'anchor')
+  }
+  applyNarrativeExchangeSpeakerReview(plan, exchangeAnswers, exchangeReview, exchangeResults)
+  const exchangeSegments = resolveSpeakerDecisionSegments(text, plan, exchangeAnswers, speakers, { isUserMessage: false, cardSpeakerId: null, historicalSpeakerId: null, evidenceOnly: true, includeDebug: true })
+  assert.deepEqual(exchangeSegments.filter(segment => segment.speakerId !== null).map(segment => segment.speakerId), ['ghost:smoker', 'ghost:smoker', 'unconfigured:maeve', 'ghost:smoker', 'ghost:smoker', 'unconfigured:maeve'])
+  assert.ok(exchangeAnswers.narrative_exchange_reconciled_s3)
+  const interrupted = { ...exchangeResults, [`${role.id}_exchange`]: confidentDecision('other_or_unclear') }
+  const unchanged: Record<string, SpeakerDecisionChoice> = { ...exchangeAnswers, speech_s3: confidentDecision('known_0') }
+  delete unchanged.narrative_role_reconciled_s3
+  applyNarrativeExchangeSpeakerReview(plan, unchanged, exchangeReview, interrupted)
+  assert.equal(unchanged.speech_s3.choice, 'known_0')
   const bystander: Record<string, SpeakerDecisionChoice> = {}
   for (const speech of plan.state.speeches) bystander[`speech_${speech.id}`] = confidentDecision('known_0')
   bystander.turn_s2 = confidentDecision('responds_to_previous_speaker')
