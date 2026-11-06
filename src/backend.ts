@@ -147,7 +147,7 @@ type FrontendMessage =
   | { type: 'chat_voice_auto_cast'; requestId: string; chatId: string; voices: FavoriteVoice[]; reserved: string[]; narratorMissing: boolean; userMissing: boolean; ghostLifetime: number }
   | { type: 'chat_voice_ghost_edit'; chatId: string; ghostId: string; voice?: string; promote?: boolean; remove?: boolean }
   | { type: 'chat_voice_get_message'; chatId: string; messageId: string; requestId: string }
-  | { type: 'chat_voice_match_uncast'; requestId: string; chatId: string; messageId: string; message: string; sourceHash: string; groups: UncastVoiceGroup[]; voices: FavoriteVoice[]; reserved: string[]; lifetime: number }
+  | { type: 'chat_voice_match_uncast'; requestId: string; chatId: string; messageId: string; message: string; sourceHash: string; groups: UncastVoiceGroup[]; voices: FavoriteVoice[]; reserved: string[]; lifetime: number; speakerLookback?: number; skippedTrackerTags?: string }
   | {
       type: 'chat_voice_parse_message'
       chatId: string
@@ -1790,7 +1790,8 @@ spindle.onFrontendMessage(async (rawPayload: unknown, userId, frontendSessionId)
         const savedGhosts = readGhostVoices(chat.metadata?.chat_voice_ghost_cast)
         const lifetime = Number.isFinite(payload.lifetime) ? Math.min(1000, Math.max(1, Math.round(payload.lifetime))) : 10
         const eligibleGhosts = activeGhostVoices(savedGhosts, assistantIds, anchor, lifetime)
-        const safeGhostContext = relationshipReviewContext(messages, payload.messageId, eligibleGhosts).ghosts
+        const matchingContext = relationshipReviewContext(messages, payload.messageId, eligibleGhosts, payload.skippedTrackerTags ?? '', payload.speakerLookback ?? DEFAULT_SPEAKER_LOOKBACK)
+        const safeGhostContext = matchingContext.ghosts
         const ghosts = eligibleGhosts.flatMap(ghost => {
           const safe = safeGhostContext.find(item => item.id === ghost.id)
           if (!safe) return []
@@ -1805,7 +1806,7 @@ spindle.onFrontendMessage(async (rawPayload: unknown, userId, frontendSessionId)
         if (!groups.length || (!voices.length && !ghosts.length)) {
           sendFrontend({ type: 'chat_voice_uncast_matches', requestId: payload.requestId, assignments: [], diagnostics: [`No matching request: groups=${groups.length}, availableFavorites=${voices.length}, historicalGhosts=${ghosts.length}, currentGhosts=${currentGhosts.length}.`] }, userId, frontendSessionId)
         } else {
-          const plan = buildUncastVoiceDecision(groups, voices, payload.message.slice(0, 30_000), ghosts)
+          const plan = buildUncastVoiceDecision(groups, voices, payload.message.slice(0, 30_000), ghosts, matchingContext.previousMessages)
           const answers: Record<string, SpeakerDecisionChoice> = {}
           let decisionError = ''
           try {
@@ -1817,7 +1818,7 @@ spindle.onFrontendMessage(async (rawPayload: unknown, userId, frontendSessionId)
             decisionError = error instanceof Error ? error.message : String(error)
             spindle.log.warn(`[Chat Voice] Uncast voice decision failed; using exact ghost matches only: ${decisionError}`)
           }
-          const review = buildUncastIdentityReview(groups, answers, payload.message.slice(0, 30_000), ghosts, payload.messageId)
+          const review = buildUncastIdentityReview(groups, answers, payload.message.slice(0, 30_000), ghosts, payload.messageId, matchingContext.previousMessages)
           let reviewError = ''
           if (Object.keys(review.questions).length) {
             try {
@@ -1839,12 +1840,12 @@ spindle.onFrontendMessage(async (rawPayload: unknown, userId, frontendSessionId)
             const identity = answers[`identity_${group.id}`]
             const label = answers[`label_${group.id}`]
             const voice = answers[`voice_${group.id}`]
-            const comparisons = Object.entries(answers).filter(([key]) => key.startsWith(`same_${group.id}_`) || key.startsWith(`review_same_${group.id}_`) || key.startsWith(`review_ghost_${group.id}_`) || key.startsWith(`review_occurrence_${group.id}_`) || key.startsWith(`review_reveal_${group.id}_`)).map(([key, answer]) => `${key}=${answer.choice} confidence=${answer.confidence} probabilities=${JSON.stringify(answer.probabilities)}`).join(';') || 'none'
+            const comparisons = Object.entries(answers).filter(([key]) => key.startsWith(`same_${group.id}_`) || key.startsWith(`review_same_${group.id}_`) || key.startsWith(`review_ghost_${group.id}_`) || key.startsWith(`review_occurrence_${group.id}_`) || key.startsWith(`review_reveal_${group.id}_`) || key.startsWith(`review_scene_${group.id}_`)).map(([key, answer]) => `${key}=${answer.choice} confidence=${answer.confidence} probabilities=${JSON.stringify(answer.probabilities)}`).join(';') || 'none'
             const assignment = assignments.find(item => item.groupId === group.id)
             const proposed = proposedAssignments.find(item => item.groupId === group.id)
             return `${group.id} segments=${group.segmentIndexes.map(index => index + 1).join(',')} identity=${identity ? `${identity.choice} confidence=${identity.confidence} probabilities=${JSON.stringify(identity.probabilities)}` : 'none'} label=${label ? `${label.choice} confidence=${label.confidence} probabilities=${JSON.stringify(label.probabilities)}` : 'none'} comparisons=${comparisons} proposed=${proposed ? `${proposed.ghostId} / ${proposed.voiceId} / ${proposed.gender}` : 'none'} match-reason=${proposed?.matchReason ?? 'none'} voice-choice=${voice ? `${voice.choice} confidence=${voice.confidence} probabilities=${JSON.stringify(voice.probabilities)}` : 'none'} final=${assignment ? `${assignment.label || 'unnamed'} / ${assignment.ghostId} / ${assignment.voiceId}` : 'connection default'}`
           })
-          diagnostics.unshift(`Available favorites=${voices.length}, historical ghosts=${ghosts.length}, current ghosts=${currentGhosts.length}${decisionError ? `; Jev failed: ${decisionError}` : ''}; identity review questions=${Object.keys(review.questions).length}${reviewError ? `; review failed: ${reviewError}` : ''}.`)
+          diagnostics.unshift(`Available favorites=${voices.length}, historical ghosts=${ghosts.length}, current ghosts=${currentGhosts.length}; prior messages=${matchingContext.previousMessages.length}${decisionError ? `; Jev failed: ${decisionError}` : ''}; identity review questions=${Object.keys(review.questions).length}${reviewError ? `; review failed: ${reviewError}` : ''}.`)
           sendFrontend({ type: 'chat_voice_uncast_matches', requestId: payload.requestId, assignments, diagnostics }, userId, frontendSessionId)
           if (assignments.length) await sendState(userId, undefined, payload.chatId, frontendSessionId)
         }

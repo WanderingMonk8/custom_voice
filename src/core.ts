@@ -259,10 +259,11 @@ export function uncastIdentityLabels(message: string, ghosts: GhostVoice[]): str
 }
 
 /** One decision call classifies each uncast group and ranks the available voice descriptions. */
-export function buildUncastVoiceDecision(groups: UncastVoiceGroup[], voices: FavoriteVoice[], message: string, ghosts: GhostVoice[] = []) {
+export function buildUncastVoiceDecision(groups: UncastVoiceGroup[], voices: FavoriteVoice[], message: string, ghosts: GhostVoice[] = [], previousMessages: RelationshipReviewContext['previousMessages'] = []) {
   const labels = uncastIdentityLabels(message, ghosts)
   const state = {
     message,
+    previousMessages,
     characters: groups.map(group => ({ id: group.id, identity: group.speakerId, speeches: group.speeches, context: group.context })),
     ghosts: ghosts.map((ghost, index) => ({ option: `ghost_${index}`, identity: ghost.speakerId, label: ghost.label || null, aliases: ghostCastAliases(ghost), context: ghost.context, conversationHistory: ghost.conversationHistory ?? [] })),
     voices: voices.map((voice, index) => ({ option: `voice_${index}`, name: voice.name, category: voice.category, description: voice.description })),
@@ -280,7 +281,7 @@ export function buildUncastVoiceDecision(groups: UncastVoiceGroup[], voices: Fav
     }
     const earlier = groups.slice(0, groups.indexOf(group))
     if (ghosts.length || earlier.length) questions[`identity_${group.id}`] = {
-      type: 'choice', instructions: `Does character ${group.id} clearly represent the same individual as one prior character? Compare the full current exchange and prior conversation history, including what others say to this person, relationships, and whether a phone call continues or the same caller arrives in person. Do not confuse a speaker with the person they address; consider scene changes and alternative callers. Shared gender, occupation, or voice alone is insufficient. Select new_or_unclear unless identity is clear.`,
+      type: 'choice', instructions: `Does character ${group.id} clearly represent the same individual as one prior character? Compare the current exchange with previousMessages and the prior character's own conversation history. Trace distinctive objects or workstations, physical location, actions, conversation topic, who addresses whom, and continuing relationships, including across user messages. Several agreeing details can identify someone when their name is revealed later. A shared object, setting, gender, occupation, or voice alone is insufficient; check for multiple people, scene changes, interruptions, and names that identify an addressee or bystander rather than the speaker. Do not confuse the speaker with the person they address. Select new_or_unclear unless identity is clear.`,
       criteria: { new_or_unclear: 'A new character, or identity cannot be reliably established.',
         ...Object.fromEntries(ghosts.map((ghost, index) => [`ghost_${index}`, `Previously seen character ${ghostCastAliases(ghost).join(" / ") || ghost.speakerId}; context: ${ghost.context}`])),
         ...Object.fromEntries(earlier.map(previous => [`group_${previous.id}`, `Earlier character ${previous.id}; context: ${previous.context.join(' ').slice(0, 2_000)}`])) },
@@ -308,7 +309,7 @@ function revealedUncastName(group: UncastVoiceGroup): string {
 }
 
 /** Review borderline same-speaker links when a later turn has a clear label. */
-export function buildUncastIdentityReview(groups: UncastVoiceGroup[], answers: Record<string, SpeakerDecisionChoice>, message: string, ghosts: GhostVoice[] = [], messageId = '') {
+export function buildUncastIdentityReview(groups: UncastVoiceGroup[], answers: Record<string, SpeakerDecisionChoice>, message: string, ghosts: GhostVoice[] = [], messageId = '', previousMessages: RelationshipReviewContext['previousMessages'] = []) {
   const labels = uncastIdentityLabels(message, ghosts)
   const questions: Record<string, { type: 'choice'; instructions: string; criteria: Record<string, string> }> = {}
   for (const [index, group] of groups.entries()) {
@@ -355,6 +356,13 @@ export function buildUncastIdentityReview(groups: UncastVoiceGroup[], answers: R
           instructions: `Has previously seen character ghost_${ghostIndex} now been identified as ${revealedName}, the actual speaker of ${group.id}? Compare that character's saved conversation history and the full scene, including relationships, locations, actions, and who addresses whom. Do not equate people based only on gender, occupation, or a shared setting. Confirm only when the evidence clearly identifies the same individual.`,
           criteria: { same: 'The newly named speaker and the earlier character are clearly the same person.', different_or_unclear: 'They are different, or the available evidence is insufficient.' },
         }
+        if (previousMessages.length && ghost.conversationHistory?.length && Object.keys(questions).length < 16) {
+          questions[`review_scene_${group.id}_${ghostIndex}`] = {
+            type: 'choice',
+            instructions: `Re-read previousMessages, ghost_${ghostIndex}'s own saved conversation history, and the CURRENT exchange. Has the previously unnamed person who spoke in that history now been identified as ${revealedName}, the actual speaker of ${group.id}? Trace who speaks to whom, a continuing conversation, distinctive objects or workstations and their location, associated actions and later naming. Use several agreeing clues together, including intervening user messages. A shared setting, object, profession, or gender alone does not prove identity. Consider multiple people, a new arrival or scene change, and whether the name belongs to an addressee or bystander. Select different_or_unclear when these details do not clearly establish the same individual.`,
+            criteria: { same: 'The earlier unnamed character and the newly named speaker are clearly the same individual.', different_or_unclear: 'Different individuals, or continuity is not clearly established.' },
+          }
+        }
       }
     }
     const label = answers[`label_${group.id}`]
@@ -378,7 +386,7 @@ export function buildUncastIdentityReview(groups: UncastVoiceGroup[], answers: R
     }
     if (Object.keys(questions).length >= 16) break
   }
-  return { state: { message, characters: groups.map(group => ({ id: group.id, identity: group.speakerId, speeches: group.speeches, context: group.context })), ghosts: ghosts.map((ghost, index) => ({ option: `ghost_${index}`, identity: ghost.speakerId, aliases: ghostCastAliases(ghost), context: ghost.context, conversationHistory: ghost.conversationHistory ?? [] })) }, questions }
+  return { state: { message, previousMessages, characters: groups.map(group => ({ id: group.id, identity: group.speakerId, speeches: group.speeches, context: group.context })), ghosts: ghosts.map((ghost, index) => ({ option: `ghost_${index}`, identity: ghost.speakerId, aliases: ghostCastAliases(ghost), context: ghost.context, conversationHistory: ghost.conversationHistory ?? [] })) }, questions }
 }
 
 export interface UncastVoiceAssignment { groupId: string; voiceId: string; gender: string; ghostId?: string; label?: string; aliases?: string[]; matchReason?: string }
@@ -481,8 +489,10 @@ export function resolveUncastVoiceDecisions(
     }
     if (!ghost) {
       const confirmed = ghosts.flatMap((candidate, index) => {
-        const review = answers[`review_reveal_${group.id}_${index}`]
-        return review?.choice === 'same' && strongChoice(review) ? [candidate] : []
+        const reveal = answers[`review_reveal_${group.id}_${index}`]
+        const scene = answers[`review_scene_${group.id}_${index}`]
+        const rejected = [reveal, scene].some(review => review?.choice === 'different_or_unclear' && strongChoice(review))
+        return !rejected && [reveal, scene].some(review => review?.choice === 'same' && strongChoice(review)) ? [candidate] : []
       })
       if (confirmed.length === 1) { ghost = confirmed[0]; reason = 'Jev name-reveal review' }
     }

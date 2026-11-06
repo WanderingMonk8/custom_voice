@@ -151,10 +151,11 @@ function uncastIdentityLabels(message, ghosts) {
   }
   return [...labels].slice(0, 80);
 }
-function buildUncastVoiceDecision(groups, voices, message, ghosts = []) {
+function buildUncastVoiceDecision(groups, voices, message, ghosts = [], previousMessages = []) {
   const labels = uncastIdentityLabels(message, ghosts);
   const state = {
     message,
+    previousMessages,
     characters: groups.map((group) => ({ id: group.id, identity: group.speakerId, speeches: group.speeches, context: group.context })),
     ghosts: ghosts.map((ghost, index) => ({ option: `ghost_${index}`, identity: ghost.speakerId, label: ghost.label || null, aliases: ghostCastAliases(ghost), context: ghost.context, conversationHistory: ghost.conversationHistory ?? [] })),
     voices: voices.map((voice, index) => ({ option: `voice_${index}`, name: voice.name, category: voice.category, description: voice.description }))
@@ -174,7 +175,7 @@ function buildUncastVoiceDecision(groups, voices, message, ghosts = []) {
     const earlier = groups.slice(0, groups.indexOf(group));
     if (ghosts.length || earlier.length) questions[`identity_${group.id}`] = {
       type: "choice",
-      instructions: `Does character ${group.id} clearly represent the same individual as one prior character? Compare the full current exchange and prior conversation history, including what others say to this person, relationships, and whether a phone call continues or the same caller arrives in person. Do not confuse a speaker with the person they address; consider scene changes and alternative callers. Shared gender, occupation, or voice alone is insufficient. Select new_or_unclear unless identity is clear.`,
+      instructions: `Does character ${group.id} clearly represent the same individual as one prior character? Compare the current exchange with previousMessages and the prior character's own conversation history. Trace distinctive objects or workstations, physical location, actions, conversation topic, who addresses whom, and continuing relationships, including across user messages. Several agreeing details can identify someone when their name is revealed later. A shared object, setting, gender, occupation, or voice alone is insufficient; check for multiple people, scene changes, interruptions, and names that identify an addressee or bystander rather than the speaker. Do not confuse the speaker with the person they address. Select new_or_unclear unless identity is clear.`,
       criteria: {
         new_or_unclear: "A new character, or identity cannot be reliably established.",
         ...Object.fromEntries(ghosts.map((ghost, index) => [`ghost_${index}`, `Previously seen character ${ghostCastAliases(ghost).join(" / ") || ghost.speakerId}; context: ${ghost.context}`])),
@@ -202,7 +203,7 @@ function revealedUncastName(group) {
   const names = new Set(group.speeches.flatMap((speech) => [...speech.matchAll(/\b(?:[Mm]y name is|[Ii] am|[Ii]'m)\s+([A-Z][a-z]+(?:[-'][A-Z]?[a-z]+)?)(?=[,.!?;:]|\s+(?:and|from|but|here)\b)/gu)].map((match) => match[1].toLowerCase())));
   return names.size === 1 ? [...names][0] : "";
 }
-function buildUncastIdentityReview(groups, answers, message, ghosts = [], messageId = "") {
+function buildUncastIdentityReview(groups, answers, message, ghosts = [], messageId = "", previousMessages = []) {
   const labels = uncastIdentityLabels(message, ghosts);
   const questions = {};
   for (const [index, group] of groups.entries()) {
@@ -244,6 +245,13 @@ function buildUncastIdentityReview(groups, answers, message, ghosts = [], messag
           instructions: `Has previously seen character ghost_${ghostIndex} now been identified as ${revealedName}, the actual speaker of ${group.id}? Compare that character's saved conversation history and the full scene, including relationships, locations, actions, and who addresses whom. Do not equate people based only on gender, occupation, or a shared setting. Confirm only when the evidence clearly identifies the same individual.`,
           criteria: { same: "The newly named speaker and the earlier character are clearly the same person.", different_or_unclear: "They are different, or the available evidence is insufficient." }
         };
+        if (previousMessages.length && ghost.conversationHistory?.length && Object.keys(questions).length < 16) {
+          questions[`review_scene_${group.id}_${ghostIndex}`] = {
+            type: "choice",
+            instructions: `Re-read previousMessages, ghost_${ghostIndex}'s own saved conversation history, and the CURRENT exchange. Has the previously unnamed person who spoke in that history now been identified as ${revealedName}, the actual speaker of ${group.id}? Trace who speaks to whom, a continuing conversation, distinctive objects or workstations and their location, associated actions and later naming. Use several agreeing clues together, including intervening user messages. A shared setting, object, profession, or gender alone does not prove identity. Consider multiple people, a new arrival or scene change, and whether the name belongs to an addressee or bystander. Select different_or_unclear when these details do not clearly establish the same individual.`,
+            criteria: { same: "The earlier unnamed character and the newly named speaker are clearly the same individual.", different_or_unclear: "Different individuals, or continuity is not clearly established." }
+          };
+        }
       }
     }
     const label = answers[`label_${group.id}`];
@@ -267,7 +275,7 @@ function buildUncastIdentityReview(groups, answers, message, ghosts = [], messag
     }
     if (Object.keys(questions).length >= 16) break;
   }
-  return { state: { message, characters: groups.map((group) => ({ id: group.id, identity: group.speakerId, speeches: group.speeches, context: group.context })), ghosts: ghosts.map((ghost, index) => ({ option: `ghost_${index}`, identity: ghost.speakerId, aliases: ghostCastAliases(ghost), context: ghost.context, conversationHistory: ghost.conversationHistory ?? [] })) }, questions };
+  return { state: { message, previousMessages, characters: groups.map((group) => ({ id: group.id, identity: group.speakerId, speeches: group.speeches, context: group.context })), ghosts: ghosts.map((ghost, index) => ({ option: `ghost_${index}`, identity: ghost.speakerId, aliases: ghostCastAliases(ghost), context: ghost.context, conversationHistory: ghost.conversationHistory ?? [] })) }, questions };
 }
 function isBroadPersonLabel(label) {
   return /^(?:(?:the|a|an)\s+)?(?:(?:young|younger|old|older|elderly|middle-aged|tall|short)\s+)*(?:woman|man|person|girl|boy|guy|lady|stranger|someone|somebody)$/iu.test(label.trim());
@@ -356,8 +364,10 @@ function resolveUncastVoiceDecisions(groups, voices, answers, ghosts = [], reser
     }
     if (!ghost) {
       const confirmed = ghosts.flatMap((candidate, index) => {
-        const review = answers[`review_reveal_${group.id}_${index}`];
-        return review?.choice === "same" && strongChoice(review) ? [candidate] : [];
+        const reveal = answers[`review_reveal_${group.id}_${index}`];
+        const scene = answers[`review_scene_${group.id}_${index}`];
+        const rejected = [reveal, scene].some((review) => review?.choice === "different_or_unclear" && strongChoice(review));
+        return !rejected && [reveal, scene].some((review) => review?.choice === "same" && strongChoice(review)) ? [candidate] : [];
       });
       if (confirmed.length === 1) {
         ghost = confirmed[0];
@@ -6400,7 +6410,8 @@ spindle.onFrontendMessage(async (rawPayload, userId, frontendSessionId) => {
         const savedGhosts = readGhostVoices(chat.metadata?.chat_voice_ghost_cast);
         const lifetime = Number.isFinite(payload.lifetime) ? Math.min(1e3, Math.max(1, Math.round(payload.lifetime))) : 10;
         const eligibleGhosts = activeGhostVoices(savedGhosts, assistantIds, anchor, lifetime);
-        const safeGhostContext = relationshipReviewContext(messages, payload.messageId, eligibleGhosts).ghosts;
+        const matchingContext = relationshipReviewContext(messages, payload.messageId, eligibleGhosts, payload.skippedTrackerTags ?? "", payload.speakerLookback ?? DEFAULT_SPEAKER_LOOKBACK);
+        const safeGhostContext = matchingContext.ghosts;
         const ghosts = eligibleGhosts.flatMap((ghost) => {
           const safe = safeGhostContext.find((item) => item.id === ghost.id);
           if (!safe) return [];
@@ -6412,7 +6423,7 @@ spindle.onFrontendMessage(async (rawPayload, userId, frontendSessionId) => {
         if (!groups.length || !voices.length && !ghosts.length) {
           sendFrontend({ type: "chat_voice_uncast_matches", requestId: payload.requestId, assignments: [], diagnostics: [`No matching request: groups=${groups.length}, availableFavorites=${voices.length}, historicalGhosts=${ghosts.length}, currentGhosts=${currentGhosts.length}.`] }, userId, frontendSessionId);
         } else {
-          const plan = buildUncastVoiceDecision(groups, voices, payload.message.slice(0, 3e4), ghosts);
+          const plan = buildUncastVoiceDecision(groups, voices, payload.message.slice(0, 3e4), ghosts, matchingContext.previousMessages);
           const answers = {};
           let decisionError = "";
           try {
@@ -6424,7 +6435,7 @@ spindle.onFrontendMessage(async (rawPayload, userId, frontendSessionId) => {
             decisionError = error instanceof Error ? error.message : String(error);
             spindle.log.warn(`[Chat Voice] Uncast voice decision failed; using exact ghost matches only: ${decisionError}`);
           }
-          const review = buildUncastIdentityReview(groups, answers, payload.message.slice(0, 3e4), ghosts, payload.messageId);
+          const review = buildUncastIdentityReview(groups, answers, payload.message.slice(0, 3e4), ghosts, payload.messageId, matchingContext.previousMessages);
           let reviewError = "";
           if (Object.keys(review.questions).length) {
             try {
@@ -6446,12 +6457,12 @@ spindle.onFrontendMessage(async (rawPayload, userId, frontendSessionId) => {
             const identity = answers[`identity_${group.id}`];
             const label = answers[`label_${group.id}`];
             const voice = answers[`voice_${group.id}`];
-            const comparisons = Object.entries(answers).filter(([key]) => key.startsWith(`same_${group.id}_`) || key.startsWith(`review_same_${group.id}_`) || key.startsWith(`review_ghost_${group.id}_`) || key.startsWith(`review_occurrence_${group.id}_`) || key.startsWith(`review_reveal_${group.id}_`)).map(([key, answer]) => `${key}=${answer.choice} confidence=${answer.confidence} probabilities=${JSON.stringify(answer.probabilities)}`).join(";") || "none";
+            const comparisons = Object.entries(answers).filter(([key]) => key.startsWith(`same_${group.id}_`) || key.startsWith(`review_same_${group.id}_`) || key.startsWith(`review_ghost_${group.id}_`) || key.startsWith(`review_occurrence_${group.id}_`) || key.startsWith(`review_reveal_${group.id}_`) || key.startsWith(`review_scene_${group.id}_`)).map(([key, answer]) => `${key}=${answer.choice} confidence=${answer.confidence} probabilities=${JSON.stringify(answer.probabilities)}`).join(";") || "none";
             const assignment = assignments.find((item) => item.groupId === group.id);
             const proposed = proposedAssignments.find((item) => item.groupId === group.id);
             return `${group.id} segments=${group.segmentIndexes.map((index) => index + 1).join(",")} identity=${identity ? `${identity.choice} confidence=${identity.confidence} probabilities=${JSON.stringify(identity.probabilities)}` : "none"} label=${label ? `${label.choice} confidence=${label.confidence} probabilities=${JSON.stringify(label.probabilities)}` : "none"} comparisons=${comparisons} proposed=${proposed ? `${proposed.ghostId} / ${proposed.voiceId} / ${proposed.gender}` : "none"} match-reason=${proposed?.matchReason ?? "none"} voice-choice=${voice ? `${voice.choice} confidence=${voice.confidence} probabilities=${JSON.stringify(voice.probabilities)}` : "none"} final=${assignment ? `${assignment.label || "unnamed"} / ${assignment.ghostId} / ${assignment.voiceId}` : "connection default"}`;
           });
-          diagnostics.unshift(`Available favorites=${voices.length}, historical ghosts=${ghosts.length}, current ghosts=${currentGhosts.length}${decisionError ? `; Jev failed: ${decisionError}` : ""}; identity review questions=${Object.keys(review.questions).length}${reviewError ? `; review failed: ${reviewError}` : ""}.`);
+          diagnostics.unshift(`Available favorites=${voices.length}, historical ghosts=${ghosts.length}, current ghosts=${currentGhosts.length}; prior messages=${matchingContext.previousMessages.length}${decisionError ? `; Jev failed: ${decisionError}` : ""}; identity review questions=${Object.keys(review.questions).length}${reviewError ? `; review failed: ${reviewError}` : ""}.`);
           sendFrontend({ type: "chat_voice_uncast_matches", requestId: payload.requestId, assignments, diagnostics }, userId, frontendSessionId);
           if (assignments.length) await sendState(userId, void 0, payload.chatId, frontendSessionId);
         }

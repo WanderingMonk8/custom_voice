@@ -2471,6 +2471,42 @@ test('reviews a newly named speaker against anonymous history even when the firs
   assert.deepEqual(selfNamed[0].aliases, ['marisol'])
 })
 
+test('connects a newly named uncast speaker through a continuing scene and conversation', () => {
+  const first = 'The counter man speaks to Ken. A woman at the second copper turns round and says, "That’s charged her for that, Arthur." Arthur answers her at the counter. The copper behind the woman sizzles.'
+  const user = 'I explain what happened to the note and offer it to the counter man.'
+  const current = 'Arthur says, "Annie at her copper will tell the whole road." "They’re all the same these lads, Arthur," says Annie from her copper. "Annie, love. Wash the sheet," he replies.'
+  const messages = [
+    { id: 'first', is_user: false, content: first },
+    { id: 'user', is_user: true, content: user },
+    { id: 'current', is_user: false, content: current },
+    { id: 'future', is_user: false, content: 'Future secret.' },
+  ]
+  const ghosts = [{ id: 'copper-worker', speakerId: UNCAST_SPEAKER_ID, label: 'the woman', aliases: ['the woman'], voiceId: 'earlier-voice', context: 'The woman speaks to Arthur by the second copper.', occurrenceKeys: [], lastSeenMessageId: 'first', conversationHistory: [{ messageId: 'first', text: first }] }]
+  const context = relationshipReviewContext(messages, 'current', ghosts)
+  const safeGhosts = ghosts.map(ghost => ({ ...ghost, conversationHistory: context.ghosts[0].conversationHistory }))
+  const groups = collectUncastVoiceGroups([{ speakerId: 'unconfigured:annie', text: 'They’re all the same these lads, Arthur.', debugPath: ['segment-type:speech'] }])
+  const voices = readFavoriteVoices([{ id: 'unused-voice' }])
+  const answers: Record<string, SpeakerDecisionChoice> = { identity_g0: confidentDecision('new_or_unclear'), voice_g0: confidentDecision('voice_0') }
+  const review = buildUncastIdentityReview(groups, answers, current, safeGhosts, 'current', context.previousMessages)
+  assert.ok(review.questions.review_scene_g0_0)
+  assert.match(review.questions.review_scene_g0_0.instructions, /workstations/u)
+  assert.deepEqual(review.state.previousMessages.map(item => item.role), ['assistant', 'user'])
+  assert.ok(!JSON.stringify(review.state).includes('Future secret'))
+  const firstPass = buildUncastVoiceDecision(groups, voices, current, safeGhosts, context.previousMessages)
+  assert.equal(firstPass.state.previousMessages[1].text, user)
+  const linked = resolveUncastVoiceDecisions(groups, voices, { ...answers, review_scene_g0_0: confidentDecision('same') }, safeGhosts, [], 'current', current, ['first'])
+  assert.equal(linked[0].ghostId, 'copper-worker')
+  assert.equal(linked[0].voiceId, 'earlier-voice')
+  assert.ok(linked[0].aliases?.includes('annie'))
+  const uncertain = resolveUncastVoiceDecisions(groups, voices, { ...answers, review_scene_g0_0: confidentDecision('different_or_unclear') }, safeGhosts, [], 'current', current, ['first'])
+  assert.equal(uncertain[0].voiceId, 'unused-voice')
+  const contradicted = resolveUncastVoiceDecisions(groups, voices, { ...answers, review_scene_g0_0: confidentDecision('same'), review_reveal_g0_0: confidentDecision('different_or_unclear') }, safeGhosts, [], 'current', current, ['first'])
+  assert.equal(contradicted[0].voiceId, 'unused-voice')
+  const another = { ...safeGhosts[0], id: 'other-worker', voiceId: 'other-voice', label: 'the other woman', aliases: ['the other woman'] }
+  const ambiguous = resolveUncastVoiceDecisions(groups, voices, { ...answers, review_scene_g0_0: confidentDecision('same'), review_scene_g0_1: confidentDecision('same') }, [...safeGhosts, another], [], 'current', current, ['first'])
+  assert.equal(ambiguous[0].voiceId, 'unused-voice')
+})
+
 test('retains conversation exchanges and relationship labels for later ghost identity review', () => {
   const ids = ['one', 'two', 'three', 'four']
   const ghost = { id: 'mother', speakerId: UNCAST_SPEAKER_ID, voiceId: 'voice', context: '', occurrenceKeys: [], lastSeenMessageId: 'one', conversationHistory: [] as Array<{ messageId: string; text: string }> }

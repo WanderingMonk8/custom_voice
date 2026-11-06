@@ -2102,7 +2102,7 @@ export function setup(ctx: SpindleFrontendContext) {
     })
   }
 
-  function requestUncastVoiceMatches(chatId: string, messageId: string, message: string, sourceHash: string, groups: UncastVoiceGroup[], voices: FavoriteVoice[], reserved: string[], lifetime: number): Promise<UncastVoiceAssignment[]> {
+  function requestUncastVoiceMatches(chatId: string, messageId: string, message: string, sourceHash: string, groups: UncastVoiceGroup[], voices: FavoriteVoice[], reserved: string[], lifetime: number, speakerLookback: number, skippedTrackerTags: string): Promise<UncastVoiceAssignment[]> {
     const requestId = `uncast-${Date.now().toString(36)}-${++uncastRequestSequence}`
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -2110,7 +2110,7 @@ export function setup(ctx: SpindleFrontendContext) {
         reject(new Error('Uncast voice matching timed out.'))
       }, 35_000)
       pendingUncastRequests.set(requestId, { resolve, reject, timer })
-      ctx.sendToBackend({ type: 'chat_voice_match_uncast', requestId, chatId, messageId, message, sourceHash, groups, voices, reserved, lifetime })
+      ctx.sendToBackend({ type: 'chat_voice_match_uncast', requestId, chatId, messageId, message, sourceHash, groups, voices, reserved, lifetime, speakerLookback, skippedTrackerTags })
     })
   }
 
@@ -2956,7 +2956,7 @@ export function setup(ctx: SpindleFrontendContext) {
       const uncastMatchPromise = preferences.autoVoiceCasting && uncastGroups.length
         ? requestUncastVoiceMatches(
             playbackChat.id, messageId, preparePlaybackContent(message.content, preferences.skippedTrackerTags), hashMessageContent(message.content),
-            uncastGroups, uncastVoices, reservedVoices, preferences.ghostVoiceLifetime,
+            uncastGroups, uncastVoices, reservedVoices, preferences.ghostVoiceLifetime, preferences.speakerLookback, preferences.skippedTrackerTags,
           ).catch(error => {
             appendSpeakerDebugLog(`Uncast voice matching failed; using connection default: ${error instanceof Error ? error.message : String(error)}`)
             return [] as UncastVoiceAssignment[]
