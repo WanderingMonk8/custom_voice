@@ -2110,6 +2110,7 @@ function applyExplicitPostQuoteVoiceAttributions(plan, answers) {
 function buildSpeakerSwitchContradictionReview(plan, answers, context, cardSpeakerId = null) {
   const questions = {};
   const runs = [];
+  const roles = [];
   const grounded = independentlyGroundedSpeakerIds(plan, context, cardSpeakerId);
   const criteria = speakerDecisionCriteria(plan.state.speakers.slice(0, 220));
   for (const speaker of plan.state.speakers) if (!grounded.has(speaker.id)) delete criteria[speaker.option];
@@ -2144,13 +2145,31 @@ function buildSpeakerSwitchContradictionReview(plan, answers, context, cardSpeak
       questions[`switch_speaker_${run.id}_${id}`] = { type: "choice", criteria: targetCriteria, instructions: `Identify the actual speaker of ${id} in run ${run.id}. Re-read all speech and narration around the exchange, later names and attributions, physical positions, actions, and the preceding messages. A distinct unnamed person may speak even when a known person is nearby. Do not assign an addressee, bystander, or previous message author merely because they are mentioned. Choose uncast_character for a distinct unnamed speaker, or no_clear_identity if uncertain.` };
       if (id !== turn.previousSpeechId && id !== turn.speechId) questions[`switch_link_${run.id}_${id}`] = { type: "choice", instructions: `If quotations ${turn.previousSpeechId} and ${turn.speechId} are spoken by two different people, which of those actual speakers, if either, speaks ${id}? Read the full run, including adjacent actions, topic, objects, pronouns, later attributions and possible third speakers. Do not treat an addressee or a bystander as the speaker. Select other_or_unclear if the text does not clearly establish the link.`, criteria: { previous: `The person who speaks ${turn.previousSpeechId}.`, current: `The person who speaks ${turn.speechId}.`, other_or_unclear: "A third person, or the link is unclear." } };
     }
+    const anchorId = answers[`explicit_voice_attribution_${turn.speechId}`] ? turn.speechId : answers[`explicit_voice_attribution_${turn.previousSpeechId}`] ? turn.previousSpeechId : "";
+    if (anchorId) {
+      const firstParagraph = plan.state.paragraphs.findIndex((item) => item.id === plan.state.speeches.find((speech) => speech.id === speechIds[0])?.paragraphId);
+      const lastParagraph = plan.state.paragraphs.findIndex((item) => item.id === plan.state.speeches.find((speech) => speech.id === speechIds.at(-1))?.paragraphId);
+      const narrative = plan.state.paragraphs.slice(Math.max(0, firstParagraph - 2), Math.max(firstParagraph, lastParagraph) + 1).map((item) => narrativeOnly(item.text)).join("\n");
+      const counts = /* @__PURE__ */ new Map();
+      for (const match of narrative.matchAll(/\bthe\s+([\p{L}][\p{L}\p{M}-]{2,30})['\u2019]s\b/giu)) {
+        const label = `the ${match[1].toLocaleLowerCase()}`;
+        if (!isBroadPersonLabel(label)) counts.set(label, (counts.get(label) ?? 0) + 1);
+      }
+      for (const [label, count] of counts) {
+        if (count < 2 || roles.filter((item) => item.runId === run.id).length >= 3) continue;
+        const roleId = `role_${run.id}_${roles.filter((item) => item.runId === run.id).length}`;
+        roles.push({ id: roleId, runId: run.id, label, anchorId, speechIds });
+        questions[`${roleId}_distinct`] = { type: "choice", instructions: `In the CURRENT dialogue run, is the person described as ${label} a different person from the actual speaker of ${anchorId}? The name or role in narration might be a bystander, an addressee, an alias for the named speaker, or a different participant. Compare the whole scene and their physical positions and actions. Select different only when it is clear they are distinct people.`, criteria: { different: "The described person and the named quote speaker are distinct people.", same_or_unclear: "They are the same person, or their relationship is unclear." } };
+        for (const id of speechIds) if (id !== anchorId) questions[`${roleId}_speech_${id}`] = { type: "choice", instructions: `Does ${label}, the person described in narration, actually speak quotation ${id} in the CURRENT message? Trace who performs the intervening actions, speech tags, pronouns, objects, positions, responses and the surrounding exchange. A person merely present, addressed, or observing is not necessarily speaking. Select role only when this quote clearly belongs to that person; otherwise select other_or_unclear.`, criteria: { role: `The person described as ${label} speaks this quote.`, other_or_unclear: "Another person speaks, or the evidence is unclear." } };
+      }
+    }
     if (runs.length >= 3) break;
   }
   const explicitAttributions = Object.fromEntries(plan.state.speeches.flatMap((speech) => {
     const answer = answers[`explicit_voice_attribution_${speech.id}`];
     return answer ? [[speech.id, plan.optionSpeakerIds[answer.choice]]] : [];
   }));
-  return { state: { ...plan.state, previousMessages: context.previousMessages, ghosts: context.ghosts, switchRuns: runs, explicitAttributions }, questions, runs, ghostOptions };
+  return { state: { ...plan.state, previousMessages: context.previousMessages, ghosts: context.ghosts, switchRuns: runs, explicitAttributions, narrativeRoles: roles }, questions, runs, ghostOptions, roles };
 }
 function applySpeakerSwitchContradictionReview(plan, answers, review, results) {
   const options = { ...plan.optionSpeakerIds, ...review.ghostOptions };
@@ -2221,6 +2240,56 @@ function applySpeakerSwitchContradictionReview(plan, answers, review, results) {
       delete answers[`relationship_confirmed_${id}`];
       delete answers[`global_uncertain_${id}`];
     }
+  }
+}
+function applyNarrativeRoleSpeakerReview(plan, answers, review, results) {
+  const speakers = plan.state.speakers.map((speaker) => ({ id: speaker.id, name: speaker.name }));
+  const candidates = /* @__PURE__ */ new Map();
+  for (const role of review.roles) {
+    const distinct = evaluateSpeakerDecisionAnswer(results[`${role.id}_distinct`], { different: "different", same_or_unclear: "same_or_unclear" }, { probability: 0.85, confidence: 0.75, margin: 0.4 });
+    if (distinct.identity !== "different") continue;
+    const anchor = answers[`explicit_voice_attribution_${role.anchorId}`];
+    const anchorId = anchor && plan.optionSpeakerIds[anchor.choice];
+    if (!anchorId) continue;
+    const names = [role.label, role.label.replace(/^the\s+/iu, "")].map((value) => value.toLocaleLowerCase());
+    const castMatches = plan.state.speakers.filter((speaker) => speaker.id !== USER_SPEAKER_ID && speaker.aliases.some((alias) => names.includes(alias.toLocaleLowerCase())));
+    if (castMatches.length > 1 || castMatches.some((speaker) => speaker.id === anchorId)) continue;
+    const ghostMatches = review.state.ghosts.filter((ghost) => [ghost.label, ...ghost.aliases].some((alias) => names.includes(alias.toLocaleLowerCase())));
+    const anchorSpeaker = plan.state.speakers.find((speaker) => speaker.id === anchorId);
+    const anchorAliases = new Set(anchorSpeaker?.aliases.map((alias) => alias.toLocaleLowerCase()) ?? []);
+    if (ghostMatches.some((ghost) => [ghost.label, ...ghost.aliases].some((alias) => !!alias && anchorAliases.has(alias.toLocaleLowerCase())))) continue;
+    const identity = castMatches[0]?.id ?? (ghostMatches.length === 1 ? `ghost:${ghostMatches[0].id}` : unconfiguredSpeakerId(role.label));
+    const option = castMatches[0]?.option ?? `${role.id}_identity`;
+    for (const id of role.speechIds) {
+      if (id === role.anchorId || answers[`explicit_voice_attribution_${id}`]) continue;
+      const existing = evaluateSpeakerDecisionAnswer(answers[`speech_${id}`], plan.optionSpeakerIds).identity;
+      if (answers[`persona_confirmed_${id}`] && existing === USER_SPEAKER_ID || (answers[`self_intro_reconciled_${id}`] || answers[`switch_reconciled_${id}`]) && existing !== identity) continue;
+      const result = results[`${role.id}_speech_${id}`];
+      if (evaluateSpeakerDecisionAnswer(result, { role: "role", other_or_unclear: "other_or_unclear" }, { probability: 0.8, confidence: 0.7, margin: 0.3 }).identity !== "role") continue;
+      const speech = plan.state.speeches.find((item) => item.id === id);
+      if (!speech) continue;
+      const explicit = narrativeAttributionSpeaker(`${speech.narrativeBefore} ${speech.narrativeAfter}`, speakers);
+      if (explicit && explicit !== identity) continue;
+      const entries = candidates.get(id) ?? [];
+      entries.push({ role, identity, option, result });
+      candidates.set(id, entries);
+    }
+  }
+  for (const [id, entries] of candidates) {
+    if (new Set(entries.map((item) => item.identity)).size !== 1) continue;
+    const { identity, option, result } = entries[0];
+    const original = answers[`speech_${id}`];
+    const existing = evaluateSpeakerDecisionAnswer(original, plan.optionSpeakerIds).identity;
+    if (existing === identity && !answers[`global_uncertain_${id}`]) continue;
+    plan.optionSpeakerIds[option] = identity;
+    const assignment = { choice: option, probabilities: { [option]: result.probabilities.role ?? 0 }, confidence: result.confidence };
+    answers[`relationship_original_${id}`] = original;
+    answers[`speech_${id}`] = assignment;
+    answers[`narrative_role_reconciled_${id}`] = result;
+    answers[`relationship_continuity_${id}`] = assignment;
+    answers[`relationship_global_${id}`] = assignment;
+    delete answers[`relationship_confirmed_${id}`];
+    delete answers[`global_uncertain_${id}`];
   }
 }
 function buildOpeningSpeakerReview(plan, answers, context, cardSpeakerId) {
@@ -4570,6 +4639,7 @@ function resolveSpeakerDecisionSegments(content, plan, answers, speakers, option
           ...answers[`self_intro_reconciled_${speech.id}`] ? ["jev-self-introduction:strongly linked to a verified self-introduction"] : [],
           ...answers[`explicit_voice_attribution_${speech.id}`] ? ["explicit-voice-attribution:immediate post-quote named voice"] : [],
           ...decisionAnswerDebug("jev-speaker-switch-review", answers[`switch_reconciled_${speech.id}`], plan.optionSpeakerIds),
+          ...decisionAnswerDebug("jev-narrative-role-review", answers[`narrative_role_reconciled_${speech.id}`], { role: "role", other_or_unclear: "other_or_unclear" }),
           ...decisionAnswerDebug("jev-speaker-switch-link", answers[`switch_link_reconciled_${speech.id}`], { previous: "previous", current: "current", other_or_unclear: "other_or_unclear" }),
           ...answers[`relationship_confirmed_${speech.id}`] ? ["jev-relationship-review:accepted first-pass identity confirmed"] : [],
           ...decisionAnswerDebug("jev-contextual-user-review", answers[`persona_check_${speech.id}`], { user: USER_SPEAKER_ID, other: "other" }),
@@ -5476,7 +5546,7 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
           })),
           cardSpeakerId: titleMatchedCardSpeakerId,
           historicalSpeakerId,
-          relationshipReview: { version: "cross-message-run-17", context: relationshipContext, speakerLookback, strategy: payload.runReview === true ? "run" : "scene", focusedOpeningFallback: payload.focusedOpeningFallback === true, bestAvailableSpeaker: payload.bestAvailableSpeaker === true },
+          relationshipReview: { version: "cross-message-run-18", context: relationshipContext, speakerLookback, strategy: payload.runReview === true ? "run" : "scene", focusedOpeningFallback: payload.focusedOpeningFallback === true, bestAvailableSpeaker: payload.bestAvailableSpeaker === true },
           skippedTrackerTags
         }));
         const cached = config.parsedMessages[payload.messageId];
@@ -5780,8 +5850,10 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
                   relationshipSceneDiagnostic += `; speaker-switch-review=incomplete (${invalid.length} invalid answers)`;
                 } else {
                   applySpeakerSwitchContradictionReview(decisionPlan, answers, switchReview, reviewed);
+                  applyNarrativeRoleSpeakerReview(decisionPlan, answers, switchReview, reviewed);
                   relationshipSceneDiagnostic += `; speaker-switch-review=${switchReview.runs.length} runs, ${Object.keys(answers).filter((id) => id.startsWith("switch_reconciled_")).length} reconciled`;
-                  if (payload.debug) relationshipSceneDiagnostic += `; speaker-switch-candidates=${JSON.stringify(switchReview.ghostOptions)}; speaker-switch-decisions=${JSON.stringify(Object.fromEntries(Object.entries(reviewed).map(([id, value]) => [id, { choice: value.choice, confidence: value.confidence, probabilities: value.probabilities }])))}`;
+                  relationshipSceneDiagnostic += `; narrative-role-review=${switchReview.roles.length} roles, ${Object.keys(answers).filter((id) => id.startsWith("narrative_role_reconciled_")).length} reconciled`;
+                  if (payload.debug) relationshipSceneDiagnostic += `; speaker-switch-candidates=${JSON.stringify(switchReview.ghostOptions)}; narrative-role-candidates=${JSON.stringify(switchReview.roles.map((role) => ({ id: role.id, label: role.label, anchor: role.anchorId })))}; speaker-switch-decisions=${JSON.stringify(Object.fromEntries(Object.entries(reviewed).map(([id, value]) => [id, { choice: value.choice, confidence: value.confidence, probabilities: value.probabilities }])))}`;
                 }
               } catch {
                 speakerSwitchRetry = true;
