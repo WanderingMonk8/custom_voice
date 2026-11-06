@@ -151,11 +151,25 @@ function uncastIdentityLabels(message, ghosts) {
   }
   return [...labels].slice(0, 80);
 }
+function uncastNarrativeNameCandidates(message) {
+  const names = /* @__PURE__ */ new Map();
+  const narrative = narrativeOnly(message);
+  const pattern = /\b([\p{Lu}][\p{Ll}\p{M}'’-]{1,39})\s+(?:is|was|has|had|stands|stood|sits|sat|turns|turned|looks|looked|says|said|asks|asked|answers|answered|replies|replied)\b/gu;
+  for (const match of narrative.matchAll(pattern)) {
+    const name = normalizeSpeakerName(match[1]);
+    if (!name || NON_NAME_PARAGRAPH_LEADS.has(name.toLowerCase())) continue;
+    names.set(name.toLowerCase(), name);
+    if (names.size >= 20) break;
+  }
+  return [...names.values()];
+}
 function buildUncastVoiceDecision(groups, voices, message, ghosts = [], previousMessages = []) {
   const labels = uncastIdentityLabels(message, ghosts);
+  const narrativeNames = uncastNarrativeNameCandidates(message);
   const state = {
     message,
     previousMessages,
+    narrativeNames,
     characters: groups.map((group) => ({ id: group.id, identity: group.speakerId, speeches: group.speeches, context: group.context })),
     ghosts: ghosts.map((ghost, index) => ({ option: `ghost_${index}`, identity: ghost.speakerId, label: ghost.label || null, aliases: ghostCastAliases(ghost), context: ghost.context, conversationHistory: ghost.conversationHistory ?? [] })),
     voices: voices.map((voice, index) => ({ option: `voice_${index}`, name: voice.name, category: voice.category, description: voice.description }))
@@ -171,6 +185,11 @@ function buildUncastVoiceDecision(groups, voices, message, ghosts = [], previous
       type: "choice",
       instructions: `Choose the descriptive label for the person who actually speaks the quoted dialogue in ${group.id}. A person mentioned in narration, observing, or addressed by the speaker is not necessarily speaking. Choose none unless the label identifies the speaker of these quotations.`,
       criteria: { none: "No reliable descriptive identity.", ...Object.fromEntries(labels.map((label, index) => [`label_${index}`, label])) }
+    };
+    if (group.speakerId === UNCAST_SPEAKER_ID && narrativeNames.length) questions[`narrative_name_${group.id}`] = {
+      type: "choice",
+      instructions: `Does a person explicitly named in CURRENT narration actually speak the quotations in ${group.id}? Trace nearby pronouns, actions, dialogue and previousMessages. Names of addressees, bystanders, narrators, and people merely discussed are not speaker identities. Choose none unless the evidence clearly identifies the speaker.`,
+      criteria: { none: "No named person is clearly identified as this speaker.", ...Object.fromEntries(narrativeNames.map((name, index) => [`name_${index}`, name])) }
     };
     const earlier = groups.slice(0, groups.indexOf(group));
     if (ghosts.length || earlier.length) questions[`identity_${group.id}`] = {
@@ -198,10 +217,22 @@ function buildUncastVoiceDecision(groups, voices, message, ghosts = [], previous
   }
   return { state, questions };
 }
-function revealedUncastName(group) {
+function revealedUncastName(group, answers = {}, message = "") {
   if (group.speakerId.startsWith("unconfigured:")) return group.speakerId.slice("unconfigured:".length);
-  const names = new Set(group.speeches.flatMap((speech) => [...speech.matchAll(/\b(?:[Mm]y name is|[Ii] am|[Ii]'m)\s+([A-Z][a-z]+(?:[-'][A-Z]?[a-z]+)?)(?=[,.!?;:]|\s+(?:and|from|but|here)\b)/gu)].map((match) => match[1].toLowerCase())));
-  return names.size === 1 ? [...names][0] : "";
+  const names = new Set(group.speeches.flatMap((speech) => [...speech.matchAll(/\b(?:[Mm]y name is|[Ii] am|[Ii]'m)\s+([A-Z][a-z]+(?:[-'][A-Z]?[a-z]+)?)(?=[,.!?;:]|\s+(?:and|from|but|here)\b)/gu)].map((match2) => match2[1].toLowerCase())));
+  if (names.size === 1) return [...names][0];
+  const answer = answers[`narrative_name_${group.id}`];
+  const match = answer?.choice.match(/^name_(\d+)$/u);
+  const probability = answer?.probabilities[answer.choice] ?? 0;
+  const runnerUp = answer ? Math.max(0, ...Object.entries(answer.probabilities).filter(([key]) => key !== answer.choice).map(([, value]) => value)) : 0;
+  return match && answer && answer.confidence >= 0.8 && probability >= 0.8 && probability - runnerUp >= 0.25 ? (uncastNarrativeNameCandidates(message)[Number(match[1])] ?? "").toLowerCase() : "";
+}
+function latestGhostOccurrenceIndex(ghosts, key) {
+  let found = -1;
+  if (key) {
+    for (let index = 0; index < ghosts.length; index++) if (ghosts[index].occurrenceKeys.includes(key)) found = index;
+  }
+  return found;
 }
 function buildUncastIdentityReview(groups, answers, message, ghosts = [], messageId = "", previousMessages = []) {
   const labels = uncastIdentityLabels(message, ghosts);
@@ -209,7 +240,7 @@ function buildUncastIdentityReview(groups, answers, message, ghosts = [], messag
   for (const [index, group] of groups.entries()) {
     if (Object.keys(questions).length >= 16) break;
     const occurrenceKey = messageId ? `${messageId}:${hashMessageContent(group.speeches.join("\n"))}` : "";
-    const occurrenceIndex = occurrenceKey ? ghosts.findIndex((ghost) => ghost.occurrenceKeys.includes(occurrenceKey)) : -1;
+    const occurrenceIndex = latestGhostOccurrenceIndex(ghosts, occurrenceKey);
     const initialIdentity = answers[`identity_${group.id}`];
     const confirmedOccurrence = occurrenceIndex >= 0 && initialIdentity?.choice === `ghost_${occurrenceIndex}` && initialIdentity.confidence >= 0.8 && (initialIdentity.probabilities[initialIdentity.choice] ?? 0) >= 0.8 && (initialIdentity.probabilities[initialIdentity.choice] ?? 0) - Math.max(0, ...Object.entries(initialIdentity.probabilities).filter(([key]) => key !== initialIdentity.choice).map(([, value]) => value)) >= 0.25;
     if (occurrenceIndex >= 0 && !confirmedOccurrence) {
@@ -217,6 +248,12 @@ function buildUncastIdentityReview(groups, answers, message, ghosts = [], messag
         type: "choice",
         instructions: `A previous generation assigned current group ${group.id} to ghost_${occurrenceIndex}. The saved occurrence may be wrong. Compare the current speaker, narrative actions and prior character context. Is this clearly the same individual? Do not infer identity from the name, gender, or the saved occurrence alone.`,
         criteria: { same: "The current speaker and saved character are clearly the same person.", different_or_unclear: "They differ, or there is insufficient evidence to confirm identity." }
+      };
+      if (Object.keys(questions).length >= 16) break;
+      questions[`review_occurrence_disposition_${group.id}_${occurrenceIndex}`] = {
+        type: "choice",
+        instructions: `Compare the actual speaker of ${group.id} with ghost_${occurrenceIndex}, which a prior generation linked to this exact occurrence. Decide whether they are clearly the same person, clearly different people, or unclear. Read their saved histories, other participants, actions, dialogue and scene context. Do not treat an uncertain mismatch as proof of a different person.`,
+        criteria: { same: "The speaker and the saved character are clearly the same person.", different: "They are clearly different people.", unclear: "The evidence does not establish whether they are the same or different." }
       };
       if (Object.keys(questions).length >= 16) break;
     }
@@ -232,10 +269,12 @@ function buildUncastIdentityReview(groups, answers, message, ghosts = [], messag
         criteria: { same: "The prior character and current speaker are clearly the same person.", different_or_unclear: "They differ or the evidence is insufficient." }
       };
     }
-    const revealedName = revealedUncastName(group);
+    const revealedName = revealedUncastName(group, answers, message);
     const alreadyNamed = ghosts.some((ghost) => ghostCastAliases(ghost).some((alias) => alias.toLowerCase() === revealedName.toLowerCase()));
     if (revealedName && !isBroadPersonLabel(revealedName) && !alreadyNamed) {
-      for (const [ghostIndex, ghost] of ghosts.entries()) {
+      const priorIds = previousMessages.map((item) => item.id);
+      const candidates = ghosts.map((ghost, ghostIndex) => ({ ghost, ghostIndex, recent: Math.max(priorIds.indexOf(ghost.lastSeenMessageId), ...(ghost.conversationHistory ?? []).map((item) => priorIds.indexOf(item.messageId))) })).sort((a, b) => b.recent - a.recent || a.ghostIndex - b.ghostIndex);
+      for (const { ghostIndex, ghost } of candidates) {
         if (Object.keys(questions).length >= 16) break;
         const aliases = ghostCastAliases(ghost);
         if (aliases.some((alias) => !isDescriptiveGhostLabel(alias))) continue;
@@ -292,6 +331,8 @@ function resolveUncastVoiceDecisions(groups, voices, answers, ghosts = [], reser
   const roots = /* @__PURE__ */ new Map();
   const linkedGhosts = /* @__PURE__ */ new Map();
   const conflictedRoots = /* @__PURE__ */ new Set();
+  const confirmedNewRoots = /* @__PURE__ */ new Set();
+  const contradictedRoots = /* @__PURE__ */ new Set();
   const linkReasons = /* @__PURE__ */ new Map();
   const labels = uncastIdentityLabels(message, ghosts);
   const groupLabels = /* @__PURE__ */ new Map();
@@ -306,16 +347,20 @@ function resolveUncastVoiceDecisions(groups, voices, answers, ghosts = [], reser
   for (const group of groups) {
     let root = group.id;
     const occurrenceKey = messageId ? `${messageId}:${hashMessageContent(group.speeches.join("\n"))}` : "";
-    const name = group.speakerId.startsWith("unconfigured:") ? group.speakerId.slice("unconfigured:".length).toLowerCase() : "";
-    const aliasMatches = name && !isBroadPersonLabel(name) ? ghosts.filter((item) => ghostCastAliases(item).some((alias) => alias.toLowerCase() === name)) : [];
-    const occurrence = ghosts.find((item) => occurrenceKey && item.occurrenceKeys.includes(occurrenceKey));
-    const occurrenceIndex = occurrence ? ghosts.indexOf(occurrence) : -1;
+    const name = revealedUncastName(group, answers, message).toLowerCase();
+    const occurrenceIndex = latestGhostOccurrenceIndex(ghosts, occurrenceKey);
+    const occurrence = occurrenceIndex >= 0 ? ghosts[occurrenceIndex] : void 0;
     const occurrenceReview = occurrenceIndex >= 0 ? answers[`review_occurrence_${group.id}_${occurrenceIndex}`] : void 0;
     const identityAnswer = answers[`identity_${group.id}`];
     const reviewedAsGhost = occurrence && group.speakerId === `ghost:${occurrence.id}`;
     const occurrenceConfirmed = !!occurrence && (reviewedAsGhost || identityAnswer?.choice === `ghost_${occurrenceIndex}` && strongChoice(identityAnswer) || occurrenceReview?.choice === "same" && strongChoice(occurrenceReview));
-    const occurrenceConflict = !!occurrence && !occurrenceConfirmed;
-    const exact = occurrence ?? (group.speakerId !== UNCAST_SPEAKER_ID && !isBroadPersonLabel(name) ? ghosts.find((item) => item.speakerId === group.speakerId) : void 0) ?? (aliasMatches.length === 1 ? aliasMatches[0] : void 0);
+    const disposition = occurrenceIndex >= 0 ? answers[`review_occurrence_disposition_${group.id}_${occurrenceIndex}`] : void 0;
+    const identityProbability = identityAnswer?.probabilities.new_or_unclear ?? 0;
+    const identityRunnerUp = identityAnswer ? Math.max(0, ...Object.entries(identityAnswer.probabilities).filter(([key]) => key !== "new_or_unclear").map(([, value]) => value)) : 0;
+    const confirmedNew = !!occurrence && disposition?.choice === "different" && strongChoice(disposition) && identityAnswer?.choice === "new_or_unclear" && identityAnswer.confidence >= 0.8 && identityProbability >= 0.8 && identityProbability - identityRunnerUp >= 0.25;
+    const occurrenceConflict = !!occurrence && !occurrenceConfirmed && !confirmedNew;
+    const aliasMatches = name && !isBroadPersonLabel(name) ? ghosts.filter((item) => (!confirmedNew || item.id !== occurrence?.id) && ghostCastAliases(item).some((alias) => alias.toLowerCase() === name)) : [];
+    const exact = (occurrenceConfirmed ? occurrence : void 0) ?? (group.speakerId !== UNCAST_SPEAKER_ID && !isBroadPersonLabel(name) ? ghosts.find((item) => item.speakerId === group.speakerId && (!confirmedNew || item.id !== occurrence?.id)) : void 0) ?? (aliasMatches.length === 1 ? aliasMatches[0] : void 0) ?? (!confirmedNew ? occurrence : void 0);
     const identity = answers[`identity_${group.id}`];
     const labelAnswer = answers[`label_${group.id}`];
     const labelIndex = labelAnswer?.choice.match(/^label_(\d+)$/u);
@@ -332,15 +377,29 @@ function resolveUncastVoiceDecisions(groups, voices, answers, ghosts = [], reser
     if (same[0]) root = roots.get(same[0].previous.id) ?? root;
     else if (label && !isBroadPersonLabel(label) && rootByLabel.has(label)) root = rootByLabel.get(label);
     else if (strongChoice(identity) && identity?.choice.startsWith("group_")) root = roots.get(identity.choice.slice(6)) ?? root;
-    const namedGhosts = label && !isBroadPersonLabel(label) ? ghosts.filter((item) => ghostCastAliases(item).some((alias) => alias.toLowerCase() === label)) : [];
+    const namedGhosts = label && !isBroadPersonLabel(label) ? ghosts.filter((item) => (!confirmedNew || item.id !== occurrence?.id) && ghostCastAliases(item).some((alias) => alias.toLowerCase() === label)) : [];
     const rankedGhosts = namedGhosts.map((item) => ({ item, recent: Math.max(
       previousMessageIds.indexOf(item.lastSeenMessageId),
       ...item.occurrenceKeys.map((key) => previousMessageIds.indexOf(key.split(":", 1)[0]))
     ) })).sort((a, b) => b.recent - a.recent);
     const priorGhost = rankedGhosts[0]?.recent >= 0 && (rankedGhosts.length === 1 || rankedGhosts[0].recent > rankedGhosts[1].recent) ? rankedGhosts[0].item : void 0;
-    const reviewedGhost = group.speakerId.startsWith("ghost:") ? ghosts.find((item) => item.id === group.speakerId.slice("ghost:".length)) : void 0;
+    const reviewedGhost = group.speakerId.startsWith("ghost:") ? ghosts.find((item) => item.id === group.speakerId.slice("ghost:".length) && (!confirmedNew || item.id !== occurrence?.id)) : void 0;
     let ghost = reviewedGhost ?? (namedGhosts.length === 1 ? namedGhosts[0] : priorGhost ?? exact);
     let reason = reviewedGhost ? "speaker relationship review" : ghost === occurrence && ghost ? "exact message occurrence" : ghost && namedGhosts.includes(ghost) ? "label or alias match" : ghost ? "speaker name or alias match" : "";
+    if (occurrenceConflict && ghost?.id === occurrence?.id) {
+      const alternatives = ghosts.flatMap((candidate, index) => {
+        if (candidate.id === occurrence.id) return [];
+        const reveal = answers[`review_reveal_${group.id}_${index}`];
+        const scene = answers[`review_scene_${group.id}_${index}`];
+        const rejected = [reveal, scene].some((review) => review?.choice === "different_or_unclear" && strongChoice(review));
+        const confirmed = [reveal, scene].some((review) => review?.choice === "same" && strongChoice(review)) || identityAnswer?.choice === `ghost_${index}` && strongChoice(identityAnswer);
+        return !rejected && confirmed ? [candidate] : [];
+      });
+      if (alternatives.length === 1) {
+        ghost = alternatives[0];
+        reason = "Jev alternative identity review (contested occurrence)";
+      }
+    }
     if (!ghost && strongChoice(identity) && identity?.choice.startsWith("ghost_")) {
       ghost = ghosts[Number(identity.choice.slice(6))];
       if (ghost) reason = "Jev identity match";
@@ -364,6 +423,7 @@ function resolveUncastVoiceDecisions(groups, voices, answers, ghosts = [], reser
     }
     if (!ghost) {
       const confirmed = ghosts.flatMap((candidate, index) => {
+        if (confirmedNew && candidate.id === occurrence?.id) return [];
         const reveal = answers[`review_reveal_${group.id}_${index}`];
         const scene = answers[`review_scene_${group.id}_${index}`];
         const rejected = [reveal, scene].some((review) => review?.choice === "different_or_unclear" && strongChoice(review));
@@ -376,15 +436,26 @@ function resolveUncastVoiceDecisions(groups, voices, answers, ghosts = [], reser
     }
     if (!ghost && group.speakerId === UNCAST_SPEAKER_ID && groupLabels.has(group.id)) {
       const literal = normalizeSpeakerName(groupLabels.get(group.id)).toLowerCase();
-      const sameLabel = literal && !isGenericAdultLabel(literal) ? ghosts.filter((item) => ghostCastAliases(item).some((alias) => alias.toLowerCase() === literal)) : [];
+      const sameLabel = literal && !isGenericAdultLabel(literal) ? ghosts.filter((item) => (!confirmedNew || item.id !== occurrence?.id) && ghostCastAliases(item).some((alias) => alias.toLowerCase() === literal)) : [];
       if (sameLabel.length === 1) {
         ghost = sameLabel[0];
         reason = "repeated unnamed label";
       }
     }
     roots.set(group.id, root);
-    if (occurrenceConflict && ghost?.id === occurrence?.id && !linkedGhosts.has(root)) {
+    if (contradictedRoots.has(root)) continue;
+    if (confirmedNew && linkedGhosts.get(root)?.id === occurrence?.id) {
+      confirmedNewRoots.delete(root);
       conflictedRoots.add(root);
+      contradictedRoots.add(root);
+      continue;
+    }
+    if (confirmedNew) {
+      confirmedNewRoots.add(root);
+      conflictedRoots.delete(root);
+    }
+    if (occurrenceConflict && ghost?.id === occurrence?.id && !linkedGhosts.has(root)) {
+      if (!confirmedNewRoots.has(root)) conflictedRoots.add(root);
       continue;
     }
     if (label && !rootByLabel.has(label)) rootByLabel.set(label, root);
@@ -418,7 +489,7 @@ function resolveUncastVoiceDecisions(groups, voices, answers, ghosts = [], reser
     for (const group of members) {
       const aliases = mergeGhostAliases(
         group.speakerId.startsWith("unconfigured:") ? [group.speakerId.slice("unconfigured:".length)] : [],
-        group.speakerId === UNCAST_SPEAKER_ID && linkReasons.get(root)?.startsWith("Jev name-reveal review") && revealedUncastName(group) ? [revealedUncastName(group)] : [],
+        group.speakerId === UNCAST_SPEAKER_ID && revealedUncastName(group, answers, message) ? [revealedUncastName(group, answers, message)] : [],
         groupLabels.has(group.id) ? [groupLabels.get(group.id)] : []
       );
       assignments.push({ groupId: group.id, voiceId: ghost.voiceId, gender, ghostId: ghost.id, matchReason: `${linkReasons.get(root) ?? "unknown"}${group.id !== root ? `; linked to group ${root}` : ""}`, ...label ? { label } : {}, ...aliases.length ? { aliases } : {} });
@@ -6457,10 +6528,11 @@ spindle.onFrontendMessage(async (rawPayload, userId, frontendSessionId) => {
             const identity = answers[`identity_${group.id}`];
             const label = answers[`label_${group.id}`];
             const voice = answers[`voice_${group.id}`];
-            const comparisons = Object.entries(answers).filter(([key]) => key.startsWith(`same_${group.id}_`) || key.startsWith(`review_same_${group.id}_`) || key.startsWith(`review_ghost_${group.id}_`) || key.startsWith(`review_occurrence_${group.id}_`) || key.startsWith(`review_reveal_${group.id}_`) || key.startsWith(`review_scene_${group.id}_`)).map(([key, answer]) => `${key}=${answer.choice} confidence=${answer.confidence} probabilities=${JSON.stringify(answer.probabilities)}`).join(";") || "none";
+            const comparisons = Object.entries(answers).filter(([key]) => key.startsWith(`same_${group.id}_`) || key.startsWith(`review_same_${group.id}_`) || key.startsWith(`review_ghost_${group.id}_`) || key.startsWith(`review_occurrence_${group.id}_`) || key.startsWith(`review_occurrence_disposition_${group.id}_`) || key.startsWith(`review_reveal_${group.id}_`) || key.startsWith(`review_scene_${group.id}_`)).map(([key, answer]) => `${key}=${answer.choice} confidence=${answer.confidence} probabilities=${JSON.stringify(answer.probabilities)}`).join(";") || "none";
+            const narrativeName = answers[`narrative_name_${group.id}`];
             const assignment = assignments.find((item) => item.groupId === group.id);
             const proposed = proposedAssignments.find((item) => item.groupId === group.id);
-            return `${group.id} segments=${group.segmentIndexes.map((index) => index + 1).join(",")} identity=${identity ? `${identity.choice} confidence=${identity.confidence} probabilities=${JSON.stringify(identity.probabilities)}` : "none"} label=${label ? `${label.choice} confidence=${label.confidence} probabilities=${JSON.stringify(label.probabilities)}` : "none"} comparisons=${comparisons} proposed=${proposed ? `${proposed.ghostId} / ${proposed.voiceId} / ${proposed.gender}` : "none"} match-reason=${proposed?.matchReason ?? "none"} voice-choice=${voice ? `${voice.choice} confidence=${voice.confidence} probabilities=${JSON.stringify(voice.probabilities)}` : "none"} final=${assignment ? `${assignment.label || "unnamed"} / ${assignment.ghostId} / ${assignment.voiceId}` : "connection default"}`;
+            return `${group.id} segments=${group.segmentIndexes.map((index) => index + 1).join(",")} identity=${identity ? `${identity.choice} confidence=${identity.confidence} probabilities=${JSON.stringify(identity.probabilities)}` : "none"} label=${label ? `${label.choice} confidence=${label.confidence} probabilities=${JSON.stringify(label.probabilities)}` : "none"} narrative-name=${narrativeName ? `${narrativeName.choice} (${plan.state.narrativeNames[Number(narrativeName.choice.replace("name_", ""))] ?? "none"}) confidence=${narrativeName.confidence} probabilities=${JSON.stringify(narrativeName.probabilities)}` : "none"} comparisons=${comparisons} proposed=${proposed ? `${proposed.ghostId} / ${proposed.voiceId} / ${proposed.gender}` : "none"} match-reason=${proposed?.matchReason ?? "none"} voice-choice=${voice ? `${voice.choice} confidence=${voice.confidence} probabilities=${JSON.stringify(voice.probabilities)}` : "none"} final=${assignment ? `${assignment.label || "unnamed"} / ${assignment.ghostId} / ${assignment.voiceId}` : "connection default"}`;
           });
           diagnostics.unshift(`Available favorites=${voices.length}, historical ghosts=${ghosts.length}, current ghosts=${currentGhosts.length}; prior messages=${matchingContext.previousMessages.length}${decisionError ? `; Jev failed: ${decisionError}` : ""}; identity review questions=${Object.keys(review.questions).length}${reviewError ? `; review failed: ${reviewError}` : ""}.`);
           sendFrontend({ type: "chat_voice_uncast_matches", requestId: payload.requestId, assignments, diagnostics }, userId, frontendSessionId);

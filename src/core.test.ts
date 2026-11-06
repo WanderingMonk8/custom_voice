@@ -2345,6 +2345,41 @@ test('a contested saved occurrence is reviewed and does not force a voice or ove
   assert.equal(confirmed[0]?.ghostId, 'halloran')
 })
 
+test('a clearly different saved occurrence can receive a new voice without changing the old ghost', () => {
+  const group = collectUncastVoiceGroups([{ speakerId: UNCAST_SPEAKER_ID, text: 'Seven-forty is the next one.' }])
+  const key = `current:${hashMessageContent('Seven-forty is the next one.')}`
+  const ghost = { id: 'wrong', speakerId: UNCAST_SPEAKER_ID, label: 'the woman', voiceId: 'old-voice', context: 'A different person.', occurrenceKeys: [key], lastSeenMessageId: 'current' }
+  const before = structuredClone(ghost)
+  const voices = readFavoriteVoices([{ id: 'new-voice' }])
+  const answers: Record<string, SpeakerDecisionChoice> = { identity_g0: confidentDecision('new_or_unclear'), voice_g0: confidentDecision('voice_0'), review_occurrence_g0_0: confidentDecision('different_or_unclear') }
+  const review = buildUncastIdentityReview(group, answers, 'A woman speaks at the tram stop.', [ghost], 'current')
+  assert.ok(review.questions.review_occurrence_disposition_g0_0)
+  assert.deepEqual(resolveUncastVoiceDecisions(group, voices, answers, [ghost], [], 'current'), [])
+  const different = { ...answers, review_occurrence_disposition_g0_0: confidentDecision('different') }
+  const replacement = resolveUncastVoiceDecisions(group, voices, different, [ghost], [], 'current')
+  assert.equal(replacement[0]?.voiceId, 'new-voice')
+  assert.match(replacement[0]?.ghostId ?? '', /^pending:/u)
+  assert.deepEqual(ghost, before)
+  const secondText = 'The next tram arrives.'
+  const linkedGroups = collectUncastVoiceGroups([{ speakerId: UNCAST_SPEAKER_ID, text: 'Seven-forty is the next one.' }, { speakerId: null, text: 'A long description. '.repeat(20) }, { speakerId: UNCAST_SPEAKER_ID, text: secondText }])
+  const repeated = { ...ghost, occurrenceKeys: [key, `current:${hashMessageContent(secondText)}`] }
+  const linkedAnswers = { ...different, same_g1_g0: confidentDecision('same'), identity_g1: confidentDecision('group_g0'), voice_g1: confidentDecision('voice_0'), review_occurrence_g1_0: confidentDecision('different_or_unclear') }
+  const linked = resolveUncastVoiceDecisions(linkedGroups, voices, linkedAnswers, [repeated], [], 'current')
+  assert.equal(linked.length, 2)
+  assert.equal(linked[0].ghostId, linked[1].ghostId)
+  const conflictingGroups = { identity_g0: confidentDecision('ghost_0'), same_g1_g0: confidentDecision('same'), identity_g1: confidentDecision('new_or_unclear'), voice_g1: confidentDecision('voice_0'), review_occurrence_disposition_g1_0: confidentDecision('different') }
+  assert.deepEqual(resolveUncastVoiceDecisions(linkedGroups, voices, conflictingGroups, [repeated], [], 'current'), [])
+  const uncertain = { ...answers, review_occurrence_disposition_g0_0: confidentDecision('unclear') }
+  assert.deepEqual(resolveUncastVoiceDecisions(group, voices, uncertain, [ghost], [], 'current'), [])
+  const weakNew = { ...different, identity_g0: { choice: 'new_or_unclear', probabilities: { new_or_unclear: 0.6, ghost_0: 0.4 }, confidence: 0.5 } }
+  assert.deepEqual(resolveUncastVoiceDecisions(group, voices, weakNew, [ghost], [], 'current'), [])
+  const newer = { ...ghost, id: 'replacement', voiceId: 'new-voice' }
+  const replayReview = buildUncastIdentityReview(group, {}, 'A woman speaks at the tram stop.', [ghost, newer], 'current')
+  assert.ok(replayReview.questions.review_occurrence_g0_1)
+  const replay = resolveUncastVoiceDecisions(group, [], { review_occurrence_g0_1: confidentDecision('same') }, [ghost, newer], [], 'current')
+  assert.equal(replay[0]?.ghostId, 'replacement')
+})
+
 test('reviews borderline opening dialogue against a later clearly labeled speaker', () => {
   const groups = collectUncastVoiceGroups([
     { speakerId: null, text: 'Two clerks work. The elder is speaking.' },
@@ -2506,6 +2541,42 @@ test('connects a newly named uncast speaker through a continuing scene and conve
   const another = { ...safeGhosts[0], id: 'other-worker', voiceId: 'other-voice', label: 'the other woman', aliases: ['the other woman'] }
   const ambiguous = resolveUncastVoiceDecisions(groups, voices, { ...answers, review_scene_g0_0: confidentDecision('same'), review_scene_g0_1: confidentDecision('same') }, [...safeGhosts, another], [], 'current', current, ['first'])
   assert.equal(ambiguous[0].voiceId, 'unused-voice')
+})
+
+test('reviews a name introduced in narration for an otherwise uncast speaker', () => {
+  const first = 'A woman at the tram stop holds a cup and a satchel. "Why, where are you headed?"'
+  const user = 'I ask her how her morning has been.'
+  const current = 'Free-use is default in this city. Leah is at her own stop on her own errand. She turns her cup. "Morning’s been morning."'
+  const messages = [{ id: 'first', is_user: false, content: first }, { id: 'user', is_user: true, content: user }, { id: 'current', is_user: false, content: current }]
+  const ghosts = [{ id: 'woman', speakerId: UNCAST_SPEAKER_ID, label: 'the woman', aliases: ['the woman'], voiceId: 'original-voice', context: 'The woman holds a cup at the stop.', occurrenceKeys: [], lastSeenMessageId: 'first', conversationHistory: [{ messageId: 'first', text: first }] }]
+  const context = relationshipReviewContext(messages, 'current', ghosts)
+  const groups = collectUncastVoiceGroups([{ speakerId: UNCAST_SPEAKER_ID, text: 'Morning’s been morning.' }])
+  const plan = buildUncastVoiceDecision(groups, [], current, ghosts, context.previousMessages)
+  const index = plan.state.narrativeNames.findIndex(name => name.toLowerCase() === 'leah')
+  assert.ok(index >= 0)
+  assert.ok(plan.questions.narrative_name_g0)
+  const answers: Record<string, SpeakerDecisionChoice> = { narrative_name_g0: confidentDecision(`name_${index}`), identity_g0: confidentDecision('new_or_unclear') }
+  const review = buildUncastIdentityReview(groups, answers, current, ghosts, 'current', context.previousMessages)
+  assert.ok(review.questions.review_reveal_g0_0)
+  assert.ok(review.questions.review_scene_g0_0)
+  const linked = resolveUncastVoiceDecisions(groups, [], { ...answers, review_scene_g0_0: confidentDecision('same') }, ghosts, [], 'current', current, ['first'])
+  assert.equal(linked[0]?.ghostId, 'woman')
+  assert.equal(linked[0]?.voiceId, 'original-voice')
+  assert.ok(linked[0]?.aliases?.includes('leah'))
+  const stale = { ...ghosts[0], id: 'stale-current', voiceId: 'wrong-voice', occurrenceKeys: [`current:${hashMessageContent('Morning’s been morning.')}`], lastSeenMessageId: 'current', conversationHistory: [] }
+  const recovered = resolveUncastVoiceDecisions(groups, [], { ...answers, review_occurrence_g0_1: confidentDecision('different_or_unclear'), review_scene_g0_0: confidentDecision('same') }, [...ghosts, stale], [], 'current', current, ['first'])
+  assert.equal(recovered[0]?.ghostId, 'woman')
+  assert.equal(recovered[0]?.voiceId, 'original-voice')
+  const namedGhost = { ...ghosts[0], label: 'Leah', aliases: ['Leah'] }
+  const existing = resolveUncastVoiceDecisions(groups, [], answers, [namedGhost], [], 'current', current, ['first'])
+  assert.equal(existing[0]?.ghostId, 'woman')
+  const older = Array.from({ length: 9 }, (_, i) => ({ ...ghosts[0], id: `older-${i}`, lastSeenMessageId: 'older', conversationHistory: [] }))
+  const recentReview = buildUncastIdentityReview(groups, answers, current, [...older, ghosts[0]], 'current', context.previousMessages)
+  assert.ok(recentReview.questions.review_scene_g0_9, 'recent matching candidates must not be crowded out by older ghosts')
+  const unrelated = { ...answers, narrative_name_g0: confidentDecision('none') }
+  assert.equal(buildUncastIdentityReview(groups, unrelated, current, ghosts, 'current', context.previousMessages).questions.review_scene_g0_0, undefined)
+  const weak = { ...answers, narrative_name_g0: { choice: `name_${index}`, probabilities: { [`name_${index}`]: 0.6, none: 0.4 }, confidence: 0.5 } }
+  assert.equal(buildUncastIdentityReview(groups, weak, current, ghosts, 'current', context.previousMessages).questions.review_scene_g0_0, undefined)
 })
 
 test('retains conversation exchanges and relationship labels for later ghost identity review', () => {
