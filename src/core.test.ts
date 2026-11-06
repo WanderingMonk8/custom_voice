@@ -45,6 +45,7 @@ import {
   applyNarrativeRoleSpeakerReview,
   applyNarrativeExchangeSpeakerReview,
   applyNarrativeLocalEvidenceReview,
+  applyContestedDialogueChain,
   applyOpeningBacklinkReview,
   invalidSpeakerReviewAnswers,
   applyRelationshipSpeakerReview,
@@ -3067,6 +3068,32 @@ test('narrative role review separates the smoker from a named reply without assi
   assert.ok(localAnswers.narrative_local_reconciled_s3)
   assert.ok(localAnswers.narrative_local_reconciled_s4)
   assert.equal(localAnswers.speech_s2.choice, 'known_0')
+  const jointAnswers: Record<string, SpeakerDecisionChoice> = {}
+  for (const speech of plan.state.speeches) jointAnswers[`speech_${speech.id}`] = confidentDecision('known_0')
+  jointAnswers.turn_s1 = confidentDecision('continues_previous_turn')
+  jointAnswers.turn_s2 = confidentDecision('responds_to_previous_speaker')
+  jointAnswers.turn_s3 = { choice: 'responds_to_previous_speaker', probabilities: { responds_to_previous_speaker: 0.58, continues_previous_turn: 0.41, responds_to_other_participant: 0.01 }, confidence: 0.44 }
+  jointAnswers.turn_s4 = confidentDecision('continues_previous_turn')
+  jointAnswers.turn_s5 = confidentDecision('responds_to_previous_speaker')
+  applyExplicitPostQuoteVoiceAttributions(plan, jointAnswers)
+  const jointReview = buildSpeakerSwitchContradictionReview(plan, jointAnswers, context)
+  const jointResults: Record<string, SpeakerDecisionChoice> = { [`${role.id}_distinct`]: { choice: 'different', probabilities: { different: 0.63, same_or_unclear: 0.37 }, confidence: 0.26 } }
+  for (const item of jointReview.localEvidence) jointResults[`${role.id}_local_${item.speechId}`] = item.speechId === 's0' || item.speechId === 's1' ? confidentDecision('role', 0.8, 0.62) : confidentDecision('other_or_unclear', 0.75, 0.5)
+  const ghostOption = Object.entries(jointReview.ghostOptions).find(([, identity]) => identity === 'ghost:smoker')?.[0]
+  assert.ok(ghostOption)
+  for (const [id, ghostProbability, namedProbability] of [['s0', 0.88, 0.07], ['s1', 0.86, 0.08], ['s2', 0.08, 0.64], ['s3', 0.35, 0.61], ['s4', 0.57, 0.36], ['s5', 0.12, 0.59]] as const) jointResults[`switch_speaker_${jointReview.runs[0].id}_${id}`] = { choice: ghostProbability > namedProbability ? ghostOption : 'known_0', probabilities: { [ghostOption]: ghostProbability, known_0: namedProbability, no_clear_identity: Math.max(0, 1 - ghostProbability - namedProbability) }, confidence: 0.86 }
+  applyContestedDialogueChain(plan, jointAnswers, jointReview, jointResults)
+  const jointSegments = resolveSpeakerDecisionSegments(text, plan, jointAnswers, speakers, { isUserMessage: false, cardSpeakerId: null, historicalSpeakerId: null, evidenceOnly: true, includeDebug: true })
+  assert.deepEqual(jointSegments.filter(segment => segment.speakerId !== null).map(segment => segment.speakerId), ['ghost:smoker', 'ghost:smoker', 'unconfigured:maeve', 'ghost:smoker', 'ghost:smoker', 'unconfigured:maeve'])
+  assert.ok(jointAnswers.joint_chain_detail_s3.choice.includes('scores are heuristic'))
+  const rejectedJoint: Record<string, SpeakerDecisionChoice> = { ...jointAnswers, speech_s3: confidentDecision('known_0') }
+  const strongOther = { ...jointResults, [`${role.id}_local_s3`]: confidentDecision('other_or_unclear') }
+  applyContestedDialogueChain(plan, rejectedJoint, jointReview, strongOther)
+  assert.equal(rejectedJoint.speech_s3.choice, 'known_0')
+  const noAnchor: Record<string, SpeakerDecisionChoice> = { ...jointAnswers, speech_s3: confidentDecision('known_0') }
+  const noTag = { ...jointResults, [`${role.id}_local_s0`]: confidentDecision('other_or_unclear'), [`${role.id}_local_s1`]: confidentDecision('other_or_unclear') }
+  applyContestedDialogueChain(plan, noAnchor, jointReview, noTag)
+  assert.equal(noAnchor.speech_s3.choice, 'known_0')
   const localRejected: Record<string, SpeakerDecisionChoice> = { ...localAnswers, speech_s3: confidentDecision('known_0') }
   delete localRejected.narrative_role_reconciled_s3
   const listenerResults = { ...localResults, [`${role.id}_local_s3`]: confidentDecision('other_or_unclear') }

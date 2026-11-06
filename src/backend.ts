@@ -36,6 +36,7 @@ import {
   applyNarrativeRoleSpeakerReview,
   applyNarrativeExchangeSpeakerReview,
   applyNarrativeLocalEvidenceReview,
+  applyContestedDialogueChain,
   applyOpeningBacklinkReview,
   invalidSpeakerReviewAnswers,
   applyRelationshipSpeakerReview,
@@ -1108,7 +1109,7 @@ function queueSpeakerParse(
           })),
           cardSpeakerId: titleMatchedCardSpeakerId,
           historicalSpeakerId,
-          relationshipReview: { version: 'cross-message-run-21', context: relationshipContext, speakerLookback, strategy: payload.runReview === true ? 'run' : 'scene', focusedOpeningFallback: payload.focusedOpeningFallback === true, bestAvailableSpeaker: payload.bestAvailableSpeaker === true },
+          relationshipReview: { version: 'cross-message-run-22', context: relationshipContext, speakerLookback, strategy: payload.runReview === true ? 'run' : 'scene', focusedOpeningFallback: payload.focusedOpeningFallback === true, bestAvailableSpeaker: payload.bestAvailableSpeaker === true },
           skippedTrackerTags,
         }))
         const cached = config.parsedMessages[payload.messageId]
@@ -1412,10 +1413,12 @@ function queueSpeakerParse(
                   applyNarrativeRoleSpeakerReview(decisionPlan, answers, switchReview, reviewed)
                   applyNarrativeExchangeSpeakerReview(decisionPlan, answers, switchReview, reviewed)
                   applyNarrativeLocalEvidenceReview(decisionPlan, answers, switchReview, reviewed)
+                  applyContestedDialogueChain(decisionPlan, answers, switchReview, reviewed)
                   relationshipSceneDiagnostic += `; speaker-switch-review=${switchReview.runs.length} runs, ${Object.keys(answers).filter(id => id.startsWith('switch_reconciled_')).length} reconciled`
                   relationshipSceneDiagnostic += `; narrative-role-review=${switchReview.roles.length} roles, ${Object.keys(answers).filter(id => id.startsWith('narrative_role_reconciled_')).length} reconciled`
                   relationshipSceneDiagnostic += `; narrative-exchange-review=${Object.keys(answers).filter(id => id.startsWith('narrative_exchange_reconciled_')).length} reconciled`
                   relationshipSceneDiagnostic += `; narrative-local-review=${Object.keys(answers).filter(id => id.startsWith('narrative_local_reconciled_')).length} reconciled`
+                  relationshipSceneDiagnostic += `; contested-joint-chain=${Object.keys(answers).filter(id => /^joint_chain_s\d+$/u.test(id)).length} reconciled`
                   if (payload.debug) relationshipSceneDiagnostic += `; narrative-local-evidence=${JSON.stringify(switchReview.localEvidence)}`
                   if (payload.debug) relationshipSceneDiagnostic += `; speaker-switch-candidates=${JSON.stringify(switchReview.ghostOptions)}; narrative-role-candidates=${JSON.stringify(switchReview.roles.map(role => ({ id: role.id, label: role.label, anchor: role.anchorId })))}; speaker-switch-decisions=${JSON.stringify(Object.fromEntries(Object.entries(reviewed).map(([id, value]) => [id, { choice: value.choice, confidence: value.confidence, probabilities: value.probabilities }])))}`
                 }

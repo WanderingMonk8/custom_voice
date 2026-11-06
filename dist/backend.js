@@ -2338,6 +2338,113 @@ function applyNarrativeLocalEvidenceReview(plan, answers, review, results) {
     for (const id of included) if (!before.has(`narrative_role_reconciled_${id}`) && answers[`narrative_role_reconciled_${id}`]) answers[`narrative_local_reconciled_${id}`] = results[`${role.id}_local_${id}`];
   }
 }
+function applyContestedDialogueChain(plan, answers, review, results) {
+  const options = { ...plan.optionSpeakerIds, ...review.ghostOptions };
+  for (const run of review.runs) {
+    const roles = review.roles.filter((role2) => role2.runId === run.id);
+    if (roles.length !== 1 || run.speechIds.length < 3) continue;
+    const role = roles[0];
+    const distinct = results[`${role.id}_distinct`];
+    if (evaluateSpeakerDecisionAnswer(distinct, { different: "different", same_or_unclear: "same_or_unclear" }, { probability: 0.6, confidence: 0.2, margin: 0.2 }).identity !== "different") continue;
+    const anchor = answers[`explicit_voice_attribution_${role.anchorId}`];
+    const anchorIdentity = anchor && options[anchor.choice];
+    if (!anchorIdentity || anchorIdentity === USER_SPEAKER_ID) continue;
+    const evidence = review.localEvidence.filter((item) => item.roleId === role.id);
+    const confirmedTags = evidence.filter((item) => item.cues.some((cue) => cue.includes("pronoun speech tag")) && evaluateSpeakerDecisionAnswer(results[`${role.id}_local_${item.speechId}`], { role: "role", other_or_unclear: "other_or_unclear" }, { probability: 0.7, confidence: 0.6, margin: 0.4 }).identity === "role");
+    if (!confirmedTags.length) continue;
+    const roleCandidates = /* @__PURE__ */ new Map();
+    for (const item of confirmedTags) {
+      const answer = results[`switch_speaker_${run.id}_${item.speechId}`];
+      const identity = answer && options[answer.choice];
+      if (identity?.startsWith("ghost:") && (answer.probabilities[answer.choice] ?? 0) >= 0.75 && answer.confidence >= 0.7) roleCandidates.set(identity, (roleCandidates.get(identity) ?? 0) + 1);
+    }
+    if (roleCandidates.size !== 1) continue;
+    const roleIdentity = [...roleCandidates.keys()][0];
+    const ghost = review.state.ghosts.find((item) => `ghost:${item.id}` === roleIdentity);
+    const namedAnchor = plan.state.speakers.find((item) => item.id === anchorIdentity);
+    const anchorAliases = new Set(namedAnchor?.aliases.map((alias) => alias.toLocaleLowerCase()) ?? []);
+    if (!ghost || [ghost.label, ...ghost.aliases].some((alias) => !!alias && anchorAliases.has(alias.toLocaleLowerCase()))) continue;
+    const roleOption = Object.entries(options).find(([, identity]) => identity === roleIdentity)?.[0];
+    if (!roleOption) continue;
+    const identities = [roleIdentity, anchorIdentity, "__joint_other__"];
+    const speeches = run.speechIds.map((id) => plan.state.speeches.find((speech) => speech.id === id));
+    if (speeches.some((speech) => !speech)) continue;
+    const turns = new Map(plan.state.turns.map((turn) => [turn.speechId, turn]));
+    const emissions = speeches.map((speech) => {
+      const explicit = answers[`explicit_voice_attribution_${speech.id}`];
+      const explicitId = explicit && options[explicit.choice];
+      const result = results[`switch_speaker_${run.id}_${speech.id}`];
+      const scores = /* @__PURE__ */ new Map();
+      const roleProbability = Object.entries(result?.probabilities ?? {}).filter(([key]) => options[key] === roleIdentity).reduce((sum, [, value]) => sum + value, 0);
+      const anchorProbability = Object.entries(result?.probabilities ?? {}).filter(([key]) => options[key] === anchorIdentity).reduce((sum, [, value]) => sum + value, 0);
+      const otherProbability = Object.entries(result?.probabilities ?? {}).filter(([key]) => options[key] !== roleIdentity && options[key] !== anchorIdentity).reduce((sum, [, value]) => sum + value, 0);
+      for (const [identity, probability] of [[roleIdentity, roleProbability], [anchorIdentity, anchorProbability], ["__joint_other__", otherProbability]]) scores.set(identity, 0.45 * Math.log(Math.max(0.05, probability)));
+      const item = evidence.find((entry) => entry.speechId === speech.id);
+      const local = results[`${role.id}_local_${speech.id}`];
+      if (item) {
+        const tag = item.cues.some((cue) => cue.includes("pronoun speech tag"));
+        const action = item.cues.some((cue) => cue.includes("role action"));
+        let bonus = tag ? 1.2 : action ? 0.55 : 0;
+        if (local?.choice === "role" && (local.probabilities.role ?? 0) >= 0.7 && local.confidence >= 0.6) bonus += 0.5;
+        scores.set(roleIdentity, (scores.get(roleIdentity) ?? 0) + bonus);
+      }
+      if (explicitId) {
+        for (const identity of identities) if (identity !== explicitId) scores.set(identity, Number.NEGATIVE_INFINITY);
+      }
+      return scores;
+    });
+    const transition = (index, previous, current) => {
+      const turn = turns.get(speeches[index].id);
+      const relation = answers[`turn_${speeches[index].id}`];
+      if (!turn || turn.previousSpeechId !== speeches[index - 1].id || SPEAKER_HARD_BOUNDARY_PATTERNS.some((item) => item.pattern.test(turn.bridge))) return 0;
+      const continuation = relation?.probabilities[TURN_CONTINUE_OPTION] ?? 0;
+      const response = relation?.probabilities[TURN_RESPOND_OPTION] ?? 0;
+      const other = relation?.probabilities[TURN_OTHER_OPTION] ?? 0;
+      const question = /[?？]\s*$/u.test(speeches[index - 1].text);
+      if (previous === "__joint_other__" || current === "__joint_other__") return 0;
+      return previous === current ? 1.5 * continuation : 1.5 * response + (question && response > continuation && other < response ? 0.35 : 0);
+    };
+    const forward = speeches.map(() => /* @__PURE__ */ new Map());
+    const backward = speeches.map(() => /* @__PURE__ */ new Map());
+    for (let i = 0; i < speeches.length; i++) for (const identity of identities) {
+      const prior = i === 0 ? 0 : Math.max(...identities.map((previous) => (forward[i - 1].get(previous) ?? Number.NEGATIVE_INFINITY) + transition(i, previous, identity)));
+      forward[i].set(identity, prior + (emissions[i].get(identity) ?? Number.NEGATIVE_INFINITY));
+    }
+    for (let i = speeches.length - 1; i >= 0; i--) for (const identity of identities) {
+      backward[i].set(identity, i === speeches.length - 1 ? 0 : Math.max(...identities.map((next) => transition(i + 1, identity, next) + (emissions[i + 1].get(next) ?? Number.NEGATIVE_INFINITY) + (backward[i + 1].get(next) ?? Number.NEGATIVE_INFINITY))));
+    }
+    for (let i = 0; i < speeches.length; i++) {
+      const speech = speeches[i];
+      const ranked = identities.map((identity) => ({ identity, score: (forward[i].get(identity) ?? Number.NEGATIVE_INFINITY) + (backward[i].get(identity) ?? Number.NEGATIVE_INFINITY) })).sort((a, b) => b.score - a.score);
+      const winner = ranked[0];
+      const margin = winner.score - ranked[1].score;
+      const clues = evidence.find((item) => item.speechId === speech.id)?.cues.join(" + ") || "none";
+      answers[`joint_chain_detail_${speech.id}`] = { choice: `role=${ranked.find((item) => item.identity === roleIdentity)?.score.toFixed(2)} anchor=${ranked.find((item) => item.identity === anchorIdentity)?.score.toFixed(2)} other=${ranked.find((item) => item.identity === "__joint_other__")?.score.toFixed(2)} margin=${margin.toFixed(2)} cues=${clues}; scores are heuristic, not probabilities`, probabilities: {}, confidence: 0 };
+      if (winner.identity === "__joint_other__" || !Number.isFinite(margin) || margin < 0.8 || answers[`explicit_voice_attribution_${speech.id}`] || answers[`self_intro_reconciled_${speech.id}`]) continue;
+      const previous = answers[`speech_${speech.id}`];
+      const existing = evaluateSpeakerDecisionAnswer(previous, options).identity;
+      if (answers[`persona_confirmed_${speech.id}`] && existing === USER_SPEAKER_ID || answers[`switch_reconciled_${speech.id}`] && existing !== winner.identity) continue;
+      const local = results[`${role.id}_local_${speech.id}`];
+      if (winner.identity === roleIdentity && evaluateSpeakerDecisionAnswer(local, { role: "role", other_or_unclear: "other_or_unclear" }, { probability: 0.9, confidence: 0.8, margin: 0.5 }).identity === "other_or_unclear") continue;
+      const reviewed = results[`switch_speaker_${run.id}_${speech.id}`];
+      const reviewedIdentity = reviewed && options[reviewed.choice];
+      if (reviewedIdentity && reviewedIdentity !== roleIdentity && reviewedIdentity !== anchorIdentity && (reviewed.probabilities[reviewed.choice] ?? 0) >= 0.85 && reviewed.confidence >= 0.8) continue;
+      const explicit = narrativeAttributionSpeaker(`${speech.narrativeBefore} ${speech.narrativeAfter}`, plan.state.speakers);
+      if (explicit && explicit !== winner.identity) continue;
+      if (existing === winner.identity && !answers[`global_uncertain_${speech.id}`]) continue;
+      const option = winner.identity === roleIdentity ? roleOption : anchor.choice;
+      Object.assign(plan.optionSpeakerIds, review.ghostOptions);
+      const assignment = { choice: option, probabilities: { [option]: 1 }, confidence: 1 };
+      answers[`relationship_original_${speech.id}`] = previous;
+      answers[`speech_${speech.id}`] = assignment;
+      answers[`relationship_continuity_${speech.id}`] = assignment;
+      answers[`relationship_global_${speech.id}`] = assignment;
+      answers[`joint_chain_${speech.id}`] = { choice: option, probabilities: { [option]: Math.min(1, margin / 4) }, confidence: Math.min(1, margin / 4) };
+      delete answers[`relationship_confirmed_${speech.id}`];
+      delete answers[`global_uncertain_${speech.id}`];
+    }
+  }
+}
 function applyNarrativeExchangeSpeakerReview(plan, answers, review, results) {
   for (const role of review.roles) {
     const exchange = results[`${role.id}_exchange`];
@@ -4710,6 +4817,8 @@ function resolveSpeakerDecisionSegments(content, plan, answers, speakers, option
           ...decisionAnswerDebug("jev-narrative-role-review", answers[`narrative_role_reconciled_${speech.id}`], { role: "role", other_or_unclear: "other_or_unclear" }),
           ...decisionAnswerDebug("jev-narrative-exchange-review", answers[`narrative_exchange_reconciled_${speech.id}`], { role: "role", anchor: "anchor", other_or_unclear: "other_or_unclear" }),
           ...decisionAnswerDebug("jev-narrative-local-review", answers[`narrative_local_reconciled_${speech.id}`], { role: "role", other_or_unclear: "other_or_unclear" }),
+          ...answers[`joint_chain_${speech.id}`] ? [`joint-chain:heuristic path margin/4=${answers[`joint_chain_${speech.id}`].confidence.toFixed(3)} (not a model probability)`] : [],
+          ...answers[`joint_chain_detail_${speech.id}`] ? [`joint-chain-evidence:${answers[`joint_chain_detail_${speech.id}`].choice}`] : [],
           ...decisionAnswerDebug("jev-speaker-switch-link", answers[`switch_link_reconciled_${speech.id}`], { previous: "previous", current: "current", other_or_unclear: "other_or_unclear" }),
           ...answers[`relationship_confirmed_${speech.id}`] ? ["jev-relationship-review:accepted first-pass identity confirmed"] : [],
           ...decisionAnswerDebug("jev-contextual-user-review", answers[`persona_check_${speech.id}`], { user: USER_SPEAKER_ID, other: "other" }),
@@ -5616,7 +5725,7 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
           })),
           cardSpeakerId: titleMatchedCardSpeakerId,
           historicalSpeakerId,
-          relationshipReview: { version: "cross-message-run-21", context: relationshipContext, speakerLookback, strategy: payload.runReview === true ? "run" : "scene", focusedOpeningFallback: payload.focusedOpeningFallback === true, bestAvailableSpeaker: payload.bestAvailableSpeaker === true },
+          relationshipReview: { version: "cross-message-run-22", context: relationshipContext, speakerLookback, strategy: payload.runReview === true ? "run" : "scene", focusedOpeningFallback: payload.focusedOpeningFallback === true, bestAvailableSpeaker: payload.bestAvailableSpeaker === true },
           skippedTrackerTags
         }));
         const cached = config.parsedMessages[payload.messageId];
@@ -5923,10 +6032,12 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
                   applyNarrativeRoleSpeakerReview(decisionPlan, answers, switchReview, reviewed);
                   applyNarrativeExchangeSpeakerReview(decisionPlan, answers, switchReview, reviewed);
                   applyNarrativeLocalEvidenceReview(decisionPlan, answers, switchReview, reviewed);
+                  applyContestedDialogueChain(decisionPlan, answers, switchReview, reviewed);
                   relationshipSceneDiagnostic += `; speaker-switch-review=${switchReview.runs.length} runs, ${Object.keys(answers).filter((id) => id.startsWith("switch_reconciled_")).length} reconciled`;
                   relationshipSceneDiagnostic += `; narrative-role-review=${switchReview.roles.length} roles, ${Object.keys(answers).filter((id) => id.startsWith("narrative_role_reconciled_")).length} reconciled`;
                   relationshipSceneDiagnostic += `; narrative-exchange-review=${Object.keys(answers).filter((id) => id.startsWith("narrative_exchange_reconciled_")).length} reconciled`;
                   relationshipSceneDiagnostic += `; narrative-local-review=${Object.keys(answers).filter((id) => id.startsWith("narrative_local_reconciled_")).length} reconciled`;
+                  relationshipSceneDiagnostic += `; contested-joint-chain=${Object.keys(answers).filter((id) => /^joint_chain_s\d+$/u.test(id)).length} reconciled`;
                   if (payload.debug) relationshipSceneDiagnostic += `; narrative-local-evidence=${JSON.stringify(switchReview.localEvidence)}`;
                   if (payload.debug) relationshipSceneDiagnostic += `; speaker-switch-candidates=${JSON.stringify(switchReview.ghostOptions)}; narrative-role-candidates=${JSON.stringify(switchReview.roles.map((role) => ({ id: role.id, label: role.label, anchor: role.anchorId })))}; speaker-switch-decisions=${JSON.stringify(Object.fromEntries(Object.entries(reviewed).map(([id, value]) => [id, { choice: value.choice, confidence: value.confidence, probabilities: value.probabilities }])))}`;
                 }
