@@ -163,6 +163,10 @@ function uncastNarrativeNameCandidates(message) {
   }
   return [...names.values()];
 }
+function ghostPriorMessageIds(ghost, previousMessages) {
+  const linked = /* @__PURE__ */ new Set([ghost.lastSeenMessageId, ...(ghost.conversationHistory ?? []).map((entry) => entry.messageId), ...ghost.occurrenceKeys.map((key) => key.split(":", 1)[0])]);
+  return previousMessages.filter((item) => linked.has(item.id)).map((item) => item.id);
+}
 function buildUncastVoiceDecision(groups, voices, message, ghosts = [], previousMessages = []) {
   const labels = uncastIdentityLabels(message, ghosts);
   const narrativeNames = uncastNarrativeNameCandidates(message);
@@ -171,7 +175,7 @@ function buildUncastVoiceDecision(groups, voices, message, ghosts = [], previous
     previousMessages,
     narrativeNames,
     characters: groups.map((group) => ({ id: group.id, identity: group.speakerId, speeches: group.speeches, context: group.context })),
-    ghosts: ghosts.map((ghost, index) => ({ option: `ghost_${index}`, identity: ghost.speakerId, label: ghost.label || null, aliases: ghostCastAliases(ghost), context: ghost.context, conversationHistory: ghost.conversationHistory ?? [] })),
+    ghosts: ghosts.map((ghost, index) => ({ option: `ghost_${index}`, identity: ghost.speakerId, label: ghost.label || null, aliases: ghostCastAliases(ghost), priorMessageIds: ghostPriorMessageIds(ghost, previousMessages), context: ghost.context, conversationHistory: ghost.conversationHistory ?? [] })),
     voices: voices.map((voice, index) => ({ option: `voice_${index}`, name: voice.name, category: voice.category, description: voice.description }))
   };
   const questions = {};
@@ -326,7 +330,7 @@ function buildUncastIdentityReview(groups, answers, message, ghosts = [], messag
     }
     if (Object.keys(questions).length >= 16) break;
   }
-  return { state: { message, previousMessages, characters: groups.map((group) => ({ id: group.id, identity: group.speakerId, speeches: group.speeches, context: group.context })), ghosts: ghosts.map((ghost, index) => ({ option: `ghost_${index}`, identity: ghost.speakerId, aliases: ghostCastAliases(ghost), context: ghost.context, conversationHistory: ghost.conversationHistory ?? [] })) }, questions };
+  return { state: { message, previousMessages, characters: groups.map((group) => ({ id: group.id, identity: group.speakerId, speeches: group.speeches, context: group.context })), ghosts: ghosts.map((ghost, index) => ({ option: `ghost_${index}`, identity: ghost.speakerId, aliases: ghostCastAliases(ghost), priorMessageIds: ghostPriorMessageIds(ghost, previousMessages), context: ghost.context, conversationHistory: ghost.conversationHistory ?? [] })) }, questions };
 }
 function isBroadPersonLabel(label) {
   return /^(?:(?:the|a|an)\s+)?(?:(?:young|younger|old|older|elderly|middle-aged|tall|short)\s+)*(?:woman|man|person|girl|boy|guy|lady|stranger|someone|somebody)$/iu.test(label.trim());
@@ -1908,20 +1912,18 @@ function relationshipReviewContext(messages, targetId, ghosts, skippedTags = "",
     ghostBudget -= selected.length;
     return selected;
   };
-  const safeGhosts = ghosts.slice(0, 20).flatMap((ghost) => {
+  const candidates = ghosts.slice(0, 20).map((ghost, index) => {
     const lastIndex = messages.findIndex((message) => message.id === ghost.lastSeenMessageId);
     const safeCurrent = lastIndex >= 0 && lastIndex <= target;
     const historical = (ghost.conversationHistory ?? []).filter((entry) => priorIds.has(entry.messageId));
-    const history = historical.slice(-3).map((entry) => ({ messageId: entry.messageId, text: takeGhostText(entry.text, 1200) })).filter((entry) => entry.text);
-    if (!safeCurrent && !historical.length) return [];
-    return [{
-      id: ghost.id,
-      label: safeCurrent ? ghost.label ?? "" : "",
-      aliases: safeCurrent ? ghostCastAliases(ghost) : [],
-      context: safeCurrent ? takeGhostText(ghost.context, 1200) : "",
-      conversationHistory: history
-    }];
-  });
+    const recent = Math.max(safeCurrent && lastIndex < target ? lastIndex : -1, ...historical.map((entry) => prior.findIndex((message) => message.id === entry.messageId)));
+    return { ghost, index, safeCurrent, historical, recent };
+  }).filter((item) => item.safeCurrent || item.historical.length).sort((a, b) => b.recent - a.recent || a.index - b.index);
+  const safeGhosts = candidates.map(({ ghost, index, safeCurrent, historical }) => {
+    const context = safeCurrent ? takeGhostText(ghost.context, 1200) : "";
+    const conversationHistory = historical.slice(-3).reverse().map((entry) => ({ messageId: entry.messageId, text: takeGhostText(entry.text, 1200) })).filter((entry) => entry.text).reverse();
+    return { index, value: { id: ghost.id, label: safeCurrent ? ghost.label ?? "" : "", aliases: safeCurrent ? ghostCastAliases(ghost) : [], context, conversationHistory } };
+  }).sort((a, b) => a.index - b.index).map((item) => item.value);
   return { previousMessages, ghosts: safeGhosts };
 }
 function independentlyGroundedSpeakerIds(plan, context, cardSpeakerId = null) {

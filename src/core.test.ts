@@ -2653,6 +2653,33 @@ test('global context includes six preceding user and assistant messages in order
   assert.deepEqual(capped.map(item => item.id), ['2', '3', '4', '5', '6', '7'])
 })
 
+test('prioritizes the latest ghost context without changing candidate indexes or exposing future links', () => {
+  const messages = [
+    { id: 'old', is_user: false, content: 'An earlier scene.' },
+    { id: 'first', is_user: false, content: 'The woman speaks at the stop.' },
+    { id: 'user', is_user: true, content: 'How was your morning?' },
+    { id: 'current', is_user: false, content: 'Leah replies.' },
+    { id: 'future', is_user: false, content: 'Future scene.' },
+  ]
+  const old = Array.from({ length: 8 }, (_, i) => ({ id: `old-${i}`, speakerId: UNCAST_SPEAKER_ID, voiceId: `voice-${i}`, context: 'old context '.repeat(150), occurrenceKeys: [], lastSeenMessageId: 'old', conversationHistory: [{ messageId: 'old', text: 'old history '.repeat(150) }] }))
+  const recent = { id: 'recent', speakerId: UNCAST_SPEAKER_ID, voiceId: 'recent-voice', context: 'the woman by the stop', occurrenceKeys: ['first:hash', 'future:hash'], lastSeenMessageId: 'first', conversationHistory: [{ messageId: 'first', text: 'the woman answers at the stop' }, { messageId: 'future', text: 'future secret' }] }
+  const ghosts = [...old, recent]
+  const context = relationshipReviewContext(messages, 'current', ghosts)
+  assert.deepEqual(context.ghosts.map(ghost => ghost.id), ghosts.map(ghost => ghost.id))
+  const safeRecent = context.ghosts[8]
+  assert.equal(safeRecent.context, recent.context)
+  assert.deepEqual(safeRecent.conversationHistory.map(item => item.messageId), ['first'])
+  assert.ok(!JSON.stringify(context).includes('future secret'))
+  const safeGhosts = ghosts.map(ghost => ({ ...ghost, ...context.ghosts.find(item => item.id === ghost.id)! }))
+  const groups = collectUncastVoiceGroups([{ speakerId: UNCAST_SPEAKER_ID, text: 'Morning was fine.' }])
+  const plan = buildUncastVoiceDecision(groups, [], messages[3].content, safeGhosts, context.previousMessages)
+  assert.deepEqual(plan.state.ghosts[8].priorMessageIds, ['first'])
+  const answers: Record<string, SpeakerDecisionChoice> = { narrative_name_g0: confidentDecision('name_0'), identity_g0: confidentDecision('new_or_unclear') }
+  const review = buildUncastIdentityReview(groups, answers, messages[3].content, safeGhosts, 'current', context.previousMessages)
+  assert.deepEqual(review.state.ghosts[8].priorMessageIds, ['first'])
+  assert.ok(review.questions.review_continuity_g0_8)
+})
+
 test('global review avoids scene-wide inheritance and treats card as context only', () => {
   const speakers = [{ id: 'tessa', name: 'Tessa' }, { id: 'ewan', name: 'Ewan' }]
   const plan = buildSpeakerDecisionPlan('"Sacrifice."\n\nHe turns with the tray.\n\n"What are you sacrificing?"', speakers, false)

@@ -284,6 +284,12 @@ export function uncastNarrativeNameCandidates(message: string): string[] {
   return [...names.values()]
 }
 
+/** Expose only links to messages actually present in the bounded prior context. */
+function ghostPriorMessageIds(ghost: GhostVoice, previousMessages: RelationshipReviewContext['previousMessages']): string[] {
+  const linked = new Set([ghost.lastSeenMessageId, ...(ghost.conversationHistory ?? []).map(entry => entry.messageId), ...ghost.occurrenceKeys.map(key => key.split(':', 1)[0])])
+  return previousMessages.filter(item => linked.has(item.id)).map(item => item.id)
+}
+
 /** One decision call classifies each uncast group and ranks the available voice descriptions. */
 export function buildUncastVoiceDecision(groups: UncastVoiceGroup[], voices: FavoriteVoice[], message: string, ghosts: GhostVoice[] = [], previousMessages: RelationshipReviewContext['previousMessages'] = []) {
   const labels = uncastIdentityLabels(message, ghosts)
@@ -293,7 +299,7 @@ export function buildUncastVoiceDecision(groups: UncastVoiceGroup[], voices: Fav
     previousMessages,
     narrativeNames,
     characters: groups.map(group => ({ id: group.id, identity: group.speakerId, speeches: group.speeches, context: group.context })),
-    ghosts: ghosts.map((ghost, index) => ({ option: `ghost_${index}`, identity: ghost.speakerId, label: ghost.label || null, aliases: ghostCastAliases(ghost), context: ghost.context, conversationHistory: ghost.conversationHistory ?? [] })),
+    ghosts: ghosts.map((ghost, index) => ({ option: `ghost_${index}`, identity: ghost.speakerId, label: ghost.label || null, aliases: ghostCastAliases(ghost), priorMessageIds: ghostPriorMessageIds(ghost, previousMessages), context: ghost.context, conversationHistory: ghost.conversationHistory ?? [] })),
     voices: voices.map((voice, index) => ({ option: `voice_${index}`, name: voice.name, category: voice.category, description: voice.description })),
   }
   const questions: Record<string, { type: 'choice'; instructions: string; criteria: Record<string, string> }> = {}
@@ -452,7 +458,7 @@ export function buildUncastIdentityReview(groups: UncastVoiceGroup[], answers: R
     }
     if (Object.keys(questions).length >= 16) break
   }
-  return { state: { message, previousMessages, characters: groups.map(group => ({ id: group.id, identity: group.speakerId, speeches: group.speeches, context: group.context })), ghosts: ghosts.map((ghost, index) => ({ option: `ghost_${index}`, identity: ghost.speakerId, aliases: ghostCastAliases(ghost), context: ghost.context, conversationHistory: ghost.conversationHistory ?? [] })) }, questions }
+  return { state: { message, previousMessages, characters: groups.map(group => ({ id: group.id, identity: group.speakerId, speeches: group.speeches, context: group.context })), ghosts: ghosts.map((ghost, index) => ({ option: `ghost_${index}`, identity: ghost.speakerId, aliases: ghostCastAliases(ghost), priorMessageIds: ghostPriorMessageIds(ghost, previousMessages), context: ghost.context, conversationHistory: ghost.conversationHistory ?? [] })) }, questions }
 }
 
 export interface UncastVoiceAssignment { groupId: string; voiceId: string; gender: string; ghostId?: string; label?: string; aliases?: string[]; matchReason?: string }
@@ -3316,15 +3322,20 @@ export function relationshipReviewContext(messages: Array<{ id: string; is_user:
     ghostBudget -= selected.length
     return selected
   }
-  const safeGhosts = ghosts.slice(0, 20).flatMap(ghost => {
+  // Spend the shared budget on the most recently invoked eligible characters
+  // first, but restore the original order so ghost_N decisions remain stable.
+  const candidates = ghosts.slice(0, 20).map((ghost, index) => {
     const lastIndex = messages.findIndex(message => message.id === ghost.lastSeenMessageId)
     const safeCurrent = lastIndex >= 0 && lastIndex <= target
     const historical = (ghost.conversationHistory ?? []).filter(entry => priorIds.has(entry.messageId))
-    const history = historical.slice(-3).map(entry => ({ messageId: entry.messageId, text: takeGhostText(entry.text, 1_200) })).filter(entry => entry.text)
-    if (!safeCurrent && !historical.length) return []
-    return [{ id: ghost.id, label: safeCurrent ? ghost.label ?? '' : '', aliases: safeCurrent ? ghostCastAliases(ghost) : [],
-      context: safeCurrent ? takeGhostText(ghost.context, 1_200) : '', conversationHistory: history }]
-  })
+    const recent = Math.max(safeCurrent && lastIndex < target ? lastIndex : -1, ...historical.map(entry => prior.findIndex(message => message.id === entry.messageId)))
+    return { ghost, index, safeCurrent, historical, recent }
+  }).filter(item => item.safeCurrent || item.historical.length).sort((a, b) => b.recent - a.recent || a.index - b.index)
+  const safeGhosts = candidates.map(({ ghost, index, safeCurrent, historical }) => {
+    const context = safeCurrent ? takeGhostText(ghost.context, 1_200) : ''
+    const conversationHistory = historical.slice(-3).reverse().map(entry => ({ messageId: entry.messageId, text: takeGhostText(entry.text, 1_200) })).filter(entry => entry.text).reverse()
+    return { index, value: { id: ghost.id, label: safeCurrent ? ghost.label ?? '' : '', aliases: safeCurrent ? ghostCastAliases(ghost) : [], context, conversationHistory } }
+  }).sort((a, b) => a.index - b.index).map(item => item.value)
   return { previousMessages, ghosts: safeGhosts }
 }
 
