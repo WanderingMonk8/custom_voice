@@ -2145,7 +2145,8 @@ function buildSpeakerSwitchContradictionReview(plan, answers, context, cardSpeak
       questions[`switch_speaker_${run.id}_${id}`] = { type: "choice", criteria: targetCriteria, instructions: `Identify the actual speaker of ${id} in run ${run.id}. Re-read all speech and narration around the exchange, later names and attributions, physical positions, actions, and the preceding messages. A distinct unnamed person may speak even when a known person is nearby. Do not assign an addressee, bystander, or previous message author merely because they are mentioned. Choose uncast_character for a distinct unnamed speaker, or no_clear_identity if uncertain.` };
       if (id !== turn.previousSpeechId && id !== turn.speechId) questions[`switch_link_${run.id}_${id}`] = { type: "choice", instructions: `If quotations ${turn.previousSpeechId} and ${turn.speechId} are spoken by two different people, which of those actual speakers, if either, speaks ${id}? Read the full run, including adjacent actions, topic, objects, pronouns, later attributions and possible third speakers. Do not treat an addressee or a bystander as the speaker. Select other_or_unclear if the text does not clearly establish the link.`, criteria: { previous: `The person who speaks ${turn.previousSpeechId}.`, current: `The person who speaks ${turn.speechId}.`, other_or_unclear: "A third person, or the link is unclear." } };
     }
-    const anchorId = answers[`explicit_voice_attribution_${turn.speechId}`] ? turn.speechId : answers[`explicit_voice_attribution_${turn.previousSpeechId}`] ? turn.previousSpeechId : "";
+    const turnIndex = speechIds.indexOf(turn.speechId);
+    const anchorId = speechIds.filter((id) => !!answers[`explicit_voice_attribution_${id}`]).sort((a, b) => Math.abs(speechIds.indexOf(a) - turnIndex) - Math.abs(speechIds.indexOf(b) - turnIndex))[0] ?? "";
     if (anchorId) {
       const firstParagraph = plan.state.paragraphs.findIndex((item) => item.id === plan.state.speeches.find((speech) => speech.id === speechIds[0])?.paragraphId);
       const lastParagraph = plan.state.paragraphs.findIndex((item) => item.id === plan.state.speeches.find((speech) => speech.id === speechIds.at(-1))?.paragraphId);
@@ -5573,7 +5574,7 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
           })),
           cardSpeakerId: titleMatchedCardSpeakerId,
           historicalSpeakerId,
-          relationshipReview: { version: "cross-message-run-19", context: relationshipContext, speakerLookback, strategy: payload.runReview === true ? "run" : "scene", focusedOpeningFallback: payload.focusedOpeningFallback === true, bestAvailableSpeaker: payload.bestAvailableSpeaker === true },
+          relationshipReview: { version: "cross-message-run-20", context: relationshipContext, speakerLookback, strategy: payload.runReview === true ? "run" : "scene", focusedOpeningFallback: payload.focusedOpeningFallback === true, bestAvailableSpeaker: payload.bestAvailableSpeaker === true },
           skippedTrackerTags
         }));
         const cached = config.parsedMessages[payload.messageId];

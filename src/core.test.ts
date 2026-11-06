@@ -3049,6 +3049,23 @@ test('narrative role review separates the smoker from a named reply without assi
   const exchangeSegments = resolveSpeakerDecisionSegments(text, plan, exchangeAnswers, speakers, { isUserMessage: false, cardSpeakerId: null, historicalSpeakerId: null, evidenceOnly: true, includeDebug: true })
   assert.deepEqual(exchangeSegments.filter(segment => segment.speakerId !== null).map(segment => segment.speakerId), ['ghost:smoker', 'ghost:smoker', 'unconfigured:maeve', 'ghost:smoker', 'ghost:smoker', 'unconfigured:maeve'])
   assert.ok(exchangeAnswers.narrative_exchange_reconciled_s3)
+  // Earlier speeches have already been resolved to the smoker, so the first
+  // same-identity response contradiction is later than Maeve's attributed line.
+  const partiallyResolved: Record<string, SpeakerDecisionChoice> = {}
+  plan.optionSpeakerIds.test_smoker = 'ghost:smoker'
+  for (const speech of plan.state.speeches) partiallyResolved[`speech_${speech.id}`] = confidentDecision('known_0')
+  partiallyResolved.speech_s0 = confidentDecision('test_smoker')
+  partiallyResolved.speech_s1 = confidentDecision('test_smoker')
+  partiallyResolved.turn_s2 = confidentDecision('responds_to_previous_speaker')
+  partiallyResolved.turn_s5 = confidentDecision('responds_to_previous_speaker')
+  applyExplicitPostQuoteVoiceAttributions(plan, partiallyResolved)
+  const laterReview = buildSpeakerSwitchContradictionReview(plan, partiallyResolved, context)
+  assert.equal(laterReview.runs[0].currentId, 's5')
+  assert.equal(laterReview.roles[0]?.anchorId, 's2')
+  assert.ok(laterReview.questions[`${role.id}_exchange_s3`])
+  applyNarrativeExchangeSpeakerReview(plan, partiallyResolved, laterReview, exchangeResults)
+  const laterSegments = resolveSpeakerDecisionSegments(text, plan, partiallyResolved, speakers, { isUserMessage: false, cardSpeakerId: null, historicalSpeakerId: null, evidenceOnly: true, includeDebug: true })
+  assert.deepEqual(laterSegments.filter(segment => segment.speakerId !== null).map(segment => segment.speakerId), ['ghost:smoker', 'ghost:smoker', 'unconfigured:maeve', 'ghost:smoker', 'ghost:smoker', 'unconfigured:maeve'])
   const interrupted = { ...exchangeResults, [`${role.id}_exchange`]: confidentDecision('other_or_unclear') }
   const unchanged: Record<string, SpeakerDecisionChoice> = { ...exchangeAnswers, speech_s3: confidentDecision('known_0') }
   delete unchanged.narrative_role_reconciled_s3
