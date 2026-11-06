@@ -3,6 +3,15 @@ export const USER_SPEAKER_ID = '__chat_voice_user__'
 export const UNCAST_SPEAKER_ID = '__chat_voice_uncast__'
 /** New defaults should not override an existing explicit opt-out. */
 export const enabledUnlessExplicitlyDisabled = (value: unknown): boolean => value !== false
+/** Choose a global extension preference, then Lumiverse's global default. */
+export function globalTtsConnectionPreference(value: Record<string, unknown>): string {
+  const chosen = typeof value.chatVoiceTtsConnectionId === 'string' ? value.chatVoiceTtsConnectionId : value.ttsConnectionId
+  return typeof chosen === 'string' ? chosen.trim().slice(0, 128) : ''
+}
+
+export function resolveGlobalTtsConnection(preference: string, connections: Array<{ id: string; is_default?: boolean }>): string {
+  return preference || connections.find(connection => connection.is_default)?.id || ''
+}
 /** A speech span whose identity is unknown; unlike null, this is not narration. */
 export const UNRESOLVED_SPEAKER_ID = '__chat_voice_unresolved__'
 export const DEFAULT_MESSAGE_LIMIT = 20

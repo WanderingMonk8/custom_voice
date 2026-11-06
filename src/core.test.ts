@@ -33,6 +33,8 @@ import {
   buildContrastiveOpeningLinkReview,
   applyFocusedOpeningFallback,
   enabledUnlessExplicitlyDisabled,
+  globalTtsConnectionPreference,
+  resolveGlobalTtsConnection,
   buildBestAvailableSpeakerReview,
   applyBestAvailableSpeakerReview,
   buildSelfIntroductionReview,
@@ -2930,6 +2932,17 @@ test('backward links require a strong independent same-speaker answer and a vali
   assert.equal(buildOpeningBacklinkReview(changedScene, sceneAnswers, context, null), null)
   const explicitlyDifferent = buildSpeakerDecisionPlan('"First," Ken says.\n\n"Second," Ewan says.', speakers, false)
   assert.equal(buildOpeningBacklinkReview(explicitlyDifferent, sceneAnswers, context, null), null)
+})
+
+test('global TTS connection preference overrides the host default without per-chat input', () => {
+  const connections = [{ id: 'fish', is_default: true }, { id: 'other' }]
+  assert.equal(globalTtsConnectionPreference({ ttsConnectionId: 'fish' }), 'fish')
+  assert.equal(globalTtsConnectionPreference({ chatVoiceTtsConnectionId: 'other', ttsConnectionId: 'fish' }), 'other')
+  assert.equal(globalTtsConnectionPreference({ chatVoiceTtsConnectionId: '', ttsConnectionId: 'other' }), '')
+  assert.equal(resolveGlobalTtsConnection('', connections), 'fish')
+  assert.equal(resolveGlobalTtsConnection('missing', connections), 'missing')
+  assert.equal(resolveGlobalTtsConnection('other', connections), 'other')
+  assert.equal(resolveGlobalTtsConnection('', []), '')
 })
 
 test('speaker feature defaults enable unset values while preserving explicit opt-outs', () => {

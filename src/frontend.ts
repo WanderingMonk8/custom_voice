@@ -17,6 +17,8 @@ import {
   DEFAULT_SAVED_AUDIO_LIMIT,
   eligibleCardFallbackSpeakerId,
   enabledUnlessExplicitlyDisabled,
+  globalTtsConnectionPreference,
+  resolveGlobalTtsConnection,
   encodeConcatenatedWav,
   expiredSavedAudioRecords,
   hashMessageContent,
@@ -462,9 +464,7 @@ async function loadPlaybackPreferences(): Promise<PlaybackPreferences> {
   return {
     speed: Math.min(4, Math.max(0.25, speed)),
     volume: Math.min(1, Math.max(0, volume)),
-    connectionId: typeof row.value?.ttsConnectionId === 'string'
-      ? row.value.ttsConnectionId.trim()
-      : '',
+    connectionId: globalTtsConnectionPreference(row.value ?? {}),
     saveGeneratedAudio: row.value?.chatVoiceSaveGeneratedAudio !== false,
     savedAudioLimit: clampSavedAudioLimit(row.value?.chatVoiceSavedAudioLimit),
     skippedTrackerTags: typeof row.value?.chatVoiceSkippedTrackerTags === 'string'
@@ -542,6 +542,10 @@ function saveGeneratedAudioPreference(enabled: boolean): Promise<void> {
     ...current,
     chatVoiceSaveGeneratedAudio: enabled,
   }))
+}
+
+function saveGlobalTtsConnection(connectionId: string): Promise<void> {
+  return updateVoiceSettings(current => ({ ...current, chatVoiceTtsConnectionId: connectionId.trim().slice(0, 128) }))
 }
 
 function saveGeneratedAudioLimit(limit: number): Promise<void> {
@@ -1127,7 +1131,7 @@ export function setup(ctx: SpindleFrontendContext) {
     return { field, label, slot }
   }
 
-  const connectionField = createField('TTS connection')
+  const connectionField = createField('TTS connection (global)')
   const saveAudioField = createField('Audio storage')
   saveAudioField.slot.className = 'chat-voice-storage'
   const saveAudioLabel = document.createElement('label')
@@ -1431,6 +1435,8 @@ export function setup(ctx: SpindleFrontendContext) {
   let activeChat: ActiveChatState | null = null
   let connections: TtsConnection[] = []
   let lumiverseConnectionId = ''
+  let savingGlobalConnection = false
+  let globalConnectionVersion = 0
   let defaultNarratorVoice = ''
   let defaultUserVoice = ''
   let favoriteVoices: FavoriteVoice[] = []
@@ -1679,10 +1685,32 @@ export function setup(ctx: SpindleFrontendContext) {
   const connectionPicker = ctx.components.mountSelect(connectionField.slot, {
     value: '', options: [], placeholder: 'Loading connections…',
     searchPlaceholder: 'Search TTS connections…', emptyMessage: 'No TTS connections found.',
-    clearable: true, clearLabel: 'Disable custom chat voices', ariaLabel: 'TTS connection',
+    clearable: true, clearLabel: 'Use default TTS connection', ariaLabel: 'Global TTS connection',
     disabled: true,
-    onChange: () => markChanged(),
+    onChange: () => { void onGlobalConnectionChanged() },
   })
+
+  async function onGlobalConnectionChanged(): Promise<void> {
+    if (applyingState) return
+    const previous = lumiverseConnectionId
+    const selected = connectionPicker.getValue()
+    const version = ++globalConnectionVersion
+    lumiverseConnectionId = resolveGlobalTtsConnection(selected, connections)
+    savingGlobalConnection = true
+    setStatus('Saving global TTS connection…')
+    try {
+      await saveGlobalTtsConnection(selected)
+      if (version === globalConnectionVersion) setStatus('Global TTS connection saved.', 'saved')
+    } catch (error) {
+      if (version === globalConnectionVersion) {
+        lumiverseConnectionId = previous
+        connectionPicker.update({ value: previous, options: connectionOptions(previous) })
+        setStatus(error instanceof Error ? error.message : 'Could not save global TTS connection.', 'error')
+      }
+    } finally {
+      if (version === globalConnectionVersion) savingGlobalConnection = false
+    }
+  }
 
   const narratorEditSlot = document.createElement('div')
   const userEditSlot = document.createElement('div')
@@ -1963,7 +1991,7 @@ export function setup(ctx: SpindleFrontendContext) {
   function collectConfig(forSave = false) {
     return {
       messageLimit: activeChat?.messageLimit ?? 20,
-      connectionId: connectionPicker.getValue(),
+      connectionId: forSave ? activeChat?.connectionId ?? '' : (connectionPicker.getValue() || lumiverseConnectionId),
       narratorVoice: forSave ? localNarratorVoice : narratorInput.getValue(),
       userVoice: forSave ? localUserVoice : userVoiceInput.getValue(),
       useGlobalNarratorVoice,
@@ -2824,6 +2852,7 @@ export function setup(ctx: SpindleFrontendContext) {
     if (!activeChat || activeChat.id !== ctx.getActiveChat().chatId) return
     const playbackChat = activeChat
     const config = collectConfig()
+    const connectionVersionAtLoad = globalConnectionVersion
     const preferences = await loadPlaybackPreferences()
     if (llmSettingsSaveTimer || savingLlmSettings) {
       preferences.speakerParsingMode = speakerParsingMode
@@ -2854,10 +2883,9 @@ export function setup(ctx: SpindleFrontendContext) {
       bestAvailableSpeaker = preferences.bestAvailableSpeaker
       skipNarration = preferences.skipNarration
     }
-    const connectionId = config.connectionId
-      || (connections.some(connection => connection.id === preferences.connectionId)
-        ? preferences.connectionId
-        : connections.find(connection => connection.is_default)?.id ?? lumiverseConnectionId)
+    const connectionId = savingGlobalConnection || connectionVersionAtLoad !== globalConnectionVersion
+      ? lumiverseConnectionId
+      : resolveGlobalTtsConnection(preferences.connectionId, connections)
     if (!connectionId) {
       setStatus('Choose a TTS connection before playing.', 'error')
       return
@@ -4425,12 +4453,12 @@ export function setup(ctx: SpindleFrontendContext) {
     }
     activeChat = next
     context.textContent = next ? `Active chat: ${next.name}` : 'Open a chat to configure its voices.'
-    const selectedConnectionId = next?.connectionId || lumiverseConnectionId
+    const selectedConnectionId = lumiverseConnectionId
     connectionPicker.update({
       value: selectedConnectionId,
       options: connectionOptions(selectedConnectionId),
       placeholder: connections.length ? 'Choose a TTS connection' : 'No TTS connections found',
-      disabled: !next || connections.length === 0,
+      disabled: connections.length === 0,
     })
     scanButton.disabled = !next || scanning
     if (!keepRoleEditor || editingRoleVoice !== 'narrator') localNarratorVoice = next?.narratorVoice ?? ''
@@ -4459,6 +4487,7 @@ export function setup(ctx: SpindleFrontendContext) {
   }
 
   async function loadConnections() {
+    const connectionVersionAtLoad = globalConnectionVersion
     try {
       const [loadedConnections, loadedLlmConnections, preferences] = await Promise.all([
         listAllTtsConnections(),
@@ -4561,15 +4590,13 @@ export function setup(ctx: SpindleFrontendContext) {
         skipNarrationToggle.checked = skipNarration
         speakerDebugOutput.hidden = !speakerAssignmentDebug
       }
-      lumiverseConnectionId = connections.some(connection => connection.id === preferences.connectionId)
-        ? preferences.connectionId
-        : connections.find(connection => connection.is_default)?.id ?? ''
-      const selectedConnectionId = activeChat?.connectionId || lumiverseConnectionId
+      if (!savingGlobalConnection && connectionVersionAtLoad === globalConnectionVersion) lumiverseConnectionId = resolveGlobalTtsConnection(preferences.connectionId, connections)
+      const selectedConnectionId = lumiverseConnectionId
       connectionPicker.update({
         value: selectedConnectionId,
         options: connectionOptions(selectedConnectionId),
         placeholder: connections.length ? 'Choose a TTS connection' : 'No TTS connections found',
-        disabled: !activeChat || connections.length === 0,
+        disabled: connections.length === 0,
       })
       if (connections.length === 0) setStatus('Create a TTS connection in Lumiverse first.')
       else if (decisionStatusFailed) {
