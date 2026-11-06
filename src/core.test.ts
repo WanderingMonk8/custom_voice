@@ -33,6 +33,8 @@ import {
   buildContrastiveOpeningLinkReview,
   applyFocusedOpeningFallback,
   standardSpeakerReviewPolicy,
+  newAssistantMessageIds,
+  readAutomaticVoicePreferences,
   globalTtsConnectionPreference,
   resolveGlobalTtsConnection,
   buildBestAvailableSpeakerReview,
@@ -2954,6 +2956,19 @@ test('global TTS connection preference overrides the host default without per-ch
 
 test('standard speaker review enables the production pipeline without comparison calls', () => {
   assert.deepEqual(standardSpeakerReviewPolicy(), { runReview: true, bestAvailableSpeaker: true, shadowEvaluation: false, focusedOpeningFallback: false })
+})
+
+test('autoplay only selects new assistant message IDs after a baseline exists', () => {
+  assert.deepEqual(newAssistantMessageIds(null, ['old']), [])
+  assert.deepEqual(newAssistantMessageIds(new Set(['old', 'existing']), ['old', 'existing']), [])
+  assert.deepEqual(newAssistantMessageIds(new Set(['old', 'existing']), ['old', 'existing', 'new', 'new', 'later']), ['new', 'later'])
+  assert.deepEqual(newAssistantMessageIds(new Set(['new', 'later']), ['new', 'later']), [])
+})
+
+test('automatic casting defaults on and autoplay requires explicit opt-in', () => {
+  assert.deepEqual(readAutomaticVoicePreferences({}), { autoVoiceCasting: true, autoPlayback: false })
+  assert.deepEqual(readAutomaticVoicePreferences({ chatVoiceAutoCasting: false, chatVoiceAutoPlayback: true }), { autoVoiceCasting: false, autoPlayback: true })
+  assert.deepEqual(readAutomaticVoicePreferences({ chatVoiceAutoCasting: true, chatVoiceAutoPlayback: 'true' }), { autoVoiceCasting: true, autoPlayback: false })
 })
 
 test('immediate named voice attribution anchors the preceding quote but not an introduced next quote', () => {

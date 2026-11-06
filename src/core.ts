@@ -5,6 +5,22 @@ export const UNCAST_SPEAKER_ID = '__chat_voice_uncast__'
 export function standardSpeakerReviewPolicy() {
   return { runReview: true, bestAvailableSpeaker: true, shadowEvaluation: false, focusedOpeningFallback: false } as const
 }
+
+/** Return genuinely new assistant message IDs in conversation order, once a baseline exists. */
+export function newAssistantMessageIds(previous: ReadonlySet<string> | null, current: readonly string[]): string[] {
+  if (!previous) return []
+  const seen = new Set(previous)
+  return current.filter(id => {
+    if (!id || seen.has(id)) return false
+    seen.add(id)
+    return true
+  })
+}
+
+/** Preserve explicit casting opt-outs; automatic playback requires an opt-in. */
+export function readAutomaticVoicePreferences(value: Record<string, unknown>) {
+  return { autoVoiceCasting: value.chatVoiceAutoCasting !== false, autoPlayback: value.chatVoiceAutoPlayback === true }
+}
 /** Choose a global extension preference, then Lumiverse's global default. */
 export function globalTtsConnectionPreference(value: Record<string, unknown>): string {
   const chosen = typeof value.chatVoiceTtsConnectionId === 'string' ? value.chatVoiceTtsConnectionId : value.ttsConnectionId

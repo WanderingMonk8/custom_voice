@@ -4,6 +4,18 @@ var UNCAST_SPEAKER_ID = "__chat_voice_uncast__";
 function standardSpeakerReviewPolicy() {
   return { runReview: true, bestAvailableSpeaker: true, shadowEvaluation: false, focusedOpeningFallback: false };
 }
+function newAssistantMessageIds(previous, current) {
+  if (!previous) return [];
+  const seen = new Set(previous);
+  return current.filter((id) => {
+    if (!id || seen.has(id)) return false;
+    seen.add(id);
+    return true;
+  });
+}
+function readAutomaticVoicePreferences(value) {
+  return { autoVoiceCasting: value.chatVoiceAutoCasting !== false, autoPlayback: value.chatVoiceAutoPlayback === true };
+}
 function globalTtsConnectionPreference(value) {
   const chosen = typeof value.chatVoiceTtsConnectionId === "string" ? value.chatVoiceTtsConnectionId : value.ttsConnectionId;
   return typeof chosen === "string" ? chosen.trim().slice(0, 128) : "";
@@ -1679,7 +1691,7 @@ async function loadPlaybackPreferences() {
     rateLimitWaitSeconds: DEFAULT_RATE_LIMIT_WAIT_SECONDS,
     ghostVoiceLifetime: GHOST_VOICE_LIFETIME_MESSAGES,
     speakerLookback: DEFAULT_SPEAKER_LOOKBACK,
-    autoVoiceCasting: true,
+    ...readAutomaticVoicePreferences({}),
     speakerAssignmentDebug: false,
     skipNarration: false,
     defaultNarratorVoice: "",
@@ -1721,7 +1733,7 @@ async function loadPlaybackPreferences() {
     ),
     ghostVoiceLifetime: clampIntegerSetting(row.value?.chatVoiceGhostVoiceLifetime, GHOST_VOICE_LIFETIME_MESSAGES, 1e3),
     speakerLookback: clampIntegerSetting(row.value?.chatVoiceSpeakerLookback, DEFAULT_SPEAKER_LOOKBACK, MAX_SPEAKER_LOOKBACK),
-    autoVoiceCasting: row.value?.chatVoiceAutoCasting !== false,
+    ...readAutomaticVoicePreferences(row.value ?? {}),
     speakerAssignmentDebug: row.value?.chatVoiceSpeakerAssignmentDebug === true,
     skipNarration: row.value?.chatVoiceSkipNarration === true,
     defaultNarratorVoice: typeof row.value?.chatVoiceDefaultNarratorVoice === "string" ? row.value.chatVoiceDefaultNarratorVoice.trim().slice(0, 512) : "",
@@ -1786,7 +1798,7 @@ function saveTtsTagPreferences(style, placement, connectionId, model) {
     chatVoiceTagLlmModel: model.trim().slice(0, 256)
   }));
 }
-function saveAdvancedPlaybackPreferences(bufferSegments, concurrentGenerations, rateLimitWaitSeconds, speakerAssignmentDebug, ghostVoiceLifetime, autoVoiceCasting, speakerLookback, skipNarration) {
+function saveAdvancedPlaybackPreferences(bufferSegments, concurrentGenerations, rateLimitWaitSeconds, speakerAssignmentDebug, ghostVoiceLifetime, autoVoiceCasting, autoPlayback, speakerLookback, skipNarration) {
   return updateVoiceSettings((current) => ({
     ...current,
     chatVoicePlaybackBufferSegments: clampIntegerSetting(
@@ -1807,6 +1819,7 @@ function saveAdvancedPlaybackPreferences(bufferSegments, concurrentGenerations, 
     chatVoiceSpeakerAssignmentDebug: speakerAssignmentDebug,
     chatVoiceSkipNarration: skipNarration,
     chatVoiceAutoCasting: autoVoiceCasting,
+    chatVoiceAutoPlayback: autoPlayback,
     chatVoiceGhostVoiceLifetime: clampIntegerSetting(ghostVoiceLifetime, GHOST_VOICE_LIFETIME_MESSAGES, 1e3),
     chatVoiceSpeakerLookback: clampIntegerSetting(speakerLookback, DEFAULT_SPEAKER_LOOKBACK, MAX_SPEAKER_LOOKBACK)
   }));
@@ -2461,6 +2474,19 @@ function setup(ctx) {
   const autoCastingText = document.createElement("span");
   autoCastingText.textContent = "Automatically cast voices";
   autoCastingLabel.append(autoCastingToggle, autoCastingText);
+  const autoPlaybackLabel = document.createElement("label");
+  autoPlaybackLabel.className = "chat-voice-toggle";
+  const autoPlaybackToggle = document.createElement("input");
+  autoPlaybackToggle.type = "checkbox";
+  const autoPlaybackCopy = document.createElement("span");
+  autoPlaybackCopy.className = "chat-voice-toggle-copy";
+  const autoPlaybackText = document.createElement("span");
+  autoPlaybackText.textContent = "Automatically play new messages";
+  const autoPlaybackHint = document.createElement("span");
+  autoPlaybackHint.className = "chat-voice-toggle-hint";
+  autoPlaybackHint.textContent = "Play new assistant messages as they arrive. Your browser may require a click before audio can start.";
+  autoPlaybackCopy.append(autoPlaybackText, autoPlaybackHint);
+  autoPlaybackLabel.append(autoPlaybackToggle, autoPlaybackCopy);
   const speakerDebugLabel = document.createElement("label");
   speakerDebugLabel.className = "chat-voice-toggle";
   const speakerDebugToggle = document.createElement("input");
@@ -2505,6 +2531,7 @@ function setup(ctx) {
     ghostLifetimeField.field,
     speakerLookbackField.field,
     autoCastingLabel,
+    autoPlaybackLabel,
     skipNarrationLabel,
     speakerDebugLabel,
     speakerDebugOutput,
@@ -2512,6 +2539,12 @@ function setup(ctx) {
   );
   let applyingState = false;
   let activeChat = null;
+  let autoPlaybackSeenChatId = null;
+  let autoPlaybackSeenIds = null;
+  let autoPlaybackEventQueue = Promise.resolve();
+  let autoPlaybackQueue = Promise.resolve();
+  let autoPlaybackDisposed = false;
+  let autoPlaybackEpoch = 0;
   let connections = [];
   let lumiverseConnectionId = "";
   let savingGlobalConnection = false;
@@ -2573,6 +2606,7 @@ function setup(ctx) {
   let concurrentGenerationLimit = DEFAULT_CONCURRENT_GENERATIONS;
   let rateLimitWaitSeconds = DEFAULT_RATE_LIMIT_WAIT_SECONDS;
   let autoVoiceCasting = true;
+  let autoPlayback = false;
   let ghostVoiceLifetime = GHOST_VOICE_LIFETIME_MESSAGES;
   let speakerLookback = DEFAULT_SPEAKER_LOOKBACK;
   let ghostLifetimeLoaded = false;
@@ -2998,6 +3032,7 @@ function setup(ctx) {
     autoVoiceCasting = autoCastingToggle.checked;
     scheduleAdvancedSettingsSave();
   });
+  autoPlaybackToggle.addEventListener("change", onAutoPlaybackChanged);
   const addNpcInput = ctx.components.mountTextInput(addNpcInputSlot, {
     value: "",
     placeholder: "NPC name / aliases",
@@ -3636,7 +3671,7 @@ function setup(ctx) {
       return attachment.type === "audio" && (attachment.swipe_id === void 0 || attachment.swipe_id === message.swipe_id);
     });
   }
-  async function playMessage(messageId, nativeRegenerationAction = false) {
+  async function playMessage(messageId, nativeRegenerationAction = false, automatic = false) {
     if (activePlayback?.messageId === messageId) {
       const finishingSave = stopPlayback();
       setStatus(finishingSave ? "Playback stopped; finishing saved audio\u2026" : "Playback stopped.");
@@ -3655,6 +3690,7 @@ function setup(ctx) {
       return;
     }
     if (ctx.getActiveChat().chatId !== requestedChatId) return;
+    if (automatic && (message.is_user || hasSavedAudioForCurrentSwipe(message))) return;
     const regeneratingSavedAudio = !message.is_user && (nativeRegenerationAction || hasSavedAudioForCurrentSwipe(message));
     if (regeneratingSavedAudio) {
       const { confirmed } = await ctx.ui.showConfirm({
@@ -3698,6 +3734,7 @@ function setup(ctx) {
       preferences.ghostVoiceLifetime = ghostVoiceLifetime;
       preferences.speakerLookback = speakerLookback;
       preferences.autoVoiceCasting = autoVoiceCasting;
+      preferences.autoPlayback = autoPlayback;
       preferences.speakerAssignmentDebug = speakerAssignmentDebug;
       preferences.skipNarration = skipNarration;
     } else {
@@ -3736,7 +3773,27 @@ function setup(ctx) {
       return;
     }
     const audioContext = new contextClass();
-    await audioContext.resume();
+    if (automatic) {
+      let timer;
+      try {
+        await Promise.race([
+          audioContext.resume(),
+          new Promise((_, reject) => {
+            timer = setTimeout(() => reject(new Error("Automatic playback needs a browser interaction. Click a play button to enable audio.")), 2e3);
+          })
+        ]);
+      } catch (error) {
+        void audioContext.close().catch(() => void 0);
+        setStatus(error instanceof Error ? error.message : "Automatic playback could not start.", "error");
+        return;
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+      if (autoPlaybackDisposed || !autoPlayback || ctx.getActiveChat().chatId !== requestedChatId) {
+        void audioContext.close().catch(() => void 0);
+        return;
+      }
+    } else await audioContext.resume();
     let audibleFinished = false;
     let resolveAudibleDone = null;
     const audibleDone = new Promise((resolve) => {
@@ -5120,6 +5177,10 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
   }
   function renderState(next) {
     applyingState = true;
+    if ((next?.id ?? null) !== autoPlaybackSeenChatId || !autoPlaybackSeenIds) {
+      autoPlaybackSeenChatId = next?.id ?? null;
+      autoPlaybackSeenIds = next ? new Set(next.assistantMessageIds ?? []) : null;
+    }
     const keepVoiceEditor = !!editingCharacterVoiceId && !!next && activeChat?.id === next.id;
     const keepRoleEditor = !!editingRoleVoice && !!next && activeChat?.id === next.id;
     if (!keepVoiceEditor) editingCharacterVoiceId = null;
@@ -5243,6 +5304,8 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
         refreshLocalState();
         autoVoiceCasting = preferences.autoVoiceCasting;
         autoCastingToggle.checked = autoVoiceCasting;
+        autoPlayback = preferences.autoPlayback;
+        autoPlaybackToggle.checked = autoPlayback;
         speakerAssignmentDebug = preferences.speakerAssignmentDebug;
         playbackBufferInput.value = String(playbackBufferSegments);
         concurrentGenerationInput.value = String(concurrentGenerationLimit);
@@ -5369,6 +5432,11 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
     skipNarration = skipNarrationToggle.checked;
     scheduleAdvancedSettingsSave();
   }
+  function onAutoPlaybackChanged() {
+    autoPlayback = autoPlaybackToggle.checked;
+    autoPlaybackEpoch += 1;
+    scheduleAdvancedSettingsSave();
+  }
   async function persistAdvancedSettings() {
     savingAdvancedSettings = true;
     setStatus("Saving global advanced playback settings\u2026");
@@ -5380,6 +5448,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
         speakerAssignmentDebug,
         ghostVoiceLifetime,
         autoVoiceCasting,
+        autoPlayback,
         speakerLookback,
         skipNarration
       );
@@ -5750,12 +5819,37 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
   ensureSavedUserBubbleControls();
   const unsubscribeChatSwitched = ctx.events.on("CHAT_SWITCHED", (rawPayload) => {
     const switchedChatId = rawPayload?.chatId ?? null;
+    autoPlaybackEpoch += 1;
+    autoPlaybackSeenChatId = null;
+    autoPlaybackSeenIds = null;
     hostWindow.requestAnimationFrame(() => {
       if (ctx.getActiveChat().chatId === switchedChatId) refreshLocalState();
     });
   });
   const unsubscribeMessageRendered = ctx.events.on("CHARACTER_MESSAGE_RENDERED", () => {
-    if (activeChat?.id === ctx.getActiveChat().chatId) refreshLocalState();
+    const chatId = ctx.getActiveChat().chatId;
+    if (!chatId || activeChat?.id !== chatId || autoPlaybackSeenChatId !== chatId || !autoPlaybackSeenIds) return;
+    const eventEpoch = autoPlaybackEpoch;
+    const seenAtEvent = autoPlaybackSeenIds;
+    autoPlaybackEventQueue = autoPlaybackEventQueue.catch(() => void 0).then(async () => {
+      if (autoPlaybackDisposed || ctx.getActiveChat().chatId !== chatId || autoPlaybackSeenChatId !== chatId || autoPlaybackSeenIds !== seenAtEvent) return;
+      const state = await requestLocalState();
+      if (autoPlaybackDisposed || !state || state.id !== chatId || ctx.getActiveChat().chatId !== chatId || autoPlaybackSeenChatId !== chatId || autoPlaybackSeenIds !== seenAtEvent) return;
+      const newIds = newAssistantMessageIds(autoPlaybackSeenIds, state.assistantMessageIds ?? []);
+      for (const id of state.assistantMessageIds ?? []) autoPlaybackSeenIds.add(id);
+      if (!autoPlayback || eventEpoch !== autoPlaybackEpoch) return;
+      for (const id of newIds) {
+        autoPlaybackQueue = autoPlaybackQueue.catch(() => void 0).then(async () => {
+          while (activePlayback && !autoPlaybackDisposed && autoPlayback && eventEpoch === autoPlaybackEpoch && ctx.getActiveChat().chatId === chatId) await activePlayback.audibleDone;
+          if (autoPlaybackDisposed || !autoPlayback || eventEpoch !== autoPlaybackEpoch || ctx.getActiveChat().chatId !== chatId) return;
+          await playMessage(id, false, true);
+        }).catch((error) => {
+          if (!autoPlaybackDisposed) setStatus(error instanceof Error ? error.message : "Automatic playback failed.", "error");
+        });
+      }
+    }).catch((error) => {
+      if (!autoPlaybackDisposed) console.warn("[Chat Voice] Could not check new messages for automatic playback.", error);
+    });
   });
   const unsubscribeActivate = tab.onActivate(() => {
     void loadConnections();
@@ -5766,6 +5860,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
   void ensureQuotationRouting().catch(() => void 0);
   refreshLocalState();
   return () => {
+    autoPlaybackDisposed = true;
     hostDocument.removeEventListener("pointerdown", closeFavoritePickerOnOutsideClick);
     hostDocument.removeEventListener("keydown", closeFavoritePickerOnEscape);
     stopVoicePreview();
@@ -5852,6 +5947,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
         speakerAssignmentDebug,
         ghostVoiceLifetime,
         autoVoiceCasting,
+        autoPlayback,
         speakerLookback,
         skipNarration
       );
@@ -5869,6 +5965,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
     speakerLookbackInput.removeEventListener("change", onSpeakerLookbackInput);
     speakerDebugToggle.removeEventListener("change", onSpeakerDebugChanged);
     skipNarrationToggle.removeEventListener("change", onSkipNarrationChanged);
+    autoPlaybackToggle.removeEventListener("change", onAutoPlaybackChanged);
     addNpcInput.destroy();
     addNpcButton.removeEventListener("click", onAddNpc);
     addNpcInputSlot.removeEventListener("keydown", onAddNpcKeyDown);

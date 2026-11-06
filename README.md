@@ -10,6 +10,7 @@ A [Lumiverse Spindle](https://docs.lumiverse.chat/) extension that detects chara
 - Uses Jev through Lumiverse Decisions to classify paragraph and quotation identities, then applies deterministic inheritance and fallback policy.
 - Reviews contested dialogue runs using nearby user and assistant messages, narrative cues, speech relationships, and explicit speaker anchors. Unresolved speech can use a best-available scene speaker or temporary voice; uncertain guesses may be wrong.
 - Offers a single opt-in speaker-assignment debug log, off by default. Additional comparison reviews do not run during normal playback.
+- Automatically casts voices by default, with an advanced option to opt out. Optional automatic playback of new assistant messages is off by default and may require a browser interaction before audio can start.
 - Uses one globally selected TTS connection across chats.
 - Assigns a different custom voice name or provider voice ID to every detected character.
 - Allows every detected or manually added character to be renamed or deleted. Slash-separated aliases share that character's voice.

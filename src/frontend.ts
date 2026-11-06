@@ -18,6 +18,8 @@ import {
   eligibleCardFallbackSpeakerId,
   globalTtsConnectionPreference,
   standardSpeakerReviewPolicy,
+  newAssistantMessageIds,
+  readAutomaticVoicePreferences,
   resolveGlobalTtsConnection,
   encodeConcatenatedWav,
   expiredSavedAudioRecords,
@@ -365,6 +367,7 @@ interface PlaybackPreferences {
   ghostVoiceLifetime: number
   speakerLookback: number
   autoVoiceCasting: boolean
+  autoPlayback: boolean
   speakerAssignmentDebug: boolean
   skipNarration: boolean
   defaultNarratorVoice: string
@@ -436,7 +439,7 @@ async function loadPlaybackPreferences(): Promise<PlaybackPreferences> {
     rateLimitWaitSeconds: DEFAULT_RATE_LIMIT_WAIT_SECONDS,
     ghostVoiceLifetime: GHOST_VOICE_LIFETIME_MESSAGES,
     speakerLookback: DEFAULT_SPEAKER_LOOKBACK,
-    autoVoiceCasting: true,
+    ...readAutomaticVoicePreferences({}),
     speakerAssignmentDebug: false,
     skipNarration: false,
     defaultNarratorVoice: '',
@@ -490,7 +493,7 @@ async function loadPlaybackPreferences(): Promise<PlaybackPreferences> {
     ),
     ghostVoiceLifetime: clampIntegerSetting(row.value?.chatVoiceGhostVoiceLifetime, GHOST_VOICE_LIFETIME_MESSAGES, 1000),
     speakerLookback: clampIntegerSetting(row.value?.chatVoiceSpeakerLookback, DEFAULT_SPEAKER_LOOKBACK, MAX_SPEAKER_LOOKBACK),
-    autoVoiceCasting: row.value?.chatVoiceAutoCasting !== false,
+    ...readAutomaticVoicePreferences(row.value ?? {}),
     speakerAssignmentDebug: row.value?.chatVoiceSpeakerAssignmentDebug === true,
     skipNarration: row.value?.chatVoiceSkipNarration === true,
     defaultNarratorVoice: typeof row.value?.chatVoiceDefaultNarratorVoice === 'string'
@@ -584,6 +587,7 @@ function saveAdvancedPlaybackPreferences(
   speakerAssignmentDebug: boolean,
   ghostVoiceLifetime: number,
   autoVoiceCasting: boolean,
+  autoPlayback: boolean,
   speakerLookback: number,
   skipNarration: boolean,
 ): Promise<void> {
@@ -607,6 +611,7 @@ function saveAdvancedPlaybackPreferences(
     chatVoiceSpeakerAssignmentDebug: speakerAssignmentDebug,
     chatVoiceSkipNarration: skipNarration,
     chatVoiceAutoCasting: autoVoiceCasting,
+    chatVoiceAutoPlayback: autoPlayback,
     chatVoiceGhostVoiceLifetime: clampIntegerSetting(ghostVoiceLifetime, GHOST_VOICE_LIFETIME_MESSAGES, 1000),
     chatVoiceSpeakerLookback: clampIntegerSetting(speakerLookback, DEFAULT_SPEAKER_LOOKBACK, MAX_SPEAKER_LOOKBACK),
   }))
@@ -1323,6 +1328,19 @@ export function setup(ctx: SpindleFrontendContext) {
   const autoCastingText = document.createElement('span')
   autoCastingText.textContent = 'Automatically cast voices'
   autoCastingLabel.append(autoCastingToggle, autoCastingText)
+  const autoPlaybackLabel = document.createElement('label')
+  autoPlaybackLabel.className = 'chat-voice-toggle'
+  const autoPlaybackToggle = document.createElement('input')
+  autoPlaybackToggle.type = 'checkbox'
+  const autoPlaybackCopy = document.createElement('span')
+  autoPlaybackCopy.className = 'chat-voice-toggle-copy'
+  const autoPlaybackText = document.createElement('span')
+  autoPlaybackText.textContent = 'Automatically play new messages'
+  const autoPlaybackHint = document.createElement('span')
+  autoPlaybackHint.className = 'chat-voice-toggle-hint'
+  autoPlaybackHint.textContent = 'Play new assistant messages as they arrive. Your browser may require a click before audio can start.'
+  autoPlaybackCopy.append(autoPlaybackText, autoPlaybackHint)
+  autoPlaybackLabel.append(autoPlaybackToggle, autoPlaybackCopy)
   const speakerDebugLabel = document.createElement('label')
   speakerDebugLabel.className = 'chat-voice-toggle'
   const speakerDebugToggle = document.createElement('input')
@@ -1367,6 +1385,7 @@ export function setup(ctx: SpindleFrontendContext) {
     ghostLifetimeField.field,
     speakerLookbackField.field,
     autoCastingLabel,
+    autoPlaybackLabel,
     skipNarrationLabel,
     speakerDebugLabel,
     speakerDebugOutput,
@@ -1375,6 +1394,12 @@ export function setup(ctx: SpindleFrontendContext) {
 
   let applyingState = false
   let activeChat: ActiveChatState | null = null
+  let autoPlaybackSeenChatId: string | null = null
+  let autoPlaybackSeenIds: Set<string> | null = null
+  let autoPlaybackEventQueue: Promise<void> = Promise.resolve()
+  let autoPlaybackQueue: Promise<void> = Promise.resolve()
+  let autoPlaybackDisposed = false
+  let autoPlaybackEpoch = 0
   let connections: TtsConnection[] = []
   let lumiverseConnectionId = ''
   let savingGlobalConnection = false
@@ -1437,6 +1462,7 @@ export function setup(ctx: SpindleFrontendContext) {
   let concurrentGenerationLimit = DEFAULT_CONCURRENT_GENERATIONS
   let rateLimitWaitSeconds = DEFAULT_RATE_LIMIT_WAIT_SECONDS
   let autoVoiceCasting = true
+  let autoPlayback = false
   let ghostVoiceLifetime = GHOST_VOICE_LIFETIME_MESSAGES
   let speakerLookback = DEFAULT_SPEAKER_LOOKBACK
   let ghostLifetimeLoaded = false
@@ -1918,6 +1944,7 @@ export function setup(ctx: SpindleFrontendContext) {
   speakerDebugToggle.addEventListener('change', onSpeakerDebugChanged)
   skipNarrationToggle.addEventListener('change', onSkipNarrationChanged)
   autoCastingToggle.addEventListener('change', () => { autoVoiceCasting = autoCastingToggle.checked; scheduleAdvancedSettingsSave() })
+  autoPlaybackToggle.addEventListener('change', onAutoPlaybackChanged)
 
   const addNpcInput = ctx.components.mountTextInput(addNpcInputSlot, {
     value: '', placeholder: 'NPC name / aliases', ariaLabel: 'NPC name and aliases to add', disabled: true,
@@ -2735,7 +2762,7 @@ export function setup(ctx: SpindleFrontendContext) {
     })
   }
 
-  async function playMessage(messageId: string, nativeRegenerationAction = false): Promise<void> {
+  async function playMessage(messageId: string, nativeRegenerationAction = false, automatic = false): Promise<void> {
     if (activePlayback?.messageId === messageId) {
       const finishingSave = stopPlayback()
       setStatus(finishingSave ? 'Playback stopped; finishing saved audio…' : 'Playback stopped.')
@@ -2755,6 +2782,7 @@ export function setup(ctx: SpindleFrontendContext) {
       return
     }
     if (ctx.getActiveChat().chatId !== requestedChatId) return
+    if (automatic && (message.is_user || hasSavedAudioForCurrentSwipe(message))) return
 
     const regeneratingSavedAudio = !message.is_user
       && (nativeRegenerationAction || hasSavedAudioForCurrentSwipe(message))
@@ -2801,6 +2829,7 @@ export function setup(ctx: SpindleFrontendContext) {
       preferences.ghostVoiceLifetime = ghostVoiceLifetime
       preferences.speakerLookback = speakerLookback
       preferences.autoVoiceCasting = autoVoiceCasting
+      preferences.autoPlayback = autoPlayback
       preferences.speakerAssignmentDebug = speakerAssignmentDebug
       preferences.skipNarration = skipNarration
     } else {
@@ -2853,7 +2882,20 @@ export function setup(ctx: SpindleFrontendContext) {
       return
     }
     const audioContext = new contextClass()
-    await audioContext.resume()
+    if (automatic) {
+      let timer: ReturnType<typeof setTimeout> | undefined
+      try {
+        await Promise.race([
+          audioContext.resume(),
+          new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error('Automatic playback needs a browser interaction. Click a play button to enable audio.')), 2000) }),
+        ])
+      } catch (error) {
+        void audioContext.close().catch(() => undefined)
+        setStatus(error instanceof Error ? error.message : 'Automatic playback could not start.', 'error')
+        return
+      } finally { if (timer) clearTimeout(timer) }
+      if (autoPlaybackDisposed || !autoPlayback || ctx.getActiveChat().chatId !== requestedChatId) { void audioContext.close().catch(() => undefined); return }
+    } else await audioContext.resume()
     let audibleFinished = false
     let resolveAudibleDone: (() => void) | null = null
     const audibleDone = new Promise<void>((resolve) => {
@@ -4368,6 +4410,10 @@ export function setup(ctx: SpindleFrontendContext) {
 
   function renderState(next: ActiveChatState | null) {
     applyingState = true
+    if ((next?.id ?? null) !== autoPlaybackSeenChatId || !autoPlaybackSeenIds) {
+      autoPlaybackSeenChatId = next?.id ?? null
+      autoPlaybackSeenIds = next ? new Set(next.assistantMessageIds ?? []) : null
+    }
     const keepVoiceEditor = !!editingCharacterVoiceId && !!next && activeChat?.id === next.id
     const keepRoleEditor = !!editingRoleVoice && !!next && activeChat?.id === next.id
     if (!keepVoiceEditor) editingCharacterVoiceId = null
@@ -4499,6 +4545,8 @@ export function setup(ctx: SpindleFrontendContext) {
         refreshLocalState()
         autoVoiceCasting = preferences.autoVoiceCasting
         autoCastingToggle.checked = autoVoiceCasting
+        autoPlayback = preferences.autoPlayback
+        autoPlaybackToggle.checked = autoPlayback
         speakerAssignmentDebug = preferences.speakerAssignmentDebug
         playbackBufferInput.value = String(playbackBufferSegments)
         concurrentGenerationInput.value = String(concurrentGenerationLimit)
@@ -4640,6 +4688,12 @@ export function setup(ctx: SpindleFrontendContext) {
     scheduleAdvancedSettingsSave()
   }
 
+  function onAutoPlaybackChanged(): void {
+    autoPlayback = autoPlaybackToggle.checked
+    autoPlaybackEpoch += 1
+    scheduleAdvancedSettingsSave()
+  }
+
   async function persistAdvancedSettings(): Promise<void> {
     savingAdvancedSettings = true
     setStatus('Saving global advanced playback settings…')
@@ -4651,6 +4705,7 @@ export function setup(ctx: SpindleFrontendContext) {
         speakerAssignmentDebug,
         ghostVoiceLifetime,
         autoVoiceCasting,
+        autoPlayback,
         speakerLookback,
         skipNarration,
       )
@@ -5054,13 +5109,34 @@ export function setup(ctx: SpindleFrontendContext) {
 
   const unsubscribeChatSwitched = ctx.events.on('CHAT_SWITCHED', (rawPayload: unknown) => {
     const switchedChatId = (rawPayload as { chatId?: string | null })?.chatId ?? null
+    autoPlaybackEpoch += 1
+    autoPlaybackSeenChatId = null
+    autoPlaybackSeenIds = null
     hostWindow.requestAnimationFrame(() => {
       if (ctx.getActiveChat().chatId === switchedChatId) refreshLocalState()
     })
   })
 
   const unsubscribeMessageRendered = ctx.events.on('CHARACTER_MESSAGE_RENDERED', () => {
-    if (activeChat?.id === ctx.getActiveChat().chatId) refreshLocalState()
+    const chatId = ctx.getActiveChat().chatId
+    if (!chatId || activeChat?.id !== chatId || autoPlaybackSeenChatId !== chatId || !autoPlaybackSeenIds) return
+    const eventEpoch = autoPlaybackEpoch
+    const seenAtEvent = autoPlaybackSeenIds
+    autoPlaybackEventQueue = autoPlaybackEventQueue.catch(() => undefined).then(async () => {
+      if (autoPlaybackDisposed || ctx.getActiveChat().chatId !== chatId || autoPlaybackSeenChatId !== chatId || autoPlaybackSeenIds !== seenAtEvent) return
+      const state = await requestLocalState()
+      if (autoPlaybackDisposed || !state || state.id !== chatId || ctx.getActiveChat().chatId !== chatId || autoPlaybackSeenChatId !== chatId || autoPlaybackSeenIds !== seenAtEvent) return
+      const newIds = newAssistantMessageIds(autoPlaybackSeenIds, state.assistantMessageIds ?? [])
+      for (const id of state.assistantMessageIds ?? []) autoPlaybackSeenIds.add(id)
+      if (!autoPlayback || eventEpoch !== autoPlaybackEpoch) return
+      for (const id of newIds) {
+        autoPlaybackQueue = autoPlaybackQueue.catch(() => undefined).then(async () => {
+          while (activePlayback && !autoPlaybackDisposed && autoPlayback && eventEpoch === autoPlaybackEpoch && ctx.getActiveChat().chatId === chatId) await activePlayback.audibleDone
+          if (autoPlaybackDisposed || !autoPlayback || eventEpoch !== autoPlaybackEpoch || ctx.getActiveChat().chatId !== chatId) return
+          await playMessage(id, false, true)
+        }).catch(error => { if (!autoPlaybackDisposed) setStatus(error instanceof Error ? error.message : 'Automatic playback failed.', 'error') })
+      }
+    }).catch(error => { if (!autoPlaybackDisposed) console.warn('[Chat Voice] Could not check new messages for automatic playback.', error) })
   })
 
   const unsubscribeActivate = tab.onActivate(() => {
@@ -5074,6 +5150,7 @@ export function setup(ctx: SpindleFrontendContext) {
   refreshLocalState()
 
   return () => {
+    autoPlaybackDisposed = true
     hostDocument.removeEventListener('pointerdown', closeFavoritePickerOnOutsideClick)
     hostDocument.removeEventListener('keydown', closeFavoritePickerOnEscape)
     stopVoicePreview()
@@ -5157,6 +5234,7 @@ export function setup(ctx: SpindleFrontendContext) {
         speakerAssignmentDebug,
         ghostVoiceLifetime,
         autoVoiceCasting,
+        autoPlayback,
         speakerLookback,
         skipNarration,
       )
@@ -5174,6 +5252,7 @@ export function setup(ctx: SpindleFrontendContext) {
     speakerLookbackInput.removeEventListener('change', onSpeakerLookbackInput)
     speakerDebugToggle.removeEventListener('change', onSpeakerDebugChanged)
     skipNarrationToggle.removeEventListener('change', onSkipNarrationChanged)
+    autoPlaybackToggle.removeEventListener('change', onAutoPlaybackChanged)
     addNpcInput.destroy()
     addNpcButton.removeEventListener('click', onAddNpc)
     addNpcInputSlot.removeEventListener('keydown', onAddNpcKeyDown)
