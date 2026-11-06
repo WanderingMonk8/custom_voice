@@ -39,6 +39,8 @@ import {
   applyBestAvailableSpeakerReview,
   buildSelfIntroductionReview,
   applySelfIntroductionReview,
+  buildSpeakerSwitchContradictionReview,
+  applySpeakerSwitchContradictionReview,
   applyOpeningBacklinkReview,
   invalidSpeakerReviewAnswers,
   applyRelationshipSpeakerReview,
@@ -2949,6 +2951,43 @@ test('speaker feature defaults enable unset values while preserving explicit opt
   assert.equal(enabledUnlessExplicitlyDisabled(undefined), true)
   assert.equal(enabledUnlessExplicitlyDisabled(true), true)
   assert.equal(enabledUnlessExplicitlyDisabled(false), false)
+})
+
+test('speaker-switch review separates an unnamed respondent from a named speaker without forcing ambiguous switches', () => {
+  const speakers = [{ id: 'unconfigured:maeve', name: 'Maeve' }, { id: 'unconfigured:erin', name: 'Erin' }, { id: USER_SPEAKER_ID, name: 'Ken' }]
+  const text = 'The smoker sits by the window. "Lamp is out," she says. "I did not light it."\n\n"Decided what?" Maeve asks.\n\n"Whether I sleep in my boots." The smoker puts her boots down. "Boots stay."'
+  const plan = buildSpeakerDecisionPlan(text, speakers, false)
+  const answers: Record<string, SpeakerDecisionChoice> = {}
+  for (const speech of plan.state.speeches) answers[`speech_${speech.id}`] = confidentDecision('known_0')
+  answers.speech_s2 = { choice: 'known_0', probabilities: { known_0: 0.28, known_1: 0.26, no_clear_identity: 0.46 }, confidence: 0.2 }
+  answers.turn_s2 = confidentDecision('responds_to_previous_speaker')
+  answers.global_uncertain_s2 = confidentDecision('no_clear_identity')
+  const context = { previousMessages: [{ id: 'prior', role: 'user' as const, text: 'Erin lies beside me.' }], ghosts: [] }
+  const review = buildSpeakerSwitchContradictionReview(plan, answers, context)
+  assert.equal(review.runs.length, 1)
+  const run = review.runs[0]
+  assert.equal(run.previousId, 's1')
+  assert.equal(run.currentId, 's2')
+  assert.ok(review.questions[`switch_speaker_${run.id}_s1`].criteria.uncast_character)
+  const results: Record<string, SpeakerDecisionChoice> = { [`switch_${run.id}`]: confidentDecision('different') }
+  for (const id of run.speechIds) results[`switch_speaker_${run.id}_${id}`] = confidentDecision(id === 's2' ? 'known_0' : 'uncast_character')
+  applySpeakerSwitchContradictionReview(plan, answers, review, results)
+  const segments = resolveSpeakerDecisionSegments(text, plan, answers, speakers, { isUserMessage: false, cardSpeakerId: null, historicalSpeakerId: null, evidenceOnly: true, includeDebug: true })
+  assert.deepEqual(segments.filter(segment => segment.speakerId !== null).map(segment => segment.speakerId), [UNCAST_SPEAKER_ID, UNCAST_SPEAKER_ID, 'unconfigured:maeve', UNCAST_SPEAKER_ID, UNCAST_SPEAKER_ID])
+  const unchanged: Record<string, SpeakerDecisionChoice> = {}
+  for (const speech of plan.state.speeches) unchanged[`speech_${speech.id}`] = confidentDecision('known_0')
+  unchanged.turn_s2 = confidentDecision('responds_to_previous_speaker')
+  const falseAlarm = buildSpeakerSwitchContradictionReview(plan, unchanged, context)
+  applySpeakerSwitchContradictionReview(plan, unchanged, falseAlarm, { ...results, [`switch_${run.id}`]: confidentDecision('same_or_unclear') })
+  assert.equal(unchanged.speech_s1.choice, 'known_0')
+  const weak = { ...results, [`switch_speaker_${run.id}_s1`]: { choice: 'uncast_character', probabilities: { uncast_character: 0.6, known_0: 0.4 }, confidence: 0.5 } }
+  applySpeakerSwitchContradictionReview(plan, unchanged, falseAlarm, weak)
+  assert.equal(unchanged.speech_s1.choice, 'known_0')
+  const sameIdentity = { ...results, [`switch_speaker_${run.id}_s1`]: confidentDecision('known_0') }
+  applySpeakerSwitchContradictionReview(plan, unchanged, falseAlarm, sameIdentity)
+  assert.equal(unchanged.speech_s1.choice, 'known_0')
+  unchanged.turn_s2 = { choice: 'responds_to_previous_speaker', probabilities: { responds_to_previous_speaker: 0.6, continues_previous_turn: 0.4 }, confidence: 0.5 }
+  assert.equal(buildSpeakerSwitchContradictionReview(plan, unchanged, context).runs.length, 0)
 })
 
 test('cast candidates require independent scene or lookback evidence, not their own prior assignment', () => {
