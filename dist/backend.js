@@ -161,6 +161,13 @@ function uncastNarrativeNameCandidates(message) {
     names.set(name.toLowerCase(), name);
     if (names.size >= 20) break;
   }
+  const actions = /\b([\p{Lu}][\p{Ll}\p{M}'’-]{1,39})\s+(?:huffs|huffed|slaps|slapped|calls|called|shouts|shouted|speaks|spoke|mutters|muttered|laughs|laughed|glances|glanced|walks|walked|moves|moved|steps|stepped|nods|nodded)\b/gu;
+  for (const match of narrative.matchAll(actions)) {
+    const name = normalizeSpeakerName(match[1]);
+    if (!name || NON_NAME_PARAGRAPH_LEADS.has(name.toLowerCase())) continue;
+    names.set(name.toLowerCase(), name);
+    if (names.size >= 20) break;
+  }
   return [...names.values()];
 }
 function ghostPriorMessageIds(ghost, previousMessages) {
@@ -353,6 +360,7 @@ function resolveUncastVoiceDecisions(groups, voices, answers, ghosts = [], reser
   const labels = uncastIdentityLabels(message, ghosts);
   const groupLabels = /* @__PURE__ */ new Map();
   const rootByLabel = /* @__PURE__ */ new Map();
+  const rootByRevealedName = /* @__PURE__ */ new Map();
   const strongChoice = (answer) => {
     if (!answer || answer.choice === "new_or_unclear") return false;
     if (!Number.isFinite(answer.confidence) || answer.confidence < 0 || answer.confidence > 1 || !answer.probabilities || Object.values(answer.probabilities).some((value) => !Number.isFinite(value) || value < 0 || value > 1)) return false;
@@ -386,6 +394,8 @@ function resolveUncastVoiceDecisions(groups, voices, answers, ghosts = [], reser
     if (label) groupLabels.set(group.id, label);
     const previousGroups = groups.slice(0, groups.indexOf(group)).slice(-8);
     const same = previousGroups.flatMap((previous) => {
+      const previousName = revealedUncastName(previous, answers, message).toLowerCase();
+      if (name && previousName && name !== previousName) return [];
       const review = answers[`review_same_${group.id}_${previous.id}`];
       const answer = review && strongChoice(review) ? review : answers[`same_${group.id}_${previous.id}`];
       return answer?.choice === "same" && strongChoice(answer) ? [{ previous, probability: answer.probabilities.same ?? 0 }] : [];
@@ -393,6 +403,12 @@ function resolveUncastVoiceDecisions(groups, voices, answers, ghosts = [], reser
     if (same[0]) root = roots.get(same[0].previous.id) ?? root;
     else if (label && !isBroadPersonLabel(label) && rootByLabel.has(label)) root = rootByLabel.get(label);
     else if (strongChoice(identity) && identity?.choice.startsWith("group_")) root = roots.get(identity.choice.slice(6)) ?? root;
+    else if (name && rootByRevealedName.has(name)) {
+      const namedRoot = rootByRevealedName.get(name);
+      const contradicts = previousGroups.some((previous) => roots.get(previous.id) === namedRoot && answers[`same_${group.id}_${previous.id}`]?.choice === "different_or_unclear" && strongChoice(answers[`same_${group.id}_${previous.id}`]));
+      if (!contradicts) root = namedRoot;
+    }
+    if (name && previousGroups.some((previous) => roots.get(previous.id) === root && revealedUncastName(previous, answers, message) && revealedUncastName(previous, answers, message).toLowerCase() !== name)) root = group.id;
     const namedGhosts = label && !isBroadPersonLabel(label) ? ghosts.filter((item) => (!confirmedNew || item.id !== occurrence?.id) && ghostCastAliases(item).some((alias) => alias.toLowerCase() === label)) : [];
     const rankedGhosts = namedGhosts.map((item) => ({ item, recent: Math.max(
       previousMessageIds.indexOf(item.lastSeenMessageId),
@@ -463,6 +479,7 @@ function resolveUncastVoiceDecisions(groups, voices, answers, ghosts = [], reser
       }
     }
     roots.set(group.id, root);
+    if (name && !rootByRevealedName.has(name)) rootByRevealedName.set(name, root);
     if (contradictedRoots.has(root)) continue;
     if (confirmedNew && linkedGhosts.get(root)?.id === occurrence?.id) {
       confirmedNewRoots.delete(root);

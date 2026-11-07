@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { syncPlaybackButtons, type PlaybackButtonState } from './playback-ui'
+import { PlaybackLongPress, PlaybackStartupGuard, syncAutoplayIndicators, syncPlaybackButtons, type PlaybackButtonState } from './playback-ui'
 import { evaluateSpeakerReviews } from './speaker-review-evaluation'
 import {
   adaptiveGenerationConcurrency,
@@ -36,6 +36,7 @@ import {
   standardSpeakerReviewPolicy,
   autoplayGenerationEvent,
   claimAutoplayGeneration,
+  hasAudioForActiveSwipe,
   readAutomaticVoicePreferences,
   globalTtsConnectionPreference,
   resolveGlobalTtsConnection,
@@ -2202,6 +2203,50 @@ test('reviews uncast turns separately when a long narrative may introduce someon
   assert.deepEqual(groups.map(group => group.segmentIndexes), [[0], [2]])
 })
 
+test('separates named-action dialogue and adjacent replies before resolving Dennis continuity', () => {
+  const segments = [
+    { speakerId: UNCAST_SPEAKER_ID, text: 'Next two, get your orders ready.' },
+    { speakerId: null, text: 'She calls without breaking eye contact.' },
+    { speakerId: UNCAST_SPEAKER_ID, text: "I can take his order for him." },
+    { speakerId: null, text: 'Dennis huffs through his nose at the register, still not turning round.' },
+    { speakerId: UNCAST_SPEAKER_ID, text: "You're going to hell, Lisa." },
+    { speakerId: UNCAST_SPEAKER_ID, text: "I'm going to my break at two." },
+    { speakerId: null, text: 'She fires back. The tongs click.' },
+    { speakerId: UNCAST_SPEAKER_ID, text: 'Which is more than some of us get.' },
+  ]
+  const groups = collectUncastVoiceGroups(segments)
+  assert.deepEqual(groups.map(group => group.segmentIndexes), [[0, 2], [4], [5, 7]])
+  const message = `Lisa calls out. Dennis huffs through his nose at the register. "You're going to hell, Lisa." "I'm going to my break at two," she fires back.`
+  const voices = readFavoriteVoices([{ id: 'lisa-voice', category: 'female' }, { id: 'dennis-voice', category: 'male' }])
+  const plan = buildUncastVoiceDecision(groups, voices, message)
+  const dennis = plan.state.narrativeNames.findIndex(name => name.toLowerCase() === 'dennis')
+  const lisa = plan.state.narrativeNames.findIndex(name => name.toLowerCase() === 'lisa')
+  assert.ok(dennis >= 0 && lisa >= 0)
+  const answers: Record<string, SpeakerDecisionChoice> = {
+    narrative_name_g0: confidentDecision(`name_${lisa}`), narrative_name_g1: confidentDecision(`name_${dennis}`), narrative_name_g2: confidentDecision(`name_${lisa}`),
+    same_g1_g0: confidentDecision('different_or_unclear'), same_g2_g0: confidentDecision('same'), same_g2_g1: confidentDecision('different_or_unclear'),
+    gender_g0: confidentDecision('female'), gender_g1: confidentDecision('male'), gender_g2: confidentDecision('female'),
+    voice_g0: confidentDecision('voice_0'), voice_g1: confidentDecision('voice_1'), voice_g2: confidentDecision('voice_0'),
+  }
+  const assigned = resolveUncastVoiceDecisions(groups, voices, answers, [], [], 'first', message)
+  assert.deepEqual(groups.map(group => assigned.find(item => item.groupId === group.id)?.voiceId), ['lisa-voice', 'dennis-voice', 'lisa-voice'])
+  assert.ok(assigned.find(item => item.groupId === 'g1')?.aliases?.includes('dennis'))
+  const ghost = { id: 'dennis', speakerId: UNCAST_SPEAKER_ID, voiceId: 'dennis-voice', label: 'dennis', aliases: ['dennis'], context: 'Dennis huffs at the register.', occurrenceKeys: [], lastSeenMessageId: 'first' }
+  const later = 'Lisa calls to Dennis. "You are what?" The steamer goes off. Dennis slaps the counter. "LISA. Machine!"'
+  const nextGroups = collectUncastVoiceGroups([
+    { speakerId: UNCAST_SPEAKER_ID, text: 'You are what?' },
+    { speakerId: null, text: 'The steamer goes off. Dennis slaps the counter.' },
+    { speakerId: UNCAST_SPEAKER_ID, text: 'LISA. Machine!' },
+  ])
+  const nextPlan = buildUncastVoiceDecision(nextGroups, [], later, [ghost])
+  const nextDennis = nextPlan.state.narrativeNames.findIndex(name => name.toLowerCase() === 'dennis')
+  assert.ok(nextDennis >= 0)
+  const next = resolveUncastVoiceDecisions(nextGroups, [], { narrative_name_g0: confidentDecision(`name_${nextDennis}`), narrative_name_g1: confidentDecision(`name_${nextDennis}`) }, [ghost], [], 'next', later, ['first'])
+  assert.deepEqual(next.map(item => item.voiceId), ['dennis-voice', 'dennis-voice'])
+  const conflict = resolveUncastVoiceDecisions(groups, voices, { ...answers, same_g1_g0: confidentDecision('same') }, [], [], 'first', message)
+  assert.notEqual(conflict.find(item => item.groupId === 'g0')?.ghostId, conflict.find(item => item.groupId === 'g1')?.ghostId)
+})
+
 test('automatic casting respects reserved voices, gender, and no match', () => {
   const voices = readFavoriteVoices([{ id: 'used', category: 'male' }, { id: 'female', category: 'female' }, { id: 'male', category: 'male' }])
   const answer = { choice: 'voice_0', confidence: 0.9, probabilities: { voice_0: 0.8, voice_1: 0.15, voice_2: 0.05, no_match: 0 } }
@@ -3104,7 +3149,7 @@ test('standard speaker review enables the production pipeline without comparison
   assert.deepEqual(standardSpeakerReviewPolicy(), { runReview: true, bestAvailableSpeaker: true, shadowEvaluation: false, focusedOpeningFallback: false })
 })
 
-test('autoplay selects successful new-message generation completions in the active chat', () => {
+test('autoplay selects successful foreground messages and rerolls without duplicate events', () => {
   const event = { chatId: 'chat', generationId: 'gen', messageId: 'new', content: 'Finished text', generationType: 'normal' }
   assert.deepEqual(autoplayGenerationEvent(event, 'chat'), { chatId: 'chat', generationId: 'gen', messageId: 'new' })
   assert.deepEqual(autoplayGenerationEvent({ ...event, generationType: undefined }, 'chat'), { chatId: 'chat', generationId: 'gen', messageId: 'new' })
@@ -3113,13 +3158,28 @@ test('autoplay selects successful new-message generation completions in the acti
   assert.equal(autoplayGenerationEvent({ ...event, messageId: undefined }, 'chat'), null)
   assert.equal(autoplayGenerationEvent({ ...event, generationId: '' }, 'chat'), null)
   assert.equal(autoplayGenerationEvent({ ...event, backgroundSwipe: true }, 'chat'), null)
-  for (const generationType of ['continue', 'regenerate', 'swipe', 'impersonate']) assert.equal(autoplayGenerationEvent({ ...event, generationType }, 'chat'), null)
+  for (const generationType of ['continue', 'impersonate']) assert.equal(autoplayGenerationEvent({ ...event, generationType }, 'chat'), null)
+  for (const generationType of ['regenerate', 'swipe']) assert.deepEqual(autoplayGenerationEvent({ ...event, generationType }, 'chat'), { chatId: 'chat', generationId: 'gen', messageId: 'new', reroll: true, content: 'Finished text' })
   const generations = new Set<string>()
   const messages = new Set<string>()
   assert.equal(claimAutoplayGeneration(event, generations, messages), true)
   assert.equal(claimAutoplayGeneration(event, generations, messages), false)
   assert.equal(claimAutoplayGeneration({ ...event, generationId: 'retry' }, generations, messages), false)
+  const reroll = { ...event, generationId: 'reroll', reroll: true }
+  assert.equal(claimAutoplayGeneration(reroll, generations, messages), true)
+  assert.equal(claimAutoplayGeneration(reroll, generations, messages), false)
+  assert.equal(claimAutoplayGeneration({ ...reroll, generationId: 'reroll-2' }, generations, messages), true)
   assert.equal(claimAutoplayGeneration({ ...event, chatId: 'other' }, generations, messages), true)
+})
+
+test('autoplay recognizes saved audio only on its active swipe', () => {
+  const legacy = { extra: { attachments: [{ type: 'audio' }] } }
+  assert.equal(hasAudioForActiveSwipe(legacy), true)
+  assert.equal(hasAudioForActiveSwipe({ ...legacy, swipe_id: 1 }), false)
+  const swiped = { swipe_id: 1, extra: { attachments: [{ type: 'audio', swipe_id: 0 }, { type: 'audio', swipe_id: 1 }] } }
+  assert.equal(hasAudioForActiveSwipe(swiped), true)
+  assert.equal(hasAudioForActiveSwipe({ ...swiped, swipe_id: 2 }), false)
+  assert.equal(hasAudioForActiveSwipe({ swipe_id: 1, extra: { attachments: [{ type: 'image', swipe_id: 1 }] } }), false)
 })
 
 test('playback controls follow shared playback state, including menus rendered later', () => {
@@ -3164,10 +3224,70 @@ test('playback controls follow shared playback state, including menus rendered l
   assert.equal(states.size, 0)
 })
 
+test('autoplay indicators follow the shared preference on each native control', () => {
+  const button = { dataset: {}, messageId: 'message' } as unknown as HTMLButtonElement
+  const unrelated = { dataset: {}, messageId: null } as unknown as HTMLButtonElement
+  const getId = (item: HTMLButtonElement) => (item as unknown as { messageId: string | null }).messageId
+  syncAutoplayIndicators([button, unrelated], true, getId)
+  assert.equal(button.dataset.chatVoiceAutoplay, 'true')
+  assert.equal(unrelated.dataset.chatVoiceAutoplay, undefined)
+  syncAutoplayIndicators([button, unrelated], false, getId)
+  assert.equal(button.dataset.chatVoiceAutoplay, undefined)
+})
+
+test('long press toggles once and suppresses its click, but taps and drags do not', async () => {
+  let toggles = 0
+  const button = {}
+  const gesture = new PlaybackLongPress<object>(() => { toggles++ }, 10)
+  gesture.start(button, 1, 0, 0)
+  gesture.end(1)
+  await new Promise(resolve => setTimeout(resolve, 20))
+  assert.equal(toggles, 0)
+  assert.equal(gesture.consumeClick(button), false)
+  gesture.start(button, 2, 0, 0)
+  gesture.move(2, 20, 0)
+  await new Promise(resolve => setTimeout(resolve, 20))
+  assert.equal(toggles, 0)
+  gesture.start(button, 3, 0, 0)
+  await new Promise(resolve => setTimeout(resolve, 20))
+  assert.equal(toggles, 1)
+  gesture.end(3)
+  assert.equal(gesture.consumeClick({}), false)
+  assert.equal(gesture.consumeClick(button), true)
+  assert.equal(gesture.consumeClick(button), false)
+  gesture.start(button, 4, 0, 0)
+  await new Promise(resolve => setTimeout(resolve, 20))
+  gesture.end(4)
+  assert.equal(toggles, 2)
+  gesture.cancel()
+})
+
 test('automatic casting defaults on and autoplay requires explicit opt-in', () => {
   assert.deepEqual(readAutomaticVoicePreferences({}), { autoVoiceCasting: true, autoPlayback: false })
   assert.deepEqual(readAutomaticVoicePreferences({ chatVoiceAutoCasting: false, chatVoiceAutoPlayback: true }), { autoVoiceCasting: false, autoPlayback: true })
   assert.deepEqual(readAutomaticVoicePreferences({ chatVoiceAutoCasting: true, chatVoiceAutoPlayback: 'true' }), { autoVoiceCasting: true, autoPlayback: false })
+})
+
+test('playback startup ownership prevents overlapping and cancelled audio starts', () => {
+  const guard = new PlaybackStartupGuard()
+  const first = guard.begin('chat', 'one', true)!
+  assert.equal(guard.begin('chat', 'one', true), null)
+  assert.equal(guard.owns(first), true)
+  const second = guard.begin('chat', 'two', false)!
+  assert.equal(guard.owns(first), false)
+  assert.equal(guard.owns(second), true)
+  guard.finish(first)
+  assert.equal(guard.owns(second), true)
+  assert.equal(guard.begin('chat', 'two', false), null)
+  assert.equal(guard.owns(second), false)
+  const third = guard.begin('chat', 'three', true)!
+  guard.cancelAutomatic()
+  assert.equal(guard.owns(third), false)
+  const manual = guard.begin('chat', 'four', false)!
+  guard.cancelAutomatic()
+  assert.equal(guard.owns(manual), true)
+  guard.cancel()
+  assert.equal(guard.owns(manual), false)
 })
 
 test('immediate named voice attribution anchors the preceding quote but not an introduced next quote', () => {

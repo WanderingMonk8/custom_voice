@@ -5,6 +5,77 @@ export interface PlaybackButtonState {
   ariaPressed: string | null
 }
 
+/** Own asynchronous startup so superseded requests cannot create audio streams. */
+export class PlaybackStartupGuard {
+  private serial = 0
+  private pending: { token: number; chatId: string; messageId: string; automatic: boolean } | null = null
+  begin(chatId: string, messageId: string, automatic: boolean): number | null {
+    if (this.pending?.chatId === chatId && this.pending.messageId === messageId) {
+      if (!automatic) this.cancel()
+      return null
+    }
+    const token = ++this.serial
+    this.pending = { token, chatId, messageId, automatic }
+    return token
+  }
+  owns(token: number): boolean { return this.pending?.token === token }
+  finish(token: number): void { if (this.owns(token)) this.pending = null }
+  cancel(): void { this.serial++; this.pending = null }
+  cancelAutomatic(): void { if (this.pending?.automatic) this.cancel() }
+}
+
+/** One pointer gesture toggles autoplay without also activating the play button. */
+export class PlaybackLongPress<T> {
+  private active: { target: T; pointerId: number; x: number; y: number; timer: ReturnType<typeof setTimeout>; fired: boolean } | null = null
+  private suppressed: T | null = null
+  private expiry: ReturnType<typeof setTimeout> | null = null
+  constructor(private readonly toggle: () => void, private readonly delay = 650) {}
+  start(target: T, pointerId: number, x: number, y: number): void {
+    this.cancel()
+    this.suppressed = null
+    const active = { target, pointerId, x, y, fired: false, timer: setTimeout(() => {
+      if (this.active !== active) return
+      active.fired = true
+      this.suppressed = target
+      this.toggle()
+    }, this.delay) }
+    this.active = active
+  }
+  move(pointerId: number, x: number, y: number): void {
+    if (this.active?.pointerId === pointerId && !this.active.fired && Math.hypot(x - this.active.x, y - this.active.y) > 10) this.cancel()
+  }
+  end(pointerId: number): void {
+    if (this.active?.pointerId !== pointerId) return
+    const fired = this.active.fired
+    clearTimeout(this.active.timer)
+    this.active = null
+    if (fired) this.expiry = setTimeout(() => { this.suppressed = null; this.expiry = null }, 1000)
+  }
+  consumeClick(target: T): boolean {
+    if (this.suppressed !== target) return false
+    this.suppressed = null
+    if (this.expiry) clearTimeout(this.expiry)
+    this.expiry = null
+    return true
+  }
+  isHolding(target: T): boolean { return this.active?.target === target }
+  cancel(): void {
+    if (this.active) clearTimeout(this.active.timer)
+    if (this.expiry) clearTimeout(this.expiry)
+    this.active = null
+    this.expiry = null
+    this.suppressed = null
+  }
+}
+
+/** Highlight native controls without replacing their playback or accessibility state. */
+export function syncAutoplayIndicators(buttons: Iterable<HTMLButtonElement>, enabled: boolean, getMessageId: (button: HTMLButtonElement) => string | null): void {
+  for (const button of buttons) {
+    if (enabled && getMessageId(button)) button.dataset.chatVoiceAutoplay = 'true'
+    else delete button.dataset.chatVoiceAutoplay
+  }
+}
+
 /** Synchronize existing or newly rendered native controls with the shared playback state. */
 export function syncPlaybackButtons(
   buttons: Iterable<HTMLButtonElement>,

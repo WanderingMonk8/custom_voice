@@ -2,7 +2,7 @@ import type {
   SpindleFrontendContext,
   SpindleTextInputHandle,
 } from 'lumiverse-spindle-types'
-import { syncPlaybackButtons, type PlaybackButtonState } from './playback-ui'
+import { PlaybackLongPress, PlaybackStartupGuard, syncAutoplayIndicators, syncPlaybackButtons, type PlaybackButtonState } from './playback-ui'
 import {
   activeGhostVoices,
   adaptiveGenerationConcurrency,
@@ -21,6 +21,7 @@ import {
   standardSpeakerReviewPolicy,
   autoplayGenerationEvent,
   claimAutoplayGeneration,
+  hasAudioForActiveSwipe,
   readAutomaticVoicePreferences,
   resolveGlobalTtsConnection,
   encodeConcatenatedWav,
@@ -1105,6 +1106,9 @@ export function setup(ctx: SpindleFrontendContext) {
   })
   const hostDocument = tab.root.ownerDocument
   const hostWindow = hostDocument.defaultView ?? window
+  const autoplayIndicatorStyle = hostDocument.createElement('style')
+  autoplayIndicatorStyle.textContent = `button[data-chat-voice-autoplay="true"] { color: #a89bff !important; background-color: rgba(122, 104, 244, .2) !important; box-shadow: inset 0 0 0 1px rgba(168, 155, 255, .8), 0 0 8px rgba(122, 104, 244, .35) !important; border-radius: 6px; }`
+  hostDocument.head.appendChild(autoplayIndicatorStyle)
 
   const panel = document.createElement('div')
   panel.className = 'chat-voice-panel'
@@ -1337,10 +1341,10 @@ export function setup(ctx: SpindleFrontendContext) {
   const autoPlaybackCopy = document.createElement('span')
   autoPlaybackCopy.className = 'chat-voice-toggle-copy'
   const autoPlaybackText = document.createElement('span')
-  autoPlaybackText.textContent = 'Automatically play new messages'
+  autoPlaybackText.textContent = 'Automatically play new messages and rerolls'
   const autoPlaybackHint = document.createElement('span')
   autoPlaybackHint.className = 'chat-voice-toggle-hint'
-  autoPlaybackHint.textContent = 'Play new assistant messages as they arrive. Your browser may require a click before audio can start.'
+  autoPlaybackHint.textContent = 'Play new assistant messages and foreground rerolls as they arrive. You can also hold a message play button to toggle this. Your browser may require a click before audio can start.'
   autoPlaybackCopy.append(autoPlaybackText, autoPlaybackHint)
   autoPlaybackLabel.append(autoPlaybackToggle, autoPlaybackCopy)
   const speakerDebugLabel = document.createElement('label')
@@ -1464,6 +1468,7 @@ export function setup(ctx: SpindleFrontendContext) {
   let rateLimitWaitSeconds = DEFAULT_RATE_LIMIT_WAIT_SECONDS
   let autoVoiceCasting = true
   let autoPlayback = false
+  const playbackStartup = new PlaybackStartupGuard()
   let ghostVoiceLifetime = GHOST_VOICE_LIFETIME_MESSAGES
   let speakerLookback = DEFAULT_SPEAKER_LOOKBACK
   let ghostLifetimeLoaded = false
@@ -2038,7 +2043,9 @@ export function setup(ctx: SpindleFrontendContext) {
   userDefaultToggle.addEventListener('change', onUserDefaultChange)
 
   function updatePlaybackButtons() {
-    syncPlaybackButtons(hostDocument.querySelectorAll<HTMLButtonElement>('button'), activePlayback?.messageId ?? null, nativeTtsMessageId, nativeButtonStates, STOP_ACTION_ICON)
+    const buttons = hostDocument.querySelectorAll<HTMLButtonElement>('button')
+    syncPlaybackButtons(buttons, activePlayback?.messageId ?? null, nativeTtsMessageId, nativeButtonStates, STOP_ACTION_ICON)
+    syncAutoplayIndicators(buttons, autoPlayback, nativeTtsMessageId)
   }
 
   function restoreNativePlaybackButtons() {
@@ -2723,8 +2730,10 @@ export function setup(ctx: SpindleFrontendContext) {
     })
   }
 
-  async function playMessage(messageId: string, nativeRegenerationAction = false, automatic = false): Promise<void> {
+  async function playMessage(messageId: string, nativeRegenerationAction = false, automatic = false, expectedContent?: string): Promise<void> {
     if (activePlayback?.messageId === messageId) {
+      if (automatic) return
+      playbackStartup.cancel()
       const finishingSave = stopPlayback()
       setStatus(finishingSave ? 'Playback stopped; finishing saved audio…' : 'Playback stopped.')
       return
@@ -2735,18 +2744,26 @@ export function setup(ctx: SpindleFrontendContext) {
       setStatus('Open a chat before starting voice playback.', 'error')
       return
     }
+    const startupToken = playbackStartup.begin(requestedChatId, messageId, automatic)
+    if (startupToken === null) {
+      if (!automatic) setStatus('Playback stopped.')
+      return
+    }
+    const ownsStartup = () => playbackStartup.owns(startupToken) && !autoPlaybackDisposed
+      && ctx.getActiveChat().chatId === requestedChatId && (!automatic || autoPlayback)
+    try {
     let message: PlaybackMessage
     try {
       message = await requestPlaybackMessage(requestedChatId, messageId)
     } catch (error) {
-      setStatus(error instanceof Error ? error.message : 'Could not load this message.', 'error')
+      if (ownsStartup()) setStatus(error instanceof Error ? error.message : 'Could not load this message.', 'error')
       return
     }
-    if (ctx.getActiveChat().chatId !== requestedChatId) return
-    if (automatic && (message.is_user || hasSavedAudioForCurrentSwipe(message))) return
+    if (!ownsStartup()) return
+    if (automatic && (message.is_user || hasAudioForActiveSwipe(message) || (expectedContent !== undefined && message.content.trim() !== expectedContent.trim()))) return
 
     const regeneratingSavedAudio = !message.is_user
-      && (nativeRegenerationAction || hasSavedAudioForCurrentSwipe(message))
+      && (nativeRegenerationAction || (!automatic && hasSavedAudioForCurrentSwipe(message)))
     if (regeneratingSavedAudio) {
       const { confirmed } = await ctx.ui.showConfirm({
         title: 'Regenerate TTS audio?',
@@ -2755,7 +2772,7 @@ export function setup(ctx: SpindleFrontendContext) {
         cancelLabel: 'Keep current',
         variant: 'warning',
       })
-      if (!confirmed || ctx.getActiveChat().chatId !== requestedChatId) return
+      if (!confirmed || !ownsStartup()) return
     }
 
     if (activePlayback) {
@@ -2767,15 +2784,16 @@ export function setup(ctx: SpindleFrontendContext) {
       try {
         await requestLocalState()
       } catch (error) {
-        setStatus(error instanceof Error ? error.message : 'Could not load this chat’s voice settings.', 'error')
+        if (ownsStartup()) setStatus(error instanceof Error ? error.message : 'Could not load this chat’s voice settings.', 'error')
         return
       }
     }
-    if (!activeChat || activeChat.id !== ctx.getActiveChat().chatId) return
+    if (!ownsStartup() || !activeChat || activeChat.id !== ctx.getActiveChat().chatId) return
     const playbackChat = activeChat
     const config = collectConfig()
     const connectionVersionAtLoad = globalConnectionVersion
     const preferences = await loadPlaybackPreferences()
+    if (!ownsStartup()) return
     if (llmSettingsSaveTimer || savingLlmSettings) {
       preferences.speakerParsingMode = speakerParsingMode
       preferences.ttsTagStyle = ttsTagStyle
@@ -2818,7 +2836,7 @@ export function setup(ctx: SpindleFrontendContext) {
     if (preferences.autoVoiceCasting && favoriteVoices.length && (!config.narratorVoice || !config.userVoice || playbackChat.characters.some(character => !config.characterVoices[character.id]))) {
       flushSave()
       const autoResult = await requestAutoCast(playbackChat.id, favoriteVoices, [connectionProfileVoice, config.narratorVoice, config.userVoice, ...Object.values(config.characterVoices)].filter(Boolean), !config.narratorVoice, !config.userVoice)
-      if (ctx.getActiveChat().chatId !== playbackChat.id) return
+      if (!ownsStartup()) return
       const assigned = autoResult.assignments
       autoCastDiagnostics = autoResult.diagnostics
       if (assigned.narrator && !config.narratorVoice) config.narratorVoice = assigned.narrator
@@ -2852,11 +2870,13 @@ export function setup(ctx: SpindleFrontendContext) {
         ])
       } catch (error) {
         void audioContext.close().catch(() => undefined)
-        setStatus(error instanceof Error ? error.message : 'Automatic playback could not start.', 'error')
+        if (ownsStartup()) setStatus(error instanceof Error ? error.message : 'Automatic playback could not start.', 'error')
         return
       } finally { if (timer) clearTimeout(timer) }
-      if (autoPlaybackDisposed || !autoPlayback || ctx.getActiveChat().chatId !== requestedChatId) { void audioContext.close().catch(() => undefined); return }
-    } else await audioContext.resume()
+    } else {
+      try { await audioContext.resume() } catch (error) { void audioContext.close().catch(() => undefined); throw error }
+    }
+    if (!ownsStartup()) { void audioContext.close().catch(() => undefined); return }
     let audibleFinished = false
     let resolveAudibleDone: (() => void) | null = null
     const audibleDone = new Promise<void>((resolve) => {
@@ -2879,7 +2899,10 @@ export function setup(ctx: SpindleFrontendContext) {
         resolveAudibleDone?.()
       },
     }
+    // A different request may have started while this one was awaiting setup.
+    if (activePlayback) stopPlayback()
     activePlayback = playback
+    playbackStartup.finish(startupToken)
     updatePlaybackButtons()
     const playbackSetupFinishedAt = Date.now()
 
@@ -3648,6 +3671,9 @@ export function setup(ctx: SpindleFrontendContext) {
         await playback.context.close().catch(() => undefined)
         updatePlaybackButtons()
       }
+    }
+    } finally {
+      playbackStartup.finish(startupToken)
     }
   }
 
@@ -4504,6 +4530,7 @@ export function setup(ctx: SpindleFrontendContext) {
         autoCastingToggle.checked = autoVoiceCasting
         autoPlayback = preferences.autoPlayback
         autoPlaybackToggle.checked = autoPlayback
+        updatePlaybackButtons()
         speakerAssignmentDebug = preferences.speakerAssignmentDebug
         playbackBufferInput.value = String(playbackBufferSegments)
         concurrentGenerationInput.value = String(concurrentGenerationLimit)
@@ -4647,7 +4674,9 @@ export function setup(ctx: SpindleFrontendContext) {
 
   function onAutoPlaybackChanged(): void {
     autoPlayback = autoPlaybackToggle.checked
+    if (!autoPlayback) playbackStartup.cancelAutomatic()
     autoPlaybackEpoch += 1
+    updatePlaybackButtons()
     scheduleAdvancedSettingsSave()
   }
 
@@ -4758,10 +4787,28 @@ export function setup(ctx: SpindleFrontendContext) {
     }
   }
 
+  const autoplayLongPress = new PlaybackLongPress<HTMLButtonElement>(() => {
+    autoPlaybackToggle.checked = !autoPlayback
+    onAutoPlaybackChanged()
+    setStatus(`Automatic playback ${autoPlayback ? 'enabled' : 'disabled'}.`, 'saved')
+  })
+  const onPlaybackPointerDown = (event: PointerEvent) => {
+    if (!event.isPrimary || event.button !== 0) return
+    const target = event.target as Element | null
+    const button = typeof target?.closest === 'function' ? target.closest<HTMLButtonElement>('button') : null
+    if (!button || !nativeTtsMessageId(button)) return
+    autoplayLongPress.start(button, event.pointerId, event.clientX, event.clientY)
+  }
+  const onPlaybackPointerMove = (event: PointerEvent) => autoplayLongPress.move(event.pointerId, event.clientX, event.clientY)
+  const onPlaybackPointerUp = (event: PointerEvent) => autoplayLongPress.end(event.pointerId)
+  const onPlaybackPointerCancel = () => autoplayLongPress.cancel()
+
   const onNativeContextMenu = (event: MouseEvent) => {
     const target = event.target && typeof (event.target as Element).closest === 'function'
       ? event.target as Element
       : null
+    const button = target?.closest<HTMLButtonElement>('button')
+    if (button && autoplayLongPress.isHolding(button)) { event.preventDefault(); event.stopImmediatePropagation(); return }
     lastContextMessageId = target?.closest<HTMLElement>('[data-message-id]')?.dataset.messageId ?? null
     hostWindow.requestAnimationFrame(updatePlaybackButtons)
     if (lastContextMessageId) void ensureSavedUserContextAction(lastContextMessageId)
@@ -4823,6 +4870,12 @@ export function setup(ctx: SpindleFrontendContext) {
       : null
     const button = target?.closest<HTMLButtonElement>('button')
     if (!button) return
+    if (event.detail !== 0 && autoplayLongPress.consumeClick(button)) {
+      event.preventDefault()
+      event.stopPropagation()
+      event.stopImmediatePropagation()
+      return
+    }
     const messageId = nativeTtsMessageId(button)
     if (!messageId) return
     event.preventDefault()
@@ -4837,6 +4890,11 @@ export function setup(ctx: SpindleFrontendContext) {
 
   hostWindow.addEventListener('contextmenu', onNativeContextMenu, true)
   hostWindow.addEventListener('click', onNativeTtsClick, true)
+  hostWindow.addEventListener('pointerdown', onPlaybackPointerDown, true)
+  hostWindow.addEventListener('pointermove', onPlaybackPointerMove, true)
+  hostWindow.addEventListener('pointerup', onPlaybackPointerUp, true)
+  hostWindow.addEventListener('pointercancel', onPlaybackPointerCancel, true)
+  hostWindow.addEventListener('blur', onPlaybackPointerCancel)
   saveAudioToggle.addEventListener('change', onSaveAudioChanged)
   saveAudioLimitInput.addEventListener('change', onSaveAudioLimitChanged)
   hostWindow.requestAnimationFrame(updatePlaybackButtons)
@@ -5063,7 +5121,7 @@ export function setup(ctx: SpindleFrontendContext) {
   let playbackButtonsFrame: number | null = null
   const savedUserControlObserver = new hostWindow.MutationObserver(() => {
     ensureSavedUserBubbleControls()
-    if (activePlayback && playbackButtonsFrame === null) {
+    if ((activePlayback || autoPlayback) && playbackButtonsFrame === null) {
       playbackButtonsFrame = hostWindow.requestAnimationFrame(() => {
         playbackButtonsFrame = null
         updatePlaybackButtons()
@@ -5076,6 +5134,7 @@ export function setup(ctx: SpindleFrontendContext) {
   const unsubscribeChatSwitched = ctx.events.on('CHAT_SWITCHED', (rawPayload: unknown) => {
     const switchedChatId = (rawPayload as { chatId?: string | null })?.chatId ?? null
     autoPlaybackEpoch += 1
+    playbackStartup.cancel()
     hostWindow.requestAnimationFrame(() => {
       if (ctx.getActiveChat().chatId === switchedChatId) refreshLocalState()
     })
@@ -5094,7 +5153,7 @@ export function setup(ctx: SpindleFrontendContext) {
     autoPlaybackQueue = autoPlaybackQueue.catch(() => undefined).then(async () => {
       while (activePlayback && !autoPlaybackDisposed && autoPlayback && eventEpoch === autoPlaybackEpoch && ctx.getActiveChat().chatId === event.chatId) await activePlayback.audibleDone
       if (autoPlaybackDisposed || !autoPlayback || eventEpoch !== autoPlaybackEpoch || ctx.getActiveChat().chatId !== event.chatId) return
-      await playMessage(event.messageId, false, true)
+      await playMessage(event.messageId, false, true, event.reroll ? event.content : undefined)
     }).catch(error => { if (!autoPlaybackDisposed) setStatus(error instanceof Error ? error.message : 'Automatic playback failed.', 'error') })
   })
 
@@ -5110,6 +5169,7 @@ export function setup(ctx: SpindleFrontendContext) {
 
   return () => {
     autoPlaybackDisposed = true
+    playbackStartup.cancel()
     hostDocument.removeEventListener('pointerdown', closeFavoritePickerOnOutsideClick)
     hostDocument.removeEventListener('keydown', closeFavoritePickerOnEscape)
     stopVoicePreview()
@@ -5221,9 +5281,17 @@ export function setup(ctx: SpindleFrontendContext) {
     saveAudioLimitInput.removeEventListener('change', onSaveAudioLimitChanged)
     hostWindow.removeEventListener('contextmenu', onNativeContextMenu, true)
     hostWindow.removeEventListener('click', onNativeTtsClick, true)
+    hostWindow.removeEventListener('pointerdown', onPlaybackPointerDown, true)
+    hostWindow.removeEventListener('pointermove', onPlaybackPointerMove, true)
+    hostWindow.removeEventListener('pointerup', onPlaybackPointerUp, true)
+    hostWindow.removeEventListener('pointercancel', onPlaybackPointerCancel, true)
+    hostWindow.removeEventListener('blur', onPlaybackPointerCancel)
+    autoplayLongPress.cancel()
     savedUserControlObserver.disconnect()
     if (playbackButtonsFrame !== null) hostWindow.cancelAnimationFrame(playbackButtonsFrame)
     restoreNativePlaybackButtons()
+    syncAutoplayIndicators(hostDocument.querySelectorAll<HTMLButtonElement>('button'), false, nativeTtsMessageId)
+    autoplayIndicatorStyle.remove()
     tab.destroy()
     removeStyle()
   }
