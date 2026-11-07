@@ -22,6 +22,9 @@ import {
   autoplayGenerationEvent,
   autoplaySwipeSnapshot,
   autoplaySwipeMatches,
+  targetSwipeContentMatches,
+  swipeSynthesisKey,
+  savedAudioMatchesSwipe,
   automaticPlaybackSkipReason,
   claimAutoplayGeneration,
   MAX_AUTOPLAY_DELAY_SECONDS,
@@ -324,6 +327,7 @@ interface PlaybackMessage {
   name: string
   content: string
   swipe_id?: number
+  targetSwipeContent?: string | null
   extra?: Record<string, unknown>
 }
 
@@ -914,7 +918,8 @@ async function saveMessageAudio(
   const form = new FormData()
   form.append('chatId', chatId)
   form.append('messageId', messageId)
-  if (typeof swipeId === 'number') form.append('swipeId', String(swipeId))
+  if (!Number.isInteger(swipeId) || (swipeId ?? -1) < 0) throw new Error('Cannot safely save audio: the target swipe ID is unavailable.')
+  form.append('swipeId', String(swipeId))
   segments.forEach((segment, index) => {
     const blob = new Blob([segment.data], { type: segment.mime || 'audio/mpeg' })
     form.append('segment', blob, `seg-${String(index).padStart(4, '0')}`)
@@ -938,13 +943,10 @@ async function saveMessageAudio(
   } catch {
     throw new Error('Lumiverse returned an invalid response after saving generated audio.')
   }
-  const savedAudioId = result.audio?.id
-  const attachments = result.message?.extra?.attachments
-  const attached = Array.isArray(attachments) && attachments.some(attachment => (
-    attachment?.type === 'audio' && attachment.image_id === savedAudioId
-  ))
-  if (result.message?.id !== messageId || !savedAudioId || !attached) {
-    throw new Error('Lumiverse did not confirm the generated audio attachment on the message.')
+  if (typeof swipeId !== 'number' || !savedAudioMatchesSwipe(result, messageId, swipeId)) {
+    const error = new Error('Lumiverse did not confirm the generated audio attachment on the requested swipe.')
+    error.name = 'AudioSaveVerificationError'
+    throw error
   }
   return result
 }
@@ -2080,7 +2082,7 @@ export function setup(ctx: SpindleFrontendContext) {
     nativeButtonStates.clear()
   }
 
-  function requestPlaybackMessage(chatId: string, messageId: string): Promise<PlaybackMessage> {
+  function requestPlaybackMessage(chatId: string, messageId: string, targetSwipeId?: number): Promise<PlaybackMessage> {
     const requestId = `${Date.now().toString(36)}-${++messageRequestSequence}`
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -2088,7 +2090,7 @@ export function setup(ctx: SpindleFrontendContext) {
         reject(new Error('Timed out while loading the message for playback.'))
       }, 15_000)
       pendingMessageRequests.set(requestId, { resolve, reject, timer })
-      ctx.sendToBackend({ type: 'chat_voice_get_message', chatId, messageId, requestId })
+      ctx.sendToBackend({ type: 'chat_voice_get_message', chatId, messageId, requestId, ...(targetSwipeId !== undefined ? { targetSwipeId } : {}) })
     })
   }
 
@@ -2733,7 +2735,7 @@ export function setup(ctx: SpindleFrontendContext) {
       await verifyBeforeSave?.()
       return await saveMessageAudio(chatId, messageId, swipeId, segments, signal)
     } catch (segmentSaveError) {
-      if ((segmentSaveError as { name?: string })?.name === 'AbortError') throw segmentSaveError
+      if (['AbortError', 'AudioSaveVerificationError'].includes((segmentSaveError as { name?: string })?.name ?? '')) throw segmentSaveError
       await waitForSafeFallback()
       if (signal.aborted) throw new DOMException('Audio saving stopped.', 'AbortError')
       onWavAssembly(false)
@@ -3357,12 +3359,12 @@ export function setup(ctx: SpindleFrontendContext) {
         ))
       }
 
-      const synthesisMessageKey = `${playbackChat.id}\u0000${messageId}`
+      const synthesisMessageKey = swipeSynthesisKey(playbackChat.id, messageId, message.swipe_id ?? 0)
       const previousSynthesis = backgroundSynthesisByMessage.get(synthesisMessageKey)
       if (previousSynthesis) {
         previousSynthesis.abort()
         backgroundSynthesisByMessage.delete(synthesisMessageKey)
-        appendSpeakerDebugLog('Cancelled an older unfinished synthesis/save for this message.')
+        appendSpeakerDebugLog('Cancelled an older unfinished synthesis/save for this message swipe.')
       }
       const synthesisController = new AbortController()
       const rateLimitBudget: RateLimitBudget = {
@@ -3585,13 +3587,14 @@ export function setup(ctx: SpindleFrontendContext) {
                   : 'Server could not combine the source audio; retrying as WAV…')
               }
             },
-            automatic ? async () => {
-              const latest = await requestPlaybackMessage(playbackChat.id, messageId)
-              if (synthesisController.signal.aborted || latest.is_user || !autoplaySwipeMatches(latest, autoplaySwipeSnapshot(message))) {
-                appendSpeakerDebugLog(`Automatic audio save cancelled: message ${messageId} changed since playback began.`)
-                throw new DOMException('Message changed before automatic audio save.', 'AbortError')
+            async () => {
+              if (!Number.isInteger(message.swipe_id) || (message.swipe_id ?? -1) < 0) throw new Error('Cannot safely save audio: the target swipe ID is unavailable.')
+              const latest = await requestPlaybackMessage(playbackChat.id, messageId, message.swipe_id)
+              if (synthesisController.signal.aborted || latest.is_user || !targetSwipeContentMatches(latest.targetSwipeContent, autoplaySwipeSnapshot(message))) {
+                appendSpeakerDebugLog(`Audio save cancelled: message ${messageId}, swipe ${message.swipe_id}, was removed or changed since playback began.`)
+                throw new DOMException('Target swipe changed before audio save.', 'AbortError')
               }
-            } : undefined,
+            },
           )
           const savedAudioId = saved.audio?.id
           if (savedAudioId) {

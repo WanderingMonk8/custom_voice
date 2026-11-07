@@ -37,6 +37,10 @@ import {
   autoplayGenerationEvent,
   autoplaySwipeSnapshot,
   autoplaySwipeMatches,
+  readMessageSwipeContent,
+  targetSwipeContentMatches,
+  swipeSynthesisKey,
+  savedAudioMatchesSwipe,
   automaticPlaybackSkipReason,
   claimAutoplayGeneration,
   hasAudioForActiveSwipe,
@@ -3195,6 +3199,27 @@ test('autoplay snapshots the active swipe and detects later navigation or edits'
   assert.equal(autoplaySwipeMatches({ ...message, swipe_id: 5 }, snapshot), false)
   assert.equal(autoplaySwipeMatches({ ...message, content: 'A later reroll in the same slot.' }, snapshot), false)
   assert.equal(autoplaySwipeMatches({ content: 'Original.' }, autoplaySwipeSnapshot({ swipe_id: 0, content: 'Original.' })), true)
+})
+
+test('synthesis and save validation remain scoped to the original swipe after navigation', () => {
+  const initial = { swipe_id: 1, content: 'Second version.' }
+  const snapshot = autoplaySwipeSnapshot(initial)
+  const navigated = { swipe_id: 2, content: 'Third version.', swipes: ['First version.', 'Second version.', 'Third version.'] }
+  assert.equal(autoplaySwipeMatches(navigated, snapshot), false)
+  assert.equal(targetSwipeContentMatches(readMessageSwipeContent(navigated, snapshot.swipeId), snapshot), true)
+  assert.equal(targetSwipeContentMatches(readMessageSwipeContent({ ...navigated, swipes: ['First version.', 'Edited.', 'Third version.'] }, 1), snapshot), false)
+  assert.equal(targetSwipeContentMatches(readMessageSwipeContent({ ...navigated, swipes: ['First version.', 'Third version.'] }, 1), snapshot), false)
+  assert.equal(readMessageSwipeContent({ swipe_id: 2, content: 'Third version.' }, 1), null)
+  assert.notEqual(swipeSynthesisKey('chat', 'message', 1), swipeSynthesisKey('chat', 'message', 2))
+  assert.equal(swipeSynthesisKey('chat', 'message', 1), swipeSynthesisKey('chat', 'message', 1))
+})
+
+test('saved audio confirmation requires the requested swipe and attachment', () => {
+  const result = { message: { id: 'message', extra: { attachments: [{ type: 'audio', image_id: 'older', swipe_id: 1 }, { type: 'audio', image_id: 'new', swipe_id: 2 }] } }, audio: { id: 'new' }, swipe_id: 2 }
+  assert.equal(savedAudioMatchesSwipe(result, 'message', 2), true)
+  assert.equal(savedAudioMatchesSwipe(result, 'message', 1), false)
+  assert.equal(savedAudioMatchesSwipe({ ...result, swipe_id: 1 }, 'message', 2), false)
+  assert.equal(savedAudioMatchesSwipe({ ...result, audio: { id: 'older' } }, 'message', 2), false)
 })
 
 test('saved audio does not prevent automatic playback of a valid reroll', () => {

@@ -209,6 +209,16 @@ function autoplaySwipeMatches(message, expected) {
   const actual = autoplaySwipeSnapshot(message);
   return actual.swipeId === expected.swipeId && actual.contentHash === expected.contentHash;
 }
+function targetSwipeContentMatches(targetSwipeContent, expected) {
+  return typeof targetSwipeContent === "string" && hashMessageContent(targetSwipeContent) === expected.contentHash;
+}
+function swipeSynthesisKey(chatId, messageId, swipeId) {
+  return `${chatId}\0${messageId}\0${swipeId}`;
+}
+function savedAudioMatchesSwipe(result, messageId, swipeId) {
+  const audioId = result.audio?.id;
+  return result.message?.id === messageId && result.swipe_id === swipeId && !!audioId && !!result.message.extra?.attachments?.some((item) => item?.type === "audio" && item.image_id === audioId && item.swipe_id === swipeId);
+}
 function automaticPlaybackSkipReason(message, expected) {
   if (message.is_user) return "user-message";
   if (expected && !autoplaySwipeMatches(message, expected)) return "changed-swipe";
@@ -2295,7 +2305,8 @@ async function saveMessageAudio(chatId, messageId, swipeId, segments, signal) {
   const form = new FormData();
   form.append("chatId", chatId);
   form.append("messageId", messageId);
-  if (typeof swipeId === "number") form.append("swipeId", String(swipeId));
+  if (!Number.isInteger(swipeId) || (swipeId ?? -1) < 0) throw new Error("Cannot safely save audio: the target swipe ID is unavailable.");
+  form.append("swipeId", String(swipeId));
   segments.forEach((segment, index) => {
     const blob = new Blob([segment.data], { type: segment.mime || "audio/mpeg" });
     form.append("segment", blob, `seg-${String(index).padStart(4, "0")}`);
@@ -2321,11 +2332,10 @@ async function saveMessageAudio(chatId, messageId, swipeId, segments, signal) {
   } catch {
     throw new Error("Lumiverse returned an invalid response after saving generated audio.");
   }
-  const savedAudioId = result.audio?.id;
-  const attachments = result.message?.extra?.attachments;
-  const attached = Array.isArray(attachments) && attachments.some((attachment) => attachment?.type === "audio" && attachment.image_id === savedAudioId);
-  if (result.message?.id !== messageId || !savedAudioId || !attached) {
-    throw new Error("Lumiverse did not confirm the generated audio attachment on the message.");
+  if (typeof swipeId !== "number" || !savedAudioMatchesSwipe(result, messageId, swipeId)) {
+    const error = new Error("Lumiverse did not confirm the generated audio attachment on the requested swipe.");
+    error.name = "AudioSaveVerificationError";
+    throw error;
   }
   return result;
 }
@@ -3381,7 +3391,7 @@ function setup(ctx) {
     updatePlaybackButtons();
     nativeButtonStates.clear();
   }
-  function requestPlaybackMessage(chatId, messageId) {
+  function requestPlaybackMessage(chatId, messageId, targetSwipeId) {
     const requestId = `${Date.now().toString(36)}-${++messageRequestSequence}`;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -3389,7 +3399,7 @@ function setup(ctx) {
         reject(new Error("Timed out while loading the message for playback."));
       }, 15e3);
       pendingMessageRequests.set(requestId, { resolve, reject, timer });
-      ctx.sendToBackend({ type: "chat_voice_get_message", chatId, messageId, requestId });
+      ctx.sendToBackend({ type: "chat_voice_get_message", chatId, messageId, requestId, ...targetSwipeId !== void 0 ? { targetSwipeId } : {} });
     });
   }
   function requestSpeakerReviewedSegments(chatId, messageId, preferences) {
@@ -3867,7 +3877,7 @@ function setup(ctx) {
       await verifyBeforeSave?.();
       return await saveMessageAudio(chatId, messageId, swipeId, segments, signal);
     } catch (segmentSaveError) {
-      if (segmentSaveError?.name === "AbortError") throw segmentSaveError;
+      if (["AbortError", "AudioSaveVerificationError"].includes(segmentSaveError?.name ?? "")) throw segmentSaveError;
       await waitForSafeFallback();
       if (signal.aborted) throw new DOMException("Audio saving stopped.", "AbortError");
       onWavAssembly(false);
@@ -4368,12 +4378,12 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
             `  [${index + 1}] voice=${JSON.stringify(segment.voice || "<connection default>")} text=${JSON.stringify(segment.text.length > 120 ? `${segment.text.slice(0, 117)}...` : segment.text)}`
           ));
         }
-        const synthesisMessageKey = `${playbackChat.id}\0${messageId}`;
+        const synthesisMessageKey = swipeSynthesisKey(playbackChat.id, messageId, message.swipe_id ?? 0);
         const previousSynthesis = backgroundSynthesisByMessage.get(synthesisMessageKey);
         if (previousSynthesis) {
           previousSynthesis.abort();
           backgroundSynthesisByMessage.delete(synthesisMessageKey);
-          appendSpeakerDebugLog("Cancelled an older unfinished synthesis/save for this message.");
+          appendSpeakerDebugLog("Cancelled an older unfinished synthesis/save for this message swipe.");
         }
         const synthesisController = new AbortController();
         const rateLimitBudget = {
@@ -4576,13 +4586,14 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
                   setStatus(normalized ? "Preparing normalized saved audio\u2026" : "Server could not combine the source audio; retrying as WAV\u2026");
                 }
               },
-              automatic ? async () => {
-                const latest = await requestPlaybackMessage(playbackChat.id, messageId);
-                if (synthesisController.signal.aborted || latest.is_user || !autoplaySwipeMatches(latest, autoplaySwipeSnapshot(message))) {
-                  appendSpeakerDebugLog(`Automatic audio save cancelled: message ${messageId} changed since playback began.`);
-                  throw new DOMException("Message changed before automatic audio save.", "AbortError");
+              async () => {
+                if (!Number.isInteger(message.swipe_id) || (message.swipe_id ?? -1) < 0) throw new Error("Cannot safely save audio: the target swipe ID is unavailable.");
+                const latest = await requestPlaybackMessage(playbackChat.id, messageId, message.swipe_id);
+                if (synthesisController.signal.aborted || latest.is_user || !targetSwipeContentMatches(latest.targetSwipeContent, autoplaySwipeSnapshot(message))) {
+                  appendSpeakerDebugLog(`Audio save cancelled: message ${messageId}, swipe ${message.swipe_id}, was removed or changed since playback began.`);
+                  throw new DOMException("Target swipe changed before audio save.", "AbortError");
                 }
-              } : void 0
+              }
             );
             const savedAudioId = saved.audio?.id;
             if (savedAudioId) {

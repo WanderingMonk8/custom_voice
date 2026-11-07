@@ -54,6 +54,31 @@ export function autoplaySwipeMatches(message: { swipe_id?: number; content: stri
   return actual.swipeId === expected.swipeId && actual.contentHash === expected.contentHash
 }
 
+/** Validate the original swipe, regardless of which swipe is currently visible. */
+export function targetSwipeContentMatches(targetSwipeContent: unknown, expected: { contentHash: string }): boolean {
+  return typeof targetSwipeContent === 'string' && hashMessageContent(targetSwipeContent) === expected.contentHash
+}
+
+/** Read a specific swipe without accidentally substituting another active swipe. */
+export function readMessageSwipeContent(message: { swipe_id?: number; swipes?: unknown; content?: string }, swipeId: number): string | null {
+  if (!Number.isInteger(swipeId) || swipeId < 0) return null
+  if (Array.isArray(message.swipes) && message.swipes.length > 0) {
+    return typeof message.swipes[swipeId] === 'string' ? message.swipes[swipeId] : null
+  }
+  return (message.swipe_id ?? 0) === swipeId && typeof message.content === 'string' ? message.content : null
+}
+
+export function swipeSynthesisKey(chatId: string, messageId: string, swipeId: number): string {
+  return `${chatId}\u0000${messageId}\u0000${swipeId}`
+}
+
+/** A save is confirmed only when the host attaches that audio to the target swipe. */
+export function savedAudioMatchesSwipe(result: { message?: { id?: string; extra?: { attachments?: Array<{ type?: string; image_id?: string; swipe_id?: number }> } }; audio?: { id?: string }; swipe_id?: number }, messageId: string, swipeId: number): boolean {
+  const audioId = result.audio?.id
+  return result.message?.id === messageId && result.swipe_id === swipeId && !!audioId
+    && !!result.message.extra?.attachments?.some(item => item?.type === 'audio' && item.image_id === audioId && item.swipe_id === swipeId)
+}
+
 /** Existing audio does not block autoplay; saving is governed separately. */
 export function automaticPlaybackSkipReason(message: { is_user: boolean; swipe_id?: number; content: string }, expected?: { swipeId: number; contentHash: string }): 'user-message' | 'changed-swipe' | null {
   if (message.is_user) return 'user-message'

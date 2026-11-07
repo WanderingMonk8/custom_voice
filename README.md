@@ -29,7 +29,7 @@ A [Lumiverse Spindle](https://docs.lumiverse.chat/) extension that detects chara
 - Uses the extension's global TTS connection, initially falling back to Lumiverse's selected connection or the profile marked as default. Legacy per-chat connection selections no longer override it.
 - Provides a global, opt-in **Save generated audio** setting. It is disabled by default to avoid consuming storage, and retains at most 50 extension recordings by default (user configurable).
 - When enabled, saves the exact synthesized custom-voice segments as a native Lumiverse audio attachment for the active message swipe, with a browser-generated WAV fallback when the server cannot mux their source formats.
-- With saving enabled, automatic playback replaces an existing recording for the same swipe. It checks that the active swipe and its text still match before saving.
+- With saving enabled, playback replaces an existing recording only for the same swipe. The original swipe's text is checked before saving, even if another swipe is now active; separate swipes retain separate recordings, subject to the global recording limit.
 - When saving is enabled, continues bounded background synthesis and saves the complete recording even when audible playback is stopped early.
 - Removes HTML/escaped tags and Markdown emphasis markers before sending readable text to TTS.
 - Provides a global, autosaved list of tracker tag names or full asymmetric tag pairs whose tags and enclosed contents are removed before playback generation.
