@@ -2202,6 +2202,50 @@ test('reviews uncast turns separately when a long narrative may introduce someon
   assert.deepEqual(groups.map(group => group.segmentIndexes), [[0], [2]])
 })
 
+test('separates named-action dialogue and adjacent replies before resolving Dennis continuity', () => {
+  const segments = [
+    { speakerId: UNCAST_SPEAKER_ID, text: 'Next two, get your orders ready.' },
+    { speakerId: null, text: 'She calls without breaking eye contact.' },
+    { speakerId: UNCAST_SPEAKER_ID, text: "I can take his order for him." },
+    { speakerId: null, text: 'Dennis huffs through his nose at the register, still not turning round.' },
+    { speakerId: UNCAST_SPEAKER_ID, text: "You're going to hell, Lisa." },
+    { speakerId: UNCAST_SPEAKER_ID, text: "I'm going to my break at two." },
+    { speakerId: null, text: 'She fires back. The tongs click.' },
+    { speakerId: UNCAST_SPEAKER_ID, text: 'Which is more than some of us get.' },
+  ]
+  const groups = collectUncastVoiceGroups(segments)
+  assert.deepEqual(groups.map(group => group.segmentIndexes), [[0, 2], [4], [5, 7]])
+  const message = `Lisa calls out. Dennis huffs through his nose at the register. "You're going to hell, Lisa." "I'm going to my break at two," she fires back.`
+  const voices = readFavoriteVoices([{ id: 'lisa-voice', category: 'female' }, { id: 'dennis-voice', category: 'male' }])
+  const plan = buildUncastVoiceDecision(groups, voices, message)
+  const dennis = plan.state.narrativeNames.findIndex(name => name.toLowerCase() === 'dennis')
+  const lisa = plan.state.narrativeNames.findIndex(name => name.toLowerCase() === 'lisa')
+  assert.ok(dennis >= 0 && lisa >= 0)
+  const answers: Record<string, SpeakerDecisionChoice> = {
+    narrative_name_g0: confidentDecision(`name_${lisa}`), narrative_name_g1: confidentDecision(`name_${dennis}`), narrative_name_g2: confidentDecision(`name_${lisa}`),
+    same_g1_g0: confidentDecision('different_or_unclear'), same_g2_g0: confidentDecision('same'), same_g2_g1: confidentDecision('different_or_unclear'),
+    gender_g0: confidentDecision('female'), gender_g1: confidentDecision('male'), gender_g2: confidentDecision('female'),
+    voice_g0: confidentDecision('voice_0'), voice_g1: confidentDecision('voice_1'), voice_g2: confidentDecision('voice_0'),
+  }
+  const assigned = resolveUncastVoiceDecisions(groups, voices, answers, [], [], 'first', message)
+  assert.deepEqual(groups.map(group => assigned.find(item => item.groupId === group.id)?.voiceId), ['lisa-voice', 'dennis-voice', 'lisa-voice'])
+  assert.ok(assigned.find(item => item.groupId === 'g1')?.aliases?.includes('dennis'))
+  const ghost = { id: 'dennis', speakerId: UNCAST_SPEAKER_ID, voiceId: 'dennis-voice', label: 'dennis', aliases: ['dennis'], context: 'Dennis huffs at the register.', occurrenceKeys: [], lastSeenMessageId: 'first' }
+  const later = 'Lisa calls to Dennis. "You are what?" The steamer goes off. Dennis slaps the counter. "LISA. Machine!"'
+  const nextGroups = collectUncastVoiceGroups([
+    { speakerId: UNCAST_SPEAKER_ID, text: 'You are what?' },
+    { speakerId: null, text: 'The steamer goes off. Dennis slaps the counter.' },
+    { speakerId: UNCAST_SPEAKER_ID, text: 'LISA. Machine!' },
+  ])
+  const nextPlan = buildUncastVoiceDecision(nextGroups, [], later, [ghost])
+  const nextDennis = nextPlan.state.narrativeNames.findIndex(name => name.toLowerCase() === 'dennis')
+  assert.ok(nextDennis >= 0)
+  const next = resolveUncastVoiceDecisions(nextGroups, [], { narrative_name_g0: confidentDecision(`name_${nextDennis}`), narrative_name_g1: confidentDecision(`name_${nextDennis}`) }, [ghost], [], 'next', later, ['first'])
+  assert.deepEqual(next.map(item => item.voiceId), ['dennis-voice', 'dennis-voice'])
+  const conflict = resolveUncastVoiceDecisions(groups, voices, { ...answers, same_g1_g0: confidentDecision('same') }, [], [], 'first', message)
+  assert.notEqual(conflict.find(item => item.groupId === 'g0')?.ghostId, conflict.find(item => item.groupId === 'g1')?.ghostId)
+})
+
 test('automatic casting respects reserved voices, gender, and no match', () => {
   const voices = readFavoriteVoices([{ id: 'used', category: 'male' }, { id: 'female', category: 'female' }, { id: 'male', category: 'male' }])
   const answer = { choice: 'voice_0', confidence: 0.9, probabilities: { voice_0: 0.8, voice_1: 0.15, voice_2: 0.05, no_match: 0 } }

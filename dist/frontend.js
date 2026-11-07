@@ -186,6 +186,8 @@ function collectUncastVoiceGroups(segments) {
     }
     if (id !== UNCAST_SPEAKER_ID) anonymous = null;
     if (id === UNCAST_SPEAKER_ID && segments[index - 1]?.speakerId === null && segments[index - 1].text.length > 240) anonymous = null;
+    if (id === UNCAST_SPEAKER_ID && segments[index - 1]?.speakerId === null && uncastNarrativeNameCandidates(segments[index - 1].text).length) anonymous = null;
+    if (id === UNCAST_SPEAKER_ID && segments[index - 1]?.speakerId === UNCAST_SPEAKER_ID && segments[index - 2]?.speakerId === null && uncastNarrativeNameCandidates(segments[index - 2].text).length) anonymous = null;
     let group = id === UNCAST_SPEAKER_ID ? anonymous : named.get(id);
     if (!group) {
       group = { id: `g${groups.length}`, speakerId: id, segmentIndexes: [], speeches: [], context: [] };
@@ -209,6 +211,25 @@ function collectUncastVoiceGroups(segments) {
 function availableUncastVoices(favorites, used) {
   const reserved = new Set(used.map((voice) => voice.trim()).filter(Boolean));
   return favorites.filter((voice) => !reserved.has(voice.id));
+}
+function uncastNarrativeNameCandidates(message) {
+  const names = /* @__PURE__ */ new Map();
+  const narrative = narrativeOnly(message);
+  const pattern = /\b([\p{Lu}][\p{Ll}\p{M}'’-]{1,39})\s+(?:is|was|has|had|stands|stood|sits|sat|turns|turned|looks|looked|says|said|asks|asked|answers|answered|replies|replied)\b/gu;
+  for (const match of narrative.matchAll(pattern)) {
+    const name = normalizeSpeakerName(match[1]);
+    if (!name || NON_NAME_PARAGRAPH_LEADS.has(name.toLowerCase())) continue;
+    names.set(name.toLowerCase(), name);
+    if (names.size >= 20) break;
+  }
+  const actions = /\b([\p{Lu}][\p{Ll}\p{M}'’-]{1,39})\s+(?:huffs|huffed|slaps|slapped|calls|called|shouts|shouted|speaks|spoke|mutters|muttered|laughs|laughed|glances|glanced|walks|walked|moves|moved|steps|stepped|nods|nodded)\b/gu;
+  for (const match of narrative.matchAll(actions)) {
+    const name = normalizeSpeakerName(match[1]);
+    if (!name || NON_NAME_PARAGRAPH_LEADS.has(name.toLowerCase())) continue;
+    names.set(name.toLowerCase(), name);
+    if (names.size >= 20) break;
+  }
+  return [...names.values()];
 }
 function speakersForMessageRole(speakers, _isUserMessage, userName = "User") {
   const nonUserSpeakers = speakers.filter((speaker) => speaker.id !== USER_SPEAKER_ID);

@@ -216,6 +216,10 @@ export function collectUncastVoiceGroups(segments: PlaybackSegment[]): UncastVoi
     // A substantial intervening narrative can introduce a different uncast
     // speaker even without an intervening cast quotation. Review each side.
     if (id === UNCAST_SPEAKER_ID && segments[index - 1]?.speakerId === null && segments[index - 1].text.length > 240) anonymous = null
+    // Named actions and adjacent replies can signal a change of speaker.
+    // Split for review; the action alone does not identify the quotation.
+    if (id === UNCAST_SPEAKER_ID && segments[index - 1]?.speakerId === null && uncastNarrativeNameCandidates(segments[index - 1].text).length) anonymous = null
+    if (id === UNCAST_SPEAKER_ID && segments[index - 1]?.speakerId === UNCAST_SPEAKER_ID && segments[index - 2]?.speakerId === null && uncastNarrativeNameCandidates(segments[index - 2].text).length) anonymous = null
     let group: UncastVoiceGroup | null | undefined = id === UNCAST_SPEAKER_ID ? anonymous : named.get(id)
     if (!group) {
       group = { id: `g${groups.length}`, speakerId: id, segmentIndexes: [], speeches: [], context: [] }
@@ -276,6 +280,15 @@ export function uncastNarrativeNameCandidates(message: string): string[] {
   const narrative = narrativeOnly(message)
   const pattern = /\b([\p{Lu}][\p{Ll}\p{M}'’-]{1,39})\s+(?:is|was|has|had|stands|stood|sits|sat|turns|turned|looks|looked|says|said|asks|asked|answers|answered|replies|replied)\b/gu
   for (const match of narrative.matchAll(pattern)) {
+    const name = normalizeSpeakerName(match[1])
+    if (!name || NON_NAME_PARAGRAPH_LEADS.has(name.toLowerCase())) continue
+    names.set(name.toLowerCase(), name)
+    if (names.size >= 20) break
+  }
+  // Action subjects are candidates, not automatic attributions: the named
+  // actor can instead be an addressee, observer, or unrelated bystander.
+  const actions = /\b([\p{Lu}][\p{Ll}\p{M}'’-]{1,39})\s+(?:huffs|huffed|slaps|slapped|calls|called|shouts|shouted|speaks|spoke|mutters|muttered|laughs|laughed|glances|glanced|walks|walked|moves|moved|steps|stepped|nods|nodded)\b/gu
+  for (const match of narrative.matchAll(actions)) {
     const name = normalizeSpeakerName(match[1])
     if (!name || NON_NAME_PARAGRAPH_LEADS.has(name.toLowerCase())) continue
     names.set(name.toLowerCase(), name)
@@ -492,6 +505,7 @@ export function resolveUncastVoiceDecisions(
   const labels = uncastIdentityLabels(message, ghosts)
   const groupLabels = new Map<string, string>()
   const rootByLabel = new Map<string, string>()
+  const rootByRevealedName = new Map<string, string>()
   const strongChoice = (answer: SpeakerDecisionChoice | undefined): boolean => {
     if (!answer || answer.choice === 'new_or_unclear') return false
     if (!Number.isFinite(answer.confidence) || answer.confidence < 0 || answer.confidence > 1 || !answer.probabilities || Object.values(answer.probabilities).some(value => !Number.isFinite(value) || value < 0 || value > 1)) return false
@@ -533,6 +547,8 @@ export function resolveUncastVoiceDecisions(
     if (label) groupLabels.set(group.id, label)
     const previousGroups = groups.slice(0, groups.indexOf(group)).slice(-8)
     const same = previousGroups.flatMap(previous => {
+      const previousName = revealedUncastName(previous, answers, message).toLowerCase()
+      if (name && previousName && name !== previousName) return []
       const review = answers[`review_same_${group.id}_${previous.id}`]
       const answer = review && strongChoice(review) ? review : answers[`same_${group.id}_${previous.id}`]
       return answer?.choice === 'same' && strongChoice(answer) ? [{ previous, probability: answer.probabilities.same ?? 0 }] : []
@@ -540,6 +556,12 @@ export function resolveUncastVoiceDecisions(
     if (same[0]) root = roots.get(same[0].previous.id) ?? root
     else if (label && !isBroadPersonLabel(label) && rootByLabel.has(label)) root = rootByLabel.get(label)!
     else if (strongChoice(identity) && identity?.choice.startsWith('group_')) root = roots.get(identity.choice.slice(6)) ?? root
+    else if (name && rootByRevealedName.has(name)) {
+      const namedRoot = rootByRevealedName.get(name)!
+      const contradicts = previousGroups.some(previous => roots.get(previous.id) === namedRoot && answers[`same_${group.id}_${previous.id}`]?.choice === 'different_or_unclear' && strongChoice(answers[`same_${group.id}_${previous.id}`]))
+      if (!contradicts) root = namedRoot
+    }
+    if (name && previousGroups.some(previous => roots.get(previous.id) === root && revealedUncastName(previous, answers, message) && revealedUncastName(previous, answers, message).toLowerCase() !== name)) root = group.id
     const namedGhosts = label && !isBroadPersonLabel(label) ? ghosts.filter(item => (!confirmedNew || item.id !== occurrence?.id) && ghostCastAliases(item).some(alias => alias.toLowerCase() === label)) : []
     const rankedGhosts = namedGhosts.map(item => ({ item, recent: Math.max(
       previousMessageIds.indexOf(item.lastSeenMessageId),
@@ -602,6 +624,7 @@ export function resolveUncastVoiceDecisions(
       if (sameLabel.length === 1) { ghost = sameLabel[0]; reason = 'repeated unnamed label' }
     }
     roots.set(group.id, root)
+    if (name && !rootByRevealedName.has(name)) rootByRevealedName.set(name, root)
     if (contradictedRoots.has(root)) continue
     if (confirmedNew && linkedGhosts.get(root)?.id === occurrence?.id) {
       confirmedNewRoots.delete(root)
