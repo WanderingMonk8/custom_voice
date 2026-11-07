@@ -18,14 +18,14 @@ export function autoplayGenerationEvent(value: unknown, activeChatId: string | n
   if (['continue', 'impersonate'].includes(kind)) return null
   const reroll = kind === 'regenerate' || kind === 'swipe'
   return { chatId: activeChatId, messageId: event.messageId, generationId: event.generationId,
-    ...(reroll ? { reroll: true, ...(typeof event.content === 'string' ? { content: event.content } : {}) } : {}) }
+    ...(reroll ? { reroll: true } : {}), ...(typeof event.content === 'string' ? { content: event.content } : {}) }
 }
 
 /** Deduplicate reconnect/repeated notifications while bounding in-memory state. */
 export function claimAutoplayGeneration(event: AutoplayGeneration, generations: Set<string>, messages: Set<string>): boolean {
   const generationKey = `${event.chatId}\u0000${event.generationId}`
   const messageKey = `${event.chatId}\u0000${event.messageId}`
-  if (generations.has(generationKey) || (!event.reroll && messages.has(messageKey))) return false
+  if (generations.has(generationKey)) return false
   generations.add(generationKey)
   messages.add(messageKey)
   if (generations.size > 512) generations.delete(generations.values().next().value!)
@@ -43,6 +43,15 @@ export function hasAudioForActiveSwipe(message: { swipe_id?: number; extra?: Rec
     const attachment = candidate as { type?: unknown; swipe_id?: unknown }
     return attachment.type === 'audio' && (attachment.swipe_id ?? 0) === swipe
   })
+}
+
+export function autoplaySwipeSnapshot(message: { swipe_id?: number; content: string }): { swipeId: number; contentHash: string } {
+  return { swipeId: message.swipe_id ?? 0, contentHash: hashMessageContent(message.content) }
+}
+
+export function autoplaySwipeMatches(message: { swipe_id?: number; content: string }, expected: { swipeId: number; contentHash: string }): boolean {
+  const actual = autoplaySwipeSnapshot(message)
+  return actual.swipeId === expected.swipeId && actual.contentHash === expected.contentHash
 }
 
 /** Preserve explicit casting opt-outs; automatic playback requires an opt-in. */

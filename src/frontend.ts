@@ -20,6 +20,8 @@ import {
   globalTtsConnectionPreference,
   standardSpeakerReviewPolicy,
   autoplayGenerationEvent,
+  autoplaySwipeSnapshot,
+  autoplaySwipeMatches,
   claimAutoplayGeneration,
   MAX_AUTOPLAY_DELAY_SECONDS,
   readAutoplayDelaySeconds,
@@ -2754,7 +2756,7 @@ export function setup(ctx: SpindleFrontendContext) {
     })
   }
 
-  async function playMessage(messageId: string, nativeRegenerationAction = false, automatic = false, expectedContent?: string): Promise<void> {
+  async function playMessage(messageId: string, nativeRegenerationAction = false, automatic = false, expectedSwipe?: { swipeId: number; contentHash: string }): Promise<void> {
     if (activePlayback?.messageId === messageId) {
       if (automatic) return
       playbackStartup.cancel()
@@ -2784,7 +2786,12 @@ export function setup(ctx: SpindleFrontendContext) {
       return
     }
     if (!ownsStartup()) return
-    if (automatic && (message.is_user || hasAudioForActiveSwipe(message) || (expectedContent !== undefined && message.content.trim() !== expectedContent.trim()))) return
+    if (automatic && message.is_user) { appendSpeakerDebugLog(`Autoplay skipped: message ${messageId} belongs to the user.`); return }
+    if (automatic && hasAudioForActiveSwipe(message)) { appendSpeakerDebugLog(`Autoplay skipped: message ${messageId}, swipe ${message.swipe_id ?? 0}, already has saved audio.`); return }
+    if (automatic && expectedSwipe && !autoplaySwipeMatches(message, expectedSwipe)) {
+      appendSpeakerDebugLog(`Autoplay skipped: message ${messageId} changed swipe or content after generation (expected swipe ${expectedSwipe.swipeId}, active swipe ${message.swipe_id ?? 0}).`)
+      return
+    }
 
     const regeneratingSavedAudio = !message.is_user
       && (nativeRegenerationAction || (!automatic && hasSavedAudioForCurrentSwipe(message)))
@@ -5180,22 +5187,34 @@ export function setup(ctx: SpindleFrontendContext) {
 
   const unsubscribeGenerationEnded = ctx.events.on('GENERATION_ENDED', (payload: unknown) => {
     const event = autoplayGenerationEvent(payload, ctx.getActiveChat().chatId)
-    if (!event || autoPlaybackDisposed) return
-    if (!claimAutoplayGeneration(event, autoPlaybackSeenGenerations, autoPlaybackSeenMessages)) return
-    if (!autoPlayback) return
+    if (!event || autoPlaybackDisposed) { appendSpeakerDebugLog('Autoplay ignored: generation was ineligible, failed, background, or not in the active chat.'); return }
+    const messageKey = `${event.chatId}\u0000${event.messageId}`
+    const isReroll = !!event.reroll || autoPlaybackSeenMessages.has(messageKey) || activePlayback?.messageId === event.messageId
+    if (!claimAutoplayGeneration(event, autoPlaybackSeenGenerations, autoPlaybackSeenMessages)) { appendSpeakerDebugLog(`Autoplay ignored duplicate generation ${event.generationId}.`); return }
+    if (!autoPlayback) { appendSpeakerDebugLog(`Autoplay ignored generation ${event.generationId}: autoplay is disabled.`); return }
+    appendSpeakerDebugLog(`Autoplay queued: generation ${event.generationId}, message ${event.messageId}, reroll=${isReroll}, delay=${autoPlaybackDelaySeconds}s.`)
     const requestKey = `${event.chatId}\u0000${event.messageId}`
     const requestSignal = autoPlaybackRequests.begin(requestKey)
-    if (event.reroll) {
+    if (isReroll) {
       playbackStartup.cancelAutomaticFor(event.chatId, event.messageId)
       if (activePlayback?.messageId === event.messageId) stopPlayback()
     }
+    // The generation event does not carry a swipe ID. Capture the saved
+    // message immediately, before the delay or another playback can queue it.
+    const snapshot = requestPlaybackMessage(event.chatId, event.messageId).then(autoplaySwipeSnapshot).catch(error => {
+      if (!requestSignal.aborted) appendSpeakerDebugLog(`Autoplay skipped: could not snapshot message ${event.messageId}: ${error instanceof Error ? error.message : String(error)}`)
+      return null
+    })
     const eventEpoch = autoPlaybackEpoch
     const deadline = Date.now() + autoPlaybackDelaySeconds * 1_000
     autoPlaybackQueue = autoPlaybackQueue.catch(() => undefined).then(async () => {
-      if (!await waitForAutoplayDeadline(deadline, requestSignal)) return
+      let expectedSwipe: { swipeId: number; contentHash: string } | null = null
+      await waitForAutoplayWork(snapshot.then(value => { expectedSwipe = value }), requestSignal)
+      if (!expectedSwipe || requestSignal.aborted) return
+      if (!await waitForAutoplayDeadline(deadline, requestSignal)) { appendSpeakerDebugLog(`Autoplay cancelled: generation ${event.generationId} was superseded or disabled.`); return }
       while (activePlayback && !requestSignal.aborted && !autoPlaybackDisposed && autoPlayback && eventEpoch === autoPlaybackEpoch && ctx.getActiveChat().chatId === event.chatId) await waitForAutoplayWork(activePlayback.audibleDone, requestSignal)
       if (requestSignal.aborted || autoPlaybackDisposed || !autoPlayback || eventEpoch !== autoPlaybackEpoch || ctx.getActiveChat().chatId !== event.chatId) return
-      await waitForAutoplayWork(playMessage(event.messageId, false, true, event.reroll ? event.content : undefined), requestSignal)
+      await waitForAutoplayWork(playMessage(event.messageId, false, true, expectedSwipe), requestSignal)
     }).catch(error => { if (!autoPlaybackDisposed && !requestSignal.aborted) setStatus(error instanceof Error ? error.message : 'Automatic playback failed.', 'error') })
       .finally(() => autoPlaybackRequests.finish(requestKey, requestSignal))
   })
