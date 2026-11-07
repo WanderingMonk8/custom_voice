@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { syncPlaybackButtons, type PlaybackButtonState } from './playback-ui'
+import { PlaybackLongPress, syncAutoplayIndicators, syncPlaybackButtons, type PlaybackButtonState } from './playback-ui'
 import { evaluateSpeakerReviews } from './speaker-review-evaluation'
 import {
   adaptiveGenerationConcurrency,
@@ -3162,6 +3162,44 @@ test('playback controls follow shared playback state, including menus rendered l
   assert.equal(bubble.getAttribute('aria-pressed'), null)
   assert.equal(menu.innerHTML, '<svg></svg><span>Play audio</span>')
   assert.equal(states.size, 0)
+})
+
+test('autoplay indicators follow the shared preference on each native control', () => {
+  const button = { dataset: {}, messageId: 'message' } as unknown as HTMLButtonElement
+  const unrelated = { dataset: {}, messageId: null } as unknown as HTMLButtonElement
+  const getId = (item: HTMLButtonElement) => (item as unknown as { messageId: string | null }).messageId
+  syncAutoplayIndicators([button, unrelated], true, getId)
+  assert.equal(button.dataset.chatVoiceAutoplay, 'true')
+  assert.equal(unrelated.dataset.chatVoiceAutoplay, undefined)
+  syncAutoplayIndicators([button, unrelated], false, getId)
+  assert.equal(button.dataset.chatVoiceAutoplay, undefined)
+})
+
+test('long press toggles once and suppresses its click, but taps and drags do not', async () => {
+  let toggles = 0
+  const button = {}
+  const gesture = new PlaybackLongPress<object>(() => { toggles++ }, 10)
+  gesture.start(button, 1, 0, 0)
+  gesture.end(1)
+  await new Promise(resolve => setTimeout(resolve, 20))
+  assert.equal(toggles, 0)
+  assert.equal(gesture.consumeClick(button), false)
+  gesture.start(button, 2, 0, 0)
+  gesture.move(2, 20, 0)
+  await new Promise(resolve => setTimeout(resolve, 20))
+  assert.equal(toggles, 0)
+  gesture.start(button, 3, 0, 0)
+  await new Promise(resolve => setTimeout(resolve, 20))
+  assert.equal(toggles, 1)
+  gesture.end(3)
+  assert.equal(gesture.consumeClick({}), false)
+  assert.equal(gesture.consumeClick(button), true)
+  assert.equal(gesture.consumeClick(button), false)
+  gesture.start(button, 4, 0, 0)
+  await new Promise(resolve => setTimeout(resolve, 20))
+  gesture.end(4)
+  assert.equal(toggles, 2)
+  gesture.cancel()
 })
 
 test('automatic casting defaults on and autoplay requires explicit opt-in', () => {

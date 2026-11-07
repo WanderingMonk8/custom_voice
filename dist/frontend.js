@@ -1,4 +1,60 @@
 // src/playback-ui.ts
+var PlaybackLongPress = class {
+  constructor(toggle, delay = 650) {
+    this.toggle = toggle;
+    this.delay = delay;
+  }
+  active = null;
+  suppressed = null;
+  expiry = null;
+  start(target, pointerId, x, y) {
+    this.cancel();
+    this.suppressed = null;
+    const active = { target, pointerId, x, y, fired: false, timer: setTimeout(() => {
+      if (this.active !== active) return;
+      active.fired = true;
+      this.suppressed = target;
+      this.toggle();
+    }, this.delay) };
+    this.active = active;
+  }
+  move(pointerId, x, y) {
+    if (this.active?.pointerId === pointerId && !this.active.fired && Math.hypot(x - this.active.x, y - this.active.y) > 10) this.cancel();
+  }
+  end(pointerId) {
+    if (this.active?.pointerId !== pointerId) return;
+    const fired = this.active.fired;
+    clearTimeout(this.active.timer);
+    this.active = null;
+    if (fired) this.expiry = setTimeout(() => {
+      this.suppressed = null;
+      this.expiry = null;
+    }, 1e3);
+  }
+  consumeClick(target) {
+    if (this.suppressed !== target) return false;
+    this.suppressed = null;
+    if (this.expiry) clearTimeout(this.expiry);
+    this.expiry = null;
+    return true;
+  }
+  isHolding(target) {
+    return this.active?.target === target;
+  }
+  cancel() {
+    if (this.active) clearTimeout(this.active.timer);
+    if (this.expiry) clearTimeout(this.expiry);
+    this.active = null;
+    this.expiry = null;
+    this.suppressed = null;
+  }
+};
+function syncAutoplayIndicators(buttons, enabled, getMessageId) {
+  for (const button of buttons) {
+    if (enabled && getMessageId(button)) button.dataset.chatVoiceAutoplay = "true";
+    else delete button.dataset.chatVoiceAutoplay;
+  }
+}
 function syncPlaybackButtons(buttons, activeMessageId, getMessageId, states, stopIcon) {
   for (const button of buttons) {
     const messageId = getMessageId(button);
@@ -2308,6 +2364,9 @@ function setup(ctx) {
   });
   const hostDocument = tab.root.ownerDocument;
   const hostWindow = hostDocument.defaultView ?? window;
+  const autoplayIndicatorStyle = hostDocument.createElement("style");
+  autoplayIndicatorStyle.textContent = `button[data-chat-voice-autoplay="true"] { color: #a89bff !important; background-color: rgba(122, 104, 244, .2) !important; box-shadow: inset 0 0 0 1px rgba(168, 155, 255, .8), 0 0 8px rgba(122, 104, 244, .35) !important; border-radius: 6px; }`;
+  hostDocument.head.appendChild(autoplayIndicatorStyle);
   const panel = document.createElement("div");
   panel.className = "chat-voice-panel";
   const context = document.createElement("div");
@@ -2532,7 +2591,7 @@ function setup(ctx) {
   autoPlaybackText.textContent = "Automatically play new messages";
   const autoPlaybackHint = document.createElement("span");
   autoPlaybackHint.className = "chat-voice-toggle-hint";
-  autoPlaybackHint.textContent = "Play new assistant messages as they arrive. Your browser may require a click before audio can start.";
+  autoPlaybackHint.textContent = "Play new assistant messages as they arrive. You can also hold a message play button to toggle this. Your browser may require a click before audio can start.";
   autoPlaybackCopy.append(autoPlaybackText, autoPlaybackHint);
   autoPlaybackLabel.append(autoPlaybackToggle, autoPlaybackCopy);
   const speakerDebugLabel = document.createElement("label");
@@ -3169,7 +3228,9 @@ function setup(ctx) {
   narratorDefaultToggle.addEventListener("change", onNarratorDefaultChange);
   userDefaultToggle.addEventListener("change", onUserDefaultChange);
   function updatePlaybackButtons() {
-    syncPlaybackButtons(hostDocument.querySelectorAll("button"), activePlayback?.messageId ?? null, nativeTtsMessageId, nativeButtonStates, STOP_ACTION_ICON);
+    const buttons = hostDocument.querySelectorAll("button");
+    syncPlaybackButtons(buttons, activePlayback?.messageId ?? null, nativeTtsMessageId, nativeButtonStates, STOP_ACTION_ICON);
+    syncAutoplayIndicators(buttons, autoPlayback, nativeTtsMessageId);
   }
   function restoreNativePlaybackButtons() {
     activePlayback = null;
@@ -5316,6 +5377,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
         autoCastingToggle.checked = autoVoiceCasting;
         autoPlayback = preferences.autoPlayback;
         autoPlaybackToggle.checked = autoPlayback;
+        updatePlaybackButtons();
         speakerAssignmentDebug = preferences.speakerAssignmentDebug;
         playbackBufferInput.value = String(playbackBufferSegments);
         concurrentGenerationInput.value = String(concurrentGenerationLimit);
@@ -5445,6 +5507,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
   function onAutoPlaybackChanged() {
     autoPlayback = autoPlaybackToggle.checked;
     autoPlaybackEpoch += 1;
+    updatePlaybackButtons();
     scheduleAdvancedSettingsSave();
   }
   async function persistAdvancedSettings() {
@@ -5547,8 +5610,29 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
       savingSkippedTrackerTags = false;
     }
   }
+  const autoplayLongPress = new PlaybackLongPress(() => {
+    autoPlaybackToggle.checked = !autoPlayback;
+    onAutoPlaybackChanged();
+    setStatus(`Automatic playback ${autoPlayback ? "enabled" : "disabled"}.`, "saved");
+  });
+  const onPlaybackPointerDown = (event) => {
+    if (!event.isPrimary || event.button !== 0) return;
+    const target = event.target;
+    const button = typeof target?.closest === "function" ? target.closest("button") : null;
+    if (!button || !nativeTtsMessageId(button)) return;
+    autoplayLongPress.start(button, event.pointerId, event.clientX, event.clientY);
+  };
+  const onPlaybackPointerMove = (event) => autoplayLongPress.move(event.pointerId, event.clientX, event.clientY);
+  const onPlaybackPointerUp = (event) => autoplayLongPress.end(event.pointerId);
+  const onPlaybackPointerCancel = () => autoplayLongPress.cancel();
   const onNativeContextMenu = (event) => {
     const target = event.target && typeof event.target.closest === "function" ? event.target : null;
+    const button = target?.closest("button");
+    if (button && autoplayLongPress.isHolding(button)) {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      return;
+    }
     lastContextMessageId = target?.closest("[data-message-id]")?.dataset.messageId ?? null;
     hostWindow.requestAnimationFrame(updatePlaybackButtons);
     if (lastContextMessageId) void ensureSavedUserContextAction(lastContextMessageId);
@@ -5600,6 +5684,12 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
     const target = event.target && typeof event.target.closest === "function" ? event.target : null;
     const button = target?.closest("button");
     if (!button) return;
+    if (event.detail !== 0 && autoplayLongPress.consumeClick(button)) {
+      event.preventDefault();
+      event.stopPropagation();
+      event.stopImmediatePropagation();
+      return;
+    }
     const messageId = nativeTtsMessageId(button);
     if (!messageId) return;
     event.preventDefault();
@@ -5613,6 +5703,11 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
   };
   hostWindow.addEventListener("contextmenu", onNativeContextMenu, true);
   hostWindow.addEventListener("click", onNativeTtsClick, true);
+  hostWindow.addEventListener("pointerdown", onPlaybackPointerDown, true);
+  hostWindow.addEventListener("pointermove", onPlaybackPointerMove, true);
+  hostWindow.addEventListener("pointerup", onPlaybackPointerUp, true);
+  hostWindow.addEventListener("pointercancel", onPlaybackPointerCancel, true);
+  hostWindow.addEventListener("blur", onPlaybackPointerCancel);
   saveAudioToggle.addEventListener("change", onSaveAudioChanged);
   saveAudioLimitInput.addEventListener("change", onSaveAudioLimitChanged);
   hostWindow.requestAnimationFrame(updatePlaybackButtons);
@@ -5827,7 +5922,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
   let playbackButtonsFrame = null;
   const savedUserControlObserver = new hostWindow.MutationObserver(() => {
     ensureSavedUserBubbleControls();
-    if (activePlayback && playbackButtonsFrame === null) {
+    if ((activePlayback || autoPlayback) && playbackButtonsFrame === null) {
       playbackButtonsFrame = hostWindow.requestAnimationFrame(() => {
         playbackButtonsFrame = null;
         updatePlaybackButtons();
@@ -5984,9 +6079,17 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
     saveAudioLimitInput.removeEventListener("change", onSaveAudioLimitChanged);
     hostWindow.removeEventListener("contextmenu", onNativeContextMenu, true);
     hostWindow.removeEventListener("click", onNativeTtsClick, true);
+    hostWindow.removeEventListener("pointerdown", onPlaybackPointerDown, true);
+    hostWindow.removeEventListener("pointermove", onPlaybackPointerMove, true);
+    hostWindow.removeEventListener("pointerup", onPlaybackPointerUp, true);
+    hostWindow.removeEventListener("pointercancel", onPlaybackPointerCancel, true);
+    hostWindow.removeEventListener("blur", onPlaybackPointerCancel);
+    autoplayLongPress.cancel();
     savedUserControlObserver.disconnect();
     if (playbackButtonsFrame !== null) hostWindow.cancelAnimationFrame(playbackButtonsFrame);
     restoreNativePlaybackButtons();
+    syncAutoplayIndicators(hostDocument.querySelectorAll("button"), false, nativeTtsMessageId);
+    autoplayIndicatorStyle.remove();
     tab.destroy();
     removeStyle();
   };
