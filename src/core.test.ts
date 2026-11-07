@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { PlaybackLongPress, PlaybackStartupGuard, syncAutoplayIndicators, syncPlaybackButtons, type PlaybackButtonState } from './playback-ui'
+import { PlaybackLongPress, PlaybackStartupGuard, syncAutoplayIndicators, syncPlaybackButtons, waitForAutoplayDeadline, type PlaybackButtonState } from './playback-ui'
 import { evaluateSpeakerReviews } from './speaker-review-evaluation'
 import {
   adaptiveGenerationConcurrency,
@@ -38,6 +38,7 @@ import {
   claimAutoplayGeneration,
   hasAudioForActiveSwipe,
   readAutomaticVoicePreferences,
+  readAutoplayDelaySeconds,
   globalTtsConnectionPreference,
   resolveGlobalTtsConnection,
   buildBestAvailableSpeakerReview,
@@ -3266,6 +3267,26 @@ test('automatic casting defaults on and autoplay requires explicit opt-in', () =
   assert.deepEqual(readAutomaticVoicePreferences({}), { autoVoiceCasting: true, autoPlayback: false })
   assert.deepEqual(readAutomaticVoicePreferences({ chatVoiceAutoCasting: false, chatVoiceAutoPlayback: true }), { autoVoiceCasting: false, autoPlayback: true })
   assert.deepEqual(readAutomaticVoicePreferences({ chatVoiceAutoCasting: true, chatVoiceAutoPlayback: 'true' }), { autoVoiceCasting: true, autoPlayback: false })
+})
+
+test('autoplay delay defaults to zero and clamps invalid and excessive values', () => {
+  assert.equal(readAutoplayDelaySeconds(undefined), 0)
+  assert.equal(readAutoplayDelaySeconds(NaN), 0)
+  assert.equal(readAutoplayDelaySeconds(-3), 0)
+  assert.equal(readAutoplayDelaySeconds(2.6), 3)
+  assert.equal(readAutoplayDelaySeconds(5000), 3600)
+})
+
+test('autoplay deadline waits and can be cancelled without blocking the queue', async () => {
+  const alreadyAborted = new AbortController()
+  alreadyAborted.abort()
+  assert.equal(await waitForAutoplayDeadline(Date.now(), alreadyAborted.signal), false)
+  assert.equal(await waitForAutoplayDeadline(Date.now() - 1, new AbortController().signal), true)
+  const pending = new AbortController()
+  const waiting = waitForAutoplayDeadline(Date.now() + 10000, pending.signal)
+  pending.abort()
+  assert.equal(await waiting, false)
+  assert.equal(await waitForAutoplayDeadline(Date.now() + 5, new AbortController().signal), true)
 })
 
 test('playback startup ownership prevents overlapping and cancelled audio starts', () => {

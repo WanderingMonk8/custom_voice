@@ -2,7 +2,7 @@ import type {
   SpindleFrontendContext,
   SpindleTextInputHandle,
 } from 'lumiverse-spindle-types'
-import { PlaybackLongPress, PlaybackStartupGuard, syncAutoplayIndicators, syncPlaybackButtons, type PlaybackButtonState } from './playback-ui'
+import { PlaybackLongPress, PlaybackStartupGuard, syncAutoplayIndicators, syncPlaybackButtons, waitForAutoplayDeadline, type PlaybackButtonState } from './playback-ui'
 import {
   activeGhostVoices,
   adaptiveGenerationConcurrency,
@@ -21,6 +21,8 @@ import {
   standardSpeakerReviewPolicy,
   autoplayGenerationEvent,
   claimAutoplayGeneration,
+  MAX_AUTOPLAY_DELAY_SECONDS,
+  readAutoplayDelaySeconds,
   hasAudioForActiveSwipe,
   readAutomaticVoicePreferences,
   resolveGlobalTtsConnection,
@@ -371,6 +373,7 @@ interface PlaybackPreferences {
   speakerLookback: number
   autoVoiceCasting: boolean
   autoPlayback: boolean
+  autoPlaybackDelaySeconds: number
   speakerAssignmentDebug: boolean
   skipNarration: boolean
   defaultNarratorVoice: string
@@ -440,6 +443,7 @@ async function loadPlaybackPreferences(): Promise<PlaybackPreferences> {
     playbackBufferSegments: DEFAULT_PLAYBACK_BUFFER_SEGMENTS,
     concurrentGenerations: DEFAULT_CONCURRENT_GENERATIONS,
     rateLimitWaitSeconds: DEFAULT_RATE_LIMIT_WAIT_SECONDS,
+    autoPlaybackDelaySeconds: 0,
     ghostVoiceLifetime: GHOST_VOICE_LIFETIME_MESSAGES,
     speakerLookback: DEFAULT_SPEAKER_LOOKBACK,
     ...readAutomaticVoicePreferences({}),
@@ -494,6 +498,7 @@ async function loadPlaybackPreferences(): Promise<PlaybackPreferences> {
       DEFAULT_RATE_LIMIT_WAIT_SECONDS,
       MAX_RATE_LIMIT_WAIT_SECONDS,
     ),
+    autoPlaybackDelaySeconds: readAutoplayDelaySeconds(row.value?.chatVoiceAutoPlaybackDelaySeconds),
     ghostVoiceLifetime: clampIntegerSetting(row.value?.chatVoiceGhostVoiceLifetime, GHOST_VOICE_LIFETIME_MESSAGES, 1000),
     speakerLookback: clampIntegerSetting(row.value?.chatVoiceSpeakerLookback, DEFAULT_SPEAKER_LOOKBACK, MAX_SPEAKER_LOOKBACK),
     ...readAutomaticVoicePreferences(row.value ?? {}),
@@ -591,6 +596,7 @@ function saveAdvancedPlaybackPreferences(
   ghostVoiceLifetime: number,
   autoVoiceCasting: boolean,
   autoPlayback: boolean,
+  autoPlaybackDelaySeconds: number,
   speakerLookback: number,
   skipNarration: boolean,
 ): Promise<void> {
@@ -615,6 +621,7 @@ function saveAdvancedPlaybackPreferences(
     chatVoiceSkipNarration: skipNarration,
     chatVoiceAutoCasting: autoVoiceCasting,
     chatVoiceAutoPlayback: autoPlayback,
+    chatVoiceAutoPlaybackDelaySeconds: readAutoplayDelaySeconds(autoPlaybackDelaySeconds),
     chatVoiceGhostVoiceLifetime: clampIntegerSetting(ghostVoiceLifetime, GHOST_VOICE_LIFETIME_MESSAGES, 1000),
     chatVoiceSpeakerLookback: clampIntegerSetting(speakerLookback, DEFAULT_SPEAKER_LOOKBACK, MAX_SPEAKER_LOOKBACK),
   }))
@@ -1324,6 +1331,7 @@ export function setup(ctx: SpindleFrontendContext) {
   const playbackBufferField = createField('Playback buffer segments')
   const concurrentGenerationField = createField('Maximum concurrent generations')
   const rateLimitWaitField = createField('Rate-limit wait budget (seconds)')
+  const autoPlaybackDelayField = createField('Autoplay delay (seconds)')
   const ghostLifetimeField = createField('Uncast voice lifetime (assistant messages)')
   const speakerLookbackField = createField('Global speaker context (messages)')
   const autoCastingLabel = document.createElement('label')
@@ -1392,6 +1400,7 @@ export function setup(ctx: SpindleFrontendContext) {
     speakerLookbackField.field,
     autoCastingLabel,
     autoPlaybackLabel,
+    autoPlaybackDelayField.field,
     skipNarrationLabel,
     speakerDebugLabel,
     speakerDebugOutput,
@@ -1403,6 +1412,7 @@ export function setup(ctx: SpindleFrontendContext) {
   const autoPlaybackSeenGenerations = new Set<string>()
   const autoPlaybackSeenMessages = new Set<string>()
   let autoPlaybackQueue: Promise<void> = Promise.resolve()
+  let autoPlaybackDelayController = new AbortController()
   let autoPlaybackDisposed = false
   let autoPlaybackEpoch = 0
   let connections: TtsConnection[] = []
@@ -1468,6 +1478,7 @@ export function setup(ctx: SpindleFrontendContext) {
   let rateLimitWaitSeconds = DEFAULT_RATE_LIMIT_WAIT_SECONDS
   let autoVoiceCasting = true
   let autoPlayback = false
+  let autoPlaybackDelaySeconds = 0
   const playbackStartup = new PlaybackStartupGuard()
   let ghostVoiceLifetime = GHOST_VOICE_LIFETIME_MESSAGES
   let speakerLookback = DEFAULT_SPEAKER_LOOKBACK
@@ -1904,6 +1915,19 @@ export function setup(ctx: SpindleFrontendContext) {
     MAX_RATE_LIMIT_WAIT_SECONDS,
     'Rate-limit wait budget in seconds',
   )
+  const autoPlaybackDelayInput = createNumberInput(0, MAX_AUTOPLAY_DELAY_SECONDS, 'Autoplay delay in seconds')
+  autoPlaybackDelayInput.min = '0'
+  autoPlaybackDelayField.slot.appendChild(autoPlaybackDelayInput)
+  const autoPlaybackDelayHint = document.createElement('div')
+  autoPlaybackDelayHint.className = 'chat-voice-hint'
+  autoPlaybackDelayHint.textContent = 'Wait this long after a message or reroll finishes before starting automatic playback. Default: 0 seconds.'
+  autoPlaybackDelayField.slot.appendChild(autoPlaybackDelayHint)
+  const onAutoPlaybackDelayInput = () => {
+    autoPlaybackDelaySeconds = readAutoplayDelaySeconds(autoPlaybackDelayInput.valueAsNumber)
+    autoPlaybackDelayInput.value = String(autoPlaybackDelaySeconds)
+    scheduleAdvancedSettingsSave()
+  }
+  autoPlaybackDelayInput.addEventListener('change', onAutoPlaybackDelayInput)
   const ghostLifetimeInput = createNumberInput(GHOST_VOICE_LIFETIME_MESSAGES, 1000, 'Uncast voice lifetime in assistant messages')
   ghostLifetimeField.slot.appendChild(ghostLifetimeInput)
   const ghostLifetimeHint = document.createElement('div')
@@ -4528,8 +4552,16 @@ export function setup(ctx: SpindleFrontendContext) {
         refreshLocalState()
         autoVoiceCasting = preferences.autoVoiceCasting
         autoCastingToggle.checked = autoVoiceCasting
+        if (autoPlayback !== preferences.autoPlayback) {
+          autoPlaybackEpoch += 1
+          autoPlaybackDelayController.abort()
+          autoPlaybackDelayController = new AbortController()
+          if (!preferences.autoPlayback) playbackStartup.cancelAutomatic()
+        }
         autoPlayback = preferences.autoPlayback
         autoPlaybackToggle.checked = autoPlayback
+        autoPlaybackDelaySeconds = preferences.autoPlaybackDelaySeconds
+        autoPlaybackDelayInput.value = String(autoPlaybackDelaySeconds)
         updatePlaybackButtons()
         speakerAssignmentDebug = preferences.speakerAssignmentDebug
         playbackBufferInput.value = String(playbackBufferSegments)
@@ -4675,6 +4707,8 @@ export function setup(ctx: SpindleFrontendContext) {
   function onAutoPlaybackChanged(): void {
     autoPlayback = autoPlaybackToggle.checked
     if (!autoPlayback) playbackStartup.cancelAutomatic()
+    autoPlaybackDelayController.abort()
+    autoPlaybackDelayController = new AbortController()
     autoPlaybackEpoch += 1
     updatePlaybackButtons()
     scheduleAdvancedSettingsSave()
@@ -4692,6 +4726,7 @@ export function setup(ctx: SpindleFrontendContext) {
         ghostVoiceLifetime,
         autoVoiceCasting,
         autoPlayback,
+        autoPlaybackDelaySeconds,
         speakerLookback,
         skipNarration,
       )
@@ -5134,6 +5169,8 @@ export function setup(ctx: SpindleFrontendContext) {
   const unsubscribeChatSwitched = ctx.events.on('CHAT_SWITCHED', (rawPayload: unknown) => {
     const switchedChatId = (rawPayload as { chatId?: string | null })?.chatId ?? null
     autoPlaybackEpoch += 1
+    autoPlaybackDelayController.abort()
+    autoPlaybackDelayController = new AbortController()
     playbackStartup.cancel()
     hostWindow.requestAnimationFrame(() => {
       if (ctx.getActiveChat().chatId === switchedChatId) refreshLocalState()
@@ -5150,7 +5187,10 @@ export function setup(ctx: SpindleFrontendContext) {
     if (!claimAutoplayGeneration(event, autoPlaybackSeenGenerations, autoPlaybackSeenMessages)) return
     if (!autoPlayback) return
     const eventEpoch = autoPlaybackEpoch
+    const deadline = Date.now() + autoPlaybackDelaySeconds * 1_000
+    const delaySignal = autoPlaybackDelayController.signal
     autoPlaybackQueue = autoPlaybackQueue.catch(() => undefined).then(async () => {
+      if (!await waitForAutoplayDeadline(deadline, delaySignal)) return
       while (activePlayback && !autoPlaybackDisposed && autoPlayback && eventEpoch === autoPlaybackEpoch && ctx.getActiveChat().chatId === event.chatId) await activePlayback.audibleDone
       if (autoPlaybackDisposed || !autoPlayback || eventEpoch !== autoPlaybackEpoch || ctx.getActiveChat().chatId !== event.chatId) return
       await playMessage(event.messageId, false, true, event.reroll ? event.content : undefined)
@@ -5169,6 +5209,7 @@ export function setup(ctx: SpindleFrontendContext) {
 
   return () => {
     autoPlaybackDisposed = true
+    autoPlaybackDelayController.abort()
     playbackStartup.cancel()
     hostDocument.removeEventListener('pointerdown', closeFavoritePickerOnOutsideClick)
     hostDocument.removeEventListener('keydown', closeFavoritePickerOnEscape)
@@ -5255,6 +5296,7 @@ export function setup(ctx: SpindleFrontendContext) {
         ghostVoiceLifetime,
         autoVoiceCasting,
         autoPlayback,
+        autoPlaybackDelaySeconds,
         speakerLookback,
         skipNarration,
       )
@@ -5268,6 +5310,7 @@ export function setup(ctx: SpindleFrontendContext) {
     playbackBufferInput.removeEventListener('change', onPlaybackBufferInput)
     concurrentGenerationInput.removeEventListener('change', onConcurrentGenerationInput)
     rateLimitWaitInput.removeEventListener('change', onRateLimitWaitInput)
+    autoPlaybackDelayInput.removeEventListener('change', onAutoPlaybackDelayInput)
     ghostLifetimeInput.removeEventListener('change', onGhostLifetimeInput)
     speakerLookbackInput.removeEventListener('change', onSpeakerLookbackInput)
     speakerDebugToggle.removeEventListener('change', onSpeakerDebugChanged)

@@ -5,6 +5,19 @@ export interface PlaybackButtonState {
   ariaPressed: string | null
 }
 
+/** Wait until the generation-relative deadline; cancellation releases the queue. */
+export function waitForAutoplayDeadline(deadline: number, signal: AbortSignal): Promise<boolean> {
+  if (signal.aborted) return Promise.resolve(false)
+  const remaining = Math.max(0, deadline - Date.now())
+  if (!remaining) return Promise.resolve(true)
+  return new Promise(resolve => {
+    const finish = (ready: boolean) => { clearTimeout(timer); signal.removeEventListener('abort', abort); resolve(ready) }
+    const abort = () => finish(false)
+    const timer = setTimeout(() => finish(true), remaining)
+    signal.addEventListener('abort', abort, { once: true })
+  })
+}
+
 /** Own asynchronous startup so superseded requests cannot create audio streams. */
 export class PlaybackStartupGuard {
   private serial = 0

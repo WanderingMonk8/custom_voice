@@ -49,6 +49,12 @@ export function hasAudioForActiveSwipe(message: { swipe_id?: number; extra?: Rec
 export function readAutomaticVoicePreferences(value: Record<string, unknown>) {
   return { autoVoiceCasting: value.chatVoiceAutoCasting !== false, autoPlayback: value.chatVoiceAutoPlayback === true }
 }
+
+export const MAX_AUTOPLAY_DELAY_SECONDS = 3600
+export function readAutoplayDelaySeconds(value: unknown): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return 0
+  return Math.min(MAX_AUTOPLAY_DELAY_SECONDS, Math.max(0, Math.round(value)))
+}
 /** Choose a global extension preference, then Lumiverse's global default. */
 export function globalTtsConnectionPreference(value: Record<string, unknown>): string {
   const chosen = typeof value.chatVoiceTtsConnectionId === 'string' ? value.chatVoiceTtsConnectionId : value.ttsConnectionId

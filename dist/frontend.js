@@ -1,4 +1,19 @@
 // src/playback-ui.ts
+function waitForAutoplayDeadline(deadline, signal) {
+  if (signal.aborted) return Promise.resolve(false);
+  const remaining = Math.max(0, deadline - Date.now());
+  if (!remaining) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    const finish = (ready) => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", abort);
+      resolve(ready);
+    };
+    const abort = () => finish(false);
+    const timer = setTimeout(() => finish(true), remaining);
+    signal.addEventListener("abort", abort, { once: true });
+  });
+}
 var PlaybackStartupGuard = class {
   serial = 0;
   pending = null;
@@ -161,6 +176,11 @@ function hasAudioForActiveSwipe(message) {
 }
 function readAutomaticVoicePreferences(value) {
   return { autoVoiceCasting: value.chatVoiceAutoCasting !== false, autoPlayback: value.chatVoiceAutoPlayback === true };
+}
+var MAX_AUTOPLAY_DELAY_SECONDS = 3600;
+function readAutoplayDelaySeconds(value) {
+  if (typeof value !== "number" || !Number.isFinite(value)) return 0;
+  return Math.min(MAX_AUTOPLAY_DELAY_SECONDS, Math.max(0, Math.round(value)));
 }
 function globalTtsConnectionPreference(value) {
   const chosen = typeof value.chatVoiceTtsConnectionId === "string" ? value.chatVoiceTtsConnectionId : value.ttsConnectionId;
@@ -1856,6 +1876,7 @@ async function loadPlaybackPreferences() {
     playbackBufferSegments: DEFAULT_PLAYBACK_BUFFER_SEGMENTS,
     concurrentGenerations: DEFAULT_CONCURRENT_GENERATIONS,
     rateLimitWaitSeconds: DEFAULT_RATE_LIMIT_WAIT_SECONDS,
+    autoPlaybackDelaySeconds: 0,
     ghostVoiceLifetime: GHOST_VOICE_LIFETIME_MESSAGES,
     speakerLookback: DEFAULT_SPEAKER_LOOKBACK,
     ...readAutomaticVoicePreferences({}),
@@ -1898,6 +1919,7 @@ async function loadPlaybackPreferences() {
       DEFAULT_RATE_LIMIT_WAIT_SECONDS,
       MAX_RATE_LIMIT_WAIT_SECONDS
     ),
+    autoPlaybackDelaySeconds: readAutoplayDelaySeconds(row.value?.chatVoiceAutoPlaybackDelaySeconds),
     ghostVoiceLifetime: clampIntegerSetting(row.value?.chatVoiceGhostVoiceLifetime, GHOST_VOICE_LIFETIME_MESSAGES, 1e3),
     speakerLookback: clampIntegerSetting(row.value?.chatVoiceSpeakerLookback, DEFAULT_SPEAKER_LOOKBACK, MAX_SPEAKER_LOOKBACK),
     ...readAutomaticVoicePreferences(row.value ?? {}),
@@ -1965,7 +1987,7 @@ function saveTtsTagPreferences(style, placement, connectionId, model) {
     chatVoiceTagLlmModel: model.trim().slice(0, 256)
   }));
 }
-function saveAdvancedPlaybackPreferences(bufferSegments, concurrentGenerations, rateLimitWaitSeconds, speakerAssignmentDebug, ghostVoiceLifetime, autoVoiceCasting, autoPlayback, speakerLookback, skipNarration) {
+function saveAdvancedPlaybackPreferences(bufferSegments, concurrentGenerations, rateLimitWaitSeconds, speakerAssignmentDebug, ghostVoiceLifetime, autoVoiceCasting, autoPlayback, autoPlaybackDelaySeconds, speakerLookback, skipNarration) {
   return updateVoiceSettings((current) => ({
     ...current,
     chatVoicePlaybackBufferSegments: clampIntegerSetting(
@@ -1987,6 +2009,7 @@ function saveAdvancedPlaybackPreferences(bufferSegments, concurrentGenerations, 
     chatVoiceSkipNarration: skipNarration,
     chatVoiceAutoCasting: autoVoiceCasting,
     chatVoiceAutoPlayback: autoPlayback,
+    chatVoiceAutoPlaybackDelaySeconds: readAutoplayDelaySeconds(autoPlaybackDelaySeconds),
     chatVoiceGhostVoiceLifetime: clampIntegerSetting(ghostVoiceLifetime, GHOST_VOICE_LIFETIME_MESSAGES, 1e3),
     chatVoiceSpeakerLookback: clampIntegerSetting(speakerLookback, DEFAULT_SPEAKER_LOOKBACK, MAX_SPEAKER_LOOKBACK)
   }));
@@ -2634,6 +2657,7 @@ function setup(ctx) {
   const playbackBufferField = createField("Playback buffer segments");
   const concurrentGenerationField = createField("Maximum concurrent generations");
   const rateLimitWaitField = createField("Rate-limit wait budget (seconds)");
+  const autoPlaybackDelayField = createField("Autoplay delay (seconds)");
   const ghostLifetimeField = createField("Uncast voice lifetime (assistant messages)");
   const speakerLookbackField = createField("Global speaker context (messages)");
   const autoCastingLabel = document.createElement("label");
@@ -2702,6 +2726,7 @@ function setup(ctx) {
     speakerLookbackField.field,
     autoCastingLabel,
     autoPlaybackLabel,
+    autoPlaybackDelayField.field,
     skipNarrationLabel,
     speakerDebugLabel,
     speakerDebugOutput,
@@ -2712,6 +2737,7 @@ function setup(ctx) {
   const autoPlaybackSeenGenerations = /* @__PURE__ */ new Set();
   const autoPlaybackSeenMessages = /* @__PURE__ */ new Set();
   let autoPlaybackQueue = Promise.resolve();
+  let autoPlaybackDelayController = new AbortController();
   let autoPlaybackDisposed = false;
   let autoPlaybackEpoch = 0;
   let connections = [];
@@ -2776,6 +2802,7 @@ function setup(ctx) {
   let rateLimitWaitSeconds = DEFAULT_RATE_LIMIT_WAIT_SECONDS;
   let autoVoiceCasting = true;
   let autoPlayback = false;
+  let autoPlaybackDelaySeconds = 0;
   const playbackStartup = new PlaybackStartupGuard();
   let ghostVoiceLifetime = GHOST_VOICE_LIFETIME_MESSAGES;
   let speakerLookback = DEFAULT_SPEAKER_LOOKBACK;
@@ -3158,6 +3185,19 @@ function setup(ctx) {
     MAX_RATE_LIMIT_WAIT_SECONDS,
     "Rate-limit wait budget in seconds"
   );
+  const autoPlaybackDelayInput = createNumberInput(0, MAX_AUTOPLAY_DELAY_SECONDS, "Autoplay delay in seconds");
+  autoPlaybackDelayInput.min = "0";
+  autoPlaybackDelayField.slot.appendChild(autoPlaybackDelayInput);
+  const autoPlaybackDelayHint = document.createElement("div");
+  autoPlaybackDelayHint.className = "chat-voice-hint";
+  autoPlaybackDelayHint.textContent = "Wait this long after a message or reroll finishes before starting automatic playback. Default: 0 seconds.";
+  autoPlaybackDelayField.slot.appendChild(autoPlaybackDelayHint);
+  const onAutoPlaybackDelayInput = () => {
+    autoPlaybackDelaySeconds = readAutoplayDelaySeconds(autoPlaybackDelayInput.valueAsNumber);
+    autoPlaybackDelayInput.value = String(autoPlaybackDelaySeconds);
+    scheduleAdvancedSettingsSave();
+  };
+  autoPlaybackDelayInput.addEventListener("change", onAutoPlaybackDelayInput);
   const ghostLifetimeInput = createNumberInput(GHOST_VOICE_LIFETIME_MESSAGES, 1e3, "Uncast voice lifetime in assistant messages");
   ghostLifetimeField.slot.appendChild(ghostLifetimeInput);
   const ghostLifetimeHint = document.createElement("div");
@@ -5461,8 +5501,16 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
         refreshLocalState();
         autoVoiceCasting = preferences.autoVoiceCasting;
         autoCastingToggle.checked = autoVoiceCasting;
+        if (autoPlayback !== preferences.autoPlayback) {
+          autoPlaybackEpoch += 1;
+          autoPlaybackDelayController.abort();
+          autoPlaybackDelayController = new AbortController();
+          if (!preferences.autoPlayback) playbackStartup.cancelAutomatic();
+        }
         autoPlayback = preferences.autoPlayback;
         autoPlaybackToggle.checked = autoPlayback;
+        autoPlaybackDelaySeconds = preferences.autoPlaybackDelaySeconds;
+        autoPlaybackDelayInput.value = String(autoPlaybackDelaySeconds);
         updatePlaybackButtons();
         speakerAssignmentDebug = preferences.speakerAssignmentDebug;
         playbackBufferInput.value = String(playbackBufferSegments);
@@ -5593,6 +5641,8 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
   function onAutoPlaybackChanged() {
     autoPlayback = autoPlaybackToggle.checked;
     if (!autoPlayback) playbackStartup.cancelAutomatic();
+    autoPlaybackDelayController.abort();
+    autoPlaybackDelayController = new AbortController();
     autoPlaybackEpoch += 1;
     updatePlaybackButtons();
     scheduleAdvancedSettingsSave();
@@ -5609,6 +5659,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
         ghostVoiceLifetime,
         autoVoiceCasting,
         autoPlayback,
+        autoPlaybackDelaySeconds,
         speakerLookback,
         skipNarration
       );
@@ -6021,6 +6072,8 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
   const unsubscribeChatSwitched = ctx.events.on("CHAT_SWITCHED", (rawPayload) => {
     const switchedChatId = rawPayload?.chatId ?? null;
     autoPlaybackEpoch += 1;
+    autoPlaybackDelayController.abort();
+    autoPlaybackDelayController = new AbortController();
     playbackStartup.cancel();
     hostWindow.requestAnimationFrame(() => {
       if (ctx.getActiveChat().chatId === switchedChatId) refreshLocalState();
@@ -6035,7 +6088,10 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
     if (!claimAutoplayGeneration(event, autoPlaybackSeenGenerations, autoPlaybackSeenMessages)) return;
     if (!autoPlayback) return;
     const eventEpoch = autoPlaybackEpoch;
+    const deadline = Date.now() + autoPlaybackDelaySeconds * 1e3;
+    const delaySignal = autoPlaybackDelayController.signal;
     autoPlaybackQueue = autoPlaybackQueue.catch(() => void 0).then(async () => {
+      if (!await waitForAutoplayDeadline(deadline, delaySignal)) return;
       while (activePlayback && !autoPlaybackDisposed && autoPlayback && eventEpoch === autoPlaybackEpoch && ctx.getActiveChat().chatId === event.chatId) await activePlayback.audibleDone;
       if (autoPlaybackDisposed || !autoPlayback || eventEpoch !== autoPlaybackEpoch || ctx.getActiveChat().chatId !== event.chatId) return;
       await playMessage(event.messageId, false, true, event.reroll ? event.content : void 0);
@@ -6053,6 +6109,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
   refreshLocalState();
   return () => {
     autoPlaybackDisposed = true;
+    autoPlaybackDelayController.abort();
     playbackStartup.cancel();
     hostDocument.removeEventListener("pointerdown", closeFavoritePickerOnOutsideClick);
     hostDocument.removeEventListener("keydown", closeFavoritePickerOnEscape);
@@ -6142,6 +6199,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
         ghostVoiceLifetime,
         autoVoiceCasting,
         autoPlayback,
+        autoPlaybackDelaySeconds,
         speakerLookback,
         skipNarration
       );
@@ -6155,6 +6213,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
     playbackBufferInput.removeEventListener("change", onPlaybackBufferInput);
     concurrentGenerationInput.removeEventListener("change", onConcurrentGenerationInput);
     rateLimitWaitInput.removeEventListener("change", onRateLimitWaitInput);
+    autoPlaybackDelayInput.removeEventListener("change", onAutoPlaybackDelayInput);
     ghostLifetimeInput.removeEventListener("change", onGhostLifetimeInput);
     speakerLookbackInput.removeEventListener("change", onSpeakerLookbackInput);
     speakerDebugToggle.removeEventListener("change", onSpeakerDebugChanged);
