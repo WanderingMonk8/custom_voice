@@ -14,6 +14,40 @@ function waitForAutoplayDeadline(deadline, signal) {
     signal.addEventListener("abort", abort, { once: true });
   });
 }
+var AutoplayRequestRegistry = class {
+  pending = /* @__PURE__ */ new Map();
+  begin(key) {
+    this.pending.get(key)?.abort();
+    const controller = new AbortController();
+    this.pending.set(key, controller);
+    return controller.signal;
+  }
+  finish(key, signal) {
+    if (this.pending.get(key)?.signal === signal) this.pending.delete(key);
+  }
+  cancelAll() {
+    for (const controller of this.pending.values()) controller.abort();
+    this.pending.clear();
+  }
+};
+function waitForAutoplayWork(work, signal) {
+  if (signal.aborted) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const abort = () => {
+      signal.removeEventListener("abort", abort);
+      resolve();
+    };
+    signal.addEventListener("abort", abort, { once: true });
+    work.then(() => {
+      signal.removeEventListener("abort", abort);
+      resolve();
+    }, (error) => {
+      signal.removeEventListener("abort", abort);
+      if (signal.aborted) resolve();
+      else reject(error);
+    });
+  });
+}
 var PlaybackStartupGuard = class {
   serial = 0;
   pending = null;
@@ -38,6 +72,9 @@ var PlaybackStartupGuard = class {
   }
   cancelAutomatic() {
     if (this.pending?.automatic) this.cancel();
+  }
+  cancelAutomaticFor(chatId, messageId) {
+    if (this.pending?.automatic && this.pending.chatId === chatId && this.pending.messageId === messageId) this.cancel();
   }
 };
 var PlaybackLongPress = class {
@@ -2737,7 +2774,7 @@ function setup(ctx) {
   const autoPlaybackSeenGenerations = /* @__PURE__ */ new Set();
   const autoPlaybackSeenMessages = /* @__PURE__ */ new Set();
   let autoPlaybackQueue = Promise.resolve();
-  let autoPlaybackDelayController = new AbortController();
+  const autoPlaybackRequests = new AutoplayRequestRegistry();
   let autoPlaybackDisposed = false;
   let autoPlaybackEpoch = 0;
   let connections = [];
@@ -5503,8 +5540,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
         autoCastingToggle.checked = autoVoiceCasting;
         if (autoPlayback !== preferences.autoPlayback) {
           autoPlaybackEpoch += 1;
-          autoPlaybackDelayController.abort();
-          autoPlaybackDelayController = new AbortController();
+          autoPlaybackRequests.cancelAll();
           if (!preferences.autoPlayback) playbackStartup.cancelAutomatic();
         }
         autoPlayback = preferences.autoPlayback;
@@ -5641,8 +5677,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
   function onAutoPlaybackChanged() {
     autoPlayback = autoPlaybackToggle.checked;
     if (!autoPlayback) playbackStartup.cancelAutomatic();
-    autoPlaybackDelayController.abort();
-    autoPlaybackDelayController = new AbortController();
+    autoPlaybackRequests.cancelAll();
     autoPlaybackEpoch += 1;
     updatePlaybackButtons();
     scheduleAdvancedSettingsSave();
@@ -6072,8 +6107,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
   const unsubscribeChatSwitched = ctx.events.on("CHAT_SWITCHED", (rawPayload) => {
     const switchedChatId = rawPayload?.chatId ?? null;
     autoPlaybackEpoch += 1;
-    autoPlaybackDelayController.abort();
-    autoPlaybackDelayController = new AbortController();
+    autoPlaybackRequests.cancelAll();
     playbackStartup.cancel();
     hostWindow.requestAnimationFrame(() => {
       if (ctx.getActiveChat().chatId === switchedChatId) refreshLocalState();
@@ -6087,17 +6121,22 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
     if (!event || autoPlaybackDisposed) return;
     if (!claimAutoplayGeneration(event, autoPlaybackSeenGenerations, autoPlaybackSeenMessages)) return;
     if (!autoPlayback) return;
+    const requestKey = `${event.chatId}\0${event.messageId}`;
+    const requestSignal = autoPlaybackRequests.begin(requestKey);
+    if (event.reroll) {
+      playbackStartup.cancelAutomaticFor(event.chatId, event.messageId);
+      if (activePlayback?.messageId === event.messageId) stopPlayback();
+    }
     const eventEpoch = autoPlaybackEpoch;
     const deadline = Date.now() + autoPlaybackDelaySeconds * 1e3;
-    const delaySignal = autoPlaybackDelayController.signal;
     autoPlaybackQueue = autoPlaybackQueue.catch(() => void 0).then(async () => {
-      if (!await waitForAutoplayDeadline(deadline, delaySignal)) return;
-      while (activePlayback && !autoPlaybackDisposed && autoPlayback && eventEpoch === autoPlaybackEpoch && ctx.getActiveChat().chatId === event.chatId) await activePlayback.audibleDone;
-      if (autoPlaybackDisposed || !autoPlayback || eventEpoch !== autoPlaybackEpoch || ctx.getActiveChat().chatId !== event.chatId) return;
-      await playMessage(event.messageId, false, true, event.reroll ? event.content : void 0);
+      if (!await waitForAutoplayDeadline(deadline, requestSignal)) return;
+      while (activePlayback && !requestSignal.aborted && !autoPlaybackDisposed && autoPlayback && eventEpoch === autoPlaybackEpoch && ctx.getActiveChat().chatId === event.chatId) await waitForAutoplayWork(activePlayback.audibleDone, requestSignal);
+      if (requestSignal.aborted || autoPlaybackDisposed || !autoPlayback || eventEpoch !== autoPlaybackEpoch || ctx.getActiveChat().chatId !== event.chatId) return;
+      await waitForAutoplayWork(playMessage(event.messageId, false, true, event.reroll ? event.content : void 0), requestSignal);
     }).catch((error) => {
-      if (!autoPlaybackDisposed) setStatus(error instanceof Error ? error.message : "Automatic playback failed.", "error");
-    });
+      if (!autoPlaybackDisposed && !requestSignal.aborted) setStatus(error instanceof Error ? error.message : "Automatic playback failed.", "error");
+    }).finally(() => autoPlaybackRequests.finish(requestKey, requestSignal));
   });
   const unsubscribeActivate = tab.onActivate(() => {
     void loadConnections();
@@ -6109,7 +6148,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
   refreshLocalState();
   return () => {
     autoPlaybackDisposed = true;
-    autoPlaybackDelayController.abort();
+    autoPlaybackRequests.cancelAll();
     playbackStartup.cancel();
     hostDocument.removeEventListener("pointerdown", closeFavoritePickerOnOutsideClick);
     hostDocument.removeEventListener("keydown", closeFavoritePickerOnEscape);

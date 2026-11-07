@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { PlaybackLongPress, PlaybackStartupGuard, syncAutoplayIndicators, syncPlaybackButtons, waitForAutoplayDeadline, type PlaybackButtonState } from './playback-ui'
+import { AutoplayRequestRegistry, PlaybackLongPress, PlaybackStartupGuard, syncAutoplayIndicators, syncPlaybackButtons, waitForAutoplayDeadline, waitForAutoplayWork, type PlaybackButtonState } from './playback-ui'
 import { evaluateSpeakerReviews } from './speaker-review-evaluation'
 import {
   adaptiveGenerationConcurrency,
@@ -3289,6 +3289,27 @@ test('autoplay deadline waits and can be cancelled without blocking the queue', 
   assert.equal(await waitForAutoplayDeadline(Date.now() + 5, new AbortController().signal), true)
 })
 
+test('new rerolls supersede the same message without cancelling other messages', async () => {
+  const requests = new AutoplayRequestRegistry()
+  const first = requests.begin('chat\0message')
+  const other = requests.begin('chat\0other')
+  const pendingDelay = waitForAutoplayDeadline(Date.now() + 10000, first)
+  const second = requests.begin('chat\0message')
+  assert.equal(await pendingDelay, false)
+  assert.equal(first.aborted, true)
+  assert.equal(other.aborted, false)
+  requests.finish('chat\0message', first)
+  assert.equal(second.aborted, false)
+  const playing = waitForAutoplayWork(new Promise<void>(() => undefined), second)
+  const third = requests.begin('chat\0message')
+  await playing
+  assert.equal(second.aborted, true)
+  assert.equal(third.aborted, false)
+  requests.cancelAll()
+  assert.equal(third.aborted, true)
+  assert.equal(other.aborted, true)
+})
+
 test('playback startup ownership prevents overlapping and cancelled audio starts', () => {
   const guard = new PlaybackStartupGuard()
   const first = guard.begin('chat', 'one', true)!
@@ -3307,8 +3328,15 @@ test('playback startup ownership prevents overlapping and cancelled audio starts
   const manual = guard.begin('chat', 'four', false)!
   guard.cancelAutomatic()
   assert.equal(guard.owns(manual), true)
+  guard.cancelAutomaticFor('chat', 'four')
+  assert.equal(guard.owns(manual), true)
   guard.cancel()
   assert.equal(guard.owns(manual), false)
+  const auto = guard.begin('chat', 'five', true)!
+  guard.cancelAutomaticFor('chat', 'other')
+  assert.equal(guard.owns(auto), true)
+  guard.cancelAutomaticFor('chat', 'five')
+  assert.equal(guard.owns(auto), false)
 })
 
 test('immediate named voice attribution anchors the preceding quote but not an introduced next quote', () => {

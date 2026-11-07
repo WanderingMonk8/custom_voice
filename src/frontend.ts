@@ -2,7 +2,7 @@ import type {
   SpindleFrontendContext,
   SpindleTextInputHandle,
 } from 'lumiverse-spindle-types'
-import { PlaybackLongPress, PlaybackStartupGuard, syncAutoplayIndicators, syncPlaybackButtons, waitForAutoplayDeadline, type PlaybackButtonState } from './playback-ui'
+import { AutoplayRequestRegistry, PlaybackLongPress, PlaybackStartupGuard, syncAutoplayIndicators, syncPlaybackButtons, waitForAutoplayDeadline, waitForAutoplayWork, type PlaybackButtonState } from './playback-ui'
 import {
   activeGhostVoices,
   adaptiveGenerationConcurrency,
@@ -1412,7 +1412,7 @@ export function setup(ctx: SpindleFrontendContext) {
   const autoPlaybackSeenGenerations = new Set<string>()
   const autoPlaybackSeenMessages = new Set<string>()
   let autoPlaybackQueue: Promise<void> = Promise.resolve()
-  let autoPlaybackDelayController = new AbortController()
+  const autoPlaybackRequests = new AutoplayRequestRegistry()
   let autoPlaybackDisposed = false
   let autoPlaybackEpoch = 0
   let connections: TtsConnection[] = []
@@ -4554,8 +4554,7 @@ export function setup(ctx: SpindleFrontendContext) {
         autoCastingToggle.checked = autoVoiceCasting
         if (autoPlayback !== preferences.autoPlayback) {
           autoPlaybackEpoch += 1
-          autoPlaybackDelayController.abort()
-          autoPlaybackDelayController = new AbortController()
+          autoPlaybackRequests.cancelAll()
           if (!preferences.autoPlayback) playbackStartup.cancelAutomatic()
         }
         autoPlayback = preferences.autoPlayback
@@ -4707,8 +4706,7 @@ export function setup(ctx: SpindleFrontendContext) {
   function onAutoPlaybackChanged(): void {
     autoPlayback = autoPlaybackToggle.checked
     if (!autoPlayback) playbackStartup.cancelAutomatic()
-    autoPlaybackDelayController.abort()
-    autoPlaybackDelayController = new AbortController()
+    autoPlaybackRequests.cancelAll()
     autoPlaybackEpoch += 1
     updatePlaybackButtons()
     scheduleAdvancedSettingsSave()
@@ -5169,8 +5167,7 @@ export function setup(ctx: SpindleFrontendContext) {
   const unsubscribeChatSwitched = ctx.events.on('CHAT_SWITCHED', (rawPayload: unknown) => {
     const switchedChatId = (rawPayload as { chatId?: string | null })?.chatId ?? null
     autoPlaybackEpoch += 1
-    autoPlaybackDelayController.abort()
-    autoPlaybackDelayController = new AbortController()
+    autoPlaybackRequests.cancelAll()
     playbackStartup.cancel()
     hostWindow.requestAnimationFrame(() => {
       if (ctx.getActiveChat().chatId === switchedChatId) refreshLocalState()
@@ -5186,15 +5183,21 @@ export function setup(ctx: SpindleFrontendContext) {
     if (!event || autoPlaybackDisposed) return
     if (!claimAutoplayGeneration(event, autoPlaybackSeenGenerations, autoPlaybackSeenMessages)) return
     if (!autoPlayback) return
+    const requestKey = `${event.chatId}\u0000${event.messageId}`
+    const requestSignal = autoPlaybackRequests.begin(requestKey)
+    if (event.reroll) {
+      playbackStartup.cancelAutomaticFor(event.chatId, event.messageId)
+      if (activePlayback?.messageId === event.messageId) stopPlayback()
+    }
     const eventEpoch = autoPlaybackEpoch
     const deadline = Date.now() + autoPlaybackDelaySeconds * 1_000
-    const delaySignal = autoPlaybackDelayController.signal
     autoPlaybackQueue = autoPlaybackQueue.catch(() => undefined).then(async () => {
-      if (!await waitForAutoplayDeadline(deadline, delaySignal)) return
-      while (activePlayback && !autoPlaybackDisposed && autoPlayback && eventEpoch === autoPlaybackEpoch && ctx.getActiveChat().chatId === event.chatId) await activePlayback.audibleDone
-      if (autoPlaybackDisposed || !autoPlayback || eventEpoch !== autoPlaybackEpoch || ctx.getActiveChat().chatId !== event.chatId) return
-      await playMessage(event.messageId, false, true, event.reroll ? event.content : undefined)
-    }).catch(error => { if (!autoPlaybackDisposed) setStatus(error instanceof Error ? error.message : 'Automatic playback failed.', 'error') })
+      if (!await waitForAutoplayDeadline(deadline, requestSignal)) return
+      while (activePlayback && !requestSignal.aborted && !autoPlaybackDisposed && autoPlayback && eventEpoch === autoPlaybackEpoch && ctx.getActiveChat().chatId === event.chatId) await waitForAutoplayWork(activePlayback.audibleDone, requestSignal)
+      if (requestSignal.aborted || autoPlaybackDisposed || !autoPlayback || eventEpoch !== autoPlaybackEpoch || ctx.getActiveChat().chatId !== event.chatId) return
+      await waitForAutoplayWork(playMessage(event.messageId, false, true, event.reroll ? event.content : undefined), requestSignal)
+    }).catch(error => { if (!autoPlaybackDisposed && !requestSignal.aborted) setStatus(error instanceof Error ? error.message : 'Automatic playback failed.', 'error') })
+      .finally(() => autoPlaybackRequests.finish(requestKey, requestSignal))
   })
 
   const unsubscribeActivate = tab.onActivate(() => {
@@ -5209,7 +5212,7 @@ export function setup(ctx: SpindleFrontendContext) {
 
   return () => {
     autoPlaybackDisposed = true
-    autoPlaybackDelayController.abort()
+    autoPlaybackRequests.cancelAll()
     playbackStartup.cancel()
     hostDocument.removeEventListener('pointerdown', closeFavoritePickerOnOutsideClick)
     hostDocument.removeEventListener('keydown', closeFavoritePickerOnEscape)
