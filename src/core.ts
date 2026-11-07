@@ -6,27 +6,43 @@ export function standardSpeakerReviewPolicy() {
   return { runReview: true, bestAvailableSpeaker: true, shadowEvaluation: false, focusedOpeningFallback: false } as const
 }
 
-/** Accept only successful, foreground new-message generation events for the active chat. */
-export function autoplayGenerationEvent(value: unknown, activeChatId: string | null): { chatId: string; messageId: string; generationId: string } | null {
+export interface AutoplayGeneration { chatId: string; messageId: string; generationId: string; reroll?: boolean; content?: string }
+
+/** Accept successful foreground new messages and rerolls in the active chat. */
+export function autoplayGenerationEvent(value: unknown, activeChatId: string | null): AutoplayGeneration | null {
   if (!value || typeof value !== 'object' || Array.isArray(value) || !activeChatId) return null
   const event = value as Record<string, unknown>
   if (event.chatId !== activeChatId || typeof event.messageId !== 'string' || !event.messageId.trim()
     || typeof event.generationId !== 'string' || !event.generationId.trim() || event.error || event.backgroundSwipe === true) return null
   const kind = typeof event.generationType === 'string' ? event.generationType.trim().toLowerCase() : ''
-  if (['continue', 'regenerate', 'swipe', 'impersonate'].includes(kind)) return null
-  return { chatId: activeChatId, messageId: event.messageId, generationId: event.generationId }
+  if (['continue', 'impersonate'].includes(kind)) return null
+  const reroll = kind === 'regenerate' || kind === 'swipe'
+  return { chatId: activeChatId, messageId: event.messageId, generationId: event.generationId,
+    ...(reroll ? { reroll: true, ...(typeof event.content === 'string' ? { content: event.content } : {}) } : {}) }
 }
 
 /** Deduplicate reconnect/repeated notifications while bounding in-memory state. */
-export function claimAutoplayGeneration(event: { chatId: string; messageId: string; generationId: string }, generations: Set<string>, messages: Set<string>): boolean {
+export function claimAutoplayGeneration(event: AutoplayGeneration, generations: Set<string>, messages: Set<string>): boolean {
   const generationKey = `${event.chatId}\u0000${event.generationId}`
   const messageKey = `${event.chatId}\u0000${event.messageId}`
-  if (generations.has(generationKey) || messages.has(messageKey)) return false
+  if (generations.has(generationKey) || (!event.reroll && messages.has(messageKey))) return false
   generations.add(generationKey)
   messages.add(messageKey)
   if (generations.size > 512) generations.delete(generations.values().next().value!)
   if (messages.size > 512) messages.delete(messages.values().next().value!)
   return true
+}
+
+/** Legacy attachments without a swipe ID belong to the original swipe only. */
+export function hasAudioForActiveSwipe(message: { swipe_id?: number; extra?: Record<string, unknown> }): boolean {
+  const attachments = message.extra?.attachments
+  if (!Array.isArray(attachments)) return false
+  const swipe = message.swipe_id ?? 0
+  return attachments.some(candidate => {
+    if (!candidate || typeof candidate !== 'object') return false
+    const attachment = candidate as { type?: unknown; swipe_id?: unknown }
+    return attachment.type === 'audio' && (attachment.swipe_id ?? 0) === swipe
+  })
 }
 
 /** Preserve explicit casting opt-outs; automatic playback requires an opt-in. */

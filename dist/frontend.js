@@ -130,18 +130,34 @@ function autoplayGenerationEvent(value, activeChatId) {
   const event = value;
   if (event.chatId !== activeChatId || typeof event.messageId !== "string" || !event.messageId.trim() || typeof event.generationId !== "string" || !event.generationId.trim() || event.error || event.backgroundSwipe === true) return null;
   const kind = typeof event.generationType === "string" ? event.generationType.trim().toLowerCase() : "";
-  if (["continue", "regenerate", "swipe", "impersonate"].includes(kind)) return null;
-  return { chatId: activeChatId, messageId: event.messageId, generationId: event.generationId };
+  if (["continue", "impersonate"].includes(kind)) return null;
+  const reroll = kind === "regenerate" || kind === "swipe";
+  return {
+    chatId: activeChatId,
+    messageId: event.messageId,
+    generationId: event.generationId,
+    ...reroll ? { reroll: true, ...typeof event.content === "string" ? { content: event.content } : {} } : {}
+  };
 }
 function claimAutoplayGeneration(event, generations, messages) {
   const generationKey = `${event.chatId}\0${event.generationId}`;
   const messageKey = `${event.chatId}\0${event.messageId}`;
-  if (generations.has(generationKey) || messages.has(messageKey)) return false;
+  if (generations.has(generationKey) || !event.reroll && messages.has(messageKey)) return false;
   generations.add(generationKey);
   messages.add(messageKey);
   if (generations.size > 512) generations.delete(generations.values().next().value);
   if (messages.size > 512) messages.delete(messages.values().next().value);
   return true;
+}
+function hasAudioForActiveSwipe(message) {
+  const attachments = message.extra?.attachments;
+  if (!Array.isArray(attachments)) return false;
+  const swipe = message.swipe_id ?? 0;
+  return attachments.some((candidate) => {
+    if (!candidate || typeof candidate !== "object") return false;
+    const attachment = candidate;
+    return attachment.type === "audio" && (attachment.swipe_id ?? 0) === swipe;
+  });
 }
 function readAutomaticVoicePreferences(value) {
   return { autoVoiceCasting: value.chatVoiceAutoCasting !== false, autoPlayback: value.chatVoiceAutoPlayback === true };
@@ -2635,10 +2651,10 @@ function setup(ctx) {
   const autoPlaybackCopy = document.createElement("span");
   autoPlaybackCopy.className = "chat-voice-toggle-copy";
   const autoPlaybackText = document.createElement("span");
-  autoPlaybackText.textContent = "Automatically play new messages";
+  autoPlaybackText.textContent = "Automatically play new messages and rerolls";
   const autoPlaybackHint = document.createElement("span");
   autoPlaybackHint.className = "chat-voice-toggle-hint";
-  autoPlaybackHint.textContent = "Play new assistant messages as they arrive. You can also hold a message play button to toggle this. Your browser may require a click before audio can start.";
+  autoPlaybackHint.textContent = "Play new assistant messages and foreground rerolls as they arrive. You can also hold a message play button to toggle this. Your browser may require a click before audio can start.";
   autoPlaybackCopy.append(autoPlaybackText, autoPlaybackHint);
   autoPlaybackLabel.append(autoPlaybackToggle, autoPlaybackCopy);
   const speakerDebugLabel = document.createElement("label");
@@ -3792,7 +3808,7 @@ function setup(ctx) {
       return attachment.type === "audio" && (attachment.swipe_id === void 0 || attachment.swipe_id === message.swipe_id);
     });
   }
-  async function playMessage(messageId, nativeRegenerationAction = false, automatic = false) {
+  async function playMessage(messageId, nativeRegenerationAction = false, automatic = false, expectedContent) {
     if (activePlayback?.messageId === messageId) {
       if (automatic) return;
       playbackStartup.cancel();
@@ -3820,8 +3836,8 @@ function setup(ctx) {
         return;
       }
       if (!ownsStartup()) return;
-      if (automatic && (message.is_user || hasSavedAudioForCurrentSwipe(message))) return;
-      const regeneratingSavedAudio = !message.is_user && (nativeRegenerationAction || hasSavedAudioForCurrentSwipe(message));
+      if (automatic && (message.is_user || hasAudioForActiveSwipe(message) || expectedContent !== void 0 && message.content.trim() !== expectedContent.trim())) return;
+      const regeneratingSavedAudio = !message.is_user && (nativeRegenerationAction || !automatic && hasSavedAudioForCurrentSwipe(message));
       if (regeneratingSavedAudio) {
         const { confirmed } = await ctx.ui.showConfirm({
           title: "Regenerate TTS audio?",
@@ -6022,7 +6038,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
     autoPlaybackQueue = autoPlaybackQueue.catch(() => void 0).then(async () => {
       while (activePlayback && !autoPlaybackDisposed && autoPlayback && eventEpoch === autoPlaybackEpoch && ctx.getActiveChat().chatId === event.chatId) await activePlayback.audibleDone;
       if (autoPlaybackDisposed || !autoPlayback || eventEpoch !== autoPlaybackEpoch || ctx.getActiveChat().chatId !== event.chatId) return;
-      await playMessage(event.messageId, false, true);
+      await playMessage(event.messageId, false, true, event.reroll ? event.content : void 0);
     }).catch((error) => {
       if (!autoPlaybackDisposed) setStatus(error instanceof Error ? error.message : "Automatic playback failed.", "error");
     });

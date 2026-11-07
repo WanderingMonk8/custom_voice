@@ -36,6 +36,7 @@ import {
   standardSpeakerReviewPolicy,
   autoplayGenerationEvent,
   claimAutoplayGeneration,
+  hasAudioForActiveSwipe,
   readAutomaticVoicePreferences,
   globalTtsConnectionPreference,
   resolveGlobalTtsConnection,
@@ -3148,7 +3149,7 @@ test('standard speaker review enables the production pipeline without comparison
   assert.deepEqual(standardSpeakerReviewPolicy(), { runReview: true, bestAvailableSpeaker: true, shadowEvaluation: false, focusedOpeningFallback: false })
 })
 
-test('autoplay selects successful new-message generation completions in the active chat', () => {
+test('autoplay selects successful foreground messages and rerolls without duplicate events', () => {
   const event = { chatId: 'chat', generationId: 'gen', messageId: 'new', content: 'Finished text', generationType: 'normal' }
   assert.deepEqual(autoplayGenerationEvent(event, 'chat'), { chatId: 'chat', generationId: 'gen', messageId: 'new' })
   assert.deepEqual(autoplayGenerationEvent({ ...event, generationType: undefined }, 'chat'), { chatId: 'chat', generationId: 'gen', messageId: 'new' })
@@ -3157,13 +3158,28 @@ test('autoplay selects successful new-message generation completions in the acti
   assert.equal(autoplayGenerationEvent({ ...event, messageId: undefined }, 'chat'), null)
   assert.equal(autoplayGenerationEvent({ ...event, generationId: '' }, 'chat'), null)
   assert.equal(autoplayGenerationEvent({ ...event, backgroundSwipe: true }, 'chat'), null)
-  for (const generationType of ['continue', 'regenerate', 'swipe', 'impersonate']) assert.equal(autoplayGenerationEvent({ ...event, generationType }, 'chat'), null)
+  for (const generationType of ['continue', 'impersonate']) assert.equal(autoplayGenerationEvent({ ...event, generationType }, 'chat'), null)
+  for (const generationType of ['regenerate', 'swipe']) assert.deepEqual(autoplayGenerationEvent({ ...event, generationType }, 'chat'), { chatId: 'chat', generationId: 'gen', messageId: 'new', reroll: true, content: 'Finished text' })
   const generations = new Set<string>()
   const messages = new Set<string>()
   assert.equal(claimAutoplayGeneration(event, generations, messages), true)
   assert.equal(claimAutoplayGeneration(event, generations, messages), false)
   assert.equal(claimAutoplayGeneration({ ...event, generationId: 'retry' }, generations, messages), false)
+  const reroll = { ...event, generationId: 'reroll', reroll: true }
+  assert.equal(claimAutoplayGeneration(reroll, generations, messages), true)
+  assert.equal(claimAutoplayGeneration(reroll, generations, messages), false)
+  assert.equal(claimAutoplayGeneration({ ...reroll, generationId: 'reroll-2' }, generations, messages), true)
   assert.equal(claimAutoplayGeneration({ ...event, chatId: 'other' }, generations, messages), true)
+})
+
+test('autoplay recognizes saved audio only on its active swipe', () => {
+  const legacy = { extra: { attachments: [{ type: 'audio' }] } }
+  assert.equal(hasAudioForActiveSwipe(legacy), true)
+  assert.equal(hasAudioForActiveSwipe({ ...legacy, swipe_id: 1 }), false)
+  const swiped = { swipe_id: 1, extra: { attachments: [{ type: 'audio', swipe_id: 0 }, { type: 'audio', swipe_id: 1 }] } }
+  assert.equal(hasAudioForActiveSwipe(swiped), true)
+  assert.equal(hasAudioForActiveSwipe({ ...swiped, swipe_id: 2 }), false)
+  assert.equal(hasAudioForActiveSwipe({ swipe_id: 1, extra: { attachments: [{ type: 'image', swipe_id: 1 }] } }), false)
 })
 
 test('playback controls follow shared playback state, including menus rendered later', () => {

@@ -21,6 +21,7 @@ import {
   standardSpeakerReviewPolicy,
   autoplayGenerationEvent,
   claimAutoplayGeneration,
+  hasAudioForActiveSwipe,
   readAutomaticVoicePreferences,
   resolveGlobalTtsConnection,
   encodeConcatenatedWav,
@@ -1340,10 +1341,10 @@ export function setup(ctx: SpindleFrontendContext) {
   const autoPlaybackCopy = document.createElement('span')
   autoPlaybackCopy.className = 'chat-voice-toggle-copy'
   const autoPlaybackText = document.createElement('span')
-  autoPlaybackText.textContent = 'Automatically play new messages'
+  autoPlaybackText.textContent = 'Automatically play new messages and rerolls'
   const autoPlaybackHint = document.createElement('span')
   autoPlaybackHint.className = 'chat-voice-toggle-hint'
-  autoPlaybackHint.textContent = 'Play new assistant messages as they arrive. You can also hold a message play button to toggle this. Your browser may require a click before audio can start.'
+  autoPlaybackHint.textContent = 'Play new assistant messages and foreground rerolls as they arrive. You can also hold a message play button to toggle this. Your browser may require a click before audio can start.'
   autoPlaybackCopy.append(autoPlaybackText, autoPlaybackHint)
   autoPlaybackLabel.append(autoPlaybackToggle, autoPlaybackCopy)
   const speakerDebugLabel = document.createElement('label')
@@ -2729,7 +2730,7 @@ export function setup(ctx: SpindleFrontendContext) {
     })
   }
 
-  async function playMessage(messageId: string, nativeRegenerationAction = false, automatic = false): Promise<void> {
+  async function playMessage(messageId: string, nativeRegenerationAction = false, automatic = false, expectedContent?: string): Promise<void> {
     if (activePlayback?.messageId === messageId) {
       if (automatic) return
       playbackStartup.cancel()
@@ -2759,10 +2760,10 @@ export function setup(ctx: SpindleFrontendContext) {
       return
     }
     if (!ownsStartup()) return
-    if (automatic && (message.is_user || hasSavedAudioForCurrentSwipe(message))) return
+    if (automatic && (message.is_user || hasAudioForActiveSwipe(message) || (expectedContent !== undefined && message.content.trim() !== expectedContent.trim()))) return
 
     const regeneratingSavedAudio = !message.is_user
-      && (nativeRegenerationAction || hasSavedAudioForCurrentSwipe(message))
+      && (nativeRegenerationAction || (!automatic && hasSavedAudioForCurrentSwipe(message)))
     if (regeneratingSavedAudio) {
       const { confirmed } = await ctx.ui.showConfirm({
         title: 'Regenerate TTS audio?',
@@ -5152,7 +5153,7 @@ export function setup(ctx: SpindleFrontendContext) {
     autoPlaybackQueue = autoPlaybackQueue.catch(() => undefined).then(async () => {
       while (activePlayback && !autoPlaybackDisposed && autoPlayback && eventEpoch === autoPlaybackEpoch && ctx.getActiveChat().chatId === event.chatId) await activePlayback.audibleDone
       if (autoPlaybackDisposed || !autoPlayback || eventEpoch !== autoPlaybackEpoch || ctx.getActiveChat().chatId !== event.chatId) return
-      await playMessage(event.messageId, false, true)
+      await playMessage(event.messageId, false, true, event.reroll ? event.content : undefined)
     }).catch(error => { if (!autoPlaybackDisposed) setStatus(error instanceof Error ? error.message : 'Automatic playback failed.', 'error') })
   })
 
