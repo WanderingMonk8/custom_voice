@@ -1,11 +1,16 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
+import { syncPlaybackButtons, type PlaybackButtonState } from './playback-ui'
+import { evaluateSpeakerReviews } from './speaker-review-evaluation'
 import {
   adaptiveGenerationConcurrency,
   addScannedFirstNameAliases,
   addUnconfiguredDialogueSpeakers,
   addFavoriteVoice,
   mergeScannedCardCast,
+  isScenarioCardTitle,
+  continueUncastClosingSpeech,
+  continuityRosterIdentity,
   applyConfigToMetadata,
   applyCustomTtsEmotionCues,
   applyCustomTtsEmotionCuesWithModulation,
@@ -14,8 +19,39 @@ import {
   applyTtsTagSelections,
   assessSpeakerDiscourseEscalation,
   buildSpeakerDecisionPlan,
+  snapshotSpeakerFirstPass,
+  speakerAssignmentSourceFromTrace,
   buildAssistantUserSpeakerReview,
+  buildContextualUserReconciliation,
+  applyContextualUserReconciliation,
   buildRelationshipSpeakerReview,
+  independentlyGroundedSpeakerIds,
+  suppressUngroundedSpeakerChoices,
+  buildOpeningSpeakerReview,
+  buildBoundaryExchangeShadowReview,
+  applyOpeningExchangeReview,
+  buildOpeningBacklinkReview,
+  buildContrastiveOpeningLinkReview,
+  applyFocusedOpeningFallback,
+  standardSpeakerReviewPolicy,
+  autoplayGenerationEvent,
+  claimAutoplayGeneration,
+  readAutomaticVoicePreferences,
+  globalTtsConnectionPreference,
+  resolveGlobalTtsConnection,
+  buildBestAvailableSpeakerReview,
+  applyBestAvailableSpeakerReview,
+  buildSelfIntroductionReview,
+  applySelfIntroductionReview,
+  applyExplicitPostQuoteVoiceAttributions,
+  buildSpeakerSwitchContradictionReview,
+  applySpeakerSwitchContradictionReview,
+  applyNarrativeRoleSpeakerReview,
+  applyNarrativeExchangeSpeakerReview,
+  applyNarrativeLocalEvidenceReview,
+  applyContestedDialogueChain,
+  applyOpeningBacklinkReview,
+  invalidSpeakerReviewAnswers,
   applyRelationshipSpeakerReview,
   previousContinuitySpeaker,
   previousNamedGhostContinuity,
@@ -38,6 +74,7 @@ import {
   uncastIdentityLabels,
   mergeGhostAliases,
   readGhostVoices,
+  recordGhostOccurrence,
   buildUncastVoiceDecision,
   buildUncastIdentityReview,
   resolveUncastVoiceDecisions,
@@ -54,6 +91,8 @@ import {
   hasNamedSpeakerMention,
   hasNamedSpeakerSubject,
   mergeVoicePlan,
+  filterNarrationSegments,
+  markUnresolvedSpeechSegments,
   normalizeSpeechBoundaryDashes,
   normalizeTtsTags,
   normalizeCustomTtsEmotionTag,
@@ -92,6 +131,7 @@ import {
   stripTtsTags,
   unconfiguredSpeakerId,
   UNCAST_SPEAKER_ID,
+  UNRESOLVED_SPEAKER_ID,
   USER_SPEAKER_ID,
   upsertSavedAudioRecord,
   validateTtsSpeechPlacement,
@@ -1059,6 +1099,9 @@ test('gates a decision answer on probability, confidence, and winner margin', ()
     optionSpeakerIds,
   )
   assert.equal(uncast.identity, UNCAST_SPEAKER_ID)
+  assert.equal(evaluateSpeakerDecisionAnswer({ choice: 'known_0', probabilities: { known_0: Infinity }, confidence: 1 }, optionSpeakerIds).resolved, false)
+  assert.equal(evaluateSpeakerDecisionAnswer({ choice: 'known_0', probabilities: { known_0: 1.1 }, confidence: 1 }, optionSpeakerIds).resolved, false)
+  assert.equal(evaluateSpeakerDecisionAnswer({ choice: 'known_0', probabilities: { known_0: 0.9 }, confidence: NaN }, optionSpeakerIds).resolved, false)
 })
 
 test('applies per-segment gain while assembling PCM WAV audio', () => {
@@ -2020,6 +2063,43 @@ test('keeps ghost voices for the configured count of assistant messages and neve
   assert.equal(activeGhostVoices([replay], ids, ids[1], 10).length, 1)
 })
 
+test('reuses a ghost voice for a weak identity only when the follow-up review confirms it', () => {
+  const ghost = { id: 'ghost-girl', speakerId: UNCAST_SPEAKER_ID, voiceId: 'voice-girl', label: 'the girl', context: 'The girl ordered coffee.', occurrenceKeys: [], lastSeenMessageId: 'assistant-0' }
+  const groups = collectUncastVoiceGroups([{ text: 'Shit.', speakerId: UNCAST_SPEAKER_ID }])
+  const weakIdentity = { choice: 'ghost_0', probabilities: { ghost_0: 0.61, new_or_unclear: 0.2, uncast_character: 0.19 }, confidence: 0.53 }
+  const confirmed = resolveUncastVoiceDecisions(groups, [], {
+    identity_g0: weakIdentity,
+    review_ghost_g0_0: { choice: 'same', probabilities: { same: 0.9, different_or_unclear: 0.1 }, confidence: 0.82 },
+  }, [ghost])
+  assert.equal(confirmed[0]?.voiceId, 'voice-girl')
+  assert.equal(confirmed[0]?.ghostId, 'ghost-girl')
+  const unconfirmed = resolveUncastVoiceDecisions(groups, [], {
+    identity_g0: weakIdentity,
+    review_ghost_g0_0: { choice: 'different_or_unclear', probabilities: { same: 0.3, different_or_unclear: 0.7 }, confidence: 0.7 },
+  }, [ghost])
+  assert.equal(unconfirmed.some(assignment => assignment.ghostId === 'ghost-girl'), false)
+})
+
+test('treats a repeated specific unnamed label as a voice match and ignores broad person labels', () => {
+  const girl = { id: 'ghost-girl', speakerId: UNCAST_SPEAKER_ID, voiceId: 'voice-girl', label: 'the girl', context: 'A girl orders coffee.', occurrenceKeys: [], lastSeenMessageId: 'assistant-0' }
+  const groups = collectUncastVoiceGroups([{ text: 'Thanks for pulling out.', speakerId: UNCAST_SPEAKER_ID }])
+  const message = 'The girl sits down. "Thanks for pulling out."'
+  const labelIndex = uncastIdentityLabels(message, [girl]).indexOf('the girl')
+  const assigned = resolveUncastVoiceDecisions(groups, [], {
+    identity_g0: { choice: 'new_or_unclear', probabilities: { new_or_unclear: 0.5, ghost_0: 0.3 }, confidence: 0.4 },
+    label_g0: { choice: `label_${labelIndex}`, probabilities: { [`label_${labelIndex}`]: 0.95 }, confidence: 0.95 },
+  }, [girl], [], 'later', message)
+  assert.equal(assigned[0]?.ghostId, 'ghost-girl')
+  const broad = { ...girl, id: 'ghost-woman', label: 'the woman', voiceId: 'voice-woman' }
+  const broadMessage = 'The woman sits down. "Thanks for pulling out."'
+  const broadIndex = uncastIdentityLabels(broadMessage, [broad]).indexOf('the woman')
+  const broadAssigned = resolveUncastVoiceDecisions(groups, [], {
+    identity_g0: { choice: 'new_or_unclear', probabilities: { new_or_unclear: 0.5, ghost_0: 0.3 }, confidence: 0.4 },
+    label_g0: { choice: `label_${broadIndex}`, probabilities: { [`label_${broadIndex}`]: 0.95 }, confidence: 0.95 },
+  }, [broad], [], 'later', broadMessage)
+  assert.equal(broadAssigned.some(assignment => assignment.ghostId === 'ghost-woman'), false)
+})
+
 test('links separate same-character runs to one ghost voice and gathers their local context', () => {
   const groups = collectUncastVoiceGroups([
     { speakerId: null, text: 'The clerk smiles.' },
@@ -2073,7 +2153,7 @@ test('strong pairwise identity links override conflicting cached turn voices', (
     { speakerId: UNCAST_SPEAKER_ID, text: 'Second.' },
   ])
   const ghosts = groups.map((group, index) => ({ id: `ghost-${index}`, speakerId: UNCAST_SPEAKER_ID, voiceId: `voice-${index}`, context: 'The clerk.', occurrenceKeys: [`message:${hashMessageContent(group.speeches.join('\n'))}`], lastSeenMessageId: 'message' }))
-  const answers = { same_g1_g0: confidentDecision('same') }
+  const answers = { same_g1_g0: confidentDecision('same'), review_occurrence_g0_0: confidentDecision('same') }
   const matches = resolveUncastVoiceDecisions(groups, [], answers, ghosts, [], 'message')
   assert.deepEqual(matches.map(match => match.voiceId), ['voice-0', 'voice-0'])
   assert.match(buildUncastVoiceDecision(groups, [], 'The clerk and Watt.').questions.same_g1_g0.instructions, /same individual/u)
@@ -2226,6 +2306,15 @@ test('retains confirmed ghost aliases for matching and promotion', () => {
   assert.deepEqual(ambiguous, [])
 })
 
+test('keeps bounded occurrence provenance while preserving legacy occurrence keys', () => {
+  const ghost = readGhostVoices([{ id: 'g', speakerId: UNCAST_SPEAKER_ID, voiceId: 'v', context: '', occurrenceKeys: ['old:legacy'], lastSeenMessageId: 'old' }])[0]
+  recordGhostOccurrence(ghost, 'new', 'message-hash', 'speech-hash', 'Jev identity match')
+  recordGhostOccurrence(ghost, 'new', 'message-hash', 'speech-hash', 'confirmed')
+  const restored = readGhostVoices([ghost])[0]
+  assert.deepEqual(restored.occurrenceKeys, ['old:legacy'])
+  assert.deepEqual(restored.occurrenceEvidence, [{ messageId: 'new', messageHash: 'message-hash', speechHash: 'speech-hash', version: 'occurrence-1', reason: 'confirmed' }])
+})
+
 test('requires identity review before matching broad person descriptions to earlier ghosts', () => {
   const group = collectUncastVoiceGroups([{ speakerId: 'unconfigured:the woman', text: 'Sit anywhere.' }])
   const ghost = { id: 'old', speakerId: 'unconfigured:the woman', label: 'the woman', voiceId: 'old-voice', context: 'A woman at another location.', occurrenceKeys: [], lastSeenMessageId: 'previous' }
@@ -2238,7 +2327,57 @@ test('requires identity review before matching broad person descriptions to earl
   assert.match(reviewed[0].matchReason!, /Jev identity match: old/u)
   const occurrence = { ...ghost, occurrenceKeys: [`current:${hashMessageContent('Sit anywhere.')}`] }
   const replay = resolveUncastVoiceDecisions(group, voices, {}, [occurrence], [], 'current')
-  assert.match(replay[0].matchReason!, /exact message occurrence/u)
+  assert.deepEqual(replay, [])
+  const confirmedReplay = resolveUncastVoiceDecisions(group, voices, { review_occurrence_g0_0: confidentDecision('same') }, [occurrence], [], 'current')
+  assert.match(confirmedReplay[0].matchReason!, /exact message occurrence/u)
+})
+
+test('a contested saved occurrence is reviewed and does not force a voice or overwrite the ghost', () => {
+  const group = collectUncastVoiceGroups([{ speakerId: UNCAST_SPEAKER_ID, text: 'No, I know what you meant.' }])
+  const ghost = { id: 'halloran', speakerId: 'unconfigured:halloran', label: 'Halloran', voiceId: 'halloran-voice', context: 'Halloran works in an office.', occurrenceKeys: [`current:${hashMessageContent('No, I know what you meant.')}`], lastSeenMessageId: 'current' }
+  const answers: Record<string, SpeakerDecisionChoice> = { identity_g0: { choice: 'ghost_0', confidence: 0.55, probabilities: { ghost_0: 0.65, new_or_unclear: 0.35 } } }
+  const review = buildUncastIdentityReview(group, answers, 'A speaker with a tray turns back.', [ghost], 'current')
+  assert.ok(review.questions.review_occurrence_g0_0)
+  const before = structuredClone(ghost)
+  assert.deepEqual(resolveUncastVoiceDecisions(group, readFavoriteVoices([{ id: 'other-voice' }]), { ...answers, review_occurrence_g0_0: confidentDecision('different_or_unclear') }, [ghost], [], 'current'), [])
+  assert.deepEqual(ghost, before)
+  const confirmed = resolveUncastVoiceDecisions(group, [], { ...answers, review_occurrence_g0_0: confidentDecision('same') }, [ghost], [], 'current')
+  assert.equal(confirmed[0]?.ghostId, 'halloran')
+})
+
+test('a clearly different saved occurrence can receive a new voice without changing the old ghost', () => {
+  const group = collectUncastVoiceGroups([{ speakerId: UNCAST_SPEAKER_ID, text: 'Seven-forty is the next one.' }])
+  const key = `current:${hashMessageContent('Seven-forty is the next one.')}`
+  const ghost = { id: 'wrong', speakerId: UNCAST_SPEAKER_ID, label: 'the woman', voiceId: 'old-voice', context: 'A different person.', occurrenceKeys: [key], lastSeenMessageId: 'current' }
+  const before = structuredClone(ghost)
+  const voices = readFavoriteVoices([{ id: 'new-voice' }])
+  const answers: Record<string, SpeakerDecisionChoice> = { identity_g0: confidentDecision('new_or_unclear'), voice_g0: confidentDecision('voice_0'), review_occurrence_g0_0: confidentDecision('different_or_unclear') }
+  const review = buildUncastIdentityReview(group, answers, 'A woman speaks at the tram stop.', [ghost], 'current')
+  assert.ok(review.questions.review_occurrence_disposition_g0_0)
+  assert.deepEqual(resolveUncastVoiceDecisions(group, voices, answers, [ghost], [], 'current'), [])
+  const different = { ...answers, review_occurrence_disposition_g0_0: confidentDecision('different') }
+  const replacement = resolveUncastVoiceDecisions(group, voices, different, [ghost], [], 'current')
+  assert.equal(replacement[0]?.voiceId, 'new-voice')
+  assert.match(replacement[0]?.ghostId ?? '', /^pending:/u)
+  assert.deepEqual(ghost, before)
+  const secondText = 'The next tram arrives.'
+  const linkedGroups = collectUncastVoiceGroups([{ speakerId: UNCAST_SPEAKER_ID, text: 'Seven-forty is the next one.' }, { speakerId: null, text: 'A long description. '.repeat(20) }, { speakerId: UNCAST_SPEAKER_ID, text: secondText }])
+  const repeated = { ...ghost, occurrenceKeys: [key, `current:${hashMessageContent(secondText)}`] }
+  const linkedAnswers = { ...different, same_g1_g0: confidentDecision('same'), identity_g1: confidentDecision('group_g0'), voice_g1: confidentDecision('voice_0'), review_occurrence_g1_0: confidentDecision('different_or_unclear') }
+  const linked = resolveUncastVoiceDecisions(linkedGroups, voices, linkedAnswers, [repeated], [], 'current')
+  assert.equal(linked.length, 2)
+  assert.equal(linked[0].ghostId, linked[1].ghostId)
+  const conflictingGroups = { identity_g0: confidentDecision('ghost_0'), same_g1_g0: confidentDecision('same'), identity_g1: confidentDecision('new_or_unclear'), voice_g1: confidentDecision('voice_0'), review_occurrence_disposition_g1_0: confidentDecision('different') }
+  assert.deepEqual(resolveUncastVoiceDecisions(linkedGroups, voices, conflictingGroups, [repeated], [], 'current'), [])
+  const uncertain = { ...answers, review_occurrence_disposition_g0_0: confidentDecision('unclear') }
+  assert.deepEqual(resolveUncastVoiceDecisions(group, voices, uncertain, [ghost], [], 'current'), [])
+  const weakNew = { ...different, identity_g0: { choice: 'new_or_unclear', probabilities: { new_or_unclear: 0.6, ghost_0: 0.4 }, confidence: 0.5 } }
+  assert.deepEqual(resolveUncastVoiceDecisions(group, voices, weakNew, [ghost], [], 'current'), [])
+  const newer = { ...ghost, id: 'replacement', voiceId: 'new-voice' }
+  const replayReview = buildUncastIdentityReview(group, {}, 'A woman speaks at the tram stop.', [ghost, newer], 'current')
+  assert.ok(replayReview.questions.review_occurrence_g0_1)
+  const replay = resolveUncastVoiceDecisions(group, [], { review_occurrence_g0_1: confidentDecision('same') }, [ghost, newer], [], 'current')
+  assert.equal(replay[0]?.ghostId, 'replacement')
 })
 
 test('reviews borderline opening dialogue against a later clearly labeled speaker', () => {
@@ -2368,6 +2507,88 @@ test('reviews a newly named speaker against anonymous history even when the firs
   assert.deepEqual(selfNamed[0].aliases, ['marisol'])
 })
 
+test('connects a newly named uncast speaker through a continuing scene and conversation', () => {
+  const first = 'The counter man speaks to Ken. A woman at the second copper turns round and says, "That’s charged her for that, Arthur." Arthur answers her at the counter. The copper behind the woman sizzles.'
+  const user = 'I explain what happened to the note and offer it to the counter man.'
+  const current = 'Arthur says, "Annie at her copper will tell the whole road." "They’re all the same these lads, Arthur," says Annie from her copper. "Annie, love. Wash the sheet," he replies.'
+  const messages = [
+    { id: 'first', is_user: false, content: first },
+    { id: 'user', is_user: true, content: user },
+    { id: 'current', is_user: false, content: current },
+    { id: 'future', is_user: false, content: 'Future secret.' },
+  ]
+  const ghosts = [{ id: 'copper-worker', speakerId: UNCAST_SPEAKER_ID, label: 'the woman', aliases: ['the woman'], voiceId: 'earlier-voice', context: 'The woman speaks to Arthur by the second copper.', occurrenceKeys: [], lastSeenMessageId: 'first', conversationHistory: [{ messageId: 'first', text: first }] }]
+  const context = relationshipReviewContext(messages, 'current', ghosts)
+  const safeGhosts = ghosts.map(ghost => ({ ...ghost, conversationHistory: context.ghosts[0].conversationHistory }))
+  const groups = collectUncastVoiceGroups([{ speakerId: 'unconfigured:annie', text: 'They’re all the same these lads, Arthur.', debugPath: ['segment-type:speech'] }])
+  const voices = readFavoriteVoices([{ id: 'unused-voice' }])
+  const answers: Record<string, SpeakerDecisionChoice> = { identity_g0: confidentDecision('new_or_unclear'), voice_g0: confidentDecision('voice_0') }
+  const review = buildUncastIdentityReview(groups, answers, current, safeGhosts, 'current', context.previousMessages)
+  assert.ok(review.questions.review_scene_g0_0)
+  assert.match(review.questions.review_scene_g0_0.instructions, /workstations/u)
+  assert.deepEqual(review.state.previousMessages.map(item => item.role), ['assistant', 'user'])
+  assert.ok(!JSON.stringify(review.state).includes('Future secret'))
+  const firstPass = buildUncastVoiceDecision(groups, voices, current, safeGhosts, context.previousMessages)
+  assert.equal(firstPass.state.previousMessages[1].text, user)
+  const linked = resolveUncastVoiceDecisions(groups, voices, { ...answers, review_scene_g0_0: confidentDecision('same') }, safeGhosts, [], 'current', current, ['first'])
+  assert.equal(linked[0].ghostId, 'copper-worker')
+  assert.equal(linked[0].voiceId, 'earlier-voice')
+  assert.ok(linked[0].aliases?.includes('annie'))
+  const uncertain = resolveUncastVoiceDecisions(groups, voices, { ...answers, review_scene_g0_0: confidentDecision('different_or_unclear') }, safeGhosts, [], 'current', current, ['first'])
+  assert.equal(uncertain[0].voiceId, 'unused-voice')
+  const contradicted = resolveUncastVoiceDecisions(groups, voices, { ...answers, review_scene_g0_0: confidentDecision('same'), review_reveal_g0_0: confidentDecision('different_or_unclear') }, safeGhosts, [], 'current', current, ['first'])
+  assert.equal(contradicted[0].voiceId, 'unused-voice')
+  const another = { ...safeGhosts[0], id: 'other-worker', voiceId: 'other-voice', label: 'the other woman', aliases: ['the other woman'] }
+  const ambiguous = resolveUncastVoiceDecisions(groups, voices, { ...answers, review_scene_g0_0: confidentDecision('same'), review_scene_g0_1: confidentDecision('same') }, [...safeGhosts, another], [], 'current', current, ['first'])
+  assert.equal(ambiguous[0].voiceId, 'unused-voice')
+})
+
+test('reviews a name introduced in narration for an otherwise uncast speaker', () => {
+  const first = 'A woman at the tram stop holds a cup and a satchel. "Why, where are you headed?"'
+  const user = 'I ask her how her morning has been.'
+  const current = 'Free-use is default in this city. Leah is at her own stop on her own errand. She turns her cup. "Morning’s been morning."'
+  const messages = [{ id: 'first', is_user: false, content: first }, { id: 'user', is_user: true, content: user }, { id: 'current', is_user: false, content: current }]
+  const ghosts = [{ id: 'woman', speakerId: UNCAST_SPEAKER_ID, label: 'the woman', aliases: ['the woman'], voiceId: 'original-voice', context: 'The woman holds a cup at the stop.', occurrenceKeys: [], lastSeenMessageId: 'first', conversationHistory: [{ messageId: 'first', text: first }] }]
+  const context = relationshipReviewContext(messages, 'current', ghosts)
+  const groups = collectUncastVoiceGroups([{ speakerId: UNCAST_SPEAKER_ID, text: 'Morning’s been morning.' }])
+  const plan = buildUncastVoiceDecision(groups, [], current, ghosts, context.previousMessages)
+  const index = plan.state.narrativeNames.findIndex(name => name.toLowerCase() === 'leah')
+  assert.ok(index >= 0)
+  assert.ok(plan.questions.narrative_name_g0)
+  const answers: Record<string, SpeakerDecisionChoice> = { narrative_name_g0: confidentDecision(`name_${index}`), identity_g0: confidentDecision('new_or_unclear') }
+  const review = buildUncastIdentityReview(groups, answers, current, ghosts, 'current', context.previousMessages)
+  assert.ok(review.questions.review_continuity_g0_0)
+  assert.match(review.questions.review_continuity_g0_0.instructions, /intervening user message/u)
+  assert.ok(review.questions.review_reveal_g0_0)
+  assert.ok(review.questions.review_scene_g0_0)
+  const linked = resolveUncastVoiceDecisions(groups, [], { ...answers, review_scene_g0_0: confidentDecision('same') }, ghosts, [], 'current', current, ['first'])
+  assert.equal(linked[0]?.ghostId, 'woman')
+  assert.equal(linked[0]?.voiceId, 'original-voice')
+  assert.ok(linked[0]?.aliases?.includes('leah'))
+  const doubtful = { ...answers, review_reveal_g0_0: confidentDecision('different_or_unclear'), review_scene_g0_0: confidentDecision('different_or_unclear') }
+  const continuity = resolveUncastVoiceDecisions(groups, [], { ...doubtful, review_continuity_g0_0: confidentDecision('same') }, ghosts, [], 'current', current, ['first'])
+  assert.equal(continuity[0]?.voiceId, 'original-voice')
+  assert.ok(continuity[0]?.aliases?.includes('leah'))
+  assert.equal(resolveUncastVoiceDecisions(groups, [], { ...doubtful, review_continuity_g0_0: confidentDecision('unclear') }, ghosts, [], 'current', current, ['first']).length, 0)
+  assert.equal(resolveUncastVoiceDecisions(groups, [], { ...answers, review_scene_g0_0: confidentDecision('same'), review_continuity_g0_0: confidentDecision('different') }, ghosts, [], 'current', current, ['first']).length, 0)
+  const competing = { ...ghosts[0], id: 'other', voiceId: 'other-voice' }
+  assert.equal(resolveUncastVoiceDecisions(groups, [], { ...doubtful, review_continuity_g0_0: confidentDecision('same'), review_continuity_g0_1: confidentDecision('same') }, [...ghosts, competing], [], 'current', current, ['first']).length, 0)
+  const stale = { ...ghosts[0], id: 'stale-current', voiceId: 'wrong-voice', occurrenceKeys: [`current:${hashMessageContent('Morning’s been morning.')}`], lastSeenMessageId: 'current', conversationHistory: [] }
+  const recovered = resolveUncastVoiceDecisions(groups, [], { ...answers, review_occurrence_g0_1: confidentDecision('different_or_unclear'), review_scene_g0_0: confidentDecision('same') }, [...ghosts, stale], [], 'current', current, ['first'])
+  assert.equal(recovered[0]?.ghostId, 'woman')
+  assert.equal(recovered[0]?.voiceId, 'original-voice')
+  const namedGhost = { ...ghosts[0], label: 'Leah', aliases: ['Leah'] }
+  const existing = resolveUncastVoiceDecisions(groups, [], answers, [namedGhost], [], 'current', current, ['first'])
+  assert.equal(existing[0]?.ghostId, 'woman')
+  const older = Array.from({ length: 9 }, (_, i) => ({ ...ghosts[0], id: `older-${i}`, lastSeenMessageId: 'older', conversationHistory: [] }))
+  const recentReview = buildUncastIdentityReview(groups, answers, current, [...older, ghosts[0]], 'current', context.previousMessages)
+  assert.ok(recentReview.questions.review_scene_g0_9, 'recent matching candidates must not be crowded out by older ghosts')
+  const unrelated = { ...answers, narrative_name_g0: confidentDecision('none') }
+  assert.equal(buildUncastIdentityReview(groups, unrelated, current, ghosts, 'current', context.previousMessages).questions.review_scene_g0_0, undefined)
+  const weak = { ...answers, narrative_name_g0: { choice: `name_${index}`, probabilities: { [`name_${index}`]: 0.6, none: 0.4 }, confidence: 0.5 } }
+  assert.equal(buildUncastIdentityReview(groups, weak, current, ghosts, 'current', context.previousMessages).questions.review_scene_g0_0, undefined)
+})
+
 test('retains conversation exchanges and relationship labels for later ghost identity review', () => {
   const ids = ['one', 'two', 'three', 'four']
   const ghost = { id: 'mother', speakerId: UNCAST_SPEAKER_ID, voiceId: 'voice', context: '', occurrenceKeys: [], lastSeenMessageId: 'one', conversationHistory: [] as Array<{ messageId: string; text: string }> }
@@ -2420,6 +2641,968 @@ test('relationship review preserves caller identity, excludes future context, an
   assert.equal(matches.find(match => groups.find(group => group.id === match.groupId)?.speakerId === 'ghost:mother')?.voiceId, 'mom-voice')
 })
 
+test('global context includes six preceding user and assistant messages in order without future leakage', () => {
+  const messages = Array.from({ length: 9 }, (_, index) => ({ id: String(index), is_user: index % 2 === 0, content: `message ${index}` }))
+  const context = relationshipReviewContext(messages, '7', [])
+  assert.deepEqual(context.previousMessages.map(item => [item.id, item.role]), [ ['1', 'assistant'], ['2', 'user'], ['3', 'assistant'], ['4', 'user'], ['5', 'assistant'], ['6', 'user'] ])
+  assert.deepEqual(relationshipReviewContext(messages, '4', [], '', 2).previousMessages.map(item => item.id), ['2', '3'])
+  assert.deepEqual(relationshipReviewContext(messages, 'missing', []).previousMessages, [])
+  const long = Array.from({ length: 9 }, (_, index) => ({ id: String(index), is_user: index % 2 === 0, content: 'x'.repeat(10_000) }))
+  const capped = relationshipReviewContext(long, '8', [], '', 8).previousMessages
+  assert.equal(capped.reduce((sum, item) => sum + item.text.length, 0), 24_000)
+  assert.deepEqual(capped.map(item => item.id), ['2', '3', '4', '5', '6', '7'])
+})
+
+test('prioritizes the latest ghost context without changing candidate indexes or exposing future links', () => {
+  const messages = [
+    { id: 'old', is_user: false, content: 'An earlier scene.' },
+    { id: 'first', is_user: false, content: 'The woman speaks at the stop.' },
+    { id: 'user', is_user: true, content: 'How was your morning?' },
+    { id: 'current', is_user: false, content: 'Leah replies.' },
+    { id: 'future', is_user: false, content: 'Future scene.' },
+  ]
+  const old = Array.from({ length: 8 }, (_, i) => ({ id: `old-${i}`, speakerId: UNCAST_SPEAKER_ID, voiceId: `voice-${i}`, context: 'old context '.repeat(150), occurrenceKeys: [], lastSeenMessageId: 'old', conversationHistory: [{ messageId: 'old', text: 'old history '.repeat(150) }] }))
+  const recent = { id: 'recent', speakerId: UNCAST_SPEAKER_ID, voiceId: 'recent-voice', context: 'the woman by the stop', occurrenceKeys: ['first:hash', 'future:hash'], lastSeenMessageId: 'first', conversationHistory: [{ messageId: 'first', text: 'the woman answers at the stop' }, { messageId: 'future', text: 'future secret' }] }
+  const ghosts = [...old, recent]
+  const context = relationshipReviewContext(messages, 'current', ghosts)
+  assert.deepEqual(context.ghosts.map(ghost => ghost.id), ghosts.map(ghost => ghost.id))
+  const safeRecent = context.ghosts[8]
+  assert.equal(safeRecent.context, recent.context)
+  assert.deepEqual(safeRecent.conversationHistory.map(item => item.messageId), ['first'])
+  assert.ok(!JSON.stringify(context).includes('future secret'))
+  const safeGhosts = ghosts.map(ghost => ({ ...ghost, ...context.ghosts.find(item => item.id === ghost.id)! }))
+  const groups = collectUncastVoiceGroups([{ speakerId: UNCAST_SPEAKER_ID, text: 'Morning was fine.' }])
+  const plan = buildUncastVoiceDecision(groups, [], messages[3].content, safeGhosts, context.previousMessages)
+  assert.deepEqual(plan.state.ghosts[8].priorMessageIds, ['first'])
+  const answers: Record<string, SpeakerDecisionChoice> = { narrative_name_g0: confidentDecision('name_0'), identity_g0: confidentDecision('new_or_unclear') }
+  const review = buildUncastIdentityReview(groups, answers, messages[3].content, safeGhosts, 'current', context.previousMessages)
+  assert.deepEqual(review.state.ghosts[8].priorMessageIds, ['first'])
+  assert.ok(review.questions.review_continuity_g0_8)
+})
+
+test('global review avoids scene-wide inheritance and treats card as context only', () => {
+  const speakers = [{ id: 'tessa', name: 'Tessa' }, { id: 'ewan', name: 'Ewan' }]
+  const plan = buildSpeakerDecisionPlan('"Sacrifice."\n\nHe turns with the tray.\n\n"What are you sacrificing?"', speakers, false)
+  const answers: Record<string, SpeakerDecisionChoice> = { speech_s0: confidentDecision('no_clear_identity'), speech_s1: confidentDecision('no_clear_identity') }
+  const context = { previousMessages: [{ id: 'prior', role: 'user' as const, text: 'Ewan walks away with his tray.' }], ghosts: [] }
+  const review = buildRelationshipSpeakerReview(plan, answers, context, null, { cardSpeakerId: 'tessa', targets: ['s0', 's1'] })
+  assert.equal(review.questions.relationship_scene, undefined)
+  assert.ok(review.questions.relationship_s0)
+  assert.equal(review.state.cardSpeakerPrior, 'tessa')
+  applyRelationshipSpeakerReview(plan, answers, { relationship_s0: confidentDecision('known_1') }, review.ghostOptions, 'tessa', 'tessa', true)
+  assert.equal(answers.speech_s0.choice, 'known_1')
+  assert.equal(answers.speech_s1.choice, 'no_clear_identity')
+  const resolved = resolveSpeakerDecisionSegments(plan.state.message, plan, answers, speakers, { isUserMessage: false, cardSpeakerId: null, historicalSpeakerId: null, evidenceOnly: true })
+  assert.notEqual(resolved.find(segment => segment.text === 'What are you sacrificing?')?.speakerId, 'tessa')
+  const failed = buildSpeakerDecisionPlan('"What now?"', speakers, false)
+  const failedAnswers = { speech_s0: confidentDecision('no_clear_identity') }
+  applyRelationshipSpeakerReview(failed, failedAnswers, {}, {}, 'tessa', 'tessa', true)
+  assert.equal(failedAnswers.speech_s0.choice, 'no_clear_identity')
+  assert.equal(resolveSpeakerDecisionSegments(failed.state.message, failed, failedAnswers, speakers, { isUserMessage: false, cardSpeakerId: null, historicalSpeakerId: null, evidenceOnly: true }).find(segment => segment.text === 'What now?')?.speakerId, UNRESOLVED_SPEAKER_ID)
+})
+
+test('speaker diagnostic source labels follow final resolution rather than an intermediate guess', () => {
+  assert.equal(speakerAssignmentSourceFromTrace(['resolution:global-context confirmed current identity (protected from local override)'], false), 'contextual-confirmation')
+  assert.equal(speakerAssignmentSourceFromTrace(['resolution:global-context review (protected from local override)'], false), 'contextual-review')
+  assert.equal(speakerAssignmentSourceFromTrace(['jev-opening-exchange:strong single-speaker review applied', 'resolution:global-context review (protected from local override)'], false), 'opening-exchange')
+  assert.equal(speakerAssignmentSourceFromTrace(['jev-opening-backlink:accepted same-speaker link to later validated quote', 'resolution:global-context review (protected from local override)'], false), 'opening-backlink')
+  assert.equal(speakerAssignmentSourceFromTrace(['jev-opening-forwardlink:accepted same-speaker link to earlier validated quote', 'resolution:global-context review (protected from local override)'], false), 'opening-forwardlink')
+  assert.equal(speakerAssignmentSourceFromTrace(['jev-opening-exchange:strong single-speaker review applied', 'resolution:unresolved speech (connection-default fallback)'], false), 'role-fallback')
+  assert.equal(speakerAssignmentSourceFromTrace(['resolution:direct-speech-identity'], false), 'first-pass')
+  assert.equal(speakerAssignmentSourceFromTrace([], true), 'local-parser')
+})
+
+test('first-pass debug snapshots remain unchanged after later review decisions', () => {
+  const plan = buildSpeakerDecisionPlan('"Hello."', [{ id: 'npc:a', name: 'A' }], false)
+  const answers: Record<string, SpeakerDecisionChoice> = { speech_s0: confidentDecision('known_0') }
+  snapshotSpeakerFirstPass(plan, answers)
+  answers.speech_s0.probabilities.known_0 = 0.4
+  answers.speech_s0.choice = 'no_clear_identity'
+  assert.equal(answers.first_pass_s0.choice, 'known_0')
+  assert.equal(answers.first_pass_s0.probabilities.known_0, 0.92)
+})
+
+test('dialogue-only filtering removes narration but keeps cast, user and unresolved speech', () => {
+  const segments = [
+    { text: 'Narration.', speakerId: null },
+    { text: 'A line.', speakerId: 'npc:ewan' },
+    { text: 'Unknown line.', speakerId: UNRESOLVED_SPEAKER_ID },
+    { text: 'User line.', speakerId: USER_SPEAKER_ID },
+    { text: 'Another narrator beat.', speakerId: null },
+  ]
+  assert.deepEqual(filterNarrationSegments(segments, true).map(item => item.text), ['A line.', 'Unknown line.', 'User line.'])
+  assert.deepEqual(filterNarrationSegments(segments, false), segments)
+  assert.deepEqual(filterNarrationSegments([{ text: 'Only narration.', speakerId: null }], true), [])
+  assert.equal(segments.length, 5)
+})
+
+test('offline speaker evaluation scores paired cases and validates alignment', () => {
+  const cases = [
+    { id: 'reply', conversation: 'exchange-a', expected: ['ewan', 'ewan', null], baseline: ['user', null, null], candidate: ['ewan', 'ewan', 'ewan'], baselineMs: 100, candidateMs: 160 },
+    { id: 'phone', conversation: 'exchange-b', expected: ['mother', 'daughter'], baseline: ['mother', 'daughter'], candidate: ['mother', 'daughter'], baselineMs: 200, candidateMs: 250 },
+  ]
+  const result = evaluateSpeakerReviews(cases)
+  assert.equal(result.conversations, 2)
+  assert.equal(result.baseline.exactMatches, 3)
+  assert.equal(result.candidate.exactMatches, 4)
+  assert.equal(result.changed, 3)
+  assert.equal(result.improved, 2)
+  assert.equal(result.regressed, 1)
+  assert.equal(result.candidate.p95Ms, 250)
+  assert.throws(() => evaluateSpeakerReviews([{ ...cases[0], candidate: [] }]), /aligned/u)
+  assert.throws(() => evaluateSpeakerReviews([cases[0], cases[0]]), /unique/u)
+  assert.throws(() => evaluateSpeakerReviews([{ ...cases[0], candidateMs: Infinity }]), /finite/u)
+})
+
+test('speaker review rejects missing, malformed and out-of-scope answers', () => {
+  const questions = { relationship_s0: { type: 'choice' as const, instructions: '', criteria: { known_0: 'A', no_clear_identity: 'Unknown' } } }
+  assert.deepEqual(invalidSpeakerReviewAnswers(questions, {}), ['relationship_s0'])
+  assert.deepEqual(invalidSpeakerReviewAnswers(questions, { relationship_s0: confidentDecision('other') }), ['relationship_s0'])
+  assert.deepEqual(invalidSpeakerReviewAnswers(questions, { relationship_s0: { choice: 'known_0', probabilities: { known_0: NaN }, confidence: 1 } }), ['relationship_s0'])
+  assert.deepEqual(invalidSpeakerReviewAnswers(questions, { relationship_s0: confidentDecision('no_clear_identity') }), [])
+})
+
+test('run-focused shadow review keeps context while leaving the live plan and answers untouched', () => {
+  const speakers = [{ id: 'ewan', name: 'Ewan' }, { id: 'tessa', name: 'Tessa' }]
+  const plan = buildSpeakerDecisionPlan('"Sacrifice."\n\nHe turns with the tray.\n\n"What are you sacrificing?"', speakers, false)
+  const answers: Record<string, SpeakerDecisionChoice> = { speech_s0: confidentDecision('no_clear_identity'), speech_s1: confidentDecision('no_clear_identity') }
+  const context = { previousMessages: [{ id: 'prior', role: 'user' as const, text: 'I turn to Ewan and mention sacrifice.' }], ghosts: [] }
+  const before = JSON.stringify({ plan, answers })
+  const shadowPlan = { ...plan, optionSpeakerIds: { ...plan.optionSpeakerIds } }
+  const shadowAnswers = { ...answers }
+  const review = buildRelationshipSpeakerReview(shadowPlan, shadowAnswers, context, null, { cardSpeakerId: null, targets: ['s0', 's1'], strategy: 'run' })
+  assert.ok(review.questions.relationship_s0)
+  assert.ok(review.questions.boundary_relation)
+  assert.ok(review.state.reviewedRuns!.length)
+  assert.equal(review.questions.scene_reference_s0, undefined)
+  applyRelationshipSpeakerReview(shadowPlan, shadowAnswers, { relationship_s0: confidentDecision('known_0') }, review.ghostOptions, null, null, true)
+  assert.equal(shadowAnswers.speech_s0.choice, 'known_0')
+  assert.equal(JSON.stringify({ plan, answers }), before)
+})
+
+test('scene references link Ewan to the tray without making a bystander the speaker', () => {
+  const content = '"Sacrifice."\n\nHe is ten paces off with the tray, and he turns halfway around.\n\n"What are you sacrificing?"\n\nSomebody behind him sidesteps the tray. He shifts without looking.\n\n"No, I know what you meant."'
+  const speakers = [{ id: 'npc:ewan', name: 'Ewan' }, { id: 'npc:tessa', name: 'Tessa' }, { id: USER_SPEAKER_ID, name: 'Ken' }]
+  const context = { previousMessages: [{ id: 'earlier', role: 'assistant' as const, text: 'Ewan picks up his tray.' }, { id: 'prior', role: 'user' as const, text: 'I turn to Ewan. "Sometimes you have to sacrifice for someone you like."' }], ghosts: [] }
+  const make = () => {
+    const plan = buildSpeakerDecisionPlan(content, speakers, false)
+    const answers: Record<string, SpeakerDecisionChoice> = { speech_s0: confidentDecision('no_clear_identity'), speech_s1: confidentDecision('no_clear_identity'), speech_s2: confidentDecision('no_clear_identity') }
+    const review = buildRelationshipSpeakerReview(plan, answers, context, null, { cardSpeakerId: null, targets: ['s0', 's1', 's2'] })
+    return { plan, answers, review }
+  }
+  const { plan, answers, review } = make()
+  assert.ok(review.questions.scene_reference_s0)
+  assert.ok(review.questions.scene_secondary_s1)
+  assert.ok(review.questions.scene_link_s0)
+  assert.match(review.state.sceneReferences!.find(item => item.speechId === 's0')!.narration, /tray/u)
+  assert.equal(review.state.previousMessages[1].role, 'user')
+  applyRelationshipSpeakerReview(plan, answers, {
+    relationship_s0: confidentDecision('no_clear_identity'),
+    scene_reference_s0: confidentDecision('known_0'),
+    scene_link_s0: confidentDecision('same_speaker'),
+    relationship_s1: confidentDecision('known_0'),
+    scene_reference_s2: confidentDecision('known_1'),
+    scene_link_s2: confidentDecision('different_person'),
+  }, review.ghostOptions, null, null, true)
+  assert.equal(answers.speech_s0.choice, 'known_0')
+  assert.equal(answers.speech_s1.choice, 'known_0')
+  assert.equal(answers.speech_s2.choice, 'no_clear_identity')
+  assert.ok(answers.scene_applied_s0)
+  const resolved = resolveSpeakerDecisionSegments(content, plan, answers, speakers, { isUserMessage: false, cardSpeakerId: null, historicalSpeakerId: null, evidenceOnly: true, includeDebug: true })
+  assert.equal(resolved.find(segment => segment.text === 'Sacrifice.')?.speakerId, 'npc:ewan')
+  assert.ok(resolved.find(segment => segment.text === 'Sacrifice.')?.debugPath?.some(item => item.includes('jev-scene-link')))
+  const unlinked = make()
+  applyRelationshipSpeakerReview(unlinked.plan, unlinked.answers, { scene_reference_s0: confidentDecision('known_0'), scene_link_s0: confidentDecision('no_clear_identity') }, unlinked.review.ghostOptions, null, null, true)
+  assert.equal(unlinked.answers.speech_s0.choice, 'no_clear_identity')
+  const contradictory = make()
+  applyRelationshipSpeakerReview(contradictory.plan, contradictory.answers, { relationship_s0: confidentDecision('known_1'), scene_reference_s0: confidentDecision('known_0'), scene_link_s0: confidentDecision('same_speaker') }, contradictory.review.ghostOptions, null, null, true)
+  assert.equal(contradictory.answers.speech_s0.choice, 'known_1')
+  assert.equal(contradictory.answers.scene_applied_s0, undefined)
+})
+
+test('cross-message review links a user exchange to each quote in the Ewan opening run', () => {
+  const speakers = [{ id: 'npc:ewan', name: 'Ewan' }, { id: 'npc:tessa', name: 'Tessa' }, { id: USER_SPEAKER_ID, name: 'Ken' }, { id: 'unconfigured:halloran', name: 'Halloran' }]
+  const content = '"Sacrifice."\n\nHe is ten paces off with the tray and turns halfway around.\n\n"What are you sacrificing? The noodles?"\n\nSomebody behind him has to sidestep the tray, and he shifts without looking.\n\n"No, I know what you meant."\n\nHe lifts one shoulder.\n\n"Whatever. Text her."'
+  const plan = buildSpeakerDecisionPlan(content, speakers, false)
+  const context = { previousMessages: [{ id: 'a', role: 'assistant' as const, text: 'Ewan gets the tray up and stands.' }, { id: 'u', role: 'user' as const, text: 'I turn to Ewan again. "Sometimes you gotta sacrifice a little for someone you like, you know?"' }], ghosts: [] }
+  const answers: Record<string, SpeakerDecisionChoice> = { speech_s0: confidentDecision('known_2'), speech_s1: confidentDecision('no_clear_identity'), speech_s2: confidentDecision('no_clear_identity'), speech_s3: confidentDecision('no_clear_identity') }
+  const review = buildRelationshipSpeakerReview(plan, answers, context, null, { cardSpeakerId: null, targets: ['s1', 's2', 's3'] })
+  assert.equal(review.state.boundaryExchange!.role, 'user')
+  assert.ok(review.questions.boundary_relation)
+  assert.ok(review.questions.boundary_addressee)
+  for (const speech of plan.state.speeches) assert.ok(review.questions[`relationship_${speech.id}`])
+  assert.match(review.questions.relationship_s0.instructions, /recipient of the preceding relevant utterance/u)
+  assert.match(review.questions.relationship_s0.instructions, /do not assume the addressee responds/u)
+  applyRelationshipSpeakerReview(plan, answers, { boundary_relation: confidentDecision('response'), boundary_addressee: confidentDecision('known_0'), relationship_s0: confidentDecision('known_0'), relationship_s1: confidentDecision('known_0'), relationship_s2: confidentDecision('known_0'), relationship_s3: confidentDecision('known_0') }, review.ghostOptions, null, null, true)
+  const resolved = resolveSpeakerDecisionSegments(content, plan, answers, speakers, { isUserMessage: false, cardSpeakerId: null, historicalSpeakerId: null, evidenceOnly: true, includeDebug: true })
+  assert.deepEqual(resolved.filter(segment => segment.speakerId !== null).map(segment => segment.speakerId), ['npc:ewan', 'npc:ewan', 'npc:ewan', 'npc:ewan'])
+  assert.ok(resolved[0].debugPath?.some(item => item.startsWith('jev-boundary-relation-choice:response')))
+})
+
+test('opening re-read uses bounded prior dialogue and only changes supported unresolved targets', () => {
+  const speakers = [{ id: 'npc:ewan', name: 'Ewan' }, { id: USER_SPEAKER_ID, name: 'Ken' }]
+  const message = '"Sacrifice."\n\nHe turns with the tray.\n\n"What are you sacrificing?"\n\nThe phone buzzes.\n\n"A different conversation."'
+  const plan = buildSpeakerDecisionPlan(message, speakers, false)
+  const answers: Record<string, SpeakerDecisionChoice> = { speech_s0: confidentDecision('known_1'), speech_s1: confidentDecision('no_clear_identity'), global_uncertain_s0: confidentDecision('no_clear_identity'), global_uncertain_s1: confidentDecision('no_clear_identity') }
+  const context = { previousMessages: [{ id: 'old', role: 'assistant' as const, text: 'Old context.' }, { id: 'prior', role: 'assistant' as const, text: 'Ewan takes his tray.' }, { id: 'user', role: 'user' as const, text: 'I turn to Ewan. "Sometimes you sacrifice."' }], ghosts: [] }
+  const review = buildOpeningSpeakerReview(plan, answers, context, null)!
+  assert.deepEqual(review.state.previousMessages.map(item => item.id), ['prior', 'user'])
+  const before = JSON.stringify({ review, answers })
+  const boundaryShadow = buildBoundaryExchangeShadowReview(review)
+  assert.ok(boundaryShadow.questions.boundary_s1)
+  assert.ok(boundaryShadow.questions.retrospective_s1)
+  assert.match(boundaryShadow.questions.retrospective_s1.instructions, /self-introductions/u)
+  assert.match(boundaryShadow.questions.boundary_s1.instructions, /across the message boundary/u)
+  assert.deepEqual(boundaryShadow.state.previousMessages.map(item => item.id), ['prior', 'user'])
+  assert.equal(boundaryShadow.expectedControls.boundary_control_interruption, 'rowan')
+  assert.equal(boundaryShadow.expectedControls.boundary_control_unclear, 'no_clear_identity')
+  assert.equal(boundaryShadow.expectedControls.retrospective_control_introduction, 'mira')
+  assert.equal(boundaryShadow.expectedControls.retrospective_control_interruption, 'rowan')
+  assert.equal(boundaryShadow.expectedControls.retrospective_control_unclear, 'no_clear_identity')
+  assert.equal('expectedControls' in boundaryShadow.state, false)
+  assert.equal(JSON.stringify({ review, answers }), before)
+  assert.ok(review.questions.relationship_s0)
+  assert.ok(review.questions.relationship_s1)
+  assert.match(review.questions.relationship_s0.instructions, /not the user who authored/u)
+  applyRelationshipSpeakerReview(plan, answers, { relationship_s0: confidentDecision('known_0'), relationship_s1: confidentDecision('known_0') }, review.ghostOptions, null, null, true)
+  assert.equal(answers.global_uncertain_s0, undefined)
+  assert.equal(answers.global_uncertain_s1, undefined)
+  assert.equal(answers.speech_s0.choice, 'known_0')
+  assert.equal(answers.speech_s1.choice, 'known_0')
+  assert.equal(buildOpeningSpeakerReview(plan, answers, context, null), null)
+  const unresolved = { ...answers, speech_s1: confidentDecision('no_clear_identity'), global_uncertain_s1: confidentDecision('no_clear_identity') }
+  applyRelationshipSpeakerReview(plan, unresolved, { relationship_s1: { choice: 'known_0', probabilities: { known_0: 0.4, no_clear_identity: 0.6 }, confidence: 0.4 } }, {}, null, null, true)
+  assert.ok(unresolved.global_uncertain_s1)
+  assert.equal(buildOpeningSpeakerReview(plan, unresolved, { previousMessages: [], ghosts: [] }, null), null)
+})
+
+test('retrospective shadow retains later self-identification in the bounded opening without applying answers', () => {
+  const speakers = [{ id: 'npc:tessa', name: 'Tessa' }, { id: USER_SPEAKER_ID, name: 'Ken' }]
+  const plan = buildSpeakerDecisionPlan('"Bishop. Third floor."\n\nShe balances her tray. "It is noisy."\n\n"Tessa. Tessa Doyle." She sits down.', speakers, false)
+  const answers: Record<string, SpeakerDecisionChoice> = { speech_s0: confidentDecision('no_clear_identity'), global_uncertain_s0: confidentDecision('no_clear_identity') }
+  const review = buildOpeningSpeakerReview(plan, answers, { previousMessages: [{ id: 'prior', role: 'user' as const, text: 'I ask her, "Where do you live?"' }], ghosts: [] }, null)!
+  const before = JSON.stringify(answers)
+  const shadow = buildBoundaryExchangeShadowReview(review)
+  assert.match(shadow.state.message, /Tessa Doyle/u)
+  assert.ok(shadow.questions.retrospective_s0)
+  assert.equal(JSON.stringify(answers), before)
+  assert.equal('expectedControls' in shadow.state, false)
+})
+
+test('agreement retains a clear first-pass identity without requiring override thresholds', () => {
+  const speakers = [{ id: 'npc:zadie', name: 'Zadie' }, { id: 'npc:tessa', name: 'Tessa' }]
+  const message = '"Dinner is handled."'
+  const make = () => ({ plan: buildSpeakerDecisionPlan(message, speakers, false), answers: { speech_s0: { choice: 'known_0', probabilities: { known_0: 0.93, known_1: 0.05, no_clear_identity: 0.02 }, confidence: 0.92 } } as Record<string, SpeakerDecisionChoice> })
+  const agreeing = make()
+  applyRelationshipSpeakerReview(agreeing.plan, agreeing.answers, { relationship_s0: { choice: 'known_0', probabilities: { known_0: 0.81, known_1: 0.16, no_clear_identity: 0.03 }, confidence: 0.80 } }, {}, null, null, true)
+  assert.ok(agreeing.answers.relationship_confirmed_s0)
+  assert.equal(agreeing.answers.global_uncertain_s0, undefined)
+  const segments = resolveSpeakerDecisionSegments(message, agreeing.plan, agreeing.answers, speakers, { isUserMessage: false, cardSpeakerId: null, historicalSpeakerId: null, evidenceOnly: true, includeDebug: true })
+  assert.equal(segments[0].speakerId, 'npc:zadie')
+  assert.ok(segments[0].debugPath?.includes('jev-relationship-review:accepted first-pass identity confirmed'))
+  const weak = make()
+  applyRelationshipSpeakerReview(weak.plan, weak.answers, { relationship_s0: { choice: 'known_0', probabilities: { known_0: 0.50, known_1: 0.30, no_clear_identity: 0.20 }, confidence: 0.39 } }, {}, null, null, true)
+  assert.ok(weak.answers.global_uncertain_s0)
+  const weakAgreement = make()
+  weakAgreement.answers.speech_s0 = { choice: 'known_0', probabilities: { known_0: 0.64, known_1: 0.32, no_clear_identity: 0.04 }, confidence: 0.60 }
+  applyRelationshipSpeakerReview(weakAgreement.plan, weakAgreement.answers, { relationship_s0: { choice: 'known_0', probabilities: { known_0: 0.51, known_1: 0.43, no_clear_identity: 0.06 }, confidence: 0.48 } }, {}, null, null, true)
+  assert.ok(weakAgreement.answers.relationship_confirmed_s0)
+  assert.equal(weakAgreement.answers.global_uncertain_s0, undefined)
+  const zadieLog = make()
+  zadieLog.answers.speech_s0 = { choice: 'known_0', probabilities: { known_0: 0.70, known_1: 0.25, no_clear_identity: 0.05 }, confidence: 0.66 }
+  applyRelationshipSpeakerReview(zadieLog.plan, zadieLog.answers, { relationship_s0: { choice: 'known_0', probabilities: { known_0: 0.49, known_1: 0.41, no_clear_identity: 0.10 }, confidence: 0.45 } }, {}, null, null, true)
+  assert.ok(zadieLog.answers.relationship_confirmed_s0)
+  assert.equal(zadieLog.answers.global_uncertain_s0, undefined)
+  const zadieSecond = make()
+  zadieSecond.answers.speech_s0 = { choice: 'known_0', probabilities: { known_0: 0.60, known_1: 0.24, no_clear_identity: 0.16 }, confidence: 0.55 }
+  applyRelationshipSpeakerReview(zadieSecond.plan, zadieSecond.answers, { relationship_s0: { choice: 'known_0', probabilities: { known_0: 0.45, known_1: 0.31, no_clear_identity: 0.24 }, confidence: 0.41 } }, {}, null, null, true)
+  assert.ok(zadieSecond.answers.relationship_confirmed_s0)
+  const conflict = make()
+  applyRelationshipSpeakerReview(conflict.plan, conflict.answers, { relationship_s0: { choice: 'known_1', probabilities: { known_1: 0.75, known_0: 0.20, no_clear_identity: 0.05 }, confidence: 0.70 } }, {}, null, null, true)
+  assert.ok(conflict.answers.global_uncertain_s0)
+  assert.equal(conflict.answers.relationship_confirmed_s0, undefined)
+  const userPlan = buildSpeakerDecisionPlan('"Sacrifice."', [{ id: USER_SPEAKER_ID, name: 'Ken' }, { id: 'npc:ewan', name: 'Ewan' }], false)
+  const userAnswers: Record<string, SpeakerDecisionChoice> = { speech_s0: { choice: 'known_0', probabilities: { known_0: 0.75, known_1: 0.1, no_clear_identity: 0.15 }, confidence: 0.72 } }
+  applyRelationshipSpeakerReview(userPlan, userAnswers, { relationship_s0: { choice: 'known_0', probabilities: { known_0: 0.51, known_1: 0.16, no_clear_identity: 0.33 }, confidence: 0.48 } }, {}, null, null, true)
+  assert.ok(userAnswers.global_uncertain_s0)
+  assert.equal(userAnswers.relationship_confirmed_s0, undefined)
+})
+
+test('contextual persona reconciliation reviews existing and newly introduced user assignments', () => {
+  const speakers = [{ id: 'npc:ewan', name: 'Ewan' }, { id: USER_SPEAKER_ID, name: 'Ken' }]
+  const message = '"Sacrifice."\n\nHe turns with the tray.\n\n"The noodles?"\n\n"No, I know what you meant."'
+  const plan = buildSpeakerDecisionPlan(message, speakers, false)
+  const context = { previousMessages: [{ id: 'u', role: 'user' as const, text: 'I turn to Ewan. "Sometimes you sacrifice."' }], ghosts: [] }
+  const answers: Record<string, SpeakerDecisionChoice> = { speech_s0: confidentDecision('known_1'), speech_s1: confidentDecision('known_1'), speech_s2: confidentDecision('known_0'), relationship_original_s1: confidentDecision('no_clear_identity'), relationship_review_s1: confidentDecision('known_1'), relationship_applied_s1: confidentDecision('known_1'), relationship_continuity_s1: confidentDecision('known_1') }
+  const review = buildContextualUserReconciliation(plan, answers, context)
+  assert.ok(review.questions.persona_check_s0)
+  assert.ok(review.questions.persona_check_s1)
+  assert.equal(review.questions.persona_check_s2, undefined)
+  applyContextualUserReconciliation(plan, answers, { persona_check_s0: confidentDecision('no_clear_identity'), persona_check_s1: confidentDecision('other') }, review.questions)
+  assert.ok(answers.global_uncertain_s0)
+  assert.ok(answers.global_uncertain_s1)
+  assert.equal(answers.speech_s0.choice, 'no_clear_identity')
+  assert.equal(answers.relationship_continuity_s1, undefined)
+  answers.persona_phase_complete = { choice: 'complete', probabilities: {}, confidence: 0 }
+  applyRelationshipSpeakerReview(plan, answers, { relationship_s0: confidentDecision('known_0', 0.67, 0.65), relationship_s1: confidentDecision('known_0', 0.67, 0.65) }, {}, null, null, true)
+  assert.equal(answers.speech_s0.choice, 'known_0')
+  assert.equal(answers.speech_s1.choice, 'known_0')
+  const late = buildSpeakerDecisionPlan('"Who said that?"', speakers, false)
+  const lateAnswers: Record<string, SpeakerDecisionChoice> = { speech_s0: confidentDecision('no_clear_identity'), persona_phase_complete: { choice: 'complete', probabilities: {}, confidence: 0 } }
+  applyRelationshipSpeakerReview(late, lateAnswers, { relationship_s0: confidentDecision('known_1') }, {}, null, null, true)
+  assert.ok(lateAnswers.global_uncertain_s0)
+  const genuine = buildSpeakerDecisionPlan('"I agree," Ken says.', speakers, false)
+  const genuineAnswers: Record<string, SpeakerDecisionChoice> = { speech_s0: confidentDecision('known_1') }
+  const genuineReview = buildContextualUserReconciliation(genuine, genuineAnswers, context)
+  applyContextualUserReconciliation(genuine, genuineAnswers, { persona_check_s0: confidentDecision('user') }, genuineReview.questions)
+  assert.ok(genuineAnswers.persona_confirmed_s0)
+  assert.equal(genuineAnswers.global_uncertain_s0, undefined)
+  const attributedOther = buildSpeakerDecisionPlan('"I agree," Ewan says.', speakers, false)
+  const wrongPersona: Record<string, SpeakerDecisionChoice> = { speech_s0: confidentDecision('known_1') }
+  const attributedReview = buildContextualUserReconciliation(attributedOther, wrongPersona, context)
+  applyContextualUserReconciliation(attributedOther, wrongPersona, { persona_check_s0: confidentDecision('user') }, attributedReview.questions)
+  assert.ok(wrongPersona.global_uncertain_s0)
+  assert.equal(wrongPersona.persona_confirmed_s0, undefined)
+  assert.equal(buildContextualUserReconciliation(buildSpeakerDecisionPlan('"I agree."', speakers, true), genuineAnswers, context).questions.persona_check_s0, undefined)
+})
+
+test('replays opening user-confusion and later text-message agreement without mixing identities', () => {
+  const speakers = [{ id: 'npc:ewan', name: 'Ewan' }, { id: 'npc:zadie', name: 'Zadie' }, { id: USER_SPEAKER_ID, name: 'Ken' }]
+  const message = '"Sacrifice."\n\nHe turns with the tray.\n\n"The noodles?"\n\n"No, I know what you meant."\n\nHe lifts one shoulder.\n\n"Whatever. Text her."\n\nHours later, a phone buzzes.\n\n"Do not bring food."\n\n"Dinner is handled."'
+  const plan = buildSpeakerDecisionPlan(message, speakers, false)
+  const context = { previousMessages: [{ id: 'prior', role: 'user' as const, text: 'I turn to Ewan. "Sometimes you sacrifice."' }], ghosts: [] }
+  const answers: Record<string, SpeakerDecisionChoice> = {
+    speech_s0: confidentDecision('known_2', 0.74, 0.71), speech_s1: confidentDecision('no_clear_identity'),
+    speech_s2: confidentDecision('known_0'), speech_s3: confidentDecision('known_0'),
+    speech_s4: confidentDecision('known_1', 0.70, 0.66), speech_s5: { choice: 'known_1', probabilities: { known_1: 0.60, known_2: 0.24, no_clear_identity: 0.16 }, confidence: 0.55 },
+  }
+  snapshotSpeakerFirstPass(plan, answers)
+  applyRelationshipSpeakerReview(plan, answers, {
+    relationship_s0: confidentDecision('known_2', 0.54, 0.51),
+    relationship_s1: confidentDecision('known_2', 0.56, 0.53),
+    relationship_s4: { choice: 'known_1', probabilities: { known_1: 0.49, known_2: 0.41, no_clear_identity: 0.1 }, confidence: 0.45 },
+    relationship_s5: { choice: 'known_1', probabilities: { known_1: 0.45, known_2: 0.31, no_clear_identity: 0.24 }, confidence: 0.41 },
+  }, {}, null, null, true)
+  const personaReview = buildContextualUserReconciliation(plan, answers, context)
+  applyContextualUserReconciliation(plan, answers, { persona_check_s0: confidentDecision('no_clear_identity'), persona_check_s1: confidentDecision('other') }, personaReview.questions)
+  answers.persona_phase_complete = { choice: 'complete', probabilities: {}, confidence: 0 }
+  assert.ok(buildOpeningSpeakerReview(plan, answers, context, null)?.questions.relationship_s0)
+  applyRelationshipSpeakerReview(plan, answers, { relationship_s0: confidentDecision('known_0', 0.67, 0.65), relationship_s1: confidentDecision('known_0', 0.67, 0.65) }, {}, null, null, true)
+  const segments = resolveSpeakerDecisionSegments(message, plan, answers, speakers, { isUserMessage: false, cardSpeakerId: null, historicalSpeakerId: null, evidenceOnly: true, includeDebug: true })
+  assert.deepEqual(segments.filter(segment => segment.speakerId !== null).map(segment => segment.speakerId), ['npc:ewan', 'npc:ewan', 'npc:ewan', 'npc:ewan', 'npc:zadie', 'npc:zadie'])
+  assert.ok(segments[0].debugPath?.some(step => step === 'jev-first-pass-speech-normalized:__chat_voice_user__'))
+  assert.equal(speakerAssignmentSourceFromTrace(segments[0].debugPath ?? [], false), 'contextual-review')
+})
+
+test('opening exchange review fills uncertain lines only for a strongly supported coherent speaker', () => {
+  const speakers = [{ id: 'npc:ewan', name: 'Ewan' }, { id: USER_SPEAKER_ID, name: 'Ken' }]
+  const plan = buildSpeakerDecisionPlan('"Sacrifice."\n\nHe turns with the tray.\n\n"The noodles?"\n\n"No, I know what you meant."', speakers, false)
+  const context = { previousMessages: [{ id: 'prior', role: 'user' as const, text: 'I turn to Ewan. "Sometimes you sacrifice."' }], ghosts: [] }
+  const make = () => ({ speech_s0: confidentDecision('known_1'), speech_s1: confidentDecision('no_clear_identity'), speech_s2: confidentDecision('known_0'), global_uncertain_s0: confidentDecision('no_clear_identity'), global_uncertain_s1: confidentDecision('no_clear_identity') } as Record<string, SpeakerDecisionChoice>)
+  const answers = make()
+  const review = buildOpeningSpeakerReview(plan, answers, context, null)!
+  assert.ok(review.questions.opening_exchange_pattern)
+  assert.ok(review.questions.opening_exchange_speaker)
+  const supported = { opening_exchange_pattern: confidentDecision('single_speaker'), opening_exchange_speaker: confidentDecision('known_0') }
+  applyOpeningExchangeReview(plan, answers, supported)
+  assert.equal(answers.speech_s0.choice, 'known_0')
+  assert.equal(answers.speech_s1.choice, 'known_0')
+  assert.equal(answers.global_uncertain_s0, undefined)
+  assert.ok(answers.relationship_exchange_s0)
+  const mixed = make()
+  applyOpeningExchangeReview(plan, mixed, { ...supported, opening_exchange_pattern: confidentDecision('multiple_speakers') })
+  assert.ok(mixed.global_uncertain_s0)
+  assert.equal(mixed.opening_pattern_s0.choice, 'multiple_speakers')
+  const weak = make()
+  applyOpeningExchangeReview(plan, weak, { ...supported, opening_exchange_speaker: { choice: 'known_0', probabilities: { known_0: 0.60, known_1: 0.40 }, confidence: 0.55 } })
+  assert.ok(weak.global_uncertain_s0)
+  const conflict = make()
+  conflict.speech_s2 = confidentDecision('known_1')
+  applyOpeningExchangeReview(plan, conflict, supported)
+  assert.ok(conflict.global_uncertain_s0)
+  const perSpeechConflict = make()
+  applyOpeningExchangeReview(plan, perSpeechConflict, { ...supported, relationship_s1: confidentDecision('known_1') })
+  assert.ok(perSpeechConflict.global_uncertain_s1)
+})
+
+test('opening review excludes the following scene and its dialogue from all focused state', () => {
+  const speakers = [{ id: 'npc:ewan', name: 'Ewan' }, { id: USER_SPEAKER_ID, name: 'Ken' }]
+  const content = '"Sacrifice."\n\nHe turns with the tray.\n\n"The noodles?"\n\nHours later, another room. "An unrelated message."'
+  const plan = buildSpeakerDecisionPlan(content, speakers, false)
+  const answers: Record<string, SpeakerDecisionChoice> = { speech_s0: confidentDecision('no_clear_identity'), global_uncertain_s0: confidentDecision('no_clear_identity') }
+  const context = { previousMessages: [{ id: 'prior', role: 'user' as const, text: 'I turn to Ewan. "Sometimes you sacrifice."' }], ghosts: [] }
+  const review = buildOpeningSpeakerReview(plan, answers, context, null)!
+  assert.deepEqual(review.state.speeches.map(speech => speech.id), ['s0', 's1'])
+  assert.doesNotMatch(review.state.message, /unrelated message/u)
+  assert.ok(review.state.runs.every(run => run.speechIds.every(id => id === 's0' || id === 's1')))
+  assert.equal(review.state.boundaryEvidence?.quotation, 'Sometimes you sacrifice.')
+})
+
+test('opening review scopes the tray exchange separately from incoming phone messages', () => {
+  const speakers = [{ id: 'npc:ewan', name: 'Ewan' }, { id: 'npc:zadie', name: 'Zadie' }, { id: USER_SPEAKER_ID, name: 'Ken' }]
+  const message = '"Sacrifice."\n\nHe is ten paces off with the tray balanced on one palm, and he turns halfway around.\n\n"What are you sacrificing? The noodles?"\n\nSomebody behind him sidesteps the tray, and he shifts without looking.\n\n"No, I know what you meant." A beat, and his jaw works over something he cannot say. "You do not take a little off the top and keep the rest."\n\nHe lifts one shoulder.\n\n"Whatever. Text her."\n\nHe goes. The tray goes through the window, and there is a crash from the other side of it, and then he is out the side door and the door swings twice and settles.\n\nThe phone buzzes in Ken’s hand.\n\n"Do not bring food."\n\n"Dinner is handled."'
+  const plan = buildSpeakerDecisionPlan(message, speakers, false)
+  const context = { previousMessages: [{ id: 'user', role: 'user' as const, text: 'I turn to Ewan again. "Sometimes you gotta sacrifice a little for someone you like, you know?"' }], ghosts: [] }
+  const answers: Record<string, SpeakerDecisionChoice> = { speech_s0: confidentDecision('no_clear_identity'), global_uncertain_s0: confidentDecision('no_clear_identity') }
+  const review = buildOpeningSpeakerReview(plan, answers, context, null)!
+  assert.deepEqual(review.state.speeches.map(item => item.id), ['s0', 's1', 's2', 's3', 's4'])
+  assert.doesNotMatch(review.state.message, /Do not bring food|Dinner is handled/u)
+  assert.match(review.state.boundaryEvidence?.quotation ?? '', /sacrifice a little/u)
+  assert.match(review.state.boundaryEvidence?.lead ?? '', /turn to Ewan/u)
+})
+
+test('backward links require a strong independent same-speaker answer and a validated later anchor', () => {
+  const speakers = [{ id: 'npc:ewan', name: 'Ewan' }, { id: USER_SPEAKER_ID, name: 'Ken' }]
+  const message = '"Sacrifice."\n\nHe turns with the tray.\n\n"What are you sacrificing?"\n\n"No, I know what you meant."'
+  const plan = buildSpeakerDecisionPlan(message, speakers, false)
+  const context = { previousMessages: [{ id: 'user', role: 'user' as const, text: 'I turn to Ewan. "Sometimes you sacrifice."' }], ghosts: [] }
+  const make = () => ({ speech_s0: confidentDecision('known_1'), speech_s1: confidentDecision('no_clear_identity'), speech_s2: confidentDecision('known_0'), global_uncertain_s0: confidentDecision('no_clear_identity'), global_uncertain_s1: confidentDecision('no_clear_identity'), relationship_applied_s2: confidentDecision('known_0') } as Record<string, SpeakerDecisionChoice>)
+  const answers = make()
+  const review = buildOpeningBacklinkReview(plan, answers, context, null)!
+  assert.equal(review.links.backlink_s0.anchorId, 's2')
+  assert.equal(review.links.backlink_s1.identity, 'npc:ewan')
+  assert.equal(review.state.boundaryEvidence?.quotation, 'Sometimes you sacrifice.')
+  assert.equal(review.state.boundaryEvidence?.role, 'user')
+  assert.match(review.state.boundaryEvidence?.lead ?? '', /turn to Ewan/u)
+  assert.equal(review.state.pairEvidence.backlink_s0.target, 'Sacrifice.')
+  assert.equal(review.state.pairEvidence.backlink_s0.anchor, 'No, I know what you meant.')
+  assert.match(review.state.pairEvidence.backlink_s0.between, /tray/u)
+  assert.match(review.questions.backlink_s0.instructions, /Both quotations are from the CURRENT message/u)
+  applyOpeningBacklinkReview(plan, answers, { backlink_s0: confidentDecision('same'), backlink_s1: confidentDecision('different_or_unclear') }, review.links)
+  assert.equal(answers.speech_s0.choice, 'known_0')
+  assert.equal(answers.global_uncertain_s0, undefined)
+  assert.ok(answers.global_uncertain_s1)
+  const weak = make()
+  applyOpeningBacklinkReview(plan, weak, { backlink_s0: { choice: 'same', probabilities: { same: 0.70, different_or_unclear: 0.30 }, confidence: 0.7 } }, review.links)
+  assert.ok(weak.global_uncertain_s0)
+  const stale = make()
+  stale.speech_s2 = confidentDecision('known_1')
+  applyOpeningBacklinkReview(plan, stale, { backlink_s0: confidentDecision('same') }, review.links)
+  assert.ok(stale.global_uncertain_s0)
+  const unvalidated = make()
+  delete unvalidated.relationship_applied_s2
+  assert.equal(buildOpeningBacklinkReview(plan, unvalidated, context, null), null)
+  const changedScene = buildSpeakerDecisionPlan('"First."\n\nHours later, the room is empty.\n\n"Second," Ewan says.', speakers, false)
+  const sceneAnswers: Record<string, SpeakerDecisionChoice> = { speech_s0: confidentDecision('no_clear_identity'), global_uncertain_s0: confidentDecision('no_clear_identity'), speech_s1: confidentDecision('known_0'), relationship_applied_s1: confidentDecision('known_0') }
+  assert.equal(buildOpeningBacklinkReview(changedScene, sceneAnswers, context, null), null)
+  const explicitlyDifferent = buildSpeakerDecisionPlan('"First," Ken says.\n\n"Second," Ewan says.', speakers, false)
+  assert.equal(buildOpeningBacklinkReview(explicitlyDifferent, sceneAnswers, context, null), null)
+})
+
+test('global TTS connection preference overrides the host default without per-chat input', () => {
+  const connections = [{ id: 'fish', is_default: true }, { id: 'other' }]
+  assert.equal(globalTtsConnectionPreference({ ttsConnectionId: 'fish' }), 'fish')
+  assert.equal(globalTtsConnectionPreference({ chatVoiceTtsConnectionId: 'other', ttsConnectionId: 'fish' }), 'other')
+  assert.equal(globalTtsConnectionPreference({ chatVoiceTtsConnectionId: '', ttsConnectionId: 'other' }), '')
+  assert.equal(resolveGlobalTtsConnection('', connections), 'fish')
+  assert.equal(resolveGlobalTtsConnection('missing', connections), 'missing')
+  assert.equal(resolveGlobalTtsConnection('other', connections), 'other')
+  assert.equal(resolveGlobalTtsConnection('', []), '')
+})
+
+test('standard speaker review enables the production pipeline without comparison calls', () => {
+  assert.deepEqual(standardSpeakerReviewPolicy(), { runReview: true, bestAvailableSpeaker: true, shadowEvaluation: false, focusedOpeningFallback: false })
+})
+
+test('autoplay selects successful new-message generation completions in the active chat', () => {
+  const event = { chatId: 'chat', generationId: 'gen', messageId: 'new', content: 'Finished text', generationType: 'normal' }
+  assert.deepEqual(autoplayGenerationEvent(event, 'chat'), { chatId: 'chat', generationId: 'gen', messageId: 'new' })
+  assert.deepEqual(autoplayGenerationEvent({ ...event, generationType: undefined }, 'chat'), { chatId: 'chat', generationId: 'gen', messageId: 'new' })
+  assert.equal(autoplayGenerationEvent(event, 'another-chat'), null)
+  assert.equal(autoplayGenerationEvent({ ...event, error: 'generation failed' }, 'chat'), null)
+  assert.equal(autoplayGenerationEvent({ ...event, messageId: undefined }, 'chat'), null)
+  assert.equal(autoplayGenerationEvent({ ...event, generationId: '' }, 'chat'), null)
+  assert.equal(autoplayGenerationEvent({ ...event, backgroundSwipe: true }, 'chat'), null)
+  for (const generationType of ['continue', 'regenerate', 'swipe', 'impersonate']) assert.equal(autoplayGenerationEvent({ ...event, generationType }, 'chat'), null)
+  const generations = new Set<string>()
+  const messages = new Set<string>()
+  assert.equal(claimAutoplayGeneration(event, generations, messages), true)
+  assert.equal(claimAutoplayGeneration(event, generations, messages), false)
+  assert.equal(claimAutoplayGeneration({ ...event, generationId: 'retry' }, generations, messages), false)
+  assert.equal(claimAutoplayGeneration({ ...event, chatId: 'other' }, generations, messages), true)
+})
+
+test('playback controls follow shared playback state, including menus rendered later', () => {
+  class FakeButton {
+    dataset: Record<string, string> = {}
+    attributes = new Map<string, string>()
+    writes = 0
+    constructor(public messageId: string, private html: string, title: string) { this.attributes.set('title', title) }
+    get innerHTML() { return this.html }
+    set innerHTML(value: string) { this.writes++; this.html = value }
+    get title() { return this.attributes.get('title') ?? '' }
+    set title(value: string) { this.attributes.set('title', value) }
+    getAttribute(name: string) { return this.attributes.get(name) ?? null }
+    setAttribute(name: string, value: string) { this.attributes.set(name, value) }
+    removeAttribute(name: string) { this.attributes.delete(name) }
+    querySelector(selector: string) { return (selector === ':scope > span' ? this.html.includes('<span>') : selector === '[data-chat-voice-stop]' && this.html.includes('data-chat-voice-stop')) ? {} : null }
+  }
+  const bubble = new FakeButton('new', '<svg></svg>', 'Play audio')
+  const other = new FakeButton('old', '<svg></svg>', 'Play other')
+  const menu = new FakeButton('new', '<svg></svg><span>Play audio</span>', 'Play audio')
+  const states = new Map<HTMLButtonElement, PlaybackButtonState>()
+  const native = (button: FakeButton) => button as unknown as HTMLButtonElement
+  const id = (button: HTMLButtonElement) => (button as unknown as FakeButton).messageId
+  const icon = '<svg data-chat-voice-stop="true"></svg>'
+  syncPlaybackButtons([native(bubble), native(other)], 'new', id, states, icon)
+  assert.equal(bubble.dataset.playing, 'true')
+  assert.equal(bubble.getAttribute('aria-label'), 'Stop custom voice playback')
+  assert.equal(other.dataset.playing, undefined)
+  const writes = bubble.writes
+  syncPlaybackButtons([native(bubble), native(other), native(menu)], 'new', id, states, icon)
+  assert.equal(bubble.writes, writes)
+  assert.equal(menu.dataset.playing, 'true')
+  assert.match(menu.innerHTML, /Stop custom voice playback/u)
+  bubble.innerHTML = '<svg></svg>' // The host re-rendered the existing control.
+  syncPlaybackButtons([native(bubble), native(other), native(menu)], 'new', id, states, icon)
+  assert.match(bubble.innerHTML, /data-chat-voice-stop/u)
+  syncPlaybackButtons([native(bubble), native(other), native(menu)], null, id, states, icon)
+  assert.equal(bubble.innerHTML, '<svg></svg>')
+  assert.equal(bubble.title, 'Play audio')
+  assert.equal(bubble.getAttribute('aria-pressed'), null)
+  assert.equal(menu.innerHTML, '<svg></svg><span>Play audio</span>')
+  assert.equal(states.size, 0)
+})
+
+test('automatic casting defaults on and autoplay requires explicit opt-in', () => {
+  assert.deepEqual(readAutomaticVoicePreferences({}), { autoVoiceCasting: true, autoPlayback: false })
+  assert.deepEqual(readAutomaticVoicePreferences({ chatVoiceAutoCasting: false, chatVoiceAutoPlayback: true }), { autoVoiceCasting: false, autoPlayback: true })
+  assert.deepEqual(readAutomaticVoicePreferences({ chatVoiceAutoCasting: true, chatVoiceAutoPlayback: 'true' }), { autoVoiceCasting: true, autoPlayback: false })
+})
+
+test('immediate named voice attribution anchors the preceding quote but not an introduced next quote', () => {
+  const speakers = [{ id: 'unconfigured:maeve', name: 'Maeve' }, { id: 'unconfigured:erin', name: 'Erin' }, { id: USER_SPEAKER_ID, name: 'Ken' }]
+  const text = '"Decided what?"\n\nMaeve’s voice comes from the other side of Erin, flat and absolutely awake.\n\n"Whether I sleep in my boots."'
+  const plan = buildSpeakerDecisionPlan(text, speakers, false)
+  const answers: Record<string, SpeakerDecisionChoice> = { speech_s0: confidentDecision('known_1'), global_uncertain_s0: confidentDecision('no_clear_identity') }
+  applyExplicitPostQuoteVoiceAttributions(plan, answers)
+  assert.equal(answers.speech_s0.choice, 'known_0')
+  assert.ok(answers.explicit_voice_attribution_s0)
+  assert.equal(answers.global_uncertain_s0, undefined)
+  const nextQuote = buildSpeakerDecisionPlan('"Hello."\n\nMaeve’s voice comes over the phone. "I am here."', speakers, false)
+  const unchanged: Record<string, SpeakerDecisionChoice> = { speech_s0: confidentDecision('known_1') }
+  applyExplicitPostQuoteVoiceAttributions(nextQuote, unchanged)
+  assert.equal(unchanged.speech_s0.choice, 'known_1')
+  assert.equal(unchanged.explicit_voice_attribution_s0, undefined)
+})
+
+test('an explicit named-voice anchor can resolve a strong switch and independently linked smoker lines', () => {
+  const speakers = [{ id: 'unconfigured:maeve', name: 'Maeve' }, { id: 'unconfigured:erin', name: 'Erin' }, { id: USER_SPEAKER_ID, name: 'Ken' }]
+  const text = 'The smoker sits by the window. "Lamp is out," she says. "I did not light it."\n\n"Decided what?"\n\nMaeve’s voice comes from the other side of Erin.\n\n"Whether I sleep in my boots." The smoker puts her boots down. "Boots stay."'
+  const plan = buildSpeakerDecisionPlan(text, speakers, false)
+  const answers: Record<string, SpeakerDecisionChoice> = {}
+  for (const speech of plan.state.speeches) answers[`speech_${speech.id}`] = confidentDecision('known_0')
+  answers.speech_s2 = { choice: 'known_0', probabilities: { known_0: 0.34, known_1: 0.22, no_clear_identity: 0.44 }, confidence: 0.27 }
+  answers.turn_s2 = confidentDecision('responds_to_previous_speaker')
+  answers.global_uncertain_s2 = confidentDecision('no_clear_identity')
+  applyExplicitPostQuoteVoiceAttributions(plan, answers)
+  assert.ok(answers.explicit_voice_attribution_s2)
+  const context = { previousMessages: [{ id: 'prior', role: 'user' as const, text: 'Erin lies beside me.' }], ghosts: [] }
+  const review = buildSpeakerSwitchContradictionReview(plan, answers, context)
+  assert.equal(review.runs.length, 1)
+  const run = review.runs[0]
+  const results: Record<string, SpeakerDecisionChoice> = {
+    [`switch_${run.id}`]: { choice: 'different', probabilities: { different: 0.73, same_or_unclear: 0.27 }, confidence: 0.46 },
+    [`switch_speaker_${run.id}_s1`]: { choice: 'uncast_character', probabilities: { uncast_character: 0.8, known_0: 0.2 }, confidence: 0.77 },
+    [`switch_speaker_${run.id}_s2`]: confidentDecision('known_1'),
+    [`switch_speaker_${run.id}_s0`]: confidentDecision('no_clear_identity'),
+    [`switch_speaker_${run.id}_s3`]: confidentDecision('no_clear_identity'),
+    [`switch_speaker_${run.id}_s4`]: confidentDecision('no_clear_identity'),
+    [`switch_link_${run.id}_s0`]: confidentDecision('previous'),
+    [`switch_link_${run.id}_s3`]: confidentDecision('previous'),
+    [`switch_link_${run.id}_s4`]: confidentDecision('previous'),
+  }
+  applySpeakerSwitchContradictionReview(plan, answers, review, results)
+  const segments = resolveSpeakerDecisionSegments(text, plan, answers, speakers, { isUserMessage: false, cardSpeakerId: null, historicalSpeakerId: null, evidenceOnly: true })
+  assert.deepEqual(segments.filter(segment => segment.speakerId !== null).map(segment => segment.speakerId), [UNCAST_SPEAKER_ID, UNCAST_SPEAKER_ID, 'unconfigured:maeve', UNCAST_SPEAKER_ID, UNCAST_SPEAKER_ID])
+  assert.ok(answers.switch_link_reconciled_s3)
+  const duplicatePlan = buildSpeakerDecisionPlan(text, speakers, false)
+  const duplicateAnswers: Record<string, SpeakerDecisionChoice> = {}
+  for (const speech of duplicatePlan.state.speeches) duplicateAnswers[`speech_${speech.id}`] = confidentDecision('known_0')
+  duplicateAnswers.turn_s2 = confidentDecision('responds_to_previous_speaker')
+  applyExplicitPostQuoteVoiceAttributions(duplicatePlan, duplicateAnswers)
+  const duplicateContext = { ...context, ghosts: [{ id: 'same-maeve', label: 'Maeve', aliases: ['Maeve'], context: '', conversationHistory: [{ messageId: 'prior', text: 'Maeve is present.' }] }] }
+  const duplicateReview = buildSpeakerSwitchContradictionReview(duplicatePlan, duplicateAnswers, duplicateContext)
+  const duplicateResults = { ...results, [`switch_speaker_${run.id}_s1`]: { choice: 'switch_ghost_0', probabilities: { switch_ghost_0: 0.8, known_0: 0.2 }, confidence: 0.77 } }
+  applySpeakerSwitchContradictionReview(duplicatePlan, duplicateAnswers, duplicateReview, duplicateResults)
+  assert.equal(duplicateAnswers.speech_s1.choice, 'known_0')
+})
+
+test('narrative role review separates the smoker from a named reply without assigning bystanders', () => {
+  const speakers = [{ id: 'unconfigured:maeve', name: 'Maeve' }, { id: 'unconfigured:erin', name: 'Erin' }, { id: USER_SPEAKER_ID, name: 'Ken' }]
+  const text = 'The smoker’s sitting upright in it, blanket pooled at her waist, boots back on and laced.\n\n"Lamp’s out," she says, to nobody in particular. "I didn’t light it. Wanted to see the room dark before I decided anything about it." "Decided what?"\n\nMaeve’s voice comes from the other side of Erin.\n\n"Whether it was a night where I sleep in my boots or a night where I take them off and trust the stair." The smoker’s boot heels come down onto the boards. "I’ve decided. Boots stay." "Suit yourself."'
+  const plan = buildSpeakerDecisionPlan(text, speakers, false)
+  const answers: Record<string, SpeakerDecisionChoice> = {}
+  for (const speech of plan.state.speeches) answers[`speech_${speech.id}`] = confidentDecision('known_0')
+  answers.turn_s2 = confidentDecision('responds_to_previous_speaker')
+  applyExplicitPostQuoteVoiceAttributions(plan, answers)
+  const context = { previousMessages: [{ id: 'prior', role: 'user' as const, text: 'Erin lies beside me.' }], ghosts: [{ id: 'smoker', label: 'the smoker', aliases: ['the smoker'], context: '', conversationHistory: [{ messageId: 'prior', text: 'The smoker is in the room.' }] }] }
+  const review = buildSpeakerSwitchContradictionReview(plan, answers, context)
+  const role = review.roles.find(item => item.label === 'the smoker')!
+  assert.ok(role)
+  assert.ok(review.localEvidence.some(item => item.speechId === 's0' && item.cues.some(cue => cue.includes('pronoun speech tag'))))
+  assert.ok(review.localEvidence.some(item => item.speechId === 's1' && item.cues.some(cue => cue.includes('follows a pronoun speech tag'))))
+  assert.ok(review.localEvidence.some(item => item.speechId === 's3' && item.cues.some(cue => cue.includes('role action immediately follows'))))
+  assert.ok(review.localEvidence.some(item => item.speechId === 's4' && item.cues.some(cue => cue.includes('role action immediately precedes'))))
+  const results: Record<string, SpeakerDecisionChoice> = { [`${role.id}_distinct`]: confidentDecision('different') }
+  for (const id of role.speechIds) if (id !== role.anchorId) results[`${role.id}_speech_${id}`] = confidentDecision(['s0', 's1', 's3', 's4'].includes(id) ? 'role' : 'other_or_unclear')
+  applyNarrativeRoleSpeakerReview(plan, answers, review, results)
+  const segments = resolveSpeakerDecisionSegments(text, plan, answers, speakers, { isUserMessage: false, cardSpeakerId: null, historicalSpeakerId: null, evidenceOnly: true, includeDebug: true })
+  assert.deepEqual(segments.filter(segment => segment.speakerId !== null).map(segment => segment.speakerId), ['ghost:smoker', 'ghost:smoker', 'unconfigured:maeve', 'ghost:smoker', 'ghost:smoker', 'unconfigured:maeve'])
+  assert.ok(answers.narrative_role_reconciled_s0)
+  const exchangeAnswers: Record<string, SpeakerDecisionChoice> = {}
+  for (const speech of plan.state.speeches) exchangeAnswers[`speech_${speech.id}`] = confidentDecision('known_0')
+  exchangeAnswers.turn_s2 = confidentDecision('responds_to_previous_speaker')
+  applyExplicitPostQuoteVoiceAttributions(plan, exchangeAnswers)
+  const exchangeReview = buildSpeakerSwitchContradictionReview(plan, exchangeAnswers, context)
+  const exchangeResults: Record<string, SpeakerDecisionChoice> = {
+    [`${role.id}_distinct`]: { choice: 'different', probabilities: { different: 0.72, same_or_unclear: 0.28 }, confidence: 0.44 },
+    [`${role.id}_exchange`]: confidentDecision('two_speakers'),
+  }
+  for (const id of role.speechIds) if (id !== role.anchorId) {
+    exchangeResults[`${role.id}_speech_${id}`] = { choice: 'other_or_unclear', probabilities: { role: 0.31, other_or_unclear: 0.69 }, confidence: 0.38 }
+    exchangeResults[`${role.id}_exchange_${id}`] = confidentDecision(['s0', 's1', 's3', 's4'].includes(id) ? 'role' : 'anchor')
+  }
+  applyNarrativeExchangeSpeakerReview(plan, exchangeAnswers, exchangeReview, exchangeResults)
+  const exchangeSegments = resolveSpeakerDecisionSegments(text, plan, exchangeAnswers, speakers, { isUserMessage: false, cardSpeakerId: null, historicalSpeakerId: null, evidenceOnly: true, includeDebug: true })
+  assert.deepEqual(exchangeSegments.filter(segment => segment.speakerId !== null).map(segment => segment.speakerId), ['ghost:smoker', 'ghost:smoker', 'unconfigured:maeve', 'ghost:smoker', 'ghost:smoker', 'unconfigured:maeve'])
+  assert.ok(exchangeAnswers.narrative_exchange_reconciled_s3)
+  const localAnswers: Record<string, SpeakerDecisionChoice> = {}
+  for (const speech of plan.state.speeches) localAnswers[`speech_${speech.id}`] = confidentDecision('known_0')
+  localAnswers.turn_s2 = confidentDecision('responds_to_previous_speaker')
+  applyExplicitPostQuoteVoiceAttributions(plan, localAnswers)
+  const localReview = buildSpeakerSwitchContradictionReview(plan, localAnswers, context)
+  const localResults: Record<string, SpeakerDecisionChoice> = { [`${role.id}_distinct`]: { choice: 'different', probabilities: { different: 0.67, same_or_unclear: 0.33 }, confidence: 0.34 } }
+  for (const item of localReview.localEvidence) localResults[`${role.id}_local_${item.speechId}`] = confidentDecision('role', 0.75, 0.65)
+  applyNarrativeLocalEvidenceReview(plan, localAnswers, localReview, localResults)
+  assert.ok(localAnswers.narrative_local_reconciled_s0)
+  assert.ok(localAnswers.narrative_local_reconciled_s1)
+  assert.ok(localAnswers.narrative_local_reconciled_s3)
+  assert.ok(localAnswers.narrative_local_reconciled_s4)
+  assert.equal(localAnswers.speech_s2.choice, 'known_0')
+  const jointAnswers: Record<string, SpeakerDecisionChoice> = {}
+  for (const speech of plan.state.speeches) jointAnswers[`speech_${speech.id}`] = confidentDecision('known_0')
+  jointAnswers.turn_s1 = confidentDecision('continues_previous_turn')
+  jointAnswers.turn_s2 = confidentDecision('responds_to_previous_speaker')
+  jointAnswers.turn_s3 = { choice: 'responds_to_previous_speaker', probabilities: { responds_to_previous_speaker: 0.58, continues_previous_turn: 0.41, responds_to_other_participant: 0.01 }, confidence: 0.44 }
+  jointAnswers.turn_s4 = confidentDecision('continues_previous_turn')
+  jointAnswers.turn_s5 = confidentDecision('responds_to_previous_speaker')
+  applyExplicitPostQuoteVoiceAttributions(plan, jointAnswers)
+  const jointReview = buildSpeakerSwitchContradictionReview(plan, jointAnswers, context)
+  const jointResults: Record<string, SpeakerDecisionChoice> = { [`${role.id}_distinct`]: { choice: 'different', probabilities: { different: 0.63, same_or_unclear: 0.37 }, confidence: 0.26 } }
+  for (const item of jointReview.localEvidence) jointResults[`${role.id}_local_${item.speechId}`] = item.speechId === 's0' || item.speechId === 's1' ? confidentDecision('role', 0.8, 0.62) : confidentDecision('other_or_unclear', 0.75, 0.5)
+  const ghostOption = Object.entries(jointReview.ghostOptions).find(([, identity]) => identity === 'ghost:smoker')?.[0]
+  assert.ok(ghostOption)
+  for (const [id, ghostProbability, namedProbability] of [['s0', 0.88, 0.07], ['s1', 0.86, 0.08], ['s2', 0.08, 0.64], ['s3', 0.35, 0.61], ['s4', 0.57, 0.36], ['s5', 0.12, 0.59]] as const) jointResults[`switch_speaker_${jointReview.runs[0].id}_${id}`] = { choice: ghostProbability > namedProbability ? ghostOption : 'known_0', probabilities: { [ghostOption]: ghostProbability, known_0: namedProbability, no_clear_identity: Math.max(0, 1 - ghostProbability - namedProbability) }, confidence: 0.86 }
+  applyContestedDialogueChain(plan, jointAnswers, jointReview, jointResults)
+  const jointSegments = resolveSpeakerDecisionSegments(text, plan, jointAnswers, speakers, { isUserMessage: false, cardSpeakerId: null, historicalSpeakerId: null, evidenceOnly: true, includeDebug: true })
+  assert.deepEqual(jointSegments.filter(segment => segment.speakerId !== null).map(segment => segment.speakerId), ['ghost:smoker', 'ghost:smoker', 'unconfigured:maeve', 'ghost:smoker', 'ghost:smoker', 'unconfigured:maeve'])
+  assert.ok(jointAnswers.joint_chain_detail_s3.choice.includes('scores are heuristic'))
+  const rejectedJoint: Record<string, SpeakerDecisionChoice> = { ...jointAnswers, speech_s3: confidentDecision('known_0') }
+  const strongOther = { ...jointResults, [`${role.id}_local_s3`]: confidentDecision('other_or_unclear') }
+  applyContestedDialogueChain(plan, rejectedJoint, jointReview, strongOther)
+  assert.equal(rejectedJoint.speech_s3.choice, 'known_0')
+  const noAnchor: Record<string, SpeakerDecisionChoice> = { ...jointAnswers, speech_s3: confidentDecision('known_0') }
+  const noTag = { ...jointResults, [`${role.id}_local_s0`]: confidentDecision('other_or_unclear'), [`${role.id}_local_s1`]: confidentDecision('other_or_unclear') }
+  applyContestedDialogueChain(plan, noAnchor, jointReview, noTag)
+  assert.equal(noAnchor.speech_s3.choice, 'known_0')
+  const localRejected: Record<string, SpeakerDecisionChoice> = { ...localAnswers, speech_s3: confidentDecision('known_0') }
+  delete localRejected.narrative_role_reconciled_s3
+  const listenerResults = { ...localResults, [`${role.id}_local_s3`]: confidentDecision('other_or_unclear') }
+  applyNarrativeLocalEvidenceReview(plan, localRejected, localReview, listenerResults)
+  assert.equal(localRejected.speech_s3.choice, 'known_0')
+  const ambiguousText = text.replace('The smoker’s sitting upright in it, blanket pooled at her waist, boots back on and laced.', 'The smoker’s sitting beside Erin, both women awake.')
+  const ambiguousPlan = buildSpeakerDecisionPlan(ambiguousText, speakers, false)
+  const ambiguousAnswers: Record<string, SpeakerDecisionChoice> = {}
+  for (const speech of ambiguousPlan.state.speeches) ambiguousAnswers[`speech_${speech.id}`] = confidentDecision('known_0')
+  ambiguousAnswers.turn_s2 = confidentDecision('responds_to_previous_speaker')
+  applyExplicitPostQuoteVoiceAttributions(ambiguousPlan, ambiguousAnswers)
+  const ambiguousReview = buildSpeakerSwitchContradictionReview(ambiguousPlan, ambiguousAnswers, context)
+  assert.ok(!ambiguousReview.localEvidence.some(item => item.speechId === 's0' && item.cues.some(cue => cue.includes('pronoun speech tag'))))
+  const interruptedText = text.replace('The smoker’s boot heels come down onto the boards.', 'The smoker’s boot heels come down onto the boards. Another woman says,')
+  const interruptedPlan = buildSpeakerDecisionPlan(interruptedText, speakers, false)
+  const interruptedAnswers: Record<string, SpeakerDecisionChoice> = {}
+  for (const speech of interruptedPlan.state.speeches) interruptedAnswers[`speech_${speech.id}`] = confidentDecision('known_0')
+  interruptedAnswers.turn_s2 = confidentDecision('responds_to_previous_speaker')
+  applyExplicitPostQuoteVoiceAttributions(interruptedPlan, interruptedAnswers)
+  const interruptedReview = buildSpeakerSwitchContradictionReview(interruptedPlan, interruptedAnswers, context)
+  assert.ok(!interruptedReview.localEvidence.some(item => item.speechId === 's4' && item.cues.some(cue => cue.includes('role action immediately precedes'))))
+  // Earlier speeches have already been resolved to the smoker, so the first
+  // same-identity response contradiction is later than Maeve's attributed line.
+  const partiallyResolved: Record<string, SpeakerDecisionChoice> = {}
+  plan.optionSpeakerIds.test_smoker = 'ghost:smoker'
+  for (const speech of plan.state.speeches) partiallyResolved[`speech_${speech.id}`] = confidentDecision('known_0')
+  partiallyResolved.speech_s0 = confidentDecision('test_smoker')
+  partiallyResolved.speech_s1 = confidentDecision('test_smoker')
+  partiallyResolved.turn_s2 = confidentDecision('responds_to_previous_speaker')
+  partiallyResolved.turn_s5 = confidentDecision('responds_to_previous_speaker')
+  applyExplicitPostQuoteVoiceAttributions(plan, partiallyResolved)
+  const laterReview = buildSpeakerSwitchContradictionReview(plan, partiallyResolved, context)
+  assert.equal(laterReview.runs[0].currentId, 's5')
+  assert.equal(laterReview.roles[0]?.anchorId, 's2')
+  assert.ok(laterReview.questions[`${role.id}_exchange_s3`])
+  applyNarrativeExchangeSpeakerReview(plan, partiallyResolved, laterReview, exchangeResults)
+  const laterSegments = resolveSpeakerDecisionSegments(text, plan, partiallyResolved, speakers, { isUserMessage: false, cardSpeakerId: null, historicalSpeakerId: null, evidenceOnly: true, includeDebug: true })
+  assert.deepEqual(laterSegments.filter(segment => segment.speakerId !== null).map(segment => segment.speakerId), ['ghost:smoker', 'ghost:smoker', 'unconfigured:maeve', 'ghost:smoker', 'ghost:smoker', 'unconfigured:maeve'])
+  const interrupted = { ...exchangeResults, [`${role.id}_exchange`]: confidentDecision('other_or_unclear') }
+  const unchanged: Record<string, SpeakerDecisionChoice> = { ...exchangeAnswers, speech_s3: confidentDecision('known_0') }
+  delete unchanged.narrative_role_reconciled_s3
+  applyNarrativeExchangeSpeakerReview(plan, unchanged, exchangeReview, interrupted)
+  assert.equal(unchanged.speech_s3.choice, 'known_0')
+  const bystander: Record<string, SpeakerDecisionChoice> = {}
+  for (const speech of plan.state.speeches) bystander[`speech_${speech.id}`] = confidentDecision('known_0')
+  bystander.turn_s2 = confidentDecision('responds_to_previous_speaker')
+  applyExplicitPostQuoteVoiceAttributions(plan, bystander)
+  const bystanderReview = buildSpeakerSwitchContradictionReview(plan, bystander, context)
+  const noRole = Object.fromEntries(Object.entries(results).map(([id, value]) => [id, id.includes('_speech_') ? confidentDecision('other_or_unclear') : value]))
+  applyNarrativeRoleSpeakerReview(plan, bystander, bystanderReview, noRole)
+  assert.equal(bystander.speech_s0.choice, 'known_0')
+  const ambiguous = { ...results, [`${role.id}_distinct`]: confidentDecision('same_or_unclear') }
+  applyNarrativeRoleSpeakerReview(plan, bystander, bystanderReview, ambiguous)
+  assert.equal(bystander.speech_s0.choice, 'known_0')
+  const userOption = plan.state.speakers.find(speaker => speaker.id === USER_SPEAKER_ID)!.option
+  bystander.speech_s0 = confidentDecision(userOption)
+  bystander.persona_confirmed_s0 = confidentDecision(userOption)
+  bystander.self_intro_reconciled_s1 = confidentDecision('known_0')
+  applyNarrativeRoleSpeakerReview(plan, bystander, bystanderReview, results)
+  assert.equal(bystander.speech_s0.choice, userOption)
+  assert.equal(bystander.speech_s1.choice, 'known_0')
+})
+
+test('speaker-switch review separates an unnamed respondent from a named speaker without forcing ambiguous switches', () => {
+  const speakers = [{ id: 'unconfigured:maeve', name: 'Maeve' }, { id: 'unconfigured:erin', name: 'Erin' }, { id: USER_SPEAKER_ID, name: 'Ken' }]
+  const text = 'The smoker sits by the window. "Lamp is out," she says. "I did not light it."\n\n"Decided what?" Maeve asks.\n\n"Whether I sleep in my boots." The smoker puts her boots down. "Boots stay."'
+  const plan = buildSpeakerDecisionPlan(text, speakers, false)
+  const answers: Record<string, SpeakerDecisionChoice> = {}
+  for (const speech of plan.state.speeches) answers[`speech_${speech.id}`] = confidentDecision('known_0')
+  answers.speech_s2 = { choice: 'known_0', probabilities: { known_0: 0.28, known_1: 0.26, no_clear_identity: 0.46 }, confidence: 0.2 }
+  answers.turn_s2 = confidentDecision('responds_to_previous_speaker')
+  answers.global_uncertain_s2 = confidentDecision('no_clear_identity')
+  const context = { previousMessages: [{ id: 'prior', role: 'user' as const, text: 'Erin lies beside me.' }], ghosts: [] }
+  const review = buildSpeakerSwitchContradictionReview(plan, answers, context)
+  assert.equal(review.runs.length, 1)
+  const run = review.runs[0]
+  assert.equal(run.previousId, 's1')
+  assert.equal(run.currentId, 's2')
+  assert.ok(review.questions[`switch_speaker_${run.id}_s1`].criteria.uncast_character)
+  const results: Record<string, SpeakerDecisionChoice> = { [`switch_${run.id}`]: confidentDecision('different') }
+  for (const id of run.speechIds) results[`switch_speaker_${run.id}_${id}`] = confidentDecision(id === 's2' ? 'known_0' : 'uncast_character')
+  applySpeakerSwitchContradictionReview(plan, answers, review, results)
+  const segments = resolveSpeakerDecisionSegments(text, plan, answers, speakers, { isUserMessage: false, cardSpeakerId: null, historicalSpeakerId: null, evidenceOnly: true, includeDebug: true })
+  assert.deepEqual(segments.filter(segment => segment.speakerId !== null).map(segment => segment.speakerId), [UNCAST_SPEAKER_ID, UNCAST_SPEAKER_ID, 'unconfigured:maeve', UNCAST_SPEAKER_ID, UNCAST_SPEAKER_ID])
+  const unchanged: Record<string, SpeakerDecisionChoice> = {}
+  for (const speech of plan.state.speeches) unchanged[`speech_${speech.id}`] = confidentDecision('known_0')
+  unchanged.turn_s2 = confidentDecision('responds_to_previous_speaker')
+  const falseAlarm = buildSpeakerSwitchContradictionReview(plan, unchanged, context)
+  applySpeakerSwitchContradictionReview(plan, unchanged, falseAlarm, { ...results, [`switch_${run.id}`]: confidentDecision('same_or_unclear') })
+  assert.equal(unchanged.speech_s1.choice, 'known_0')
+  const weak = { ...results, [`switch_speaker_${run.id}_s1`]: { choice: 'uncast_character', probabilities: { uncast_character: 0.6, known_0: 0.4 }, confidence: 0.5 } }
+  applySpeakerSwitchContradictionReview(plan, unchanged, falseAlarm, weak)
+  assert.equal(unchanged.speech_s1.choice, 'known_0')
+  const sameIdentity = { ...results, [`switch_speaker_${run.id}_s1`]: confidentDecision('known_0') }
+  applySpeakerSwitchContradictionReview(plan, unchanged, falseAlarm, sameIdentity)
+  assert.equal(unchanged.speech_s1.choice, 'known_0')
+  unchanged.turn_s2 = { choice: 'responds_to_previous_speaker', probabilities: { responds_to_previous_speaker: 0.6, continues_previous_turn: 0.4 }, confidence: 0.5 }
+  assert.equal(buildSpeakerSwitchContradictionReview(plan, unchanged, context).runs.length, 0)
+})
+
+test('cast candidates require independent scene or lookback evidence, not their own prior assignment', () => {
+  const speakers = [{ id: 'npc:zara', name: 'Zara Vane / Zara' }, { id: 'npc:ewan', name: 'Ewan' }, { id: USER_SPEAKER_ID, name: 'Ken' }]
+  const plan = buildSpeakerDecisionPlan('She smiles. "Dear." She turns. "Come on."', speakers, false)
+  const context = { previousMessages: [{ id: 'prior', role: 'user' as const, text: 'I turn toward Ewan.' }], ghosts: [] }
+  const answers: Record<string, SpeakerDecisionChoice> = { speech_s0: confidentDecision('known_0'), paragraph_p0: confidentDecision('known_0') }
+  suppressUngroundedSpeakerChoices(plan, answers, context)
+  assert.ok(answers.global_uncertain_s0)
+  assert.equal(answers.speech_s0.choice, 'no_clear_identity')
+  assert.equal(answers.ungrounded_original_s0.choice, 'known_0')
+  const review = buildRelationshipSpeakerReview(plan, answers, context, null, { cardSpeakerId: null, targets: ['s0'], strategy: 'run' })
+  assert.equal(review.questions.relationship_s0.criteria.known_0, undefined)
+  assert.ok(review.questions.relationship_s0.criteria.known_1)
+  assert.ok(review.questions.relationship_s0.criteria.uncast_character)
+  answers.relationship_applied_s0 = confidentDecision('known_0')
+  answers.speech_s0 = confidentDecision('known_0')
+  const fallback = buildBestAvailableSpeakerReview(plan, answers, context)
+  assert.equal(fallback.questions.best_guess_s0.criteria.known_0, undefined)
+  assert.ok(fallback.questions.best_guess_s0.criteria.known_1)
+  assert.ok(independentlyGroundedSpeakerIds(plan, context, 'npc:zara').has('npc:zara'))
+  const soloAnswers: Record<string, SpeakerDecisionChoice> = { speech_s0: confidentDecision('known_0') }
+  suppressUngroundedSpeakerChoices(plan, soloAnswers, context, 'npc:zara')
+  assert.equal(soloAnswers.speech_s0.choice, 'known_0')
+  const namedContext = { previousMessages: [{ id: 'prior', role: 'user' as const, text: 'I turn to Zara.' }], ghosts: [] }
+  assert.ok(independentlyGroundedSpeakerIds(plan, namedContext).has('npc:zara'))
+  const ghostContext = { previousMessages: [{ id: 'prior', role: 'assistant' as const, text: 'She opens the door.' }], ghosts: [
+    { id: 'active', label: '', aliases: [], context: 'She speaks.', conversationHistory: [{ messageId: 'prior', text: 'She opens the door.' }] },
+    { id: 'stale', label: 'Maeve', aliases: ['Maeve'], context: '', conversationHistory: [{ messageId: 'older', text: 'Maeve speaks.' }] },
+  ] }
+  const groundedGhosts = independentlyGroundedSpeakerIds(plan, ghostContext)
+  assert.ok(groundedGhosts.has('ghost:active'))
+  assert.equal(groundedGhosts.has('ghost:stale'), false)
+})
+
+test('verified self-introduction reconciles earlier uncertain identities without crossing scene changes or explicit speakers', () => {
+  const speakers = [{ id: 'npc:zara', name: 'Zara' }, { id: 'npc:sarah', name: 'Sarah' }, { id: USER_SPEAKER_ID, name: 'Ken' }]
+  const text = '"Dear." She tries the word. "Okay, big caa."\n\nShe walks to the rail. "Come on, then."\n\nA woman in scrubs waits nearby. "Fair is fair." She turns to him. "Maeve. My friend is Erin."'
+  const plan = buildSpeakerDecisionPlan(text, speakers, false)
+  const answers: Record<string, SpeakerDecisionChoice> = {}
+  for (const speech of plan.state.speeches) {
+    answers[`speech_${speech.id}`] = confidentDecision('known_0')
+    answers[`relationship_original_${speech.id}`] = confidentDecision('uncast_character')
+  }
+  const context = { previousMessages: [{ id: 'previous', role: 'user' as const, text: 'I follow her outside.' }], ghosts: [] }
+  const review = buildSelfIntroductionReview(plan, context)
+  const anchor = plan.state.speeches.at(-1)!
+  assert.equal(review.candidates[`intro_${anchor.id}`].name, 'Maeve')
+  const results: Record<string, SpeakerDecisionChoice> = { [`intro_${anchor.id}`]: confidentDecision('self') }
+  for (const id of review.candidates[`intro_${anchor.id}`].targetIds) results[`intro_link_${anchor.id}_${id}`] = confidentDecision('same')
+  applySelfIntroductionReview(plan, answers, review, results)
+  assert.ok(plan.state.speeches.every(speech => answers[`self_intro_reconciled_${speech.id}`]))
+  const segments = resolveSpeakerDecisionSegments(text, plan, answers, speakers, { isUserMessage: false, cardSpeakerId: null, historicalSpeakerId: null, evidenceOnly: true, includeDebug: true })
+  assert.ok(segments.filter(segment => segment.speakerId !== null).every(segment => segment.speakerId === 'unconfigured:maeve'))
+  const notSelf: Record<string, SpeakerDecisionChoice> = { [`intro_${anchor.id}`]: confidentDecision('other_or_unclear') }
+  const unchanged: Record<string, SpeakerDecisionChoice> = { speech_s0: confidentDecision('known_0'), relationship_original_s0: confidentDecision('uncast_character') }
+  applySelfIntroductionReview(plan, unchanged, review, notSelf)
+  assert.equal(unchanged.speech_s0.choice, 'known_0')
+  const mixed = buildSpeakerDecisionPlan('"Hello," Sarah says.\n\n"Maeve. My friend is Erin."', speakers, false)
+  const mixedReview = buildSelfIntroductionReview(mixed, context)
+  const mixedAnswers: Record<string, SpeakerDecisionChoice> = { speech_s0: confidentDecision('known_1'), relationship_original_s0: confidentDecision('known_1') }
+  applySelfIntroductionReview(mixed, mixedAnswers, mixedReview, { intro_s1: confidentDecision('self'), intro_link_s1_s0: confidentDecision('same') })
+  assert.equal(mixedAnswers.speech_s0.choice, 'known_1')
+  const interrupt = buildSpeakerDecisionPlan('"Hello." A stranger steps in. "Maeve. My friend is Erin."', speakers, false)
+  const interruptReview = buildSelfIntroductionReview(interrupt, context)
+  const interruptAnswers: Record<string, SpeakerDecisionChoice> = { speech_s0: confidentDecision('uncast_character'), global_uncertain_s0: confidentDecision('no_clear_identity') }
+  applySelfIntroductionReview(interrupt, interruptAnswers, interruptReview, { intro_s1: confidentDecision('self'), intro_link_s1_s0: confidentDecision('different_or_unclear') })
+  assert.ok(interruptAnswers.global_uncertain_s0)
+  assert.equal(interruptAnswers.self_intro_reconciled_s0, undefined)
+  const cut = buildSpeakerDecisionPlan('"Hello."\n\nHours later, she arrives.\n\n"Maeve. My friend is Erin."', speakers, false)
+  assert.equal(Object.keys(buildSelfIntroductionReview(cut, context).questions).length, 0)
+})
+
+test('best-available guesses use scene candidates and never become validated anchors', () => {
+  const speakers = [{ id: 'npc:ewan', name: 'Ewan' }, { id: 'npc:absent', name: 'Absent' }, { id: USER_SPEAKER_ID, name: 'Ken' }]
+  const plan = buildSpeakerDecisionPlan('"Sacrifice."\n\nHe holds a tray.\n\n"The noodles?"', speakers, false)
+  const answers: Record<string, SpeakerDecisionChoice> = { speech_s0: confidentDecision('no_clear_identity'), global_uncertain_s0: confidentDecision('no_clear_identity'), speech_s1: confidentDecision('no_clear_identity'), global_uncertain_s1: confidentDecision('no_clear_identity') }
+  const review = buildBestAvailableSpeakerReview(plan, answers, { previousMessages: [{ id: 'prior', role: 'user' as const, text: 'I turn to Ewan. "Sometimes you sacrifice."' }], ghosts: [] })
+  assert.ok(review.questions.best_guess_s0.criteria.known_0)
+  assert.equal(review.questions.best_guess_s0.criteria.known_1, undefined)
+  assert.equal(review.questions.best_guess_s0.criteria.known_2, undefined)
+  assert.ok(review.questions.best_guess_s0.criteria.uncast_character)
+  applyBestAvailableSpeakerReview(plan, answers, review, { best_guess_s0: { choice: 'known_0', probabilities: { known_0: 0.4, no_clear_identity: 0.3, uncast_character: 0.3 }, confidence: 0.3 } })
+  assert.ok(answers.global_uncertain_s0)
+  assert.equal(answers.relationship_applied_s0, undefined)
+  const segments = resolveSpeakerDecisionSegments(plan.state.message, plan, answers, speakers, { isUserMessage: false, cardSpeakerId: null, historicalSpeakerId: null, evidenceOnly: true, includeDebug: true })
+  const speech = segments.filter(segment => segment.speakerId !== null)
+  assert.equal(speech[0].speakerId, 'npc:ewan')
+  assert.equal(speech[1].speakerId, UNRESOLVED_SPEAKER_ID)
+  assert.ok(speech[0].debugPath?.some(step => step.includes('low-confidence guess; not an anchor')))
+  assert.equal(buildOpeningBacklinkReview(plan, answers, { previousMessages: [{ id: 'prior', role: 'user', text: 'I turn to Ewan.' }], ghosts: [] }, null), null)
+  const uncastAnswers: Record<string, SpeakerDecisionChoice> = { speech_s0: confidentDecision('no_clear_identity'), global_uncertain_s0: confidentDecision('no_clear_identity') }
+  applyBestAvailableSpeakerReview(plan, uncastAnswers, review, { best_guess_s0: { choice: 'uncast_character', probabilities: { uncast_character: 0.6, no_clear_identity: 0.4 }, confidence: 0.4 } })
+  const uncast = resolveSpeakerDecisionSegments(plan.state.message, plan, uncastAnswers, speakers, { isUserMessage: false, cardSpeakerId: null, historicalSpeakerId: null, evidenceOnly: true })
+  assert.equal(uncast.find(segment => segment.speakerId !== null)?.speakerId, UNCAST_SPEAKER_ID)
+  const unknownAnswers: Record<string, SpeakerDecisionChoice> = { speech_s0: confidentDecision('no_clear_identity'), global_uncertain_s0: confidentDecision('no_clear_identity') }
+  applyBestAvailableSpeakerReview(plan, unknownAnswers, review, { best_guess_s0: { choice: 'no_clear_identity', probabilities: { no_clear_identity: 1 }, confidence: 1 } })
+  assert.equal(unknownAnswers.best_guess_s0, undefined)
+  applyBestAvailableSpeakerReview(plan, unknownAnswers, review, { best_guess_s0: { choice: 'known_2', probabilities: { known_2: 1 }, confidence: 1 } })
+  assert.equal(unknownAnswers.best_guess_s0, undefined)
+  const ghostReview = buildBestAvailableSpeakerReview(plan, unknownAnswers, { previousMessages: [{ id: 'prior', role: 'user', text: 'Mira returns to the table.' }], ghosts: [{ id: 'mira', label: 'Mira', aliases: ['Mira'], context: 'Friend at the table', conversationHistory: [] }] })
+  assert.equal(ghostReview.options.best_ghost_0, 'ghost:mira')
+})
+
+test('focused shadow compares the earlier unnamed reply to a validated later anchor', () => {
+  const speakers = [{ id: 'npc:tessa', name: 'Tessa' }, { id: USER_SPEAKER_ID, name: 'Ken' }]
+  const plan = buildSpeakerDecisionPlan('"Bishop. Third floor."\n\nShe balances her tray. "It is noisy."\n\n"Tessa. Tessa Doyle." She sits down.', speakers, false)
+  const answers: Record<string, SpeakerDecisionChoice> = { speech_s0: confidentDecision('no_clear_identity'), global_uncertain_s0: confidentDecision('no_clear_identity'), speech_s1: confidentDecision('known_0'), relationship_confirmed_s1: confidentDecision('known_0') }
+  const review = buildOpeningBacklinkReview(plan, answers, { previousMessages: [{ id: 'prior', role: 'user' as const, text: 'I ask her, "Where do you live?"' }], ghosts: [] }, null)!
+  const before = JSON.stringify(answers)
+  const shadow = buildContrastiveOpeningLinkReview(review)
+  assert.equal(review.links.backlink_s0.identity, 'npc:tessa')
+  assert.match(shadow.state.pairEvidence.backlink_s0.between, /balances her tray/u)
+  assert.match(shadow.state.message, /Tessa Doyle/u)
+  assert.ok(shadow.questions.focused_backlink_s0)
+  assert.equal(JSON.stringify(answers), before)
+})
+
+test('opening links consider adjacent validated speakers in both directions without forcing continuity', () => {
+  const speakers = [{ id: 'npc:ewan', name: 'Ewan' }, { id: USER_SPEAKER_ID, name: 'Ken' }]
+  const plan = buildSpeakerDecisionPlan('"Sacrifice."\n\nHe turns with the tray.\n\n"The noodles?"\n\n"No, I know what you meant."', speakers, false)
+  const context = { previousMessages: [{ id: 'prior', role: 'user' as const, text: 'I turn to Ewan. "Sometimes you sacrifice."' }], ghosts: [] }
+  const make = () => ({ speech_s0: confidentDecision('known_0'), relationship_applied_s0: confidentDecision('known_0'), speech_s1: confidentDecision('no_clear_identity'), global_uncertain_s1: confidentDecision('no_clear_identity'), speech_s2: confidentDecision('known_0'), relationship_applied_s2: confidentDecision('known_0') } as Record<string, SpeakerDecisionChoice>)
+  const answers = make()
+  const review = buildOpeningBacklinkReview(plan, answers, context, null)!
+  assert.equal(review.links.forwardlink_s1.anchorId, 's0')
+  assert.equal(review.links.backlink_s1.anchorId, 's2')
+  const reviewBefore = JSON.stringify(review)
+  const contrastive = buildContrastiveOpeningLinkReview(review)
+  assert.deepEqual(Object.keys(contrastive.questions.forwardlink_s1.criteria), ['same', 'different', 'no_clear_identity'])
+  assert.match(contrastive.questions.focused_backlink_s1.instructions, /self-introduction/u)
+  assert.equal(contrastive.expectedControls.focused_control_introduction, 'same')
+  assert.equal(contrastive.expectedControls.focused_control_interruption, 'different')
+  assert.equal(contrastive.expectedControls.focused_control_unclear, 'no_clear_identity')
+  assert.ok(contrastive.questions.control_continuation)
+  assert.ok(contrastive.questions.control_reply)
+  assert.ok(contrastive.questions.control_uncertain)
+  assert.equal(contrastive.expectedControls.control_reply, 'different')
+  assert.equal('expectedControls' in contrastive.state, false)
+  assert.equal(JSON.stringify(review), reviewBefore)
+  const focusedSame = { choice: 'same', probabilities: { same: 0.68, different: 0.21, no_clear_identity: 0.11 }, confidence: 0.52 }
+  const focusedDifferent = { choice: 'different', probabilities: { same: 0.1, different: 0.85, no_clear_identity: 0.05 }, confidence: 0.8 }
+  const fallback = make()
+  applyFocusedOpeningFallback(plan, fallback, { focused_backlink_s1: focusedSame }, review.links, {})
+  assert.equal(fallback.speech_s1.choice, 'known_0')
+  assert.equal(fallback.focused_fallback_s1, focusedSame)
+  const fallbackSegments = resolveSpeakerDecisionSegments(plan.state.message, plan, fallback, speakers, { isUserMessage: false, cardSpeakerId: null, historicalSpeakerId: null, evidenceOnly: true, includeDebug: true })
+  assert.equal(fallbackSegments.filter(segment => segment.speakerId !== null)[1].speakerId, 'npc:ewan')
+  const conflicting = make()
+  applyFocusedOpeningFallback(plan, conflicting, { focused_backlink_s1: focusedSame, focused_forwardlink_s1: focusedDifferent }, review.links, {})
+  assert.ok(conflicting.global_uncertain_s1)
+  const weak = make()
+  applyFocusedOpeningFallback(plan, weak, { focused_backlink_s1: { ...focusedSame, confidence: 0.3 } }, review.links, {})
+  assert.ok(weak.global_uncertain_s1)
+  const stale = make()
+  stale.speech_s2 = confidentDecision('known_1')
+  applyFocusedOpeningFallback(plan, stale, { focused_backlink_s1: focusedSame }, review.links, {})
+  assert.ok(stale.global_uncertain_s1)
+  const blockedBaseline = make()
+  applyFocusedOpeningFallback(plan, blockedBaseline, { focused_backlink_s1: focusedSame }, review.links, { backlink_s1: confidentDecision('different_or_unclear') })
+  assert.ok(blockedBaseline.global_uncertain_s1)
+  assert.match(review.state.pairEvidence.forwardlink_s1.between, /tray/u)
+  assert.match(review.questions.forwardlink_s1.instructions, /earlier quotation s0/u)
+  applyOpeningBacklinkReview(plan, answers, { forwardlink_s1: confidentDecision('same'), backlink_s1: { choice: 'different_or_unclear', probabilities: { different_or_unclear: 0.62, same: 0.38 }, confidence: 0.24 } }, review.links)
+  assert.equal(answers.speech_s1.choice, 'known_0')
+  assert.ok(answers.relationship_forwardlink_s1)
+  assert.equal(answers.global_uncertain_s1, undefined)
+  const disagreement = make()
+  applyOpeningBacklinkReview(plan, disagreement, { forwardlink_s1: confidentDecision('same'), backlink_s1: confidentDecision('different_or_unclear') }, review.links)
+  assert.ok(disagreement.global_uncertain_s1)
+  const changed = make()
+  changed.speech_s0 = confidentDecision('known_1')
+  applyOpeningBacklinkReview(plan, changed, { forwardlink_s1: confidentDecision('same') }, review.links)
+  assert.ok(changed.global_uncertain_s1)
+  const turn = buildSpeakerDecisionPlan('"Sacrifice," Ewan says.\n\n"No," Ken replies.\n\n"Fine," Ewan says.', speakers, false)
+  const mixed: Record<string, SpeakerDecisionChoice> = { speech_s0: confidentDecision('known_0'), relationship_applied_s0: confidentDecision('known_0'), speech_s1: confidentDecision('no_clear_identity'), global_uncertain_s1: confidentDecision('no_clear_identity'), speech_s2: confidentDecision('known_0'), relationship_applied_s2: confidentDecision('known_0') }
+  assert.equal(buildOpeningBacklinkReview(turn, mixed, context, null), null)
+})
+
+test('uncertain global review blocks chain guessing and uses unresolved speech voice, not narration', () => {
+  const speakers = [{ id: USER_SPEAKER_ID, name: 'Ken' }, { id: 'npc:ewan', name: 'Ewan' }]
+  const content = '"Sacrifice."\n\nHe turns with the tray.\n\n"What are you sacrificing?"'
+  const plan = buildSpeakerDecisionPlan(content, speakers, false)
+  const answers: Record<string, SpeakerDecisionChoice> = { speech_s0: confidentDecision('known_0'), speech_s1: confidentDecision('no_clear_identity'), turn_s1: confidentDecision('continues_previous_turn') }
+  applyRelationshipSpeakerReview(plan, answers, { relationship_s0: confidentDecision('no_clear_identity'), relationship_s1: confidentDecision('no_clear_identity') }, {}, null, null, true)
+  const segments = resolveSpeakerDecisionSegments(content, plan, answers, speakers, { isUserMessage: false, cardSpeakerId: null, historicalSpeakerId: null, evidenceOnly: true })
+  assert.deepEqual(segments.filter(segment => segment.speakerId !== null).map(segment => segment.speakerId), [UNRESOLVED_SPEAKER_ID, UNRESOLVED_SPEAKER_ID])
+  assert.equal(playbackVoiceForSpeaker(UNRESOLVED_SPEAKER_ID, false, {}, 'narrator', 'user'), '')
+  assert.deepEqual(collectUncastVoiceGroups(segments), [])
+})
+
+test('local parser fallback keeps unresolved quotes distinct from narration', () => {
+  const content = 'The curtain moves.\n\n"Who is there?"'
+  const segments = markUnresolvedSpeechSegments(parseRosterVoiceSegments(content, null, [], '', null, true))
+  assert.equal(segments.find(segment => segment.text === 'The curtain moves.')?.speakerId, null)
+  assert.equal(segments.find(segment => segment.text === 'Who is there?')?.speakerId, UNRESOLVED_SPEAKER_ID)
+  assert.equal(playbackVoiceForSpeaker(UNRESOLVED_SPEAKER_ID, false, {}, 'narrator', 'user'), '')
+})
+
 test('relationship review keeps explicit attributions and rejects weak changes', () => {
   const content = '"Hello," Tessa says. "Someone is calling."'
   const speakers = [{ id: 'npc:tessa', name: 'Tessa' }, { id: USER_SPEAKER_ID, name: 'Ken' }]
@@ -2451,13 +3634,16 @@ test('uses a leading temporary speaker for a continuous anonymous scene while pr
   applyRelationshipSpeakerReview(unique.plan, unique.answers, { relationship_scene: scene }, unique.review.ghostOptions, 'npc:tova')
   assert.equal(unique.answers.speech_s1.choice, 'known_0')
   const established = create()
-  applyRelationshipSpeakerReview(established.plan, established.answers, { relationship_scene: scene }, established.review.ghostOptions, 'npc:tova', 'ghost:tasha')
+  applyRelationshipSpeakerReview(established.plan, established.answers, { relationship_scene: scene }, established.review.ghostOptions, null, 'ghost:tasha')
   assert.equal(established.answers.speech_s1.choice, 'relationship_ghost_0')
   for (const paragraph of established.plan.state.paragraphs) established.answers[`paragraph_${paragraph.id}`] = confidentDecision('known_0')
   const assessment = assessSpeakerDiscourseEscalation(established.plan, established.answers)
   assert.equal(assessment.plan, null)
   const resolved = resolveSpeakerDecisionSegments(content, established.plan, established.answers, speakers, { isUserMessage: false, cardSpeakerId: null, historicalSpeakerId: null, discourse: { assessment, answers: null } })
   assert.deepEqual(resolved.filter(segment => segment.speakerId !== null).map(segment => segment.speakerId), ['ghost:tasha', 'ghost:tasha', 'ghost:tasha'])
+  const cardFirst = create()
+  applyRelationshipSpeakerReview(cardFirst.plan, cardFirst.answers, { relationship_scene: scene }, cardFirst.review.ghostOptions, 'npc:tova', 'ghost:tasha')
+  assert.equal(cardFirst.answers.speech_s1.choice, 'known_0')
   const tied = create()
   applyRelationshipSpeakerReview(tied.plan, tied.answers, { relationship_scene: { ...scene, probabilities: { relationship_ghost_0: 0.52, no_clear_identity: 0.48 } } }, tied.review.ghostOptions)
   assert.equal(tied.answers.speech_s1.choice, 'known_0')
@@ -2519,7 +3705,7 @@ test('looks back at most five assistant messages and stops at the nearest clear 
   const ambiguous = Array.from({ length: 4 }, (_, index) => ({ id: `amb-${index}`, is_user: false, content: 'She smiles. "Yes."' }))
   const target = { id: 'target', is_user: false, content: 'She speaks. "Again."' }
   const user = { id: 'user', is_user: true, content: 'I listen.' }
-  const find = (messages: typeof ambiguous) => lookbackSpeakerContinuity(messages, 'target', {}, {}, [ghost], cast)
+  const find = (messages: typeof ambiguous) => lookbackSpeakerContinuity(messages, 'target', {}, {}, [ghost], cast, '', 5)
   assert.equal(find([named, user, ...ambiguous, target]), 'ghost:tasha')
   assert.equal(find([named, ...ambiguous, { ...ambiguous[0], id: 'fifth' }, target]), null)
   assert.equal(lookbackSpeakerContinuity([named, ...ambiguous, { ...ambiguous[0], id: 'fifth' }, target], 'target', {}, {}, [ghost], cast, '', 6), 'ghost:tasha')
@@ -2527,6 +3713,29 @@ test('looks back at most five assistant messages and stops at the nearest clear 
   assert.equal(find([named, ...ambiguous, { id: 'tova', is_user: false, content: 'Tova says, "Hello."' }, target]), 'npc:tova')
   assert.equal(find([named, ...ambiguous, { id: 'other', is_user: false, content: 'The clerk says, "Hello."' }, target]), CONTINUITY_LOOKBACK_BLOCKED)
   assert.equal(find([named, ...ambiguous, { id: 'mixed', is_user: false, content: 'Tasha and Tova speak. "Hello."' }, target]), CONTINUITY_LOOKBACK_BLOCKED)
+})
+
+test('uses saved continuity or the final explicit attribution in a multi-character previous message', () => {
+  const cast = [{ id: 'npc:sarah', name: 'Sarah' }, { id: 'npc:zadie', name: 'Zadie' }]
+  const prior = { id: 'prior', is_user: false, content: 'Sarah says, "Hello."\n\nZadie says, "Goodbye."' }
+  const target = { id: 'target', is_user: false, content: 'She smiles. "Again."' }
+  const messages = [prior, target]
+  assert.equal(lookbackSpeakerContinuity(messages, 'target', {}, {}, [], cast), 'npc:zadie')
+  const records = { prior: { contentHash: hashMessageContent(prior.content), speakerId: 'npc:zadie' } }
+  assert.equal(lookbackSpeakerContinuity(messages, 'target', records, {}, [], cast), 'npc:zadie')
+})
+
+test('finds the last named speaker after an anonymous interruption and continued dialogue', () => {
+  const cast = [{ id: 'npc:sarah', name: 'Sarah' }, { id: 'npc:zadie', name: 'Zadie' }]
+  const previous = { id: 'prior', is_user: false, content: 'Sarah says, "Earlier."\n\nA woman walks past. "Whites are going in."\n\nShe keeps walking.\n\nZadie does not blink at the interruption. She pulls her notebook closer.\n\n"Write it down."\n\nHer voice dries at the edges.\n\n"Since you are being thorough."\n\nA pause.\n\n"Do not make me come find you."' }
+  const target = { id: 'target', is_user: false, content: 'She smiles. "Every night."' }
+  const diagnostics: string[] = []
+  assert.equal(lookbackSpeakerContinuity([previous, target], 'target', {}, {}, [], cast, '', 5, diagnostics), 'npc:zadie')
+  assert.ok(diagnostics.some(line => line.includes('closing named subject -> npc:zadie')))
+  const ghost = { id: 'zadie', speakerId: UNCAST_SPEAKER_ID, label: 'Zadie', aliases: ['Zadie'], voiceId: 'voice', context: '', lastSeenMessageId: 'prior', occurrenceKeys: [] }
+  assert.equal(lookbackSpeakerContinuity([previous, target], 'target', {}, {}, [ghost], [cast[0]]), 'ghost:zadie')
+  const interruptedAgain = { ...previous, content: previous.content + '\n\nThe clerk says, "Wait."' }
+  assert.notEqual(lookbackSpeakerContinuity([interruptedAgain, target], 'target', {}, {}, [], cast), 'npc:zadie')
 })
 
 test('keeps a historically seen temporary speaker eligible after later playback without leaking future-only ghosts', () => {
@@ -3292,6 +4501,44 @@ test('validates card-cast extraction and rejects unknown card IDs', () => {
     { cardId: 'card', name: 'Alice' },
     { cardId: 'card', name: 'Bob' },
   ])
+})
+
+test('world and RPG titles are not automatically added as speakers', () => {
+  assert.equal(isScenarioCardTitle('Free Use World / Free'), true)
+  assert.equal(isScenarioCardTitle('Alice Mercer / Alice'), false)
+  assert.deepEqual(mergeScannedCardCast([{ id: 'world', name: 'Free Use World' }], [{ cardId: 'world', name: 'Halloran' }]), [{ id: 'npc:halloran', name: 'Halloran' }])
+  assert.deepEqual(mergeScannedCardCast([{ id: 'world', name: 'Free Use World' }], []), [])
+})
+
+test('keeps the established speaker when a visitor enters before an uncast closing line', () => {
+  const plan = buildSpeakerDecisionPlan('"Keep that."\n\n"Hold the door."\n\nThe student moves into the office.\n\n"Sit. Name and ID."', [{ id: 'unconfigured:halloran', name: 'Halloran' }], false)
+  const answers: Record<string, SpeakerDecisionChoice> = { speech_s0: confidentDecision('known_0'), speech_s1: confidentDecision('known_0'), speech_s2: confidentDecision('uncast_character') }
+  continueUncastClosingSpeech(plan, answers)
+  assert.equal(answers.speech_s2.choice, 'known_0')
+  const different = buildSpeakerDecisionPlan('"Keep that."\n\n"Hold the door."\n\nThe clerk walks in and says, "Sit. Name and ID."', [{ id: 'unconfigured:halloran', name: 'Halloran' }], false)
+  const differentAnswers: Record<string, SpeakerDecisionChoice> = { speech_s0: confidentDecision('known_0'), speech_s1: confidentDecision('known_0'), speech_s2: confidentDecision('uncast_character') }
+  continueUncastClosingSpeech(different, differentAnswers)
+  assert.equal(differentAnswers.speech_s2.choice, 'uncast_character')
+  const unresolved: Record<string, SpeakerDecisionChoice> = { speech_s0: confidentDecision('known_0'), speech_s1: confidentDecision('known_0'), speech_s2: { choice: 'known_0', confidence: 0.45, probabilities: { known_0: 0.51, uncast_character: 0.27, no_clear_identity: 0.22 } } }
+  continueUncastClosingSpeech(plan, unresolved)
+  assert.equal(unresolved.speech_s2.choice, 'known_0')
+  assert.ok(unresolved.relationship_continuity_s2)
+})
+
+test('maps a safe ghost alias to its unique roster identity for relationship and discourse review', () => {
+  const context = { previousMessages: [{ id: 'previous', text: 'Halloran speaks.' }], ghosts: [{ id: 'halloran', label: 'Halloran', aliases: ['Halloran'], context: '', conversationHistory: [] }] }
+  const speakers = [{ id: 'npc:sarah', name: 'Sarah' }, { id: 'unconfigured:halloran', name: 'Halloran' }]
+  const continuity = continuityRosterIdentity('ghost:halloran', context, speakers)
+  assert.equal(continuity, 'unconfigured:halloran')
+  assert.equal(continuityRosterIdentity('ghost:halloran', context, [...speakers, { id: 'npc:halloran', name: 'Halloran' }]), 'ghost:halloran')
+  const plan = buildSpeakerDecisionPlan('"Does he know?"\n\nHer eyes come up.\n\n"Because he will."\n\n"Next."', speakers, false)
+  const answers: Record<string, SpeakerDecisionChoice> = { speech_s0: confidentDecision('known_1'), speech_s1: confidentDecision('known_0'), speech_s2: confidentDecision('known_1') }
+  const review = buildRelationshipSpeakerReview(plan, answers, context, continuity)
+  applyRelationshipSpeakerReview(plan, answers, { relationship_s1: confidentDecision('known_1', 0.97, 0.97) }, review.ghostOptions, null, continuity)
+  assert.equal(answers.speech_s1.choice, 'known_1')
+  assert.ok(answers.relationship_continuity_s1)
+  const assessment = assessSpeakerDiscourseEscalation(plan, answers)
+  assert.ok(!assessment.runs.some(run => run.targets.includes('s1')))
 })
 
 test('assigns quoted output to saved cast members using dialogue tags', () => {
@@ -4174,6 +5421,30 @@ test('inherits an identity-free single speaker from the previous assistant messa
       .map(segment => segment.speakerId),
     ['mara', 'mara', 'mara'],
   )
+})
+
+test('does not inherit the previous speaker across conflicting explicit subject pronouns', () => {
+  const speakers = [{ id: 'npc:ewan', name: 'Ewan' }, { id: 'unconfigured:tessa', name: 'Tessa' }]
+  const previous = 'Ewan picks up his tray. "I am going."\n\nTessa puts her bowl down. She frowns. "Talk about something else."'
+  const current = '"Sacrifice."\n\nHe turns halfway back with the tray balanced on one palm.\n\n"What are you sacrificing?"\n\nHe shifts his weight.\n\n"Text her."'
+  assert.equal(previousAssistantSpeakerFallback(current, previous, null, speakers), null)
+  assert.ok(!addUnconfiguredDialogueSpeakers('Somebody behind him sidesteps the tray. Somebody moves. "Hello."', speakers).some(speaker => speaker.name === 'Somebody'))
+})
+
+test('speaker questions ask Jev to use names, pronouns and communication channels', () => {
+  const plan = buildSpeakerDecisionPlan('"Hello."', [{ id: 'npc:ewan', name: 'Ewan' }], false)
+  assert.match(plan.questions.speech_s0.instructions, /pronoun references/u)
+  assert.match(plan.questions.speech_s0.instructions, /text messages/u)
+  assert.match(plan.questions.speech_s0.instructions, /not proof of gender/u)
+})
+
+test('a clear response turn stops automatic carryover of the preceding speaker', () => {
+  const content = '"Hello."\n\nThe other person looks up.\n\n"What now?"'
+  const speakers = [{ id: 'npc:tessa', name: 'Tessa' }]
+  const plan = buildSpeakerDecisionPlan(content, speakers, false)
+  const answers: Record<string, SpeakerDecisionChoice> = { speech_s0: confidentDecision('known_0'), speech_s1: confidentDecision('no_clear_identity'), turn_s1: confidentDecision('responds_to_previous_speaker') }
+  const result = resolveSpeakerDecisionSegments(content, plan, answers, speakers, { isUserMessage: false, cardSpeakerId: null, historicalSpeakerId: 'npc:tessa' })
+  assert.notEqual(result.find(segment => segment.text === 'What now?')?.speakerId, 'npc:tessa')
 })
 
 test('prefers the sole character card for an unattributed assistant message', () => {

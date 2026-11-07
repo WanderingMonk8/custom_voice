@@ -2,6 +2,7 @@ import type {
   SpindleFrontendContext,
   SpindleTextInputHandle,
 } from 'lumiverse-spindle-types'
+import { syncPlaybackButtons, type PlaybackButtonState } from './playback-ui'
 import {
   activeGhostVoices,
   adaptiveGenerationConcurrency,
@@ -16,10 +17,18 @@ import {
   clampSavedAudioLimit,
   DEFAULT_SAVED_AUDIO_LIMIT,
   eligibleCardFallbackSpeakerId,
+  globalTtsConnectionPreference,
+  standardSpeakerReviewPolicy,
+  autoplayGenerationEvent,
+  claimAutoplayGeneration,
+  readAutomaticVoicePreferences,
+  resolveGlobalTtsConnection,
   encodeConcatenatedWav,
   expiredSavedAudioRecords,
   hashMessageContent,
   mergeVoicePlan,
+  filterNarrationSegments,
+  markUnresolvedSpeechSegments,
   npcSpeakerId,
   normalizeSpeechBoundaryDashes,
   normalizeSpeakerName,
@@ -32,15 +41,18 @@ import {
   reducedRequestWindowLimit,
   rollingRequestWindowDelay,
   speakerAliases,
+  speakerAssignmentSourceFromTrace,
   speakerAliasIdLookup,
   speakersForMessageRole,
   splitLargeVoicePlanSegments,
   shouldPersistMessageAudio,
   UNCAST_SPEAKER_ID,
+  UNRESOLVED_SPEAKER_ID,
   USER_SPEAKER_ID,
   upsertSavedAudioRecord,
   type GhostVoice,
   type PlaybackSegment,
+  type SpeakerAssignmentSource,
   type FavoriteVoice,
   type UncastVoiceGroup,
   type UncastVoiceAssignment,
@@ -357,7 +369,9 @@ interface PlaybackPreferences {
   ghostVoiceLifetime: number
   speakerLookback: number
   autoVoiceCasting: boolean
+  autoPlayback: boolean
   speakerAssignmentDebug: boolean
+  skipNarration: boolean
   defaultNarratorVoice: string
   defaultUserVoice: string
   favoriteVoices: FavoriteVoice[]
@@ -382,7 +396,7 @@ const MICROPHONE_ICON = `
   </svg>
 `
 
-const STOP_ACTION_ICON = `<svg viewBox="0 0 24 24" width="13" height="13" fill="currentColor" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="1"/></svg>`
+const STOP_ACTION_ICON = `<svg data-chat-voice-stop="true" viewBox="0 0 24 24" width="13" height="13" fill="currentColor" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="1"/></svg>`
 const PLAY_TTS_ACTION_ICON = `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" aria-hidden="true"><path d="M11 5 6 9H3v6h3l5 4V5Z" fill="currentColor"/><path d="M15 9.5a4 4 0 0 1 0 5M18 7a7.5 7.5 0 0 1 0 10" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>`
 const RENAME_ICON = `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" aria-hidden="true"><path d="M4 20h4l11-11-4-4L4 16v4Zm9.5-13.5 4 4" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>`
 
@@ -427,8 +441,9 @@ async function loadPlaybackPreferences(): Promise<PlaybackPreferences> {
     rateLimitWaitSeconds: DEFAULT_RATE_LIMIT_WAIT_SECONDS,
     ghostVoiceLifetime: GHOST_VOICE_LIFETIME_MESSAGES,
     speakerLookback: DEFAULT_SPEAKER_LOOKBACK,
-    autoVoiceCasting: true,
+    ...readAutomaticVoicePreferences({}),
     speakerAssignmentDebug: false,
+    skipNarration: false,
     defaultNarratorVoice: '',
     defaultUserVoice: '',
     favoriteVoices: [],
@@ -448,9 +463,7 @@ async function loadPlaybackPreferences(): Promise<PlaybackPreferences> {
   return {
     speed: Math.min(4, Math.max(0.25, speed)),
     volume: Math.min(1, Math.max(0, volume)),
-    connectionId: typeof row.value?.ttsConnectionId === 'string'
-      ? row.value.ttsConnectionId.trim()
-      : '',
+    connectionId: globalTtsConnectionPreference(row.value ?? {}),
     saveGeneratedAudio: row.value?.chatVoiceSaveGeneratedAudio !== false,
     savedAudioLimit: clampSavedAudioLimit(row.value?.chatVoiceSavedAudioLimit),
     skippedTrackerTags: typeof row.value?.chatVoiceSkippedTrackerTags === 'string'
@@ -482,8 +495,9 @@ async function loadPlaybackPreferences(): Promise<PlaybackPreferences> {
     ),
     ghostVoiceLifetime: clampIntegerSetting(row.value?.chatVoiceGhostVoiceLifetime, GHOST_VOICE_LIFETIME_MESSAGES, 1000),
     speakerLookback: clampIntegerSetting(row.value?.chatVoiceSpeakerLookback, DEFAULT_SPEAKER_LOOKBACK, MAX_SPEAKER_LOOKBACK),
-    autoVoiceCasting: row.value?.chatVoiceAutoCasting !== false,
+    ...readAutomaticVoicePreferences(row.value ?? {}),
     speakerAssignmentDebug: row.value?.chatVoiceSpeakerAssignmentDebug === true,
+    skipNarration: row.value?.chatVoiceSkipNarration === true,
     defaultNarratorVoice: typeof row.value?.chatVoiceDefaultNarratorVoice === 'string'
       ? row.value.chatVoiceDefaultNarratorVoice.trim().slice(0, 512)
       : '',
@@ -524,6 +538,10 @@ function saveGeneratedAudioPreference(enabled: boolean): Promise<void> {
     ...current,
     chatVoiceSaveGeneratedAudio: enabled,
   }))
+}
+
+function saveGlobalTtsConnection(connectionId: string): Promise<void> {
+  return updateVoiceSettings(current => ({ ...current, chatVoiceTtsConnectionId: connectionId.trim().slice(0, 128) }))
 }
 
 function saveGeneratedAudioLimit(limit: number): Promise<void> {
@@ -571,7 +589,9 @@ function saveAdvancedPlaybackPreferences(
   speakerAssignmentDebug: boolean,
   ghostVoiceLifetime: number,
   autoVoiceCasting: boolean,
+  autoPlayback: boolean,
   speakerLookback: number,
+  skipNarration: boolean,
 ): Promise<void> {
   return updateVoiceSettings(current => ({
     ...current,
@@ -591,7 +611,9 @@ function saveAdvancedPlaybackPreferences(
       MAX_RATE_LIMIT_WAIT_SECONDS,
     ),
     chatVoiceSpeakerAssignmentDebug: speakerAssignmentDebug,
+    chatVoiceSkipNarration: skipNarration,
     chatVoiceAutoCasting: autoVoiceCasting,
+    chatVoiceAutoPlayback: autoPlayback,
     chatVoiceGhostVoiceLifetime: clampIntegerSetting(ghostVoiceLifetime, GHOST_VOICE_LIFETIME_MESSAGES, 1000),
     chatVoiceSpeakerLookback: clampIntegerSetting(speakerLookback, DEFAULT_SPEAKER_LOOKBACK, MAX_SPEAKER_LOOKBACK),
   }))
@@ -1101,7 +1123,7 @@ export function setup(ctx: SpindleFrontendContext) {
     return { field, label, slot }
   }
 
-  const connectionField = createField('TTS connection')
+  const connectionField = createField('TTS connection (global)')
   const saveAudioField = createField('Audio storage')
   saveAudioField.slot.className = 'chat-voice-storage'
   const saveAudioLabel = document.createElement('label')
@@ -1299,7 +1321,7 @@ export function setup(ctx: SpindleFrontendContext) {
   const concurrentGenerationField = createField('Maximum concurrent generations')
   const rateLimitWaitField = createField('Rate-limit wait budget (seconds)')
   const ghostLifetimeField = createField('Uncast voice lifetime (assistant messages)')
-  const speakerLookbackField = createField('Speaker lookback (assistant messages)')
+  const speakerLookbackField = createField('Global speaker context (messages)')
   const autoCastingLabel = document.createElement('label')
   autoCastingLabel.className = 'chat-voice-toggle'
   const autoCastingToggle = document.createElement('input')
@@ -1308,6 +1330,19 @@ export function setup(ctx: SpindleFrontendContext) {
   const autoCastingText = document.createElement('span')
   autoCastingText.textContent = 'Automatically cast voices'
   autoCastingLabel.append(autoCastingToggle, autoCastingText)
+  const autoPlaybackLabel = document.createElement('label')
+  autoPlaybackLabel.className = 'chat-voice-toggle'
+  const autoPlaybackToggle = document.createElement('input')
+  autoPlaybackToggle.type = 'checkbox'
+  const autoPlaybackCopy = document.createElement('span')
+  autoPlaybackCopy.className = 'chat-voice-toggle-copy'
+  const autoPlaybackText = document.createElement('span')
+  autoPlaybackText.textContent = 'Automatically play new messages'
+  const autoPlaybackHint = document.createElement('span')
+  autoPlaybackHint.className = 'chat-voice-toggle-hint'
+  autoPlaybackHint.textContent = 'Play new assistant messages as they arrive. Your browser may require a click before audio can start.'
+  autoPlaybackCopy.append(autoPlaybackText, autoPlaybackHint)
+  autoPlaybackLabel.append(autoPlaybackToggle, autoPlaybackCopy)
   const speakerDebugLabel = document.createElement('label')
   speakerDebugLabel.className = 'chat-voice-toggle'
   const speakerDebugToggle = document.createElement('input')
@@ -1322,6 +1357,19 @@ export function setup(ctx: SpindleFrontendContext) {
   speakerDebugHint.textContent = 'Records both Jev passes, the turn matrix, narrative cues, dialogue-run review, inheritance, fallbacks, aliases, and the final voice route for every segment.'
   speakerDebugCopy.append(speakerDebugText, speakerDebugHint)
   speakerDebugLabel.append(speakerDebugToggle, speakerDebugCopy)
+  const skipNarrationLabel = document.createElement('label')
+  skipNarrationLabel.className = 'chat-voice-toggle'
+  const skipNarrationToggle = document.createElement('input')
+  skipNarrationToggle.type = 'checkbox'
+  const skipNarrationCopy = document.createElement('span')
+  skipNarrationCopy.className = 'chat-voice-toggle-copy'
+  const skipNarrationText = document.createElement('span')
+  skipNarrationText.textContent = 'Skip narration audio'
+  const skipNarrationHint = document.createElement('span')
+  skipNarrationHint.className = 'chat-voice-toggle-hint'
+  skipNarrationHint.textContent = 'Generate dialogue only. Narration still provides speaker context; existing saved audio is unchanged until regenerated.'
+  skipNarrationCopy.append(skipNarrationText, skipNarrationHint)
+  skipNarrationLabel.append(skipNarrationToggle, skipNarrationCopy)
   const speakerDebugOutput = document.createElement('textarea')
   speakerDebugOutput.className = 'chat-voice-debug-output'
   speakerDebugOutput.readOnly = true
@@ -1339,6 +1387,8 @@ export function setup(ctx: SpindleFrontendContext) {
     ghostLifetimeField.field,
     speakerLookbackField.field,
     autoCastingLabel,
+    autoPlaybackLabel,
+    skipNarrationLabel,
     speakerDebugLabel,
     speakerDebugOutput,
     advancedHint,
@@ -1346,8 +1396,15 @@ export function setup(ctx: SpindleFrontendContext) {
 
   let applyingState = false
   let activeChat: ActiveChatState | null = null
+  const autoPlaybackSeenGenerations = new Set<string>()
+  const autoPlaybackSeenMessages = new Set<string>()
+  let autoPlaybackQueue: Promise<void> = Promise.resolve()
+  let autoPlaybackDisposed = false
+  let autoPlaybackEpoch = 0
   let connections: TtsConnection[] = []
   let lumiverseConnectionId = ''
+  let savingGlobalConnection = false
+  let globalConnectionVersion = 0
   let defaultNarratorVoice = ''
   let defaultUserVoice = ''
   let favoriteVoices: FavoriteVoice[] = []
@@ -1406,10 +1463,12 @@ export function setup(ctx: SpindleFrontendContext) {
   let concurrentGenerationLimit = DEFAULT_CONCURRENT_GENERATIONS
   let rateLimitWaitSeconds = DEFAULT_RATE_LIMIT_WAIT_SECONDS
   let autoVoiceCasting = true
+  let autoPlayback = false
   let ghostVoiceLifetime = GHOST_VOICE_LIFETIME_MESSAGES
   let speakerLookback = DEFAULT_SPEAKER_LOOKBACK
   let ghostLifetimeLoaded = false
   let speakerAssignmentDebug = false
+  let skipNarration = false
   let advancedSettingsSaveTimer: ReturnType<typeof setTimeout> | null = null
   let savingAdvancedSettings = false
   let saveTimer: ReturnType<typeof setTimeout> | null = null
@@ -1482,12 +1541,7 @@ export function setup(ctx: SpindleFrontendContext) {
   const ghostVoiceEditors = new Map<string, { input: SpindleTextInputHandle; display: HTMLButtonElement }>()
   let editingCharacterVoiceId: string | null = null
   let lastContextMessageId: string | null = null
-  const nativeButtonStates = new Map<HTMLButtonElement, {
-    html: string
-    title: string | null
-    ariaLabel: string | null
-    ariaPressed: string | null
-  }>()
+  const nativeButtonStates = new Map<HTMLButtonElement, PlaybackButtonState>()
   const pendingMessageRequests = new Map<string, {
     resolve: (message: PlaybackMessage) => void
     reject: (error: Error) => void
@@ -1592,10 +1646,32 @@ export function setup(ctx: SpindleFrontendContext) {
   const connectionPicker = ctx.components.mountSelect(connectionField.slot, {
     value: '', options: [], placeholder: 'Loading connections…',
     searchPlaceholder: 'Search TTS connections…', emptyMessage: 'No TTS connections found.',
-    clearable: true, clearLabel: 'Disable custom chat voices', ariaLabel: 'TTS connection',
+    clearable: true, clearLabel: 'Use default TTS connection', ariaLabel: 'Global TTS connection',
     disabled: true,
-    onChange: () => markChanged(),
+    onChange: () => { void onGlobalConnectionChanged() },
   })
+
+  async function onGlobalConnectionChanged(): Promise<void> {
+    if (applyingState) return
+    const previous = lumiverseConnectionId
+    const selected = connectionPicker.getValue()
+    const version = ++globalConnectionVersion
+    lumiverseConnectionId = resolveGlobalTtsConnection(selected, connections)
+    savingGlobalConnection = true
+    setStatus('Saving global TTS connection…')
+    try {
+      await saveGlobalTtsConnection(selected)
+      if (version === globalConnectionVersion) setStatus('Global TTS connection saved.', 'saved')
+    } catch (error) {
+      if (version === globalConnectionVersion) {
+        lumiverseConnectionId = previous
+        connectionPicker.update({ value: previous, options: connectionOptions(previous) })
+        setStatus(error instanceof Error ? error.message : 'Could not save global TTS connection.', 'error')
+      }
+    } finally {
+      if (version === globalConnectionVersion) savingGlobalConnection = false
+    }
+  }
 
   const narratorEditSlot = document.createElement('div')
   const userEditSlot = document.createElement('div')
@@ -1840,11 +1916,11 @@ export function setup(ctx: SpindleFrontendContext) {
     refreshLocalState()
   }
   ghostLifetimeInput.addEventListener('change', onGhostLifetimeInput)
-  const speakerLookbackInput = createNumberInput(DEFAULT_SPEAKER_LOOKBACK, MAX_SPEAKER_LOOKBACK, 'Speaker lookback in assistant messages')
+  const speakerLookbackInput = createNumberInput(DEFAULT_SPEAKER_LOOKBACK, MAX_SPEAKER_LOOKBACK, 'Previous messages used for global speaker context')
   speakerLookbackField.slot.appendChild(speakerLookbackInput)
   const speakerLookbackHint = document.createElement('div')
   speakerLookbackHint.className = 'chat-voice-hint'
-  speakerLookbackHint.textContent = 'Check up to this many previous assistant messages for the last clear speaker.'
+  speakerLookbackHint.textContent = 'Include up to this many earlier user and assistant messages as context. Default: 6 messages (roughly 3 exchanges).'
   speakerLookbackField.slot.appendChild(speakerLookbackHint)
   const onSpeakerLookbackInput = () => {
     speakerLookback = clampIntegerSetting(speakerLookbackInput.valueAsNumber, DEFAULT_SPEAKER_LOOKBACK, MAX_SPEAKER_LOOKBACK)
@@ -1862,7 +1938,9 @@ export function setup(ctx: SpindleFrontendContext) {
   concurrentGenerationInput.addEventListener('change', onConcurrentGenerationInput)
   rateLimitWaitInput.addEventListener('change', onRateLimitWaitInput)
   speakerDebugToggle.addEventListener('change', onSpeakerDebugChanged)
+  skipNarrationToggle.addEventListener('change', onSkipNarrationChanged)
   autoCastingToggle.addEventListener('change', () => { autoVoiceCasting = autoCastingToggle.checked; scheduleAdvancedSettingsSave() })
+  autoPlaybackToggle.addEventListener('change', onAutoPlaybackChanged)
 
   const addNpcInput = ctx.components.mountTextInput(addNpcInputSlot, {
     value: '', placeholder: 'NPC name / aliases', ariaLabel: 'NPC name and aliases to add', disabled: true,
@@ -1872,7 +1950,7 @@ export function setup(ctx: SpindleFrontendContext) {
   function collectConfig(forSave = false) {
     return {
       messageLimit: activeChat?.messageLimit ?? 20,
-      connectionId: connectionPicker.getValue(),
+      connectionId: forSave ? activeChat?.connectionId ?? '' : (connectionPicker.getValue() || lumiverseConnectionId),
       narratorVoice: forSave ? localNarratorVoice : narratorInput.getValue(),
       userVoice: forSave ? localUserVoice : userVoiceInput.getValue(),
       useGlobalNarratorVoice,
@@ -1960,42 +2038,7 @@ export function setup(ctx: SpindleFrontendContext) {
   userDefaultToggle.addEventListener('change', onUserDefaultChange)
 
   function updatePlaybackButtons() {
-    for (const button of hostDocument.querySelectorAll<HTMLButtonElement>('button')) {
-      const messageId = nativeTtsMessageId(button)
-      if (!messageId) continue
-      const playing = activePlayback?.messageId === messageId
-      const idle = nativeButtonStates.get(button)
-      if (!playing) {
-        if (!idle) continue
-        button.innerHTML = idle.html
-        if (idle.title === null) button.removeAttribute('title')
-        else button.setAttribute('title', idle.title)
-        if (idle.ariaLabel === null) button.removeAttribute('aria-label')
-        else button.setAttribute('aria-label', idle.ariaLabel)
-        if (idle.ariaPressed === null) button.removeAttribute('aria-pressed')
-        else button.setAttribute('aria-pressed', idle.ariaPressed)
-        delete button.dataset.chatVoiceNativeTts
-        delete button.dataset.playing
-        nativeButtonStates.delete(button)
-        continue
-      }
-      if (!idle) {
-        nativeButtonStates.set(button, {
-          html: button.innerHTML,
-          title: button.getAttribute('title'),
-          ariaLabel: button.getAttribute('aria-label'),
-          ariaPressed: button.getAttribute('aria-pressed'),
-        })
-      }
-      const label = 'Stop custom voice playback'
-      const hasText = !!button.querySelector(':scope > span')
-      button.dataset.chatVoiceNativeTts = 'true'
-      button.dataset.playing = 'true'
-      button.innerHTML = `${STOP_ACTION_ICON}${hasText ? `<span>${label}</span>` : ''}`
-      button.title = label
-      button.setAttribute('aria-label', label)
-      button.setAttribute('aria-pressed', 'true')
-    }
+    syncPlaybackButtons(hostDocument.querySelectorAll<HTMLButtonElement>('button'), activePlayback?.messageId ?? null, nativeTtsMessageId, nativeButtonStates, STOP_ACTION_ICON)
   }
 
   function restoreNativePlaybackButtons() {
@@ -2044,6 +2087,7 @@ export function setup(ctx: SpindleFrontendContext) {
         ghostVoiceLifetime: preferences.ghostVoiceLifetime,
         speakerLookback: preferences.speakerLookback,
         debug: preferences.speakerAssignmentDebug,
+        ...standardSpeakerReviewPolicy(),
       })
     })
   }
@@ -2058,7 +2102,7 @@ export function setup(ctx: SpindleFrontendContext) {
     })
   }
 
-  function requestUncastVoiceMatches(chatId: string, messageId: string, message: string, groups: UncastVoiceGroup[], voices: FavoriteVoice[], reserved: string[], lifetime: number): Promise<UncastVoiceAssignment[]> {
+  function requestUncastVoiceMatches(chatId: string, messageId: string, message: string, sourceHash: string, groups: UncastVoiceGroup[], voices: FavoriteVoice[], reserved: string[], lifetime: number, speakerLookback: number, skippedTrackerTags: string): Promise<UncastVoiceAssignment[]> {
     const requestId = `uncast-${Date.now().toString(36)}-${++uncastRequestSequence}`
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -2066,7 +2110,7 @@ export function setup(ctx: SpindleFrontendContext) {
         reject(new Error('Uncast voice matching timed out.'))
       }, 35_000)
       pendingUncastRequests.set(requestId, { resolve, reject, timer })
-      ctx.sendToBackend({ type: 'chat_voice_match_uncast', requestId, chatId, messageId, message, groups, voices, reserved, lifetime })
+      ctx.sendToBackend({ type: 'chat_voice_match_uncast', requestId, chatId, messageId, message, sourceHash, groups, voices, reserved, lifetime, speakerLookback, skippedTrackerTags })
     })
   }
 
@@ -2074,25 +2118,19 @@ export function setup(ctx: SpindleFrontendContext) {
     if (speakerId === null) return 'narrator'
     if (speakerId === USER_SPEAKER_ID) return 'user persona'
     if (speakerId === UNCAST_SPEAKER_ID) return 'uncast character'
+    if (speakerId === UNRESOLVED_SPEAKER_ID) return 'unresolved speech'
     const speaker = speakers.find(candidate => candidate.id === speakerId)
     return speaker ? `${speaker.name} [${speakerId}]` : speakerId
   }
 
-  type SpeakerAssignmentSource =
-    | 'first-pass'
-    | 'chain-fill'
-    | 'chain-override'
-    | 'discourse-fill'
-    | 'discourse-override'
-    | 'inheritance'
-    | 'previous-assistant'
-    | 'card-title'
-    | 'role-fallback'
-    | 'local-parser'
-    | 'unreported'
-
   const SPEAKER_SOURCE_LABELS: Record<SpeakerAssignmentSource, string> = {
+    'best-available': 'best-available guess (uncertain)',
     'first-pass': 'first pass',
+    'contextual-confirmation': 'contextually confirmed first pass',
+    'contextual-review': 'contextual review',
+    'opening-exchange': 'opening exchange review',
+    'opening-backlink': 'opening backward link',
+    'opening-forwardlink': 'opening forward link',
     'chain-fill': 'turn chain fill',
     'chain-override': 'turn chain override',
     'discourse-fill': 'discourse fill',
@@ -2119,22 +2157,7 @@ export function setup(ctx: SpindleFrontendContext) {
     parsingMode: PlaybackPreferences['speakerParsingMode'],
     review: SpeakerParseReview,
   ): SpeakerAssignmentSource {
-    const resolution = speakerDebugStep(segment, 'resolution:')
-    if (resolution?.startsWith('resolution:chain-identity (overrode')) return 'chain-override'
-    if (resolution?.startsWith('resolution:chain-identity')) return 'chain-fill'
-    if (resolution?.startsWith('resolution:discourse-identity (overrode')) return 'discourse-override'
-    if (resolution?.startsWith('resolution:discourse-identity')) return 'discourse-fill'
-    if (resolution === 'resolution:direct-speech-identity') return 'first-pass'
-    if (resolution?.startsWith('resolution:upstream-identity')) return 'inheritance'
-    if (resolution?.startsWith('resolution:previous-assistant')) return 'previous-assistant'
-    if (resolution?.startsWith('resolution:unique card-title')) return 'card-title'
-    if (resolution?.startsWith('resolution:user-role')) return 'role-fallback'
-    if (resolution?.startsWith('resolution:assistant connection-default')) return 'role-fallback'
-    if (review.failed || review.usedLlm === false || parsingMode === 'off') return 'local-parser'
-    if (speakerDebugStep(segment, 'jev-fallback:') || speakerDebugStep(segment, 'jev-disabled:')) {
-      return 'local-parser'
-    }
-    return 'unreported'
+    return speakerAssignmentSourceFromTrace(segment.debugPath ?? [], review.failed || review.usedLlm === false || parsingMode === 'off')
   }
 
   function speakerSourceDetail(
@@ -2197,7 +2220,7 @@ export function setup(ctx: SpindleFrontendContext) {
     const lines = ['Jev pipeline: first pass answered; deterministic policy applied after normalization']
     const speechSegments = segments.filter(segment => speakerDebugStep(segment, 'segment-type:speech'))
     const normalized = speechSegments
-      .map(segment => speakerDebugStep(segment, 'jev-speech-normalized:'))
+      .map(segment => speakerDebugStep(segment, 'jev-first-pass-speech-normalized:') ?? speakerDebugStep(segment, 'jev-speech-normalized:'))
       .filter((step): step is string => step !== undefined)
     if (normalized.length > 0) {
       const clear = normalized.filter(step => !step.includes(':unclear')).length
@@ -2700,7 +2723,7 @@ export function setup(ctx: SpindleFrontendContext) {
     })
   }
 
-  async function playMessage(messageId: string, nativeRegenerationAction = false): Promise<void> {
+  async function playMessage(messageId: string, nativeRegenerationAction = false, automatic = false): Promise<void> {
     if (activePlayback?.messageId === messageId) {
       const finishingSave = stopPlayback()
       setStatus(finishingSave ? 'Playback stopped; finishing saved audio…' : 'Playback stopped.')
@@ -2720,6 +2743,7 @@ export function setup(ctx: SpindleFrontendContext) {
       return
     }
     if (ctx.getActiveChat().chatId !== requestedChatId) return
+    if (automatic && (message.is_user || hasSavedAudioForCurrentSwipe(message))) return
 
     const regeneratingSavedAudio = !message.is_user
       && (nativeRegenerationAction || hasSavedAudioForCurrentSwipe(message))
@@ -2750,6 +2774,7 @@ export function setup(ctx: SpindleFrontendContext) {
     if (!activeChat || activeChat.id !== ctx.getActiveChat().chatId) return
     const playbackChat = activeChat
     const config = collectConfig()
+    const connectionVersionAtLoad = globalConnectionVersion
     const preferences = await loadPlaybackPreferences()
     if (llmSettingsSaveTimer || savingLlmSettings) {
       preferences.speakerParsingMode = speakerParsingMode
@@ -2765,17 +2790,19 @@ export function setup(ctx: SpindleFrontendContext) {
       preferences.ghostVoiceLifetime = ghostVoiceLifetime
       preferences.speakerLookback = speakerLookback
       preferences.autoVoiceCasting = autoVoiceCasting
+      preferences.autoPlayback = autoPlayback
       preferences.speakerAssignmentDebug = speakerAssignmentDebug
+      preferences.skipNarration = skipNarration
     } else {
       playbackBufferSegments = preferences.playbackBufferSegments
       concurrentGenerationLimit = preferences.concurrentGenerations
       rateLimitWaitSeconds = preferences.rateLimitWaitSeconds
       speakerAssignmentDebug = preferences.speakerAssignmentDebug
+      skipNarration = preferences.skipNarration
     }
-    const connectionId = config.connectionId
-      || (connections.some(connection => connection.id === preferences.connectionId)
-        ? preferences.connectionId
-        : connections.find(connection => connection.is_default)?.id ?? lumiverseConnectionId)
+    const connectionId = savingGlobalConnection || connectionVersionAtLoad !== globalConnectionVersion
+      ? lumiverseConnectionId
+      : resolveGlobalTtsConnection(preferences.connectionId, connections)
     if (!connectionId) {
       setStatus('Choose a TTS connection before playing.', 'error')
       return
@@ -2816,7 +2843,20 @@ export function setup(ctx: SpindleFrontendContext) {
       return
     }
     const audioContext = new contextClass()
-    await audioContext.resume()
+    if (automatic) {
+      let timer: ReturnType<typeof setTimeout> | undefined
+      try {
+        await Promise.race([
+          audioContext.resume(),
+          new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error('Automatic playback needs a browser interaction. Click a play button to enable audio.')), 2000) }),
+        ])
+      } catch (error) {
+        void audioContext.close().catch(() => undefined)
+        setStatus(error instanceof Error ? error.message : 'Automatic playback could not start.', 'error')
+        return
+      } finally { if (timer) clearTimeout(timer) }
+      if (autoPlaybackDisposed || !autoPlayback || ctx.getActiveChat().chatId !== requestedChatId) { void audioContext.close().catch(() => undefined); return }
+    } else await audioContext.resume()
     let audibleFinished = false
     let resolveAudibleDone: (() => void) | null = null
     const audibleDone = new Promise<void>((resolve) => {
@@ -2841,6 +2881,7 @@ export function setup(ctx: SpindleFrontendContext) {
     }
     activePlayback = playback
     updatePlaybackButtons()
+    const playbackSetupFinishedAt = Date.now()
 
     try {
       if (playback.controller.signal.aborted) throw new DOMException('Playback stopped.', 'AbortError')
@@ -2855,25 +2896,16 @@ export function setup(ctx: SpindleFrontendContext) {
       )
       const defaultSpeakerId = message.is_user
         ? USER_SPEAKER_ID
-        : eligibleCardFallbackSpeakerId(
-            message.content,
-            preferredCardSpeakerId(
-              message,
-              playbackChat.characters,
-              playbackChat.cardCharacterIds ?? [],
-            ),
-            playbackSpeakers,
-            preferences.skippedTrackerTags,
-          )
+        : null
       const aliases = speakerAliasIdLookup(playbackChat.characters)
-      const localSegments = parseRosterVoiceSegments(
+      const localSegments = markUnresolvedSpeechSegments(parseRosterVoiceSegments(
         message.content,
         defaultSpeakerId,
         playbackSpeakers,
         preferences.skippedTrackerTags,
         null,
-        preferences.speakerAssignmentDebug,
-      )
+        true,
+      ), preferences.speakerAssignmentDebug)
       let review: SpeakerParseReview = { segments: localSegments, usedLlm: null, failed: false }
       if (preferences.speakerParsingMode !== 'off' || preferences.ttsTagStyle !== 'off') {
         setStatus(
@@ -2885,12 +2917,13 @@ export function setup(ctx: SpindleFrontendContext) {
       try {
         review = await requestSpeakerReviewedSegments(playbackChat.id, messageId, preferences)
       } catch (error) {
-        console.warn('[Chat Voice] Backend speaker parsing failed; using the message-local parser.', error)
         if (playback.controller.signal.aborted) throw new DOMException('Playback stopped.', 'AbortError')
+        if (error instanceof Error && error.message.includes('changed during speaker review')) throw error
+        console.warn('[Chat Voice] Backend speaker parsing failed; using the message-local parser.', error)
         review = { segments: localSegments, usedLlm: null, failed: true }
         setStatus('Historical speaker lookup unavailable; using the message-local parser.')
       }
-      const segments = review.segments
+      const reviewedSegments = review.segments
       updateSpeakerDebugLog(
         messageId,
         message.is_user,
@@ -2898,13 +2931,19 @@ export function setup(ctx: SpindleFrontendContext) {
         playbackSpeakers,
         playbackChat.characters,
         localSegments,
-        segments,
+        reviewedSegments,
         aliases,
         config,
         preferences.speakerParsingMode,
         review,
       )
       for (const line of autoCastDiagnostics) appendSpeakerDebugLog(`Automatic casting: ${line}`)
+      const segments = filterNarrationSegments(reviewedSegments, preferences.skipNarration)
+      if (preferences.skipNarration) appendSpeakerDebugLog(`Narration audio skipped: ${reviewedSegments.length - segments.length} segment(s).`)
+      if (!segments.length && preferences.skipNarration) {
+        setStatus('No dialogue to play; narration audio is disabled.', 'saved')
+        return
+      }
       const matchingSegments = segments.map(segment => ({
         ...segment,
         speakerId: segment.speakerId ? aliases.get(segment.speakerId) ?? segment.speakerId : null,
@@ -2916,8 +2955,8 @@ export function setup(ctx: SpindleFrontendContext) {
       const uncastVoices = availableUncastVoices(favoriteVoices, reservedVoices)
       const uncastMatchPromise = preferences.autoVoiceCasting && uncastGroups.length
         ? requestUncastVoiceMatches(
-            playbackChat.id, messageId, preparePlaybackContent(message.content, preferences.skippedTrackerTags),
-            uncastGroups, uncastVoices, reservedVoices, preferences.ghostVoiceLifetime,
+            playbackChat.id, messageId, preparePlaybackContent(message.content, preferences.skippedTrackerTags), hashMessageContent(message.content),
+            uncastGroups, uncastVoices, reservedVoices, preferences.ghostVoiceLifetime, preferences.speakerLookback, preferences.skippedTrackerTags,
           ).catch(error => {
             appendSpeakerDebugLog(`Uncast voice matching failed; using connection default: ${error instanceof Error ? error.message : String(error)}`)
             return [] as UncastVoiceAssignment[]
@@ -3579,6 +3618,7 @@ export function setup(ctx: SpindleFrontendContext) {
         appendSpeakerDebugLog(
           `Playback [${index + 1}] using voice=${JSON.stringify(plan[index].voice || '<connection default>')}.`,
         )
+        if (index === 0) appendSpeakerDebugLog(`Time from playback setup to first audio dispatch: ${Date.now() - playbackSetupFinishedAt}ms (includes speaker review, tag placement and buffering).`)
         setStatus(`Playing ${index + 1} of ${plan.length} voice segment${plan.length === 1 ? '' : 's'}…`)
         await playDecodedBuffer(playback, current.segment, preferences.volume)
       }
@@ -4343,12 +4383,12 @@ export function setup(ctx: SpindleFrontendContext) {
     }
     activeChat = next
     context.textContent = next ? `Active chat: ${next.name}` : 'Open a chat to configure its voices.'
-    const selectedConnectionId = next?.connectionId || lumiverseConnectionId
+    const selectedConnectionId = lumiverseConnectionId
     connectionPicker.update({
       value: selectedConnectionId,
       options: connectionOptions(selectedConnectionId),
       placeholder: connections.length ? 'Choose a TTS connection' : 'No TTS connections found',
-      disabled: !next || connections.length === 0,
+      disabled: connections.length === 0,
     })
     scanButton.disabled = !next || scanning
     if (!keepRoleEditor || editingRoleVoice !== 'narrator') localNarratorVoice = next?.narratorVoice ?? ''
@@ -4377,6 +4417,7 @@ export function setup(ctx: SpindleFrontendContext) {
   }
 
   async function loadConnections() {
+    const connectionVersionAtLoad = globalConnectionVersion
     try {
       const [loadedConnections, loadedLlmConnections, preferences] = await Promise.all([
         listAllTtsConnections(),
@@ -4461,6 +4502,8 @@ export function setup(ctx: SpindleFrontendContext) {
         refreshLocalState()
         autoVoiceCasting = preferences.autoVoiceCasting
         autoCastingToggle.checked = autoVoiceCasting
+        autoPlayback = preferences.autoPlayback
+        autoPlaybackToggle.checked = autoPlayback
         speakerAssignmentDebug = preferences.speakerAssignmentDebug
         playbackBufferInput.value = String(playbackBufferSegments)
         concurrentGenerationInput.value = String(concurrentGenerationLimit)
@@ -4468,17 +4511,17 @@ export function setup(ctx: SpindleFrontendContext) {
         ghostLifetimeInput.value = String(ghostVoiceLifetime)
         speakerLookbackInput.value = String(speakerLookback)
         speakerDebugToggle.checked = speakerAssignmentDebug
+        skipNarration = preferences.skipNarration
+        skipNarrationToggle.checked = skipNarration
         speakerDebugOutput.hidden = !speakerAssignmentDebug
       }
-      lumiverseConnectionId = connections.some(connection => connection.id === preferences.connectionId)
-        ? preferences.connectionId
-        : connections.find(connection => connection.is_default)?.id ?? ''
-      const selectedConnectionId = activeChat?.connectionId || lumiverseConnectionId
+      if (!savingGlobalConnection && connectionVersionAtLoad === globalConnectionVersion) lumiverseConnectionId = resolveGlobalTtsConnection(preferences.connectionId, connections)
+      const selectedConnectionId = lumiverseConnectionId
       connectionPicker.update({
         value: selectedConnectionId,
         options: connectionOptions(selectedConnectionId),
         placeholder: connections.length ? 'Choose a TTS connection' : 'No TTS connections found',
-        disabled: !activeChat || connections.length === 0,
+        disabled: connections.length === 0,
       })
       if (connections.length === 0) setStatus('Create a TTS connection in Lumiverse first.')
       else if (decisionStatusFailed) {
@@ -4597,6 +4640,17 @@ export function setup(ctx: SpindleFrontendContext) {
     scheduleAdvancedSettingsSave()
   }
 
+  function onSkipNarrationChanged(): void {
+    skipNarration = skipNarrationToggle.checked
+    scheduleAdvancedSettingsSave()
+  }
+
+  function onAutoPlaybackChanged(): void {
+    autoPlayback = autoPlaybackToggle.checked
+    autoPlaybackEpoch += 1
+    scheduleAdvancedSettingsSave()
+  }
+
   async function persistAdvancedSettings(): Promise<void> {
     savingAdvancedSettings = true
     setStatus('Saving global advanced playback settings…')
@@ -4608,7 +4662,9 @@ export function setup(ctx: SpindleFrontendContext) {
         speakerAssignmentDebug,
         ghostVoiceLifetime,
         autoVoiceCasting,
+        autoPlayback,
         speakerLookback,
+        skipNarration,
       )
       setStatus('Advanced playback settings saved globally.', 'saved')
     } catch (error) {
@@ -5004,12 +5060,22 @@ export function setup(ctx: SpindleFrontendContext) {
       })
     }
   }
-  const savedUserControlObserver = new hostWindow.MutationObserver(() => ensureSavedUserBubbleControls())
+  let playbackButtonsFrame: number | null = null
+  const savedUserControlObserver = new hostWindow.MutationObserver(() => {
+    ensureSavedUserBubbleControls()
+    if (activePlayback && playbackButtonsFrame === null) {
+      playbackButtonsFrame = hostWindow.requestAnimationFrame(() => {
+        playbackButtonsFrame = null
+        updatePlaybackButtons()
+      })
+    }
+  })
   savedUserControlObserver.observe(hostDocument.body, { childList: true, subtree: true })
   ensureSavedUserBubbleControls()
 
   const unsubscribeChatSwitched = ctx.events.on('CHAT_SWITCHED', (rawPayload: unknown) => {
     const switchedChatId = (rawPayload as { chatId?: string | null })?.chatId ?? null
+    autoPlaybackEpoch += 1
     hostWindow.requestAnimationFrame(() => {
       if (ctx.getActiveChat().chatId === switchedChatId) refreshLocalState()
     })
@@ -5017,6 +5083,19 @@ export function setup(ctx: SpindleFrontendContext) {
 
   const unsubscribeMessageRendered = ctx.events.on('CHARACTER_MESSAGE_RENDERED', () => {
     if (activeChat?.id === ctx.getActiveChat().chatId) refreshLocalState()
+  })
+
+  const unsubscribeGenerationEnded = ctx.events.on('GENERATION_ENDED', (payload: unknown) => {
+    const event = autoplayGenerationEvent(payload, ctx.getActiveChat().chatId)
+    if (!event || autoPlaybackDisposed) return
+    if (!claimAutoplayGeneration(event, autoPlaybackSeenGenerations, autoPlaybackSeenMessages)) return
+    if (!autoPlayback) return
+    const eventEpoch = autoPlaybackEpoch
+    autoPlaybackQueue = autoPlaybackQueue.catch(() => undefined).then(async () => {
+      while (activePlayback && !autoPlaybackDisposed && autoPlayback && eventEpoch === autoPlaybackEpoch && ctx.getActiveChat().chatId === event.chatId) await activePlayback.audibleDone
+      if (autoPlaybackDisposed || !autoPlayback || eventEpoch !== autoPlaybackEpoch || ctx.getActiveChat().chatId !== event.chatId) return
+      await playMessage(event.messageId, false, true)
+    }).catch(error => { if (!autoPlaybackDisposed) setStatus(error instanceof Error ? error.message : 'Automatic playback failed.', 'error') })
   })
 
   const unsubscribeActivate = tab.onActivate(() => {
@@ -5030,6 +5109,7 @@ export function setup(ctx: SpindleFrontendContext) {
   refreshLocalState()
 
   return () => {
+    autoPlaybackDisposed = true
     hostDocument.removeEventListener('pointerdown', closeFavoritePickerOnOutsideClick)
     hostDocument.removeEventListener('keydown', closeFavoritePickerOnEscape)
     stopVoicePreview()
@@ -5042,6 +5122,7 @@ export function setup(ctx: SpindleFrontendContext) {
     unsubscribeActivate()
     unsubscribeChatSwitched()
     unsubscribeMessageRendered()
+    unsubscribeGenerationEnded()
     unsubscribeBackend()
     for (const input of characterInputs.values()) input.destroy()
     for (const { input } of ghostVoiceEditors.values()) input.destroy()
@@ -5113,7 +5194,9 @@ export function setup(ctx: SpindleFrontendContext) {
         speakerAssignmentDebug,
         ghostVoiceLifetime,
         autoVoiceCasting,
+        autoPlayback,
         speakerLookback,
+        skipNarration,
       )
     }
     skippedTrackerTagsInput.destroy()
@@ -5128,6 +5211,8 @@ export function setup(ctx: SpindleFrontendContext) {
     ghostLifetimeInput.removeEventListener('change', onGhostLifetimeInput)
     speakerLookbackInput.removeEventListener('change', onSpeakerLookbackInput)
     speakerDebugToggle.removeEventListener('change', onSpeakerDebugChanged)
+    skipNarrationToggle.removeEventListener('change', onSkipNarrationChanged)
+    autoPlaybackToggle.removeEventListener('change', onAutoPlaybackChanged)
     addNpcInput.destroy()
     addNpcButton.removeEventListener('click', onAddNpc)
     addNpcInputSlot.removeEventListener('keydown', onAddNpcKeyDown)
@@ -5137,6 +5222,7 @@ export function setup(ctx: SpindleFrontendContext) {
     hostWindow.removeEventListener('contextmenu', onNativeContextMenu, true)
     hostWindow.removeEventListener('click', onNativeTtsClick, true)
     savedUserControlObserver.disconnect()
+    if (playbackButtonsFrame !== null) hostWindow.cancelAnimationFrame(playbackButtonsFrame)
     restoreNativePlaybackButtons()
     tab.destroy()
     removeStyle()

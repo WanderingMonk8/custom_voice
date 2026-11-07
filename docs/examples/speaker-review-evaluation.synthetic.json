@@ -1,0 +1,20 @@
+[
+  {
+    "id": "synthetic-opening-reply",
+    "conversation": "synthetic-conversation-a",
+    "expected": ["speaker-a", "speaker-a", null],
+    "baseline": ["speaker-b", null, null],
+    "candidate": ["speaker-a", "speaker-a", "speaker-a"],
+    "baselineMs": 100,
+    "candidateMs": 160
+  },
+  {
+    "id": "synthetic-phone-exchange",
+    "conversation": "synthetic-conversation-b",
+    "expected": ["speaker-c", "speaker-d"],
+    "baseline": ["speaker-c", "speaker-d"],
+    "candidate": ["speaker-c", "speaker-d"],
+    "baselineMs": 200,
+    "candidateMs": 250
+  }
+]

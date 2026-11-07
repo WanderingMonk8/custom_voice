@@ -1,11 +1,12 @@
 {
   "name": "lumiverse-chat-voice",
-  "version": "3.26.2",
+  "version": "3.28.4",
   "private": true,
   "type": "module",
   "scripts": {
     "build": "node scripts/build.mjs",
     "test": "node scripts/test.mjs",
+    "evaluate:speakers": "node scripts/evaluate-speakers.mjs",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {

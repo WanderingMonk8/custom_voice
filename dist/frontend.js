@@ -1,6 +1,77 @@
+// src/playback-ui.ts
+function syncPlaybackButtons(buttons, activeMessageId, getMessageId, states, stopIcon) {
+  for (const button of buttons) {
+    const messageId = getMessageId(button);
+    if (!messageId) continue;
+    const playing = activeMessageId === messageId;
+    const idle = states.get(button);
+    if (!playing) {
+      if (!idle) continue;
+      button.innerHTML = idle.html;
+      if (idle.title === null) button.removeAttribute("title");
+      else button.setAttribute("title", idle.title);
+      if (idle.ariaLabel === null) button.removeAttribute("aria-label");
+      else button.setAttribute("aria-label", idle.ariaLabel);
+      if (idle.ariaPressed === null) button.removeAttribute("aria-pressed");
+      else button.setAttribute("aria-pressed", idle.ariaPressed);
+      delete button.dataset.chatVoiceNativeTts;
+      delete button.dataset.playing;
+      states.delete(button);
+      continue;
+    }
+    if (!idle) states.set(button, {
+      html: button.innerHTML,
+      title: button.getAttribute("title"),
+      ariaLabel: button.getAttribute("aria-label"),
+      ariaPressed: button.getAttribute("aria-pressed")
+    });
+    if (button.dataset.playing === "true" && button.querySelector("[data-chat-voice-stop]")) continue;
+    const label = "Stop custom voice playback";
+    const hasText = !!button.querySelector(":scope > span");
+    button.dataset.chatVoiceNativeTts = "true";
+    button.dataset.playing = "true";
+    button.innerHTML = `${stopIcon}${hasText ? `<span>${label}</span>` : ""}`;
+    button.title = label;
+    button.setAttribute("aria-label", label);
+    button.setAttribute("aria-pressed", "true");
+  }
+}
+
 // src/core.ts
 var USER_SPEAKER_ID = "__chat_voice_user__";
 var UNCAST_SPEAKER_ID = "__chat_voice_uncast__";
+function standardSpeakerReviewPolicy() {
+  return { runReview: true, bestAvailableSpeaker: true, shadowEvaluation: false, focusedOpeningFallback: false };
+}
+function autoplayGenerationEvent(value, activeChatId) {
+  if (!value || typeof value !== "object" || Array.isArray(value) || !activeChatId) return null;
+  const event = value;
+  if (event.chatId !== activeChatId || typeof event.messageId !== "string" || !event.messageId.trim() || typeof event.generationId !== "string" || !event.generationId.trim() || event.error || event.backgroundSwipe === true) return null;
+  const kind = typeof event.generationType === "string" ? event.generationType.trim().toLowerCase() : "";
+  if (["continue", "regenerate", "swipe", "impersonate"].includes(kind)) return null;
+  return { chatId: activeChatId, messageId: event.messageId, generationId: event.generationId };
+}
+function claimAutoplayGeneration(event, generations, messages) {
+  const generationKey = `${event.chatId}\0${event.generationId}`;
+  const messageKey = `${event.chatId}\0${event.messageId}`;
+  if (generations.has(generationKey) || messages.has(messageKey)) return false;
+  generations.add(generationKey);
+  messages.add(messageKey);
+  if (generations.size > 512) generations.delete(generations.values().next().value);
+  if (messages.size > 512) messages.delete(messages.values().next().value);
+  return true;
+}
+function readAutomaticVoicePreferences(value) {
+  return { autoVoiceCasting: value.chatVoiceAutoCasting !== false, autoPlayback: value.chatVoiceAutoPlayback === true };
+}
+function globalTtsConnectionPreference(value) {
+  const chosen = typeof value.chatVoiceTtsConnectionId === "string" ? value.chatVoiceTtsConnectionId : value.ttsConnectionId;
+  return typeof chosen === "string" ? chosen.trim().slice(0, 128) : "";
+}
+function resolveGlobalTtsConnection(preference, connections) {
+  return preference || connections.find((connection) => connection.is_default)?.id || "";
+}
+var UNRESOLVED_SPEAKER_ID = "__chat_voice_unresolved__";
 var DEFAULT_SAVED_AUDIO_LIMIT = 50;
 var MAX_SAVED_AUDIO_LIMIT = 1e4;
 function readFavoriteVoices(value) {
@@ -90,10 +161,43 @@ function speakersForMessageRole(speakers, _isUserMessage, userName = "User") {
     { id: USER_SPEAKER_ID, name: normalizeSpeakerName(userName) || "User" }
   ];
 }
+function speakerAssignmentSourceFromTrace(steps, localFallback) {
+  const resolution = steps.find((step) => step.startsWith("resolution:"));
+  if (resolution?.startsWith("resolution:best-available speaker")) return "best-available";
+  if (resolution?.startsWith("resolution:chain-identity (overrode")) return "chain-override";
+  if (resolution?.startsWith("resolution:chain-identity")) return "chain-fill";
+  if (resolution?.startsWith("resolution:discourse-identity (overrode")) return "discourse-override";
+  if (resolution?.startsWith("resolution:discourse-identity")) return "discourse-fill";
+  if (resolution?.startsWith("resolution:global-context confirmed")) return "contextual-confirmation";
+  if (resolution?.startsWith("resolution:global-context review")) {
+    if (steps.includes("jev-opening-exchange:strong single-speaker review applied")) return "opening-exchange";
+    if (steps.includes("jev-opening-backlink:accepted same-speaker link to later validated quote")) return "opening-backlink";
+    if (steps.includes("jev-opening-forwardlink:accepted same-speaker link to earlier validated quote")) return "opening-forwardlink";
+    return "contextual-review";
+  }
+  if (resolution === "resolution:direct-speech-identity") return steps.includes("jev-user-review:strong alternative applied") ? "contextual-review" : "first-pass";
+  if (resolution?.startsWith("resolution:upstream-identity")) return "inheritance";
+  if (resolution?.startsWith("resolution:previous-assistant")) return "previous-assistant";
+  if (resolution?.startsWith("resolution:unique card-title")) return "card-title";
+  if (resolution?.startsWith("resolution:user-role") || resolution?.startsWith("resolution:unresolved speech") || resolution?.startsWith("resolution:assistant connection-default")) return "role-fallback";
+  if (localFallback || steps.some((step) => step.startsWith("jev-fallback:") || step.startsWith("jev-disabled:"))) return "local-parser";
+  return "unreported";
+}
+function filterNarrationSegments(segments, skipNarration) {
+  return skipNarration ? segments.filter((segment) => segment.speakerId !== null) : segments;
+}
 function playbackVoiceForSpeaker(speakerId, isUserMessage, characterVoices, narratorVoice, userVoice) {
   if (speakerId === USER_SPEAKER_ID) return userVoice;
   if (speakerId) return characterVoices[speakerId] || "";
   return narratorVoice;
+}
+function markUnresolvedSpeechSegments(segments, includeDebug = false) {
+  return segments.map((segment) => {
+    const isSpeech = segment.debugPath?.some((step) => step.startsWith("segment-type:speech")) ?? false;
+    const { debugPath, ...plain } = segment;
+    const speakerId = isSpeech && segment.speakerId === null ? UNRESOLVED_SPEAKER_ID : segment.speakerId;
+    return includeDebug ? { ...segment, speakerId } : { ...plain, speakerId };
+  });
 }
 function shouldPersistMessageAudio(isUserMessage, saveGeneratedAudio, regeneratingSavedAudio) {
   return !isUserMessage && (saveGeneratedAudio || regeneratingSavedAudio);
@@ -408,6 +512,14 @@ var NON_NAME_PARAGRAPH_LEADS = /* @__PURE__ */ new Set([
   "or",
   "she",
   "so",
+  "somebody",
+  "someone",
+  "anybody",
+  "anyone",
+  "nobody",
+  "noone",
+  "everybody",
+  "everyone",
   "somewhere",
   "that",
   "the",
@@ -511,16 +623,6 @@ function addUnconfiguredDialogueSpeakers(content, speakers, skippedTrackerTagPai
     }
   }
   return result;
-}
-function preferredCardSpeakerId(message, speakers, cardCharacterIds) {
-  const speakerIds = new Set(speakers.map((speaker) => speaker.id));
-  const explicitId = typeof message.extra?.character_id === "string" ? message.extra.character_id : "";
-  if (explicitId && speakerIds.has(explicitId)) return explicitId;
-  const messageName = normalizeSpeakerName(message.name ?? "").toLowerCase();
-  const namedSpeaker = messageName ? speakers.find((speaker) => speakerAliases(speaker.name).some((alias) => alias.toLowerCase() === messageName)) : void 0;
-  if (namedSpeaker) return namedSpeaker.id;
-  const availableCardIds = [...new Set(cardCharacterIds)].filter((characterId) => speakerIds.has(characterId));
-  return availableCardIds.length === 1 ? availableCardIds[0] : null;
 }
 function npcSpeakerId(name) {
   return `npc:${normalizeSpeakerName(name).toLowerCase()}`;
@@ -884,19 +986,6 @@ function hasAnonymousSpeechAttribution(text) {
 function hasLeadingPronounSubject(text) {
   return /^(?:he|she|they)\b/iu.test(narrativeOnly(text).trimStart());
 }
-function hasNamedSpeakerSubject(content, speakers, skippedTrackerTagPairs = "") {
-  const playbackContent = preparePlaybackContent(content, skippedTrackerTagPairs);
-  return playbackParagraphs(playbackContent).some((paragraph) => {
-    const mentions = mentionedSpeakers(paragraph.text, speakers);
-    return preferredMentionedSpeaker(paragraph.text, speakers, mentions) !== null;
-  });
-}
-function eligibleCardFallbackSpeakerId(content, cardSpeakerId, speakers, skippedTrackerTagPairs = "") {
-  if (!cardSpeakerId) return null;
-  const alternativeSpeakers = speakers.filter((speaker) => speaker.id !== cardSpeakerId);
-  if (hasNamedSpeakerSubject(content, alternativeSpeakers, skippedTrackerTagPairs)) return null;
-  return hasExplicitUncastCue(content, skippedTrackerTagPairs) ? null : cardSpeakerId;
-}
 function currentParagraphSpeaker(before, after, speakers) {
   let paragraphStart = 0;
   for (const match of before.matchAll(/\n[^\S\n]*\n/gu)) {
@@ -1201,7 +1290,7 @@ var TURN_RELATION_CRITERIA = {
   [TURN_OTHER_OPTION]: "A different participant addresses someone else in the scene, a third party, or an off-scene channel.",
   [TURN_UNCLEAR_OPTION]: "The text does not establish whether the speaker continues or changes."
 };
-var DEFAULT_SPEAKER_LOOKBACK = 5;
+var DEFAULT_SPEAKER_LOOKBACK = 6;
 var MAX_SPEAKER_LOOKBACK = 100;
 var TTS_EMOTION_OPTIONS = [
   { value: "happy", description: "Cheerful, upbeat." },
@@ -1358,16 +1447,10 @@ var TTS_TAG_NAMES = /* @__PURE__ */ new Set([
   ...TTS_PAUSE_NAMES,
   ...TTS_STYLE_NAMES
 ]);
-var SPEAKER_TURN_SWITCH_PATTERN = /\b(?:(?:another|a second|a third|a new|the other)\s+(?:voice|woman|man|person|speaker|figure|kid|girl|boy)|(?:someone|somebody)\s+(?:else\s+)?(?:says|said|asks|asked|replies|replied|answers|answered|calls|called|whispers|whispered|shouts|shouted)|(?:a|another)\s+voice\s+(?:from|behind|near|across)|from (?:across the room|the (?:hallway|doorway|next room|other room|shadows)))\b/iu;
 var NARRATIVE_SPEECH_VERB_PATTERN = new RegExp(
   `\\b(?:${SPEECH_VERBS}|blurt(?:s|ed)|laugh(?:s|ed)|mutter(?:s|ed)|hiss(?:es|ed)|snap(?:s|ped))\\b`,
   "iu"
 );
-function hasExplicitUncastCue(content, skippedTrackerTagPairs = "") {
-  const playbackContent = preparePlaybackContent(content, skippedTrackerTagPairs);
-  const narration = cleanPlaybackText(narrativeOnly(playbackContent));
-  return ANONYMOUS_ROLE_IDENTITY_PATTERN.test(narration) || hasAnonymousHumanSubject(narration) || SPEAKER_TURN_SWITCH_PATTERN.test(narration);
-}
 function parseRosterVoiceSegmentsInternal(content, defaultSpeakerId, speakers, skippedTrackerTagPairs = "", quoteSpeakerOverrides, historicalSpeakerId = null, preserveLocalOnNullOverride = false, lowConfidenceQuoteIndexes, includeDebug = false) {
   const playbackContent = preparePlaybackContent(content, skippedTrackerTagPairs);
   const result = [];
@@ -1613,7 +1696,7 @@ var MICROPHONE_ICON = `
     <path d="M5 11a7 7 0 0 0 14 0M12 18v4M9 22h6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
   </svg>
 `;
-var STOP_ACTION_ICON = `<svg viewBox="0 0 24 24" width="13" height="13" fill="currentColor" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="1"/></svg>`;
+var STOP_ACTION_ICON = `<svg data-chat-voice-stop="true" viewBox="0 0 24 24" width="13" height="13" fill="currentColor" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="1"/></svg>`;
 var PLAY_TTS_ACTION_ICON = `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" aria-hidden="true"><path d="M11 5 6 9H3v6h3l5 4V5Z" fill="currentColor"/><path d="M15 9.5a4 4 0 0 1 0 5M18 7a7.5 7.5 0 0 1 0 10" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>`;
 var RENAME_ICON = `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" aria-hidden="true"><path d="M4 20h4l11-11-4-4L4 16v4Zm9.5-13.5 4 4" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
 async function listAllTtsConnections() {
@@ -1656,8 +1739,9 @@ async function loadPlaybackPreferences() {
     rateLimitWaitSeconds: DEFAULT_RATE_LIMIT_WAIT_SECONDS,
     ghostVoiceLifetime: GHOST_VOICE_LIFETIME_MESSAGES,
     speakerLookback: DEFAULT_SPEAKER_LOOKBACK,
-    autoVoiceCasting: true,
+    ...readAutomaticVoicePreferences({}),
     speakerAssignmentDebug: false,
+    skipNarration: false,
     defaultNarratorVoice: "",
     defaultUserVoice: "",
     favoriteVoices: []
@@ -1671,7 +1755,7 @@ async function loadPlaybackPreferences() {
   return {
     speed: Math.min(4, Math.max(0.25, speed)),
     volume: Math.min(1, Math.max(0, volume)),
-    connectionId: typeof row.value?.ttsConnectionId === "string" ? row.value.ttsConnectionId.trim() : "",
+    connectionId: globalTtsConnectionPreference(row.value ?? {}),
     saveGeneratedAudio: row.value?.chatVoiceSaveGeneratedAudio !== false,
     savedAudioLimit: clampSavedAudioLimit(row.value?.chatVoiceSavedAudioLimit),
     skippedTrackerTags: typeof row.value?.chatVoiceSkippedTrackerTags === "string" ? row.value.chatVoiceSkippedTrackerTags.slice(0, 4e3) : "",
@@ -1697,8 +1781,9 @@ async function loadPlaybackPreferences() {
     ),
     ghostVoiceLifetime: clampIntegerSetting(row.value?.chatVoiceGhostVoiceLifetime, GHOST_VOICE_LIFETIME_MESSAGES, 1e3),
     speakerLookback: clampIntegerSetting(row.value?.chatVoiceSpeakerLookback, DEFAULT_SPEAKER_LOOKBACK, MAX_SPEAKER_LOOKBACK),
-    autoVoiceCasting: row.value?.chatVoiceAutoCasting !== false,
+    ...readAutomaticVoicePreferences(row.value ?? {}),
     speakerAssignmentDebug: row.value?.chatVoiceSpeakerAssignmentDebug === true,
+    skipNarration: row.value?.chatVoiceSkipNarration === true,
     defaultNarratorVoice: typeof row.value?.chatVoiceDefaultNarratorVoice === "string" ? row.value.chatVoiceDefaultNarratorVoice.trim().slice(0, 512) : "",
     defaultUserVoice: typeof row.value?.chatVoiceDefaultUserVoice === "string" ? row.value.chatVoiceDefaultUserVoice.trim().slice(0, 512) : "",
     favoriteVoices: readFavoriteVoices(row.value?.chatVoiceFavoriteVoices)
@@ -1731,6 +1816,9 @@ function saveGeneratedAudioPreference(enabled) {
     chatVoiceSaveGeneratedAudio: enabled
   }));
 }
+function saveGlobalTtsConnection(connectionId) {
+  return updateVoiceSettings((current) => ({ ...current, chatVoiceTtsConnectionId: connectionId.trim().slice(0, 128) }));
+}
 function saveGeneratedAudioLimit(limit) {
   return updateVoiceSettings((current) => ({
     ...current,
@@ -1758,7 +1846,7 @@ function saveTtsTagPreferences(style, placement, connectionId, model) {
     chatVoiceTagLlmModel: model.trim().slice(0, 256)
   }));
 }
-function saveAdvancedPlaybackPreferences(bufferSegments, concurrentGenerations, rateLimitWaitSeconds, speakerAssignmentDebug, ghostVoiceLifetime, autoVoiceCasting, speakerLookback) {
+function saveAdvancedPlaybackPreferences(bufferSegments, concurrentGenerations, rateLimitWaitSeconds, speakerAssignmentDebug, ghostVoiceLifetime, autoVoiceCasting, autoPlayback, speakerLookback, skipNarration) {
   return updateVoiceSettings((current) => ({
     ...current,
     chatVoicePlaybackBufferSegments: clampIntegerSetting(
@@ -1777,7 +1865,9 @@ function saveAdvancedPlaybackPreferences(bufferSegments, concurrentGenerations, 
       MAX_RATE_LIMIT_WAIT_SECONDS
     ),
     chatVoiceSpeakerAssignmentDebug: speakerAssignmentDebug,
+    chatVoiceSkipNarration: skipNarration,
     chatVoiceAutoCasting: autoVoiceCasting,
+    chatVoiceAutoPlayback: autoPlayback,
     chatVoiceGhostVoiceLifetime: clampIntegerSetting(ghostVoiceLifetime, GHOST_VOICE_LIFETIME_MESSAGES, 1e3),
     chatVoiceSpeakerLookback: clampIntegerSetting(speakerLookback, DEFAULT_SPEAKER_LOOKBACK, MAX_SPEAKER_LOOKBACK)
   }));
@@ -2233,7 +2323,7 @@ function setup(ctx) {
     field.append(label, slot);
     return { field, label, slot };
   }
-  const connectionField = createField("TTS connection");
+  const connectionField = createField("TTS connection (global)");
   const saveAudioField = createField("Audio storage");
   saveAudioField.slot.className = "chat-voice-storage";
   const saveAudioLabel = document.createElement("label");
@@ -2423,7 +2513,7 @@ function setup(ctx) {
   const concurrentGenerationField = createField("Maximum concurrent generations");
   const rateLimitWaitField = createField("Rate-limit wait budget (seconds)");
   const ghostLifetimeField = createField("Uncast voice lifetime (assistant messages)");
-  const speakerLookbackField = createField("Speaker lookback (assistant messages)");
+  const speakerLookbackField = createField("Global speaker context (messages)");
   const autoCastingLabel = document.createElement("label");
   autoCastingLabel.className = "chat-voice-toggle";
   const autoCastingToggle = document.createElement("input");
@@ -2432,6 +2522,19 @@ function setup(ctx) {
   const autoCastingText = document.createElement("span");
   autoCastingText.textContent = "Automatically cast voices";
   autoCastingLabel.append(autoCastingToggle, autoCastingText);
+  const autoPlaybackLabel = document.createElement("label");
+  autoPlaybackLabel.className = "chat-voice-toggle";
+  const autoPlaybackToggle = document.createElement("input");
+  autoPlaybackToggle.type = "checkbox";
+  const autoPlaybackCopy = document.createElement("span");
+  autoPlaybackCopy.className = "chat-voice-toggle-copy";
+  const autoPlaybackText = document.createElement("span");
+  autoPlaybackText.textContent = "Automatically play new messages";
+  const autoPlaybackHint = document.createElement("span");
+  autoPlaybackHint.className = "chat-voice-toggle-hint";
+  autoPlaybackHint.textContent = "Play new assistant messages as they arrive. Your browser may require a click before audio can start.";
+  autoPlaybackCopy.append(autoPlaybackText, autoPlaybackHint);
+  autoPlaybackLabel.append(autoPlaybackToggle, autoPlaybackCopy);
   const speakerDebugLabel = document.createElement("label");
   speakerDebugLabel.className = "chat-voice-toggle";
   const speakerDebugToggle = document.createElement("input");
@@ -2446,6 +2549,19 @@ function setup(ctx) {
   speakerDebugHint.textContent = "Records both Jev passes, the turn matrix, narrative cues, dialogue-run review, inheritance, fallbacks, aliases, and the final voice route for every segment.";
   speakerDebugCopy.append(speakerDebugText, speakerDebugHint);
   speakerDebugLabel.append(speakerDebugToggle, speakerDebugCopy);
+  const skipNarrationLabel = document.createElement("label");
+  skipNarrationLabel.className = "chat-voice-toggle";
+  const skipNarrationToggle = document.createElement("input");
+  skipNarrationToggle.type = "checkbox";
+  const skipNarrationCopy = document.createElement("span");
+  skipNarrationCopy.className = "chat-voice-toggle-copy";
+  const skipNarrationText = document.createElement("span");
+  skipNarrationText.textContent = "Skip narration audio";
+  const skipNarrationHint = document.createElement("span");
+  skipNarrationHint.className = "chat-voice-toggle-hint";
+  skipNarrationHint.textContent = "Generate dialogue only. Narration still provides speaker context; existing saved audio is unchanged until regenerated.";
+  skipNarrationCopy.append(skipNarrationText, skipNarrationHint);
+  skipNarrationLabel.append(skipNarrationToggle, skipNarrationCopy);
   const speakerDebugOutput = document.createElement("textarea");
   speakerDebugOutput.className = "chat-voice-debug-output";
   speakerDebugOutput.readOnly = true;
@@ -2463,14 +2579,23 @@ function setup(ctx) {
     ghostLifetimeField.field,
     speakerLookbackField.field,
     autoCastingLabel,
+    autoPlaybackLabel,
+    skipNarrationLabel,
     speakerDebugLabel,
     speakerDebugOutput,
     advancedHint
   );
   let applyingState = false;
   let activeChat = null;
+  const autoPlaybackSeenGenerations = /* @__PURE__ */ new Set();
+  const autoPlaybackSeenMessages = /* @__PURE__ */ new Set();
+  let autoPlaybackQueue = Promise.resolve();
+  let autoPlaybackDisposed = false;
+  let autoPlaybackEpoch = 0;
   let connections = [];
   let lumiverseConnectionId = "";
+  let savingGlobalConnection = false;
+  let globalConnectionVersion = 0;
   let defaultNarratorVoice = "";
   let defaultUserVoice = "";
   let favoriteVoices = [];
@@ -2528,10 +2653,12 @@ function setup(ctx) {
   let concurrentGenerationLimit = DEFAULT_CONCURRENT_GENERATIONS;
   let rateLimitWaitSeconds = DEFAULT_RATE_LIMIT_WAIT_SECONDS;
   let autoVoiceCasting = true;
+  let autoPlayback = false;
   let ghostVoiceLifetime = GHOST_VOICE_LIFETIME_MESSAGES;
   let speakerLookback = DEFAULT_SPEAKER_LOOKBACK;
   let ghostLifetimeLoaded = false;
   let speakerAssignmentDebug = false;
+  let skipNarration = false;
   let advancedSettingsSaveTimer = null;
   let savingAdvancedSettings = false;
   let saveTimer = null;
@@ -2645,11 +2772,34 @@ function setup(ctx) {
     searchPlaceholder: "Search TTS connections\u2026",
     emptyMessage: "No TTS connections found.",
     clearable: true,
-    clearLabel: "Disable custom chat voices",
-    ariaLabel: "TTS connection",
+    clearLabel: "Use default TTS connection",
+    ariaLabel: "Global TTS connection",
     disabled: true,
-    onChange: () => markChanged()
+    onChange: () => {
+      void onGlobalConnectionChanged();
+    }
   });
+  async function onGlobalConnectionChanged() {
+    if (applyingState) return;
+    const previous = lumiverseConnectionId;
+    const selected = connectionPicker.getValue();
+    const version = ++globalConnectionVersion;
+    lumiverseConnectionId = resolveGlobalTtsConnection(selected, connections);
+    savingGlobalConnection = true;
+    setStatus("Saving global TTS connection\u2026");
+    try {
+      await saveGlobalTtsConnection(selected);
+      if (version === globalConnectionVersion) setStatus("Global TTS connection saved.", "saved");
+    } catch (error) {
+      if (version === globalConnectionVersion) {
+        lumiverseConnectionId = previous;
+        connectionPicker.update({ value: previous, options: connectionOptions(previous) });
+        setStatus(error instanceof Error ? error.message : "Could not save global TTS connection.", "error");
+      }
+    } finally {
+      if (version === globalConnectionVersion) savingGlobalConnection = false;
+    }
+  }
   const narratorEditSlot = document.createElement("div");
   const userEditSlot = document.createElement("div");
   narratorEditSlot.hidden = true;
@@ -2902,11 +3052,11 @@ function setup(ctx) {
     refreshLocalState();
   };
   ghostLifetimeInput.addEventListener("change", onGhostLifetimeInput);
-  const speakerLookbackInput = createNumberInput(DEFAULT_SPEAKER_LOOKBACK, MAX_SPEAKER_LOOKBACK, "Speaker lookback in assistant messages");
+  const speakerLookbackInput = createNumberInput(DEFAULT_SPEAKER_LOOKBACK, MAX_SPEAKER_LOOKBACK, "Previous messages used for global speaker context");
   speakerLookbackField.slot.appendChild(speakerLookbackInput);
   const speakerLookbackHint = document.createElement("div");
   speakerLookbackHint.className = "chat-voice-hint";
-  speakerLookbackHint.textContent = "Check up to this many previous assistant messages for the last clear speaker.";
+  speakerLookbackHint.textContent = "Include up to this many earlier user and assistant messages as context. Default: 6 messages (roughly 3 exchanges).";
   speakerLookbackField.slot.appendChild(speakerLookbackHint);
   const onSpeakerLookbackInput = () => {
     speakerLookback = clampIntegerSetting(speakerLookbackInput.valueAsNumber, DEFAULT_SPEAKER_LOOKBACK, MAX_SPEAKER_LOOKBACK);
@@ -2924,10 +3074,12 @@ function setup(ctx) {
   concurrentGenerationInput.addEventListener("change", onConcurrentGenerationInput);
   rateLimitWaitInput.addEventListener("change", onRateLimitWaitInput);
   speakerDebugToggle.addEventListener("change", onSpeakerDebugChanged);
+  skipNarrationToggle.addEventListener("change", onSkipNarrationChanged);
   autoCastingToggle.addEventListener("change", () => {
     autoVoiceCasting = autoCastingToggle.checked;
     scheduleAdvancedSettingsSave();
   });
+  autoPlaybackToggle.addEventListener("change", onAutoPlaybackChanged);
   const addNpcInput = ctx.components.mountTextInput(addNpcInputSlot, {
     value: "",
     placeholder: "NPC name / aliases",
@@ -2938,7 +3090,7 @@ function setup(ctx) {
   function collectConfig(forSave = false) {
     return {
       messageLimit: activeChat?.messageLimit ?? 20,
-      connectionId: connectionPicker.getValue(),
+      connectionId: forSave ? activeChat?.connectionId ?? "" : connectionPicker.getValue() || lumiverseConnectionId,
       narratorVoice: forSave ? localNarratorVoice : narratorInput.getValue(),
       userVoice: forSave ? localUserVoice : userVoiceInput.getValue(),
       useGlobalNarratorVoice,
@@ -3017,42 +3169,7 @@ function setup(ctx) {
   narratorDefaultToggle.addEventListener("change", onNarratorDefaultChange);
   userDefaultToggle.addEventListener("change", onUserDefaultChange);
   function updatePlaybackButtons() {
-    for (const button of hostDocument.querySelectorAll("button")) {
-      const messageId = nativeTtsMessageId(button);
-      if (!messageId) continue;
-      const playing = activePlayback?.messageId === messageId;
-      const idle = nativeButtonStates.get(button);
-      if (!playing) {
-        if (!idle) continue;
-        button.innerHTML = idle.html;
-        if (idle.title === null) button.removeAttribute("title");
-        else button.setAttribute("title", idle.title);
-        if (idle.ariaLabel === null) button.removeAttribute("aria-label");
-        else button.setAttribute("aria-label", idle.ariaLabel);
-        if (idle.ariaPressed === null) button.removeAttribute("aria-pressed");
-        else button.setAttribute("aria-pressed", idle.ariaPressed);
-        delete button.dataset.chatVoiceNativeTts;
-        delete button.dataset.playing;
-        nativeButtonStates.delete(button);
-        continue;
-      }
-      if (!idle) {
-        nativeButtonStates.set(button, {
-          html: button.innerHTML,
-          title: button.getAttribute("title"),
-          ariaLabel: button.getAttribute("aria-label"),
-          ariaPressed: button.getAttribute("aria-pressed")
-        });
-      }
-      const label = "Stop custom voice playback";
-      const hasText = !!button.querySelector(":scope > span");
-      button.dataset.chatVoiceNativeTts = "true";
-      button.dataset.playing = "true";
-      button.innerHTML = `${STOP_ACTION_ICON}${hasText ? `<span>${label}</span>` : ""}`;
-      button.title = label;
-      button.setAttribute("aria-label", label);
-      button.setAttribute("aria-pressed", "true");
-    }
+    syncPlaybackButtons(hostDocument.querySelectorAll("button"), activePlayback?.messageId ?? null, nativeTtsMessageId, nativeButtonStates, STOP_ACTION_ICON);
   }
   function restoreNativePlaybackButtons() {
     activePlayback = null;
@@ -3091,7 +3208,8 @@ function setup(ctx) {
         skippedTrackerTags: preferences.skippedTrackerTags,
         ghostVoiceLifetime: preferences.ghostVoiceLifetime,
         speakerLookback: preferences.speakerLookback,
-        debug: preferences.speakerAssignmentDebug
+        debug: preferences.speakerAssignmentDebug,
+        ...standardSpeakerReviewPolicy()
       });
     });
   }
@@ -3107,7 +3225,7 @@ function setup(ctx) {
       ctx.sendToBackend({ type: "chat_voice_auto_cast", requestId, chatId, voices, reserved, narratorMissing, userMissing, ghostLifetime: ghostVoiceLifetime });
     });
   }
-  function requestUncastVoiceMatches(chatId, messageId, message, groups, voices, reserved, lifetime) {
+  function requestUncastVoiceMatches(chatId, messageId, message, sourceHash, groups, voices, reserved, lifetime, speakerLookback2, skippedTrackerTags2) {
     const requestId = `uncast-${Date.now().toString(36)}-${++uncastRequestSequence}`;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -3115,18 +3233,25 @@ function setup(ctx) {
         reject(new Error("Uncast voice matching timed out."));
       }, 35e3);
       pendingUncastRequests.set(requestId, { resolve, reject, timer });
-      ctx.sendToBackend({ type: "chat_voice_match_uncast", requestId, chatId, messageId, message, groups, voices, reserved, lifetime });
+      ctx.sendToBackend({ type: "chat_voice_match_uncast", requestId, chatId, messageId, message, sourceHash, groups, voices, reserved, lifetime, speakerLookback: speakerLookback2, skippedTrackerTags: skippedTrackerTags2 });
     });
   }
   function speakerDebugName(speakerId, speakers) {
     if (speakerId === null) return "narrator";
     if (speakerId === USER_SPEAKER_ID) return "user persona";
     if (speakerId === UNCAST_SPEAKER_ID) return "uncast character";
+    if (speakerId === UNRESOLVED_SPEAKER_ID) return "unresolved speech";
     const speaker = speakers.find((candidate) => candidate.id === speakerId);
     return speaker ? `${speaker.name} [${speakerId}]` : speakerId;
   }
   const SPEAKER_SOURCE_LABELS = {
+    "best-available": "best-available guess (uncertain)",
     "first-pass": "first pass",
+    "contextual-confirmation": "contextually confirmed first pass",
+    "contextual-review": "contextual review",
+    "opening-exchange": "opening exchange review",
+    "opening-backlink": "opening backward link",
+    "opening-forwardlink": "opening forward link",
     "chain-fill": "turn chain fill",
     "chain-override": "turn chain override",
     "discourse-fill": "discourse fill",
@@ -3145,22 +3270,7 @@ function setup(ctx) {
     return speakerDebugLine(segment.debugPath ?? [], prefix);
   }
   function speakerAssignmentSource(segment, parsingMode, review) {
-    const resolution = speakerDebugStep(segment, "resolution:");
-    if (resolution?.startsWith("resolution:chain-identity (overrode")) return "chain-override";
-    if (resolution?.startsWith("resolution:chain-identity")) return "chain-fill";
-    if (resolution?.startsWith("resolution:discourse-identity (overrode")) return "discourse-override";
-    if (resolution?.startsWith("resolution:discourse-identity")) return "discourse-fill";
-    if (resolution === "resolution:direct-speech-identity") return "first-pass";
-    if (resolution?.startsWith("resolution:upstream-identity")) return "inheritance";
-    if (resolution?.startsWith("resolution:previous-assistant")) return "previous-assistant";
-    if (resolution?.startsWith("resolution:unique card-title")) return "card-title";
-    if (resolution?.startsWith("resolution:user-role")) return "role-fallback";
-    if (resolution?.startsWith("resolution:assistant connection-default")) return "role-fallback";
-    if (review.failed || review.usedLlm === false || parsingMode === "off") return "local-parser";
-    if (speakerDebugStep(segment, "jev-fallback:") || speakerDebugStep(segment, "jev-disabled:")) {
-      return "local-parser";
-    }
-    return "unreported";
+    return speakerAssignmentSourceFromTrace(segment.debugPath ?? [], review.failed || review.usedLlm === false || parsingMode === "off");
   }
   function speakerSourceDetail(segment, source, parsingMode, review) {
     if (source !== "local-parser") return SPEAKER_SOURCE_LABELS[source];
@@ -3198,7 +3308,7 @@ function setup(ctx) {
     }
     const lines = ["Jev pipeline: first pass answered; deterministic policy applied after normalization"];
     const speechSegments = segments.filter((segment) => speakerDebugStep(segment, "segment-type:speech"));
-    const normalized = speechSegments.map((segment) => speakerDebugStep(segment, "jev-speech-normalized:")).filter((step) => step !== void 0);
+    const normalized = speechSegments.map((segment) => speakerDebugStep(segment, "jev-first-pass-speech-normalized:") ?? speakerDebugStep(segment, "jev-speech-normalized:")).filter((step) => step !== void 0);
     if (normalized.length > 0) {
       const clear = normalized.filter((step) => !step.includes(":unclear")).length;
       lines.push(
@@ -3573,7 +3683,7 @@ function setup(ctx) {
       return attachment.type === "audio" && (attachment.swipe_id === void 0 || attachment.swipe_id === message.swipe_id);
     });
   }
-  async function playMessage(messageId, nativeRegenerationAction = false) {
+  async function playMessage(messageId, nativeRegenerationAction = false, automatic = false) {
     if (activePlayback?.messageId === messageId) {
       const finishingSave = stopPlayback();
       setStatus(finishingSave ? "Playback stopped; finishing saved audio\u2026" : "Playback stopped.");
@@ -3592,6 +3702,7 @@ function setup(ctx) {
       return;
     }
     if (ctx.getActiveChat().chatId !== requestedChatId) return;
+    if (automatic && (message.is_user || hasSavedAudioForCurrentSwipe(message))) return;
     const regeneratingSavedAudio = !message.is_user && (nativeRegenerationAction || hasSavedAudioForCurrentSwipe(message));
     if (regeneratingSavedAudio) {
       const { confirmed } = await ctx.ui.showConfirm({
@@ -3619,6 +3730,7 @@ function setup(ctx) {
     if (!activeChat || activeChat.id !== ctx.getActiveChat().chatId) return;
     const playbackChat = activeChat;
     const config = collectConfig();
+    const connectionVersionAtLoad = globalConnectionVersion;
     const preferences = await loadPlaybackPreferences();
     if (llmSettingsSaveTimer || savingLlmSettings) {
       preferences.speakerParsingMode = speakerParsingMode;
@@ -3634,14 +3746,17 @@ function setup(ctx) {
       preferences.ghostVoiceLifetime = ghostVoiceLifetime;
       preferences.speakerLookback = speakerLookback;
       preferences.autoVoiceCasting = autoVoiceCasting;
+      preferences.autoPlayback = autoPlayback;
       preferences.speakerAssignmentDebug = speakerAssignmentDebug;
+      preferences.skipNarration = skipNarration;
     } else {
       playbackBufferSegments = preferences.playbackBufferSegments;
       concurrentGenerationLimit = preferences.concurrentGenerations;
       rateLimitWaitSeconds = preferences.rateLimitWaitSeconds;
       speakerAssignmentDebug = preferences.speakerAssignmentDebug;
+      skipNarration = preferences.skipNarration;
     }
-    const connectionId = config.connectionId || (connections.some((connection) => connection.id === preferences.connectionId) ? preferences.connectionId : connections.find((connection) => connection.is_default)?.id ?? lumiverseConnectionId);
+    const connectionId = savingGlobalConnection || connectionVersionAtLoad !== globalConnectionVersion ? lumiverseConnectionId : resolveGlobalTtsConnection(preferences.connectionId, connections);
     if (!connectionId) {
       setStatus("Choose a TTS connection before playing.", "error");
       return;
@@ -3670,7 +3785,27 @@ function setup(ctx) {
       return;
     }
     const audioContext = new contextClass();
-    await audioContext.resume();
+    if (automatic) {
+      let timer;
+      try {
+        await Promise.race([
+          audioContext.resume(),
+          new Promise((_, reject) => {
+            timer = setTimeout(() => reject(new Error("Automatic playback needs a browser interaction. Click a play button to enable audio.")), 2e3);
+          })
+        ]);
+      } catch (error) {
+        void audioContext.close().catch(() => void 0);
+        setStatus(error instanceof Error ? error.message : "Automatic playback could not start.", "error");
+        return;
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+      if (autoPlaybackDisposed || !autoPlayback || ctx.getActiveChat().chatId !== requestedChatId) {
+        void audioContext.close().catch(() => void 0);
+        return;
+      }
+    } else await audioContext.resume();
     let audibleFinished = false;
     let resolveAudibleDone = null;
     const audibleDone = new Promise((resolve) => {
@@ -3695,6 +3830,7 @@ function setup(ctx) {
     };
     activePlayback = playback;
     updatePlaybackButtons();
+    const playbackSetupFinishedAt = Date.now();
     try {
       if (playback.controller.signal.aborted) throw new DOMException("Playback stopped.", "AbortError");
       const playbackSpeakers = addUnconfiguredDialogueSpeakers(
@@ -3706,25 +3842,16 @@ function setup(ctx) {
         ),
         preferences.skippedTrackerTags
       );
-      const defaultSpeakerId = message.is_user ? USER_SPEAKER_ID : eligibleCardFallbackSpeakerId(
-        message.content,
-        preferredCardSpeakerId(
-          message,
-          playbackChat.characters,
-          playbackChat.cardCharacterIds ?? []
-        ),
-        playbackSpeakers,
-        preferences.skippedTrackerTags
-      );
+      const defaultSpeakerId = message.is_user ? USER_SPEAKER_ID : null;
       const aliases = speakerAliasIdLookup(playbackChat.characters);
-      const localSegments = parseRosterVoiceSegments(
+      const localSegments = markUnresolvedSpeechSegments(parseRosterVoiceSegments(
         message.content,
         defaultSpeakerId,
         playbackSpeakers,
         preferences.skippedTrackerTags,
         null,
-        preferences.speakerAssignmentDebug
-      );
+        true
+      ), preferences.speakerAssignmentDebug);
       let review = { segments: localSegments, usedLlm: null, failed: false };
       if (preferences.speakerParsingMode !== "off" || preferences.ttsTagStyle !== "off") {
         setStatus(
@@ -3734,12 +3861,13 @@ function setup(ctx) {
       try {
         review = await requestSpeakerReviewedSegments(playbackChat.id, messageId, preferences);
       } catch (error) {
-        console.warn("[Chat Voice] Backend speaker parsing failed; using the message-local parser.", error);
         if (playback.controller.signal.aborted) throw new DOMException("Playback stopped.", "AbortError");
+        if (error instanceof Error && error.message.includes("changed during speaker review")) throw error;
+        console.warn("[Chat Voice] Backend speaker parsing failed; using the message-local parser.", error);
         review = { segments: localSegments, usedLlm: null, failed: true };
         setStatus("Historical speaker lookup unavailable; using the message-local parser.");
       }
-      const segments = review.segments;
+      const reviewedSegments = review.segments;
       updateSpeakerDebugLog(
         messageId,
         message.is_user,
@@ -3747,13 +3875,19 @@ function setup(ctx) {
         playbackSpeakers,
         playbackChat.characters,
         localSegments,
-        segments,
+        reviewedSegments,
         aliases,
         config,
         preferences.speakerParsingMode,
         review
       );
       for (const line of autoCastDiagnostics) appendSpeakerDebugLog(`Automatic casting: ${line}`);
+      const segments = filterNarrationSegments(reviewedSegments, preferences.skipNarration);
+      if (preferences.skipNarration) appendSpeakerDebugLog(`Narration audio skipped: ${reviewedSegments.length - segments.length} segment(s).`);
+      if (!segments.length && preferences.skipNarration) {
+        setStatus("No dialogue to play; narration audio is disabled.", "saved");
+        return;
+      }
       const matchingSegments = segments.map((segment) => ({
         ...segment,
         speakerId: segment.speakerId ? aliases.get(segment.speakerId) ?? segment.speakerId : null
@@ -3770,10 +3904,13 @@ function setup(ctx) {
         playbackChat.id,
         messageId,
         preparePlaybackContent(message.content, preferences.skippedTrackerTags),
+        hashMessageContent(message.content),
         uncastGroups,
         uncastVoices,
         reservedVoices,
-        preferences.ghostVoiceLifetime
+        preferences.ghostVoiceLifetime,
+        preferences.speakerLookback,
+        preferences.skippedTrackerTags
       ).catch((error) => {
         appendSpeakerDebugLog(`Uncast voice matching failed; using connection default: ${error instanceof Error ? error.message : String(error)}`);
         return [];
@@ -4285,6 +4422,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
         appendSpeakerDebugLog(
           `Playback [${index + 1}] using voice=${JSON.stringify(plan[index].voice || "<connection default>")}.`
         );
+        if (index === 0) appendSpeakerDebugLog(`Time from playback setup to first audio dispatch: ${Date.now() - playbackSetupFinishedAt}ms (includes speaker review, tag placement and buffering).`);
         setStatus(`Playing ${index + 1} of ${plan.length} voice segment${plan.length === 1 ? "" : "s"}\u2026`);
         await playDecodedBuffer(playback, current.segment, preferences.volume);
       }
@@ -5065,12 +5203,12 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
     }
     activeChat = next;
     context.textContent = next ? `Active chat: ${next.name}` : "Open a chat to configure its voices.";
-    const selectedConnectionId = next?.connectionId || lumiverseConnectionId;
+    const selectedConnectionId = lumiverseConnectionId;
     connectionPicker.update({
       value: selectedConnectionId,
       options: connectionOptions(selectedConnectionId),
       placeholder: connections.length ? "Choose a TTS connection" : "No TTS connections found",
-      disabled: !next || connections.length === 0
+      disabled: connections.length === 0
     });
     scanButton.disabled = !next || scanning;
     if (!keepRoleEditor || editingRoleVoice !== "narrator") localNarratorVoice = next?.narratorVoice ?? "";
@@ -5098,6 +5236,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
     else setStatus("All changes save automatically.", "saved");
   }
   async function loadConnections() {
+    const connectionVersionAtLoad = globalConnectionVersion;
     try {
       const [loadedConnections, loadedLlmConnections, preferences] = await Promise.all([
         listAllTtsConnections(),
@@ -5175,6 +5314,8 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
         refreshLocalState();
         autoVoiceCasting = preferences.autoVoiceCasting;
         autoCastingToggle.checked = autoVoiceCasting;
+        autoPlayback = preferences.autoPlayback;
+        autoPlaybackToggle.checked = autoPlayback;
         speakerAssignmentDebug = preferences.speakerAssignmentDebug;
         playbackBufferInput.value = String(playbackBufferSegments);
         concurrentGenerationInput.value = String(concurrentGenerationLimit);
@@ -5182,15 +5323,17 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
         ghostLifetimeInput.value = String(ghostVoiceLifetime);
         speakerLookbackInput.value = String(speakerLookback);
         speakerDebugToggle.checked = speakerAssignmentDebug;
+        skipNarration = preferences.skipNarration;
+        skipNarrationToggle.checked = skipNarration;
         speakerDebugOutput.hidden = !speakerAssignmentDebug;
       }
-      lumiverseConnectionId = connections.some((connection) => connection.id === preferences.connectionId) ? preferences.connectionId : connections.find((connection) => connection.is_default)?.id ?? "";
-      const selectedConnectionId = activeChat?.connectionId || lumiverseConnectionId;
+      if (!savingGlobalConnection && connectionVersionAtLoad === globalConnectionVersion) lumiverseConnectionId = resolveGlobalTtsConnection(preferences.connectionId, connections);
+      const selectedConnectionId = lumiverseConnectionId;
       connectionPicker.update({
         value: selectedConnectionId,
         options: connectionOptions(selectedConnectionId),
         placeholder: connections.length ? "Choose a TTS connection" : "No TTS connections found",
-        disabled: !activeChat || connections.length === 0
+        disabled: connections.length === 0
       });
       if (connections.length === 0) setStatus("Create a TTS connection in Lumiverse first.");
       else if (decisionStatusFailed) {
@@ -5295,6 +5438,15 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
     speakerDebugOutput.hidden = !speakerAssignmentDebug;
     scheduleAdvancedSettingsSave();
   }
+  function onSkipNarrationChanged() {
+    skipNarration = skipNarrationToggle.checked;
+    scheduleAdvancedSettingsSave();
+  }
+  function onAutoPlaybackChanged() {
+    autoPlayback = autoPlaybackToggle.checked;
+    autoPlaybackEpoch += 1;
+    scheduleAdvancedSettingsSave();
+  }
   async function persistAdvancedSettings() {
     savingAdvancedSettings = true;
     setStatus("Saving global advanced playback settings\u2026");
@@ -5306,7 +5458,9 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
         speakerAssignmentDebug,
         ghostVoiceLifetime,
         autoVoiceCasting,
-        speakerLookback
+        autoPlayback,
+        speakerLookback,
+        skipNarration
       );
       setStatus("Advanced playback settings saved globally.", "saved");
     } catch (error) {
@@ -5670,17 +5824,41 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
       });
     }
   };
-  const savedUserControlObserver = new hostWindow.MutationObserver(() => ensureSavedUserBubbleControls());
+  let playbackButtonsFrame = null;
+  const savedUserControlObserver = new hostWindow.MutationObserver(() => {
+    ensureSavedUserBubbleControls();
+    if (activePlayback && playbackButtonsFrame === null) {
+      playbackButtonsFrame = hostWindow.requestAnimationFrame(() => {
+        playbackButtonsFrame = null;
+        updatePlaybackButtons();
+      });
+    }
+  });
   savedUserControlObserver.observe(hostDocument.body, { childList: true, subtree: true });
   ensureSavedUserBubbleControls();
   const unsubscribeChatSwitched = ctx.events.on("CHAT_SWITCHED", (rawPayload) => {
     const switchedChatId = rawPayload?.chatId ?? null;
+    autoPlaybackEpoch += 1;
     hostWindow.requestAnimationFrame(() => {
       if (ctx.getActiveChat().chatId === switchedChatId) refreshLocalState();
     });
   });
   const unsubscribeMessageRendered = ctx.events.on("CHARACTER_MESSAGE_RENDERED", () => {
     if (activeChat?.id === ctx.getActiveChat().chatId) refreshLocalState();
+  });
+  const unsubscribeGenerationEnded = ctx.events.on("GENERATION_ENDED", (payload) => {
+    const event = autoplayGenerationEvent(payload, ctx.getActiveChat().chatId);
+    if (!event || autoPlaybackDisposed) return;
+    if (!claimAutoplayGeneration(event, autoPlaybackSeenGenerations, autoPlaybackSeenMessages)) return;
+    if (!autoPlayback) return;
+    const eventEpoch = autoPlaybackEpoch;
+    autoPlaybackQueue = autoPlaybackQueue.catch(() => void 0).then(async () => {
+      while (activePlayback && !autoPlaybackDisposed && autoPlayback && eventEpoch === autoPlaybackEpoch && ctx.getActiveChat().chatId === event.chatId) await activePlayback.audibleDone;
+      if (autoPlaybackDisposed || !autoPlayback || eventEpoch !== autoPlaybackEpoch || ctx.getActiveChat().chatId !== event.chatId) return;
+      await playMessage(event.messageId, false, true);
+    }).catch((error) => {
+      if (!autoPlaybackDisposed) setStatus(error instanceof Error ? error.message : "Automatic playback failed.", "error");
+    });
   });
   const unsubscribeActivate = tab.onActivate(() => {
     void loadConnections();
@@ -5691,6 +5869,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
   void ensureQuotationRouting().catch(() => void 0);
   refreshLocalState();
   return () => {
+    autoPlaybackDisposed = true;
     hostDocument.removeEventListener("pointerdown", closeFavoritePickerOnOutsideClick);
     hostDocument.removeEventListener("keydown", closeFavoritePickerOnEscape);
     stopVoicePreview();
@@ -5703,6 +5882,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
     unsubscribeActivate();
     unsubscribeChatSwitched();
     unsubscribeMessageRendered();
+    unsubscribeGenerationEnded();
     unsubscribeBackend();
     for (const input of characterInputs.values()) input.destroy();
     for (const { input } of ghostVoiceEditors.values()) input.destroy();
@@ -5777,7 +5957,9 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
         speakerAssignmentDebug,
         ghostVoiceLifetime,
         autoVoiceCasting,
-        speakerLookback
+        autoPlayback,
+        speakerLookback,
+        skipNarration
       );
     }
     skippedTrackerTagsInput.destroy();
@@ -5792,6 +5974,8 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
     ghostLifetimeInput.removeEventListener("change", onGhostLifetimeInput);
     speakerLookbackInput.removeEventListener("change", onSpeakerLookbackInput);
     speakerDebugToggle.removeEventListener("change", onSpeakerDebugChanged);
+    skipNarrationToggle.removeEventListener("change", onSkipNarrationChanged);
+    autoPlaybackToggle.removeEventListener("change", onAutoPlaybackChanged);
     addNpcInput.destroy();
     addNpcButton.removeEventListener("click", onAddNpc);
     addNpcInputSlot.removeEventListener("keydown", onAddNpcKeyDown);
@@ -5801,6 +5985,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
     hostWindow.removeEventListener("contextmenu", onNativeContextMenu, true);
     hostWindow.removeEventListener("click", onNativeTtsClick, true);
     savedUserControlObserver.disconnect();
+    if (playbackButtonsFrame !== null) hostWindow.cancelAnimationFrame(playbackButtonsFrame);
     restoreNativePlaybackButtons();
     tab.destroy();
     removeStyle();
