@@ -5,6 +5,25 @@ export interface PlaybackButtonState {
   ariaPressed: string | null
 }
 
+/** Own asynchronous startup so superseded requests cannot create audio streams. */
+export class PlaybackStartupGuard {
+  private serial = 0
+  private pending: { token: number; chatId: string; messageId: string; automatic: boolean } | null = null
+  begin(chatId: string, messageId: string, automatic: boolean): number | null {
+    if (this.pending?.chatId === chatId && this.pending.messageId === messageId) {
+      if (!automatic) this.cancel()
+      return null
+    }
+    const token = ++this.serial
+    this.pending = { token, chatId, messageId, automatic }
+    return token
+  }
+  owns(token: number): boolean { return this.pending?.token === token }
+  finish(token: number): void { if (this.owns(token)) this.pending = null }
+  cancel(): void { this.serial++; this.pending = null }
+  cancelAutomatic(): void { if (this.pending?.automatic) this.cancel() }
+}
+
 /** One pointer gesture toggles autoplay without also activating the play button. */
 export class PlaybackLongPress<T> {
   private active: { target: T; pointerId: number; x: number; y: number; timer: ReturnType<typeof setTimeout>; fired: boolean } | null = null

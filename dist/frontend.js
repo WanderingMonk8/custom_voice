@@ -1,4 +1,30 @@
 // src/playback-ui.ts
+var PlaybackStartupGuard = class {
+  serial = 0;
+  pending = null;
+  begin(chatId, messageId, automatic) {
+    if (this.pending?.chatId === chatId && this.pending.messageId === messageId) {
+      if (!automatic) this.cancel();
+      return null;
+    }
+    const token = ++this.serial;
+    this.pending = { token, chatId, messageId, automatic };
+    return token;
+  }
+  owns(token) {
+    return this.pending?.token === token;
+  }
+  finish(token) {
+    if (this.owns(token)) this.pending = null;
+  }
+  cancel() {
+    this.serial++;
+    this.pending = null;
+  }
+  cancelAutomatic() {
+    if (this.pending?.automatic) this.cancel();
+  }
+};
 var PlaybackLongPress = class {
   constructor(toggle, delay = 650) {
     this.toggle = toggle;
@@ -2734,6 +2760,7 @@ function setup(ctx) {
   let rateLimitWaitSeconds = DEFAULT_RATE_LIMIT_WAIT_SECONDS;
   let autoVoiceCasting = true;
   let autoPlayback = false;
+  const playbackStartup = new PlaybackStartupGuard();
   let ghostVoiceLifetime = GHOST_VOICE_LIFETIME_MESSAGES;
   let speakerLookback = DEFAULT_SPEAKER_LOOKBACK;
   let ghostLifetimeLoaded = false;
@@ -3767,6 +3794,8 @@ function setup(ctx) {
   }
   async function playMessage(messageId, nativeRegenerationAction = false, automatic = false) {
     if (activePlayback?.messageId === messageId) {
+      if (automatic) return;
+      playbackStartup.cancel();
       const finishingSave = stopPlayback();
       setStatus(finishingSave ? "Playback stopped; finishing saved audio\u2026" : "Playback stopped.");
       return;
@@ -3776,764 +3805,784 @@ function setup(ctx) {
       setStatus("Open a chat before starting voice playback.", "error");
       return;
     }
-    let message;
+    const startupToken = playbackStartup.begin(requestedChatId, messageId, automatic);
+    if (startupToken === null) {
+      if (!automatic) setStatus("Playback stopped.");
+      return;
+    }
+    const ownsStartup = () => playbackStartup.owns(startupToken) && !autoPlaybackDisposed && ctx.getActiveChat().chatId === requestedChatId && (!automatic || autoPlayback);
     try {
-      message = await requestPlaybackMessage(requestedChatId, messageId);
-    } catch (error) {
-      setStatus(error instanceof Error ? error.message : "Could not load this message.", "error");
-      return;
-    }
-    if (ctx.getActiveChat().chatId !== requestedChatId) return;
-    if (automatic && (message.is_user || hasSavedAudioForCurrentSwipe(message))) return;
-    const regeneratingSavedAudio = !message.is_user && (nativeRegenerationAction || hasSavedAudioForCurrentSwipe(message));
-    if (regeneratingSavedAudio) {
-      const { confirmed } = await ctx.ui.showConfirm({
-        title: "Regenerate TTS audio?",
-        message: "This will replace the saved audio attached to this message with a new TTS synthesis. The current recording will be deleted.",
-        confirmLabel: "Regenerate",
-        cancelLabel: "Keep current",
-        variant: "warning"
-      });
-      if (!confirmed || ctx.getActiveChat().chatId !== requestedChatId) return;
-    }
-    if (activePlayback) {
-      stopPlayback();
-    }
-    const localChatId = ctx.getActiveChat().chatId;
-    if (activeChat?.id !== localChatId) {
-      setStatus("Loading this chat\u2019s voice settings\u2026");
+      let message;
       try {
-        await requestLocalState();
+        message = await requestPlaybackMessage(requestedChatId, messageId);
       } catch (error) {
-        setStatus(error instanceof Error ? error.message : "Could not load this chat\u2019s voice settings.", "error");
+        if (ownsStartup()) setStatus(error instanceof Error ? error.message : "Could not load this message.", "error");
         return;
       }
-    }
-    if (!activeChat || activeChat.id !== ctx.getActiveChat().chatId) return;
-    const playbackChat = activeChat;
-    const config = collectConfig();
-    const connectionVersionAtLoad = globalConnectionVersion;
-    const preferences = await loadPlaybackPreferences();
-    if (llmSettingsSaveTimer || savingLlmSettings) {
-      preferences.speakerParsingMode = speakerParsingMode;
-      preferences.ttsTagStyle = ttsTagStyle;
-      preferences.ttsTagPlacement = ttsTagPlacement;
-      preferences.tagLlmConnectionId = tagLlmConnectionId;
-      preferences.tagLlmModel = tagLlmModel;
-    }
-    if (advancedSettingsSaveTimer || savingAdvancedSettings) {
-      preferences.playbackBufferSegments = playbackBufferSegments;
-      preferences.concurrentGenerations = concurrentGenerationLimit;
-      preferences.rateLimitWaitSeconds = rateLimitWaitSeconds;
-      preferences.ghostVoiceLifetime = ghostVoiceLifetime;
-      preferences.speakerLookback = speakerLookback;
-      preferences.autoVoiceCasting = autoVoiceCasting;
-      preferences.autoPlayback = autoPlayback;
-      preferences.speakerAssignmentDebug = speakerAssignmentDebug;
-      preferences.skipNarration = skipNarration;
-    } else {
-      playbackBufferSegments = preferences.playbackBufferSegments;
-      concurrentGenerationLimit = preferences.concurrentGenerations;
-      rateLimitWaitSeconds = preferences.rateLimitWaitSeconds;
-      speakerAssignmentDebug = preferences.speakerAssignmentDebug;
-      skipNarration = preferences.skipNarration;
-    }
-    const connectionId = savingGlobalConnection || connectionVersionAtLoad !== globalConnectionVersion ? lumiverseConnectionId : resolveGlobalTtsConnection(preferences.connectionId, connections);
-    if (!connectionId) {
-      setStatus("Choose a TTS connection before playing.", "error");
-      return;
-    }
-    const connectionProfileVoice = (connections.find((connection) => connection.id === connectionId)?.voice ?? "").trim();
-    let autoCastDiagnostics = [];
-    if (preferences.autoVoiceCasting && favoriteVoices.length && (!config.narratorVoice || !config.userVoice || playbackChat.characters.some((character) => !config.characterVoices[character.id]))) {
-      flushSave();
-      const autoResult = await requestAutoCast(playbackChat.id, favoriteVoices, [connectionProfileVoice, config.narratorVoice, config.userVoice, ...Object.values(config.characterVoices)].filter(Boolean), !config.narratorVoice, !config.userVoice);
-      if (ctx.getActiveChat().chatId !== playbackChat.id) return;
-      const assigned = autoResult.assignments;
-      autoCastDiagnostics = autoResult.diagnostics;
-      if (assigned.narrator && !config.narratorVoice) config.narratorVoice = assigned.narrator;
-      if (assigned.user && !config.userVoice) config.userVoice = assigned.user;
-      for (const [id, voice] of Object.entries(assigned)) if (id !== "narrator" && id !== "user" && !config.characterVoices[id]) config.characterVoices[id] = voice;
-    }
-    if (preferences.speakerAssignmentDebug) {
-      const profile = connections.find((connection) => connection.id === connectionId);
-      appendSpeakerDebugLog(
-        `TTS connection profile: id=${JSON.stringify(connectionId)}, provider=${JSON.stringify(profile?.provider ?? "")}, model=${JSON.stringify(profile?.model ?? "")}, defaultVoice=${JSON.stringify(profile?.voice ?? "")}, narratorVoice=${JSON.stringify(config.narratorVoice || "<connection default>")}, userVoice=${JSON.stringify(config.userVoice || "<none>")}`
-      );
-    }
-    const contextClass = window.AudioContext ?? window.webkitAudioContext;
-    if (!contextClass) {
-      setStatus("Web Audio is unavailable in this browser.", "error");
-      return;
-    }
-    const audioContext = new contextClass();
-    if (automatic) {
-      let timer;
-      try {
-        await Promise.race([
-          audioContext.resume(),
-          new Promise((_, reject) => {
-            timer = setTimeout(() => reject(new Error("Automatic playback needs a browser interaction. Click a play button to enable audio.")), 2e3);
-          })
-        ]);
-      } catch (error) {
-        void audioContext.close().catch(() => void 0);
-        setStatus(error instanceof Error ? error.message : "Automatic playback could not start.", "error");
-        return;
-      } finally {
-        if (timer) clearTimeout(timer);
+      if (!ownsStartup()) return;
+      if (automatic && (message.is_user || hasSavedAudioForCurrentSwipe(message))) return;
+      const regeneratingSavedAudio = !message.is_user && (nativeRegenerationAction || hasSavedAudioForCurrentSwipe(message));
+      if (regeneratingSavedAudio) {
+        const { confirmed } = await ctx.ui.showConfirm({
+          title: "Regenerate TTS audio?",
+          message: "This will replace the saved audio attached to this message with a new TTS synthesis. The current recording will be deleted.",
+          confirmLabel: "Regenerate",
+          cancelLabel: "Keep current",
+          variant: "warning"
+        });
+        if (!confirmed || !ownsStartup()) return;
       }
-      if (autoPlaybackDisposed || !autoPlayback || ctx.getActiveChat().chatId !== requestedChatId) {
-        void audioContext.close().catch(() => void 0);
-        return;
+      if (activePlayback) {
+        stopPlayback();
       }
-    } else await audioContext.resume();
-    let audibleFinished = false;
-    let resolveAudibleDone = null;
-    const audibleDone = new Promise((resolve) => {
-      resolveAudibleDone = resolve;
-    });
-    const playback = {
-      messageId,
-      controller: new AbortController(),
-      synthesisController: null,
-      context: audioContext,
-      source: null,
-      persistenceState: "not-started",
-      persistenceError: null,
-      playbackStopped: false,
-      playbackFinished: false,
-      audibleDone,
-      finishAudible: () => {
-        if (audibleFinished) return;
-        audibleFinished = true;
-        resolveAudibleDone?.();
-      }
-    };
-    activePlayback = playback;
-    updatePlaybackButtons();
-    const playbackSetupFinishedAt = Date.now();
-    try {
-      if (playback.controller.signal.aborted) throw new DOMException("Playback stopped.", "AbortError");
-      const playbackSpeakers = addUnconfiguredDialogueSpeakers(
-        message.content,
-        speakersForMessageRole(
-          playbackChat.characters,
-          message.is_user,
-          message.is_user ? message.name : "User"
-        ),
-        preferences.skippedTrackerTags
-      );
-      const defaultSpeakerId = message.is_user ? USER_SPEAKER_ID : null;
-      const aliases = speakerAliasIdLookup(playbackChat.characters);
-      const localSegments = markUnresolvedSpeechSegments(parseRosterVoiceSegments(
-        message.content,
-        defaultSpeakerId,
-        playbackSpeakers,
-        preferences.skippedTrackerTags,
-        null,
-        true
-      ), preferences.speakerAssignmentDebug);
-      let review = { segments: localSegments, usedLlm: null, failed: false };
-      if (preferences.speakerParsingMode !== "off" || preferences.ttsTagStyle !== "off") {
-        setStatus(
-          preferences.speakerParsingMode !== "off" ? "Classifying dialogue speakers with Jev\u2026" : "Adding TTS vocal tags\u2026"
-        );
-      }
-      try {
-        review = await requestSpeakerReviewedSegments(playbackChat.id, messageId, preferences);
-      } catch (error) {
-        if (playback.controller.signal.aborted) throw new DOMException("Playback stopped.", "AbortError");
-        if (error instanceof Error && error.message.includes("changed during speaker review")) throw error;
-        console.warn("[Chat Voice] Backend speaker parsing failed; using the message-local parser.", error);
-        review = { segments: localSegments, usedLlm: null, failed: true };
-        setStatus("Historical speaker lookup unavailable; using the message-local parser.");
-      }
-      const reviewedSegments = review.segments;
-      updateSpeakerDebugLog(
-        messageId,
-        message.is_user,
-        defaultSpeakerId,
-        playbackSpeakers,
-        playbackChat.characters,
-        localSegments,
-        reviewedSegments,
-        aliases,
-        config,
-        preferences.speakerParsingMode,
-        review
-      );
-      for (const line of autoCastDiagnostics) appendSpeakerDebugLog(`Automatic casting: ${line}`);
-      const segments = filterNarrationSegments(reviewedSegments, preferences.skipNarration);
-      if (preferences.skipNarration) appendSpeakerDebugLog(`Narration audio skipped: ${reviewedSegments.length - segments.length} segment(s).`);
-      if (!segments.length && preferences.skipNarration) {
-        setStatus("No dialogue to play; narration audio is disabled.", "saved");
-        return;
-      }
-      const matchingSegments = segments.map((segment) => ({
-        ...segment,
-        speakerId: segment.speakerId ? aliases.get(segment.speakerId) ?? segment.speakerId : null
-      }));
-      const uncastGroups = collectUncastVoiceGroups(matchingSegments);
-      const reservedVoices = [
-        ...Object.values(config.characterVoices),
-        config.narratorVoice,
-        config.userVoice,
-        connectionProfileVoice
-      ];
-      const uncastVoices = availableUncastVoices(favoriteVoices, reservedVoices);
-      const uncastMatchPromise = preferences.autoVoiceCasting && uncastGroups.length ? requestUncastVoiceMatches(
-        playbackChat.id,
-        messageId,
-        preparePlaybackContent(message.content, preferences.skippedTrackerTags),
-        hashMessageContent(message.content),
-        uncastGroups,
-        uncastVoices,
-        reservedVoices,
-        preferences.ghostVoiceLifetime,
-        preferences.speakerLookback,
-        preferences.skippedTrackerTags
-      ).catch((error) => {
-        appendSpeakerDebugLog(`Uncast voice matching failed; using connection default: ${error instanceof Error ? error.message : String(error)}`);
-        return [];
-      }) : Promise.resolve([]);
-      let explicitVoiceCount = 0;
-      let connectionVoiceFallbacks = 0;
-      const segmentPlanIndexes = [];
-      const rawPlan = segments.map((segment) => {
-        const speakerId = segment.speakerId ? aliases.get(segment.speakerId) ?? segment.speakerId : null;
-        const configuredVoice = playbackVoiceForSpeaker(
-          speakerId,
-          message.is_user,
-          config.characterVoices,
-          config.narratorVoice,
-          config.userVoice
-        );
-        const voice = configuredVoice || connectionProfileVoice;
-        if (configuredVoice) explicitVoiceCount += 1;
-        else if (connectionProfileVoice) connectionVoiceFallbacks += 1;
-        return {
-          text: speakerId ? normalizeSpeechBoundaryDashes(segment.ttsText ?? segment.text) : segment.ttsText ?? segment.text,
-          voice,
-          ...segment.ttsTag ? { tagId: segment.ttsTag.id } : {}
-        };
-      });
-      const plan = mergeVoicePlan(rawPlan);
-      let planIndex = 0;
-      for (const item of rawPlan) {
-        const count = mergeVoicePlan([item]).length;
-        segmentPlanIndexes.push(Array.from({ length: count }, (_, offset) => planIndex + offset));
-        planIndex += count;
-      }
-      appendSpeakerDebugLog(
-        `TTS voice resolution: explicit=${explicitVoiceCount}, connectionDefaultFallback=${connectionVoiceFallbacks}${connectionVoiceFallbacks > 0 ? ` (explicit default voice ${JSON.stringify(connectionProfileVoice || "<connection default>")})` : ""}.`
-      );
-      const tagIndexes = /* @__PURE__ */ new Map();
-      plan.forEach((entry, index) => {
-        if (!entry.tagId) return;
-        const indexes = tagIndexes.get(entry.tagId) ?? [];
-        indexes.push(index);
-        tagIndexes.set(entry.tagId, indexes);
-      });
-      const tagSources = /* @__PURE__ */ new Map();
-      let synthesisPlanFrozen = false;
-      for (const segment of segments) {
-        if (segment.ttsTag && (preferences.ttsTagStyle === "fish" || segment.ttsTag.sounds.length > 0 || segment.ttsTag.pauses.length > 0) && !/\n\s*\n/u.test(segment.text.trim())) {
-          tagSources.set(segment.ttsTag.id, {
-            text: segment.ttsTag.baseText ?? segment.ttsText ?? segment.text,
-            emotions: segment.ttsTag.emotions,
-            styles: segment.ttsTag.styles,
-            sounds: segment.ttsTag.sounds,
-            pauses: segment.ttsTag.pauses,
-            modulation: segment.ttsTag.modulation === true,
-            ...segment.ttsTag.modulationPoint ? { modulationPoint: segment.ttsTag.modulationPoint } : {},
-            ...segment.ttsTag.modulationCharIndex !== void 0 ? { modulationCharIndex: segment.ttsTag.modulationCharIndex } : {},
-            narrativeBefore: segment.ttsTag.narrativeBefore ?? "",
-            narrativeAfter: segment.ttsTag.narrativeAfter ?? ""
-          });
-        }
-      }
-      const applyTagPlacements = (placements, origin) => {
-        for (const placement of placements) {
-          const source = tagSources.get(placement.id);
-          if (!source) continue;
-          tagPlacementCache.set(
-            `${playbackChat.id}\0${messageId}\0${preferences.ttsTagStyle}\0${preferences.tagLlmConnectionId}\0${preferences.tagLlmModel}\0${placement.id}\0${JSON.stringify(source.emotions)}\0${JSON.stringify(source.styles)}\0${JSON.stringify(source.sounds)}\0${JSON.stringify(source.pauses)}\0${source.modulation ? "1" : "0"}\0${source.modulationPoint ?? ""}\0${source.modulationCharIndex ?? ""}\0${source.text}\0${source.narrativeBefore}\0${source.narrativeAfter}`,
-            placement.text
-          );
-          if (synthesisPlanFrozen) {
-            appendSpeakerDebugLog(
-              `TTS tag placement [${placement.id}] arrived after synthesis-plan freeze; cached for the next playback without changing the active plan.`
-            );
-            continue;
-          }
-          for (const index of tagIndexes.get(placement.id) ?? []) {
-            plan[index] = { ...plan[index], text: normalizeSpeechBoundaryDashes(placement.text) };
-          }
-          for (const segment of segments) {
-            if (segment.ttsTag?.id !== placement.id) continue;
-            segment.ttsText = placement.text;
-            segment.ttsTag = { ...segment.ttsTag, source: "llm" };
-          }
-          appendSpeakerDebugLog(
-            `TTS tag placement [${placement.id}] emotions=${JSON.stringify(source.emotions)}, styles=${JSON.stringify(source.styles)}, sounds=${JSON.stringify(source.sounds)}, pauses=${JSON.stringify(source.pauses)}, modulation=${source.modulation}${source.modulationPoint ? ` at ${source.modulationPoint}` : ""}${source.modulationCharIndex !== void 0 ? ` char=${source.modulationCharIndex}` : ""}${placement.emotionTag ? `, custom=${JSON.stringify(placement.emotionTag)}` : ""}${placement.modulationTag ? `, modulationTag=${JSON.stringify(placement.modulationTag)}` : ""} via ${origin}: ` + JSON.stringify(placement.text.length > 180 ? `${placement.text.slice(0, 177)}...` : placement.text)
-          );
-        }
-      };
-      if (preferences.ttsTagStyle !== "off" && preferences.ttsTagPlacement === "llm" && tagSources.size > 0) {
-        const placementStyle = preferences.ttsTagStyle;
-        appendSpeakerDebugLog(
-          `
-TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size}, connection=${JSON.stringify(preferences.tagLlmConnectionId || "<active>")}, model=${JSON.stringify(preferences.tagLlmModel || "<connection default>")}`
-        );
-        const keyFor = (id, source) => `${playbackChat.id}\0${messageId}\0${placementStyle}\0${preferences.tagLlmConnectionId}\0${preferences.tagLlmModel}\0${id}\0${JSON.stringify(source.emotions)}\0${JSON.stringify(source.styles)}\0${JSON.stringify(source.sounds)}\0${JSON.stringify(source.pauses)}\0${source.modulation ? "1" : "0"}\0${source.modulationPoint ?? ""}\0${source.modulationCharIndex ?? ""}\0${source.text}\0${source.narrativeBefore}\0${source.narrativeAfter}`;
-        const cachedPlacements = [];
-        for (const [id, source] of tagSources) {
-          const cached = tagPlacementCache.get(keyFor(id, source));
-          if (cached) cachedPlacements.push({ id, text: cached });
-        }
-        if (cachedPlacements.length > 0) {
-          appendSpeakerDebugLog(
-            `TTS tag placement cache hits: ${cachedPlacements.length}/${tagSources.size}.`
-          );
-          applyTagPlacements(cachedPlacements, "cache");
-        }
-        const items = [...tagSources.entries()].filter(([id, source]) => !tagPlacementCache.has(keyFor(id, source))).map(([id, source]) => ({
-          id,
-          text: source.text,
-          emotions: source.emotions,
-          styles: source.styles,
-          sounds: source.sounds,
-          pauses: source.pauses,
-          modulation: source.modulation,
-          ...source.modulationPoint ? { modulationPoint: source.modulationPoint } : {},
-          ...source.modulationCharIndex !== void 0 ? { modulationCharIndex: source.modulationCharIndex } : {},
-          narrativeBefore: source.narrativeBefore,
-          narrativeAfter: source.narrativeAfter
-        }));
-        const chunks = [];
-        for (let index = 0; index < items.length; index += 4) {
-          chunks.push(items.slice(index, index + 4));
-        }
-        if (chunks.length > 0) {
-          appendSpeakerDebugLog(
-            `TTS tag placement chunks: ${chunks.length} pending (first chunk ${chunks[0].length} speeches, later chunks of up to 4).`
-          );
-          let firstSettled = false;
-          appendSpeakerDebugLog(
-            `TTS tag placement chunk 1/${chunks.length} started with ${chunks[0].length} speeches.`
-          );
-          const firstPlacement = requestTagPlacements(
-            preparePlaybackContent(message.content, preferences.skippedTrackerTags),
-            placementStyle,
-            preferences.tagLlmConnectionId,
-            preferences.tagLlmModel,
-            chunks[0]
-          ).then((placements) => {
-            firstSettled = true;
-            appendSpeakerDebugLog(
-              `TTS tag placement chunk 1/${chunks.length} resolved with ${placements.length}/${chunks[0].length} placements.`
-            );
-            applyTagPlacements(placements, "llm");
-            return placements;
-          }).catch((error) => {
-            firstSettled = true;
-            appendSpeakerDebugLog(
-              `TTS tag placement chunk 1/${chunks.length} failed; deterministic Jev placement remains: ${error instanceof Error ? error.message : String(error)}`
-            );
-            console.warn("[Chat Voice] First vocal tag placement chunk failed.", error);
-            return [];
-          });
-          setStatus("Placing vocal tags\u2026");
-          await Promise.race([
-            firstPlacement,
-            new Promise((resolve) => setTimeout(resolve, 8e3))
-          ]);
-          if (!firstSettled) {
-            appendSpeakerDebugLog(
-              "TTS tag placement chunk 1 is still pending after 8s; starting playback with deterministic Jev placement for unresolved segments."
-            );
-          }
-          void (async () => {
-            let chunkNumber = 2;
-            for (const chunk of chunks.slice(1)) {
-              if (playback.controller.signal.aborted) {
-                appendSpeakerDebugLog(
-                  `TTS tag placement chunk ${chunkNumber}/${chunks.length} skipped because playback stopped.`
-                );
-                return;
-              }
-              appendSpeakerDebugLog(
-                `TTS tag placement chunk ${chunkNumber}/${chunks.length} started with ${chunk.length} speeches.`
-              );
-              try {
-                const placements = await requestTagPlacements(
-                  preparePlaybackContent(message.content, preferences.skippedTrackerTags),
-                  placementStyle,
-                  preferences.tagLlmConnectionId,
-                  preferences.tagLlmModel,
-                  chunk
-                );
-                appendSpeakerDebugLog(
-                  `TTS tag placement chunk ${chunkNumber}/${chunks.length} resolved with ${placements.length}/${chunk.length} placements.`
-                );
-                applyTagPlacements(placements, "llm");
-              } catch (error) {
-                appendSpeakerDebugLog(
-                  `TTS tag placement chunk ${chunkNumber}/${chunks.length} failed; deterministic Jev placement remains: ${error instanceof Error ? error.message : String(error)}`
-                );
-                console.warn("[Chat Voice] Vocal tag placement chunk failed.", error);
-              }
-              chunkNumber += 1;
-            }
-          })();
-        }
-      }
-      if (uncastGroups.length) setStatus("Matching uncast characters to favorite voices\u2026");
-      const uncastMatches = await uncastMatchPromise;
-      if (playback.controller.signal.aborted) throw new DOMException("Playback stopped.", "AbortError");
-      for (const match of uncastMatches) {
-        const group = uncastGroups.find((item) => item.id === match.groupId);
-        if (!group || reservedVoices.includes(match.voiceId)) continue;
-        for (const segmentIndex of group.segmentIndexes) {
-          for (const index of segmentPlanIndexes[segmentIndex] ?? []) plan[index] = { ...plan[index], voice: match.voiceId };
-        }
-        appendSpeakerDebugLog(`Uncast voice ${group.id}: gender=${match.gender}, ghost=${match.ghostId ?? "none"}, voice=${JSON.stringify(match.voiceId)}.`);
-      }
-      synthesisPlanFrozen = true;
-      const splitPlan = splitLargeVoicePlanSegments(plan);
-      if (splitPlan.length !== plan.length) {
-        appendSpeakerDebugLog(
-          `Split ${plan.length} paragraph-level TTS job${plan.length === 1 ? "" : "s"} into ${splitPlan.length} latency-sized segments.`
-        );
-        plan.splice(0, plan.length, ...splitPlan);
-      }
-      if (plan.length === 0) throw new Error("This message has no playable narration or dialogue.");
-      if (preferences.speakerAssignmentDebug) {
-        appendSpeakerDebugLog("\nSynthesis plan");
-        plan.forEach((segment, index) => appendSpeakerDebugLog(
-          `  [${index + 1}] voice=${JSON.stringify(segment.voice || "<connection default>")} text=${JSON.stringify(segment.text.length > 120 ? `${segment.text.slice(0, 117)}...` : segment.text)}`
-        ));
-      }
-      const synthesisMessageKey = `${playbackChat.id}\0${messageId}`;
-      const previousSynthesis = backgroundSynthesisByMessage.get(synthesisMessageKey);
-      if (previousSynthesis) {
-        previousSynthesis.abort();
-        backgroundSynthesisByMessage.delete(synthesisMessageKey);
-        appendSpeakerDebugLog("Cancelled an older unfinished synthesis/save for this message.");
-      }
-      const synthesisController = new AbortController();
-      const rateLimitBudget = {
-        blockedUntil: 0,
-        cumulativeWaitMs: 0,
-        consecutiveResponses: 0,
-        maximumWaitMs: preferences.rateLimitWaitSeconds * 1e3,
-        recovering: false,
-        recoveryTail: Promise.resolve()
-      };
-      playback.synthesisController = synthesisController;
-      backgroundSynthesisControllers.add(synthesisController);
-      backgroundSynthesisByMessage.set(synthesisMessageKey, synthesisController);
-      const adaptiveLimitToken = Symbol("playback-concurrency");
-      let adaptiveConcurrency = 1;
-      let shortConcurrencyCooldown = 0;
-      let longWindowStreak = 0;
-      let rateLimitedForRemainder = false;
-      const prepare = async (index) => {
+      const localChatId = ctx.getActiveChat().chatId;
+      if (activeChat?.id !== localChatId) {
+        setStatus("Loading this chat\u2019s voice settings\u2026");
         try {
-          appendSpeakerDebugLog(
-            `Synthesis request [${index + 1}] started with voice=${JSON.stringify(plan[index].voice || "<connection default>")}.`
+          await requestLocalState();
+        } catch (error) {
+          if (ownsStartup()) setStatus(error instanceof Error ? error.message : "Could not load this chat\u2019s voice settings.", "error");
+          return;
+        }
+      }
+      if (!ownsStartup() || !activeChat || activeChat.id !== ctx.getActiveChat().chatId) return;
+      const playbackChat = activeChat;
+      const config = collectConfig();
+      const connectionVersionAtLoad = globalConnectionVersion;
+      const preferences = await loadPlaybackPreferences();
+      if (!ownsStartup()) return;
+      if (llmSettingsSaveTimer || savingLlmSettings) {
+        preferences.speakerParsingMode = speakerParsingMode;
+        preferences.ttsTagStyle = ttsTagStyle;
+        preferences.ttsTagPlacement = ttsTagPlacement;
+        preferences.tagLlmConnectionId = tagLlmConnectionId;
+        preferences.tagLlmModel = tagLlmModel;
+      }
+      if (advancedSettingsSaveTimer || savingAdvancedSettings) {
+        preferences.playbackBufferSegments = playbackBufferSegments;
+        preferences.concurrentGenerations = concurrentGenerationLimit;
+        preferences.rateLimitWaitSeconds = rateLimitWaitSeconds;
+        preferences.ghostVoiceLifetime = ghostVoiceLifetime;
+        preferences.speakerLookback = speakerLookback;
+        preferences.autoVoiceCasting = autoVoiceCasting;
+        preferences.autoPlayback = autoPlayback;
+        preferences.speakerAssignmentDebug = speakerAssignmentDebug;
+        preferences.skipNarration = skipNarration;
+      } else {
+        playbackBufferSegments = preferences.playbackBufferSegments;
+        concurrentGenerationLimit = preferences.concurrentGenerations;
+        rateLimitWaitSeconds = preferences.rateLimitWaitSeconds;
+        speakerAssignmentDebug = preferences.speakerAssignmentDebug;
+        skipNarration = preferences.skipNarration;
+      }
+      const connectionId = savingGlobalConnection || connectionVersionAtLoad !== globalConnectionVersion ? lumiverseConnectionId : resolveGlobalTtsConnection(preferences.connectionId, connections);
+      if (!connectionId) {
+        setStatus("Choose a TTS connection before playing.", "error");
+        return;
+      }
+      const connectionProfileVoice = (connections.find((connection) => connection.id === connectionId)?.voice ?? "").trim();
+      let autoCastDiagnostics = [];
+      if (preferences.autoVoiceCasting && favoriteVoices.length && (!config.narratorVoice || !config.userVoice || playbackChat.characters.some((character) => !config.characterVoices[character.id]))) {
+        flushSave();
+        const autoResult = await requestAutoCast(playbackChat.id, favoriteVoices, [connectionProfileVoice, config.narratorVoice, config.userVoice, ...Object.values(config.characterVoices)].filter(Boolean), !config.narratorVoice, !config.userVoice);
+        if (!ownsStartup()) return;
+        const assigned = autoResult.assignments;
+        autoCastDiagnostics = autoResult.diagnostics;
+        if (assigned.narrator && !config.narratorVoice) config.narratorVoice = assigned.narrator;
+        if (assigned.user && !config.userVoice) config.userVoice = assigned.user;
+        for (const [id, voice] of Object.entries(assigned)) if (id !== "narrator" && id !== "user" && !config.characterVoices[id]) config.characterVoices[id] = voice;
+      }
+      if (preferences.speakerAssignmentDebug) {
+        const profile = connections.find((connection) => connection.id === connectionId);
+        appendSpeakerDebugLog(
+          `TTS connection profile: id=${JSON.stringify(connectionId)}, provider=${JSON.stringify(profile?.provider ?? "")}, model=${JSON.stringify(profile?.model ?? "")}, defaultVoice=${JSON.stringify(profile?.voice ?? "")}, narratorVoice=${JSON.stringify(config.narratorVoice || "<connection default>")}, userVoice=${JSON.stringify(config.userVoice || "<none>")}`
+        );
+      }
+      const contextClass = window.AudioContext ?? window.webkitAudioContext;
+      if (!contextClass) {
+        setStatus("Web Audio is unavailable in this browser.", "error");
+        return;
+      }
+      const audioContext = new contextClass();
+      if (automatic) {
+        let timer;
+        try {
+          await Promise.race([
+            audioContext.resume(),
+            new Promise((_, reject) => {
+              timer = setTimeout(() => reject(new Error("Automatic playback needs a browser interaction. Click a play button to enable audio.")), 2e3);
+            })
+          ]);
+        } catch (error) {
+          void audioContext.close().catch(() => void 0);
+          if (ownsStartup()) setStatus(error instanceof Error ? error.message : "Automatic playback could not start.", "error");
+          return;
+        } finally {
+          if (timer) clearTimeout(timer);
+        }
+      } else {
+        try {
+          await audioContext.resume();
+        } catch (error) {
+          void audioContext.close().catch(() => void 0);
+          throw error;
+        }
+      }
+      if (!ownsStartup()) {
+        void audioContext.close().catch(() => void 0);
+        return;
+      }
+      let audibleFinished = false;
+      let resolveAudibleDone = null;
+      const audibleDone = new Promise((resolve) => {
+        resolveAudibleDone = resolve;
+      });
+      const playback = {
+        messageId,
+        controller: new AbortController(),
+        synthesisController: null,
+        context: audioContext,
+        source: null,
+        persistenceState: "not-started",
+        persistenceError: null,
+        playbackStopped: false,
+        playbackFinished: false,
+        audibleDone,
+        finishAudible: () => {
+          if (audibleFinished) return;
+          audibleFinished = true;
+          resolveAudibleDone?.();
+        }
+      };
+      if (activePlayback) stopPlayback();
+      activePlayback = playback;
+      playbackStartup.finish(startupToken);
+      updatePlaybackButtons();
+      const playbackSetupFinishedAt = Date.now();
+      try {
+        if (playback.controller.signal.aborted) throw new DOMException("Playback stopped.", "AbortError");
+        const playbackSpeakers = addUnconfiguredDialogueSpeakers(
+          message.content,
+          speakersForMessageRole(
+            playbackChat.characters,
+            message.is_user,
+            message.is_user ? message.name : "User"
+          ),
+          preferences.skippedTrackerTags
+        );
+        const defaultSpeakerId = message.is_user ? USER_SPEAKER_ID : null;
+        const aliases = speakerAliasIdLookup(playbackChat.characters);
+        const localSegments = markUnresolvedSpeechSegments(parseRosterVoiceSegments(
+          message.content,
+          defaultSpeakerId,
+          playbackSpeakers,
+          preferences.skippedTrackerTags,
+          null,
+          true
+        ), preferences.speakerAssignmentDebug);
+        let review = { segments: localSegments, usedLlm: null, failed: false };
+        if (preferences.speakerParsingMode !== "off" || preferences.ttsTagStyle !== "off") {
+          setStatus(
+            preferences.speakerParsingMode !== "off" ? "Classifying dialogue speakers with Jev\u2026" : "Adding TTS vocal tags\u2026"
           );
-          const segment = await runSynthesisTask(() => {
-            const text = plan[index].text;
-            const voice = plan[index].voice;
-            appendSpeakerDebugLog(
-              `Synthesis dispatch [${index + 1}] voice=${JSON.stringify(voice || "<connection default>")}, textHash=${hashMessageContent(text)}, chars=${text.length}.`
+        }
+        try {
+          review = await requestSpeakerReviewedSegments(playbackChat.id, messageId, preferences);
+        } catch (error) {
+          if (playback.controller.signal.aborted) throw new DOMException("Playback stopped.", "AbortError");
+          if (error instanceof Error && error.message.includes("changed during speaker review")) throw error;
+          console.warn("[Chat Voice] Backend speaker parsing failed; using the message-local parser.", error);
+          review = { segments: localSegments, usedLlm: null, failed: true };
+          setStatus("Historical speaker lookup unavailable; using the message-local parser.");
+        }
+        const reviewedSegments = review.segments;
+        updateSpeakerDebugLog(
+          messageId,
+          message.is_user,
+          defaultSpeakerId,
+          playbackSpeakers,
+          playbackChat.characters,
+          localSegments,
+          reviewedSegments,
+          aliases,
+          config,
+          preferences.speakerParsingMode,
+          review
+        );
+        for (const line of autoCastDiagnostics) appendSpeakerDebugLog(`Automatic casting: ${line}`);
+        const segments = filterNarrationSegments(reviewedSegments, preferences.skipNarration);
+        if (preferences.skipNarration) appendSpeakerDebugLog(`Narration audio skipped: ${reviewedSegments.length - segments.length} segment(s).`);
+        if (!segments.length && preferences.skipNarration) {
+          setStatus("No dialogue to play; narration audio is disabled.", "saved");
+          return;
+        }
+        const matchingSegments = segments.map((segment) => ({
+          ...segment,
+          speakerId: segment.speakerId ? aliases.get(segment.speakerId) ?? segment.speakerId : null
+        }));
+        const uncastGroups = collectUncastVoiceGroups(matchingSegments);
+        const reservedVoices = [
+          ...Object.values(config.characterVoices),
+          config.narratorVoice,
+          config.userVoice,
+          connectionProfileVoice
+        ];
+        const uncastVoices = availableUncastVoices(favoriteVoices, reservedVoices);
+        const uncastMatchPromise = preferences.autoVoiceCasting && uncastGroups.length ? requestUncastVoiceMatches(
+          playbackChat.id,
+          messageId,
+          preparePlaybackContent(message.content, preferences.skippedTrackerTags),
+          hashMessageContent(message.content),
+          uncastGroups,
+          uncastVoices,
+          reservedVoices,
+          preferences.ghostVoiceLifetime,
+          preferences.speakerLookback,
+          preferences.skippedTrackerTags
+        ).catch((error) => {
+          appendSpeakerDebugLog(`Uncast voice matching failed; using connection default: ${error instanceof Error ? error.message : String(error)}`);
+          return [];
+        }) : Promise.resolve([]);
+        let explicitVoiceCount = 0;
+        let connectionVoiceFallbacks = 0;
+        const segmentPlanIndexes = [];
+        const rawPlan = segments.map((segment) => {
+          const speakerId = segment.speakerId ? aliases.get(segment.speakerId) ?? segment.speakerId : null;
+          const configuredVoice = playbackVoiceForSpeaker(
+            speakerId,
+            message.is_user,
+            config.characterVoices,
+            config.narratorVoice,
+            config.userVoice
+          );
+          const voice = configuredVoice || connectionProfileVoice;
+          if (configuredVoice) explicitVoiceCount += 1;
+          else if (connectionProfileVoice) connectionVoiceFallbacks += 1;
+          return {
+            text: speakerId ? normalizeSpeechBoundaryDashes(segment.ttsText ?? segment.text) : segment.ttsText ?? segment.text,
+            voice,
+            ...segment.ttsTag ? { tagId: segment.ttsTag.id } : {}
+          };
+        });
+        const plan = mergeVoicePlan(rawPlan);
+        let planIndex = 0;
+        for (const item of rawPlan) {
+          const count = mergeVoicePlan([item]).length;
+          segmentPlanIndexes.push(Array.from({ length: count }, (_, offset) => planIndex + offset));
+          planIndex += count;
+        }
+        appendSpeakerDebugLog(
+          `TTS voice resolution: explicit=${explicitVoiceCount}, connectionDefaultFallback=${connectionVoiceFallbacks}${connectionVoiceFallbacks > 0 ? ` (explicit default voice ${JSON.stringify(connectionProfileVoice || "<connection default>")})` : ""}.`
+        );
+        const tagIndexes = /* @__PURE__ */ new Map();
+        plan.forEach((entry, index) => {
+          if (!entry.tagId) return;
+          const indexes = tagIndexes.get(entry.tagId) ?? [];
+          indexes.push(index);
+          tagIndexes.set(entry.tagId, indexes);
+        });
+        const tagSources = /* @__PURE__ */ new Map();
+        let synthesisPlanFrozen = false;
+        for (const segment of segments) {
+          if (segment.ttsTag && (preferences.ttsTagStyle === "fish" || segment.ttsTag.sounds.length > 0 || segment.ttsTag.pauses.length > 0) && !/\n\s*\n/u.test(segment.text.trim())) {
+            tagSources.set(segment.ttsTag.id, {
+              text: segment.ttsTag.baseText ?? segment.ttsText ?? segment.text,
+              emotions: segment.ttsTag.emotions,
+              styles: segment.ttsTag.styles,
+              sounds: segment.ttsTag.sounds,
+              pauses: segment.ttsTag.pauses,
+              modulation: segment.ttsTag.modulation === true,
+              ...segment.ttsTag.modulationPoint ? { modulationPoint: segment.ttsTag.modulationPoint } : {},
+              ...segment.ttsTag.modulationCharIndex !== void 0 ? { modulationCharIndex: segment.ttsTag.modulationCharIndex } : {},
+              narrativeBefore: segment.ttsTag.narrativeBefore ?? "",
+              narrativeAfter: segment.ttsTag.narrativeAfter ?? ""
+            });
+          }
+        }
+        const applyTagPlacements = (placements, origin) => {
+          for (const placement of placements) {
+            const source = tagSources.get(placement.id);
+            if (!source) continue;
+            tagPlacementCache.set(
+              `${playbackChat.id}\0${messageId}\0${preferences.ttsTagStyle}\0${preferences.tagLlmConnectionId}\0${preferences.tagLlmModel}\0${placement.id}\0${JSON.stringify(source.emotions)}\0${JSON.stringify(source.styles)}\0${JSON.stringify(source.sounds)}\0${JSON.stringify(source.pauses)}\0${source.modulation ? "1" : "0"}\0${source.modulationPoint ?? ""}\0${source.modulationCharIndex ?? ""}\0${source.text}\0${source.narrativeBefore}\0${source.narrativeAfter}`,
+              placement.text
             );
-            return synthesizeVoiceSegment(
-              connectionId,
-              text,
-              voice,
-              preferences.speed,
-              synthesisController.signal,
-              sharedSynthesisPacer,
-              rateLimitBudget,
-              connectionVoiceGates.get(connectionId) ?? (() => {
-                const gate = new ConnectionVoiceGate();
-                connectionVoiceGates.set(connectionId, gate);
-                return gate;
-              })(),
-              (delayMs, cumulativeWaitMs) => {
-                rateLimitedForRemainder = true;
-                adaptiveConcurrency = 1;
-                shortConcurrencyCooldown = 0;
-                longWindowStreak = 0;
-                adaptiveSynthesisLimits.set(adaptiveLimitToken, 1);
-                drainSynthesisQueue();
-                if (ctx.getActiveChat().chatId === playbackChat.id && (!activePlayback || activePlayback === playback)) {
-                  setStatus(
-                    `Rate limited; resuming in ${Math.max(1, Math.ceil(delayMs / 1e3))}s\u2026 (${Math.ceil(cumulativeWaitMs / 1e3)}s of ${preferences.rateLimitWaitSeconds}s wait budget)`
+            if (synthesisPlanFrozen) {
+              appendSpeakerDebugLog(
+                `TTS tag placement [${placement.id}] arrived after synthesis-plan freeze; cached for the next playback without changing the active plan.`
+              );
+              continue;
+            }
+            for (const index of tagIndexes.get(placement.id) ?? []) {
+              plan[index] = { ...plan[index], text: normalizeSpeechBoundaryDashes(placement.text) };
+            }
+            for (const segment of segments) {
+              if (segment.ttsTag?.id !== placement.id) continue;
+              segment.ttsText = placement.text;
+              segment.ttsTag = { ...segment.ttsTag, source: "llm" };
+            }
+            appendSpeakerDebugLog(
+              `TTS tag placement [${placement.id}] emotions=${JSON.stringify(source.emotions)}, styles=${JSON.stringify(source.styles)}, sounds=${JSON.stringify(source.sounds)}, pauses=${JSON.stringify(source.pauses)}, modulation=${source.modulation}${source.modulationPoint ? ` at ${source.modulationPoint}` : ""}${source.modulationCharIndex !== void 0 ? ` char=${source.modulationCharIndex}` : ""}${placement.emotionTag ? `, custom=${JSON.stringify(placement.emotionTag)}` : ""}${placement.modulationTag ? `, modulationTag=${JSON.stringify(placement.modulationTag)}` : ""} via ${origin}: ` + JSON.stringify(placement.text.length > 180 ? `${placement.text.slice(0, 177)}...` : placement.text)
+            );
+          }
+        };
+        if (preferences.ttsTagStyle !== "off" && preferences.ttsTagPlacement === "llm" && tagSources.size > 0) {
+          const placementStyle = preferences.ttsTagStyle;
+          appendSpeakerDebugLog(
+            `
+TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size}, connection=${JSON.stringify(preferences.tagLlmConnectionId || "<active>")}, model=${JSON.stringify(preferences.tagLlmModel || "<connection default>")}`
+          );
+          const keyFor = (id, source) => `${playbackChat.id}\0${messageId}\0${placementStyle}\0${preferences.tagLlmConnectionId}\0${preferences.tagLlmModel}\0${id}\0${JSON.stringify(source.emotions)}\0${JSON.stringify(source.styles)}\0${JSON.stringify(source.sounds)}\0${JSON.stringify(source.pauses)}\0${source.modulation ? "1" : "0"}\0${source.modulationPoint ?? ""}\0${source.modulationCharIndex ?? ""}\0${source.text}\0${source.narrativeBefore}\0${source.narrativeAfter}`;
+          const cachedPlacements = [];
+          for (const [id, source] of tagSources) {
+            const cached = tagPlacementCache.get(keyFor(id, source));
+            if (cached) cachedPlacements.push({ id, text: cached });
+          }
+          if (cachedPlacements.length > 0) {
+            appendSpeakerDebugLog(
+              `TTS tag placement cache hits: ${cachedPlacements.length}/${tagSources.size}.`
+            );
+            applyTagPlacements(cachedPlacements, "cache");
+          }
+          const items = [...tagSources.entries()].filter(([id, source]) => !tagPlacementCache.has(keyFor(id, source))).map(([id, source]) => ({
+            id,
+            text: source.text,
+            emotions: source.emotions,
+            styles: source.styles,
+            sounds: source.sounds,
+            pauses: source.pauses,
+            modulation: source.modulation,
+            ...source.modulationPoint ? { modulationPoint: source.modulationPoint } : {},
+            ...source.modulationCharIndex !== void 0 ? { modulationCharIndex: source.modulationCharIndex } : {},
+            narrativeBefore: source.narrativeBefore,
+            narrativeAfter: source.narrativeAfter
+          }));
+          const chunks = [];
+          for (let index = 0; index < items.length; index += 4) {
+            chunks.push(items.slice(index, index + 4));
+          }
+          if (chunks.length > 0) {
+            appendSpeakerDebugLog(
+              `TTS tag placement chunks: ${chunks.length} pending (first chunk ${chunks[0].length} speeches, later chunks of up to 4).`
+            );
+            let firstSettled = false;
+            appendSpeakerDebugLog(
+              `TTS tag placement chunk 1/${chunks.length} started with ${chunks[0].length} speeches.`
+            );
+            const firstPlacement = requestTagPlacements(
+              preparePlaybackContent(message.content, preferences.skippedTrackerTags),
+              placementStyle,
+              preferences.tagLlmConnectionId,
+              preferences.tagLlmModel,
+              chunks[0]
+            ).then((placements) => {
+              firstSettled = true;
+              appendSpeakerDebugLog(
+                `TTS tag placement chunk 1/${chunks.length} resolved with ${placements.length}/${chunks[0].length} placements.`
+              );
+              applyTagPlacements(placements, "llm");
+              return placements;
+            }).catch((error) => {
+              firstSettled = true;
+              appendSpeakerDebugLog(
+                `TTS tag placement chunk 1/${chunks.length} failed; deterministic Jev placement remains: ${error instanceof Error ? error.message : String(error)}`
+              );
+              console.warn("[Chat Voice] First vocal tag placement chunk failed.", error);
+              return [];
+            });
+            setStatus("Placing vocal tags\u2026");
+            await Promise.race([
+              firstPlacement,
+              new Promise((resolve) => setTimeout(resolve, 8e3))
+            ]);
+            if (!firstSettled) {
+              appendSpeakerDebugLog(
+                "TTS tag placement chunk 1 is still pending after 8s; starting playback with deterministic Jev placement for unresolved segments."
+              );
+            }
+            void (async () => {
+              let chunkNumber = 2;
+              for (const chunk of chunks.slice(1)) {
+                if (playback.controller.signal.aborted) {
+                  appendSpeakerDebugLog(
+                    `TTS tag placement chunk ${chunkNumber}/${chunks.length} skipped because playback stopped.`
                   );
+                  return;
+                }
+                appendSpeakerDebugLog(
+                  `TTS tag placement chunk ${chunkNumber}/${chunks.length} started with ${chunk.length} speeches.`
+                );
+                try {
+                  const placements = await requestTagPlacements(
+                    preparePlaybackContent(message.content, preferences.skippedTrackerTags),
+                    placementStyle,
+                    preferences.tagLlmConnectionId,
+                    preferences.tagLlmModel,
+                    chunk
+                  );
+                  appendSpeakerDebugLog(
+                    `TTS tag placement chunk ${chunkNumber}/${chunks.length} resolved with ${placements.length}/${chunk.length} placements.`
+                  );
+                  applyTagPlacements(placements, "llm");
+                } catch (error) {
+                  appendSpeakerDebugLog(
+                    `TTS tag placement chunk ${chunkNumber}/${chunks.length} failed; deterministic Jev placement remains: ${error instanceof Error ? error.message : String(error)}`
+                  );
+                  console.warn("[Chat Voice] Vocal tag placement chunk failed.", error);
+                }
+                chunkNumber += 1;
+              }
+            })();
+          }
+        }
+        if (uncastGroups.length) setStatus("Matching uncast characters to favorite voices\u2026");
+        const uncastMatches = await uncastMatchPromise;
+        if (playback.controller.signal.aborted) throw new DOMException("Playback stopped.", "AbortError");
+        for (const match of uncastMatches) {
+          const group = uncastGroups.find((item) => item.id === match.groupId);
+          if (!group || reservedVoices.includes(match.voiceId)) continue;
+          for (const segmentIndex of group.segmentIndexes) {
+            for (const index of segmentPlanIndexes[segmentIndex] ?? []) plan[index] = { ...plan[index], voice: match.voiceId };
+          }
+          appendSpeakerDebugLog(`Uncast voice ${group.id}: gender=${match.gender}, ghost=${match.ghostId ?? "none"}, voice=${JSON.stringify(match.voiceId)}.`);
+        }
+        synthesisPlanFrozen = true;
+        const splitPlan = splitLargeVoicePlanSegments(plan);
+        if (splitPlan.length !== plan.length) {
+          appendSpeakerDebugLog(
+            `Split ${plan.length} paragraph-level TTS job${plan.length === 1 ? "" : "s"} into ${splitPlan.length} latency-sized segments.`
+          );
+          plan.splice(0, plan.length, ...splitPlan);
+        }
+        if (plan.length === 0) throw new Error("This message has no playable narration or dialogue.");
+        if (preferences.speakerAssignmentDebug) {
+          appendSpeakerDebugLog("\nSynthesis plan");
+          plan.forEach((segment, index) => appendSpeakerDebugLog(
+            `  [${index + 1}] voice=${JSON.stringify(segment.voice || "<connection default>")} text=${JSON.stringify(segment.text.length > 120 ? `${segment.text.slice(0, 117)}...` : segment.text)}`
+          ));
+        }
+        const synthesisMessageKey = `${playbackChat.id}\0${messageId}`;
+        const previousSynthesis = backgroundSynthesisByMessage.get(synthesisMessageKey);
+        if (previousSynthesis) {
+          previousSynthesis.abort();
+          backgroundSynthesisByMessage.delete(synthesisMessageKey);
+          appendSpeakerDebugLog("Cancelled an older unfinished synthesis/save for this message.");
+        }
+        const synthesisController = new AbortController();
+        const rateLimitBudget = {
+          blockedUntil: 0,
+          cumulativeWaitMs: 0,
+          consecutiveResponses: 0,
+          maximumWaitMs: preferences.rateLimitWaitSeconds * 1e3,
+          recovering: false,
+          recoveryTail: Promise.resolve()
+        };
+        playback.synthesisController = synthesisController;
+        backgroundSynthesisControllers.add(synthesisController);
+        backgroundSynthesisByMessage.set(synthesisMessageKey, synthesisController);
+        const adaptiveLimitToken = Symbol("playback-concurrency");
+        let adaptiveConcurrency = 1;
+        let shortConcurrencyCooldown = 0;
+        let longWindowStreak = 0;
+        let rateLimitedForRemainder = false;
+        const prepare = async (index) => {
+          try {
+            appendSpeakerDebugLog(
+              `Synthesis request [${index + 1}] started with voice=${JSON.stringify(plan[index].voice || "<connection default>")}.`
+            );
+            const segment = await runSynthesisTask(() => {
+              const text = plan[index].text;
+              const voice = plan[index].voice;
+              appendSpeakerDebugLog(
+                `Synthesis dispatch [${index + 1}] voice=${JSON.stringify(voice || "<connection default>")}, textHash=${hashMessageContent(text)}, chars=${text.length}.`
+              );
+              return synthesizeVoiceSegment(
+                connectionId,
+                text,
+                voice,
+                preferences.speed,
+                synthesisController.signal,
+                sharedSynthesisPacer,
+                rateLimitBudget,
+                connectionVoiceGates.get(connectionId) ?? (() => {
+                  const gate = new ConnectionVoiceGate();
+                  connectionVoiceGates.set(connectionId, gate);
+                  return gate;
+                })(),
+                (delayMs, cumulativeWaitMs) => {
+                  rateLimitedForRemainder = true;
+                  adaptiveConcurrency = 1;
+                  shortConcurrencyCooldown = 0;
+                  longWindowStreak = 0;
+                  adaptiveSynthesisLimits.set(adaptiveLimitToken, 1);
+                  drainSynthesisQueue();
+                  if (ctx.getActiveChat().chatId === playbackChat.id && (!activePlayback || activePlayback === playback)) {
+                    setStatus(
+                      `Rate limited; resuming in ${Math.max(1, Math.ceil(delayMs / 1e3))}s\u2026 (${Math.ceil(cumulativeWaitMs / 1e3)}s of ${preferences.rateLimitWaitSeconds}s wait budget)`
+                    );
+                  }
+                }
+              );
+            }, activePlayback === playback && !playback.playbackStopped);
+            appendSpeakerDebugLog(
+              `Synthesis request [${index + 1}] completed with voice=${JSON.stringify(plan[index].voice || "<connection default>")} (${segment.data.byteLength} bytes, ${segment.mime}, fingerprint=${segment.fingerprint ?? "<none>"}).`
+            );
+            return { ok: true, segment };
+          } catch (error) {
+            appendSpeakerDebugLog(
+              `Synthesis request [${index + 1}] failed for voice=${JSON.stringify(plan[index].voice || "<connection default>")}: ${error instanceof Error ? error.message : String(error)}`
+            );
+            return { ok: false, error };
+          }
+        };
+        const preparedResolvers = [];
+        const prepared = plan.map(() => new Promise((resolve) => {
+          preparedResolvers.push(resolve);
+        }));
+        const synthesizedIndexes = /* @__PURE__ */ new Set();
+        let playbackCursor = 0;
+        const readySynthesisAhead = () => {
+          let index = playbackCursor;
+          while (synthesizedIndexes.has(index)) index += 1;
+          return index - playbackCursor;
+        };
+        let synthesisCursor = 0;
+        let localSynthesisTasks = 0;
+        const initialAdaptiveState = adaptiveGenerationConcurrency(
+          adaptiveConcurrency,
+          preferences.concurrentGenerations,
+          plan.slice(0, 6).map((segment) => segment.text.length),
+          shortConcurrencyCooldown,
+          longWindowStreak,
+          MAX_CONCURRENT_GENERATIONS,
+          plan.slice(1, 6).filter((segment, index) => segment.voice !== plan[index]?.voice).length
+        );
+        adaptiveConcurrency = bufferAwareGenerationConcurrency(
+          adaptiveConcurrency,
+          preferences.concurrentGenerations,
+          readySynthesisAhead(),
+          preferences.playbackBufferSegments,
+          initialAdaptiveState.concurrency,
+          rateLimitedForRemainder,
+          MAX_CONCURRENT_GENERATIONS
+        );
+        shortConcurrencyCooldown = initialAdaptiveState.shortCooldown;
+        longWindowStreak = initialAdaptiveState.longWindowStreak;
+        adaptiveSynthesisLimits.set(adaptiveLimitToken, adaptiveConcurrency);
+        appendSpeakerDebugLog(
+          `Initial synthesis concurrency=${adaptiveConcurrency}, readyAhead=${readySynthesisAhead()}, bufferTarget=${preferences.playbackBufferSegments}, configuredMax=${preferences.concurrentGenerations}.`
+        );
+        const scheduleSynthesis = () => {
+          while (localSynthesisTasks < adaptiveConcurrency && synthesisCursor < plan.length) {
+            const index = synthesisCursor++;
+            localSynthesisTasks += 1;
+            void prepare(index).then((result) => {
+              if (result.ok) synthesizedIndexes.add(index);
+              preparedResolvers[index](result);
+            }).finally(() => {
+              localSynthesisTasks -= 1;
+              if (!rateLimitedForRemainder) {
+                const nextState = adaptiveGenerationConcurrency(
+                  adaptiveConcurrency,
+                  preferences.concurrentGenerations,
+                  plan.slice(index + 1, Math.min(plan.length, index + 7)).map((segment) => segment.text.length),
+                  shortConcurrencyCooldown,
+                  longWindowStreak,
+                  MAX_CONCURRENT_GENERATIONS,
+                  plan.slice(index + 2, Math.min(plan.length, index + 7)).filter((segment, offset) => segment.voice !== plan[index + 1 + offset]?.voice).length
+                );
+                const previousConcurrency = adaptiveConcurrency;
+                adaptiveConcurrency = bufferAwareGenerationConcurrency(
+                  adaptiveConcurrency,
+                  preferences.concurrentGenerations,
+                  readySynthesisAhead(),
+                  preferences.playbackBufferSegments,
+                  nextState.concurrency,
+                  rateLimitedForRemainder,
+                  MAX_CONCURRENT_GENERATIONS
+                );
+                if (adaptiveConcurrency !== previousConcurrency) {
+                  appendSpeakerDebugLog(
+                    `Synthesis concurrency ${previousConcurrency}->${adaptiveConcurrency} after request ${index + 1}; readyAhead=${readySynthesisAhead()}, bufferTarget=${preferences.playbackBufferSegments}.`
+                  );
+                }
+                shortConcurrencyCooldown = nextState.shortCooldown;
+                longWindowStreak = nextState.longWindowStreak;
+                adaptiveSynthesisLimits.set(adaptiveLimitToken, adaptiveConcurrency);
+                drainSynthesisQueue();
+              }
+              scheduleSynthesis();
+            });
+          }
+        };
+        scheduleSynthesis();
+        void Promise.all(prepared).finally(() => {
+          adaptiveSynthesisLimits.delete(adaptiveLimitToken);
+          drainSynthesisQueue();
+        });
+        const normalizationContext = new contextClass();
+        const voiceLoudnessProfiles = /* @__PURE__ */ new Map();
+        let normalizationChain = Promise.resolve();
+        const processed = prepared.map((pending, index) => {
+          const processing = normalizationChain.then(async () => {
+            const result = await pending;
+            if (!result.ok) return result;
+            const decodedBuffer = await normalizationContext.decodeAudioData(result.segment.data.slice(0));
+            const voiceKey = plan[index].voice.trim().toLowerCase() || "__connection-default__";
+            const normalizationGain = normalizedVoiceGain(decodedBuffer, voiceKey, voiceLoudnessProfiles);
+            return {
+              ok: true,
+              segment: { ...result.segment, decodedBuffer, normalizationGain }
+            };
+          });
+          normalizationChain = processing.then(() => void 0, () => void 0);
+          return processing;
+        });
+        void Promise.all(processed).finally(() => normalizationContext.close().catch(() => void 0)).catch(() => void 0);
+        if (shouldPersistMessageAudio(
+          message.is_user,
+          preferences.saveGeneratedAudio,
+          regeneratingSavedAudio
+        )) {
+          playback.persistenceState = "pending";
+          void Promise.all(processed).then(async (results) => {
+            const failed = results.find((result) => !result.ok);
+            if (failed) throw failed.error;
+            const captured = results.filter(
+              (result) => result.ok
+            ).map((result) => ({
+              data: result.segment.data.slice(0),
+              mime: result.segment.mime,
+              decodedBuffer: result.segment.decodedBuffer,
+              normalizationGain: result.segment.normalizationGain
+            }));
+            const saved = await persistCapturedAudio(
+              playbackChat.id,
+              messageId,
+              message.swipe_id,
+              captured,
+              contextClass,
+              synthesisController.signal,
+              () => playback.audibleDone,
+              (normalized) => {
+                if (ctx.getActiveChat().chatId === playbackChat.id && (!activePlayback || activePlayback === playback)) {
+                  setStatus(normalized ? "Preparing normalized saved audio\u2026" : "Server could not combine the source audio; retrying as WAV\u2026");
                 }
               }
             );
-          }, activePlayback === playback && !playback.playbackStopped);
-          appendSpeakerDebugLog(
-            `Synthesis request [${index + 1}] completed with voice=${JSON.stringify(plan[index].voice || "<connection default>")} (${segment.data.byteLength} bytes, ${segment.mime}, fingerprint=${segment.fingerprint ?? "<none>"}).`
-          );
-          return { ok: true, segment };
-        } catch (error) {
-          appendSpeakerDebugLog(
-            `Synthesis request [${index + 1}] failed for voice=${JSON.stringify(plan[index].voice || "<connection default>")}: ${error instanceof Error ? error.message : String(error)}`
-          );
-          return { ok: false, error };
-        }
-      };
-      const preparedResolvers = [];
-      const prepared = plan.map(() => new Promise((resolve) => {
-        preparedResolvers.push(resolve);
-      }));
-      const synthesizedIndexes = /* @__PURE__ */ new Set();
-      let playbackCursor = 0;
-      const readySynthesisAhead = () => {
-        let index = playbackCursor;
-        while (synthesizedIndexes.has(index)) index += 1;
-        return index - playbackCursor;
-      };
-      let synthesisCursor = 0;
-      let localSynthesisTasks = 0;
-      const initialAdaptiveState = adaptiveGenerationConcurrency(
-        adaptiveConcurrency,
-        preferences.concurrentGenerations,
-        plan.slice(0, 6).map((segment) => segment.text.length),
-        shortConcurrencyCooldown,
-        longWindowStreak,
-        MAX_CONCURRENT_GENERATIONS,
-        plan.slice(1, 6).filter((segment, index) => segment.voice !== plan[index]?.voice).length
-      );
-      adaptiveConcurrency = bufferAwareGenerationConcurrency(
-        adaptiveConcurrency,
-        preferences.concurrentGenerations,
-        readySynthesisAhead(),
-        preferences.playbackBufferSegments,
-        initialAdaptiveState.concurrency,
-        rateLimitedForRemainder,
-        MAX_CONCURRENT_GENERATIONS
-      );
-      shortConcurrencyCooldown = initialAdaptiveState.shortCooldown;
-      longWindowStreak = initialAdaptiveState.longWindowStreak;
-      adaptiveSynthesisLimits.set(adaptiveLimitToken, adaptiveConcurrency);
-      appendSpeakerDebugLog(
-        `Initial synthesis concurrency=${adaptiveConcurrency}, readyAhead=${readySynthesisAhead()}, bufferTarget=${preferences.playbackBufferSegments}, configuredMax=${preferences.concurrentGenerations}.`
-      );
-      const scheduleSynthesis = () => {
-        while (localSynthesisTasks < adaptiveConcurrency && synthesisCursor < plan.length) {
-          const index = synthesisCursor++;
-          localSynthesisTasks += 1;
-          void prepare(index).then((result) => {
-            if (result.ok) synthesizedIndexes.add(index);
-            preparedResolvers[index](result);
-          }).finally(() => {
-            localSynthesisTasks -= 1;
-            if (!rateLimitedForRemainder) {
-              const nextState = adaptiveGenerationConcurrency(
-                adaptiveConcurrency,
-                preferences.concurrentGenerations,
-                plan.slice(index + 1, Math.min(plan.length, index + 7)).map((segment) => segment.text.length),
-                shortConcurrencyCooldown,
-                longWindowStreak,
-                MAX_CONCURRENT_GENERATIONS,
-                plan.slice(index + 2, Math.min(plan.length, index + 7)).filter((segment, offset) => segment.voice !== plan[index + 1 + offset]?.voice).length
-              );
-              const previousConcurrency = adaptiveConcurrency;
-              adaptiveConcurrency = bufferAwareGenerationConcurrency(
-                adaptiveConcurrency,
-                preferences.concurrentGenerations,
-                readySynthesisAhead(),
-                preferences.playbackBufferSegments,
-                nextState.concurrency,
-                rateLimitedForRemainder,
-                MAX_CONCURRENT_GENERATIONS
-              );
-              if (adaptiveConcurrency !== previousConcurrency) {
-                appendSpeakerDebugLog(
-                  `Synthesis concurrency ${previousConcurrency}->${adaptiveConcurrency} after request ${index + 1}; readyAhead=${readySynthesisAhead()}, bufferTarget=${preferences.playbackBufferSegments}.`
-                );
+            const savedAudioId = saved.audio?.id;
+            if (savedAudioId) {
+              try {
+                await enforceSavedAudioRetention({
+                  chatId: playbackChat.id,
+                  messageId,
+                  audioId: savedAudioId,
+                  swipeId: saved.swipe_id ?? message.swipe_id ?? 0,
+                  savedAt: Date.now()
+                });
+              } catch (error) {
+                console.warn("[Chat Voice] Saved audio retention cleanup failed.", error);
               }
-              shortConcurrencyCooldown = nextState.shortCooldown;
-              longWindowStreak = nextState.longWindowStreak;
+            }
+            playback.persistenceState = "saved";
+            console.info("[Chat Voice] Saved generated message audio.", {
+              messageId,
+              swipeId: saved.swipe_id,
+              audioId: saved.audio?.id,
+              mime: saved.audio?.mime_type,
+              sizeBytes: saved.audio?.size_bytes,
+              muxedWithFfmpeg: saved.muxed_with_ffmpeg
+            });
+            if (ctx.getActiveChat().chatId === playbackChat.id && (!activePlayback || activePlayback === playback)) {
+              if (playback.playbackStopped) setStatus("Playback stopped; audio saved.", "saved");
+              else if (playback.playbackFinished) setStatus("Playback complete and audio saved.", "saved");
+            }
+          }).catch((error) => {
+            playback.persistenceState = "failed";
+            playback.persistenceError = error instanceof Error ? error.message : "Unknown save error.";
+            if (error?.name !== "AbortError" && ctx.getActiveChat().chatId === playbackChat.id && (!activePlayback || activePlayback === playback) && (playback.playbackStopped || playback.playbackFinished)) {
+              setStatus(`Audio could not be saved: ${playback.persistenceError}`, "error");
+            }
+          }).finally(() => {
+            backgroundSynthesisControllers.delete(synthesisController);
+            if (backgroundSynthesisByMessage.get(synthesisMessageKey) === synthesisController) {
+              backgroundSynthesisByMessage.delete(synthesisMessageKey);
+            }
+          });
+        } else {
+          playback.persistenceState = "disabled";
+          void Promise.all(processed).catch(() => void 0).finally(() => {
+            backgroundSynthesisControllers.delete(synthesisController);
+            if (backgroundSynthesisByMessage.get(synthesisMessageKey) === synthesisController) {
+              backgroundSynthesisByMessage.delete(synthesisMessageKey);
+            }
+          });
+        }
+        const initialBufferSize = Math.min(preferences.playbackBufferSegments, plan.length);
+        setStatus(
+          `Buffering ${initialBufferSize} voice segment${initialBufferSize === 1 ? "" : "s"} before playback\u2026`
+        );
+        await Promise.all(processed.slice(0, initialBufferSize));
+        for (let index = 0; index < plan.length; index += 1) {
+          const current = await processed[index];
+          if (!current.ok) throw current.error;
+          playbackCursor = index + 1;
+          if (synthesisCursor < plan.length || localSynthesisTasks > 0) {
+            const pressuredConcurrency = bufferAwareGenerationConcurrency(
+              adaptiveConcurrency,
+              preferences.concurrentGenerations,
+              readySynthesisAhead(),
+              preferences.playbackBufferSegments,
+              adaptiveConcurrency,
+              rateLimitedForRemainder,
+              MAX_CONCURRENT_GENERATIONS
+            );
+            if (pressuredConcurrency !== adaptiveConcurrency) {
+              appendSpeakerDebugLog(
+                `Synthesis concurrency ${adaptiveConcurrency}->${pressuredConcurrency} at playback ${index + 1}; readyAhead=${readySynthesisAhead()}, bufferTarget=${preferences.playbackBufferSegments}.`
+              );
+              adaptiveConcurrency = pressuredConcurrency;
               adaptiveSynthesisLimits.set(adaptiveLimitToken, adaptiveConcurrency);
               drainSynthesisQueue();
+              scheduleSynthesis();
             }
-            scheduleSynthesis();
-          });
+          }
+          appendSpeakerDebugLog(
+            `Playback [${index + 1}] using voice=${JSON.stringify(plan[index].voice || "<connection default>")}.`
+          );
+          if (index === 0) appendSpeakerDebugLog(`Time from playback setup to first audio dispatch: ${Date.now() - playbackSetupFinishedAt}ms (includes speaker review, tag placement and buffering).`);
+          setStatus(`Playing ${index + 1} of ${plan.length} voice segment${plan.length === 1 ? "" : "s"}\u2026`);
+          await playDecodedBuffer(playback, current.segment, preferences.volume);
         }
-      };
-      scheduleSynthesis();
-      void Promise.all(prepared).finally(() => {
         adaptiveSynthesisLimits.delete(adaptiveLimitToken);
         drainSynthesisQueue();
-      });
-      const normalizationContext = new contextClass();
-      const voiceLoudnessProfiles = /* @__PURE__ */ new Map();
-      let normalizationChain = Promise.resolve();
-      const processed = prepared.map((pending, index) => {
-        const processing = normalizationChain.then(async () => {
-          const result = await pending;
-          if (!result.ok) return result;
-          const decodedBuffer = await normalizationContext.decodeAudioData(result.segment.data.slice(0));
-          const voiceKey = plan[index].voice.trim().toLowerCase() || "__connection-default__";
-          const normalizationGain = normalizedVoiceGain(decodedBuffer, voiceKey, voiceLoudnessProfiles);
-          return {
-            ok: true,
-            segment: { ...result.segment, decodedBuffer, normalizationGain }
-          };
-        });
-        normalizationChain = processing.then(() => void 0, () => void 0);
-        return processing;
-      });
-      void Promise.all(processed).finally(() => normalizationContext.close().catch(() => void 0)).catch(() => void 0);
-      if (shouldPersistMessageAudio(
-        message.is_user,
-        preferences.saveGeneratedAudio,
-        regeneratingSavedAudio
-      )) {
-        playback.persistenceState = "pending";
-        void Promise.all(processed).then(async (results) => {
-          const failed = results.find((result) => !result.ok);
-          if (failed) throw failed.error;
-          const captured = results.filter(
-            (result) => result.ok
-          ).map((result) => ({
-            data: result.segment.data.slice(0),
-            mime: result.segment.mime,
-            decodedBuffer: result.segment.decodedBuffer,
-            normalizationGain: result.segment.normalizationGain
-          }));
-          const saved = await persistCapturedAudio(
-            playbackChat.id,
-            messageId,
-            message.swipe_id,
-            captured,
-            contextClass,
-            synthesisController.signal,
-            () => playback.audibleDone,
-            (normalized) => {
-              if (ctx.getActiveChat().chatId === playbackChat.id && (!activePlayback || activePlayback === playback)) {
-                setStatus(normalized ? "Preparing normalized saved audio\u2026" : "Server could not combine the source audio; retrying as WAV\u2026");
-              }
-            }
-          );
-          const savedAudioId = saved.audio?.id;
-          if (savedAudioId) {
-            try {
-              await enforceSavedAudioRetention({
-                chatId: playbackChat.id,
-                messageId,
-                audioId: savedAudioId,
-                swipeId: saved.swipe_id ?? message.swipe_id ?? 0,
-                savedAt: Date.now()
-              });
-            } catch (error) {
-              console.warn("[Chat Voice] Saved audio retention cleanup failed.", error);
-            }
-          }
-          playback.persistenceState = "saved";
-          console.info("[Chat Voice] Saved generated message audio.", {
-            messageId,
-            swipeId: saved.swipe_id,
-            audioId: saved.audio?.id,
-            mime: saved.audio?.mime_type,
-            sizeBytes: saved.audio?.size_bytes,
-            muxedWithFfmpeg: saved.muxed_with_ffmpeg
-          });
-          if (ctx.getActiveChat().chatId === playbackChat.id && (!activePlayback || activePlayback === playback)) {
-            if (playback.playbackStopped) setStatus("Playback stopped; audio saved.", "saved");
-            else if (playback.playbackFinished) setStatus("Playback complete and audio saved.", "saved");
-          }
-        }).catch((error) => {
-          playback.persistenceState = "failed";
-          playback.persistenceError = error instanceof Error ? error.message : "Unknown save error.";
-          if (error?.name !== "AbortError" && ctx.getActiveChat().chatId === playbackChat.id && (!activePlayback || activePlayback === playback) && (playback.playbackStopped || playback.playbackFinished)) {
-            setStatus(`Audio could not be saved: ${playback.persistenceError}`, "error");
-          }
-        }).finally(() => {
-          backgroundSynthesisControllers.delete(synthesisController);
-          if (backgroundSynthesisByMessage.get(synthesisMessageKey) === synthesisController) {
-            backgroundSynthesisByMessage.delete(synthesisMessageKey);
-          }
-        });
-      } else {
-        playback.persistenceState = "disabled";
-        void Promise.all(processed).catch(() => void 0).finally(() => {
-          backgroundSynthesisControllers.delete(synthesisController);
-          if (backgroundSynthesisByMessage.get(synthesisMessageKey) === synthesisController) {
-            backgroundSynthesisByMessage.delete(synthesisMessageKey);
-          }
-        });
-      }
-      const initialBufferSize = Math.min(preferences.playbackBufferSegments, plan.length);
-      setStatus(
-        `Buffering ${initialBufferSize} voice segment${initialBufferSize === 1 ? "" : "s"} before playback\u2026`
-      );
-      await Promise.all(processed.slice(0, initialBufferSize));
-      for (let index = 0; index < plan.length; index += 1) {
-        const current = await processed[index];
-        if (!current.ok) throw current.error;
-        playbackCursor = index + 1;
-        if (synthesisCursor < plan.length || localSynthesisTasks > 0) {
-          const pressuredConcurrency = bufferAwareGenerationConcurrency(
-            adaptiveConcurrency,
-            preferences.concurrentGenerations,
-            readySynthesisAhead(),
-            preferences.playbackBufferSegments,
-            adaptiveConcurrency,
-            rateLimitedForRemainder,
-            MAX_CONCURRENT_GENERATIONS
-          );
-          if (pressuredConcurrency !== adaptiveConcurrency) {
-            appendSpeakerDebugLog(
-              `Synthesis concurrency ${adaptiveConcurrency}->${pressuredConcurrency} at playback ${index + 1}; readyAhead=${readySynthesisAhead()}, bufferTarget=${preferences.playbackBufferSegments}.`
-            );
-            adaptiveConcurrency = pressuredConcurrency;
-            adaptiveSynthesisLimits.set(adaptiveLimitToken, adaptiveConcurrency);
-            drainSynthesisQueue();
-            scheduleSynthesis();
-          }
+        playback.playbackFinished = true;
+        playback.finishAudible();
+        if (activePlayback === playback) {
+          activePlayback = null;
+          updatePlaybackButtons();
+          await playback.context.close().catch(() => void 0);
         }
-        appendSpeakerDebugLog(
-          `Playback [${index + 1}] using voice=${JSON.stringify(plan[index].voice || "<connection default>")}.`
-        );
-        if (index === 0) appendSpeakerDebugLog(`Time from playback setup to first audio dispatch: ${Date.now() - playbackSetupFinishedAt}ms (includes speaker review, tag placement and buffering).`);
-        setStatus(`Playing ${index + 1} of ${plan.length} voice segment${plan.length === 1 ? "" : "s"}\u2026`);
-        await playDecodedBuffer(playback, current.segment, preferences.volume);
-      }
-      adaptiveSynthesisLimits.delete(adaptiveLimitToken);
-      drainSynthesisQueue();
-      playback.playbackFinished = true;
-      playback.finishAudible();
-      if (activePlayback === playback) {
-        activePlayback = null;
-        updatePlaybackButtons();
-        await playback.context.close().catch(() => void 0);
-      }
-      const persistenceState = playback.persistenceState;
-      if (persistenceState === "saved") setStatus("Playback complete and audio saved.", "saved");
-      else if (persistenceState === "failed") {
-        setStatus(`Playback completed, but its audio could not be saved: ${playback.persistenceError}`, "error");
-      } else if (persistenceState === "pending") setStatus("Playback complete; finishing saved audio\u2026");
-      else setStatus("Playback complete.", "saved");
-    } catch (error) {
-      if (error?.name !== "AbortError") {
-        setStatus(error instanceof Error ? error.message : "Custom voice playback failed.", "error");
+        const persistenceState = playback.persistenceState;
+        if (persistenceState === "saved") setStatus("Playback complete and audio saved.", "saved");
+        else if (persistenceState === "failed") {
+          setStatus(`Playback completed, but its audio could not be saved: ${playback.persistenceError}`, "error");
+        } else if (persistenceState === "pending") setStatus("Playback complete; finishing saved audio\u2026");
+        else setStatus("Playback complete.", "saved");
+      } catch (error) {
+        if (error?.name !== "AbortError") {
+          setStatus(error instanceof Error ? error.message : "Custom voice playback failed.", "error");
+        }
+      } finally {
+        playback.finishAudible();
+        if (activePlayback === playback) {
+          activePlayback = null;
+          await playback.context.close().catch(() => void 0);
+          updatePlaybackButtons();
+        }
       }
     } finally {
-      playback.finishAudible();
-      if (activePlayback === playback) {
-        activePlayback = null;
-        await playback.context.close().catch(() => void 0);
-        updatePlaybackButtons();
-      }
+      playbackStartup.finish(startupToken);
     }
   }
   function scanMessages() {
@@ -5527,6 +5576,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
   }
   function onAutoPlaybackChanged() {
     autoPlayback = autoPlaybackToggle.checked;
+    if (!autoPlayback) playbackStartup.cancelAutomatic();
     autoPlaybackEpoch += 1;
     updatePlaybackButtons();
     scheduleAdvancedSettingsSave();
@@ -5955,6 +6005,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
   const unsubscribeChatSwitched = ctx.events.on("CHAT_SWITCHED", (rawPayload) => {
     const switchedChatId = rawPayload?.chatId ?? null;
     autoPlaybackEpoch += 1;
+    playbackStartup.cancel();
     hostWindow.requestAnimationFrame(() => {
       if (ctx.getActiveChat().chatId === switchedChatId) refreshLocalState();
     });
@@ -5986,6 +6037,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
   refreshLocalState();
   return () => {
     autoPlaybackDisposed = true;
+    playbackStartup.cancel();
     hostDocument.removeEventListener("pointerdown", closeFavoritePickerOnOutsideClick);
     hostDocument.removeEventListener("keydown", closeFavoritePickerOnEscape);
     stopVoicePreview();

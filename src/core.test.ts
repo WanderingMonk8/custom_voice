@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { PlaybackLongPress, syncAutoplayIndicators, syncPlaybackButtons, type PlaybackButtonState } from './playback-ui'
+import { PlaybackLongPress, PlaybackStartupGuard, syncAutoplayIndicators, syncPlaybackButtons, type PlaybackButtonState } from './playback-ui'
 import { evaluateSpeakerReviews } from './speaker-review-evaluation'
 import {
   adaptiveGenerationConcurrency,
@@ -3250,6 +3250,28 @@ test('automatic casting defaults on and autoplay requires explicit opt-in', () =
   assert.deepEqual(readAutomaticVoicePreferences({}), { autoVoiceCasting: true, autoPlayback: false })
   assert.deepEqual(readAutomaticVoicePreferences({ chatVoiceAutoCasting: false, chatVoiceAutoPlayback: true }), { autoVoiceCasting: false, autoPlayback: true })
   assert.deepEqual(readAutomaticVoicePreferences({ chatVoiceAutoCasting: true, chatVoiceAutoPlayback: 'true' }), { autoVoiceCasting: true, autoPlayback: false })
+})
+
+test('playback startup ownership prevents overlapping and cancelled audio starts', () => {
+  const guard = new PlaybackStartupGuard()
+  const first = guard.begin('chat', 'one', true)!
+  assert.equal(guard.begin('chat', 'one', true), null)
+  assert.equal(guard.owns(first), true)
+  const second = guard.begin('chat', 'two', false)!
+  assert.equal(guard.owns(first), false)
+  assert.equal(guard.owns(second), true)
+  guard.finish(first)
+  assert.equal(guard.owns(second), true)
+  assert.equal(guard.begin('chat', 'two', false), null)
+  assert.equal(guard.owns(second), false)
+  const third = guard.begin('chat', 'three', true)!
+  guard.cancelAutomatic()
+  assert.equal(guard.owns(third), false)
+  const manual = guard.begin('chat', 'four', false)!
+  guard.cancelAutomatic()
+  assert.equal(guard.owns(manual), true)
+  guard.cancel()
+  assert.equal(guard.owns(manual), false)
 })
 
 test('immediate named voice attribution anchors the preceding quote but not an introduced next quote', () => {
