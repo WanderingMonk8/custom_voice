@@ -54,6 +54,13 @@ export function autoplaySwipeMatches(message: { swipe_id?: number; content: stri
   return actual.swipeId === expected.swipeId && actual.contentHash === expected.contentHash
 }
 
+/** Existing audio does not block autoplay; saving is governed separately. */
+export function automaticPlaybackSkipReason(message: { is_user: boolean; swipe_id?: number; content: string }, expected?: { swipeId: number; contentHash: string }): 'user-message' | 'changed-swipe' | null {
+  if (message.is_user) return 'user-message'
+  if (expected && !autoplaySwipeMatches(message, expected)) return 'changed-swipe'
+  return null
+}
+
 /** Preserve explicit casting opt-outs; automatic playback requires an opt-in. */
 export function readAutomaticVoicePreferences(value: Record<string, unknown>) {
   return { autoVoiceCasting: value.chatVoiceAutoCasting !== false, autoPlayback: value.chatVoiceAutoPlayback === true }

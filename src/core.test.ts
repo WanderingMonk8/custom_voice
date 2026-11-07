@@ -37,6 +37,7 @@ import {
   autoplayGenerationEvent,
   autoplaySwipeSnapshot,
   autoplaySwipeMatches,
+  automaticPlaybackSkipReason,
   claimAutoplayGeneration,
   hasAudioForActiveSwipe,
   readAutomaticVoicePreferences,
@@ -3194,6 +3195,18 @@ test('autoplay snapshots the active swipe and detects later navigation or edits'
   assert.equal(autoplaySwipeMatches({ ...message, swipe_id: 5 }, snapshot), false)
   assert.equal(autoplaySwipeMatches({ ...message, content: 'A later reroll in the same slot.' }, snapshot), false)
   assert.equal(autoplaySwipeMatches({ content: 'Original.' }, autoplaySwipeSnapshot({ swipe_id: 0, content: 'Original.' })), true)
+})
+
+test('saved audio does not prevent automatic playback of a valid reroll', () => {
+  const message = { is_user: false, swipe_id: 3, content: 'New response.', extra: { attachments: [{ type: 'audio', swipe_id: 3 }] } }
+  const snapshot = autoplaySwipeSnapshot(message)
+  assert.equal(hasAudioForActiveSwipe(message), true)
+  assert.equal(automaticPlaybackSkipReason(message, snapshot), null)
+  assert.equal(automaticPlaybackSkipReason({ ...message, is_user: true }, snapshot), 'user-message')
+  assert.equal(automaticPlaybackSkipReason({ ...message, swipe_id: 4 }, snapshot), 'changed-swipe')
+  assert.equal(automaticPlaybackSkipReason({ ...message, content: 'Changed response.' }, snapshot), 'changed-swipe')
+  assert.equal(shouldPersistMessageAudio(false, true, false), true)
+  assert.equal(shouldPersistMessageAudio(false, false, false), false)
 })
 
 test('playback controls follow shared playback state, including menus rendered later', () => {

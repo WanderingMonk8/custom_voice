@@ -202,22 +202,17 @@ function claimAutoplayGeneration(event, generations, messages) {
   if (messages.size > 512) messages.delete(messages.values().next().value);
   return true;
 }
-function hasAudioForActiveSwipe(message) {
-  const attachments = message.extra?.attachments;
-  if (!Array.isArray(attachments)) return false;
-  const swipe = message.swipe_id ?? 0;
-  return attachments.some((candidate) => {
-    if (!candidate || typeof candidate !== "object") return false;
-    const attachment = candidate;
-    return attachment.type === "audio" && (attachment.swipe_id ?? 0) === swipe;
-  });
-}
 function autoplaySwipeSnapshot(message) {
   return { swipeId: message.swipe_id ?? 0, contentHash: hashMessageContent(message.content) };
 }
 function autoplaySwipeMatches(message, expected) {
   const actual = autoplaySwipeSnapshot(message);
   return actual.swipeId === expected.swipeId && actual.contentHash === expected.contentHash;
+}
+function automaticPlaybackSkipReason(message, expected) {
+  if (message.is_user) return "user-message";
+  if (expected && !autoplaySwipeMatches(message, expected)) return "changed-swipe";
+  return null;
 }
 function readAutomaticVoicePreferences(value) {
   return { autoVoiceCasting: value.chatVoiceAutoCasting !== false, autoPlayback: value.chatVoiceAutoPlayback === true };
@@ -3854,11 +3849,12 @@ function setup(ctx) {
       await decodeContext.close().catch(() => void 0);
     }
   }
-  async function persistCapturedAudio(chatId, messageId, swipeId, segments, contextClass, signal, waitForSafeFallback, onWavAssembly) {
+  async function persistCapturedAudio(chatId, messageId, swipeId, segments, contextClass, signal, waitForSafeFallback, onWavAssembly, verifyBeforeSave) {
     const normalized = segments.some((segment) => segment.normalizationGain !== void 0);
     if (normalized) {
       onWavAssembly(true);
       const wav = await encodeCapturedWav(segments, contextClass);
+      await verifyBeforeSave?.();
       return saveMessageAudio(
         chatId,
         messageId,
@@ -3868,6 +3864,7 @@ function setup(ctx) {
       );
     }
     try {
+      await verifyBeforeSave?.();
       return await saveMessageAudio(chatId, messageId, swipeId, segments, signal);
     } catch (segmentSaveError) {
       if (segmentSaveError?.name === "AbortError") throw segmentSaveError;
@@ -3875,6 +3872,7 @@ function setup(ctx) {
       if (signal.aborted) throw new DOMException("Audio saving stopped.", "AbortError");
       onWavAssembly(false);
       const wav = await encodeCapturedWav(segments, contextClass);
+      await verifyBeforeSave?.();
       return saveMessageAudio(
         chatId,
         messageId,
@@ -3921,16 +3919,13 @@ function setup(ctx) {
         return;
       }
       if (!ownsStartup()) return;
-      if (automatic && message.is_user) {
+      const automaticSkip = automatic ? automaticPlaybackSkipReason(message, expectedSwipe) : null;
+      if (automaticSkip === "user-message") {
         appendSpeakerDebugLog(`Autoplay skipped: message ${messageId} belongs to the user.`);
         return;
       }
-      if (automatic && hasAudioForActiveSwipe(message)) {
-        appendSpeakerDebugLog(`Autoplay skipped: message ${messageId}, swipe ${message.swipe_id ?? 0}, already has saved audio.`);
-        return;
-      }
-      if (automatic && expectedSwipe && !autoplaySwipeMatches(message, expectedSwipe)) {
-        appendSpeakerDebugLog(`Autoplay skipped: message ${messageId} changed swipe or content after generation (expected swipe ${expectedSwipe.swipeId}, active swipe ${message.swipe_id ?? 0}).`);
+      if (automaticSkip === "changed-swipe") {
+        appendSpeakerDebugLog(`Autoplay skipped: message ${messageId} changed swipe or content after generation (expected swipe ${expectedSwipe?.swipeId ?? "unknown"}, active swipe ${message.swipe_id ?? 0}).`);
         return;
       }
       const regeneratingSavedAudio = !message.is_user && (nativeRegenerationAction || !automatic && hasSavedAudioForCurrentSwipe(message));
@@ -4580,7 +4575,14 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
                 if (ctx.getActiveChat().chatId === playbackChat.id && (!activePlayback || activePlayback === playback)) {
                   setStatus(normalized ? "Preparing normalized saved audio\u2026" : "Server could not combine the source audio; retrying as WAV\u2026");
                 }
-              }
+              },
+              automatic ? async () => {
+                const latest = await requestPlaybackMessage(playbackChat.id, messageId);
+                if (synthesisController.signal.aborted || latest.is_user || !autoplaySwipeMatches(latest, autoplaySwipeSnapshot(message))) {
+                  appendSpeakerDebugLog(`Automatic audio save cancelled: message ${messageId} changed since playback began.`);
+                  throw new DOMException("Message changed before automatic audio save.", "AbortError");
+                }
+              } : void 0
             );
             const savedAudioId = saved.audio?.id;
             if (savedAudioId) {

@@ -22,10 +22,10 @@ import {
   autoplayGenerationEvent,
   autoplaySwipeSnapshot,
   autoplaySwipeMatches,
+  automaticPlaybackSkipReason,
   claimAutoplayGeneration,
   MAX_AUTOPLAY_DELAY_SECONDS,
   readAutoplayDelaySeconds,
-  hasAudioForActiveSwipe,
   readAutomaticVoicePreferences,
   resolveGlobalTtsConnection,
   encodeConcatenatedWav,
@@ -2714,11 +2714,13 @@ export function setup(ctx: SpindleFrontendContext) {
     signal: AbortSignal,
     waitForSafeFallback: () => Promise<void>,
     onWavAssembly: (normalized: boolean) => void,
+    verifyBeforeSave?: () => Promise<void>,
   ): Promise<SavedMessageAudioResult> {
     const normalized = segments.some(segment => segment.normalizationGain !== undefined)
     if (normalized) {
       onWavAssembly(true)
       const wav = await encodeCapturedWav(segments, contextClass)
+      await verifyBeforeSave?.()
       return saveMessageAudio(
         chatId,
         messageId,
@@ -2728,6 +2730,7 @@ export function setup(ctx: SpindleFrontendContext) {
       )
     }
     try {
+      await verifyBeforeSave?.()
       return await saveMessageAudio(chatId, messageId, swipeId, segments, signal)
     } catch (segmentSaveError) {
       if ((segmentSaveError as { name?: string })?.name === 'AbortError') throw segmentSaveError
@@ -2735,6 +2738,7 @@ export function setup(ctx: SpindleFrontendContext) {
       if (signal.aborted) throw new DOMException('Audio saving stopped.', 'AbortError')
       onWavAssembly(false)
       const wav = await encodeCapturedWav(segments, contextClass)
+      await verifyBeforeSave?.()
       return saveMessageAudio(
         chatId,
         messageId,
@@ -2786,10 +2790,10 @@ export function setup(ctx: SpindleFrontendContext) {
       return
     }
     if (!ownsStartup()) return
-    if (automatic && message.is_user) { appendSpeakerDebugLog(`Autoplay skipped: message ${messageId} belongs to the user.`); return }
-    if (automatic && hasAudioForActiveSwipe(message)) { appendSpeakerDebugLog(`Autoplay skipped: message ${messageId}, swipe ${message.swipe_id ?? 0}, already has saved audio.`); return }
-    if (automatic && expectedSwipe && !autoplaySwipeMatches(message, expectedSwipe)) {
-      appendSpeakerDebugLog(`Autoplay skipped: message ${messageId} changed swipe or content after generation (expected swipe ${expectedSwipe.swipeId}, active swipe ${message.swipe_id ?? 0}).`)
+    const automaticSkip = automatic ? automaticPlaybackSkipReason(message, expectedSwipe) : null
+    if (automaticSkip === 'user-message') { appendSpeakerDebugLog(`Autoplay skipped: message ${messageId} belongs to the user.`); return }
+    if (automaticSkip === 'changed-swipe') {
+      appendSpeakerDebugLog(`Autoplay skipped: message ${messageId} changed swipe or content after generation (expected swipe ${expectedSwipe?.swipeId ?? 'unknown'}, active swipe ${message.swipe_id ?? 0}).`)
       return
     }
 
@@ -3581,6 +3585,13 @@ export function setup(ctx: SpindleFrontendContext) {
                   : 'Server could not combine the source audio; retrying as WAV…')
               }
             },
+            automatic ? async () => {
+              const latest = await requestPlaybackMessage(playbackChat.id, messageId)
+              if (synthesisController.signal.aborted || latest.is_user || !autoplaySwipeMatches(latest, autoplaySwipeSnapshot(message))) {
+                appendSpeakerDebugLog(`Automatic audio save cancelled: message ${messageId} changed since playback began.`)
+                throw new DOMException('Message changed before automatic audio save.', 'AbortError')
+              }
+            } : undefined,
           )
           const savedAudioId = saved.audio?.id
           if (savedAudioId) {
