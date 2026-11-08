@@ -2112,19 +2112,16 @@ test('treats a repeated specific unnamed label as a voice match and ignores broa
   assert.equal(broadAssigned.some(assignment => assignment.ghostId === 'ghost-woman'), false)
 })
 
-test('an unnamed speaker takes the name addressed in the next quote, not in their own', () => {
-  const ghost = { id: 'ghost-ellis', speakerId: 'unconfigured:ellis', voiceId: 'voice-ellis', label: 'Ellis', aliases: ['Ellis'], context: 'A man stands by the gate.', occurrenceKeys: [], lastSeenMessageId: 'assistant-0' }
+test('an unnamed speaker takes the name addressed in the preceding quote by someone else', () => {
   const segments = [
-    { text: 'Gate is shut.', speakerId: UNCAST_SPEAKER_ID },
-    { text: 'Leave it, Ellis. Come away.', speakerId: 'unconfigured:hallie' },
+    { text: 'Leave it, Ellis.', speakerId: 'unconfigured:hallie' },
+    { text: 'Not yet.', speakerId: UNCAST_SPEAKER_ID },
   ] as PlaybackSegment[]
   const groups = collectUncastVoiceGroups(segments)
-  assert.equal(groups[0].addressee, 'ellis')
-  assert.equal(groups[1]?.addressee, undefined)
-  const message = 'A man stands by the gate. "Gate is shut." "Leave it, Ellis. Come away."'
-  const labels = uncastIdentityLabels(message, [])
-  assert.ok(groupLabelOptions(groups[0], labels).includes('ellis'))
-  assert.ok(!labels.includes('ellis'))
+  assert.equal(groups[0].addressee, undefined)
+  assert.equal(groups[1].addressee, 'ellis')
+  assert.ok(groupLabelOptions(groups[1], ['hallie']).includes('ellis'))
+  assert.ok(!groupLabelOptions(groups[0], ['hallie']).includes('ellis'))
 })
 
 test('links separate same-character runs to one ghost voice and gathers their local context', () => {

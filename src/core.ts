@@ -308,7 +308,7 @@ export function collectUncastVoiceGroups(segments: PlaybackSegment[]): UncastVoi
       segments[index + 1]?.speakerId === null ? segments[index + 1].text : ''].filter(Boolean).join(' ').slice(0, 2_000))
   }
   for (const group of groups) {
-    const addressee = addressedNameAfterGroup(group, segments)
+    const addressee = addressedNameBeforeGroup(group, segments)
     if (addressee) group.addressee = addressee
   }
   return groups
@@ -341,11 +341,12 @@ const UNCAST_VOCATIVE_STOPWORDS = new Set(['okay', 'yeah', 'yes', 'hello', 'hey'
  * candidate for that group: the next speaker is talking to the group's speaker.
  * It is only a candidate; the label question decides whether it identifies them.
  */
-export function addressedNameAfterGroup(group: UncastVoiceGroup, segments: PlaybackSegment[]): string {
-  const last = Math.max(...group.segmentIndexes)
-  const next = segments.slice(last + 1).find(segment => segment.speakerId !== null)
-  if (!next || next.speakerId === group.speakerId) return ''
-  for (const vocative of next.text.matchAll(/(?:^|,\s*)([A-Z][a-z]{2,})\s*[.!?,]/gu)) {
+export function addressedNameBeforeGroup(group: UncastVoiceGroup, segments: PlaybackSegment[]): string {
+  if (group.speakerId !== UNCAST_SPEAKER_ID) return ''
+  const first = Math.min(...group.segmentIndexes)
+  const previous = segments.slice(0, first).reverse().find(segment => segment.speakerId !== null && segment.speakerId !== UNCAST_SPEAKER_ID)
+  if (!previous) return ''
+  for (const vocative of previous.text.matchAll(/(?:^|,\s*)([A-Z][a-z]{2,})\s*[.!?,]/gu)) {
     const name = vocative[1].toLowerCase()
     if (!UNCAST_VOCATIVE_STOPWORDS.has(name)) return name
   }
