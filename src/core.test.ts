@@ -2133,6 +2133,15 @@ test('a name invoked by another speaker boosts the same-person link between the 
   assert.deepEqual(first.flankPartners, [second.id])
 })
 
+test('mutually invoked unnamed-speaker pairs share one voice', () => {
+  const hallie = { id: 'g0', speakerId: 'unconfigured:hallie', segmentIndexes: [0], speeches: ['Leave it, Ellis.'], context: [], addressee: 'ellis' }
+  const ellis = { id: 'g1', speakerId: 'unconfigured:ellis', segmentIndexes: [2], speeches: ['Not yet, Hallie.'], context: [], addressee: 'hallie' }
+  const voices = readFavoriteVoices([{ id: 'voice-1', description: 'friendly and warm' }])
+  const assigned = resolveUncastVoiceDecisions([hallie, ellis], voices, { voice_g0: confidentDecision('voice_0') }, [], [], 'later', 'Leave it, Ellis. Not yet, Hallie.')
+  assert.deepEqual(assigned.map(item => item.voiceId), ['voice-1', 'voice-1'])
+  assert.equal(assigned[0].ghostId, assigned[1].ghostId)
+})
+
 test('an unnamed speaker takes the name addressed in the preceding quote by someone else', () => {
   const segments = [
     { text: 'Leave it, Ellis.', speakerId: 'unconfigured:hallie' },

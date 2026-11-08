@@ -667,6 +667,7 @@ export function resolveUncastVoiceDecisions(
     const label = labelIndex && labelAnswer && labelAnswer.confidence >= 0.7 && labelProbability >= 0.7 && labelProbability - labelRunnerUp >= 0.25 ? groupLabelOptions(group, labels)[Number(labelIndex[1])] : undefined
     if (label) groupLabels.set(group.id, label)
     const previousGroups = groups.slice(0, groups.indexOf(group)).slice(-8)
+    const mutualPrevious = previousGroups.find(previous => mutuallyInvoked(group, previous, answers, message))
     const same = previousGroups.flatMap(previous => {
       const previousName = revealedUncastName(previous, answers, message).toLowerCase()
       if (name && previousName && name !== previousName) return []
@@ -676,6 +677,7 @@ export function resolveUncastVoiceDecisions(
       return (answer?.choice === 'same' && strongChoice(answer)) || boosted ? [{ previous, probability: answer?.probabilities.same ?? 0 }] : []
     }).sort((a, b) => b.probability - a.probability)
     if (same[0]) root = roots.get(same[0].previous.id) ?? root
+    else if (mutualPrevious) root = roots.get(mutualPrevious.id) ?? root
     else if (label && !isBroadPersonLabel(label) && rootByLabel.has(label)) root = rootByLabel.get(label)!
     else if (strongChoice(identity) && identity?.choice.startsWith('group_')) root = roots.get(identity.choice.slice(6)) ?? root
     else if (name && rootByRevealedName.has(name)) {
@@ -683,7 +685,7 @@ export function resolveUncastVoiceDecisions(
       const contradicts = previousGroups.some(previous => roots.get(previous.id) === namedRoot && answers[`same_${group.id}_${previous.id}`]?.choice === 'different_or_unclear' && strongChoice(answers[`same_${group.id}_${previous.id}`]))
       if (!contradicts) root = namedRoot
     }
-    if (name && previousGroups.some(previous => roots.get(previous.id) === root && revealedUncastName(previous, answers, message) && revealedUncastName(previous, answers, message).toLowerCase() !== name)) root = group.id
+    if (name && !mutualPrevious && previousGroups.some(previous => roots.get(previous.id) === root && revealedUncastName(previous, answers, message) && revealedUncastName(previous, answers, message).toLowerCase() !== name)) root = group.id
     const namedGhosts = label && !isBroadPersonLabel(label) ? ghosts.filter(item => (!confirmedNew || item.id !== occurrence?.id) && ghostCastAliases(item).some(alias => alias.toLowerCase() === label)) : []
     const rankedGhosts = namedGhosts.map(item => ({ item, recent: Math.max(
       previousMessageIds.indexOf(item.lastSeenMessageId),
