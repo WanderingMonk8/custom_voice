@@ -84,6 +84,7 @@ import {
   purgeExpiredGhostContexts,
   markGhostVoiceInvoked,
   collectUncastVoiceGroups,
+  countSpeechVoices,
   ghostCastAliases,
   updateGhostConversationHistory,
   uncastIdentityLabels,
@@ -2135,13 +2136,14 @@ test('a name invoked by another speaker boosts the same-person link between the 
   assert.deepEqual(first.flankPartners, [second.id])
 })
 
-test('mutually invoked unnamed-speaker pairs share one voice', () => {
+test('mutually invoked unnamed-speaker pairs establish distinct named voices', () => {
   const hallie = { id: 'g0', speakerId: 'unconfigured:hallie', segmentIndexes: [0], speeches: ['Leave it, Ellis.'], context: [], addressee: 'ellis' }
   const ellis = { id: 'g1', speakerId: 'unconfigured:ellis', segmentIndexes: [2], speeches: ['Not yet, Hallie.'], context: [], addressee: 'hallie' }
-  const voices = readFavoriteVoices([{ id: 'voice-1', description: 'friendly and warm' }])
-  const assigned = resolveUncastVoiceDecisions([hallie, ellis], voices, { voice_g0: confidentDecision('voice_0') }, [], [], 'later', 'Leave it, Ellis. Not yet, Hallie.')
-  assert.deepEqual(assigned.map(item => item.voiceId), ['voice-1', 'voice-1'])
-  assert.equal(assigned[0].ghostId, assigned[1].ghostId)
+  const voices = readFavoriteVoices([{ id: 'voice-1', description: 'friendly and warm' }, { id: 'voice-2', description: 'warm female' }])
+  const assigned = resolveUncastVoiceDecisions([hallie, ellis], voices, { voice_g0: confidentDecision('voice_0'), voice_g1: confidentDecision('voice_1') }, [], [], 'later', 'Leave it, Ellis. Not yet, Hallie.')
+  assert.deepEqual(assigned.map(item => item.voiceId), ['voice-1', 'voice-2'])
+  assert.notEqual(assigned[0].ghostId, assigned[1].ghostId)
+  assert.deepEqual(assigned.map(item => item.aliases), [['hallie'], ['ellis']])
 })
 
 test('vocativeNames counts only true invocations, not mentions', () => {
@@ -2150,6 +2152,75 @@ test('vocativeNames counts only true invocations, not mentions', () => {
   assert.deepEqual(vocativeNames('No, keep your eyes on B!'), [])
   assert.deepEqual(vocativeNames('Hey, Ellis is watching!'), [])
   assert.deepEqual(vocativeNames("Ellis's gone."), [])
+  assert.deepEqual(vocativeNames("Somebody's in there, Hallie."), ['hallie'])
+})
+
+test('a three-voice message where two unnamed speakers invoke each other names both temp voices', () => {
+  const segments = [
+    { text: "Towel's done,", speakerId: 'npc:elena' },
+    { text: "Gate's shut — look at it, that's been shut today. Somebody's in there, Hallie.", speakerId: UNCAST_SPEAKER_ID },
+    { text: "Don't open that door,", speakerId: 'npc:elena' },
+    { text: "Leave it, Ellis. There's one right there, a walker — leave it and come away.", speakerId: UNCAST_SPEAKER_ID },
+  ] as PlaybackSegment[]
+  const groups = collectUncastVoiceGroups(segments)
+  assert.equal(groups.length, 2)
+  assert.equal(countSpeechVoices(segments, groups), 3)
+  assert.equal(groups[0].inferredName, 'ellis')
+  assert.equal(groups[1].inferredName, 'hallie')
+  assert.equal(groups[0].addressee, 'ellis')
+  assert.equal(groups[1].addressee, 'hallie')
+  const voices = readFavoriteVoices([{ id: 'voice-1', description: 'warm' }, { id: 'voice-2', description: 'warm' }])
+  const assigned = resolveUncastVoiceDecisions(groups, voices, {
+    voice_g0: confidentDecision('voice_0'), voice_g1: confidentDecision('voice_1'),
+    gender_g0: confidentDecision('male'), gender_g1: confidentDecision('female'),
+  }, [], [], 'first', 'Gate. Hallie. Ellis.')
+  assert.deepEqual(assigned.map(item => item.voiceId).sort(), ['voice-1', 'voice-2'])
+  assert.notEqual(assigned[0].ghostId, assigned[1].ghostId)
+  assert.deepEqual(assigned.map(item => item.aliases?.[0]).sort(), ['ellis', 'hallie'])
+})
+
+test('mutual naming assigns only the invoking pair when other unnamed voices stay unnamed', () => {
+  const segments = [
+    { text: "Gate's shut. Somebody's in there, Hallie.", speakerId: UNCAST_SPEAKER_ID },
+    { text: 'Hello.', speakerId: 'npc:elena' },
+    { text: 'Hello.', speakerId: UNCAST_SPEAKER_ID },
+    { text: 'Hello.', speakerId: 'npc:elena' },
+    { text: "Leave it, Ellis.", speakerId: UNCAST_SPEAKER_ID },
+    { text: 'Hello.', speakerId: 'npc:elena' },
+    { text: 'Hello again.', speakerId: UNCAST_SPEAKER_ID },
+  ] as PlaybackSegment[]
+  const groups = collectUncastVoiceGroups(segments)
+  // Four unnamed groups: only the two trailing-comma invocations are the pair.
+  assert.equal(groups.length, 4)
+  const invoking = groups.filter(group => group.inferredName)
+  assert.equal(invoking.length, 2)
+  assert.deepEqual(invoking.map(group => group.inferredName).sort(), ['ellis', 'hallie'])
+  assert.equal(countSpeechVoices(segments, groups), 5)
+})
+
+test('mutual naming needs a unique invoking pair', () => {
+  const segments = [
+    { text: "Somebody's in there, Hallie.", speakerId: UNCAST_SPEAKER_ID },
+    { text: 'Hello.', speakerId: 'npc:elena' },
+    { text: "Leave it, Ellis.", speakerId: UNCAST_SPEAKER_ID },
+    { text: 'Hello.', speakerId: 'npc:elena' },
+    { text: "Somebody's in there, Ken.", speakerId: UNCAST_SPEAKER_ID },
+    { text: 'Hello.', speakerId: 'npc:elena' },
+    { text: "Leave it, Mia.", speakerId: UNCAST_SPEAKER_ID },
+  ] as PlaybackSegment[]
+  const groups = collectUncastVoiceGroups(segments)
+  assert.equal(groups.length, 4)
+  assert.equal(groups.every(group => !group.inferredName), true)
+})
+
+test('an invocation does not split the same unnamed speaker', () => {
+  const groups = collectUncastVoiceGroups([
+    { text: 'Ellis.', speakerId: UNCAST_SPEAKER_ID },
+    { text: "The woman's voice again, and closer now.", speakerId: null },
+    { text: "We don't need whatever's in there that bad.", speakerId: UNCAST_SPEAKER_ID },
+  ] as PlaybackSegment[])
+  assert.deepEqual(groups.map(group => group.segmentIndexes), [[0, 2]])
+  assert.equal(groups[0].inferredName, undefined)
 })
 
 test('a name invoked in the next quote by another speaker is the candidate for the preceding unnamed speaker', () => {

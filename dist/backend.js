@@ -240,6 +240,7 @@ function buildUncastVoiceDecision(groups, voices, message, ghosts = [], previous
 }
 function revealedUncastName(group, answers = {}, message = "") {
   if (group.speakerId.startsWith("unconfigured:")) return group.speakerId.slice("unconfigured:".length);
+  if (group.inferredName && !isBroadPersonLabel(group.inferredName)) return group.inferredName.toLowerCase();
   const names = new Set(group.speeches.flatMap((speech) => [...speech.matchAll(/\b(?:[Mm]y name is|[Ii] am|[Ii]'m)\s+([A-Z][a-z]+(?:[-'][A-Z]?[a-z]+)?)(?=[,.!?;:]|\s+(?:and|from|but|here)\b)/gu)].map((match2) => match2[1].toLowerCase())));
   if (names.size === 1) return [...names][0];
   const answer = answers[`narrative_name_${group.id}`];
@@ -358,11 +359,6 @@ function isGenericAdultLabel(label) {
 function isDescriptiveGhostLabel(label) {
   return isBroadPersonLabel(label) || /^(?:the|a|an)\s/iu.test(label.trim()) || /['’]s\s/iu.test(label.trim());
 }
-function mutuallyInvoked(a, b, answers = {}, message = "") {
-  const nameA = revealedUncastName(a, answers, message).toLowerCase();
-  const nameB = revealedUncastName(b, answers, message).toLowerCase();
-  return !!nameA && !!nameB && a.addressee === nameB && b.addressee === nameA;
-}
 function narrationBoostsPair(group, partner) {
   return !!group.narratedName && group.flankPartners?.includes(partner.id) === true && partner.addressee === group.narratedName;
 }
@@ -411,7 +407,6 @@ function resolveUncastVoiceDecisions(groups, voices, answers, ghosts = [], reser
     const label = labelIndex && labelAnswer && labelAnswer.confidence >= 0.7 && labelProbability >= 0.7 && labelProbability - labelRunnerUp >= 0.25 ? groupLabelOptions(group, labels)[Number(labelIndex[1])] : void 0;
     if (label) groupLabels.set(group.id, label);
     const previousGroups = groups.slice(0, groups.indexOf(group)).slice(-8);
-    const mutualPrevious = previousGroups.find((previous) => mutuallyInvoked(group, previous, answers, message));
     const same = previousGroups.flatMap((previous) => {
       const previousName = revealedUncastName(previous, answers, message).toLowerCase();
       if (name && previousName && name !== previousName) return [];
@@ -422,7 +417,6 @@ function resolveUncastVoiceDecisions(groups, voices, answers, ghosts = [], reser
     }).sort((a, b) => b.probability - a.probability);
     const narratedPartner = previousGroups.find((previous) => narrationBoostsPair(group, previous));
     if (same[0]) root = roots.get(same[0].previous.id) ?? root;
-    else if (mutualPrevious) root = roots.get(mutualPrevious.id) ?? root;
     else if (narratedPartner) root = roots.get(narratedPartner.id) ?? root;
     else if (label && !isBroadPersonLabel(label) && rootByLabel.has(label)) root = rootByLabel.get(label);
     else if (strongChoice(identity) && identity?.choice.startsWith("group_")) root = roots.get(identity.choice.slice(6)) ?? root;
@@ -431,7 +425,7 @@ function resolveUncastVoiceDecisions(groups, voices, answers, ghosts = [], reser
       const contradicts = previousGroups.some((previous) => roots.get(previous.id) === namedRoot && answers[`same_${group.id}_${previous.id}`]?.choice === "different_or_unclear" && strongChoice(answers[`same_${group.id}_${previous.id}`]));
       if (!contradicts) root = namedRoot;
     }
-    if (name && !mutualPrevious && previousGroups.some((previous) => roots.get(previous.id) === root && revealedUncastName(previous, answers, message) && revealedUncastName(previous, answers, message).toLowerCase() !== name)) root = group.id;
+    if (name && previousGroups.some((previous) => roots.get(previous.id) === root && revealedUncastName(previous, answers, message) && revealedUncastName(previous, answers, message).toLowerCase() !== name)) root = group.id;
     const namedGhosts = label && !isBroadPersonLabel(label) ? ghosts.filter((item) => (!confirmedNew || item.id !== occurrence?.id) && ghostCastAliases(item).some((alias) => alias.toLowerCase() === label)) : [];
     const rankedGhosts = namedGhosts.map((item) => ({ item, recent: Math.max(
       previousMessageIds.indexOf(item.lastSeenMessageId),

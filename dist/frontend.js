@@ -308,12 +308,6 @@ function collectUncastVoiceGroups(segments) {
     if (id === UNCAST_SPEAKER_ID && segments[index - 1]?.speakerId === null && segments[index - 1].text.length > 240) anonymous = null;
     if (id === UNCAST_SPEAKER_ID && segments[index - 1]?.speakerId === null && uncastNarrativeNameCandidates(segments[index - 1].text).length) anonymous = null;
     if (id === UNCAST_SPEAKER_ID && segments[index - 1]?.speakerId === UNCAST_SPEAKER_ID && segments[index - 2]?.speakerId === null && uncastNarrativeNameCandidates(segments[index - 2].text).length) anonymous = null;
-    if (id === UNCAST_SPEAKER_ID && segments[index - 1]?.speakerId === UNCAST_SPEAKER_ID && vocativeNames(segments[index - 1].text).length) anonymous = null;
-    if (id === UNCAST_SPEAKER_ID) {
-      const priorIndex = adjacentQuoteIndex(segments, index, -1);
-      const prior = priorIndex >= 0 ? segments[priorIndex] : void 0;
-      if (prior?.speakerId === UNCAST_SPEAKER_ID && vocativeNames(prior.text).length) anonymous = null;
-    }
     let group = id === UNCAST_SPEAKER_ID ? anonymous : named.get(id);
     if (!group) {
       group = { id: `g${groups.length}`, speakerId: id, segmentIndexes: [], speeches: [], context: [] };
@@ -376,6 +370,28 @@ function collectUncastVoiceGroups(segments) {
       before.flankPartners = [...before.flankPartners ?? [], after.id];
     }
   }
+  const unknownGroups = groups.filter((group) => group.speakerId === UNCAST_SPEAKER_ID);
+  const invokedByGroup = new Map(unknownGroups.map((group) => [group.id, [...new Set(group.speeches.flatMap((speech) => [...speech.matchAll(/,\s*([A-Z][A-Za-z'-]*)\s*[.!?]/gu)].map((match) => match[1].toLowerCase()).filter((name) => !UNCAST_VOCATIVE_STOPWORDS.has(name))))]]));
+  const invokingGroups = unknownGroups.filter((group) => invokedByGroup.get(group.id)?.length === 1);
+  if (invokingGroups.length === 2) {
+    const [a, b] = invokingGroups;
+    const invokedA = invokedByGroup.get(a.id)[0];
+    const invokedB = invokedByGroup.get(b.id)[0];
+    const knownNames = /* @__PURE__ */ new Set();
+    for (const segment of segments) {
+      const id = segment.speakerId;
+      if (!id || id === UNCAST_SPEAKER_ID || id.startsWith("unconfigured:") || id.startsWith("ghost:") || id === USER_SPEAKER_ID || id === UNRESOLVED_SPEAKER_ID) continue;
+      knownNames.add(id.includes(":") ? id.slice(id.indexOf(":") + 1).toLowerCase() : id.toLowerCase());
+    }
+    const invokedCounts = /* @__PURE__ */ new Map();
+    for (const names of invokedByGroup.values()) for (const name of names) invokedCounts.set(name, (invokedCounts.get(name) ?? 0) + 1);
+    if (invokedA !== invokedB && !isBroadPersonLabel(invokedA) && !isBroadPersonLabel(invokedB) && !knownNames.has(invokedA) && !knownNames.has(invokedB) && invokedCounts.get(invokedA) === 1 && invokedCounts.get(invokedB) === 1) {
+      a.inferredName = invokedB;
+      b.inferredName = invokedA;
+      a.addressee = invokedB;
+      b.addressee = invokedA;
+    }
+  }
   return groups;
 }
 function availableUncastVoices(favorites, used) {
@@ -401,14 +417,20 @@ function narrationNamesInvokedSpeaker(segments, index) {
 }
 var UNCAST_VOCATIVE_STOPWORDS = /* @__PURE__ */ new Set(["okay", "yeah", "yes", "no", "hello", "hey", "please", "thanks", "sorry", "listen", "look", "wait", "fine", "well", "honey", "sweetie", "darling"]);
 function vocativeNames(quote) {
-  const names = [];
-  const match = quote.trim().match(/^(?:[A-Za-z' ]+,\s*)?([A-Z][A-Za-z'-]*)\s*([.!?,;:])(?!\w)/u);
-  if (!match) return names;
-  const name = match[1];
-  if (name.length < 1 || UNCAST_VOCATIVE_STOPWORDS.has(name.toLowerCase())) return names;
-  if (/\b(?:on|at|to|for|with|about|from|of|by)\s*$/iu.test(quote.slice(0, quote.indexOf(name)))) return names;
-  names.push(name.toLowerCase());
-  return names;
+  const found = /* @__PURE__ */ new Set();
+  const text = quote.trim();
+  const push = (raw, prefix) => {
+    const name = raw.toLowerCase();
+    if (!name || UNCAST_VOCATIVE_STOPWORDS.has(name)) return;
+    if (/\b(?:on|at|to|for|with|about|from|of|by)\s*$/iu.test(prefix)) return;
+    found.add(name);
+  };
+  const leading = text.match(/^(?:[A-Za-z' ]+,\s*)?([A-Z][A-Za-z'-]*)\s*([.!?,;:])(?!\w)/u);
+  if (leading) push(leading[1], text.slice(0, text.indexOf(leading[1])));
+  for (const match of text.matchAll(/,\s*([A-Z][A-Za-z'-]*)\s*[.!?]/gu)) {
+    push(match[1], text.slice(0, match.index));
+  }
+  return [...found];
 }
 function addressedNameBeforeGroup(group, segments) {
   if (group.speakerId !== UNCAST_SPEAKER_ID) return "";
@@ -439,6 +461,9 @@ function uncastNarrativeNameCandidates(message) {
     if (names.size >= 20) break;
   }
   return [...names.values()];
+}
+function isBroadPersonLabel(label) {
+  return /^(?:(?:the|a|an)\s+)?(?:(?:young|younger|old|older|elderly|middle-aged|tall|short)\s+)*(?:woman|man|person|girl|boy|guy|lady|stranger|someone|somebody)$/iu.test(label.trim());
 }
 function speakersForMessageRole(speakers, _isUserMessage, userName = "User") {
   const nonUserSpeakers = speakers.filter((speaker) => speaker.id !== USER_SPEAKER_ID);
