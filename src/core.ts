@@ -117,50 +117,6 @@ export function globalTtsConnectionPreference(value: Record<string, unknown>): s
 export function resolveGlobalTtsConnection(preference: string, connections: Array<{ id: string; is_default?: boolean }>): string {
   return preference || connections.find(connection => connection.is_default)?.id || ''
 }
-
-/** One step of the Connection Test's diagnostic series. */
-export interface ConnectionTestStepResult {
-  name: string
-  status: 'pass' | 'fail' | 'skip'
-  detail: string
-}
-
-/**
- * One-line verdict for the Connection Test series. The series exercises four
- * independent paths (Decision list, LLM routing list, bare quiet generation,
- * explicit connection, connection + model override, Jev evaluate). The verdict
- * names only the paths that fail and interprets the failure split that
- * isolates the likely cause.
- */
-export function summarizeConnectionTest(results: readonly ConnectionTestStepResult[]): string {
-  const step = (name: string) => results.find(result => result.name === name)
-  const failed = results.filter(result => result.status === 'fail')
-  if (failed.length === 0) {
-    return 'Verdict: all connection paths healthy; Decision and LLM routing both resolve.'
-  }
-  const lines: string[] = []
-  const decisionsList = step('Decision connections list')
-  const bareQuiet = step('Bare quiet generation (default routing)')
-  const explicitQuiet = step('Quiet generation with selected connection')
-  const modelQuiet = step('Quiet generation with connection + model override')
-  const jev = step('Jev decisions evaluate')
-  if (jev?.status === 'fail' || decisionsList?.status === 'fail') {
-    lines.push('Decision path broken: Jev speaker assignment and Jev tag classification will fail.')
-  }
-  if (bareQuiet?.status === 'fail') {
-    lines.push('Default routing resolution fails: bare quiet generation cannot resolve a connection, so every quiet call that omits connection_id fails; pass an explicit connection_id or set Lumiverse\u2019s generation default.')
-  } else if (explicitQuiet?.status === 'fail') {
-    lines.push(`Explicit connection_id does not resolve (${explicitQuiet.detail}); bare routing works, so tag placement should drop connection_id and use default routing, or fix the saved connection id.`)
-  } else if (modelQuiet?.status === 'fail') {
-    lines.push(`Model in parameters conflicts with the connection model (${modelQuiet.detail}); remove the model override (masthead merge) or use the connection's model.`)
-  } else if (bareQuiet?.status === 'pass' && explicitQuiet?.status === 'pass' && modelQuiet?.status === 'pass') {
-    lines.push('All quiet-generation paths work; tag placement failures are not a connection problem.')
-  }
-  if (lines.length === 0) {
-    lines.push(`Failed steps: ${failed.map(result => `${result.name} (${result.detail})`).join('; ')}.`)
-  }
-  return `Verdict: ${lines.join(' ')}`
-}
 /** A speech span whose identity is unknown; unlike null, this is not narration. */
 export const UNRESOLVED_SPEAKER_ID = '__chat_voice_unresolved__'
 export const DEFAULT_MESSAGE_LIMIT = 20

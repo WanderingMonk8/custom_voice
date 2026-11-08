@@ -54,7 +54,6 @@ import {
   readAutoplayDelaySeconds,
   globalTtsConnectionPreference,
   resolveGlobalTtsConnection,
-  summarizeConnectionTest,
   buildBestAvailableSpeakerReview,
   applyBestAvailableSpeakerReview,
   buildSelfIntroductionReview,
@@ -3438,37 +3437,6 @@ test('global TTS connection preference overrides the host default without per-ch
   assert.equal(resolveGlobalTtsConnection('missing', connections), 'missing')
   assert.equal(resolveGlobalTtsConnection('other', connections), 'other')
   assert.equal(resolveGlobalTtsConnection('', []), '')
-})
-
-test('connection test verdict isolates the failing path', () => {
-  const healthy = [
-    { name: 'Decision connections list', status: 'pass' as const, detail: '4 connections' },
-    { name: 'Bare quiet generation (default routing)', status: 'pass' as const, detail: 'OK' },
-    { name: 'Quiet generation with selected connection', status: 'pass' as const, detail: 'OK' },
-    { name: 'Quiet generation with connection + model override', status: 'pass' as const, detail: 'OK' },
-    { name: 'Jev decisions evaluate', status: 'pass' as const, detail: 'choice=a' },
-  ]
-  assert.match(summarizeConnectionTest(healthy), /all connection paths healthy/)
-  const routingBroken = healthy.map(step => step.name.startsWith('Bare quiet')
-    ? { ...step, status: 'fail' as const, detail: 'No connection' }
-    : step)
-  assert.match(summarizeConnectionTest(routingBroken), /Default routing resolution fails/)
-  const staleId = healthy.map(step => step.name === 'Quiet generation with selected connection'
-    ? { ...step, status: 'fail' as const, detail: 'No connection' }
-    : step)
-  assert.match(summarizeConnectionTest(staleId), /Explicit connection_id does not resolve/)
-  assert.match(summarizeConnectionTest(staleId), /drop connection_id/)
-  const modelConflict = healthy.map(step => step.name === 'Quiet generation with connection + model override'
-    ? { ...step, status: 'fail' as const, detail: 'Model not found' }
-    : step)
-  assert.match(summarizeConnectionTest(modelConflict), /Model in parameters conflicts/)
-  assert.match(summarizeConnectionTest(modelConflict), /masthead merge/)
-  const jevBroken = healthy.map(step => step.name === 'Jev decisions evaluate'
-    ? { ...step, status: 'fail' as const, detail: 'Decision returned no choice answers' }
-    : step)
-  assert.match(summarizeConnectionTest(jevBroken), /Decision path broken/)
-  const unknown = [{ name: 'Host capability check', status: 'fail' as const, detail: 'decisions-v1 missing' }]
-  assert.match(summarizeConnectionTest(unknown), /Failed steps: Host capability check/)
 })
 
 test('standard speaker review enables the production pipeline without comparison calls', () => {

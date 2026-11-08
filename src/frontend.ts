@@ -297,14 +297,6 @@ interface LlmConnectionsPayload {
   error?: string
 }
 
-interface ConnectionTestPayload {
-  type: 'chat_voice_connection_test_result'
-  requestId: string
-  lines: string[]
-  done: boolean
-  error?: string
-}
-
 interface TagPlacementPayload {
   type: 'chat_voice_tag_placement'
   requestId: string
@@ -1115,13 +1107,6 @@ export function setup(ctx: SpindleFrontendContext) {
       border:1px solid var(--lumiverse-border); border-radius:var(--lumiverse-radius);
       background:var(--lumiverse-bg-secondary, transparent); color:var(--lumiverse-text-primary); font:inherit;
     }
-    .chat-voice-connection-test-button {
-      width:100%; min-height:42px; padding:0 14px; border:1px solid var(--lumiverse-border);
-      border-radius:var(--lumiverse-radius); background:var(--lumiverse-accent, #7c6df2);
-      color:#fff; font:inherit; font-size:13px; font-weight:700; cursor:pointer;
-    }
-    .chat-voice-connection-test-button:hover:not(:disabled) { filter:brightness(1.08); }
-    .chat-voice-connection-test-button:disabled { cursor:not-allowed; opacity:.5; }
     .chat-voice-debug-actions { display:flex; gap:8px; }
     .chat-voice-copy-report-button {
       min-height:30px; padding:0 12px; border:1px solid var(--lumiverse-border);
@@ -1165,16 +1150,6 @@ export function setup(ctx: SpindleFrontendContext) {
   }
 
   const connectionField = createField('TTS connection (global)')
-  const connectionTestField = createField('Connection diagnostics')
-  const connectionTestButton = document.createElement('button')
-  connectionTestButton.type = 'button'
-  connectionTestButton.className = 'chat-voice-connection-test-button'
-  connectionTestButton.textContent = 'Connection Test'
-  connectionTestField.slot.append(connectionTestButton)
-  const connectionTestHint = document.createElement('div')
-  connectionTestHint.className = 'chat-voice-hint'
-  connectionTestHint.textContent = 'Checks Decision and LLM connections, bare quiet generation, the selected connection, the model override, and Jev evaluate. Results print in the speaker-assignment debug log under Advanced settings.'
-  connectionTestField.field.insertBefore(connectionTestHint, connectionTestField.slot)
   const saveAudioField = createField('Audio storage')
   saveAudioField.slot.className = 'chat-voice-storage'
   const saveAudioLabel = document.createElement('label')
@@ -1348,7 +1323,6 @@ export function setup(ctx: SpindleFrontendContext) {
   panel.append(
     context,
     connectionField.field,
-    connectionTestField.field,
     scanField.field,
     skippedTagsField.field,
     speakerParsingField.field,
@@ -1634,11 +1608,6 @@ export function setup(ctx: SpindleFrontendContext) {
     reject: (error: Error) => void
     timer: ReturnType<typeof setTimeout>
   }>()
-  const pendingConnectionTestRequests = new Map<string, {
-    resolve: () => void
-    reject: (error: Error) => void
-    timer: ReturnType<typeof setTimeout>
-  }>()
   const pendingTagPlacementRequests = new Map<string, {
     resolve: (placements: Array<{
       id: string
@@ -1660,7 +1629,6 @@ export function setup(ctx: SpindleFrontendContext) {
   let speakerParseRequestSequence = 0
   let decisionStatusRequestSequence = 0
   let llmConnectionRequestSequence = 0
-  let connectionTestRequestSequence = 0
   let tagPlacementRequestSequence = 0
 
   const setStatus = (message: string, state: 'normal' | 'saved' | 'error' = 'normal') => {
@@ -2549,16 +2517,10 @@ export function setup(ctx: SpindleFrontendContext) {
     })
   }
 
-  function appendConnectionTestLog(line: string): void {
-    speakerDebugOutput.hidden = false
-    speakerDebugOutput.value += `${speakerDebugOutput.value ? '\n' : ''}${line}`
-    console.debug(`[Chat Voice] ${line}`)
-  }
-
   async function copyDebugReport(): Promise<void> {
     const text = speakerDebugOutput.value
     if (!text) {
-      setStatus('The debug log is empty; run a Connection Test first.')
+      setStatus('The debug log is empty.')
       return
     }
     try {
@@ -2570,47 +2532,6 @@ export function setup(ctx: SpindleFrontendContext) {
       setStatus('Clipboard copy failed; the debug log text is selected for manual copying.', 'error')
     }
   }
-
-  function requestConnectionTest(connectionId: string, model: string): Promise<void> {
-    const requestId = `connection-test-${Date.now().toString(36)}-${++connectionTestRequestSequence}`
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        pendingConnectionTestRequests.delete(requestId)
-        reject(new Error('Timed out while running the Connection Test.'))
-      }, 180_000)
-      pendingConnectionTestRequests.set(requestId, { resolve, reject, timer })
-      ctx.sendToBackend({ type: 'chat_voice_connection_test', requestId, connectionId, model })
-    })
-  }
-
-  let connectionTestRunning = false
-  async function runConnectionTest(): Promise<void> {
-    if (connectionTestRunning) return
-    connectionTestRunning = true
-    connectionTestButton.disabled = true
-    connectionTestButton.textContent = 'Testing…'
-    if (!speakerAssignmentDebug) {
-      speakerDebugToggle.checked = true
-      speakerAssignmentDebug = true
-      scheduleAdvancedSettingsSave()
-    }
-    advancedSection.open = true
-    speakerDebugOutput.hidden = false
-    const selected = llmConnections.find(connection => connection.id === tagLlmConnectionId)
-    appendConnectionTestLog(`Connection Test started at ${new Date().toLocaleTimeString()}; selected tag LLM connection: ${selected ? `${selected.name} (${selected.id}), model=${JSON.stringify(tagLlmModel || selected.model)}` : tagLlmConnectionId ? `missing ${tagLlmConnectionId}` : 'none (default routing)'}.`)
-    try {
-      await requestConnectionTest(tagLlmConnectionId, tagLlmModel)
-      setStatus('Connection Test complete; see the debug log for results.')
-    } catch (error) {
-      appendConnectionTestLog(`[FAIL] Connection Test: ${error instanceof Error ? error.message : String(error)}`)
-      setStatus(error instanceof Error ? error.message : 'Connection Test failed.', 'error')
-    } finally {
-      connectionTestRunning = false
-      connectionTestButton.disabled = false
-      connectionTestButton.textContent = 'Connection Test'
-    }
-  }
-  connectionTestButton.addEventListener('click', () => { void runConnectionTest() })
 
   function requestTagPlacements(
     message: string,
@@ -5078,7 +4999,6 @@ export function setup(ctx: SpindleFrontendContext) {
       | ParsedMessagePayload
       | DecisionStatusPayload
       | LlmConnectionsPayload
-      | ConnectionTestPayload
       | TagPlacementPayload
       | UncastMatchPayload
       | AutoCastPayload
@@ -5139,18 +5059,6 @@ export function setup(ctx: SpindleFrontendContext) {
       pendingLlmConnectionRequests.delete(payload.requestId)
       if (payload.error) pending.reject(new Error(payload.error))
       else pending.resolve(payload.connections)
-      return
-    }
-    if (payload.type === 'chat_voice_connection_test_result') {
-      const pending = pendingConnectionTestRequests.get(payload.requestId)
-      if (!pending) return
-      for (const line of payload.lines) appendConnectionTestLog(line)
-      if (payload.done) {
-        clearTimeout(pending.timer)
-        pendingConnectionTestRequests.delete(payload.requestId)
-        if (payload.error) pending.reject(new Error(payload.error))
-        else pending.resolve()
-      }
       return
     }
     if (payload.type === 'chat_voice_tag_placement') {

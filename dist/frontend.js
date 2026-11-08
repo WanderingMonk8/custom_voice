@@ -2641,13 +2641,6 @@ function setup(ctx) {
       border:1px solid var(--lumiverse-border); border-radius:var(--lumiverse-radius);
       background:var(--lumiverse-bg-secondary, transparent); color:var(--lumiverse-text-primary); font:inherit;
     }
-    .chat-voice-connection-test-button {
-      width:100%; min-height:42px; padding:0 14px; border:1px solid var(--lumiverse-border);
-      border-radius:var(--lumiverse-radius); background:var(--lumiverse-accent, #7c6df2);
-      color:#fff; font:inherit; font-size:13px; font-weight:700; cursor:pointer;
-    }
-    .chat-voice-connection-test-button:hover:not(:disabled) { filter:brightness(1.08); }
-    .chat-voice-connection-test-button:disabled { cursor:not-allowed; opacity:.5; }
     .chat-voice-debug-actions { display:flex; gap:8px; }
     .chat-voice-copy-report-button {
       min-height:30px; padding:0 12px; border:1px solid var(--lumiverse-border);
@@ -2687,16 +2680,6 @@ function setup(ctx) {
     return { field, label, slot };
   }
   const connectionField = createField("TTS connection (global)");
-  const connectionTestField = createField("Connection diagnostics");
-  const connectionTestButton = document.createElement("button");
-  connectionTestButton.type = "button";
-  connectionTestButton.className = "chat-voice-connection-test-button";
-  connectionTestButton.textContent = "Connection Test";
-  connectionTestField.slot.append(connectionTestButton);
-  const connectionTestHint = document.createElement("div");
-  connectionTestHint.className = "chat-voice-hint";
-  connectionTestHint.textContent = "Checks Decision and LLM connections, bare quiet generation, the selected connection, the model override, and Jev evaluate. Results print in the speaker-assignment debug log under Advanced settings.";
-  connectionTestField.field.insertBefore(connectionTestHint, connectionTestField.slot);
   const saveAudioField = createField("Audio storage");
   saveAudioField.slot.className = "chat-voice-storage";
   const saveAudioLabel = document.createElement("label");
@@ -2863,7 +2846,6 @@ function setup(ctx) {
   panel.append(
     context,
     connectionField.field,
-    connectionTestField.field,
     scanField.field,
     skippedTagsField.field,
     speakerParsingField.field,
@@ -3109,7 +3091,6 @@ function setup(ctx) {
   const pendingSpeakerParseRequests = /* @__PURE__ */ new Map();
   const pendingDecisionStatusRequests = /* @__PURE__ */ new Map();
   const pendingLlmConnectionRequests = /* @__PURE__ */ new Map();
-  const pendingConnectionTestRequests = /* @__PURE__ */ new Map();
   const pendingTagPlacementRequests = /* @__PURE__ */ new Map();
   const pendingUncastRequests = /* @__PURE__ */ new Map();
   let uncastRequestSequence = 0;
@@ -3118,7 +3099,6 @@ function setup(ctx) {
   let speakerParseRequestSequence = 0;
   let decisionStatusRequestSequence = 0;
   let llmConnectionRequestSequence = 0;
-  let connectionTestRequestSequence = 0;
   let tagPlacementRequestSequence = 0;
   const setStatus = (message, state = "normal") => {
     status.textContent = message;
@@ -3885,15 +3865,10 @@ function setup(ctx) {
       ctx.sendToBackend({ type: "chat_voice_list_llm_connections", requestId });
     });
   }
-  function appendConnectionTestLog(line) {
-    speakerDebugOutput.hidden = false;
-    speakerDebugOutput.value += `${speakerDebugOutput.value ? "\n" : ""}${line}`;
-    console.debug(`[Chat Voice] ${line}`);
-  }
   async function copyDebugReport() {
     const text = speakerDebugOutput.value;
     if (!text) {
-      setStatus("The debug log is empty; run a Connection Test first.");
+      setStatus("The debug log is empty.");
       return;
     }
     try {
@@ -3905,47 +3880,6 @@ function setup(ctx) {
       setStatus("Clipboard copy failed; the debug log text is selected for manual copying.", "error");
     }
   }
-  function requestConnectionTest(connectionId, model) {
-    const requestId = `connection-test-${Date.now().toString(36)}-${++connectionTestRequestSequence}`;
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        pendingConnectionTestRequests.delete(requestId);
-        reject(new Error("Timed out while running the Connection Test."));
-      }, 18e4);
-      pendingConnectionTestRequests.set(requestId, { resolve, reject, timer });
-      ctx.sendToBackend({ type: "chat_voice_connection_test", requestId, connectionId, model });
-    });
-  }
-  let connectionTestRunning = false;
-  async function runConnectionTest() {
-    if (connectionTestRunning) return;
-    connectionTestRunning = true;
-    connectionTestButton.disabled = true;
-    connectionTestButton.textContent = "Testing\u2026";
-    if (!speakerAssignmentDebug) {
-      speakerDebugToggle.checked = true;
-      speakerAssignmentDebug = true;
-      scheduleAdvancedSettingsSave();
-    }
-    advancedSection.open = true;
-    speakerDebugOutput.hidden = false;
-    const selected = llmConnections.find((connection) => connection.id === tagLlmConnectionId);
-    appendConnectionTestLog(`Connection Test started at ${(/* @__PURE__ */ new Date()).toLocaleTimeString()}; selected tag LLM connection: ${selected ? `${selected.name} (${selected.id}), model=${JSON.stringify(tagLlmModel || selected.model)}` : tagLlmConnectionId ? `missing ${tagLlmConnectionId}` : "none (default routing)"}.`);
-    try {
-      await requestConnectionTest(tagLlmConnectionId, tagLlmModel);
-      setStatus("Connection Test complete; see the debug log for results.");
-    } catch (error) {
-      appendConnectionTestLog(`[FAIL] Connection Test: ${error instanceof Error ? error.message : String(error)}`);
-      setStatus(error instanceof Error ? error.message : "Connection Test failed.", "error");
-    } finally {
-      connectionTestRunning = false;
-      connectionTestButton.disabled = false;
-      connectionTestButton.textContent = "Connection Test";
-    }
-  }
-  connectionTestButton.addEventListener("click", () => {
-    void runConnectionTest();
-  });
   function requestTagPlacements(message, style, connectionId, model, items) {
     const requestId = `tag-placement-${Date.now().toString(36)}-${++tagPlacementRequestSequence}`;
     return new Promise((resolve, reject) => {
@@ -6233,18 +6167,6 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
       pendingLlmConnectionRequests.delete(payload.requestId);
       if (payload.error) pending.reject(new Error(payload.error));
       else pending.resolve(payload.connections);
-      return;
-    }
-    if (payload.type === "chat_voice_connection_test_result") {
-      const pending = pendingConnectionTestRequests.get(payload.requestId);
-      if (!pending) return;
-      for (const line of payload.lines) appendConnectionTestLog(line);
-      if (payload.done) {
-        clearTimeout(pending.timer);
-        pendingConnectionTestRequests.delete(payload.requestId);
-        if (payload.error) pending.reject(new Error(payload.error));
-        else pending.resolve();
-      }
       return;
     }
     if (payload.type === "chat_voice_tag_placement") {
