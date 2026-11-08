@@ -2207,6 +2207,15 @@ test('both neighbors of an invoking quote are flank partners only within an actu
   assert.equal(noReply.find(group => group.speakerId === UNCAST_SPEAKER_ID)?.flankPartners, undefined)
 })
 
+test('narration that names a speaker before a quote records that name on the quote group', () => {
+  const groups = collectUncastVoiceGroups([
+    { text: 'Ellis says, without turning his head.', speakerId: null },
+    { text: 'Not yet.', speakerId: UNCAST_SPEAKER_ID },
+  ] as PlaybackSegment[])
+  assert.equal(groups[0].narratedName, 'ellis')
+  assert.equal(groups.length, 1)
+})
+
 test('an unnamed speaker takes the name addressed in the preceding quote by someone else', () => {
   const segments = [
     { text: 'Leave it, Ellis.', speakerId: 'unconfigured:hallie' },

@@ -331,6 +331,13 @@ function collectUncastVoiceGroups(segments) {
     if (addressee) group.addressee = addressee;
   }
   for (const group of groups) {
+    const first = Math.min(...group.segmentIndexes);
+    const lead = segments[first - 1];
+    if (!lead || lead.speakerId !== null) continue;
+    const named2 = lead.text.match(/^([A-Z][a-z]{2,})\s+(?:says|said|murmurs|murmured|whispers|whispered|mutters|muttered|replies|replied|answers|answered|calls|called)\b/u);
+    if (named2) group.narratedName = named2[1].toLowerCase();
+  }
+  for (const group of groups) {
     if (group.addressee) continue;
     const last = Math.max(...group.segmentIndexes);
     const next = segments.slice(last + 1).find((segment) => segment.speakerId !== null);

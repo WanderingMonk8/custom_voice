@@ -163,7 +163,7 @@ export function addFavoriteVoice(existing: FavoriteVoice[], voice: FavoriteVoice
   return [...existing, { ...voice, id }]
 }
 
-export interface UncastVoiceGroup { id: string; speakerId: string; segmentIndexes: number[]; speeches: string[]; context: string[]; addressee?: string; flankPartners?: string[] }
+export interface UncastVoiceGroup { id: string; speakerId: string; segmentIndexes: number[]; speeches: string[]; context: string[]; addressee?: string; flankPartners?: string[]; narratedName?: string }
 export interface GhostOccurrenceEvidence { messageId: string; messageHash: string; speechHash: string; version: 'occurrence-1'; reason: string }
 export interface GhostVoice { id: string; speakerId: string; voiceId: string; context: string; occurrenceKeys: string[]; lastSeenMessageId: string; label?: string; createdAtMessageId?: string; lastInvokedAtMessageId?: string; invokedMessageIds?: string[]; aliases?: string[]; conversationHistory?: Array<{ messageId: string; text: string }>; occurrenceEvidence?: GhostOccurrenceEvidence[] }
 export const GHOST_VOICE_LIFETIME_MESSAGES = 10
@@ -310,6 +310,13 @@ export function collectUncastVoiceGroups(segments: PlaybackSegment[]): UncastVoi
   for (const group of groups) {
     const addressee = addressedNameBeforeGroup(group, segments)
     if (addressee) group.addressee = addressee
+  }
+  for (const group of groups) {
+    const first = Math.min(...group.segmentIndexes)
+    const lead = segments[first - 1]
+    if (!lead || lead.speakerId !== null) continue
+    const named = lead.text.match(/^([A-Z][a-z]{2,})\s+(?:says|said|murmurs|murmured|whispers|whispered|mutters|muttered|replies|replied|answers|answered|calls|called)\b/u)
+    if (named) group.narratedName = named[1].toLowerCase()
   }
   for (const group of groups) {
     if (group.addressee) continue
