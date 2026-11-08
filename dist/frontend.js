@@ -1,4 +1,53 @@
 // src/playback-ui.ts
+function waitForAutoplayDeadline(deadline, signal) {
+  if (signal.aborted) return Promise.resolve(false);
+  const remaining = Math.max(0, deadline - Date.now());
+  if (!remaining) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    const finish = (ready) => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", abort);
+      resolve(ready);
+    };
+    const abort = () => finish(false);
+    const timer = setTimeout(() => finish(true), remaining);
+    signal.addEventListener("abort", abort, { once: true });
+  });
+}
+var AutoplayRequestRegistry = class {
+  pending = /* @__PURE__ */ new Map();
+  begin(key) {
+    this.pending.get(key)?.abort();
+    const controller = new AbortController();
+    this.pending.set(key, controller);
+    return controller.signal;
+  }
+  finish(key, signal) {
+    if (this.pending.get(key)?.signal === signal) this.pending.delete(key);
+  }
+  cancelAll() {
+    for (const controller of this.pending.values()) controller.abort();
+    this.pending.clear();
+  }
+};
+function waitForAutoplayWork(work, signal) {
+  if (signal.aborted) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const abort = () => {
+      signal.removeEventListener("abort", abort);
+      resolve();
+    };
+    signal.addEventListener("abort", abort, { once: true });
+    work.then(() => {
+      signal.removeEventListener("abort", abort);
+      resolve();
+    }, (error) => {
+      signal.removeEventListener("abort", abort);
+      if (signal.aborted) resolve();
+      else reject(error);
+    });
+  });
+}
 var PlaybackStartupGuard = class {
   serial = 0;
   pending = null;
@@ -23,6 +72,9 @@ var PlaybackStartupGuard = class {
   }
   cancelAutomatic() {
     if (this.pending?.automatic) this.cancel();
+  }
+  cancelAutomaticFor(chatId, messageId) {
+    if (this.pending?.automatic && this.pending.chatId === chatId && this.pending.messageId === messageId) this.cancel();
   }
 };
 var PlaybackLongPress = class {
@@ -136,31 +188,57 @@ function autoplayGenerationEvent(value, activeChatId) {
     chatId: activeChatId,
     messageId: event.messageId,
     generationId: event.generationId,
-    ...reroll ? { reroll: true, ...typeof event.content === "string" ? { content: event.content } : {} } : {}
+    ...reroll ? { reroll: true } : {},
+    ...typeof event.content === "string" ? { content: event.content } : {}
   };
 }
 function claimAutoplayGeneration(event, generations, messages) {
   const generationKey = `${event.chatId}\0${event.generationId}`;
   const messageKey = `${event.chatId}\0${event.messageId}`;
-  if (generations.has(generationKey) || !event.reroll && messages.has(messageKey)) return false;
+  if (generations.has(generationKey)) return false;
   generations.add(generationKey);
   messages.add(messageKey);
   if (generations.size > 512) generations.delete(generations.values().next().value);
   if (messages.size > 512) messages.delete(messages.values().next().value);
   return true;
 }
-function hasAudioForActiveSwipe(message) {
-  const attachments = message.extra?.attachments;
-  if (!Array.isArray(attachments)) return false;
-  const swipe = message.swipe_id ?? 0;
-  return attachments.some((candidate) => {
-    if (!candidate || typeof candidate !== "object") return false;
-    const attachment = candidate;
-    return attachment.type === "audio" && (attachment.swipe_id ?? 0) === swipe;
-  });
+function autoplaySwipeSnapshot(message) {
+  const swipeId = message.swipe_id ?? 0;
+  const swipeDate = message.swipe_dates?.[swipeId];
+  return { swipeId, contentHash: hashMessageContent(message.content), ...typeof swipeDate === "number" && Number.isFinite(swipeDate) ? { swipeDate } : {} };
+}
+function autoplaySwipeMatches(message, expected) {
+  const actual = autoplaySwipeSnapshot(message);
+  return actual.swipeId === expected.swipeId && actual.contentHash === expected.contentHash && (expected.swipeDate === void 0 || actual.swipeDate === expected.swipeDate);
+}
+function refreshAutoplaySwipe(message, original) {
+  const current = autoplaySwipeSnapshot(message);
+  if (current.swipeId !== original.swipeId) return null;
+  if (original.swipeDate !== void 0 && current.swipeDate !== original.swipeDate) return null;
+  return current;
+}
+function targetSwipeContentMatches(targetSwipeContent, expected) {
+  return typeof targetSwipeContent === "string" && hashMessageContent(targetSwipeContent) === expected.contentHash;
+}
+function swipeSynthesisKey(chatId, messageId, swipeId) {
+  return `${chatId}\0${messageId}\0${swipeId}`;
+}
+function savedAudioMatchesSwipe(result, messageId, swipeId) {
+  const audioId = result.audio?.id;
+  return result.message?.id === messageId && result.swipe_id === swipeId && !!audioId && !!result.message.extra?.attachments?.some((item) => item?.type === "audio" && item.image_id === audioId && item.swipe_id === swipeId);
+}
+function automaticPlaybackSkipReason(message, expected) {
+  if (message.is_user) return "user-message";
+  if (expected && !autoplaySwipeMatches(message, expected)) return "changed-swipe";
+  return null;
 }
 function readAutomaticVoicePreferences(value) {
   return { autoVoiceCasting: value.chatVoiceAutoCasting !== false, autoPlayback: value.chatVoiceAutoPlayback === true };
+}
+var MAX_AUTOPLAY_DELAY_SECONDS = 3600;
+function readAutoplayDelaySeconds(value) {
+  if (typeof value !== "number" || !Number.isFinite(value)) return 0;
+  return Math.min(MAX_AUTOPLAY_DELAY_SECONDS, Math.max(0, Math.round(value)));
 }
 function globalTtsConnectionPreference(value) {
   const chosen = typeof value.chatVoiceTtsConnectionId === "string" ? value.chatVoiceTtsConnectionId : value.ttsConnectionId;
@@ -1856,6 +1934,7 @@ async function loadPlaybackPreferences() {
     playbackBufferSegments: DEFAULT_PLAYBACK_BUFFER_SEGMENTS,
     concurrentGenerations: DEFAULT_CONCURRENT_GENERATIONS,
     rateLimitWaitSeconds: DEFAULT_RATE_LIMIT_WAIT_SECONDS,
+    autoPlaybackDelaySeconds: 0,
     ghostVoiceLifetime: GHOST_VOICE_LIFETIME_MESSAGES,
     speakerLookback: DEFAULT_SPEAKER_LOOKBACK,
     ...readAutomaticVoicePreferences({}),
@@ -1898,6 +1977,7 @@ async function loadPlaybackPreferences() {
       DEFAULT_RATE_LIMIT_WAIT_SECONDS,
       MAX_RATE_LIMIT_WAIT_SECONDS
     ),
+    autoPlaybackDelaySeconds: readAutoplayDelaySeconds(row.value?.chatVoiceAutoPlaybackDelaySeconds),
     ghostVoiceLifetime: clampIntegerSetting(row.value?.chatVoiceGhostVoiceLifetime, GHOST_VOICE_LIFETIME_MESSAGES, 1e3),
     speakerLookback: clampIntegerSetting(row.value?.chatVoiceSpeakerLookback, DEFAULT_SPEAKER_LOOKBACK, MAX_SPEAKER_LOOKBACK),
     ...readAutomaticVoicePreferences(row.value ?? {}),
@@ -1965,7 +2045,7 @@ function saveTtsTagPreferences(style, placement, connectionId, model) {
     chatVoiceTagLlmModel: model.trim().slice(0, 256)
   }));
 }
-function saveAdvancedPlaybackPreferences(bufferSegments, concurrentGenerations, rateLimitWaitSeconds, speakerAssignmentDebug, ghostVoiceLifetime, autoVoiceCasting, autoPlayback, speakerLookback, skipNarration) {
+function saveAdvancedPlaybackPreferences(bufferSegments, concurrentGenerations, rateLimitWaitSeconds, speakerAssignmentDebug, ghostVoiceLifetime, autoVoiceCasting, autoPlayback, autoPlaybackDelaySeconds, speakerLookback, skipNarration) {
   return updateVoiceSettings((current) => ({
     ...current,
     chatVoicePlaybackBufferSegments: clampIntegerSetting(
@@ -1987,6 +2067,7 @@ function saveAdvancedPlaybackPreferences(bufferSegments, concurrentGenerations, 
     chatVoiceSkipNarration: skipNarration,
     chatVoiceAutoCasting: autoVoiceCasting,
     chatVoiceAutoPlayback: autoPlayback,
+    chatVoiceAutoPlaybackDelaySeconds: readAutoplayDelaySeconds(autoPlaybackDelaySeconds),
     chatVoiceGhostVoiceLifetime: clampIntegerSetting(ghostVoiceLifetime, GHOST_VOICE_LIFETIME_MESSAGES, 1e3),
     chatVoiceSpeakerLookback: clampIntegerSetting(speakerLookback, DEFAULT_SPEAKER_LOOKBACK, MAX_SPEAKER_LOOKBACK)
   }));
@@ -2232,7 +2313,8 @@ async function saveMessageAudio(chatId, messageId, swipeId, segments, signal) {
   const form = new FormData();
   form.append("chatId", chatId);
   form.append("messageId", messageId);
-  if (typeof swipeId === "number") form.append("swipeId", String(swipeId));
+  if (!Number.isInteger(swipeId) || (swipeId ?? -1) < 0) throw new Error("Cannot safely save audio: the target swipe ID is unavailable.");
+  form.append("swipeId", String(swipeId));
   segments.forEach((segment, index) => {
     const blob = new Blob([segment.data], { type: segment.mime || "audio/mpeg" });
     form.append("segment", blob, `seg-${String(index).padStart(4, "0")}`);
@@ -2258,11 +2340,10 @@ async function saveMessageAudio(chatId, messageId, swipeId, segments, signal) {
   } catch {
     throw new Error("Lumiverse returned an invalid response after saving generated audio.");
   }
-  const savedAudioId = result.audio?.id;
-  const attachments = result.message?.extra?.attachments;
-  const attached = Array.isArray(attachments) && attachments.some((attachment) => attachment?.type === "audio" && attachment.image_id === savedAudioId);
-  if (result.message?.id !== messageId || !savedAudioId || !attached) {
-    throw new Error("Lumiverse did not confirm the generated audio attachment on the message.");
+  if (typeof swipeId !== "number" || !savedAudioMatchesSwipe(result, messageId, swipeId)) {
+    const error = new Error("Lumiverse did not confirm the generated audio attachment on the requested swipe.");
+    error.name = "AudioSaveVerificationError";
+    throw error;
   }
   return result;
 }
@@ -2634,6 +2715,7 @@ function setup(ctx) {
   const playbackBufferField = createField("Playback buffer segments");
   const concurrentGenerationField = createField("Maximum concurrent generations");
   const rateLimitWaitField = createField("Rate-limit wait budget (seconds)");
+  const autoPlaybackDelayField = createField("Autoplay delay (seconds)");
   const ghostLifetimeField = createField("Uncast voice lifetime (assistant messages)");
   const speakerLookbackField = createField("Global speaker context (messages)");
   const autoCastingLabel = document.createElement("label");
@@ -2702,6 +2784,7 @@ function setup(ctx) {
     speakerLookbackField.field,
     autoCastingLabel,
     autoPlaybackLabel,
+    autoPlaybackDelayField.field,
     skipNarrationLabel,
     speakerDebugLabel,
     speakerDebugOutput,
@@ -2712,6 +2795,7 @@ function setup(ctx) {
   const autoPlaybackSeenGenerations = /* @__PURE__ */ new Set();
   const autoPlaybackSeenMessages = /* @__PURE__ */ new Set();
   let autoPlaybackQueue = Promise.resolve();
+  const autoPlaybackRequests = new AutoplayRequestRegistry();
   let autoPlaybackDisposed = false;
   let autoPlaybackEpoch = 0;
   let connections = [];
@@ -2776,6 +2860,7 @@ function setup(ctx) {
   let rateLimitWaitSeconds = DEFAULT_RATE_LIMIT_WAIT_SECONDS;
   let autoVoiceCasting = true;
   let autoPlayback = false;
+  let autoPlaybackDelaySeconds = 0;
   const playbackStartup = new PlaybackStartupGuard();
   let ghostVoiceLifetime = GHOST_VOICE_LIFETIME_MESSAGES;
   let speakerLookback = DEFAULT_SPEAKER_LOOKBACK;
@@ -3158,6 +3243,19 @@ function setup(ctx) {
     MAX_RATE_LIMIT_WAIT_SECONDS,
     "Rate-limit wait budget in seconds"
   );
+  const autoPlaybackDelayInput = createNumberInput(0, MAX_AUTOPLAY_DELAY_SECONDS, "Autoplay delay in seconds");
+  autoPlaybackDelayInput.min = "0";
+  autoPlaybackDelayField.slot.appendChild(autoPlaybackDelayInput);
+  const autoPlaybackDelayHint = document.createElement("div");
+  autoPlaybackDelayHint.className = "chat-voice-hint";
+  autoPlaybackDelayHint.textContent = "Wait this long after a message or reroll finishes before starting automatic playback. Default: 0 seconds.";
+  autoPlaybackDelayField.slot.appendChild(autoPlaybackDelayHint);
+  const onAutoPlaybackDelayInput = () => {
+    autoPlaybackDelaySeconds = readAutoplayDelaySeconds(autoPlaybackDelayInput.valueAsNumber);
+    autoPlaybackDelayInput.value = String(autoPlaybackDelaySeconds);
+    scheduleAdvancedSettingsSave();
+  };
+  autoPlaybackDelayInput.addEventListener("change", onAutoPlaybackDelayInput);
   const ghostLifetimeInput = createNumberInput(GHOST_VOICE_LIFETIME_MESSAGES, 1e3, "Uncast voice lifetime in assistant messages");
   ghostLifetimeField.slot.appendChild(ghostLifetimeInput);
   const ghostLifetimeHint = document.createElement("div");
@@ -3301,7 +3399,7 @@ function setup(ctx) {
     updatePlaybackButtons();
     nativeButtonStates.clear();
   }
-  function requestPlaybackMessage(chatId, messageId) {
+  function requestPlaybackMessage(chatId, messageId, targetSwipeId) {
     const requestId = `${Date.now().toString(36)}-${++messageRequestSequence}`;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -3309,7 +3407,7 @@ function setup(ctx) {
         reject(new Error("Timed out while loading the message for playback."));
       }, 15e3);
       pendingMessageRequests.set(requestId, { resolve, reject, timer });
-      ctx.sendToBackend({ type: "chat_voice_get_message", chatId, messageId, requestId });
+      ctx.sendToBackend({ type: "chat_voice_get_message", chatId, messageId, requestId, ...targetSwipeId !== void 0 ? { targetSwipeId } : {} });
     });
   }
   function requestSpeakerReviewedSegments(chatId, messageId, preferences) {
@@ -3769,11 +3867,12 @@ function setup(ctx) {
       await decodeContext.close().catch(() => void 0);
     }
   }
-  async function persistCapturedAudio(chatId, messageId, swipeId, segments, contextClass, signal, waitForSafeFallback, onWavAssembly) {
+  async function persistCapturedAudio(chatId, messageId, swipeId, segments, contextClass, signal, waitForSafeFallback, onWavAssembly, verifyBeforeSave) {
     const normalized = segments.some((segment) => segment.normalizationGain !== void 0);
     if (normalized) {
       onWavAssembly(true);
       const wav = await encodeCapturedWav(segments, contextClass);
+      await verifyBeforeSave?.();
       return saveMessageAudio(
         chatId,
         messageId,
@@ -3783,13 +3882,15 @@ function setup(ctx) {
       );
     }
     try {
+      await verifyBeforeSave?.();
       return await saveMessageAudio(chatId, messageId, swipeId, segments, signal);
     } catch (segmentSaveError) {
-      if (segmentSaveError?.name === "AbortError") throw segmentSaveError;
+      if (["AbortError", "AudioSaveVerificationError"].includes(segmentSaveError?.name ?? "")) throw segmentSaveError;
       await waitForSafeFallback();
       if (signal.aborted) throw new DOMException("Audio saving stopped.", "AbortError");
       onWavAssembly(false);
       const wav = await encodeCapturedWav(segments, contextClass);
+      await verifyBeforeSave?.();
       return saveMessageAudio(
         chatId,
         messageId,
@@ -3808,7 +3909,7 @@ function setup(ctx) {
       return attachment.type === "audio" && (attachment.swipe_id === void 0 || attachment.swipe_id === message.swipe_id);
     });
   }
-  async function playMessage(messageId, nativeRegenerationAction = false, automatic = false, expectedContent) {
+  async function playMessage(messageId, nativeRegenerationAction = false, automatic = false, expectedSwipe) {
     if (activePlayback?.messageId === messageId) {
       if (automatic) return;
       playbackStartup.cancel();
@@ -3836,7 +3937,15 @@ function setup(ctx) {
         return;
       }
       if (!ownsStartup()) return;
-      if (automatic && (message.is_user || hasAudioForActiveSwipe(message) || expectedContent !== void 0 && message.content.trim() !== expectedContent.trim())) return;
+      const automaticSkip = automatic ? automaticPlaybackSkipReason(message, expectedSwipe) : null;
+      if (automaticSkip === "user-message") {
+        appendSpeakerDebugLog(`Autoplay skipped: message ${messageId} belongs to the user.`);
+        return;
+      }
+      if (automaticSkip === "changed-swipe") {
+        appendSpeakerDebugLog(`Autoplay skipped: message ${messageId} changed swipe or content after generation (expected swipe ${expectedSwipe?.swipeId ?? "unknown"}, active swipe ${message.swipe_id ?? 0}).`);
+        return;
+      }
       const regeneratingSavedAudio = !message.is_user && (nativeRegenerationAction || !automatic && hasSavedAudioForCurrentSwipe(message));
       if (regeneratingSavedAudio) {
         const { confirmed } = await ctx.ui.showConfirm({
@@ -4277,12 +4386,12 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
             `  [${index + 1}] voice=${JSON.stringify(segment.voice || "<connection default>")} text=${JSON.stringify(segment.text.length > 120 ? `${segment.text.slice(0, 117)}...` : segment.text)}`
           ));
         }
-        const synthesisMessageKey = `${playbackChat.id}\0${messageId}`;
+        const synthesisMessageKey = swipeSynthesisKey(playbackChat.id, messageId, message.swipe_id ?? 0);
         const previousSynthesis = backgroundSynthesisByMessage.get(synthesisMessageKey);
         if (previousSynthesis) {
           previousSynthesis.abort();
           backgroundSynthesisByMessage.delete(synthesisMessageKey);
-          appendSpeakerDebugLog("Cancelled an older unfinished synthesis/save for this message.");
+          appendSpeakerDebugLog("Cancelled an older unfinished synthesis/save for this message swipe.");
         }
         const synthesisController = new AbortController();
         const rateLimitBudget = {
@@ -4483,6 +4592,14 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
               (normalized) => {
                 if (ctx.getActiveChat().chatId === playbackChat.id && (!activePlayback || activePlayback === playback)) {
                   setStatus(normalized ? "Preparing normalized saved audio\u2026" : "Server could not combine the source audio; retrying as WAV\u2026");
+                }
+              },
+              async () => {
+                if (!Number.isInteger(message.swipe_id) || (message.swipe_id ?? -1) < 0) throw new Error("Cannot safely save audio: the target swipe ID is unavailable.");
+                const latest = await requestPlaybackMessage(playbackChat.id, messageId, message.swipe_id);
+                if (synthesisController.signal.aborted || latest.is_user || !targetSwipeContentMatches(latest.targetSwipeContent, autoplaySwipeSnapshot(message))) {
+                  appendSpeakerDebugLog(`Audio save cancelled: message ${messageId}, swipe ${message.swipe_id}, was removed or changed since playback began.`);
+                  throw new DOMException("Target swipe changed before audio save.", "AbortError");
                 }
               }
             );
@@ -5461,8 +5578,15 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
         refreshLocalState();
         autoVoiceCasting = preferences.autoVoiceCasting;
         autoCastingToggle.checked = autoVoiceCasting;
+        if (autoPlayback !== preferences.autoPlayback) {
+          autoPlaybackEpoch += 1;
+          autoPlaybackRequests.cancelAll();
+          if (!preferences.autoPlayback) playbackStartup.cancelAutomatic();
+        }
         autoPlayback = preferences.autoPlayback;
         autoPlaybackToggle.checked = autoPlayback;
+        autoPlaybackDelaySeconds = preferences.autoPlaybackDelaySeconds;
+        autoPlaybackDelayInput.value = String(autoPlaybackDelaySeconds);
         updatePlaybackButtons();
         speakerAssignmentDebug = preferences.speakerAssignmentDebug;
         playbackBufferInput.value = String(playbackBufferSegments);
@@ -5593,6 +5717,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
   function onAutoPlaybackChanged() {
     autoPlayback = autoPlaybackToggle.checked;
     if (!autoPlayback) playbackStartup.cancelAutomatic();
+    autoPlaybackRequests.cancelAll();
     autoPlaybackEpoch += 1;
     updatePlaybackButtons();
     scheduleAdvancedSettingsSave();
@@ -5609,6 +5734,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
         ghostVoiceLifetime,
         autoVoiceCasting,
         autoPlayback,
+        autoPlaybackDelaySeconds,
         speakerLookback,
         skipNarration
       );
@@ -6021,6 +6147,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
   const unsubscribeChatSwitched = ctx.events.on("CHAT_SWITCHED", (rawPayload) => {
     const switchedChatId = rawPayload?.chatId ?? null;
     autoPlaybackEpoch += 1;
+    autoPlaybackRequests.cancelAll();
     playbackStartup.cancel();
     hostWindow.requestAnimationFrame(() => {
       if (ctx.getActiveChat().chatId === switchedChatId) refreshLocalState();
@@ -6031,17 +6158,57 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
   });
   const unsubscribeGenerationEnded = ctx.events.on("GENERATION_ENDED", (payload) => {
     const event = autoplayGenerationEvent(payload, ctx.getActiveChat().chatId);
-    if (!event || autoPlaybackDisposed) return;
-    if (!claimAutoplayGeneration(event, autoPlaybackSeenGenerations, autoPlaybackSeenMessages)) return;
-    if (!autoPlayback) return;
-    const eventEpoch = autoPlaybackEpoch;
-    autoPlaybackQueue = autoPlaybackQueue.catch(() => void 0).then(async () => {
-      while (activePlayback && !autoPlaybackDisposed && autoPlayback && eventEpoch === autoPlaybackEpoch && ctx.getActiveChat().chatId === event.chatId) await activePlayback.audibleDone;
-      if (autoPlaybackDisposed || !autoPlayback || eventEpoch !== autoPlaybackEpoch || ctx.getActiveChat().chatId !== event.chatId) return;
-      await playMessage(event.messageId, false, true, event.reroll ? event.content : void 0);
-    }).catch((error) => {
-      if (!autoPlaybackDisposed) setStatus(error instanceof Error ? error.message : "Automatic playback failed.", "error");
+    if (!event || autoPlaybackDisposed) {
+      appendSpeakerDebugLog("Autoplay ignored: generation was ineligible, failed, background, or not in the active chat.");
+      return;
+    }
+    const messageKey = `${event.chatId}\0${event.messageId}`;
+    const isReroll = !!event.reroll || autoPlaybackSeenMessages.has(messageKey) || activePlayback?.messageId === event.messageId;
+    if (!claimAutoplayGeneration(event, autoPlaybackSeenGenerations, autoPlaybackSeenMessages)) {
+      appendSpeakerDebugLog(`Autoplay ignored duplicate generation ${event.generationId}.`);
+      return;
+    }
+    if (!autoPlayback) {
+      appendSpeakerDebugLog(`Autoplay ignored generation ${event.generationId}: autoplay is disabled.`);
+      return;
+    }
+    appendSpeakerDebugLog(`Autoplay queued: generation ${event.generationId}, message ${event.messageId}, reroll=${isReroll}, delay=${autoPlaybackDelaySeconds}s.`);
+    const requestKey = `${event.chatId}\0${event.messageId}`;
+    const requestSignal = autoPlaybackRequests.begin(requestKey);
+    if (isReroll) {
+      playbackStartup.cancelAutomaticFor(event.chatId, event.messageId);
+      if (activePlayback?.messageId === event.messageId) stopPlayback();
+    }
+    const snapshot = requestPlaybackMessage(event.chatId, event.messageId).then(autoplaySwipeSnapshot).catch((error) => {
+      if (!requestSignal.aborted) appendSpeakerDebugLog(`Autoplay skipped: could not snapshot message ${event.messageId}: ${error instanceof Error ? error.message : String(error)}`);
+      return null;
     });
+    const eventEpoch = autoPlaybackEpoch;
+    const deadline = Date.now() + autoPlaybackDelaySeconds * 1e3;
+    autoPlaybackQueue = autoPlaybackQueue.catch(() => void 0).then(async () => {
+      let expectedSwipe = null;
+      await waitForAutoplayWork(snapshot.then((value) => {
+        expectedSwipe = value;
+      }), requestSignal);
+      if (!expectedSwipe || requestSignal.aborted) return;
+      if (!await waitForAutoplayDeadline(deadline, requestSignal)) {
+        appendSpeakerDebugLog(`Autoplay cancelled: generation ${event.generationId} was superseded or disabled.`);
+        return;
+      }
+      while (activePlayback && !requestSignal.aborted && !autoPlaybackDisposed && autoPlayback && eventEpoch === autoPlaybackEpoch && ctx.getActiveChat().chatId === event.chatId) await waitForAutoplayWork(activePlayback.audibleDone, requestSignal);
+      if (requestSignal.aborted || autoPlaybackDisposed || !autoPlayback || eventEpoch !== autoPlaybackEpoch || ctx.getActiveChat().chatId !== event.chatId) return;
+      let refreshedSwipe = null;
+      await waitForAutoplayWork(requestPlaybackMessage(event.chatId, event.messageId).then((message) => {
+        if (!message.is_user && expectedSwipe) refreshedSwipe = refreshAutoplaySwipe(message, expectedSwipe);
+      }), requestSignal);
+      if (!refreshedSwipe || requestSignal.aborted) {
+        appendSpeakerDebugLog(`Autoplay skipped: message ${event.messageId} is no longer on the generated swipe.`);
+        return;
+      }
+      await waitForAutoplayWork(playMessage(event.messageId, false, true, refreshedSwipe), requestSignal);
+    }).catch((error) => {
+      if (!autoPlaybackDisposed && !requestSignal.aborted) setStatus(error instanceof Error ? error.message : "Automatic playback failed.", "error");
+    }).finally(() => autoPlaybackRequests.finish(requestKey, requestSignal));
   });
   const unsubscribeActivate = tab.onActivate(() => {
     void loadConnections();
@@ -6053,6 +6220,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
   refreshLocalState();
   return () => {
     autoPlaybackDisposed = true;
+    autoPlaybackRequests.cancelAll();
     playbackStartup.cancel();
     hostDocument.removeEventListener("pointerdown", closeFavoritePickerOnOutsideClick);
     hostDocument.removeEventListener("keydown", closeFavoritePickerOnEscape);
@@ -6142,6 +6310,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
         ghostVoiceLifetime,
         autoVoiceCasting,
         autoPlayback,
+        autoPlaybackDelaySeconds,
         speakerLookback,
         skipNarration
       );
@@ -6155,6 +6324,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
     playbackBufferInput.removeEventListener("change", onPlaybackBufferInput);
     concurrentGenerationInput.removeEventListener("change", onConcurrentGenerationInput);
     rateLimitWaitInput.removeEventListener("change", onRateLimitWaitInput);
+    autoPlaybackDelayInput.removeEventListener("change", onAutoPlaybackDelayInput);
     ghostLifetimeInput.removeEventListener("change", onGhostLifetimeInput);
     speakerLookbackInput.removeEventListener("change", onSpeakerLookbackInput);
     speakerDebugToggle.removeEventListener("change", onSpeakerDebugChanged);

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { PlaybackLongPress, PlaybackStartupGuard, syncAutoplayIndicators, syncPlaybackButtons, type PlaybackButtonState } from './playback-ui'
+import { AutoplayRequestRegistry, PlaybackLongPress, PlaybackStartupGuard, syncAutoplayIndicators, syncPlaybackButtons, waitForAutoplayDeadline, waitForAutoplayWork, type PlaybackButtonState } from './playback-ui'
 import { evaluateSpeakerReviews } from './speaker-review-evaluation'
 import {
   adaptiveGenerationConcurrency,
@@ -35,9 +35,18 @@ import {
   applyFocusedOpeningFallback,
   standardSpeakerReviewPolicy,
   autoplayGenerationEvent,
+  autoplaySwipeSnapshot,
+  autoplaySwipeMatches,
+  refreshAutoplaySwipe,
+  readMessageSwipeContent,
+  targetSwipeContentMatches,
+  swipeSynthesisKey,
+  savedAudioMatchesSwipe,
+  automaticPlaybackSkipReason,
   claimAutoplayGeneration,
   hasAudioForActiveSwipe,
   readAutomaticVoicePreferences,
+  readAutoplayDelaySeconds,
   globalTtsConnectionPreference,
   resolveGlobalTtsConnection,
   buildBestAvailableSpeakerReview,
@@ -3151,8 +3160,8 @@ test('standard speaker review enables the production pipeline without comparison
 
 test('autoplay selects successful foreground messages and rerolls without duplicate events', () => {
   const event = { chatId: 'chat', generationId: 'gen', messageId: 'new', content: 'Finished text', generationType: 'normal' }
-  assert.deepEqual(autoplayGenerationEvent(event, 'chat'), { chatId: 'chat', generationId: 'gen', messageId: 'new' })
-  assert.deepEqual(autoplayGenerationEvent({ ...event, generationType: undefined }, 'chat'), { chatId: 'chat', generationId: 'gen', messageId: 'new' })
+  assert.deepEqual(autoplayGenerationEvent(event, 'chat'), { chatId: 'chat', generationId: 'gen', messageId: 'new', content: 'Finished text' })
+  assert.deepEqual(autoplayGenerationEvent({ ...event, generationType: undefined }, 'chat'), { chatId: 'chat', generationId: 'gen', messageId: 'new', content: 'Finished text' })
   assert.equal(autoplayGenerationEvent(event, 'another-chat'), null)
   assert.equal(autoplayGenerationEvent({ ...event, error: 'generation failed' }, 'chat'), null)
   assert.equal(autoplayGenerationEvent({ ...event, messageId: undefined }, 'chat'), null)
@@ -3164,7 +3173,9 @@ test('autoplay selects successful foreground messages and rerolls without duplic
   const messages = new Set<string>()
   assert.equal(claimAutoplayGeneration(event, generations, messages), true)
   assert.equal(claimAutoplayGeneration(event, generations, messages), false)
-  assert.equal(claimAutoplayGeneration({ ...event, generationId: 'retry' }, generations, messages), false)
+  const untypedReroll = autoplayGenerationEvent({ ...event, generationId: 'retry', generationType: undefined }, 'chat')!
+  assert.equal(claimAutoplayGeneration(untypedReroll, generations, messages), true)
+  assert.equal(claimAutoplayGeneration(untypedReroll, generations, messages), false)
   const reroll = { ...event, generationId: 'reroll', reroll: true }
   assert.equal(claimAutoplayGeneration(reroll, generations, messages), true)
   assert.equal(claimAutoplayGeneration(reroll, generations, messages), false)
@@ -3180,6 +3191,62 @@ test('autoplay recognizes saved audio only on its active swipe', () => {
   assert.equal(hasAudioForActiveSwipe(swiped), true)
   assert.equal(hasAudioForActiveSwipe({ ...swiped, swipe_id: 2 }), false)
   assert.equal(hasAudioForActiveSwipe({ swipe_id: 1, extra: { attachments: [{ type: 'image', swipe_id: 1 }] } }), false)
+})
+
+test('autoplay snapshots the active swipe and detects later navigation or edits', () => {
+  const message = { swipe_id: 4, content: 'Fourth reroll.' }
+  const snapshot = autoplaySwipeSnapshot(message)
+  assert.equal(autoplaySwipeMatches(message, snapshot), true)
+  assert.equal(autoplaySwipeMatches({ ...message, swipe_id: 5 }, snapshot), false)
+  assert.equal(autoplaySwipeMatches({ ...message, content: 'A later reroll in the same slot.' }, snapshot), false)
+  assert.equal(autoplaySwipeMatches({ content: 'Original.' }, autoplaySwipeSnapshot({ swipe_id: 0, content: 'Original.' })), true)
+})
+
+test('autoplay refreshes edits on the original swipe after its delay but rejects another swipe', () => {
+  const generated = { swipe_id: 2, content: 'Original text.', swipe_dates: [10, 20, 30] }
+  const original = autoplaySwipeSnapshot(generated)
+  const honed = { ...generated, content: 'Honed text.' }
+  const refreshed = refreshAutoplaySwipe(honed, original)
+  assert.ok(refreshed)
+  assert.equal(autoplaySwipeMatches(honed, refreshed), true)
+  assert.equal(autoplaySwipeMatches(honed, original), false)
+  assert.equal(refreshAutoplaySwipe({ ...honed, swipe_id: 1 }, original), null)
+  assert.equal(refreshAutoplaySwipe({ ...honed, swipe_dates: [10, 20, 99] }, original), null)
+  assert.equal(autoplaySwipeMatches({ ...honed, content: 'Edited after refresh.' }, refreshed), false)
+  assert.ok(refreshAutoplaySwipe({ swipe_id: 2, content: 'Edited.' }, autoplaySwipeSnapshot({ swipe_id: 2, content: 'Original.' })))
+})
+
+test('synthesis and save validation remain scoped to the original swipe after navigation', () => {
+  const initial = { swipe_id: 1, content: 'Second version.' }
+  const snapshot = autoplaySwipeSnapshot(initial)
+  const navigated = { swipe_id: 2, content: 'Third version.', swipes: ['First version.', 'Second version.', 'Third version.'] }
+  assert.equal(autoplaySwipeMatches(navigated, snapshot), false)
+  assert.equal(targetSwipeContentMatches(readMessageSwipeContent(navigated, snapshot.swipeId), snapshot), true)
+  assert.equal(targetSwipeContentMatches(readMessageSwipeContent({ ...navigated, swipes: ['First version.', 'Edited.', 'Third version.'] }, 1), snapshot), false)
+  assert.equal(targetSwipeContentMatches(readMessageSwipeContent({ ...navigated, swipes: ['First version.', 'Third version.'] }, 1), snapshot), false)
+  assert.equal(readMessageSwipeContent({ swipe_id: 2, content: 'Third version.' }, 1), null)
+  assert.notEqual(swipeSynthesisKey('chat', 'message', 1), swipeSynthesisKey('chat', 'message', 2))
+  assert.equal(swipeSynthesisKey('chat', 'message', 1), swipeSynthesisKey('chat', 'message', 1))
+})
+
+test('saved audio confirmation requires the requested swipe and attachment', () => {
+  const result = { message: { id: 'message', extra: { attachments: [{ type: 'audio', image_id: 'older', swipe_id: 1 }, { type: 'audio', image_id: 'new', swipe_id: 2 }] } }, audio: { id: 'new' }, swipe_id: 2 }
+  assert.equal(savedAudioMatchesSwipe(result, 'message', 2), true)
+  assert.equal(savedAudioMatchesSwipe(result, 'message', 1), false)
+  assert.equal(savedAudioMatchesSwipe({ ...result, swipe_id: 1 }, 'message', 2), false)
+  assert.equal(savedAudioMatchesSwipe({ ...result, audio: { id: 'older' } }, 'message', 2), false)
+})
+
+test('saved audio does not prevent automatic playback of a valid reroll', () => {
+  const message = { is_user: false, swipe_id: 3, content: 'New response.', extra: { attachments: [{ type: 'audio', swipe_id: 3 }] } }
+  const snapshot = autoplaySwipeSnapshot(message)
+  assert.equal(hasAudioForActiveSwipe(message), true)
+  assert.equal(automaticPlaybackSkipReason(message, snapshot), null)
+  assert.equal(automaticPlaybackSkipReason({ ...message, is_user: true }, snapshot), 'user-message')
+  assert.equal(automaticPlaybackSkipReason({ ...message, swipe_id: 4 }, snapshot), 'changed-swipe')
+  assert.equal(automaticPlaybackSkipReason({ ...message, content: 'Changed response.' }, snapshot), 'changed-swipe')
+  assert.equal(shouldPersistMessageAudio(false, true, false), true)
+  assert.equal(shouldPersistMessageAudio(false, false, false), false)
 })
 
 test('playback controls follow shared playback state, including menus rendered later', () => {
@@ -3268,6 +3335,47 @@ test('automatic casting defaults on and autoplay requires explicit opt-in', () =
   assert.deepEqual(readAutomaticVoicePreferences({ chatVoiceAutoCasting: true, chatVoiceAutoPlayback: 'true' }), { autoVoiceCasting: true, autoPlayback: false })
 })
 
+test('autoplay delay defaults to zero and clamps invalid and excessive values', () => {
+  assert.equal(readAutoplayDelaySeconds(undefined), 0)
+  assert.equal(readAutoplayDelaySeconds(NaN), 0)
+  assert.equal(readAutoplayDelaySeconds(-3), 0)
+  assert.equal(readAutoplayDelaySeconds(2.6), 3)
+  assert.equal(readAutoplayDelaySeconds(5000), 3600)
+})
+
+test('autoplay deadline waits and can be cancelled without blocking the queue', async () => {
+  const alreadyAborted = new AbortController()
+  alreadyAborted.abort()
+  assert.equal(await waitForAutoplayDeadline(Date.now(), alreadyAborted.signal), false)
+  assert.equal(await waitForAutoplayDeadline(Date.now() - 1, new AbortController().signal), true)
+  const pending = new AbortController()
+  const waiting = waitForAutoplayDeadline(Date.now() + 10000, pending.signal)
+  pending.abort()
+  assert.equal(await waiting, false)
+  assert.equal(await waitForAutoplayDeadline(Date.now() + 5, new AbortController().signal), true)
+})
+
+test('new rerolls supersede the same message without cancelling other messages', async () => {
+  const requests = new AutoplayRequestRegistry()
+  const first = requests.begin('chat\0message')
+  const other = requests.begin('chat\0other')
+  const pendingDelay = waitForAutoplayDeadline(Date.now() + 10000, first)
+  const second = requests.begin('chat\0message')
+  assert.equal(await pendingDelay, false)
+  assert.equal(first.aborted, true)
+  assert.equal(other.aborted, false)
+  requests.finish('chat\0message', first)
+  assert.equal(second.aborted, false)
+  const playing = waitForAutoplayWork(new Promise<void>(() => undefined), second)
+  const third = requests.begin('chat\0message')
+  await playing
+  assert.equal(second.aborted, true)
+  assert.equal(third.aborted, false)
+  requests.cancelAll()
+  assert.equal(third.aborted, true)
+  assert.equal(other.aborted, true)
+})
+
 test('playback startup ownership prevents overlapping and cancelled audio starts', () => {
   const guard = new PlaybackStartupGuard()
   const first = guard.begin('chat', 'one', true)!
@@ -3286,8 +3394,15 @@ test('playback startup ownership prevents overlapping and cancelled audio starts
   const manual = guard.begin('chat', 'four', false)!
   guard.cancelAutomatic()
   assert.equal(guard.owns(manual), true)
+  guard.cancelAutomaticFor('chat', 'four')
+  assert.equal(guard.owns(manual), true)
   guard.cancel()
   assert.equal(guard.owns(manual), false)
+  const auto = guard.begin('chat', 'five', true)!
+  guard.cancelAutomaticFor('chat', 'other')
+  assert.equal(guard.owns(auto), true)
+  guard.cancelAutomaticFor('chat', 'five')
+  assert.equal(guard.owns(auto), false)
 })
 
 test('immediate named voice attribution anchors the preceding quote but not an introduced next quote', () => {

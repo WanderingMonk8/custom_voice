@@ -18,14 +18,14 @@ export function autoplayGenerationEvent(value: unknown, activeChatId: string | n
   if (['continue', 'impersonate'].includes(kind)) return null
   const reroll = kind === 'regenerate' || kind === 'swipe'
   return { chatId: activeChatId, messageId: event.messageId, generationId: event.generationId,
-    ...(reroll ? { reroll: true, ...(typeof event.content === 'string' ? { content: event.content } : {}) } : {}) }
+    ...(reroll ? { reroll: true } : {}), ...(typeof event.content === 'string' ? { content: event.content } : {}) }
 }
 
 /** Deduplicate reconnect/repeated notifications while bounding in-memory state. */
 export function claimAutoplayGeneration(event: AutoplayGeneration, generations: Set<string>, messages: Set<string>): boolean {
   const generationKey = `${event.chatId}\u0000${event.generationId}`
   const messageKey = `${event.chatId}\u0000${event.messageId}`
-  if (generations.has(generationKey) || (!event.reroll && messages.has(messageKey))) return false
+  if (generations.has(generationKey)) return false
   generations.add(generationKey)
   messages.add(messageKey)
   if (generations.size > 512) generations.delete(generations.values().next().value!)
@@ -45,9 +45,68 @@ export function hasAudioForActiveSwipe(message: { swipe_id?: number; extra?: Rec
   })
 }
 
+export interface AutoplaySwipeSnapshot { swipeId: number; contentHash: string; swipeDate?: number }
+export function autoplaySwipeSnapshot(message: { swipe_id?: number; content: string; swipe_dates?: number[] }): AutoplaySwipeSnapshot {
+  const swipeId = message.swipe_id ?? 0
+  const swipeDate = message.swipe_dates?.[swipeId]
+  return { swipeId, contentHash: hashMessageContent(message.content), ...(typeof swipeDate === 'number' && Number.isFinite(swipeDate) ? { swipeDate } : {}) }
+}
+
+export function autoplaySwipeMatches(message: { swipe_id?: number; content: string; swipe_dates?: number[] }, expected: AutoplaySwipeSnapshot): boolean {
+  const actual = autoplaySwipeSnapshot(message)
+  return actual.swipeId === expected.swipeId && actual.contentHash === expected.contentHash
+    && (expected.swipeDate === undefined || actual.swipeDate === expected.swipeDate)
+}
+
+/** Accept same-swipe edits during the delay but never follow a different swipe. */
+export function refreshAutoplaySwipe(message: { swipe_id?: number; content: string; swipe_dates?: number[] }, original: AutoplaySwipeSnapshot): AutoplaySwipeSnapshot | null {
+  const current = autoplaySwipeSnapshot(message)
+  if (current.swipeId !== original.swipeId) return null
+  if (original.swipeDate !== undefined && current.swipeDate !== original.swipeDate) return null
+  return current
+}
+
+/** Validate the original swipe, regardless of which swipe is currently visible. */
+export function targetSwipeContentMatches(targetSwipeContent: unknown, expected: { contentHash: string }): boolean {
+  return typeof targetSwipeContent === 'string' && hashMessageContent(targetSwipeContent) === expected.contentHash
+}
+
+/** Read a specific swipe without accidentally substituting another active swipe. */
+export function readMessageSwipeContent(message: { swipe_id?: number; swipes?: unknown; content?: string }, swipeId: number): string | null {
+  if (!Number.isInteger(swipeId) || swipeId < 0) return null
+  if (Array.isArray(message.swipes) && message.swipes.length > 0) {
+    return typeof message.swipes[swipeId] === 'string' ? message.swipes[swipeId] : null
+  }
+  return (message.swipe_id ?? 0) === swipeId && typeof message.content === 'string' ? message.content : null
+}
+
+export function swipeSynthesisKey(chatId: string, messageId: string, swipeId: number): string {
+  return `${chatId}\u0000${messageId}\u0000${swipeId}`
+}
+
+/** A save is confirmed only when the host attaches that audio to the target swipe. */
+export function savedAudioMatchesSwipe(result: { message?: { id?: string; extra?: { attachments?: Array<{ type?: string; image_id?: string; swipe_id?: number }> } }; audio?: { id?: string }; swipe_id?: number }, messageId: string, swipeId: number): boolean {
+  const audioId = result.audio?.id
+  return result.message?.id === messageId && result.swipe_id === swipeId && !!audioId
+    && !!result.message.extra?.attachments?.some(item => item?.type === 'audio' && item.image_id === audioId && item.swipe_id === swipeId)
+}
+
+/** Existing audio does not block autoplay; saving is governed separately. */
+export function automaticPlaybackSkipReason(message: { is_user: boolean; swipe_id?: number; content: string; swipe_dates?: number[] }, expected?: AutoplaySwipeSnapshot): 'user-message' | 'changed-swipe' | null {
+  if (message.is_user) return 'user-message'
+  if (expected && !autoplaySwipeMatches(message, expected)) return 'changed-swipe'
+  return null
+}
+
 /** Preserve explicit casting opt-outs; automatic playback requires an opt-in. */
 export function readAutomaticVoicePreferences(value: Record<string, unknown>) {
   return { autoVoiceCasting: value.chatVoiceAutoCasting !== false, autoPlayback: value.chatVoiceAutoPlayback === true }
+}
+
+export const MAX_AUTOPLAY_DELAY_SECONDS = 3600
+export function readAutoplayDelaySeconds(value: unknown): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return 0
+  return Math.min(MAX_AUTOPLAY_DELAY_SECONDS, Math.max(0, Math.round(value)))
 }
 /** Choose a global extension preference, then Lumiverse's global default. */
 export function globalTtsConnectionPreference(value: Record<string, unknown>): string {

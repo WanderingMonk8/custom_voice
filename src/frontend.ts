@@ -2,7 +2,7 @@ import type {
   SpindleFrontendContext,
   SpindleTextInputHandle,
 } from 'lumiverse-spindle-types'
-import { PlaybackLongPress, PlaybackStartupGuard, syncAutoplayIndicators, syncPlaybackButtons, type PlaybackButtonState } from './playback-ui'
+import { AutoplayRequestRegistry, PlaybackLongPress, PlaybackStartupGuard, syncAutoplayIndicators, syncPlaybackButtons, waitForAutoplayDeadline, waitForAutoplayWork, type PlaybackButtonState } from './playback-ui'
 import {
   activeGhostVoices,
   adaptiveGenerationConcurrency,
@@ -20,8 +20,16 @@ import {
   globalTtsConnectionPreference,
   standardSpeakerReviewPolicy,
   autoplayGenerationEvent,
+  autoplaySwipeSnapshot,
+  autoplaySwipeMatches,
+  refreshAutoplaySwipe,
+  targetSwipeContentMatches,
+  swipeSynthesisKey,
+  savedAudioMatchesSwipe,
+  automaticPlaybackSkipReason,
   claimAutoplayGeneration,
-  hasAudioForActiveSwipe,
+  MAX_AUTOPLAY_DELAY_SECONDS,
+  readAutoplayDelaySeconds,
   readAutomaticVoicePreferences,
   resolveGlobalTtsConnection,
   encodeConcatenatedWav,
@@ -55,6 +63,7 @@ import {
   type PlaybackSegment,
   type SpeakerAssignmentSource,
   type FavoriteVoice,
+  type AutoplaySwipeSnapshot,
   type UncastVoiceGroup,
   type UncastVoiceAssignment,
   type SavedAudioRecord,
@@ -320,6 +329,8 @@ interface PlaybackMessage {
   name: string
   content: string
   swipe_id?: number
+  swipe_dates?: number[]
+  targetSwipeContent?: string | null
   extra?: Record<string, unknown>
 }
 
@@ -371,6 +382,7 @@ interface PlaybackPreferences {
   speakerLookback: number
   autoVoiceCasting: boolean
   autoPlayback: boolean
+  autoPlaybackDelaySeconds: number
   speakerAssignmentDebug: boolean
   skipNarration: boolean
   defaultNarratorVoice: string
@@ -440,6 +452,7 @@ async function loadPlaybackPreferences(): Promise<PlaybackPreferences> {
     playbackBufferSegments: DEFAULT_PLAYBACK_BUFFER_SEGMENTS,
     concurrentGenerations: DEFAULT_CONCURRENT_GENERATIONS,
     rateLimitWaitSeconds: DEFAULT_RATE_LIMIT_WAIT_SECONDS,
+    autoPlaybackDelaySeconds: 0,
     ghostVoiceLifetime: GHOST_VOICE_LIFETIME_MESSAGES,
     speakerLookback: DEFAULT_SPEAKER_LOOKBACK,
     ...readAutomaticVoicePreferences({}),
@@ -494,6 +507,7 @@ async function loadPlaybackPreferences(): Promise<PlaybackPreferences> {
       DEFAULT_RATE_LIMIT_WAIT_SECONDS,
       MAX_RATE_LIMIT_WAIT_SECONDS,
     ),
+    autoPlaybackDelaySeconds: readAutoplayDelaySeconds(row.value?.chatVoiceAutoPlaybackDelaySeconds),
     ghostVoiceLifetime: clampIntegerSetting(row.value?.chatVoiceGhostVoiceLifetime, GHOST_VOICE_LIFETIME_MESSAGES, 1000),
     speakerLookback: clampIntegerSetting(row.value?.chatVoiceSpeakerLookback, DEFAULT_SPEAKER_LOOKBACK, MAX_SPEAKER_LOOKBACK),
     ...readAutomaticVoicePreferences(row.value ?? {}),
@@ -591,6 +605,7 @@ function saveAdvancedPlaybackPreferences(
   ghostVoiceLifetime: number,
   autoVoiceCasting: boolean,
   autoPlayback: boolean,
+  autoPlaybackDelaySeconds: number,
   speakerLookback: number,
   skipNarration: boolean,
 ): Promise<void> {
@@ -615,6 +630,7 @@ function saveAdvancedPlaybackPreferences(
     chatVoiceSkipNarration: skipNarration,
     chatVoiceAutoCasting: autoVoiceCasting,
     chatVoiceAutoPlayback: autoPlayback,
+    chatVoiceAutoPlaybackDelaySeconds: readAutoplayDelaySeconds(autoPlaybackDelaySeconds),
     chatVoiceGhostVoiceLifetime: clampIntegerSetting(ghostVoiceLifetime, GHOST_VOICE_LIFETIME_MESSAGES, 1000),
     chatVoiceSpeakerLookback: clampIntegerSetting(speakerLookback, DEFAULT_SPEAKER_LOOKBACK, MAX_SPEAKER_LOOKBACK),
   }))
@@ -905,7 +921,8 @@ async function saveMessageAudio(
   const form = new FormData()
   form.append('chatId', chatId)
   form.append('messageId', messageId)
-  if (typeof swipeId === 'number') form.append('swipeId', String(swipeId))
+  if (!Number.isInteger(swipeId) || (swipeId ?? -1) < 0) throw new Error('Cannot safely save audio: the target swipe ID is unavailable.')
+  form.append('swipeId', String(swipeId))
   segments.forEach((segment, index) => {
     const blob = new Blob([segment.data], { type: segment.mime || 'audio/mpeg' })
     form.append('segment', blob, `seg-${String(index).padStart(4, '0')}`)
@@ -929,13 +946,10 @@ async function saveMessageAudio(
   } catch {
     throw new Error('Lumiverse returned an invalid response after saving generated audio.')
   }
-  const savedAudioId = result.audio?.id
-  const attachments = result.message?.extra?.attachments
-  const attached = Array.isArray(attachments) && attachments.some(attachment => (
-    attachment?.type === 'audio' && attachment.image_id === savedAudioId
-  ))
-  if (result.message?.id !== messageId || !savedAudioId || !attached) {
-    throw new Error('Lumiverse did not confirm the generated audio attachment on the message.')
+  if (typeof swipeId !== 'number' || !savedAudioMatchesSwipe(result, messageId, swipeId)) {
+    const error = new Error('Lumiverse did not confirm the generated audio attachment on the requested swipe.')
+    error.name = 'AudioSaveVerificationError'
+    throw error
   }
   return result
 }
@@ -1324,6 +1338,7 @@ export function setup(ctx: SpindleFrontendContext) {
   const playbackBufferField = createField('Playback buffer segments')
   const concurrentGenerationField = createField('Maximum concurrent generations')
   const rateLimitWaitField = createField('Rate-limit wait budget (seconds)')
+  const autoPlaybackDelayField = createField('Autoplay delay (seconds)')
   const ghostLifetimeField = createField('Uncast voice lifetime (assistant messages)')
   const speakerLookbackField = createField('Global speaker context (messages)')
   const autoCastingLabel = document.createElement('label')
@@ -1392,6 +1407,7 @@ export function setup(ctx: SpindleFrontendContext) {
     speakerLookbackField.field,
     autoCastingLabel,
     autoPlaybackLabel,
+    autoPlaybackDelayField.field,
     skipNarrationLabel,
     speakerDebugLabel,
     speakerDebugOutput,
@@ -1403,6 +1419,7 @@ export function setup(ctx: SpindleFrontendContext) {
   const autoPlaybackSeenGenerations = new Set<string>()
   const autoPlaybackSeenMessages = new Set<string>()
   let autoPlaybackQueue: Promise<void> = Promise.resolve()
+  const autoPlaybackRequests = new AutoplayRequestRegistry()
   let autoPlaybackDisposed = false
   let autoPlaybackEpoch = 0
   let connections: TtsConnection[] = []
@@ -1468,6 +1485,7 @@ export function setup(ctx: SpindleFrontendContext) {
   let rateLimitWaitSeconds = DEFAULT_RATE_LIMIT_WAIT_SECONDS
   let autoVoiceCasting = true
   let autoPlayback = false
+  let autoPlaybackDelaySeconds = 0
   const playbackStartup = new PlaybackStartupGuard()
   let ghostVoiceLifetime = GHOST_VOICE_LIFETIME_MESSAGES
   let speakerLookback = DEFAULT_SPEAKER_LOOKBACK
@@ -1904,6 +1922,19 @@ export function setup(ctx: SpindleFrontendContext) {
     MAX_RATE_LIMIT_WAIT_SECONDS,
     'Rate-limit wait budget in seconds',
   )
+  const autoPlaybackDelayInput = createNumberInput(0, MAX_AUTOPLAY_DELAY_SECONDS, 'Autoplay delay in seconds')
+  autoPlaybackDelayInput.min = '0'
+  autoPlaybackDelayField.slot.appendChild(autoPlaybackDelayInput)
+  const autoPlaybackDelayHint = document.createElement('div')
+  autoPlaybackDelayHint.className = 'chat-voice-hint'
+  autoPlaybackDelayHint.textContent = 'Wait this long after a message or reroll finishes before starting automatic playback. Default: 0 seconds.'
+  autoPlaybackDelayField.slot.appendChild(autoPlaybackDelayHint)
+  const onAutoPlaybackDelayInput = () => {
+    autoPlaybackDelaySeconds = readAutoplayDelaySeconds(autoPlaybackDelayInput.valueAsNumber)
+    autoPlaybackDelayInput.value = String(autoPlaybackDelaySeconds)
+    scheduleAdvancedSettingsSave()
+  }
+  autoPlaybackDelayInput.addEventListener('change', onAutoPlaybackDelayInput)
   const ghostLifetimeInput = createNumberInput(GHOST_VOICE_LIFETIME_MESSAGES, 1000, 'Uncast voice lifetime in assistant messages')
   ghostLifetimeField.slot.appendChild(ghostLifetimeInput)
   const ghostLifetimeHint = document.createElement('div')
@@ -2054,7 +2085,7 @@ export function setup(ctx: SpindleFrontendContext) {
     nativeButtonStates.clear()
   }
 
-  function requestPlaybackMessage(chatId: string, messageId: string): Promise<PlaybackMessage> {
+  function requestPlaybackMessage(chatId: string, messageId: string, targetSwipeId?: number): Promise<PlaybackMessage> {
     const requestId = `${Date.now().toString(36)}-${++messageRequestSequence}`
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -2062,7 +2093,7 @@ export function setup(ctx: SpindleFrontendContext) {
         reject(new Error('Timed out while loading the message for playback.'))
       }, 15_000)
       pendingMessageRequests.set(requestId, { resolve, reject, timer })
-      ctx.sendToBackend({ type: 'chat_voice_get_message', chatId, messageId, requestId })
+      ctx.sendToBackend({ type: 'chat_voice_get_message', chatId, messageId, requestId, ...(targetSwipeId !== undefined ? { targetSwipeId } : {}) })
     })
   }
 
@@ -2688,11 +2719,13 @@ export function setup(ctx: SpindleFrontendContext) {
     signal: AbortSignal,
     waitForSafeFallback: () => Promise<void>,
     onWavAssembly: (normalized: boolean) => void,
+    verifyBeforeSave?: () => Promise<void>,
   ): Promise<SavedMessageAudioResult> {
     const normalized = segments.some(segment => segment.normalizationGain !== undefined)
     if (normalized) {
       onWavAssembly(true)
       const wav = await encodeCapturedWav(segments, contextClass)
+      await verifyBeforeSave?.()
       return saveMessageAudio(
         chatId,
         messageId,
@@ -2702,13 +2735,15 @@ export function setup(ctx: SpindleFrontendContext) {
       )
     }
     try {
+      await verifyBeforeSave?.()
       return await saveMessageAudio(chatId, messageId, swipeId, segments, signal)
     } catch (segmentSaveError) {
-      if ((segmentSaveError as { name?: string })?.name === 'AbortError') throw segmentSaveError
+      if (['AbortError', 'AudioSaveVerificationError'].includes((segmentSaveError as { name?: string })?.name ?? '')) throw segmentSaveError
       await waitForSafeFallback()
       if (signal.aborted) throw new DOMException('Audio saving stopped.', 'AbortError')
       onWavAssembly(false)
       const wav = await encodeCapturedWav(segments, contextClass)
+      await verifyBeforeSave?.()
       return saveMessageAudio(
         chatId,
         messageId,
@@ -2730,7 +2765,7 @@ export function setup(ctx: SpindleFrontendContext) {
     })
   }
 
-  async function playMessage(messageId: string, nativeRegenerationAction = false, automatic = false, expectedContent?: string): Promise<void> {
+  async function playMessage(messageId: string, nativeRegenerationAction = false, automatic = false, expectedSwipe?: AutoplaySwipeSnapshot): Promise<void> {
     if (activePlayback?.messageId === messageId) {
       if (automatic) return
       playbackStartup.cancel()
@@ -2760,7 +2795,12 @@ export function setup(ctx: SpindleFrontendContext) {
       return
     }
     if (!ownsStartup()) return
-    if (automatic && (message.is_user || hasAudioForActiveSwipe(message) || (expectedContent !== undefined && message.content.trim() !== expectedContent.trim()))) return
+    const automaticSkip = automatic ? automaticPlaybackSkipReason(message, expectedSwipe) : null
+    if (automaticSkip === 'user-message') { appendSpeakerDebugLog(`Autoplay skipped: message ${messageId} belongs to the user.`); return }
+    if (automaticSkip === 'changed-swipe') {
+      appendSpeakerDebugLog(`Autoplay skipped: message ${messageId} changed swipe or content after generation (expected swipe ${expectedSwipe?.swipeId ?? 'unknown'}, active swipe ${message.swipe_id ?? 0}).`)
+      return
+    }
 
     const regeneratingSavedAudio = !message.is_user
       && (nativeRegenerationAction || (!automatic && hasSavedAudioForCurrentSwipe(message)))
@@ -3322,12 +3362,12 @@ export function setup(ctx: SpindleFrontendContext) {
         ))
       }
 
-      const synthesisMessageKey = `${playbackChat.id}\u0000${messageId}`
+      const synthesisMessageKey = swipeSynthesisKey(playbackChat.id, messageId, message.swipe_id ?? 0)
       const previousSynthesis = backgroundSynthesisByMessage.get(synthesisMessageKey)
       if (previousSynthesis) {
         previousSynthesis.abort()
         backgroundSynthesisByMessage.delete(synthesisMessageKey)
-        appendSpeakerDebugLog('Cancelled an older unfinished synthesis/save for this message.')
+        appendSpeakerDebugLog('Cancelled an older unfinished synthesis/save for this message swipe.')
       }
       const synthesisController = new AbortController()
       const rateLimitBudget: RateLimitBudget = {
@@ -3548,6 +3588,14 @@ export function setup(ctx: SpindleFrontendContext) {
                 setStatus(normalized
                   ? 'Preparing normalized saved audio…'
                   : 'Server could not combine the source audio; retrying as WAV…')
+              }
+            },
+            async () => {
+              if (!Number.isInteger(message.swipe_id) || (message.swipe_id ?? -1) < 0) throw new Error('Cannot safely save audio: the target swipe ID is unavailable.')
+              const latest = await requestPlaybackMessage(playbackChat.id, messageId, message.swipe_id)
+              if (synthesisController.signal.aborted || latest.is_user || !targetSwipeContentMatches(latest.targetSwipeContent, autoplaySwipeSnapshot(message))) {
+                appendSpeakerDebugLog(`Audio save cancelled: message ${messageId}, swipe ${message.swipe_id}, was removed or changed since playback began.`)
+                throw new DOMException('Target swipe changed before audio save.', 'AbortError')
               }
             },
           )
@@ -4528,8 +4576,15 @@ export function setup(ctx: SpindleFrontendContext) {
         refreshLocalState()
         autoVoiceCasting = preferences.autoVoiceCasting
         autoCastingToggle.checked = autoVoiceCasting
+        if (autoPlayback !== preferences.autoPlayback) {
+          autoPlaybackEpoch += 1
+          autoPlaybackRequests.cancelAll()
+          if (!preferences.autoPlayback) playbackStartup.cancelAutomatic()
+        }
         autoPlayback = preferences.autoPlayback
         autoPlaybackToggle.checked = autoPlayback
+        autoPlaybackDelaySeconds = preferences.autoPlaybackDelaySeconds
+        autoPlaybackDelayInput.value = String(autoPlaybackDelaySeconds)
         updatePlaybackButtons()
         speakerAssignmentDebug = preferences.speakerAssignmentDebug
         playbackBufferInput.value = String(playbackBufferSegments)
@@ -4675,6 +4730,7 @@ export function setup(ctx: SpindleFrontendContext) {
   function onAutoPlaybackChanged(): void {
     autoPlayback = autoPlaybackToggle.checked
     if (!autoPlayback) playbackStartup.cancelAutomatic()
+    autoPlaybackRequests.cancelAll()
     autoPlaybackEpoch += 1
     updatePlaybackButtons()
     scheduleAdvancedSettingsSave()
@@ -4692,6 +4748,7 @@ export function setup(ctx: SpindleFrontendContext) {
         ghostVoiceLifetime,
         autoVoiceCasting,
         autoPlayback,
+        autoPlaybackDelaySeconds,
         speakerLookback,
         skipNarration,
       )
@@ -5134,6 +5191,7 @@ export function setup(ctx: SpindleFrontendContext) {
   const unsubscribeChatSwitched = ctx.events.on('CHAT_SWITCHED', (rawPayload: unknown) => {
     const switchedChatId = (rawPayload as { chatId?: string | null })?.chatId ?? null
     autoPlaybackEpoch += 1
+    autoPlaybackRequests.cancelAll()
     playbackStartup.cancel()
     hostWindow.requestAnimationFrame(() => {
       if (ctx.getActiveChat().chatId === switchedChatId) refreshLocalState()
@@ -5146,15 +5204,46 @@ export function setup(ctx: SpindleFrontendContext) {
 
   const unsubscribeGenerationEnded = ctx.events.on('GENERATION_ENDED', (payload: unknown) => {
     const event = autoplayGenerationEvent(payload, ctx.getActiveChat().chatId)
-    if (!event || autoPlaybackDisposed) return
-    if (!claimAutoplayGeneration(event, autoPlaybackSeenGenerations, autoPlaybackSeenMessages)) return
-    if (!autoPlayback) return
+    if (!event || autoPlaybackDisposed) { appendSpeakerDebugLog('Autoplay ignored: generation was ineligible, failed, background, or not in the active chat.'); return }
+    const messageKey = `${event.chatId}\u0000${event.messageId}`
+    const isReroll = !!event.reroll || autoPlaybackSeenMessages.has(messageKey) || activePlayback?.messageId === event.messageId
+    if (!claimAutoplayGeneration(event, autoPlaybackSeenGenerations, autoPlaybackSeenMessages)) { appendSpeakerDebugLog(`Autoplay ignored duplicate generation ${event.generationId}.`); return }
+    if (!autoPlayback) { appendSpeakerDebugLog(`Autoplay ignored generation ${event.generationId}: autoplay is disabled.`); return }
+    appendSpeakerDebugLog(`Autoplay queued: generation ${event.generationId}, message ${event.messageId}, reroll=${isReroll}, delay=${autoPlaybackDelaySeconds}s.`)
+    const requestKey = `${event.chatId}\u0000${event.messageId}`
+    const requestSignal = autoPlaybackRequests.begin(requestKey)
+    if (isReroll) {
+      playbackStartup.cancelAutomaticFor(event.chatId, event.messageId)
+      if (activePlayback?.messageId === event.messageId) stopPlayback()
+    }
+    // The generation event does not carry a swipe ID. Capture the saved
+    // message immediately, before the delay or another playback can queue it.
+    const snapshot = requestPlaybackMessage(event.chatId, event.messageId).then(autoplaySwipeSnapshot).catch(error => {
+      if (!requestSignal.aborted) appendSpeakerDebugLog(`Autoplay skipped: could not snapshot message ${event.messageId}: ${error instanceof Error ? error.message : String(error)}`)
+      return null
+    })
     const eventEpoch = autoPlaybackEpoch
+    const deadline = Date.now() + autoPlaybackDelaySeconds * 1_000
     autoPlaybackQueue = autoPlaybackQueue.catch(() => undefined).then(async () => {
-      while (activePlayback && !autoPlaybackDisposed && autoPlayback && eventEpoch === autoPlaybackEpoch && ctx.getActiveChat().chatId === event.chatId) await activePlayback.audibleDone
-      if (autoPlaybackDisposed || !autoPlayback || eventEpoch !== autoPlaybackEpoch || ctx.getActiveChat().chatId !== event.chatId) return
-      await playMessage(event.messageId, false, true, event.reroll ? event.content : undefined)
-    }).catch(error => { if (!autoPlaybackDisposed) setStatus(error instanceof Error ? error.message : 'Automatic playback failed.', 'error') })
+      let expectedSwipe: AutoplaySwipeSnapshot | null = null
+      await waitForAutoplayWork(snapshot.then(value => { expectedSwipe = value }), requestSignal)
+      if (!expectedSwipe || requestSignal.aborted) return
+      if (!await waitForAutoplayDeadline(deadline, requestSignal)) { appendSpeakerDebugLog(`Autoplay cancelled: generation ${event.generationId} was superseded or disabled.`); return }
+      while (activePlayback && !requestSignal.aborted && !autoPlaybackDisposed && autoPlayback && eventEpoch === autoPlaybackEpoch && ctx.getActiveChat().chatId === event.chatId) await waitForAutoplayWork(activePlayback.audibleDone, requestSignal)
+      if (requestSignal.aborted || autoPlaybackDisposed || !autoPlayback || eventEpoch !== autoPlaybackEpoch || ctx.getActiveChat().chatId !== event.chatId) return
+      // Refinement extensions may edit this same swipe during the configured
+      // delay. Refresh its text, but refuse navigation or a replaced swipe.
+      let refreshedSwipe: AutoplaySwipeSnapshot | null = null
+      await waitForAutoplayWork(requestPlaybackMessage(event.chatId, event.messageId).then(message => {
+        if (!message.is_user && expectedSwipe) refreshedSwipe = refreshAutoplaySwipe(message, expectedSwipe)
+      }), requestSignal)
+      if (!refreshedSwipe || requestSignal.aborted) {
+        appendSpeakerDebugLog(`Autoplay skipped: message ${event.messageId} is no longer on the generated swipe.`)
+        return
+      }
+      await waitForAutoplayWork(playMessage(event.messageId, false, true, refreshedSwipe), requestSignal)
+    }).catch(error => { if (!autoPlaybackDisposed && !requestSignal.aborted) setStatus(error instanceof Error ? error.message : 'Automatic playback failed.', 'error') })
+      .finally(() => autoPlaybackRequests.finish(requestKey, requestSignal))
   })
 
   const unsubscribeActivate = tab.onActivate(() => {
@@ -5169,6 +5258,7 @@ export function setup(ctx: SpindleFrontendContext) {
 
   return () => {
     autoPlaybackDisposed = true
+    autoPlaybackRequests.cancelAll()
     playbackStartup.cancel()
     hostDocument.removeEventListener('pointerdown', closeFavoritePickerOnOutsideClick)
     hostDocument.removeEventListener('keydown', closeFavoritePickerOnEscape)
@@ -5255,6 +5345,7 @@ export function setup(ctx: SpindleFrontendContext) {
         ghostVoiceLifetime,
         autoVoiceCasting,
         autoPlayback,
+        autoPlaybackDelaySeconds,
         speakerLookback,
         skipNarration,
       )
@@ -5268,6 +5359,7 @@ export function setup(ctx: SpindleFrontendContext) {
     playbackBufferInput.removeEventListener('change', onPlaybackBufferInput)
     concurrentGenerationInput.removeEventListener('change', onConcurrentGenerationInput)
     rateLimitWaitInput.removeEventListener('change', onRateLimitWaitInput)
+    autoPlaybackDelayInput.removeEventListener('change', onAutoPlaybackDelayInput)
     ghostLifetimeInput.removeEventListener('change', onGhostLifetimeInput)
     speakerLookbackInput.removeEventListener('change', onSpeakerLookbackInput)
     speakerDebugToggle.removeEventListener('change', onSpeakerDebugChanged)

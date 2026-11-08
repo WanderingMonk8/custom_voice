@@ -10,7 +10,7 @@ A [Lumiverse Spindle](https://docs.lumiverse.chat/) extension that detects chara
 - Uses Jev through Lumiverse Decisions to classify paragraph and quotation identities, then applies deterministic inheritance and fallback policy.
 - Reviews contested dialogue runs using nearby user and assistant messages, narrative cues, speech relationships, and explicit speaker anchors. Unresolved speech can use a best-available scene speaker or temporary voice; uncertain guesses may be wrong.
 - Offers a single opt-in speaker-assignment debug log, off by default. Additional comparison reviews do not run during normal playback.
-- Automatically casts voices by default, with an advanced option to opt out. Optional automatic playback of new assistant messages and foreground rerolls is off by default and may require a browser interaction before audio can start. Hold a message's TTS play button to toggle autoplay; highlighted play buttons indicate that it is enabled, in sync with the advanced setting.
+- Automatically casts voices by default, with an advanced option to opt out. Optional automatic playback of new assistant messages and foreground rerolls is off by default and may require a browser interaction before audio can start. Configure an optional autoplay delay in advanced settings (default: 0 seconds). Hold a message's TTS play button to toggle autoplay; highlighted play buttons indicate that it is enabled, in sync with the advanced setting.
 - Uses one globally selected TTS connection across chats.
 - Assigns a different custom voice name or provider voice ID to every detected character.
 - Allows every detected or manually added character to be renamed or deleted. Slash-separated aliases share that character's voice.
@@ -29,6 +29,7 @@ A [Lumiverse Spindle](https://docs.lumiverse.chat/) extension that detects chara
 - Uses the extension's global TTS connection, initially falling back to Lumiverse's selected connection or the profile marked as default. Legacy per-chat connection selections no longer override it.
 - Provides a global, opt-in **Save generated audio** setting. It is disabled by default to avoid consuming storage, and retains at most 50 extension recordings by default (user configurable).
 - When enabled, saves the exact synthesized custom-voice segments as a native Lumiverse audio attachment for the active message swipe, with a browser-generated WAV fallback when the server cannot mux their source formats.
+- With saving enabled, playback replaces an existing recording only for the same swipe. The original swipe's text is checked before saving, even if another swipe is now active; separate swipes retain separate recordings, subject to the global recording limit.
 - When saving is enabled, continues bounded background synthesis and saves the complete recording even when audible playback is stopped early.
 - Removes HTML/escaped tags and Markdown emphasis markers before sending readable text to TTS.
 - Provides a global, autosaved list of tracker tag names or full asymmetric tag pairs whose tags and enclosed contents are removed before playback generation.

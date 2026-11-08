@@ -2,6 +2,13 @@
 var CONFIG_KEY = "chat_voice";
 var USER_SPEAKER_ID = "__chat_voice_user__";
 var UNCAST_SPEAKER_ID = "__chat_voice_uncast__";
+function readMessageSwipeContent(message, swipeId) {
+  if (!Number.isInteger(swipeId) || swipeId < 0) return null;
+  if (Array.isArray(message.swipes) && message.swipes.length > 0) {
+    return typeof message.swipes[swipeId] === "string" ? message.swipes[swipeId] : null;
+  }
+  return (message.swipe_id ?? 0) === swipeId && typeof message.content === "string" ? message.content : null;
+}
 var UNRESOLVED_SPEAKER_ID = "__chat_voice_unresolved__";
 var DEFAULT_MESSAGE_LIMIT = 20;
 var MIN_MESSAGE_LIMIT = 1;
@@ -6608,6 +6615,10 @@ spindle.onFrontendMessage(async (rawPayload, userId, frontendSessionId) => {
             name: message.name,
             content: message.content ?? "",
             swipe_id: message.swipe_id,
+            swipe_dates: message.swipe_dates,
+            ...Number.isInteger(payload.targetSwipeId) && (payload.targetSwipeId ?? -1) >= 0 ? {
+              targetSwipeContent: readMessageSwipeContent(message, payload.targetSwipeId)
+            } : {},
             extra: message.extra ?? {}
           } : null,
           ...!message ? { error: "The message is no longer available." } : {}

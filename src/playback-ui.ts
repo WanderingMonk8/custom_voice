@@ -5,6 +5,51 @@ export interface PlaybackButtonState {
   ariaPressed: string | null
 }
 
+/** Wait until the generation-relative deadline; cancellation releases the queue. */
+export function waitForAutoplayDeadline(deadline: number, signal: AbortSignal): Promise<boolean> {
+  if (signal.aborted) return Promise.resolve(false)
+  const remaining = Math.max(0, deadline - Date.now())
+  if (!remaining) return Promise.resolve(true)
+  return new Promise(resolve => {
+    const finish = (ready: boolean) => { clearTimeout(timer); signal.removeEventListener('abort', abort); resolve(ready) }
+    const abort = () => finish(false)
+    const timer = setTimeout(() => finish(true), remaining)
+    signal.addEventListener('abort', abort, { once: true })
+  })
+}
+
+/** Keep only the latest queued generation for each message. */
+export class AutoplayRequestRegistry {
+  private pending = new Map<string, AbortController>()
+  begin(key: string): AbortSignal {
+    this.pending.get(key)?.abort()
+    const controller = new AbortController()
+    this.pending.set(key, controller)
+    return controller.signal
+  }
+  finish(key: string, signal: AbortSignal): void {
+    if (this.pending.get(key)?.signal === signal) this.pending.delete(key)
+  }
+  cancelAll(): void {
+    for (const controller of this.pending.values()) controller.abort()
+    this.pending.clear()
+  }
+}
+
+/** Release the autoplay queue when a superseded startup or playback is cancelled. */
+export function waitForAutoplayWork(work: Promise<void>, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) return Promise.resolve()
+  return new Promise((resolve, reject) => {
+    const abort = () => { signal.removeEventListener('abort', abort); resolve() }
+    signal.addEventListener('abort', abort, { once: true })
+    work.then(() => { signal.removeEventListener('abort', abort); resolve() }, error => {
+      signal.removeEventListener('abort', abort)
+      if (signal.aborted) resolve()
+      else reject(error)
+    })
+  })
+}
+
 /** Own asynchronous startup so superseded requests cannot create audio streams. */
 export class PlaybackStartupGuard {
   private serial = 0
@@ -22,6 +67,9 @@ export class PlaybackStartupGuard {
   finish(token: number): void { if (this.owns(token)) this.pending = null }
   cancel(): void { this.serial++; this.pending = null }
   cancelAutomatic(): void { if (this.pending?.automatic) this.cancel() }
+  cancelAutomaticFor(chatId: string, messageId: string): void {
+    if (this.pending?.automatic && this.pending.chatId === chatId && this.pending.messageId === messageId) this.cancel()
+  }
 }
 
 /** One pointer gesture toggles autoplay without also activating the play button. */
