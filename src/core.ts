@@ -604,6 +604,13 @@ export function isDescriptiveGhostLabel(label: string): boolean {
   return isBroadPersonLabel(label) || /^(?:the|a|an)\s/iu.test(label.trim()) || /['’]s\s/iu.test(label.trim())
 }
 
+/** Two unnamed groups that each invoke the other's name are the same pair of speakers. */
+export function mutuallyInvoked(a: UncastVoiceGroup, b: UncastVoiceGroup, answers: Record<string, SpeakerDecisionChoice> = {}, message = ''): boolean {
+  const nameA = revealedUncastName(a, answers, message).toLowerCase()
+  const nameB = revealedUncastName(b, answers, message).toLowerCase()
+  return !!nameA && !!nameB && a.addressee === nameB && b.addressee === nameA
+}
+
 export function resolveUncastVoiceDecisions(
   groups: UncastVoiceGroup[], voices: FavoriteVoice[], answers: Record<string, SpeakerDecisionChoice>,
   ghosts: GhostVoice[] = [], reserved: readonly string[] = [], messageId = '', message = '', previousMessageIds: readonly string[] = [],

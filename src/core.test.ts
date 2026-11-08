@@ -8,6 +8,7 @@ import {
   addUnconfiguredDialogueSpeakers,
   addFavoriteVoice,
   groupLabelOptions,
+  mutuallyInvoked,
   type PlaybackSegment,
   mergeScannedCardCast,
   isScenarioCardTitle,
@@ -2110,6 +2111,13 @@ test('treats a repeated specific unnamed label as a voice match and ignores broa
     label_g0: { choice: `label_${broadIndex}`, probabilities: { [`label_${broadIndex}`]: 0.95 }, confidence: 0.95 },
   }, [broad], [], 'later', broadMessage)
   assert.equal(broadAssigned.some(assignment => assignment.ghostId === 'ghost-woman'), false)
+})
+
+test('two speakers who each invoke the other by name are mutually invoked', () => {
+  const ellis = { id: 'g0', speakerId: 'unconfigured:ellis', segmentIndexes: [2], speeches: ['Not yet.'], context: [], addressee: 'hallie' }
+  const hallie = { id: 'g1', speakerId: 'unconfigured:hallie', segmentIndexes: [0], speeches: ['Leave it, Ellis.'], context: [], addressee: 'ellis' }
+  assert.equal(mutuallyInvoked(ellis, hallie), true)
+  assert.equal(mutuallyInvoked(ellis, { ...hallie, addressee: 'ken' }), false)
 })
 
 test('a name invoked by another speaker boosts the same-person link between the unnamed speakers around it', () => {
