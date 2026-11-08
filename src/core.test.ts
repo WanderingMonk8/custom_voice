@@ -8,6 +8,7 @@ import {
   addUnconfiguredDialogueSpeakers,
   addFavoriteVoice,
   groupLabelOptions,
+  labelGenderHint,
   mutuallyInvoked,
   narrationBoostsPair,
   vocativeNames,
@@ -2054,6 +2055,70 @@ test('matches uncast voice groups without using cast voices or crossing gender c
   assert.deepEqual(resolveUncastVoiceDecisions(groups, available, {
     voice_g0: confidentDecision('no_match'),
   }), [])
+})
+
+test('labelGenderHint reads gendered nouns but refuses ambiguous labels', () => {
+  assert.equal(labelGenderHint('the girl'), 'female')
+  assert.equal(labelGenderHint('The Lady'), 'female')
+  assert.equal(labelGenderHint('the taller woman'), 'female')
+  assert.equal(labelGenderHint('her mother'), 'female')
+  assert.equal(labelGenderHint('the man'), 'male')
+  assert.equal(labelGenderHint('THE BOY'), 'male')
+  assert.equal(labelGenderHint('the gentleman'), 'male')
+  assert.equal(labelGenderHint('his father'), 'male')
+  assert.equal(labelGenderHint('the firefighter'), null)
+  assert.equal(labelGenderHint('the stranger'), null)
+  assert.equal(labelGenderHint('the person'), null)
+  assert.equal(labelGenderHint(''), null)
+  assert.equal(labelGenderHint('the man and the girl'), null)
+  assert.equal(labelGenderHint('the lady beside him'), null)
+})
+
+test('a gendered label picks a gender-matched voice when Jev leaves the gender unknown', () => {
+  const message = 'The girl turns toward the stairs. "I see it."'
+  const groups = collectUncastVoiceGroups([{ text: 'I see it.', speakerId: UNCAST_SPEAKER_ID }])
+  const voices = readFavoriteVoices([
+    { id: 'male', category: 'male', description: 'commanding' },
+    { id: 'female', category: 'female', description: 'gentle warm' },
+  ])
+  const options = groupLabelOptions(groups[0], uncastIdentityLabels(message, []))
+  const labelIndex = options.indexOf('the girl')
+  assert.ok(labelIndex >= 0)
+  const matches = resolveUncastVoiceDecisions(groups, voices, {
+    gender_g0: confidentDecision('unknown'),
+    [`label_g0`]: { choice: `label_${labelIndex}`, probabilities: { [`label_${labelIndex}`]: 0.92 }, confidence: 0.9 },
+    voice_g0: { choice: 'voice_0', probabilities: { voice_0: 0.85, voice_1: 0.15 }, confidence: 0.8 },
+  }, [], [], 'message-1', message)
+  assert.deepEqual(matches.map(match => [match.voiceId, match.gender]), [['female', 'female']])
+  const manMessage = 'The man turns toward the stairs. "I see it."'
+  const manGroups = collectUncastVoiceGroups([{ text: 'I see it.', speakerId: UNCAST_SPEAKER_ID }])
+  const manOptions = groupLabelOptions(manGroups[0], uncastIdentityLabels(manMessage, []))
+  const manLabelIndex = manOptions.indexOf('the man')
+  assert.ok(manLabelIndex >= 0)
+  const manMatches = resolveUncastVoiceDecisions(manGroups, voices, {
+    gender_g0: confidentDecision('unknown'),
+    [`label_g0`]: { choice: `label_${manLabelIndex}`, probabilities: { [`label_${manLabelIndex}`]: 0.92 }, confidence: 0.9 },
+    voice_g0: { choice: 'voice_1', probabilities: { voice_0: 0.15, voice_1: 0.85 }, confidence: 0.8 },
+  }, [], [], 'message-1', manMessage)
+  assert.deepEqual(manMatches.map(match => [match.voiceId, match.gender]), [['male', 'male']])
+})
+
+test('an established Jev gender outranks a contradictory label hint', () => {
+  const message = 'The man turns toward the stairs. "I see it."'
+  const groups = collectUncastVoiceGroups([{ text: 'I see it.', speakerId: UNCAST_SPEAKER_ID }])
+  const voices = readFavoriteVoices([
+    { id: 'male', category: 'male', description: 'commanding' },
+    { id: 'female', category: 'female', description: 'gentle warm' },
+  ])
+  const options = groupLabelOptions(groups[0], uncastIdentityLabels(message, []))
+  const labelIndex = options.indexOf('the man')
+  assert.ok(labelIndex >= 0)
+  const matches = resolveUncastVoiceDecisions(groups, voices, {
+    gender_g0: confidentDecision('female'),
+    [`label_g0`]: { choice: `label_${labelIndex}`, probabilities: { [`label_${labelIndex}`]: 0.92 }, confidence: 0.9 },
+    voice_g0: { choice: 'voice_0', probabilities: { voice_0: 0.85, voice_1: 0.15 }, confidence: 0.8 },
+  }, [], [], 'message-1', message)
+  assert.deepEqual(matches.map(match => [match.voiceId, match.gender]), [['female', 'female']])
 })
 
 test('keeps ghost voices for the configured count of assistant messages and never links weak identities', () => {

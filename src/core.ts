@@ -748,6 +748,32 @@ export function isDescriptiveGhostLabel(label: string): boolean {
   return isBroadPersonLabel(label) || /^(?:the|a|an)\s/iu.test(label.trim()) || /['’]s\s/iu.test(label.trim())
 }
 
+const LABEL_GENDER_TOKENS: ReadonlyMap<string, 'male' | 'female'> = new Map(
+  [
+    ...['girl', 'girls', 'woman', 'women', 'lady', 'ladies', 'female', 'females', 'mother', 'mothers', 'mum', 'mums', 'mom', 'moms', 'sister', 'sisters', 'wife', 'wives', 'daughter', 'daughters', 'aunt', 'aunts', 'niece', 'nieces', 'grandmother', 'grandmothers', 'grandma', 'grandmas', 'granny', 'grannies', 'nanny', 'nannies', 'maid', 'maids', 'bride', 'brides', 'princess', 'princesses', 'madam', 'mrs', 'miss', 'she', 'her', 'hers', 'herself'].map(token => [token, 'female'] as const),
+    ...['boy', 'boys', 'man', 'men', 'gentleman', 'gentlemen', 'male', 'males', 'father', 'fathers', 'dad', 'dads', 'brother', 'brothers', 'husband', 'husbands', 'son', 'sons', 'uncle', 'uncles', 'nephew', 'nephews', 'grandfather', 'grandfathers', 'grandpa', 'grandpas', 'groom', 'grooms', 'prince', 'princes', 'monk', 'monks', 'guy', 'guys', 'mr', 'sir', 'he', 'him', 'his', 'himself'].map(token => [token, 'male'] as const),
+  ],
+)
+
+/**
+ * Deterministic gender hint from a descriptive label ("the girl", "the
+ * taller man"). A label can be too broad to identify an individual yet still
+ * state their gender. Returns null when no gendered token appears, or when
+ * both genders appear (e.g. "the man and the girl").
+ */
+export function labelGenderHint(label: string): 'male' | 'female' | null {
+  const genders = new Set<'male' | 'female'>()
+  for (const token of label.toLowerCase().replace(/[^a-z]+/gu, ' ').split(/\s+/u)) {
+    if (!token) continue
+    const gender = LABEL_GENDER_TOKENS.get(token)
+    if (gender) {
+      genders.add(gender)
+      if (genders.size > 1) return null
+    }
+  }
+  return genders.size === 1 ? [...genders][0] : null
+}
+
 /** Two unnamed groups that each invoke the other's name are the same pair of speakers. */
 export function mutuallyInvoked(a: UncastVoiceGroup, b: UncastVoiceGroup, answers: Record<string, SpeakerDecisionChoice> = {}, message = ''): boolean {
   const nameA = revealedUncastName(a, answers, message).toLowerCase()
@@ -920,8 +946,13 @@ export function resolveUncastVoiceDecisions(
     const members = groups.filter(group => roots.get(group.id) === root)
     const genderVotes = members.map(group => answers[`gender_${group.id}`]).filter(answer => answer && (answer.choice === 'male' || answer.choice === 'female') && answer.confidence >= 0.6 && (answer.probabilities[answer.choice] ?? 0) >= 0.6)
     const genders = new Set(genderVotes.map(answer => answer.choice))
-    const gender = genders.size === 1 ? genderVotes[0].choice : 'unknown'
+    const jevGender = genders.size === 1 ? genderVotes[0].choice : 'unknown'
     let ghost = linkedGhosts.get(root)
+    // A gendered descriptive label ("the girl", "the lady", "the man") is
+    // deterministic evidence Jev may have missed; it only fills in an
+    // unknown gender, never overrules an established one.
+    const labelHint = labelGenderHint(ghost?.label || members.map(group => groupLabels.get(group.id)).find(Boolean) || '')
+    const gender = jevGender !== 'unknown' ? jevGender : labelHint ?? 'unknown'
     if (!ghost) {
       const matches = members.map(group => answers[`voice_${group.id}`]).filter((answer): answer is SpeakerDecisionChoice => !!answer)
       const eligible = voices.flatMap((voice, index) => {

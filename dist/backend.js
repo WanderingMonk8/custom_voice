@@ -360,6 +360,24 @@ function isGenericAdultLabel(label) {
 function isDescriptiveGhostLabel(label) {
   return isBroadPersonLabel(label) || /^(?:the|a|an)\s/iu.test(label.trim()) || /['’]s\s/iu.test(label.trim());
 }
+var LABEL_GENDER_TOKENS = new Map(
+  [
+    ...["girl", "girls", "woman", "women", "lady", "ladies", "female", "females", "mother", "mothers", "mum", "mums", "mom", "moms", "sister", "sisters", "wife", "wives", "daughter", "daughters", "aunt", "aunts", "niece", "nieces", "grandmother", "grandmothers", "grandma", "grandmas", "granny", "grannies", "nanny", "nannies", "maid", "maids", "bride", "brides", "princess", "princesses", "madam", "mrs", "miss", "she", "her", "hers", "herself"].map((token) => [token, "female"]),
+    ...["boy", "boys", "man", "men", "gentleman", "gentlemen", "male", "males", "father", "fathers", "dad", "dads", "brother", "brothers", "husband", "husbands", "son", "sons", "uncle", "uncles", "nephew", "nephews", "grandfather", "grandfathers", "grandpa", "grandpas", "groom", "grooms", "prince", "princes", "monk", "monks", "guy", "guys", "mr", "sir", "he", "him", "his", "himself"].map((token) => [token, "male"])
+  ]
+);
+function labelGenderHint(label) {
+  const genders = /* @__PURE__ */ new Set();
+  for (const token of label.toLowerCase().replace(/[^a-z]+/gu, " ").split(/\s+/u)) {
+    if (!token) continue;
+    const gender = LABEL_GENDER_TOKENS.get(token);
+    if (gender) {
+      genders.add(gender);
+      if (genders.size > 1) return null;
+    }
+  }
+  return genders.size === 1 ? [...genders][0] : null;
+}
 function narrationBoostsPair(group, partner) {
   return !!group.narratedName && group.flankPartners?.includes(partner.id) === true && partner.addressee === group.narratedName;
 }
@@ -524,8 +542,10 @@ function resolveUncastVoiceDecisions(groups, voices, answers, ghosts = [], reser
     const members = groups.filter((group) => roots.get(group.id) === root);
     const genderVotes = members.map((group) => answers[`gender_${group.id}`]).filter((answer) => answer && (answer.choice === "male" || answer.choice === "female") && answer.confidence >= 0.6 && (answer.probabilities[answer.choice] ?? 0) >= 0.6);
     const genders = new Set(genderVotes.map((answer) => answer.choice));
-    const gender = genders.size === 1 ? genderVotes[0].choice : "unknown";
+    const jevGender = genders.size === 1 ? genderVotes[0].choice : "unknown";
     let ghost = linkedGhosts.get(root);
+    const labelHint = labelGenderHint(ghost?.label || members.map((group) => groupLabels.get(group.id)).find(Boolean) || "");
+    const gender = jevGender !== "unknown" ? jevGender : labelHint ?? "unknown";
     if (!ghost) {
       const matches = members.map((group) => answers[`voice_${group.id}`]).filter((answer) => !!answer);
       const eligible = voices.flatMap((voice, index) => {

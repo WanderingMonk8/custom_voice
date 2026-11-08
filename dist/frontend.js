@@ -493,6 +493,12 @@ function uncastNarrativeNameCandidates(message) {
 function isBroadPersonLabel(label) {
   return /^(?:(?:the|a|an)\s+)?(?:(?:young|younger|old|older|elderly|middle-aged|tall|short)\s+)*(?:woman|man|person|girl|boy|guy|lady|stranger|someone|somebody)$/iu.test(label.trim());
 }
+var LABEL_GENDER_TOKENS = new Map(
+  [
+    ...["girl", "girls", "woman", "women", "lady", "ladies", "female", "females", "mother", "mothers", "mum", "mums", "mom", "moms", "sister", "sisters", "wife", "wives", "daughter", "daughters", "aunt", "aunts", "niece", "nieces", "grandmother", "grandmothers", "grandma", "grandmas", "granny", "grannies", "nanny", "nannies", "maid", "maids", "bride", "brides", "princess", "princesses", "madam", "mrs", "miss", "she", "her", "hers", "herself"].map((token) => [token, "female"]),
+    ...["boy", "boys", "man", "men", "gentleman", "gentlemen", "male", "males", "father", "fathers", "dad", "dads", "brother", "brothers", "husband", "husbands", "son", "sons", "uncle", "uncles", "nephew", "nephews", "grandfather", "grandfathers", "grandpa", "grandpas", "groom", "grooms", "prince", "princes", "monk", "monks", "guy", "guys", "mr", "sir", "he", "him", "his", "himself"].map((token) => [token, "male"])
+  ]
+);
 function speakersForMessageRole(speakers, _isUserMessage, userName = "User") {
   const nonUserSpeakers = speakers.filter((speaker) => speaker.id !== USER_SPEAKER_ID);
   return [
