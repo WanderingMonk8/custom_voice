@@ -9,6 +9,7 @@ import {
   addFavoriteVoice,
   groupLabelOptions,
   mutuallyInvoked,
+  narrationBoostsPair,
   vocativeNames,
   type PlaybackSegment,
   mergeScannedCardCast,
@@ -2244,6 +2245,13 @@ test('a backward invocation reaches the unnamed speaker across plain narration, 
     { text: 'Hey!', speakerId: UNCAST_SPEAKER_ID },
   ] as PlaybackSegment[])
   assert.equal(named.find(group => group.speakerId === UNCAST_SPEAKER_ID)?.addressee, undefined)
+})
+
+test('a narrated name boosts a flank pair only when the partner is addressed by that name', () => {
+  const woman = { id: 'g0', speakerId: UNCAST_SPEAKER_ID, segmentIndexes: [0], speeches: ['Ellis.'], context: [], addressee: 'ellis', flankPartners: ['g1'] }
+  const ellis = { id: 'g1', speakerId: UNCAST_SPEAKER_ID, segmentIndexes: [2], speeches: ['You know.'], context: [], narratedName: 'ellis', flankPartners: ['g0'] }
+  assert.equal(narrationBoostsPair(ellis, woman), true)
+  assert.equal(narrationBoostsPair(ellis, { ...woman, addressee: 'ken' }), false)
 })
 
 test('an unnamed speaker takes the name addressed in the preceding quote by someone else', () => {

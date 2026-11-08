@@ -656,6 +656,11 @@ export function mutuallyInvoked(a: UncastVoiceGroup, b: UncastVoiceGroup, answer
   return !!nameA && !!nameB && a.addressee === nameB && b.addressee === nameA
 }
 
+/** A narration name boosts a group only when it confirms a flank pair: the narrated speaker is the partner's addressee. */
+export function narrationBoostsPair(group: UncastVoiceGroup, partner: UncastVoiceGroup): boolean {
+  return !!group.narratedName && group.flankPartners?.includes(partner.id) === true && partner.addressee === group.narratedName
+}
+
 export function resolveUncastVoiceDecisions(
   groups: UncastVoiceGroup[], voices: FavoriteVoice[], answers: Record<string, SpeakerDecisionChoice>,
   ghosts: GhostVoice[] = [], reserved: readonly string[] = [], messageId = '', message = '', previousMessageIds: readonly string[] = [],
