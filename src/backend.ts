@@ -89,12 +89,14 @@ import {
   TTS_AUTO_EMOTION_OPTIONS,
   TTS_COMPACT_EMOTION_OPTIONS,
   stripTtsModulationMarker,
+  summarizeConnectionTest,
   validateTtsSpeechPlacement,
   USER_SPEAKER_ID,
   UNCAST_SPEAKER_ID,
   UNRESOLVED_SPEAKER_ID,
   type CharacterLike,
   type ChatVoiceConfig,
+  type ConnectionTestStepResult,
   type PlaybackSegment,
   type SpeakerDecisionChoice,
   type SpeakerDecisionPlan,
@@ -143,6 +145,7 @@ interface CardPromptData {
 type FrontendMessage =
   | { type: 'chat_voice_refresh'; chatId?: string | null; requestId?: string; ghostLifetime?: number }
   | { type: 'chat_voice_decision_status'; requestId?: string }
+  | { type: 'chat_voice_connection_test'; requestId: string; connectionId?: string; model?: string }
   | { type: 'chat_voice_list_llm_connections'; requestId: string }
   | { type: 'chat_voice_scan'; chatId: string; messageLimit: number }
   | { type: 'chat_voice_auto_cast'; requestId: string; chatId: string; voices: FavoriteVoice[]; reserved: string[]; narratorMissing: boolean; userMissing: boolean; ghostLifetime: number }
@@ -232,6 +235,205 @@ async function decisionConnectionStatus(userId?: string): Promise<DecisionConnec
     )
     return { available: false, hasConnection: false, defaultConnectionName: null }
   }
+}
+
+const CONNECTION_TEST_QUIET_TIMEOUT_MS = 30_000
+const CONNECTION_TEST_DECISION_TIMEOUT_MS = 20_000
+
+async function quietConnectionProbe(
+  userId: string | undefined,
+  connectionId: string | undefined,
+  model: string | undefined,
+  timeoutMs: number,
+): Promise<{ text: string; elapsedMs: number }> {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
+  try {
+    const started = Date.now()
+    const response = await spindle.generate.quiet({
+      type: 'quiet',
+      userId,
+      ...(connectionId ? { connection_id: connectionId } : {}),
+      messages: [{ role: 'user', content: 'Reply with exactly: OK' }],
+      parameters: { temperature: 0, ...(model ? { model } : {}) },
+      reasoning: { source: 'off' },
+      signal: controller.signal,
+    })
+    return {
+      text: extractGenerationText(response).trim().slice(0, 120),
+      elapsedMs: Date.now() - started,
+    }
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+function formatConnectionTestLine(result: ConnectionTestStepResult, elapsedMs?: number): string {
+  const status = result.status === 'pass' ? 'PASS' : result.status === 'fail' ? 'FAIL' : 'SKIP'
+  const timing = elapsedMs !== undefined ? ` (${elapsedMs}ms)` : ''
+  return `[${status}] ${result.name}: ${result.detail}${timing}`
+}
+
+/**
+ * Run the Connection Test series: capability and connection inventories first,
+ * then the four runtime paths the extension depends on (bare quiet generation
+ * over default routing, quiet generation through an explicit connection, the
+ * same with a model override merged into parameters, and one trivial Jev
+ * decisions evaluation). Each step streams its line to the frontend as a
+ * progressive result so the debug box fills in while the series runs.
+ */
+async function runConnectionTest(
+  payload: Extract<FrontendMessage, { type: 'chat_voice_connection_test' }>,
+  userId: string | undefined,
+  frontendSessionId: string | undefined,
+): Promise<void> {
+  const results: ConnectionTestStepResult[] = []
+  const report = (result: ConnectionTestStepResult, elapsedMs?: number, done = false) => {
+    results.push(result)
+    sendFrontend({
+      type: 'chat_voice_connection_test_result',
+      requestId: payload.requestId,
+      lines: [formatConnectionTestLine(result, elapsedMs)],
+      done,
+    }, userId, frontendSessionId)
+  }
+  const errorOf = (error: unknown) => error instanceof Error ? error.message : String(error)
+
+  // 1. Host capabilities and runtime identity.
+  const decisionsCapability = (spindle.host.capabilities['decisions-v1'] ?? 0) >= 1
+  report({
+    name: 'Host capability check',
+    status: 'pass',
+    detail: `Lumiverse ${spindle.host.lumiverseVersion}, decisions-v1=${decisionsCapability ? 'available' : 'missing'}, decisions connections feature=${typeof spindle.decisions.listConnections === 'function' ? 'present' : 'absent'}, connections getModels=${typeof spindle.connections.getModels === 'function' ? 'present' : 'absent'}`,
+  })
+
+  // 2. Decision connections (the Jev path's inventory).
+  try {
+    const connections = await spindle.decisions.listConnections({ ...(userId ? { userId } : {}) })
+    const defaultConnection = connections.find(connection => connection.is_default) ?? connections[0]
+    report({
+      name: 'Decision connections list',
+      status: connections.length ? 'pass' : 'fail',
+      detail: connections.length
+        ? `${connections.length} connection(s): ${connections.map(connection => `${connection.name} [${connection.provider}] model=${connection.model}${connection.is_default ? ' (default)' : ''}`).join('; ')}; routed default=${defaultConnection?.name ?? 'none'}`
+        : 'no Decision connections found; create one in Lumiverse',
+    })
+  } catch (error) {
+    report({ name: 'Decision connections list', status: 'fail', detail: errorOf(error) })
+  }
+
+  // 3. LLM generation connections (the quiet-generation routing inventory).
+  let llmConnections: Awaited<ReturnType<typeof spindle.connections.list>> = []
+  try {
+    llmConnections = await spindle.connections.list(userId)
+    const defaultConnection = llmConnections.find(connection => connection.is_default) ?? llmConnections[0]
+    report({
+      name: 'LLM generation connections list',
+      status: llmConnections.length ? 'pass' : 'fail',
+      detail: llmConnections.length
+        ? `${llmConnections.length} connection(s): ${llmConnections.map(connection => `${connection.name} [${connection.provider}] model=${connection.model} default=${connection.is_default} key=${connection.has_api_key ? 'present' : 'missing'}`).join('; ')}; routed default=${defaultConnection ? `${defaultConnection.name} (${defaultConnection.id})` : 'none'}`
+        : 'no LLM connections found; generation routing has nothing to use',
+    })
+  } catch (error) {
+    report({ name: 'LLM generation connections list', status: 'fail', detail: errorOf(error) })
+  }
+
+  const selectedConnectionId = (payload.connectionId ?? '').trim()
+  const testConnection =
+    llmConnections.find(connection => connection.id === selectedConnectionId)
+    ?? llmConnections.find(connection => connection.is_default)
+    ?? llmConnections[0]
+  const testConnectionLabel = testConnection
+    ? (selectedConnectionId && testConnection.id === selectedConnectionId
+        ? `selected ${testConnection.name} (${testConnection.id})`
+        : `default ${testConnection.name} (${testConnection.id})`)
+    : 'none available'
+  const testConnectionId = testConnection?.id ?? selectedConnectionId ?? ''
+
+  // 4. Bare quiet generation (default routing, no explicit connection).
+  try {
+    const probe = await quietConnectionProbe(userId, undefined, undefined, CONNECTION_TEST_QUIET_TIMEOUT_MS)
+    report(
+      { name: 'Bare quiet generation (default routing)', status: 'pass', detail: `output=${JSON.stringify(probe.text)}` },
+      probe.elapsedMs,
+    )
+  } catch (error) {
+    report({ name: 'Bare quiet generation (default routing)', status: 'fail', detail: errorOf(error) })
+  }
+
+  // 5. Quiet generation through an explicit connection.
+  if (testConnectionId) {
+    try {
+      const probe = await quietConnectionProbe(userId, testConnectionId, undefined, CONNECTION_TEST_QUIET_TIMEOUT_MS)
+      report(
+        { name: 'Quiet generation with selected connection', status: 'pass', detail: `via ${testConnectionLabel}; output=${JSON.stringify(probe.text)}` },
+        probe.elapsedMs,
+      )
+    } catch (error) {
+      report({ name: 'Quiet generation with selected connection', status: 'fail', detail: `via ${testConnectionLabel}: ${errorOf(error)}` })
+    }
+  } else {
+    report({ name: 'Quiet generation with selected connection', status: 'skip', detail: 'no LLM connection available to test' })
+  }
+
+  // 6. Quiet generation with the connection plus a model merged into parameters.
+  const testModel = (payload.model ?? '').trim() || testConnection?.model || ''
+  if (testConnectionId && testModel) {
+    try {
+      const probe = await quietConnectionProbe(userId, testConnectionId, testModel, CONNECTION_TEST_QUIET_TIMEOUT_MS)
+      report(
+        { name: 'Quiet generation with connection + model override', status: 'pass', detail: `via ${testConnectionLabel}, model=${JSON.stringify(testModel)}; output=${JSON.stringify(probe.text)}` },
+        probe.elapsedMs,
+      )
+    } catch (error) {
+      report({ name: 'Quiet generation with connection + model override', status: 'fail', detail: `via ${testConnectionLabel}, model=${JSON.stringify(testModel)}: ${errorOf(error)}` })
+    }
+  } else {
+    report({ name: 'Quiet generation with connection + model override', status: 'skip', detail: 'no model to merge into parameters' })
+  }
+
+  // 7. A trivial Jev decisions evaluation over the default Decision connection.
+  if (decisionsCapability) {
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), CONNECTION_TEST_DECISION_TIMEOUT_MS)
+    try {
+      const started = Date.now()
+      const result = await spindle.decisions.evaluate({
+        state: { probe: 'chat-voice connection test' },
+        questions: { probe: { type: 'choice', instructions: 'Pick the first option.', criteria: { a: null, b: null } } },
+        ...(userId ? { userId } : {}),
+      }, { signal: controller.signal })
+      const answer = result.answers['probe']
+      report(
+        {
+          name: 'Jev decisions evaluate',
+          status: answer?.type === 'choice' ? 'pass' : 'fail',
+          detail: answer?.type === 'choice' ? `choice=${answer.choice}, model=${result.model}` : 'no choice answer returned',
+        },
+        Date.now() - started,
+      )
+    } catch (error) {
+      report({ name: 'Jev decisions evaluate', status: 'fail', detail: errorOf(error) })
+    } finally {
+      clearTimeout(timer)
+    }
+  } else {
+    report({ name: 'Jev decisions evaluate', status: 'skip', detail: 'decisions-v1 capability unavailable' })
+  }
+
+  // 8. Verdict, always sent as the terminal line.
+  const verdict: ConnectionTestStepResult = {
+    name: 'Summary',
+    status: results.some(result => result.status === 'fail') ? 'fail' : 'pass',
+    detail: summarizeConnectionTest(results),
+  }
+  results.push(verdict)
+  sendFrontend({
+    type: 'chat_voice_connection_test_result',
+    requestId: payload.requestId,
+    lines: [formatConnectionTestLine(verdict)],
+    done: true,
+  }, userId, frontendSessionId)
 }
 
 function chatMemberIds(chat: ChatLike): string[] {
@@ -1768,6 +1970,17 @@ spindle.onFrontendMessage(async (rawPayload: unknown, userId, frontendSessionId)
           requestId: payload.requestId,
           connections: [],
           error: error instanceof Error ? error.message : 'Could not load LLM connections.',
+        }, userId, frontendSessionId)
+      }
+    } else if (payload?.type === 'chat_voice_connection_test') {
+      try {
+        await runConnectionTest(payload, userId, frontendSessionId)
+      } catch (error) {
+        sendFrontend({
+          type: 'chat_voice_connection_test_result',
+          requestId: payload.requestId,
+          lines: [`[FAIL] Connection Test: ${error instanceof Error ? error.message : String(error)}`],
+          done: true,
         }, userId, frontendSessionId)
       }
     } else if (payload?.type === 'chat_voice_match_uncast') {
