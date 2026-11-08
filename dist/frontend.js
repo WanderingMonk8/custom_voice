@@ -291,6 +291,14 @@ function activeGhostVoices(ghosts, assistantMessageIds, targetId, lifetime = GHO
     return (activeSince >= 0 || !ghost.lastSeenMessageId) && activeSince <= target && target - activeSince <= Math.max(1, lifetime);
   });
 }
+function hasStrongNarrativeName(text) {
+  const narrative = narrativeOnly(text);
+  for (const match of narrative.matchAll(/\b([\p{Lu}][\p{Ll}\p{M}'’-]{1,39})\s+(?:is|was|has|had|stands|stood|sits|sat|turns|turned|looks|looked|says|said|asks|asked|answers|answered|replies|replied|huffs|huffed|slaps|slapped|calls|called|shouts|shouted|speaks|spoke|mutters|muttered|laughs|laughed|glances|glanced|walks|walked|moves|moved|steps|stepped|nods|nodded)\b/gu)) {
+    const name = normalizeSpeakerName(match[1]);
+    if (name && !NON_NAME_PARAGRAPH_LEADS.has(name.toLowerCase())) return true;
+  }
+  return false;
+}
 function collectUncastVoiceGroups(segments) {
   const groups = [];
   const named = /* @__PURE__ */ new Map();
@@ -306,8 +314,8 @@ function collectUncastVoiceGroups(segments) {
     }
     if (id !== UNCAST_SPEAKER_ID) anonymous = null;
     if (id === UNCAST_SPEAKER_ID && segments[index - 1]?.speakerId === null && segments[index - 1].text.length > 240) anonymous = null;
-    if (id === UNCAST_SPEAKER_ID && segments[index - 1]?.speakerId === null && uncastNarrativeNameCandidates(segments[index - 1].text).length) anonymous = null;
-    if (id === UNCAST_SPEAKER_ID && segments[index - 1]?.speakerId === UNCAST_SPEAKER_ID && segments[index - 2]?.speakerId === null && uncastNarrativeNameCandidates(segments[index - 2].text).length) anonymous = null;
+    if (id === UNCAST_SPEAKER_ID && segments[index - 1]?.speakerId === null && hasStrongNarrativeName(segments[index - 1].text)) anonymous = null;
+    if (id === UNCAST_SPEAKER_ID && segments[index - 1]?.speakerId === UNCAST_SPEAKER_ID && segments[index - 2]?.speakerId === null && hasStrongNarrativeName(segments[index - 2].text)) anonymous = null;
     let group = id === UNCAST_SPEAKER_ID ? anonymous : named.get(id);
     if (!group) {
       group = { id: `g${groups.length}`, speakerId: id, segmentIndexes: [], speeches: [], context: [] };
@@ -326,11 +334,138 @@ function collectUncastVoiceGroups(segments) {
       segments[index + 1]?.speakerId === null ? segments[index + 1].text : ""
     ].filter(Boolean).join(" ").slice(0, 2e3));
   }
+  for (const group of groups) {
+    const addressee = addressedNameBeforeGroup(group, segments);
+    if (addressee) group.addressee = addressee;
+  }
+  for (const group of groups) {
+    if (group.speakerId === UNCAST_SPEAKER_ID) continue;
+    const first = Math.min(...group.segmentIndexes);
+    const invokerIndex = adjacentQuoteIndex(segments, first, -1);
+    if (invokerIndex < 0 || segments[invokerIndex].speakerId !== UNCAST_SPEAKER_ID) continue;
+    const invoked = vocativeNames(segments[invokerIndex].text)[0];
+    if (!invoked) continue;
+    group.narratedName = invoked;
+    const invoker = groups.find((item) => item.speakerId === UNCAST_SPEAKER_ID && item.segmentIndexes.includes(invokerIndex));
+    if (!invoker) continue;
+    group.flankPartners = [...group.flankPartners ?? [], invoker.id];
+    invoker.flankPartners = [...invoker.flankPartners ?? [], group.id];
+  }
+  for (const group of groups) {
+    const first = Math.min(...group.segmentIndexes);
+    const lead = segments[first - 1];
+    if (!lead || lead.speakerId !== null) continue;
+    const named2 = lead.text.match(/^([A-Z][a-z]{2,})\s+(?:says|said|murmurs|murmured|whispers|whispered|mutters|muttered|replies|replied|answers|answered|calls|called)\b/u);
+    if (named2) group.narratedName = named2[1].toLowerCase();
+  }
+  for (const group of groups) {
+    if (group.addressee) continue;
+    const last = Math.max(...group.segmentIndexes);
+    const nextIndex = adjacentQuoteIndex(segments, last, 1);
+    const next = nextIndex >= 0 ? segments[nextIndex] : void 0;
+    if (!next || next.speakerId === UNCAST_SPEAKER_ID) continue;
+    const named2 = vocativeNames(next.text).find((name) => name !== group.speakerId.replace(/^unconfigured:/u, ""));
+    if (named2) group.addressee = named2;
+  }
+  for (const group of groups) {
+    const invoking = segments.findIndex((segment, index) => index < Math.min(...group.segmentIndexes) && segment.speakerId !== null && segment.speakerId !== UNCAST_SPEAKER_ID && new RegExp(`(?:^|,\\s*)${group.addressee}\\s*[.!?,]`, "iu").test(segment.text));
+    if (invoking < 0) continue;
+    const priorSpeech = segments.slice(0, invoking).reduce((found, segment, index) => segment.speakerId === null ? found : index, void 0);
+    const before = priorSpeech === void 0 ? void 0 : groups.find((item) => item !== group && item.speakerId === UNCAST_SPEAKER_ID && item.segmentIndexes.includes(priorSpeech) && segments[priorSpeech].speakerId !== segments[invoking].speakerId);
+    const after = group;
+    if (before) {
+      after.flankPartners = [...after.flankPartners ?? [], before.id];
+      before.flankPartners = [...before.flankPartners ?? [], after.id];
+    }
+  }
+  const unknownGroups = groups.filter((group) => group.speakerId === UNCAST_SPEAKER_ID);
+  const invokedByGroup = new Map(unknownGroups.map((group) => [group.id, [...new Set(group.speeches.flatMap((speech) => vocativeNames(speech)))]]));
+  const invokingGroups = unknownGroups.filter((group) => invokedByGroup.get(group.id)?.length === 1);
+  const knownNames = /* @__PURE__ */ new Set();
+  for (const segment of segments) {
+    const id = segment.speakerId;
+    if (!id || id === UNCAST_SPEAKER_ID || id.startsWith("unconfigured:") || id.startsWith("ghost:") || id === USER_SPEAKER_ID || id === UNRESOLVED_SPEAKER_ID) continue;
+    knownNames.add(id.includes(":") ? id.slice(id.indexOf(":") + 1).toLowerCase() : id.toLowerCase());
+  }
+  const invokedCounts = /* @__PURE__ */ new Map();
+  for (const names of invokedByGroup.values()) for (const name of names) invokedCounts.set(name, (invokedCounts.get(name) ?? 0) + 1);
+  const nameIsEligible = (name) => !isBroadPersonLabel(name) && !knownNames.has(name) && invokedCounts.get(name) === 1;
+  if (invokingGroups.length === 2) {
+    const [a, b] = invokingGroups;
+    const invokedA = invokedByGroup.get(a.id)[0];
+    const invokedB = invokedByGroup.get(b.id)[0];
+    if (invokedA !== invokedB && nameIsEligible(invokedA) && nameIsEligible(invokedB)) {
+      a.inferredName = invokedB;
+      b.inferredName = invokedA;
+      a.addressee = invokedB;
+      b.addressee = invokedA;
+    }
+  } else if (invokingGroups.length === 1) {
+    const invoker = invokingGroups[0];
+    const invoked = invokedByGroup.get(invoker.id)[0];
+    if (nameIsEligible(invoked) && unknownGroups.length >= 2) {
+      const sorted = [...unknownGroups].sort((x, y) => Math.min(...x.segmentIndexes) - Math.min(...y.segmentIndexes));
+      const index = sorted.indexOf(invoker);
+      const candidates = [sorted[index + 1], sorted[index - 1]].filter(Boolean);
+      const distance = (a, b) => Math.min(...a.segmentIndexes.flatMap((x) => b.segmentIndexes.map((y) => Math.abs(x - y))));
+      candidates.sort((x, y) => distance(x, invoker) - distance(y, invoker) || (x === sorted[index + 1] ? -1 : 1) - (y === sorted[index + 1] ? -1 : 1));
+      const partner = candidates.find((candidate) => !candidate.inferredName && invokedByGroup.get(candidate.id)?.length === 0);
+      if (partner) {
+        partner.inferredName = invoked;
+        partner.addressee = invoked;
+      }
+    }
+  }
   return groups;
 }
 function availableUncastVoices(favorites, used) {
   const reserved = new Set(used.map((voice) => voice.trim()).filter(Boolean));
   return favorites.filter((voice) => !reserved.has(voice.id));
+}
+function adjacentQuoteIndex(segments, from, step) {
+  for (let index = from + step; index >= 0 && index < segments.length; index += step) {
+    const segment = segments[index];
+    if (segment.speakerId !== null) return index;
+    if (uncastNarrativeNameCandidates(segment.text).length || /^[A-Z][a-z]{2,}\s+(?:says|said|murmurs|murmured|whispers|whispered|mutters|muttered|replies|replied|answers|answered|calls|called)\b/u.test(segment.text)) {
+      if (narrationNamesInvokedSpeaker(segments, index)) continue;
+      return -1;
+    }
+  }
+  return -1;
+}
+function narrationNamesInvokedSpeaker(segments, index) {
+  const named = segments[index].text.match(/^([A-Z][a-z]{2,})\s+(?:says|said|murmurs|murmured|whispers|whispered|mutters|muttered|replies|replied|answers|answered|calls|called)\b/u);
+  if (!named) return false;
+  const name = named[1].toLowerCase();
+  return [segments[index - 1], segments[index + 1]].some((quote) => !!quote && quote.speakerId !== null && vocativeNames(quote.text).includes(name));
+}
+var UNCAST_VOCATIVE_STOPWORDS = /* @__PURE__ */ new Set(["okay", "yeah", "yes", "no", "hello", "hey", "please", "thanks", "sorry", "listen", "look", "wait", "fine", "well", "honey", "sweetie", "darling", "first", "second", "third", "fourth", "fifth", "last", "next", "one", "two", "three", "four", "five", "once", "twice", "again", "then"]);
+function vocativeNames(quote) {
+  const found = /* @__PURE__ */ new Set();
+  const text = quote.trim();
+  const push = (raw, prefix) => {
+    const name = raw.toLowerCase();
+    if (!name || UNCAST_VOCATIVE_STOPWORDS.has(name)) return;
+    if (/\b(?:on|at|to|for|with|about|from|of|by)\s*$/iu.test(prefix)) return;
+    found.add(name);
+  };
+  const leading = text.match(/^(?:[A-Za-z' ]+,\s*)?([A-Z][A-Za-z'-]*)\s*([.!?,;:])(?!\w)/u);
+  if (leading) push(leading[1], text.slice(0, text.indexOf(leading[1])));
+  for (const match of text.matchAll(/,\s*([A-Z][A-Za-z'-]*)\s*[.!?]/gu)) {
+    push(match[1], text.slice(0, match.index));
+  }
+  return [...found];
+}
+function addressedNameBeforeGroup(group, segments) {
+  if (group.speakerId !== UNCAST_SPEAKER_ID) return "";
+  const first = Math.min(...group.segmentIndexes);
+  const previousIndex = adjacentQuoteIndex(segments, first, -1);
+  const previous = previousIndex >= 0 ? segments[previousIndex] : void 0;
+  if (!previous || previous.speakerId === UNCAST_SPEAKER_ID) return "";
+  for (const name of vocativeNames(previous.text)) {
+    if (!UNCAST_VOCATIVE_STOPWORDS.has(name)) return name;
+  }
+  return "";
 }
 function uncastNarrativeNameCandidates(message) {
   const names = /* @__PURE__ */ new Map();
@@ -349,7 +484,17 @@ function uncastNarrativeNameCandidates(message) {
     names.set(name.toLowerCase(), name);
     if (names.size >= 20) break;
   }
+  const dashed = /(?:—+|–+|--+|-)\s*([\p{Lu}][\p{Ll}\p{M}'’-]{1,39})\s*(?:—+|–+|--+|-|,)/gu;
+  for (const match of narrative.matchAll(dashed)) {
+    const name = normalizeSpeakerName(match[1]);
+    if (!name || NON_NAME_PARAGRAPH_LEADS.has(name.toLowerCase())) continue;
+    names.set(name.toLowerCase(), name);
+    if (names.size >= 20) break;
+  }
   return [...names.values()];
+}
+function isBroadPersonLabel(label) {
+  return /^(?:(?:the|a|an)\s+)?(?:(?:young|younger|old|older|elderly|middle-aged|tall|short)\s+)*(?:woman|man|person|girl|boy|guy|lady|stranger|someone|somebody)$/iu.test(label.trim());
 }
 function speakersForMessageRole(speakers, _isUserMessage, userName = "User") {
   const nonUserSpeakers = speakers.filter((speaker) => speaker.id !== USER_SPEAKER_ID);
@@ -2496,6 +2641,14 @@ function setup(ctx) {
       border:1px solid var(--lumiverse-border); border-radius:var(--lumiverse-radius);
       background:var(--lumiverse-bg-secondary, transparent); color:var(--lumiverse-text-primary); font:inherit;
     }
+    .chat-voice-debug-actions { display:flex; gap:8px; }
+    .chat-voice-copy-report-button {
+      min-height:30px; padding:0 12px; border:1px solid var(--lumiverse-border);
+      border-radius:6px; background:var(--lumiverse-fill-subtle); color:var(--lumiverse-text);
+      font:inherit; font-size:12px; font-weight:600; cursor:pointer;
+    }
+    .chat-voice-copy-report-button:hover:not(:disabled) { filter:brightness(1.08); }
+    .chat-voice-copy-report-button:disabled { cursor:not-allowed; opacity:.5; }
   `);
   const tab = ctx.ui.registerDrawerTab({
     id: "chat-voice",
@@ -2772,6 +2925,16 @@ function setup(ctx) {
   speakerDebugOutput.hidden = true;
   speakerDebugOutput.placeholder = "Generate TTS to see the turn matrix, discourse review, inheritance, and voice-route trace.";
   speakerDebugOutput.setAttribute("aria-label", "Speaker assignment debug log");
+  const debugActions = document.createElement("div");
+  debugActions.className = "chat-voice-debug-actions";
+  const copyReportButton = document.createElement("button");
+  copyReportButton.type = "button";
+  copyReportButton.className = "chat-voice-copy-report-button";
+  copyReportButton.textContent = "Copy Report";
+  copyReportButton.addEventListener("click", () => {
+    void copyDebugReport();
+  });
+  debugActions.append(copyReportButton);
   const advancedHint = document.createElement("div");
   advancedHint.className = "chat-voice-hint";
   advancedHint.textContent = "Concurrency starts at one and adapts up to the selected maximum. Dense short-segment runs stay at one request at a time, while sustained long runs increase gradually. Larger buffers reduce pauses but delay playback. The wait budget controls cumulative rate-limit cooldowns.";
@@ -2787,6 +2950,7 @@ function setup(ctx) {
     autoPlaybackDelayField.field,
     skipNarrationLabel,
     speakerDebugLabel,
+    debugActions,
     speakerDebugOutput,
     advancedHint
   );
@@ -3700,6 +3864,21 @@ function setup(ctx) {
       pendingLlmConnectionRequests.set(requestId, { resolve, reject, timer });
       ctx.sendToBackend({ type: "chat_voice_list_llm_connections", requestId });
     });
+  }
+  async function copyDebugReport() {
+    const text = speakerDebugOutput.value;
+    if (!text) {
+      setStatus("The debug log is empty.");
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(text);
+      setStatus("Debug report copied to clipboard.", "saved");
+    } catch {
+      speakerDebugOutput.focus();
+      speakerDebugOutput.select();
+      setStatus("Clipboard copy failed; the debug log text is selected for manual copying.", "error");
+    }
   }
   function requestTagPlacements(message, style, connectionId, model, items) {
     const requestId = `tag-placement-${Date.now().toString(36)}-${++tagPlacementRequestSequence}`;
@@ -4728,7 +4907,8 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
     ctx.sendToBackend({
       type: "chat_voice_scan",
       chatId: activeChat.id,
-      messageLimit: activeChat.messageLimit
+      messageLimit: activeChat.messageLimit,
+      tagLlmConnectionId
     });
   }
   scanButton.addEventListener("click", scanMessages);

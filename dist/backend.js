@@ -143,6 +143,9 @@ function availableUncastVoices(favorites, used) {
   const reserved = new Set(used.map((voice) => voice.trim()).filter(Boolean));
   return favorites.filter((voice) => !reserved.has(voice.id));
 }
+function groupLabelOptions(group, labels) {
+  return group.addressee && !labels.includes(group.addressee) ? [...labels, group.addressee] : labels;
+}
 function uncastIdentityLabels(message, ghosts) {
   const labels = /* @__PURE__ */ new Set();
   for (const ghost of ghosts) for (const alias of ghostCastAliases(ghost)) labels.add(alias.toLowerCase());
@@ -175,6 +178,13 @@ function uncastNarrativeNameCandidates(message) {
     names.set(name.toLowerCase(), name);
     if (names.size >= 20) break;
   }
+  const dashed = /(?:—+|–+|--+|-)\s*([\p{Lu}][\p{Ll}\p{M}'’-]{1,39})\s*(?:—+|–+|--+|-|,)/gu;
+  for (const match of narrative.matchAll(dashed)) {
+    const name = normalizeSpeakerName(match[1]);
+    if (!name || NON_NAME_PARAGRAPH_LEADS.has(name.toLowerCase())) continue;
+    names.set(name.toLowerCase(), name);
+    if (names.size >= 20) break;
+  }
   return [...names.values()];
 }
 function ghostPriorMessageIds(ghost, previousMessages) {
@@ -202,7 +212,7 @@ function buildUncastVoiceDecision(groups, voices, message, ghosts = [], previous
     if (labels.length) questions[`label_${group.id}`] = {
       type: "choice",
       instructions: `Choose the descriptive label for the person who actually speaks the quoted dialogue in ${group.id}. A person mentioned in narration, observing, or addressed by the speaker is not necessarily speaking. Choose none unless the label identifies the speaker of these quotations.`,
-      criteria: { none: "No reliable descriptive identity.", ...Object.fromEntries(labels.map((label, index) => [`label_${index}`, label])) }
+      criteria: { none: "No reliable descriptive identity.", ...Object.fromEntries(groupLabelOptions(group, labels).map((label, index) => [`label_${index}`, label])) }
     };
     if (group.speakerId === UNCAST_SPEAKER_ID && narrativeNames.length) questions[`narrative_name_${group.id}`] = {
       type: "choice",
@@ -243,7 +253,9 @@ function revealedUncastName(group, answers = {}, message = "") {
   const match = answer?.choice.match(/^name_(\d+)$/u);
   const probability = answer?.probabilities[answer.choice] ?? 0;
   const runnerUp = answer ? Math.max(0, ...Object.entries(answer.probabilities).filter(([key]) => key !== answer.choice).map(([, value]) => value)) : 0;
-  return match && answer && answer.confidence >= 0.8 && probability >= 0.8 && probability - runnerUp >= 0.25 ? (uncastNarrativeNameCandidates(message)[Number(match[1])] ?? "").toLowerCase() : "";
+  const jev = match && answer && answer.confidence >= 0.8 && probability >= 0.8 && probability - runnerUp >= 0.25 ? (uncastNarrativeNameCandidates(message)[Number(match[1])] ?? "").toLowerCase() : "";
+  if (jev) return jev;
+  return group.inferredName && !isBroadPersonLabel(group.inferredName) ? group.inferredName.toLowerCase() : "";
 }
 function latestGhostOccurrenceIndex(ghosts, key) {
   let found = -1;
@@ -327,7 +339,7 @@ function buildUncastIdentityReview(groups, answers, message, ghosts = [], messag
     const labelIndex = label?.choice.match(/^label_(\d+)$/u);
     const labelProbability = label ? label.probabilities[label.choice] ?? 0 : 0;
     const labelRunnerUp = label ? Math.max(0, ...Object.entries(label.probabilities).filter(([key]) => key !== label.choice).map(([, probability2]) => probability2)) : 0;
-    const named = labelIndex && labels[Number(labelIndex[1])] && label && label.confidence >= 0.7 && labelProbability >= 0.7 && labelProbability - labelRunnerUp >= 0.25;
+    const named = labelIndex && groupLabelOptions(group, labels)[Number(labelIndex[1])] && label && label.confidence >= 0.7 && labelProbability >= 0.7 && labelProbability - labelRunnerUp >= 0.25;
     if (!named) continue;
     for (const previous of groups.slice(0, index).slice(-8)) {
       const pair = answers[`same_${group.id}_${previous.id}`];
@@ -337,7 +349,7 @@ function buildUncastIdentityReview(groups, answers, message, ghosts = [], messag
       if (priorNamed || pair?.choice !== "same" || probability2 < 0.8 || pair.confidence < 0.6 || pair.confidence >= 0.8) continue;
       questions[`review_same_${group.id}_${previous.id}`] = {
         type: "choice",
-        instructions: `Review whether the speaker of the earlier group ${previous.id} is the same individual as ${group.id}, identified as ${labels[Number(labelIndex[1])]}. Read the entire scene, including intervening turns and narration. Shared occupation, gender, or similar voice alone is not enough.`,
+        instructions: `Review whether the speaker of the earlier group ${previous.id} is the same individual as ${group.id}, identified as ${groupLabelOptions(group, labels)[Number(labelIndex[1])]}. Read the entire scene, including intervening turns and narration. Shared occupation, gender, or similar voice alone is not enough.`,
         criteria: { same: "The scene clearly establishes that both groups have the same speaker.", different_or_unclear: "The speakers differ or the evidence is insufficient." }
       };
       if (Object.keys(questions).length >= 16) break;
@@ -354,6 +366,9 @@ function isGenericAdultLabel(label) {
 }
 function isDescriptiveGhostLabel(label) {
   return isBroadPersonLabel(label) || /^(?:the|a|an)\s/iu.test(label.trim()) || /['’]s\s/iu.test(label.trim());
+}
+function narrationBoostsPair(group, partner) {
+  return !!group.narratedName && group.flankPartners?.includes(partner.id) === true && partner.addressee === group.narratedName;
 }
 function resolveUncastVoiceDecisions(groups, voices, answers, ghosts = [], reserved = [], messageId = "", message = "", previousMessageIds = []) {
   const used = new Set(reserved.filter(Boolean));
@@ -397,7 +412,7 @@ function resolveUncastVoiceDecisions(groups, voices, answers, ghosts = [], reser
     const labelIndex = labelAnswer?.choice.match(/^label_(\d+)$/u);
     const labelProbability = labelAnswer ? labelAnswer.probabilities[labelAnswer.choice] ?? 0 : 0;
     const labelRunnerUp = labelAnswer ? Math.max(0, ...Object.entries(labelAnswer.probabilities).filter(([key]) => key !== labelAnswer.choice).map(([, probability]) => probability)) : 0;
-    const label = labelIndex && labelAnswer && labelAnswer.confidence >= 0.7 && labelProbability >= 0.7 && labelProbability - labelRunnerUp >= 0.25 ? labels[Number(labelIndex[1])] : void 0;
+    const label = labelIndex && labelAnswer && labelAnswer.confidence >= 0.7 && labelProbability >= 0.7 && labelProbability - labelRunnerUp >= 0.25 ? groupLabelOptions(group, labels)[Number(labelIndex[1])] : void 0;
     if (label) groupLabels.set(group.id, label);
     const previousGroups = groups.slice(0, groups.indexOf(group)).slice(-8);
     const same = previousGroups.flatMap((previous) => {
@@ -405,9 +420,12 @@ function resolveUncastVoiceDecisions(groups, voices, answers, ghosts = [], reser
       if (name && previousName && name !== previousName) return [];
       const review = answers[`review_same_${group.id}_${previous.id}`];
       const answer = review && strongChoice(review) ? review : answers[`same_${group.id}_${previous.id}`];
-      return answer?.choice === "same" && strongChoice(answer) ? [{ previous, probability: answer.probabilities.same ?? 0 }] : [];
+      const boosted = answer?.choice === "same" && answer.confidence >= 0.6 && (answer.probabilities.same ?? 0) >= 0.8 && !!group.flankPartners?.includes(previous.id);
+      return answer?.choice === "same" && strongChoice(answer) || boosted ? [{ previous, probability: answer?.probabilities.same ?? 0 }] : [];
     }).sort((a, b) => b.probability - a.probability);
+    const narratedPartner = previousGroups.find((previous) => narrationBoostsPair(group, previous));
     if (same[0]) root = roots.get(same[0].previous.id) ?? root;
+    else if (narratedPartner) root = roots.get(narratedPartner.id) ?? root;
     else if (label && !isBroadPersonLabel(label) && rootByLabel.has(label)) root = rootByLabel.get(label);
     else if (strongChoice(identity) && identity?.choice.startsWith("group_")) root = roots.get(identity.choice.slice(6)) ?? root;
     else if (name && rootByRevealedName.has(name)) {
@@ -5217,6 +5235,20 @@ async function decisionConnectionStatus(userId) {
     return { available: false, hasConnection: false, defaultConnectionName: null };
   }
 }
+async function resolveGenerationConnection(userId, preferredId) {
+  const preferred = (preferredId ?? "").trim();
+  try {
+    const connections = await spindle.connections.list(userId);
+    if (connections.length === 0) return "";
+    if (preferred && connections.some((connection) => connection.id === preferred)) return preferred;
+    return connections.find((connection) => connection.is_default)?.id ?? connections[0].id;
+  } catch (error) {
+    spindle.log.warn(
+      `[Chat Voice] Could not list LLM connections for generation routing: ${error instanceof Error ? error.message : String(error)}`
+    );
+    return preferred;
+  }
+}
 function chatMemberIds(chat) {
   const rawIds = chat.metadata?.character_ids;
   if (chat.metadata?.group === true && Array.isArray(rawIds)) {
@@ -5478,10 +5510,11 @@ async function placeTtsTags(payload, userId) {
     TTS_TAG_FORMAT_PROMPTS[payload.style],
     ...payload.style === "fish" ? [TTS_CUSTOM_EMOTION_PROMPT, ...hasModulation ? [TTS_MODULATION_PROMPT] : []] : []
   ].join("\n");
+  const connectionId = payload.connectionId || await resolveGenerationConnection(userId);
   const response = await spindle.generate.quiet({
     type: "quiet",
     userId,
-    ...payload.connectionId ? { connection_id: payload.connectionId } : {},
+    ...connectionId ? { connection_id: connectionId } : {},
     messages: [
       {
         role: "system",
@@ -5622,13 +5655,15 @@ function cardPromptData(cards) {
     ].join("\n").slice(0, perCardLimit)
   }));
 }
-async function scanCardCast(cards, userId) {
+async function scanCardCast(cards, userId, preferredConnectionId) {
   const base = cards.map((card) => ({ id: card.id, name: card.name, messageCount: 0 }));
   if (cards.length === 0) return { detected: base, usedFallback: false };
   try {
+    const connectionId = await resolveGenerationConnection(userId, preferredConnectionId);
     const response = await spindle.generate.quiet({
       type: "quiet",
       userId,
+      ...connectionId ? { connection_id: connectionId } : {},
       messages: [
         { role: "system", content: CARD_PARSER_PROMPT },
         { role: "user", content: JSON.stringify({ cards: cardPromptData(cards) }) }
@@ -6402,7 +6437,7 @@ function queueScan(payload, userId, frontendSessionId) {
     if (!chat) throw new Error("The chat is no longer available.");
     const candidates = await loadCharacters(chat, userId);
     const messageLimit = clampMessageLimit(payload.messageLimit);
-    const cardResult = await scanCardCast(candidates, userId);
+    const cardResult = await scanCardCast(candidates, userId, payload.tagLlmConnectionId);
     const config = readConfig(chat.metadata ?? {}, candidates.map((character) => character.id));
     const detected = new Map(cardResult.detected.map((character) => [character.id, character]));
     if (cardResult.usedFallback) for (const character of config.detectedCharacters) detected.set(character.id, character);
@@ -6510,7 +6545,11 @@ spindle.onFrontendMessage(async (rawPayload, userId, frontendSessionId) => {
           speakerId: group.speakerId,
           segmentIndexes: group.segmentIndexes.slice(0, 500),
           speeches: group.speeches.slice(0, 20).map((speech) => speech.slice(0, 2e3)),
-          context: (group.context ?? []).slice(0, 20).map((context) => context.slice(0, 2e3))
+          context: (group.context ?? []).slice(0, 20).map((context) => context.slice(0, 2e3)),
+          ...group.addressee ? { addressee: group.addressee } : {},
+          ...group.flankPartners ? { flankPartners: group.flankPartners.slice(0, 20) } : {},
+          ...group.narratedName ? { narratedName: group.narratedName } : {},
+          ...group.inferredName ? { inferredName: group.inferredName } : {}
         }));
         const chat = await spindle.chats.get(payload.chatId, userId);
         if (!chat) throw new Error("The chat is no longer available.");

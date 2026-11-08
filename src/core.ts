@@ -163,7 +163,7 @@ export function addFavoriteVoice(existing: FavoriteVoice[], voice: FavoriteVoice
   return [...existing, { ...voice, id }]
 }
 
-export interface UncastVoiceGroup { id: string; speakerId: string; segmentIndexes: number[]; speeches: string[]; context: string[] }
+export interface UncastVoiceGroup { id: string; speakerId: string; segmentIndexes: number[]; speeches: string[]; context: string[]; addressee?: string; flankPartners?: string[]; narratedName?: string; inferredName?: string }
 export interface GhostOccurrenceEvidence { messageId: string; messageHash: string; speechHash: string; version: 'occurrence-1'; reason: string }
 export interface GhostVoice { id: string; speakerId: string; voiceId: string; context: string; occurrenceKeys: string[]; lastSeenMessageId: string; label?: string; createdAtMessageId?: string; lastInvokedAtMessageId?: string; invokedMessageIds?: string[]; aliases?: string[]; conversationHistory?: Array<{ messageId: string; text: string }>; occurrenceEvidence?: GhostOccurrenceEvidence[] }
 export const GHOST_VOICE_LIFETIME_MESSAGES = 10
@@ -276,6 +276,14 @@ export function purgeExpiredGhostContexts(ghosts: GhostVoice[], assistantMessage
 }
 
 /** Group named unconfigured speakers by identity; anonymous runs stay separate. */
+function hasStrongNarrativeName(text: string): boolean {
+  const narrative = narrativeOnly(text)
+  for (const match of narrative.matchAll(/\b([\p{Lu}][\p{Ll}\p{M}'’-]{1,39})\s+(?:is|was|has|had|stands|stood|sits|sat|turns|turned|looks|looked|says|said|asks|asked|answers|answered|replies|replied|huffs|huffed|slaps|slapped|calls|called|shouts|shouted|speaks|spoke|mutters|muttered|laughs|laughed|glances|glanced|walks|walked|moves|moved|steps|stepped|nods|nodded)\b/gu)) {
+    const name = normalizeSpeakerName(match[1])
+    if (name && !NON_NAME_PARAGRAPH_LEADS.has(name.toLowerCase())) return true
+  }
+  return false
+}
 export function collectUncastVoiceGroups(segments: PlaybackSegment[]): UncastVoiceGroup[] {
   const groups: UncastVoiceGroup[] = []
   const named = new Map<string, UncastVoiceGroup>()
@@ -293,8 +301,12 @@ export function collectUncastVoiceGroups(segments: PlaybackSegment[]): UncastVoi
     if (id === UNCAST_SPEAKER_ID && segments[index - 1]?.speakerId === null && segments[index - 1].text.length > 240) anonymous = null
     // Named actions and adjacent replies can signal a change of speaker.
     // Split for review; the action alone does not identify the quotation.
-    if (id === UNCAST_SPEAKER_ID && segments[index - 1]?.speakerId === null && uncastNarrativeNameCandidates(segments[index - 1].text).length) anonymous = null
-    if (id === UNCAST_SPEAKER_ID && segments[index - 1]?.speakerId === UNCAST_SPEAKER_ID && segments[index - 2]?.speakerId === null && uncastNarrativeNameCandidates(segments[index - 2].text).length) anonymous = null
+    // Dashed appositives (the man — Ellis —) are context candidates for
+    // narration, not a split trigger: they may describe the same speaker's
+    // next line (Hallie) and must not fragment her run.
+    if (id === UNCAST_SPEAKER_ID && segments[index - 1]?.speakerId === null && hasStrongNarrativeName(segments[index - 1].text)) anonymous = null
+    if (id === UNCAST_SPEAKER_ID && segments[index - 1]?.speakerId === UNCAST_SPEAKER_ID && segments[index - 2]?.speakerId === null && hasStrongNarrativeName(segments[index - 2].text)) anonymous = null
+    // An invocation alone does not split an anonymous run: the same speaker can address one name and continue speaking (e.g. "Ellis." then the same woman's next line).
     let group: UncastVoiceGroup | null | undefined = id === UNCAST_SPEAKER_ID ? anonymous : named.get(id)
     if (!group) {
       group = { id: `g${groups.length}`, speakerId: id, segmentIndexes: [], speeches: [], context: [] }
@@ -307,7 +319,110 @@ export function collectUncastVoiceGroups(segments: PlaybackSegment[]): UncastVoi
     group.context.push([segments[index - 1]?.speakerId === null ? segments[index - 1].text : '', segment.text,
       segments[index + 1]?.speakerId === null ? segments[index + 1].text : ''].filter(Boolean).join(' ').slice(0, 2_000))
   }
+  for (const group of groups) {
+    const addressee = addressedNameBeforeGroup(group, segments)
+    if (addressee) group.addressee = addressee
+  }
+  for (const group of groups) {
+    if (group.speakerId === UNCAST_SPEAKER_ID) continue
+    const first = Math.min(...group.segmentIndexes)
+    const invokerIndex = adjacentQuoteIndex(segments, first, -1)
+    if (invokerIndex < 0 || segments[invokerIndex].speakerId !== UNCAST_SPEAKER_ID) continue
+    const invoked = vocativeNames(segments[invokerIndex].text)[0]
+    if (!invoked) continue
+    group.narratedName = invoked
+    const invoker = groups.find(item => item.speakerId === UNCAST_SPEAKER_ID && item.segmentIndexes.includes(invokerIndex))
+    if (!invoker) continue
+    group.flankPartners = [...(group.flankPartners ?? []), invoker.id]
+    invoker.flankPartners = [...(invoker.flankPartners ?? []), group.id]
+  }
+  for (const group of groups) {
+    const first = Math.min(...group.segmentIndexes)
+    const lead = segments[first - 1]
+    if (!lead || lead.speakerId !== null) continue
+    const named = lead.text.match(/^([A-Z][a-z]{2,})\s+(?:says|said|murmurs|murmured|whispers|whispered|mutters|muttered|replies|replied|answers|answered|calls|called)\b/u)
+    if (named) group.narratedName = named[1].toLowerCase()
+  }
+  for (const group of groups) {
+    if (group.addressee) continue
+    const last = Math.max(...group.segmentIndexes)
+    const nextIndex = adjacentQuoteIndex(segments, last, 1)
+    const next = nextIndex >= 0 ? segments[nextIndex] : undefined
+    if (!next || next.speakerId === UNCAST_SPEAKER_ID) continue
+    const named = vocativeNames(next.text).find(name => name !== group.speakerId.replace(/^unconfigured:/u, ''))
+    if (named) group.addressee = named
+  }
+  for (const group of groups) {
+    const invoking = segments.findIndex((segment, index) => index < Math.min(...group.segmentIndexes) && segment.speakerId !== null && segment.speakerId !== UNCAST_SPEAKER_ID && new RegExp(`(?:^|,\\s*)${group.addressee}\\s*[.!?,]`, 'iu').test(segment.text))
+    if (invoking < 0) continue
+    const priorSpeech = segments.slice(0, invoking).reduce<number | undefined>((found, segment, index) => segment.speakerId === null ? found : index, undefined)
+    const before = priorSpeech === undefined ? undefined : groups.find(item => item !== group && item.speakerId === UNCAST_SPEAKER_ID && item.segmentIndexes.includes(priorSpeech) && segments[priorSpeech].speakerId !== segments[invoking].speakerId)
+    const after = group
+    if (before) {
+      after.flankPartners = [...(after.flankPartners ?? []), before.id]
+      before.flankPartners = [...(before.flankPartners ?? []), after.id]
+    }
+  }
+  // Mutual naming: two unnamed voices that each invoke a distinct name for
+  // the other are those names, even when the message holds more voices than
+  // the pair covers (e.g. Elena plus two non-invoking unnamed voices). Only
+  // trailing ", Name." vocatives count here: standalone imperatives like
+  // "First." / "Next." are discourse markers, not personal names.
+  const unknownGroups = groups.filter(group => group.speakerId === UNCAST_SPEAKER_ID)
+  const invokedByGroup = new Map(unknownGroups.map(group => [group.id, [...new Set(group.speeches.flatMap(speech => vocativeNames(speech)))]]))
+  const invokingGroups = unknownGroups.filter(group => invokedByGroup.get(group.id)?.length === 1)
+  const knownNames = new Set<string>()
+  for (const segment of segments) {
+    const id = segment.speakerId
+    if (!id || id === UNCAST_SPEAKER_ID || id.startsWith('unconfigured:') || id.startsWith('ghost:') || id === USER_SPEAKER_ID || id === UNRESOLVED_SPEAKER_ID) continue
+    knownNames.add(id.includes(':') ? id.slice(id.indexOf(':') + 1).toLowerCase() : id.toLowerCase())
+  }
+  const invokedCounts = new Map<string, number>()
+  for (const names of invokedByGroup.values()) for (const name of names) invokedCounts.set(name, (invokedCounts.get(name) ?? 0) + 1)
+  const nameIsEligible = (name: string) => !isBroadPersonLabel(name) && !knownNames.has(name) && invokedCounts.get(name) === 1
+  if (invokingGroups.length === 2) {
+    const [a, b] = invokingGroups
+    const invokedA = invokedByGroup.get(a.id)![0]
+    const invokedB = invokedByGroup.get(b.id)![0]
+    if (invokedA !== invokedB && nameIsEligible(invokedA) && nameIsEligible(invokedB)) {
+      a.inferredName = invokedB
+      b.inferredName = invokedA
+      a.addressee = invokedB
+      b.addressee = invokedA
+    }
+  } else if (invokingGroups.length === 1) {
+    const invoker = invokingGroups[0]
+    const invoked = invokedByGroup.get(invoker.id)![0]
+    if (nameIsEligible(invoked) && unknownGroups.length >= 2) {
+      // Single invocation: the other participant in the same exchange is named.
+      // Prefer the nearest neighbouring unknown group in appearance order
+      // (even when a known voice interjects between them); fall back to the
+      // predecessor when the invoker is last. Other voices stay unnamed.
+      const sorted = [...unknownGroups].sort((x, y) => Math.min(...x.segmentIndexes) - Math.min(...y.segmentIndexes))
+      const index = sorted.indexOf(invoker)
+      const candidates = [sorted[index + 1], sorted[index - 1]].filter(Boolean) as UncastVoiceGroup[]
+      const distance = (a: UncastVoiceGroup, b: UncastVoiceGroup) => Math.min(...a.segmentIndexes.flatMap(x => b.segmentIndexes.map(y => Math.abs(x - y))))
+      candidates.sort((x, y) => distance(x, invoker) - distance(y, invoker)
+        || (x === sorted[index + 1] ? -1 : 1) - (y === sorted[index + 1] ? -1 : 1))
+      const partner = candidates.find(candidate => !candidate.inferredName && invokedByGroup.get(candidate.id)?.length === 0)
+      if (partner) {
+        partner.inferredName = invoked
+        partner.addressee = invoked
+      }
+    }
+  }
   return groups
+}
+
+/** Count speech voices in a message: unnamed groups plus distinct known speakers. */
+export function countSpeechVoices(segments: PlaybackSegment[], groups: UncastVoiceGroup[]): number {
+  const known = new Set<string>()
+  for (const segment of segments) {
+    const id = segment.speakerId
+    if (!id || id === UNCAST_SPEAKER_ID || id.startsWith('unconfigured:') || id.startsWith('ghost:') || id === USER_SPEAKER_ID || id === UNRESOLVED_SPEAKER_ID) continue
+    known.add(id)
+  }
+  return groups.length + known.size
 }
 
 /** Reserve a favorite only while it is unused; a character may keep its own voice. */
@@ -328,6 +443,76 @@ export function selectAutomaticVoice(voices: FavoriteVoice[], used: ReadonlySet<
 export function availableUncastVoices(favorites: FavoriteVoice[], used: readonly string[]): FavoriteVoice[] {
   const reserved = new Set(used.map(voice => voice.trim()).filter(Boolean))
   return favorites.filter(voice => !reserved.has(voice.id))
+}
+
+/**
+ * The nearest quote from the given direction, skipping narration. Narration
+ * that names a speaker ends the search, since it can claim nearby speeches.
+ */
+function adjacentQuoteIndex(segments: PlaybackSegment[], from: number, step: 1 | -1): number {
+  for (let index = from + step; index >= 0 && index < segments.length; index += step) {
+    const segment = segments[index]
+    if (segment.speakerId !== null) return index
+    if (uncastNarrativeNameCandidates(segment.text).length || /^[A-Z][a-z]{2,}\s+(?:says|said|murmurs|murmured|whispers|whispered|mutters|muttered|replies|replied|answers|answered|calls|called)\b/u.test(segment.text)) {
+      if (narrationNamesInvokedSpeaker(segments, index)) continue
+      return -1
+    }
+  }
+  return -1
+}
+
+/** Narration that names a speaker who is invoked by an adjacent quote does not claim speeches. */
+function narrationNamesInvokedSpeaker(segments: PlaybackSegment[], index: number): boolean {
+  const named = segments[index].text.match(/^([A-Z][a-z]{2,})\s+(?:says|said|murmurs|murmured|whispers|whispered|mutters|muttered|replies|replied|answers|answered|calls|called)\b/u)
+  if (!named) return false
+  const name = named[1].toLowerCase()
+  return [segments[index - 1], segments[index + 1]].some(quote => !!quote && quote.speakerId !== null && vocativeNames(quote.text).includes(name))
+}
+
+const UNCAST_VOCATIVE_STOPWORDS = new Set(['okay', 'yeah', 'yes', 'no', 'hello', 'hey', 'please', 'thanks', 'sorry', 'listen', 'look', 'wait', 'fine', 'well', 'honey', 'sweetie', 'darling', 'first', 'second', 'third', 'fourth', 'fifth', 'last', 'next', 'one', 'two', 'three', 'four', 'five', 'once', 'twice', 'again', 'then'])
+
+/**
+ * Names a quote addresses directly: a name that opens the quote or follows a
+ * leading interjection and comma, set off by punctuation. A name merely
+ * mentioned after a preposition, possessive, or inside a clause is not a vocative.
+ */
+export function vocativeNames(quote: string): string[] {
+  const found = new Set<string>()
+  const text = quote.trim()
+  const push = (raw: string, prefix: string) => {
+    const name = raw.toLowerCase()
+    if (!name || UNCAST_VOCATIVE_STOPWORDS.has(name)) return
+    if (/\b(?:on|at|to|for|with|about|from|of|by)\s*$/iu.test(prefix)) return
+    found.add(name)
+  }
+  const leading = text.match(/^(?:[A-Za-z' ]+,\s*)?([A-Z][A-Za-z'-]*)\s*([.!?,;:])(?!\w)/u)
+  if (leading) push(leading[1], text.slice(0, text.indexOf(leading[1])))
+  for (const match of text.matchAll(/,\s*([A-Z][A-Za-z'-]*)\s*[.!?]/gu)) {
+    push(match[1], text.slice(0, match.index))
+  }
+  return [...found]
+}
+
+/**
+ * A name addressed in the quotation right after an unnamed group's speech is a
+ * candidate for that group: the next speaker is talking to the group's speaker.
+ * It is only a candidate; the label question decides whether it identifies them.
+ */
+export function addressedNameBeforeGroup(group: UncastVoiceGroup, segments: PlaybackSegment[]): string {
+  if (group.speakerId !== UNCAST_SPEAKER_ID) return ''
+  const first = Math.min(...group.segmentIndexes)
+  const previousIndex = adjacentQuoteIndex(segments, first, -1)
+  const previous = previousIndex >= 0 ? segments[previousIndex] : undefined
+  if (!previous || previous.speakerId === UNCAST_SPEAKER_ID) return ''
+  for (const name of vocativeNames(previous.text)) {
+    if (!UNCAST_VOCATIVE_STOPWORDS.has(name)) return name
+  }
+  return ''
+}
+
+/** Shared labels plus this group's own addressee candidate, so only that group can take the name. */
+export function groupLabelOptions(group: UncastVoiceGroup, labels: string[]): string[] {
+  return group.addressee && !labels.includes(group.addressee) ? [...labels, group.addressee] : labels
 }
 
 /** Collect possible descriptive identities; Jev decides whether any refers to a speaker. */
@@ -369,6 +554,16 @@ export function uncastNarrativeNameCandidates(message: string): string[] {
     names.set(name.toLowerCase(), name)
     if (names.size >= 20) break
   }
+  // Dashed appositives name a participant in passing: "the man — Ellis — has
+  // stopped" (double dash) and "now — Hallie, half-crouched" (single dash).
+  // They are still only candidates. Hyphen forms are accepted too.
+  const dashed = /(?:—+|–+|--+|-)\s*([\p{Lu}][\p{Ll}\p{M}'’-]{1,39})\s*(?:—+|–+|--+|-|,)/gu
+  for (const match of narrative.matchAll(dashed)) {
+    const name = normalizeSpeakerName(match[1])
+    if (!name || NON_NAME_PARAGRAPH_LEADS.has(name.toLowerCase())) continue
+    names.set(name.toLowerCase(), name)
+    if (names.size >= 20) break
+  }
   return [...names.values()]
 }
 
@@ -399,7 +594,7 @@ export function buildUncastVoiceDecision(groups: UncastVoiceGroup[], voices: Fav
     if (labels.length) questions[`label_${group.id}`] = {
       type: 'choice',
       instructions: `Choose the descriptive label for the person who actually speaks the quoted dialogue in ${group.id}. A person mentioned in narration, observing, or addressed by the speaker is not necessarily speaking. Choose none unless the label identifies the speaker of these quotations.`,
-      criteria: { none: 'No reliable descriptive identity.', ...Object.fromEntries(labels.map((label, index) => [`label_${index}`, label])) },
+      criteria: { none: 'No reliable descriptive identity.', ...Object.fromEntries(groupLabelOptions(group, labels).map((label, index) => [`label_${index}`, label])) },
     }
     if (group.speakerId === UNCAST_SPEAKER_ID && narrativeNames.length) questions[`narrative_name_${group.id}`] = {
       type: 'choice',
@@ -437,7 +632,9 @@ function revealedUncastName(group: UncastVoiceGroup, answers: Record<string, Spe
   const match = answer?.choice.match(/^name_(\d+)$/u)
   const probability = answer?.probabilities[answer.choice] ?? 0
   const runnerUp = answer ? Math.max(0, ...Object.entries(answer.probabilities).filter(([key]) => key !== answer.choice).map(([, value]) => value)) : 0
-  return match && answer && answer.confidence >= 0.8 && probability >= 0.8 && probability - runnerUp >= 0.25 ? (uncastNarrativeNameCandidates(message)[Number(match[1])] ?? '').toLowerCase() : ''
+  const jev = match && answer && answer.confidence >= 0.8 && probability >= 0.8 && probability - runnerUp >= 0.25 ? (uncastNarrativeNameCandidates(message)[Number(match[1])] ?? '').toLowerCase() : ''
+  if (jev) return jev
+  return group.inferredName && !isBroadPersonLabel(group.inferredName) ? group.inferredName.toLowerCase() : ''
 }
 
 /** Prefer the most recently recorded claim if a rejected old occurrence was superseded. */
@@ -529,7 +726,7 @@ export function buildUncastIdentityReview(groups: UncastVoiceGroup[], answers: R
     const labelIndex = label?.choice.match(/^label_(\d+)$/u)
     const labelProbability = label ? label.probabilities[label.choice] ?? 0 : 0
     const labelRunnerUp = label ? Math.max(0, ...Object.entries(label.probabilities).filter(([key]) => key !== label.choice).map(([, probability]) => probability)) : 0
-    const named = labelIndex && labels[Number(labelIndex[1])] && label && label.confidence >= 0.7 && labelProbability >= 0.7 && labelProbability - labelRunnerUp >= 0.25
+    const named = labelIndex && groupLabelOptions(group, labels)[Number(labelIndex[1])] && label && label.confidence >= 0.7 && labelProbability >= 0.7 && labelProbability - labelRunnerUp >= 0.25
     if (!named) continue
     for (const previous of groups.slice(0, index).slice(-8)) {
       const pair = answers[`same_${group.id}_${previous.id}`]
@@ -539,7 +736,7 @@ export function buildUncastIdentityReview(groups: UncastVoiceGroup[], answers: R
       if (priorNamed || pair?.choice !== 'same' || probability < 0.8 || pair.confidence < 0.6 || pair.confidence >= 0.8) continue
       questions[`review_same_${group.id}_${previous.id}`] = {
         type: 'choice',
-        instructions: `Review whether the speaker of the earlier group ${previous.id} is the same individual as ${group.id}, identified as ${labels[Number(labelIndex![1])]}. Read the entire scene, including intervening turns and narration. Shared occupation, gender, or similar voice alone is not enough.`,
+        instructions: `Review whether the speaker of the earlier group ${previous.id} is the same individual as ${group.id}, identified as ${groupLabelOptions(group, labels)[Number(labelIndex![1])]}. Read the entire scene, including intervening turns and narration. Shared occupation, gender, or similar voice alone is not enough.`,
         criteria: { same: 'The scene clearly establishes that both groups have the same speaker.', different_or_unclear: 'The speakers differ or the evidence is insufficient.' },
       }
       if (Object.keys(questions).length >= 16) break
@@ -563,6 +760,18 @@ function isGenericAdultLabel(label: string): boolean {
 
 export function isDescriptiveGhostLabel(label: string): boolean {
   return isBroadPersonLabel(label) || /^(?:the|a|an)\s/iu.test(label.trim()) || /['’]s\s/iu.test(label.trim())
+}
+
+/** Two unnamed groups that each invoke the other's name are the same pair of speakers. */
+export function mutuallyInvoked(a: UncastVoiceGroup, b: UncastVoiceGroup, answers: Record<string, SpeakerDecisionChoice> = {}, message = ''): boolean {
+  const nameA = revealedUncastName(a, answers, message).toLowerCase()
+  const nameB = revealedUncastName(b, answers, message).toLowerCase()
+  return !!nameA && !!nameB && a.addressee === nameB && b.addressee === nameA
+}
+
+/** A narration name boosts a group only when it confirms a flank pair: the narrated speaker is the partner's addressee. */
+export function narrationBoostsPair(group: UncastVoiceGroup, partner: UncastVoiceGroup): boolean {
+  return !!group.narratedName && group.flankPartners?.includes(partner.id) === true && partner.addressee === group.narratedName
 }
 
 export function resolveUncastVoiceDecisions(
@@ -618,7 +827,7 @@ export function resolveUncastVoiceDecisions(
     const labelIndex = labelAnswer?.choice.match(/^label_(\d+)$/u)
     const labelProbability = labelAnswer ? labelAnswer.probabilities[labelAnswer.choice] ?? 0 : 0
     const labelRunnerUp = labelAnswer ? Math.max(0, ...Object.entries(labelAnswer.probabilities).filter(([key]) => key !== labelAnswer.choice).map(([, probability]) => probability)) : 0
-    const label = labelIndex && labelAnswer && labelAnswer.confidence >= 0.7 && labelProbability >= 0.7 && labelProbability - labelRunnerUp >= 0.25 ? labels[Number(labelIndex[1])] : undefined
+    const label = labelIndex && labelAnswer && labelAnswer.confidence >= 0.7 && labelProbability >= 0.7 && labelProbability - labelRunnerUp >= 0.25 ? groupLabelOptions(group, labels)[Number(labelIndex[1])] : undefined
     if (label) groupLabels.set(group.id, label)
     const previousGroups = groups.slice(0, groups.indexOf(group)).slice(-8)
     const same = previousGroups.flatMap(previous => {
@@ -626,9 +835,12 @@ export function resolveUncastVoiceDecisions(
       if (name && previousName && name !== previousName) return []
       const review = answers[`review_same_${group.id}_${previous.id}`]
       const answer = review && strongChoice(review) ? review : answers[`same_${group.id}_${previous.id}`]
-      return answer?.choice === 'same' && strongChoice(answer) ? [{ previous, probability: answer.probabilities.same ?? 0 }] : []
+      const boosted = answer?.choice === 'same' && answer.confidence >= 0.6 && (answer.probabilities.same ?? 0) >= 0.8 && !!group.flankPartners?.includes(previous.id)
+      return (answer?.choice === 'same' && strongChoice(answer)) || boosted ? [{ previous, probability: answer?.probabilities.same ?? 0 }] : []
     }).sort((a, b) => b.probability - a.probability)
+    const narratedPartner = previousGroups.find(previous => narrationBoostsPair(group, previous))
     if (same[0]) root = roots.get(same[0].previous.id) ?? root
+    else if (narratedPartner) root = roots.get(narratedPartner.id) ?? root
     else if (label && !isBroadPersonLabel(label) && rootByLabel.has(label)) root = rootByLabel.get(label)!
     else if (strongChoice(identity) && identity?.choice.startsWith('group_')) root = roots.get(identity.choice.slice(6)) ?? root
     else if (name && rootByRevealedName.has(name)) {
