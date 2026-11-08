@@ -315,10 +315,9 @@ function buildUncastIdentityReview(groups, answers, message, ghosts = [], messag
           if (Object.keys(questions).length >= 16) break;
         }
         const key = `review_reveal_${group.id}_${ghostIndex}`;
-        const addressedInHistory = (ghost.conversationHistory ?? []).some((item) => new RegExp(`"[^"]*\\b${revealedName.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")}\\b[^"]*"`, "iu").test(item.text));
         questions[key] = {
           type: "choice",
-          instructions: `Has previously seen character ghost_${ghostIndex} now been identified as ${revealedName}, the actual speaker of ${group.id}? Compare that character's saved conversation history and the full scene, including relationships, locations, actions, and who addresses whom. ${addressedInHistory ? `The earlier history addresses someone as ${revealedName} inside a quotation; check whether that addressee is this same person, who may be the speaker now. ` : ""}Do not equate people based only on gender, occupation, or a shared setting. Confirm only when the evidence clearly identifies the same individual.`,
+          instructions: `Has previously seen character ghost_${ghostIndex} now been identified as ${revealedName}, the actual speaker of ${group.id}? Compare that character's saved conversation history and the full scene, including relationships, locations, actions, and who addresses whom. Do not equate people based only on gender, occupation, or a shared setting. Confirm only when the evidence clearly identifies the same individual.`,
           criteria: { same: "The newly named speaker and the earlier character are clearly the same person.", different_or_unclear: "They are different, or the available evidence is insufficient." }
         };
         if (previousMessages.length && ghost.conversationHistory?.length && Object.keys(questions).length < 16) {

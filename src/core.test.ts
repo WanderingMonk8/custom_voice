@@ -2124,14 +2124,6 @@ test('a vocative name inside a quote is a label candidate that a speaker answer 
   assert.ok(uncastIdentityLabels(message, []).includes('ellis'))
 })
 
-test('reveal review cites an earlier addressee of the same name in the ghost history', () => {
-  const ghost = { id: 'ghost-unnamed', speakerId: UNCAST_SPEAKER_ID, voiceId: 'voice-ellis', label: 'the man', context: '', occurrenceKeys: [], lastSeenMessageId: 'assistant-0', conversationHistory: [{ messageId: 'assistant-0', text: 'A man stands by the gate. "Leave it, Ellis. Come away."' }] }
-  const message = '"Ellis says, without turning his head." "Not yet."'
-  const groups = collectUncastVoiceGroups([{ text: 'Not yet.', speakerId: 'unconfigured:ellis' }])
-  const review = buildUncastIdentityReview(groups, {}, message, [ghost], 'later', [{ id: 'assistant-0', role: 'assistant', text: ghost.conversationHistory[0].text }])
-  assert.match(review.questions.review_reveal_g0_0.instructions, /addressee/u)
-})
-
 test('links separate same-character runs to one ghost voice and gathers their local context', () => {
   const groups = collectUncastVoiceGroups([
     { speakerId: null, text: 'The clerk smiles.' },
