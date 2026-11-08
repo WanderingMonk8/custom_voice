@@ -2254,6 +2254,14 @@ test('a narrated name boosts a flank pair only when the partner is addressed by 
   assert.equal(narrationBoostsPair(ellis, { ...woman, addressee: 'ken' }), false)
 })
 
+test('a narrated name that confirms a flank pair links the narrated group to its partner voice', () => {
+  const woman = { id: 'g0', speakerId: UNCAST_SPEAKER_ID, segmentIndexes: [0], speeches: ['Ellis.'], context: [], addressee: 'ellis', flankPartners: ['g1'] }
+  const ellis = { id: 'g1', speakerId: UNCAST_SPEAKER_ID, segmentIndexes: [2], speeches: ['You know.'], context: [], narratedName: 'ellis', flankPartners: ['g0'] }
+  const voices = readFavoriteVoices([{ id: 'voice-1', description: 'friendly and warm' }])
+  const assigned = resolveUncastVoiceDecisions([woman, ellis], voices, { voice_g0: confidentDecision('voice_0') }, [], [], 'later', 'Ellis. You know.')
+  assert.deepEqual(assigned.map(item => item.voiceId), ['voice-1', 'voice-1'])
+})
+
 test('an unnamed speaker takes the name addressed in the preceding quote by someone else', () => {
   const segments = [
     { text: 'Leave it, Ellis.', speakerId: 'unconfigured:hallie' },

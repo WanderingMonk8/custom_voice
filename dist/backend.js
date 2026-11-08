@@ -363,6 +363,9 @@ function mutuallyInvoked(a, b, answers = {}, message = "") {
   const nameB = revealedUncastName(b, answers, message).toLowerCase();
   return !!nameA && !!nameB && a.addressee === nameB && b.addressee === nameA;
 }
+function narrationBoostsPair(group, partner) {
+  return !!group.narratedName && group.flankPartners?.includes(partner.id) === true && partner.addressee === group.narratedName;
+}
 function resolveUncastVoiceDecisions(groups, voices, answers, ghosts = [], reserved = [], messageId = "", message = "", previousMessageIds = []) {
   const used = new Set(reserved.filter(Boolean));
   const assignments = [];
@@ -417,8 +420,10 @@ function resolveUncastVoiceDecisions(groups, voices, answers, ghosts = [], reser
       const boosted = answer?.choice === "same" && answer.confidence >= 0.6 && (answer.probabilities.same ?? 0) >= 0.8 && !!group.flankPartners?.includes(previous.id);
       return answer?.choice === "same" && strongChoice(answer) || boosted ? [{ previous, probability: answer?.probabilities.same ?? 0 }] : [];
     }).sort((a, b) => b.probability - a.probability);
+    const narratedPartner = previousGroups.find((previous) => narrationBoostsPair(group, previous));
     if (same[0]) root = roots.get(same[0].previous.id) ?? root;
     else if (mutualPrevious) root = roots.get(mutualPrevious.id) ?? root;
+    else if (narratedPartner) root = roots.get(narratedPartner.id) ?? root;
     else if (label && !isBroadPersonLabel(label) && rootByLabel.has(label)) root = rootByLabel.get(label);
     else if (strongChoice(identity) && identity?.choice.startsWith("group_")) root = roots.get(identity.choice.slice(6)) ?? root;
     else if (name && rootByRevealedName.has(name)) {
