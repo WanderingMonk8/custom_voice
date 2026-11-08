@@ -345,7 +345,23 @@ export function availableUncastVoices(favorites: FavoriteVoice[], used: readonly
   return favorites.filter(voice => !reserved.has(voice.id))
 }
 
-const UNCAST_VOCATIVE_STOPWORDS = new Set(['okay', 'yeah', 'yes', 'hello', 'hey', 'please', 'thanks', 'sorry', 'listen', 'look', 'wait', 'fine', 'well', 'honey', 'sweetie', 'darling'])
+const UNCAST_VOCATIVE_STOPWORDS = new Set(['okay', 'yeah', 'yes', 'no', 'hello', 'hey', 'please', 'thanks', 'sorry', 'listen', 'look', 'wait', 'fine', 'well', 'honey', 'sweetie', 'darling'])
+
+/**
+ * Names a quote addresses directly: a name that opens the quote or follows a
+ * leading interjection and comma, set off by punctuation. A name merely
+ * mentioned after a preposition, possessive, or inside a clause is not a vocative.
+ */
+export function vocativeNames(quote: string): string[] {
+  const names: string[] = []
+  const match = quote.trim().match(/^(?:[A-Za-z' ]+,\s*)?([A-Z][A-Za-z'-]*)\s*([.!?,;:])(?!\w)/u)
+  if (!match) return names
+  const name = match[1]
+  if (name.length < 1 || UNCAST_VOCATIVE_STOPWORDS.has(name.toLowerCase())) return names
+  if (/\b(?:on|at|to|for|with|about|from|of|by)\s*$/iu.test(quote.slice(0, quote.indexOf(name)))) return names
+  names.push(name.toLowerCase())
+  return names
+}
 
 /**
  * A name addressed in the quotation right after an unnamed group's speech is a
@@ -357,8 +373,7 @@ export function addressedNameBeforeGroup(group: UncastVoiceGroup, segments: Play
   const first = Math.min(...group.segmentIndexes)
   const previous = segments.slice(0, first).reverse().find(segment => segment.speakerId !== null && segment.speakerId !== UNCAST_SPEAKER_ID)
   if (!previous) return ''
-  for (const vocative of previous.text.matchAll(/(?:^|,\s*)([A-Z][a-z]{2,})\s*[.!?,]/gu)) {
-    const name = vocative[1].toLowerCase()
+  for (const name of vocativeNames(previous.text)) {
     if (!UNCAST_VOCATIVE_STOPWORDS.has(name)) return name
   }
   return ''

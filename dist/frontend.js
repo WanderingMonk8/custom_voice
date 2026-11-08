@@ -347,14 +347,23 @@ function availableUncastVoices(favorites, used) {
   const reserved = new Set(used.map((voice) => voice.trim()).filter(Boolean));
   return favorites.filter((voice) => !reserved.has(voice.id));
 }
-var UNCAST_VOCATIVE_STOPWORDS = /* @__PURE__ */ new Set(["okay", "yeah", "yes", "hello", "hey", "please", "thanks", "sorry", "listen", "look", "wait", "fine", "well", "honey", "sweetie", "darling"]);
+var UNCAST_VOCATIVE_STOPWORDS = /* @__PURE__ */ new Set(["okay", "yeah", "yes", "no", "hello", "hey", "please", "thanks", "sorry", "listen", "look", "wait", "fine", "well", "honey", "sweetie", "darling"]);
+function vocativeNames(quote) {
+  const names = [];
+  const match = quote.trim().match(/^(?:[A-Za-z' ]+,\s*)?([A-Z][A-Za-z'-]*)\s*([.!?,;:])(?!\w)/u);
+  if (!match) return names;
+  const name = match[1];
+  if (name.length < 1 || UNCAST_VOCATIVE_STOPWORDS.has(name.toLowerCase())) return names;
+  if (/\b(?:on|at|to|for|with|about|from|of|by)\s*$/iu.test(quote.slice(0, quote.indexOf(name)))) return names;
+  names.push(name.toLowerCase());
+  return names;
+}
 function addressedNameBeforeGroup(group, segments) {
   if (group.speakerId !== UNCAST_SPEAKER_ID) return "";
   const first = Math.min(...group.segmentIndexes);
   const previous = segments.slice(0, first).reverse().find((segment) => segment.speakerId !== null && segment.speakerId !== UNCAST_SPEAKER_ID);
   if (!previous) return "";
-  for (const vocative of previous.text.matchAll(/(?:^|,\s*)([A-Z][a-z]{2,})\s*[.!?,]/gu)) {
-    const name = vocative[1].toLowerCase();
+  for (const name of vocativeNames(previous.text)) {
     if (!UNCAST_VOCATIVE_STOPWORDS.has(name)) return name;
   }
   return "";

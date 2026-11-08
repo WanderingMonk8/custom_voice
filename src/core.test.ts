@@ -9,6 +9,7 @@ import {
   addFavoriteVoice,
   groupLabelOptions,
   mutuallyInvoked,
+  vocativeNames,
   type PlaybackSegment,
   mergeScannedCardCast,
   isScenarioCardTitle,
@@ -2140,6 +2141,14 @@ test('mutually invoked unnamed-speaker pairs share one voice', () => {
   const assigned = resolveUncastVoiceDecisions([hallie, ellis], voices, { voice_g0: confidentDecision('voice_0') }, [], [], 'later', 'Leave it, Ellis. Not yet, Hallie.')
   assert.deepEqual(assigned.map(item => item.voiceId), ['voice-1', 'voice-1'])
   assert.equal(assigned[0].ghostId, assigned[1].ghostId)
+})
+
+test('vocativeNames counts only true invocations, not mentions', () => {
+  assert.deepEqual(vocativeNames('No, B!'), ['b'])
+  assert.deepEqual(vocativeNames('Leave it, Ellis. Come away.'), ['ellis'])
+  assert.deepEqual(vocativeNames('No, keep your eyes on B!'), [])
+  assert.deepEqual(vocativeNames('Hey, Ellis is watching!'), [])
+  assert.deepEqual(vocativeNames("Ellis's gone."), [])
 })
 
 test('an unnamed speaker takes the name addressed in the preceding quote by someone else', () => {
