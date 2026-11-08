@@ -276,6 +276,14 @@ export function purgeExpiredGhostContexts(ghosts: GhostVoice[], assistantMessage
 }
 
 /** Group named unconfigured speakers by identity; anonymous runs stay separate. */
+function hasStrongNarrativeName(text: string): boolean {
+  const narrative = narrativeOnly(text)
+  for (const match of narrative.matchAll(/\b([\p{Lu}][\p{Ll}\p{M}'’-]{1,39})\s+(?:is|was|has|had|stands|stood|sits|sat|turns|turned|looks|looked|says|said|asks|asked|answers|answered|replies|replied|huffs|huffed|slaps|slapped|calls|called|shouts|shouted|speaks|spoke|mutters|muttered|laughs|laughed|glances|glanced|walks|walked|moves|moved|steps|stepped|nods|nodded)\b/gu)) {
+    const name = normalizeSpeakerName(match[1])
+    if (name && !NON_NAME_PARAGRAPH_LEADS.has(name.toLowerCase())) return true
+  }
+  return false
+}
 export function collectUncastVoiceGroups(segments: PlaybackSegment[]): UncastVoiceGroup[] {
   const groups: UncastVoiceGroup[] = []
   const named = new Map<string, UncastVoiceGroup>()
@@ -293,8 +301,11 @@ export function collectUncastVoiceGroups(segments: PlaybackSegment[]): UncastVoi
     if (id === UNCAST_SPEAKER_ID && segments[index - 1]?.speakerId === null && segments[index - 1].text.length > 240) anonymous = null
     // Named actions and adjacent replies can signal a change of speaker.
     // Split for review; the action alone does not identify the quotation.
-    if (id === UNCAST_SPEAKER_ID && segments[index - 1]?.speakerId === null && uncastNarrativeNameCandidates(segments[index - 1].text).length) anonymous = null
-    if (id === UNCAST_SPEAKER_ID && segments[index - 1]?.speakerId === UNCAST_SPEAKER_ID && segments[index - 2]?.speakerId === null && uncastNarrativeNameCandidates(segments[index - 2].text).length) anonymous = null
+    // Dashed appositives (the man — Ellis —) are context candidates for
+    // narration, not a split trigger: they may describe the same speaker's
+    // next line (Hallie) and must not fragment her run.
+    if (id === UNCAST_SPEAKER_ID && segments[index - 1]?.speakerId === null && hasStrongNarrativeName(segments[index - 1].text)) anonymous = null
+    if (id === UNCAST_SPEAKER_ID && segments[index - 1]?.speakerId === UNCAST_SPEAKER_ID && segments[index - 2]?.speakerId === null && hasStrongNarrativeName(segments[index - 2].text)) anonymous = null
     // An invocation alone does not split an anonymous run: the same speaker can address one name and continue speaking (e.g. "Ellis." then the same woman's next line).
     let group: UncastVoiceGroup | null | undefined = id === UNCAST_SPEAKER_ID ? anonymous : named.get(id)
     if (!group) {

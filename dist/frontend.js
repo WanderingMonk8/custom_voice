@@ -291,6 +291,14 @@ function activeGhostVoices(ghosts, assistantMessageIds, targetId, lifetime = GHO
     return (activeSince >= 0 || !ghost.lastSeenMessageId) && activeSince <= target && target - activeSince <= Math.max(1, lifetime);
   });
 }
+function hasStrongNarrativeName(text) {
+  const narrative = narrativeOnly(text);
+  for (const match of narrative.matchAll(/\b([\p{Lu}][\p{Ll}\p{M}'’-]{1,39})\s+(?:is|was|has|had|stands|stood|sits|sat|turns|turned|looks|looked|says|said|asks|asked|answers|answered|replies|replied|huffs|huffed|slaps|slapped|calls|called|shouts|shouted|speaks|spoke|mutters|muttered|laughs|laughed|glances|glanced|walks|walked|moves|moved|steps|stepped|nods|nodded)\b/gu)) {
+    const name = normalizeSpeakerName(match[1]);
+    if (name && !NON_NAME_PARAGRAPH_LEADS.has(name.toLowerCase())) return true;
+  }
+  return false;
+}
 function collectUncastVoiceGroups(segments) {
   const groups = [];
   const named = /* @__PURE__ */ new Map();
@@ -306,8 +314,8 @@ function collectUncastVoiceGroups(segments) {
     }
     if (id !== UNCAST_SPEAKER_ID) anonymous = null;
     if (id === UNCAST_SPEAKER_ID && segments[index - 1]?.speakerId === null && segments[index - 1].text.length > 240) anonymous = null;
-    if (id === UNCAST_SPEAKER_ID && segments[index - 1]?.speakerId === null && uncastNarrativeNameCandidates(segments[index - 1].text).length) anonymous = null;
-    if (id === UNCAST_SPEAKER_ID && segments[index - 1]?.speakerId === UNCAST_SPEAKER_ID && segments[index - 2]?.speakerId === null && uncastNarrativeNameCandidates(segments[index - 2].text).length) anonymous = null;
+    if (id === UNCAST_SPEAKER_ID && segments[index - 1]?.speakerId === null && hasStrongNarrativeName(segments[index - 1].text)) anonymous = null;
+    if (id === UNCAST_SPEAKER_ID && segments[index - 1]?.speakerId === UNCAST_SPEAKER_ID && segments[index - 2]?.speakerId === null && hasStrongNarrativeName(segments[index - 2].text)) anonymous = null;
     let group = id === UNCAST_SPEAKER_ID ? anonymous : named.get(id);
     if (!group) {
       group = { id: `g${groups.length}`, speakerId: id, segmentIndexes: [], speeches: [], context: [] };

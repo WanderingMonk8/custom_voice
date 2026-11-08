@@ -6528,7 +6528,11 @@ spindle.onFrontendMessage(async (rawPayload, userId, frontendSessionId) => {
           speakerId: group.speakerId,
           segmentIndexes: group.segmentIndexes.slice(0, 500),
           speeches: group.speeches.slice(0, 20).map((speech) => speech.slice(0, 2e3)),
-          context: (group.context ?? []).slice(0, 20).map((context) => context.slice(0, 2e3))
+          context: (group.context ?? []).slice(0, 20).map((context) => context.slice(0, 2e3)),
+          ...group.addressee ? { addressee: group.addressee } : {},
+          ...group.flankPartners ? { flankPartners: group.flankPartners.slice(0, 20) } : {},
+          ...group.narratedName ? { narratedName: group.narratedName } : {},
+          ...group.inferredName ? { inferredName: group.inferredName } : {}
         }));
         const chat = await spindle.chats.get(payload.chatId, userId);
         if (!chat) throw new Error("The chat is no longer available.");
