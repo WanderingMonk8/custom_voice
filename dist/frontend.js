@@ -2641,6 +2641,14 @@ function setup(ctx) {
       border:1px solid var(--lumiverse-border); border-radius:var(--lumiverse-radius);
       background:var(--lumiverse-bg-secondary, transparent); color:var(--lumiverse-text-primary); font:inherit;
     }
+    .chat-voice-debug-actions { display:flex; gap:8px; }
+    .chat-voice-copy-report-button {
+      min-height:30px; padding:0 12px; border:1px solid var(--lumiverse-border);
+      border-radius:6px; background:var(--lumiverse-fill-subtle); color:var(--lumiverse-text);
+      font:inherit; font-size:12px; font-weight:600; cursor:pointer;
+    }
+    .chat-voice-copy-report-button:hover:not(:disabled) { filter:brightness(1.08); }
+    .chat-voice-copy-report-button:disabled { cursor:not-allowed; opacity:.5; }
   `);
   const tab = ctx.ui.registerDrawerTab({
     id: "chat-voice",
@@ -2917,6 +2925,16 @@ function setup(ctx) {
   speakerDebugOutput.hidden = true;
   speakerDebugOutput.placeholder = "Generate TTS to see the turn matrix, discourse review, inheritance, and voice-route trace.";
   speakerDebugOutput.setAttribute("aria-label", "Speaker assignment debug log");
+  const debugActions = document.createElement("div");
+  debugActions.className = "chat-voice-debug-actions";
+  const copyReportButton = document.createElement("button");
+  copyReportButton.type = "button";
+  copyReportButton.className = "chat-voice-copy-report-button";
+  copyReportButton.textContent = "Copy Report";
+  copyReportButton.addEventListener("click", () => {
+    void copyDebugReport();
+  });
+  debugActions.append(copyReportButton);
   const advancedHint = document.createElement("div");
   advancedHint.className = "chat-voice-hint";
   advancedHint.textContent = "Concurrency starts at one and adapts up to the selected maximum. Dense short-segment runs stay at one request at a time, while sustained long runs increase gradually. Larger buffers reduce pauses but delay playback. The wait budget controls cumulative rate-limit cooldowns.";
@@ -2932,6 +2950,7 @@ function setup(ctx) {
     autoPlaybackDelayField.field,
     skipNarrationLabel,
     speakerDebugLabel,
+    debugActions,
     speakerDebugOutput,
     advancedHint
   );
@@ -3845,6 +3864,21 @@ function setup(ctx) {
       pendingLlmConnectionRequests.set(requestId, { resolve, reject, timer });
       ctx.sendToBackend({ type: "chat_voice_list_llm_connections", requestId });
     });
+  }
+  async function copyDebugReport() {
+    const text = speakerDebugOutput.value;
+    if (!text) {
+      setStatus("The debug log is empty.");
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(text);
+      setStatus("Debug report copied to clipboard.", "saved");
+    } catch {
+      speakerDebugOutput.focus();
+      speakerDebugOutput.select();
+      setStatus("Clipboard copy failed; the debug log text is selected for manual copying.", "error");
+    }
   }
   function requestTagPlacements(message, style, connectionId, model, items) {
     const requestId = `tag-placement-${Date.now().toString(36)}-${++tagPlacementRequestSequence}`;
@@ -4873,7 +4907,8 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
     ctx.sendToBackend({
       type: "chat_voice_scan",
       chatId: activeChat.id,
-      messageLimit: activeChat.messageLimit
+      messageLimit: activeChat.messageLimit,
+      tagLlmConnectionId
     });
   }
   scanButton.addEventListener("click", scanMessages);
