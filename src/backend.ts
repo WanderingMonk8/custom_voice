@@ -1881,6 +1881,7 @@ spindle.onFrontendMessage(async (rawPayload: unknown, userId, frontendSessionId)
           content?: string
           swipe_id?: number
           swipes?: string[]
+          swipe_dates?: number[]
           extra?: Record<string, unknown>
         }>
         const message = messages.find((item) => item.id === payload.messageId)
@@ -1894,6 +1895,7 @@ spindle.onFrontendMessage(async (rawPayload: unknown, userId, frontendSessionId)
             name: message.name,
             content: message.content ?? '',
             swipe_id: message.swipe_id,
+            swipe_dates: message.swipe_dates,
             ...(Number.isInteger(payload.targetSwipeId) && (payload.targetSwipeId ?? -1) >= 0 ? {
               targetSwipeContent: readMessageSwipeContent(message, payload.targetSwipeId!),
             } : {}),

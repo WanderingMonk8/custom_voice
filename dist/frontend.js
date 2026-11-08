@@ -203,11 +203,19 @@ function claimAutoplayGeneration(event, generations, messages) {
   return true;
 }
 function autoplaySwipeSnapshot(message) {
-  return { swipeId: message.swipe_id ?? 0, contentHash: hashMessageContent(message.content) };
+  const swipeId = message.swipe_id ?? 0;
+  const swipeDate = message.swipe_dates?.[swipeId];
+  return { swipeId, contentHash: hashMessageContent(message.content), ...typeof swipeDate === "number" && Number.isFinite(swipeDate) ? { swipeDate } : {} };
 }
 function autoplaySwipeMatches(message, expected) {
   const actual = autoplaySwipeSnapshot(message);
-  return actual.swipeId === expected.swipeId && actual.contentHash === expected.contentHash;
+  return actual.swipeId === expected.swipeId && actual.contentHash === expected.contentHash && (expected.swipeDate === void 0 || actual.swipeDate === expected.swipeDate);
+}
+function refreshAutoplaySwipe(message, original) {
+  const current = autoplaySwipeSnapshot(message);
+  if (current.swipeId !== original.swipeId) return null;
+  if (original.swipeDate !== void 0 && current.swipeDate !== original.swipeDate) return null;
+  return current;
 }
 function targetSwipeContentMatches(targetSwipeContent, expected) {
   return typeof targetSwipeContent === "string" && hashMessageContent(targetSwipeContent) === expected.contentHash;
@@ -6189,7 +6197,15 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
       }
       while (activePlayback && !requestSignal.aborted && !autoPlaybackDisposed && autoPlayback && eventEpoch === autoPlaybackEpoch && ctx.getActiveChat().chatId === event.chatId) await waitForAutoplayWork(activePlayback.audibleDone, requestSignal);
       if (requestSignal.aborted || autoPlaybackDisposed || !autoPlayback || eventEpoch !== autoPlaybackEpoch || ctx.getActiveChat().chatId !== event.chatId) return;
-      await waitForAutoplayWork(playMessage(event.messageId, false, true, expectedSwipe), requestSignal);
+      let refreshedSwipe = null;
+      await waitForAutoplayWork(requestPlaybackMessage(event.chatId, event.messageId).then((message) => {
+        if (!message.is_user && expectedSwipe) refreshedSwipe = refreshAutoplaySwipe(message, expectedSwipe);
+      }), requestSignal);
+      if (!refreshedSwipe || requestSignal.aborted) {
+        appendSpeakerDebugLog(`Autoplay skipped: message ${event.messageId} is no longer on the generated swipe.`);
+        return;
+      }
+      await waitForAutoplayWork(playMessage(event.messageId, false, true, refreshedSwipe), requestSignal);
     }).catch((error) => {
       if (!autoPlaybackDisposed && !requestSignal.aborted) setStatus(error instanceof Error ? error.message : "Automatic playback failed.", "error");
     }).finally(() => autoPlaybackRequests.finish(requestKey, requestSignal));

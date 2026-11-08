@@ -37,6 +37,7 @@ import {
   autoplayGenerationEvent,
   autoplaySwipeSnapshot,
   autoplaySwipeMatches,
+  refreshAutoplaySwipe,
   readMessageSwipeContent,
   targetSwipeContentMatches,
   swipeSynthesisKey,
@@ -3199,6 +3200,20 @@ test('autoplay snapshots the active swipe and detects later navigation or edits'
   assert.equal(autoplaySwipeMatches({ ...message, swipe_id: 5 }, snapshot), false)
   assert.equal(autoplaySwipeMatches({ ...message, content: 'A later reroll in the same slot.' }, snapshot), false)
   assert.equal(autoplaySwipeMatches({ content: 'Original.' }, autoplaySwipeSnapshot({ swipe_id: 0, content: 'Original.' })), true)
+})
+
+test('autoplay refreshes edits on the original swipe after its delay but rejects another swipe', () => {
+  const generated = { swipe_id: 2, content: 'Original text.', swipe_dates: [10, 20, 30] }
+  const original = autoplaySwipeSnapshot(generated)
+  const honed = { ...generated, content: 'Honed text.' }
+  const refreshed = refreshAutoplaySwipe(honed, original)
+  assert.ok(refreshed)
+  assert.equal(autoplaySwipeMatches(honed, refreshed), true)
+  assert.equal(autoplaySwipeMatches(honed, original), false)
+  assert.equal(refreshAutoplaySwipe({ ...honed, swipe_id: 1 }, original), null)
+  assert.equal(refreshAutoplaySwipe({ ...honed, swipe_dates: [10, 20, 99] }, original), null)
+  assert.equal(autoplaySwipeMatches({ ...honed, content: 'Edited after refresh.' }, refreshed), false)
+  assert.ok(refreshAutoplaySwipe({ swipe_id: 2, content: 'Edited.' }, autoplaySwipeSnapshot({ swipe_id: 2, content: 'Original.' })))
 })
 
 test('synthesis and save validation remain scoped to the original swipe after navigation', () => {

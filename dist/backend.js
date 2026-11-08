@@ -6615,6 +6615,7 @@ spindle.onFrontendMessage(async (rawPayload, userId, frontendSessionId) => {
             name: message.name,
             content: message.content ?? "",
             swipe_id: message.swipe_id,
+            swipe_dates: message.swipe_dates,
             ...Number.isInteger(payload.targetSwipeId) && (payload.targetSwipeId ?? -1) >= 0 ? {
               targetSwipeContent: readMessageSwipeContent(message, payload.targetSwipeId)
             } : {},

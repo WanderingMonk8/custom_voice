@@ -45,13 +45,25 @@ export function hasAudioForActiveSwipe(message: { swipe_id?: number; extra?: Rec
   })
 }
 
-export function autoplaySwipeSnapshot(message: { swipe_id?: number; content: string }): { swipeId: number; contentHash: string } {
-  return { swipeId: message.swipe_id ?? 0, contentHash: hashMessageContent(message.content) }
+export interface AutoplaySwipeSnapshot { swipeId: number; contentHash: string; swipeDate?: number }
+export function autoplaySwipeSnapshot(message: { swipe_id?: number; content: string; swipe_dates?: number[] }): AutoplaySwipeSnapshot {
+  const swipeId = message.swipe_id ?? 0
+  const swipeDate = message.swipe_dates?.[swipeId]
+  return { swipeId, contentHash: hashMessageContent(message.content), ...(typeof swipeDate === 'number' && Number.isFinite(swipeDate) ? { swipeDate } : {}) }
 }
 
-export function autoplaySwipeMatches(message: { swipe_id?: number; content: string }, expected: { swipeId: number; contentHash: string }): boolean {
+export function autoplaySwipeMatches(message: { swipe_id?: number; content: string; swipe_dates?: number[] }, expected: AutoplaySwipeSnapshot): boolean {
   const actual = autoplaySwipeSnapshot(message)
   return actual.swipeId === expected.swipeId && actual.contentHash === expected.contentHash
+    && (expected.swipeDate === undefined || actual.swipeDate === expected.swipeDate)
+}
+
+/** Accept same-swipe edits during the delay but never follow a different swipe. */
+export function refreshAutoplaySwipe(message: { swipe_id?: number; content: string; swipe_dates?: number[] }, original: AutoplaySwipeSnapshot): AutoplaySwipeSnapshot | null {
+  const current = autoplaySwipeSnapshot(message)
+  if (current.swipeId !== original.swipeId) return null
+  if (original.swipeDate !== undefined && current.swipeDate !== original.swipeDate) return null
+  return current
 }
 
 /** Validate the original swipe, regardless of which swipe is currently visible. */
@@ -80,7 +92,7 @@ export function savedAudioMatchesSwipe(result: { message?: { id?: string; extra?
 }
 
 /** Existing audio does not block autoplay; saving is governed separately. */
-export function automaticPlaybackSkipReason(message: { is_user: boolean; swipe_id?: number; content: string }, expected?: { swipeId: number; contentHash: string }): 'user-message' | 'changed-swipe' | null {
+export function automaticPlaybackSkipReason(message: { is_user: boolean; swipe_id?: number; content: string; swipe_dates?: number[] }, expected?: AutoplaySwipeSnapshot): 'user-message' | 'changed-swipe' | null {
   if (message.is_user) return 'user-message'
   if (expected && !autoplaySwipeMatches(message, expected)) return 'changed-swipe'
   return null
