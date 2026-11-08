@@ -308,6 +308,12 @@ function collectUncastVoiceGroups(segments) {
     if (id === UNCAST_SPEAKER_ID && segments[index - 1]?.speakerId === null && segments[index - 1].text.length > 240) anonymous = null;
     if (id === UNCAST_SPEAKER_ID && segments[index - 1]?.speakerId === null && uncastNarrativeNameCandidates(segments[index - 1].text).length) anonymous = null;
     if (id === UNCAST_SPEAKER_ID && segments[index - 1]?.speakerId === UNCAST_SPEAKER_ID && segments[index - 2]?.speakerId === null && uncastNarrativeNameCandidates(segments[index - 2].text).length) anonymous = null;
+    if (id === UNCAST_SPEAKER_ID && segments[index - 1]?.speakerId === UNCAST_SPEAKER_ID && vocativeNames(segments[index - 1].text).length) anonymous = null;
+    if (id === UNCAST_SPEAKER_ID) {
+      const priorIndex = adjacentQuoteIndex(segments, index, -1);
+      const prior = priorIndex >= 0 ? segments[priorIndex] : void 0;
+      if (prior?.speakerId === UNCAST_SPEAKER_ID && vocativeNames(prior.text).length) anonymous = null;
+    }
     let group = id === UNCAST_SPEAKER_ID ? anonymous : named.get(id);
     if (!group) {
       group = { id: `g${groups.length}`, speakerId: id, segmentIndexes: [], speeches: [], context: [] };
@@ -329,6 +335,19 @@ function collectUncastVoiceGroups(segments) {
   for (const group of groups) {
     const addressee = addressedNameBeforeGroup(group, segments);
     if (addressee) group.addressee = addressee;
+  }
+  for (const group of groups) {
+    if (group.speakerId === UNCAST_SPEAKER_ID) continue;
+    const first = Math.min(...group.segmentIndexes);
+    const invokerIndex = adjacentQuoteIndex(segments, first, -1);
+    if (invokerIndex < 0 || segments[invokerIndex].speakerId !== UNCAST_SPEAKER_ID) continue;
+    const invoked = vocativeNames(segments[invokerIndex].text)[0];
+    if (!invoked) continue;
+    group.narratedName = invoked;
+    const invoker = groups.find((item) => item.speakerId === UNCAST_SPEAKER_ID && item.segmentIndexes.includes(invokerIndex));
+    if (!invoker) continue;
+    group.flankPartners = [...group.flankPartners ?? [], invoker.id];
+    invoker.flankPartners = [...invoker.flankPartners ?? [], group.id];
   }
   for (const group of groups) {
     const first = Math.min(...group.segmentIndexes);
@@ -367,9 +386,18 @@ function adjacentQuoteIndex(segments, from, step) {
   for (let index = from + step; index >= 0 && index < segments.length; index += step) {
     const segment = segments[index];
     if (segment.speakerId !== null) return index;
-    if (uncastNarrativeNameCandidates(segment.text).length || /^[A-Z][a-z]{2,}\s+(?:says|said|murmurs|murmured|whispers|whispered|mutters|muttered|replies|replied|answers|answered|calls|called)\b/u.test(segment.text)) return -1;
+    if (uncastNarrativeNameCandidates(segment.text).length || /^[A-Z][a-z]{2,}\s+(?:says|said|murmurs|murmured|whispers|whispered|mutters|muttered|replies|replied|answers|answered|calls|called)\b/u.test(segment.text)) {
+      if (narrationNamesInvokedSpeaker(segments, index)) continue;
+      return -1;
+    }
   }
   return -1;
+}
+function narrationNamesInvokedSpeaker(segments, index) {
+  const named = segments[index].text.match(/^([A-Z][a-z]{2,})\s+(?:says|said|murmurs|murmured|whispers|whispered|mutters|muttered|replies|replied|answers|answered|calls|called)\b/u);
+  if (!named) return false;
+  const name = named[1].toLowerCase();
+  return [segments[index - 1], segments[index + 1]].some((quote) => !!quote && quote.speakerId !== null && vocativeNames(quote.text).includes(name));
 }
 var UNCAST_VOCATIVE_STOPWORDS = /* @__PURE__ */ new Set(["okay", "yeah", "yes", "no", "hello", "hey", "please", "thanks", "sorry", "listen", "look", "wait", "fine", "well", "honey", "sweetie", "darling"]);
 function vocativeNames(quote) {

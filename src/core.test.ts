@@ -2178,6 +2178,20 @@ test('a flank link needs an exchange: the invoking quote directly follows the pa
   assert.ok(linked.some(group => group.flankPartners?.length))
 })
 
+test('an unnamed invoker can flank-link the unnamed partner it addresses, as in the Ellis chat', () => {
+  const groups = collectUncastVoiceGroups([
+    { text: 'Ellis.', speakerId: UNCAST_SPEAKER_ID },
+    { text: 'Then the groan out in the street.', speakerId: null },
+    { text: 'They have a gate latched.', speakerId: 'unconfigured:ellis' },
+    { text: 'Ellis says, without turning his head.', speakerId: null },
+    { text: 'You know what that means?', speakerId: 'unconfigured:ellis' },
+  ] as PlaybackSegment[])
+  const woman = groups.find(group => group.segmentIndexes.includes(0))
+  const ellis = groups.find(group => group.segmentIndexes.includes(2))
+  assert.deepEqual(ellis?.flankPartners, [woman?.id])
+  assert.equal(ellis?.narratedName, 'ellis')
+})
+
 test('an addressee needs an adjacent invoking quote; intervening speech blocks it', () => {
   const adjacent = collectUncastVoiceGroups([
     { text: 'Leave it, Ellis.', speakerId: 'unconfigured:hallie' },
