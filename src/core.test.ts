@@ -2163,6 +2163,50 @@ test('a name invoked in the next quote by another speaker is the candidate for t
   assert.equal(y?.addressee, undefined)
 })
 
+test('a flank link needs an exchange: the invoking quote directly follows the partner quote', () => {
+  const direct = collectUncastVoiceGroups([
+    { text: 'Gate is shut.', speakerId: UNCAST_SPEAKER_ID },
+    { text: 'Leave it, Ellis.', speakerId: 'unconfigured:hallie' },
+  ] as PlaybackSegment[])
+  assert.equal(direct.filter(group => group.speakerId === UNCAST_SPEAKER_ID)[0].flankPartners, undefined)
+  const linked = collectUncastVoiceGroups([
+    { text: 'Gate is shut.', speakerId: UNCAST_SPEAKER_ID },
+    { text: 'Leave it, Ellis.', speakerId: 'unconfigured:hallie' },
+    { text: 'Not yet.', speakerId: UNCAST_SPEAKER_ID },
+  ] as PlaybackSegment[])
+  assert.ok(linked.some(group => group.flankPartners?.length))
+})
+
+test('an addressee needs an adjacent invoking quote; intervening speech blocks it', () => {
+  const adjacent = collectUncastVoiceGroups([
+    { text: 'Leave it, Ellis.', speakerId: 'unconfigured:hallie' },
+    { text: 'Not yet.', speakerId: UNCAST_SPEAKER_ID },
+  ] as PlaybackSegment[])
+  assert.equal(adjacent.find(group => group.speakerId === UNCAST_SPEAKER_ID)?.addressee, 'ellis')
+  const blocked = collectUncastVoiceGroups([
+    { text: 'Leave it, Ellis.', speakerId: 'unconfigured:hallie' },
+    { text: 'Fine.', speakerId: 'unconfigured:ken' },
+    { text: 'Not yet.', speakerId: UNCAST_SPEAKER_ID },
+  ] as PlaybackSegment[])
+  assert.equal(blocked.find(group => group.speakerId === UNCAST_SPEAKER_ID)?.addressee, undefined)
+})
+
+test('both neighbors of an invoking quote are flank partners only within an actual dialogue', () => {
+  const dialogue = collectUncastVoiceGroups([
+    { text: 'Gate is shut.', speakerId: UNCAST_SPEAKER_ID },
+    { text: 'Leave it, Ellis.', speakerId: 'unconfigured:hallie' },
+    { text: 'Not yet.', speakerId: UNCAST_SPEAKER_ID },
+  ] as PlaybackSegment[])
+  const [before, after] = dialogue.filter(group => group.speakerId === UNCAST_SPEAKER_ID)
+  assert.deepEqual(before.flankPartners, [after.id])
+  assert.deepEqual(after.flankPartners, [before.id])
+  const noReply = collectUncastVoiceGroups([
+    { text: 'Hey!', speakerId: UNCAST_SPEAKER_ID },
+    { text: 'No, B!', speakerId: 'unconfigured:yara' },
+  ] as PlaybackSegment[])
+  assert.equal(noReply.find(group => group.speakerId === UNCAST_SPEAKER_ID)?.flankPartners, undefined)
+})
+
 test('an unnamed speaker takes the name addressed in the preceding quote by someone else', () => {
   const segments = [
     { text: 'Leave it, Ellis.', speakerId: 'unconfigured:hallie' },

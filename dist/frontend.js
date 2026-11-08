@@ -341,7 +341,8 @@ function collectUncastVoiceGroups(segments) {
   for (const group of groups) {
     const invoking = segments.findIndex((segment, index) => index < Math.min(...group.segmentIndexes) && segment.speakerId !== null && segment.speakerId !== UNCAST_SPEAKER_ID && new RegExp(`(?:^|,\\s*)${group.addressee}\\s*[.!?,]`, "iu").test(segment.text));
     if (invoking < 0) continue;
-    const before = groups.filter((item) => item !== group && item.speakerId === UNCAST_SPEAKER_ID && Math.max(...item.segmentIndexes) < invoking).sort((a, b) => Math.max(...b.segmentIndexes) - Math.max(...a.segmentIndexes))[0];
+    const priorSpeech = segments.slice(0, invoking).reduce((found, segment, index) => segment.speakerId === null ? found : index, void 0);
+    const before = priorSpeech === void 0 ? void 0 : groups.find((item) => item !== group && item.speakerId === UNCAST_SPEAKER_ID && item.segmentIndexes.includes(priorSpeech) && segments[priorSpeech].speakerId !== segments[invoking].speakerId);
     const after = group;
     if (before) {
       after.flankPartners = [...after.flankPartners ?? [], before.id];
@@ -368,8 +369,8 @@ function vocativeNames(quote) {
 function addressedNameBeforeGroup(group, segments) {
   if (group.speakerId !== UNCAST_SPEAKER_ID) return "";
   const first = Math.min(...group.segmentIndexes);
-  const previous = segments.slice(0, first).reverse().find((segment) => segment.speakerId !== null && segment.speakerId !== UNCAST_SPEAKER_ID);
-  if (!previous) return "";
+  const previous = segments[first - 1];
+  if (!previous || previous.speakerId === null || previous.speakerId === UNCAST_SPEAKER_ID) return "";
   for (const name of vocativeNames(previous.text)) {
     if (!UNCAST_VOCATIVE_STOPWORDS.has(name)) return name;
   }
