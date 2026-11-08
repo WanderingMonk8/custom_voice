@@ -43,8 +43,6 @@ import {
   autoplaySwipeSnapshot,
   autoplaySwipeMatches,
   refreshAutoplaySwipe,
-  readMessageSwipeContent,
-  targetSwipeContentMatches,
   swipeSynthesisKey,
   savedAudioMatchesSwipe,
   automaticPlaybackSkipReason,
@@ -3506,12 +3504,19 @@ test('synthesis and save validation remain scoped to the original swipe after na
   const snapshot = autoplaySwipeSnapshot(initial)
   const navigated = { swipe_id: 2, content: 'Third version.', swipes: ['First version.', 'Second version.', 'Third version.'] }
   assert.equal(autoplaySwipeMatches(navigated, snapshot), false)
-  assert.equal(targetSwipeContentMatches(readMessageSwipeContent(navigated, snapshot.swipeId), snapshot), true)
-  assert.equal(targetSwipeContentMatches(readMessageSwipeContent({ ...navigated, swipes: ['First version.', 'Edited.', 'Third version.'] }, 1), snapshot), false)
-  assert.equal(targetSwipeContentMatches(readMessageSwipeContent({ ...navigated, swipes: ['First version.', 'Third version.'] }, 1), snapshot), false)
-  assert.equal(readMessageSwipeContent({ swipe_id: 2, content: 'Third version.' }, 1), null)
   assert.notEqual(swipeSynthesisKey('chat', 'message', 1), swipeSynthesisKey('chat', 'message', 2))
   assert.equal(swipeSynthesisKey('chat', 'message', 1), swipeSynthesisKey('chat', 'message', 1))
+})
+
+test('the save check accepts same-swipe refinements but still refuses navigation', () => {
+  const started = { swipe_id: 2, content: 'Generated text.', swipe_dates: [10, 20, 30] }
+  const original = autoplaySwipeSnapshot(started)
+  const refined = { swipe_id: 2, content: 'Improved text.', swipe_dates: [10, 20, 30] }
+  const refreshed = refreshAutoplaySwipe(refined, original)
+  assert.ok(refreshed)
+  assert.notEqual(refreshed.contentHash, original.contentHash)
+  assert.equal(refreshAutoplaySwipe({ swipe_id: 3, content: 'Improved text.', swipe_dates: [10, 20, 30] }, original), null)
+  assert.equal(refreshAutoplaySwipe({ swipe_id: 2, content: 'Improved text.', swipe_dates: [10, 20, 99] }, original), null)
 })
 
 test('saved audio confirmation requires the requested swipe and attachment', () => {

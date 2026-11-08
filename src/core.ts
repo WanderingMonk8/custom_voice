@@ -66,20 +66,6 @@ export function refreshAutoplaySwipe(message: { swipe_id?: number; content: stri
   return current
 }
 
-/** Validate the original swipe, regardless of which swipe is currently visible. */
-export function targetSwipeContentMatches(targetSwipeContent: unknown, expected: { contentHash: string }): boolean {
-  return typeof targetSwipeContent === 'string' && hashMessageContent(targetSwipeContent) === expected.contentHash
-}
-
-/** Read a specific swipe without accidentally substituting another active swipe. */
-export function readMessageSwipeContent(message: { swipe_id?: number; swipes?: unknown; content?: string }, swipeId: number): string | null {
-  if (!Number.isInteger(swipeId) || swipeId < 0) return null
-  if (Array.isArray(message.swipes) && message.swipes.length > 0) {
-    return typeof message.swipes[swipeId] === 'string' ? message.swipes[swipeId] : null
-  }
-  return (message.swipe_id ?? 0) === swipeId && typeof message.content === 'string' ? message.content : null
-}
-
 export function swipeSynthesisKey(chatId: string, messageId: string, swipeId: number): string {
   return `${chatId}\u0000${messageId}\u0000${swipeId}`
 }

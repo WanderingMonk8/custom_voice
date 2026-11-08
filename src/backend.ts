@@ -55,7 +55,6 @@ import {
   extractGenerationText,
   formatTtsTag,
   hashMessageContent,
-  readMessageSwipeContent,
   ghostCastAliases,
   mergeGhostAliases,
   updateGhostConversationHistory,
@@ -147,7 +146,7 @@ type FrontendMessage =
   | { type: 'chat_voice_scan'; chatId: string; messageLimit: number; tagLlmConnectionId?: string }
   | { type: 'chat_voice_auto_cast'; requestId: string; chatId: string; voices: FavoriteVoice[]; reserved: string[]; narratorMissing: boolean; userMissing: boolean; ghostLifetime: number }
   | { type: 'chat_voice_ghost_edit'; chatId: string; ghostId: string; voice?: string; promote?: boolean; remove?: boolean }
-  | { type: 'chat_voice_get_message'; chatId: string; messageId: string; requestId: string; targetSwipeId?: number }
+  | { type: 'chat_voice_get_message'; chatId: string; messageId: string; requestId: string }
   | { type: 'chat_voice_match_uncast'; requestId: string; chatId: string; messageId: string; message: string; sourceHash: string; groups: UncastVoiceGroup[]; voices: FavoriteVoice[]; reserved: string[]; lifetime: number; speakerLookback?: number; skippedTrackerTags?: string }
   | {
       type: 'chat_voice_parse_message'
@@ -1931,9 +1930,6 @@ spindle.onFrontendMessage(async (rawPayload: unknown, userId, frontendSessionId)
             content: message.content ?? '',
             swipe_id: message.swipe_id,
             swipe_dates: message.swipe_dates,
-            ...(Number.isInteger(payload.targetSwipeId) && (payload.targetSwipeId ?? -1) >= 0 ? {
-              targetSwipeContent: readMessageSwipeContent(message, payload.targetSwipeId!),
-            } : {}),
             extra: message.extra ?? {},
           } : null,
           ...(!message ? { error: 'The message is no longer available.' } : {}),

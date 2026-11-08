@@ -23,7 +23,6 @@ import {
   autoplaySwipeSnapshot,
   autoplaySwipeMatches,
   refreshAutoplaySwipe,
-  targetSwipeContentMatches,
   swipeSynthesisKey,
   savedAudioMatchesSwipe,
   automaticPlaybackSkipReason,
@@ -330,7 +329,6 @@ interface PlaybackMessage {
   content: string
   swipe_id?: number
   swipe_dates?: number[]
-  targetSwipeContent?: string | null
   extra?: Record<string, unknown>
 }
 
@@ -2102,7 +2100,7 @@ export function setup(ctx: SpindleFrontendContext) {
     nativeButtonStates.clear()
   }
 
-  function requestPlaybackMessage(chatId: string, messageId: string, targetSwipeId?: number): Promise<PlaybackMessage> {
+  function requestPlaybackMessage(chatId: string, messageId: string): Promise<PlaybackMessage> {
     const requestId = `${Date.now().toString(36)}-${++messageRequestSequence}`
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -2110,7 +2108,7 @@ export function setup(ctx: SpindleFrontendContext) {
         reject(new Error('Timed out while loading the message for playback.'))
       }, 15_000)
       pendingMessageRequests.set(requestId, { resolve, reject, timer })
-      ctx.sendToBackend({ type: 'chat_voice_get_message', chatId, messageId, requestId, ...(targetSwipeId !== undefined ? { targetSwipeId } : {}) })
+      ctx.sendToBackend({ type: 'chat_voice_get_message', chatId, messageId, requestId })
     })
   }
 
@@ -3625,10 +3623,19 @@ export function setup(ctx: SpindleFrontendContext) {
             },
             async () => {
               if (!Number.isInteger(message.swipe_id) || (message.swipe_id ?? -1) < 0) throw new Error('Cannot safely save audio: the target swipe ID is unavailable.')
-              const latest = await requestPlaybackMessage(playbackChat.id, messageId, message.swipe_id)
-              if (synthesisController.signal.aborted || latest.is_user || !targetSwipeContentMatches(latest.targetSwipeContent, autoplaySwipeSnapshot(message))) {
-                appendSpeakerDebugLog(`Audio save cancelled: message ${messageId}, swipe ${message.swipe_id}, was removed or changed since playback began.`)
+              const latest = await requestPlaybackMessage(playbackChat.id, messageId)
+              const originalSwipe = autoplaySwipeSnapshot(message)
+              // Same-swipe refinements (e.g. a post-generation improvement pass
+              // landing during synthesis) are acceptable: the saved audio is
+              // the recording of the text as played. Only swipe navigation or
+              // replacement cancels the save.
+              const refreshedSwipe = refreshAutoplaySwipe(latest, originalSwipe)
+              if (synthesisController.signal.aborted || latest.is_user || !refreshedSwipe) {
+                appendSpeakerDebugLog(`Audio save cancelled: message ${messageId}, swipe ${message.swipe_id}, was removed, navigated, or replaced since playback began.`)
                 throw new DOMException('Target swipe changed before audio save.', 'AbortError')
+              }
+              if (refreshedSwipe.contentHash !== originalSwipe.contentHash) {
+                appendSpeakerDebugLog(`Audio save: message ${messageId}, swipe ${message.swipe_id}, message text was refined on the same swipe since playback began; saving the audio of the text as played.`)
               }
             },
           )

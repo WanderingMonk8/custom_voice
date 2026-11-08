@@ -217,9 +217,6 @@ function refreshAutoplaySwipe(message, original) {
   if (original.swipeDate !== void 0 && current.swipeDate !== original.swipeDate) return null;
   return current;
 }
-function targetSwipeContentMatches(targetSwipeContent, expected) {
-  return typeof targetSwipeContent === "string" && hashMessageContent(targetSwipeContent) === expected.contentHash;
-}
 function swipeSynthesisKey(chatId, messageId, swipeId) {
   return `${chatId}\0${messageId}\0${swipeId}`;
 }
@@ -3563,7 +3560,7 @@ function setup(ctx) {
     updatePlaybackButtons();
     nativeButtonStates.clear();
   }
-  function requestPlaybackMessage(chatId, messageId, targetSwipeId) {
+  function requestPlaybackMessage(chatId, messageId) {
     const requestId = `${Date.now().toString(36)}-${++messageRequestSequence}`;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -3571,7 +3568,7 @@ function setup(ctx) {
         reject(new Error("Timed out while loading the message for playback."));
       }, 15e3);
       pendingMessageRequests.set(requestId, { resolve, reject, timer });
-      ctx.sendToBackend({ type: "chat_voice_get_message", chatId, messageId, requestId, ...targetSwipeId !== void 0 ? { targetSwipeId } : {} });
+      ctx.sendToBackend({ type: "chat_voice_get_message", chatId, messageId, requestId });
     });
   }
   function requestSpeakerReviewedSegments(chatId, messageId, preferences) {
@@ -4775,10 +4772,15 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
               },
               async () => {
                 if (!Number.isInteger(message.swipe_id) || (message.swipe_id ?? -1) < 0) throw new Error("Cannot safely save audio: the target swipe ID is unavailable.");
-                const latest = await requestPlaybackMessage(playbackChat.id, messageId, message.swipe_id);
-                if (synthesisController.signal.aborted || latest.is_user || !targetSwipeContentMatches(latest.targetSwipeContent, autoplaySwipeSnapshot(message))) {
-                  appendSpeakerDebugLog(`Audio save cancelled: message ${messageId}, swipe ${message.swipe_id}, was removed or changed since playback began.`);
+                const latest = await requestPlaybackMessage(playbackChat.id, messageId);
+                const originalSwipe = autoplaySwipeSnapshot(message);
+                const refreshedSwipe = refreshAutoplaySwipe(latest, originalSwipe);
+                if (synthesisController.signal.aborted || latest.is_user || !refreshedSwipe) {
+                  appendSpeakerDebugLog(`Audio save cancelled: message ${messageId}, swipe ${message.swipe_id}, was removed, navigated, or replaced since playback began.`);
                   throw new DOMException("Target swipe changed before audio save.", "AbortError");
+                }
+                if (refreshedSwipe.contentHash !== originalSwipe.contentHash) {
+                  appendSpeakerDebugLog(`Audio save: message ${messageId}, swipe ${message.swipe_id}, message text was refined on the same swipe since playback began; saving the audio of the text as played.`);
                 }
               }
             );
