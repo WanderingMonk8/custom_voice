@@ -330,6 +330,8 @@ export function availableUncastVoices(favorites: FavoriteVoice[], used: readonly
   return favorites.filter(voice => !reserved.has(voice.id))
 }
 
+const UNCAST_VOCATIVE_STOPWORDS = new Set(['okay', 'yeah', 'yes', 'hello', 'hey', 'please', 'thanks', 'sorry', 'listen', 'look', 'wait', 'fine', 'well', 'honey', 'sweetie', 'darling'])
+
 /** Collect possible descriptive identities; Jev decides whether any refers to a speaker. */
 export function uncastIdentityLabels(message: string, ghosts: GhostVoice[]): string[] {
   const labels = new Set<string>()
@@ -337,6 +339,13 @@ export function uncastIdentityLabels(message: string, ghosts: GhostVoice[]): str
   // Offer relationship labels as candidates, not facts: Jev must establish
   // which person speaks, who is addressed, and whose relationship it is.
   const names = addUnconfiguredDialogueSpeakers(message, []).slice(0, 12).map(speaker => speaker.name)
+  // A name addressed inside a quotation may be the unnamed speaker's identity;
+  // the label question still decides whether that person actually speaks.
+  for (const quote of message.matchAll(/"([^"]*)"/gu)) {
+    for (const vocative of quote[1].matchAll(/(?:^|,\s*)([A-Z][a-z]{2,})\s*[.!?,]/gu)) {
+      if (!UNCAST_VOCATIVE_STOPWORDS.has(vocative[1].toLowerCase())) labels.add(vocative[1].toLowerCase())
+    }
+  }
   const relations = [...new Set([...message.matchAll(/\b(?:mom|mother|mum|dad|father|sister|brother|daughter|son|wife|husband|partner|parent|aunt|uncle|friend|boss|doctor|nurse|teacher|assistant)\b/giu)].map(match => match[0].toLowerCase()))]
   for (const name of names) for (const relation of relations) {
     if (labels.size >= 60) break

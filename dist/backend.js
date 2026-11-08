@@ -143,10 +143,16 @@ function availableUncastVoices(favorites, used) {
   const reserved = new Set(used.map((voice) => voice.trim()).filter(Boolean));
   return favorites.filter((voice) => !reserved.has(voice.id));
 }
+var UNCAST_VOCATIVE_STOPWORDS = /* @__PURE__ */ new Set(["okay", "yeah", "yes", "hello", "hey", "please", "thanks", "sorry", "listen", "look", "wait", "fine", "well", "honey", "sweetie", "darling"]);
 function uncastIdentityLabels(message, ghosts) {
   const labels = /* @__PURE__ */ new Set();
   for (const ghost of ghosts) for (const alias of ghostCastAliases(ghost)) labels.add(alias.toLowerCase());
   const names = addUnconfiguredDialogueSpeakers(message, []).slice(0, 12).map((speaker) => speaker.name);
+  for (const quote of message.matchAll(/"([^"]*)"/gu)) {
+    for (const vocative of quote[1].matchAll(/(?:^|,\s*)([A-Z][a-z]{2,})\s*[.!?,]/gu)) {
+      if (!UNCAST_VOCATIVE_STOPWORDS.has(vocative[1].toLowerCase())) labels.add(vocative[1].toLowerCase());
+    }
+  }
   const relations = [...new Set([...message.matchAll(/\b(?:mom|mother|mum|dad|father|sister|brother|daughter|son|wife|husband|partner|parent|aunt|uncle|friend|boss|doctor|nurse|teacher|assistant)\b/giu)].map((match) => match[0].toLowerCase()))];
   for (const name of names) for (const relation of relations) {
     if (labels.size >= 60) break;

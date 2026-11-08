@@ -2110,6 +2110,20 @@ test('treats a repeated specific unnamed label as a voice match and ignores broa
   assert.equal(broadAssigned.some(assignment => assignment.ghostId === 'ghost-woman'), false)
 })
 
+test('a vocative name inside a quote is a label candidate that a speaker answer can confirm', () => {
+  const ghost = { id: 'ghost-ellis', speakerId: UNCAST_SPEAKER_ID, voiceId: 'voice-ellis', label: 'Ellis', aliases: ['Ellis'], context: 'A man stands by the gate.', occurrenceKeys: [], lastSeenMessageId: 'assistant-0' }
+  const message = 'A man stands by the gate. "Leave it, Ellis. Come away."'
+  const labelIndex = uncastIdentityLabels(message, [ghost]).indexOf('ellis')
+  assert.ok(labelIndex >= 0)
+  const groups = collectUncastVoiceGroups([{ text: 'Leave it, Ellis. Come away.', speakerId: UNCAST_SPEAKER_ID }])
+  const assigned = resolveUncastVoiceDecisions(groups, [], {
+    identity_g0: { choice: 'new_or_unclear', probabilities: { new_or_unclear: 0.5, ghost_0: 0.3 }, confidence: 0.4 },
+    label_g0: { choice: `label_${labelIndex}`, probabilities: { [`label_${labelIndex}`]: 0.95 }, confidence: 0.95 },
+  }, [ghost], [], 'later', message)
+  assert.equal(assigned[0]?.ghostId, 'ghost-ellis')
+  assert.ok(uncastIdentityLabels(message, []).includes('ellis'))
+})
+
 test('links separate same-character runs to one ghost voice and gathers their local context', () => {
   const groups = collectUncastVoiceGroups([
     { speakerId: null, text: 'The clerk smiles.' },
