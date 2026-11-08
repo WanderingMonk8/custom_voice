@@ -2231,6 +2231,21 @@ test('narration may sit between an invocation and its reply, unless it names a s
   assert.equal(named.find(group => group.speakerId === UNCAST_SPEAKER_ID)?.addressee, undefined)
 })
 
+test('a backward invocation reaches the unnamed speaker across plain narration, but not across named narration', () => {
+  const plain = collectUncastVoiceGroups([
+    { text: 'No, B!', speakerId: 'unconfigured:yara' },
+    { text: 'The gate creaks.', speakerId: null },
+    { text: 'Hey!', speakerId: UNCAST_SPEAKER_ID },
+  ] as PlaybackSegment[])
+  assert.equal(plain.find(group => group.speakerId === UNCAST_SPEAKER_ID)?.addressee, 'b')
+  const named = collectUncastVoiceGroups([
+    { text: 'No, B!', speakerId: 'unconfigured:yara' },
+    { text: 'Ken says, flatly.', speakerId: null },
+    { text: 'Hey!', speakerId: UNCAST_SPEAKER_ID },
+  ] as PlaybackSegment[])
+  assert.equal(named.find(group => group.speakerId === UNCAST_SPEAKER_ID)?.addressee, undefined)
+})
+
 test('an unnamed speaker takes the name addressed in the preceding quote by someone else', () => {
   const segments = [
     { text: 'Leave it, Ellis.', speakerId: 'unconfigured:hallie' },

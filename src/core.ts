@@ -400,8 +400,9 @@ export function vocativeNames(quote: string): string[] {
 export function addressedNameBeforeGroup(group: UncastVoiceGroup, segments: PlaybackSegment[]): string {
   if (group.speakerId !== UNCAST_SPEAKER_ID) return ''
   const first = Math.min(...group.segmentIndexes)
-  const previous = segments[first - 1]
-  if (!previous || previous.speakerId === null || previous.speakerId === UNCAST_SPEAKER_ID) return ''
+  const previousIndex = adjacentQuoteIndex(segments, first, -1)
+  const previous = previousIndex >= 0 ? segments[previousIndex] : undefined
+  if (!previous || previous.speakerId === UNCAST_SPEAKER_ID) return ''
   for (const name of vocativeNames(previous.text)) {
     if (!UNCAST_VOCATIVE_STOPWORDS.has(name)) return name
   }
