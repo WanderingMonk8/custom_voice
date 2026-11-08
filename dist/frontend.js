@@ -340,7 +340,8 @@ function collectUncastVoiceGroups(segments) {
   for (const group of groups) {
     if (group.addressee) continue;
     const last = Math.max(...group.segmentIndexes);
-    const next = segments.slice(last + 1).find((segment) => segment.speakerId !== null);
+    const nextIndex = adjacentQuoteIndex(segments, last, 1);
+    const next = nextIndex >= 0 ? segments[nextIndex] : void 0;
     if (!next || next.speakerId === UNCAST_SPEAKER_ID) continue;
     const named2 = vocativeNames(next.text).find((name) => name !== group.speakerId.replace(/^unconfigured:/u, ""));
     if (named2) group.addressee = named2;
@@ -361,6 +362,14 @@ function collectUncastVoiceGroups(segments) {
 function availableUncastVoices(favorites, used) {
   const reserved = new Set(used.map((voice) => voice.trim()).filter(Boolean));
   return favorites.filter((voice) => !reserved.has(voice.id));
+}
+function adjacentQuoteIndex(segments, from, step) {
+  for (let index = from + step; index >= 0 && index < segments.length; index += step) {
+    const segment = segments[index];
+    if (segment.speakerId !== null) return index;
+    if (uncastNarrativeNameCandidates(segment.text).length || /^[A-Z][a-z]{2,}\s+(?:says|said|murmurs|murmured|whispers|whispered|mutters|muttered|replies|replied|answers|answered|calls|called)\b/u.test(segment.text)) return -1;
+  }
+  return -1;
 }
 var UNCAST_VOCATIVE_STOPWORDS = /* @__PURE__ */ new Set(["okay", "yeah", "yes", "no", "hello", "hey", "please", "thanks", "sorry", "listen", "look", "wait", "fine", "well", "honey", "sweetie", "darling"]);
 function vocativeNames(quote) {

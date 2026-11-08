@@ -2216,6 +2216,21 @@ test('narration that names a speaker before a quote records that name on the quo
   assert.equal(groups.length, 1)
 })
 
+test('narration may sit between an invocation and its reply, unless it names a speaker', () => {
+  const plain = collectUncastVoiceGroups([
+    { text: 'Hey!', speakerId: UNCAST_SPEAKER_ID },
+    { text: 'The walker groans.', speakerId: null },
+    { text: 'No, B!', speakerId: 'unconfigured:yara' },
+  ] as PlaybackSegment[])
+  assert.equal(plain.find(group => group.speakerId === UNCAST_SPEAKER_ID)?.addressee, 'b')
+  const named = collectUncastVoiceGroups([
+    { text: 'Hey!', speakerId: UNCAST_SPEAKER_ID },
+    { text: 'Ken says, flatly.', speakerId: null },
+    { text: 'No, B!', speakerId: 'unconfigured:yara' },
+  ] as PlaybackSegment[])
+  assert.equal(named.find(group => group.speakerId === UNCAST_SPEAKER_ID)?.addressee, undefined)
+})
+
 test('an unnamed speaker takes the name addressed in the preceding quote by someone else', () => {
   const segments = [
     { text: 'Leave it, Ellis.', speakerId: 'unconfigured:hallie' },
