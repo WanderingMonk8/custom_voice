@@ -544,8 +544,9 @@ export function uncastNarrativeNameCandidates(message: string): string[] {
     if (names.size >= 20) break
   }
   // Dashed appositives name a participant in passing: "the man — Ellis — has
-  // stopped" and "now — Hallie, half-crouched". They are still only candidates.
-  const dashed = /[—–]\s*([\p{Lu}][\p{Ll}\p{M}'’-]{1,39})\s*(?:[—–]|,)/gu
+  // stopped" (double dash) and "now — Hallie, half-crouched" (single dash).
+  // They are still only candidates. Hyphen forms are accepted too.
+  const dashed = /(?:—+|–+|--+|-)\s*([\p{Lu}][\p{Ll}\p{M}'’-]{1,39})\s*(?:—+|–+|--+|-|,)/gu
   for (const match of narrative.matchAll(dashed)) {
     const name = normalizeSpeakerName(match[1])
     if (!name || NON_NAME_PARAGRAPH_LEADS.has(name.toLowerCase())) continue
