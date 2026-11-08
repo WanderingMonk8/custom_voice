@@ -3452,7 +3452,7 @@ test('connection test verdict isolates the failing path', () => {
   const routingBroken = healthy.map(step => step.name.startsWith('Bare quiet')
     ? { ...step, status: 'fail' as const, detail: 'No connection' }
     : step)
-  assert.match(summarizeConnectionTest(routingBroken), /LLM routing broken/)
+  assert.match(summarizeConnectionTest(routingBroken), /Default routing resolution fails/)
   const staleId = healthy.map(step => step.name === 'Quiet generation with selected connection'
     ? { ...step, status: 'fail' as const, detail: 'No connection' }
     : step)

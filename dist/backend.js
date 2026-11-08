@@ -25,7 +25,7 @@ function summarizeConnectionTest(results) {
     lines.push("Decision path broken: Jev speaker assignment and Jev tag classification will fail.");
   }
   if (bareQuiet?.status === "fail") {
-    lines.push("LLM routing broken: even default quiet generation fails, so LLM vocal-tag placement cannot work at all.");
+    lines.push("Default routing resolution fails: bare quiet generation cannot resolve a connection, so every quiet call that omits connection_id fails; pass an explicit connection_id or set Lumiverse\u2019s generation default.");
   } else if (explicitQuiet?.status === "fail") {
     lines.push(`Explicit connection_id does not resolve (${explicitQuiet.detail}); bare routing works, so tag placement should drop connection_id and use default routing, or fix the saved connection id.`);
   } else if (modelQuiet?.status === "fail") {
@@ -5264,6 +5264,20 @@ async function decisionConnectionStatus(userId) {
     return { available: false, hasConnection: false, defaultConnectionName: null };
   }
 }
+async function resolveGenerationConnection(userId, preferredId) {
+  const preferred = (preferredId ?? "").trim();
+  try {
+    const connections = await spindle.connections.list(userId);
+    if (connections.length === 0) return "";
+    if (preferred && connections.some((connection) => connection.id === preferred)) return preferred;
+    return connections.find((connection) => connection.is_default)?.id ?? connections[0].id;
+  } catch (error) {
+    spindle.log.warn(
+      `[Chat Voice] Could not list LLM connections for generation routing: ${error instanceof Error ? error.message : String(error)}`
+    );
+    return preferred;
+  }
+}
 var CONNECTION_TEST_QUIET_TIMEOUT_MS = 3e4;
 var CONNECTION_TEST_DECISION_TIMEOUT_MS = 2e4;
 async function quietConnectionProbe(userId, connectionId, model, timeoutMs) {
@@ -5675,10 +5689,11 @@ async function placeTtsTags(payload, userId) {
     TTS_TAG_FORMAT_PROMPTS[payload.style],
     ...payload.style === "fish" ? [TTS_CUSTOM_EMOTION_PROMPT, ...hasModulation ? [TTS_MODULATION_PROMPT] : []] : []
   ].join("\n");
+  const connectionId = payload.connectionId || await resolveGenerationConnection(userId);
   const response = await spindle.generate.quiet({
     type: "quiet",
     userId,
-    ...payload.connectionId ? { connection_id: payload.connectionId } : {},
+    ...connectionId ? { connection_id: connectionId } : {},
     messages: [
       {
         role: "system",
@@ -5819,13 +5834,15 @@ function cardPromptData(cards) {
     ].join("\n").slice(0, perCardLimit)
   }));
 }
-async function scanCardCast(cards, userId) {
+async function scanCardCast(cards, userId, preferredConnectionId) {
   const base = cards.map((card) => ({ id: card.id, name: card.name, messageCount: 0 }));
   if (cards.length === 0) return { detected: base, usedFallback: false };
   try {
+    const connectionId = await resolveGenerationConnection(userId, preferredConnectionId);
     const response = await spindle.generate.quiet({
       type: "quiet",
       userId,
+      ...connectionId ? { connection_id: connectionId } : {},
       messages: [
         { role: "system", content: CARD_PARSER_PROMPT },
         { role: "user", content: JSON.stringify({ cards: cardPromptData(cards) }) }
@@ -6599,7 +6616,7 @@ function queueScan(payload, userId, frontendSessionId) {
     if (!chat) throw new Error("The chat is no longer available.");
     const candidates = await loadCharacters(chat, userId);
     const messageLimit = clampMessageLimit(payload.messageLimit);
-    const cardResult = await scanCardCast(candidates, userId);
+    const cardResult = await scanCardCast(candidates, userId, payload.tagLlmConnectionId);
     const config = readConfig(chat.metadata ?? {}, candidates.map((character) => character.id));
     const detected = new Map(cardResult.detected.map((character) => [character.id, character]));
     if (cardResult.usedFallback) for (const character of config.detectedCharacters) detected.set(character.id, character);

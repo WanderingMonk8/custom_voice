@@ -3848,6 +3848,7 @@ export function setup(ctx: SpindleFrontendContext) {
       type: 'chat_voice_scan',
       chatId: activeChat.id,
       messageLimit: activeChat.messageLimit,
+      tagLlmConnectionId,
     })
   }
 

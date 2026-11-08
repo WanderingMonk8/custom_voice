@@ -147,7 +147,7 @@ type FrontendMessage =
   | { type: 'chat_voice_decision_status'; requestId?: string }
   | { type: 'chat_voice_connection_test'; requestId: string; connectionId?: string; model?: string }
   | { type: 'chat_voice_list_llm_connections'; requestId: string }
-  | { type: 'chat_voice_scan'; chatId: string; messageLimit: number }
+  | { type: 'chat_voice_scan'; chatId: string; messageLimit: number; tagLlmConnectionId?: string }
   | { type: 'chat_voice_auto_cast'; requestId: string; chatId: string; voices: FavoriteVoice[]; reserved: string[]; narratorMissing: boolean; userMissing: boolean; ghostLifetime: number }
   | { type: 'chat_voice_ghost_edit'; chatId: string; ghostId: string; voice?: string; promote?: boolean; remove?: boolean }
   | { type: 'chat_voice_get_message'; chatId: string; messageId: string; requestId: string; targetSwipeId?: number }
@@ -234,6 +234,30 @@ async function decisionConnectionStatus(userId?: string): Promise<DecisionConnec
       `[Chat Voice] Could not inspect Decision connections: ${error instanceof Error ? error.message : String(error)}`,
     )
     return { available: false, hasConnection: false, defaultConnectionName: null }
+  }
+}
+
+/**
+ * Resolve the LLM connection a quiet generation should run through. Bare
+ * quiet generation (no connection_id) resolves through Lumiverse's own
+ * generation default, which some installs leave unset even when profiles
+ * exist; an explicit profile id always resolves. Prefer a caller-supplied
+ * id, then the profile flagged default, then the first profile. Returns ''
+ * when no profile exists so the call falls back to bare routing and surfaces
+ * the host's own error.
+ */
+async function resolveGenerationConnection(userId: string | undefined, preferredId?: string): Promise<string> {
+  const preferred = (preferredId ?? '').trim()
+  try {
+    const connections = await spindle.connections.list(userId)
+    if (connections.length === 0) return ''
+    if (preferred && connections.some(connection => connection.id === preferred)) return preferred
+    return connections.find(connection => connection.is_default)?.id ?? connections[0].id
+  } catch (error) {
+    spindle.log.warn(
+      `[Chat Voice] Could not list LLM connections for generation routing: ${error instanceof Error ? error.message : String(error)}`,
+    )
+    return preferred
   }
 }
 
@@ -848,10 +872,14 @@ async function placeTtsTags(
       ? [TTS_CUSTOM_EMOTION_PROMPT, ...(hasModulation ? [TTS_MODULATION_PROMPT] : [])]
       : []),
   ].join('\n')
+  // Never rely on bare routing: installs without a Lumiverse generation
+  // default fail bare calls even when profiles exist. Resolve an explicit
+  // profile instead; empty only when no profile exists at all.
+  const connectionId = payload.connectionId || await resolveGenerationConnection(userId)
   const response = await spindle.generate.quiet({
     type: 'quiet',
     userId,
-    ...(payload.connectionId ? { connection_id: payload.connectionId } : {}),
+    ...(connectionId ? { connection_id: connectionId } : {}),
     messages: [
       {
         role: 'system',
@@ -1050,13 +1078,16 @@ function cardPromptData(cards: CharacterCard[]): CardPromptData[] {
 async function scanCardCast(
   cards: CharacterCard[],
   userId?: string,
+  preferredConnectionId?: string,
 ): Promise<CardScanResult> {
   const base = cards.map((card) => ({ id: card.id, name: card.name, messageCount: 0 }))
   if (cards.length === 0) return { detected: base, usedFallback: false }
   try {
+    const connectionId = await resolveGenerationConnection(userId, preferredConnectionId)
     const response = await spindle.generate.quiet({
       type: 'quiet',
       userId,
+      ...(connectionId ? { connection_id: connectionId } : {}),
       messages: [
         { role: 'system', content: CARD_PARSER_PROMPT },
         { role: 'user', content: JSON.stringify({ cards: cardPromptData(cards) }) },
@@ -1871,7 +1902,7 @@ function queueScan(
     if (!chat) throw new Error('The chat is no longer available.')
     const candidates = await loadCharacters(chat, userId)
     const messageLimit = clampMessageLimit(payload.messageLimit)
-    const cardResult = await scanCardCast(candidates, userId)
+    const cardResult = await scanCardCast(candidates, userId, payload.tagLlmConnectionId)
     const config = readConfig(chat.metadata ?? {}, candidates.map((character) => character.id))
     const detected = new Map(cardResult.detected.map((character) => [character.id, character] as const))
     if (cardResult.usedFallback) for (const character of config.detectedCharacters) detected.set(character.id, character)

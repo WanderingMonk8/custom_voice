@@ -4973,7 +4973,8 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
     ctx.sendToBackend({
       type: "chat_voice_scan",
       chatId: activeChat.id,
-      messageLimit: activeChat.messageLimit
+      messageLimit: activeChat.messageLimit,
+      tagLlmConnectionId
     });
   }
   scanButton.addEventListener("click", scanMessages);

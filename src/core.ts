@@ -148,7 +148,7 @@ export function summarizeConnectionTest(results: readonly ConnectionTestStepResu
     lines.push('Decision path broken: Jev speaker assignment and Jev tag classification will fail.')
   }
   if (bareQuiet?.status === 'fail') {
-    lines.push('LLM routing broken: even default quiet generation fails, so LLM vocal-tag placement cannot work at all.')
+    lines.push('Default routing resolution fails: bare quiet generation cannot resolve a connection, so every quiet call that omits connection_id fails; pass an explicit connection_id or set Lumiverse\u2019s generation default.')
   } else if (explicitQuiet?.status === 'fail') {
     lines.push(`Explicit connection_id does not resolve (${explicitQuiet.detail}); bare routing works, so tag placement should drop connection_id and use default routing, or fix the saved connection id.`)
   } else if (modelQuiet?.status === 'fail') {
