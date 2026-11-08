@@ -358,27 +358,46 @@ export function collectUncastVoiceGroups(segments: PlaybackSegment[]): UncastVoi
   // trailing ", Name." vocatives count here: standalone imperatives like
   // "First." / "Next." are discourse markers, not personal names.
   const unknownGroups = groups.filter(group => group.speakerId === UNCAST_SPEAKER_ID)
-  const invokedByGroup = new Map(unknownGroups.map(group => [group.id, [...new Set(group.speeches.flatMap(speech => [...speech.matchAll(/,\s*([A-Z][A-Za-z'-]*)\s*[.!?]/gu)].map(match => match[1].toLowerCase()).filter(name => !UNCAST_VOCATIVE_STOPWORDS.has(name))))]]))
+  const invokedByGroup = new Map(unknownGroups.map(group => [group.id, [...new Set(group.speeches.flatMap(speech => vocativeNames(speech)))]]))
   const invokingGroups = unknownGroups.filter(group => invokedByGroup.get(group.id)?.length === 1)
+  const knownNames = new Set<string>()
+  for (const segment of segments) {
+    const id = segment.speakerId
+    if (!id || id === UNCAST_SPEAKER_ID || id.startsWith('unconfigured:') || id.startsWith('ghost:') || id === USER_SPEAKER_ID || id === UNRESOLVED_SPEAKER_ID) continue
+    knownNames.add(id.includes(':') ? id.slice(id.indexOf(':') + 1).toLowerCase() : id.toLowerCase())
+  }
+  const invokedCounts = new Map<string, number>()
+  for (const names of invokedByGroup.values()) for (const name of names) invokedCounts.set(name, (invokedCounts.get(name) ?? 0) + 1)
+  const nameIsEligible = (name: string) => !isBroadPersonLabel(name) && !knownNames.has(name) && invokedCounts.get(name) === 1
   if (invokingGroups.length === 2) {
     const [a, b] = invokingGroups
     const invokedA = invokedByGroup.get(a.id)![0]
     const invokedB = invokedByGroup.get(b.id)![0]
-    const knownNames = new Set<string>()
-    for (const segment of segments) {
-      const id = segment.speakerId
-      if (!id || id === UNCAST_SPEAKER_ID || id.startsWith('unconfigured:') || id.startsWith('ghost:') || id === USER_SPEAKER_ID || id === UNRESOLVED_SPEAKER_ID) continue
-      knownNames.add(id.includes(':') ? id.slice(id.indexOf(':') + 1).toLowerCase() : id.toLowerCase())
-    }
-    const invokedCounts = new Map<string, number>()
-    for (const names of invokedByGroup.values()) for (const name of names) invokedCounts.set(name, (invokedCounts.get(name) ?? 0) + 1)
-    if (invokedA !== invokedB && !isBroadPersonLabel(invokedA) && !isBroadPersonLabel(invokedB)
-      && !knownNames.has(invokedA) && !knownNames.has(invokedB)
-      && invokedCounts.get(invokedA) === 1 && invokedCounts.get(invokedB) === 1) {
+    if (invokedA !== invokedB && nameIsEligible(invokedA) && nameIsEligible(invokedB)) {
       a.inferredName = invokedB
       b.inferredName = invokedA
       a.addressee = invokedB
       b.addressee = invokedA
+    }
+  } else if (invokingGroups.length === 1) {
+    const invoker = invokingGroups[0]
+    const invoked = invokedByGroup.get(invoker.id)![0]
+    if (nameIsEligible(invoked) && unknownGroups.length >= 2) {
+      // Single invocation: the other participant in the same exchange is named.
+      // Prefer the nearest neighbouring unknown group in appearance order
+      // (even when a known voice interjects between them); fall back to the
+      // predecessor when the invoker is last. Other voices stay unnamed.
+      const sorted = [...unknownGroups].sort((x, y) => Math.min(...x.segmentIndexes) - Math.min(...y.segmentIndexes))
+      const index = sorted.indexOf(invoker)
+      const candidates = [sorted[index + 1], sorted[index - 1]].filter(Boolean) as UncastVoiceGroup[]
+      const distance = (a: UncastVoiceGroup, b: UncastVoiceGroup) => Math.min(...a.segmentIndexes.flatMap(x => b.segmentIndexes.map(y => Math.abs(x - y))))
+      candidates.sort((x, y) => distance(x, invoker) - distance(y, invoker)
+        || (x === sorted[index + 1] ? -1 : 1) - (y === sorted[index + 1] ? -1 : 1))
+      const partner = candidates.find(candidate => !candidate.inferredName && invokedByGroup.get(candidate.id)?.length === 0)
+      if (partner) {
+        partner.inferredName = invoked
+        partner.addressee = invoked
+      }
     }
   }
   return groups
@@ -439,7 +458,7 @@ function narrationNamesInvokedSpeaker(segments: PlaybackSegment[], index: number
   return [segments[index - 1], segments[index + 1]].some(quote => !!quote && quote.speakerId !== null && vocativeNames(quote.text).includes(name))
 }
 
-const UNCAST_VOCATIVE_STOPWORDS = new Set(['okay', 'yeah', 'yes', 'no', 'hello', 'hey', 'please', 'thanks', 'sorry', 'listen', 'look', 'wait', 'fine', 'well', 'honey', 'sweetie', 'darling'])
+const UNCAST_VOCATIVE_STOPWORDS = new Set(['okay', 'yeah', 'yes', 'no', 'hello', 'hey', 'please', 'thanks', 'sorry', 'listen', 'look', 'wait', 'fine', 'well', 'honey', 'sweetie', 'darling', 'first', 'second', 'third', 'fourth', 'fifth', 'last', 'next', 'one', 'two', 'three', 'four', 'five', 'once', 'twice', 'again', 'then'])
 
 /**
  * Names a quote addresses directly: a name that opens the quote or follows a
@@ -524,6 +543,15 @@ export function uncastNarrativeNameCandidates(message: string): string[] {
     names.set(name.toLowerCase(), name)
     if (names.size >= 20) break
   }
+  // Dashed appositives name a participant in passing: "the man — Ellis — has
+  // stopped" and "now — Hallie, half-crouched". They are still only candidates.
+  const dashed = /[—–]\s*([\p{Lu}][\p{Ll}\p{M}'’-]{1,39})\s*(?:[—–]|,)/gu
+  for (const match of narrative.matchAll(dashed)) {
+    const name = normalizeSpeakerName(match[1])
+    if (!name || NON_NAME_PARAGRAPH_LEADS.has(name.toLowerCase())) continue
+    names.set(name.toLowerCase(), name)
+    if (names.size >= 20) break
+  }
   return [...names.values()]
 }
 
@@ -586,14 +614,15 @@ export function buildUncastVoiceDecision(groups: UncastVoiceGroup[], voices: Fav
 
 function revealedUncastName(group: UncastVoiceGroup, answers: Record<string, SpeakerDecisionChoice> = {}, message = ''): string {
   if (group.speakerId.startsWith('unconfigured:')) return group.speakerId.slice('unconfigured:'.length)
-  if (group.inferredName && !isBroadPersonLabel(group.inferredName)) return group.inferredName.toLowerCase()
   const names = new Set(group.speeches.flatMap(speech => [...speech.matchAll(/\b(?:[Mm]y name is|[Ii] am|[Ii]'m)\s+([A-Z][a-z]+(?:[-'][A-Z]?[a-z]+)?)(?=[,.!?;:]|\s+(?:and|from|but|here)\b)/gu)].map(match => match[1].toLowerCase())))
   if (names.size === 1) return [...names][0]
   const answer = answers[`narrative_name_${group.id}`]
   const match = answer?.choice.match(/^name_(\d+)$/u)
   const probability = answer?.probabilities[answer.choice] ?? 0
   const runnerUp = answer ? Math.max(0, ...Object.entries(answer.probabilities).filter(([key]) => key !== answer.choice).map(([, value]) => value)) : 0
-  return match && answer && answer.confidence >= 0.8 && probability >= 0.8 && probability - runnerUp >= 0.25 ? (uncastNarrativeNameCandidates(message)[Number(match[1])] ?? '').toLowerCase() : ''
+  const jev = match && answer && answer.confidence >= 0.8 && probability >= 0.8 && probability - runnerUp >= 0.25 ? (uncastNarrativeNameCandidates(message)[Number(match[1])] ?? '').toLowerCase() : ''
+  if (jev) return jev
+  return group.inferredName && !isBroadPersonLabel(group.inferredName) ? group.inferredName.toLowerCase() : ''
 }
 
 /** Prefer the most recently recorded claim if a rejected old occurrence was superseded. */

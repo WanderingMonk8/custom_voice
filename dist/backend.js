@@ -178,6 +178,13 @@ function uncastNarrativeNameCandidates(message) {
     names.set(name.toLowerCase(), name);
     if (names.size >= 20) break;
   }
+  const dashed = /[—–]\s*([\p{Lu}][\p{Ll}\p{M}'’-]{1,39})\s*(?:[—–]|,)/gu;
+  for (const match of narrative.matchAll(dashed)) {
+    const name = normalizeSpeakerName(match[1]);
+    if (!name || NON_NAME_PARAGRAPH_LEADS.has(name.toLowerCase())) continue;
+    names.set(name.toLowerCase(), name);
+    if (names.size >= 20) break;
+  }
   return [...names.values()];
 }
 function ghostPriorMessageIds(ghost, previousMessages) {
@@ -240,14 +247,15 @@ function buildUncastVoiceDecision(groups, voices, message, ghosts = [], previous
 }
 function revealedUncastName(group, answers = {}, message = "") {
   if (group.speakerId.startsWith("unconfigured:")) return group.speakerId.slice("unconfigured:".length);
-  if (group.inferredName && !isBroadPersonLabel(group.inferredName)) return group.inferredName.toLowerCase();
   const names = new Set(group.speeches.flatMap((speech) => [...speech.matchAll(/\b(?:[Mm]y name is|[Ii] am|[Ii]'m)\s+([A-Z][a-z]+(?:[-'][A-Z]?[a-z]+)?)(?=[,.!?;:]|\s+(?:and|from|but|here)\b)/gu)].map((match2) => match2[1].toLowerCase())));
   if (names.size === 1) return [...names][0];
   const answer = answers[`narrative_name_${group.id}`];
   const match = answer?.choice.match(/^name_(\d+)$/u);
   const probability = answer?.probabilities[answer.choice] ?? 0;
   const runnerUp = answer ? Math.max(0, ...Object.entries(answer.probabilities).filter(([key]) => key !== answer.choice).map(([, value]) => value)) : 0;
-  return match && answer && answer.confidence >= 0.8 && probability >= 0.8 && probability - runnerUp >= 0.25 ? (uncastNarrativeNameCandidates(message)[Number(match[1])] ?? "").toLowerCase() : "";
+  const jev = match && answer && answer.confidence >= 0.8 && probability >= 0.8 && probability - runnerUp >= 0.25 ? (uncastNarrativeNameCandidates(message)[Number(match[1])] ?? "").toLowerCase() : "";
+  if (jev) return jev;
+  return group.inferredName && !isBroadPersonLabel(group.inferredName) ? group.inferredName.toLowerCase() : "";
 }
 function latestGhostOccurrenceIndex(ghosts, key) {
   let found = -1;

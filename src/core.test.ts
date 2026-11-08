@@ -85,6 +85,7 @@ import {
   markGhostVoiceInvoked,
   collectUncastVoiceGroups,
   countSpeechVoices,
+  uncastNarrativeNameCandidates,
   ghostCastAliases,
   updateGhostConversationHistory,
   uncastIdentityLabels,
@@ -2153,6 +2154,13 @@ test('vocativeNames counts only true invocations, not mentions', () => {
   assert.deepEqual(vocativeNames('Hey, Ellis is watching!'), [])
   assert.deepEqual(vocativeNames("Ellis's gone."), [])
   assert.deepEqual(vocativeNames("Somebody's in there, Hallie."), ['hallie'])
+  assert.deepEqual(vocativeNames('Ellis.'), ['ellis'])
+  assert.deepEqual(vocativeNames('First.'), [])
+})
+
+test('dashed narration names are narrative candidates', () => {
+  assert.ok(uncastNarrativeNameCandidates('Beyond the fence, the man — Ellis — has stopped moving altogether, and the stopping is the worst part.').includes('Ellis'))
+  assert.ok(uncastNarrativeNameCandidates("The woman's voice again, and closer now — Hallie, half-crouched behind the flatbed truck across the street, rain running off her hood.").includes('Hallie'))
 })
 
 test('a three-voice message where two unnamed speakers invoke each other names both temp voices', () => {
@@ -2221,6 +2229,34 @@ test('an invocation does not split the same unnamed speaker', () => {
   ] as PlaybackSegment[])
   assert.deepEqual(groups.map(group => group.segmentIndexes), [[0, 2]])
   assert.equal(groups[0].inferredName, undefined)
+})
+
+test('a single invocation names the other voice in the exchange, even over a known interjection', () => {
+  const segments = [
+    { text: "Somebody's in there, Hallie.", speakerId: UNCAST_SPEAKER_ID },
+    { text: 'Hello.', speakerId: 'npc:elena' },
+    { text: 'We need to leave.', speakerId: UNCAST_SPEAKER_ID },
+    { text: 'Hello.', speakerId: 'npc:elena' },
+    { text: 'Hello again.', speakerId: UNCAST_SPEAKER_ID },
+  ] as PlaybackSegment[]
+  const groups = collectUncastVoiceGroups(segments)
+  assert.equal(groups.length, 3)
+  assert.equal(groups[0].inferredName, undefined)
+  assert.equal(groups[1].inferredName, 'hallie')
+  assert.equal(groups[1].addressee, 'hallie')
+  assert.equal(groups[2].inferredName, undefined)
+})
+
+test('a single invocation from the last voice names its predecessor', () => {
+  const segments = [
+    { text: 'Hello.', speakerId: UNCAST_SPEAKER_ID },
+    { text: 'Hello.', speakerId: 'npc:elena' },
+    { text: "Leave it, Ellis.", speakerId: UNCAST_SPEAKER_ID },
+  ] as PlaybackSegment[]
+  const groups = collectUncastVoiceGroups(segments)
+  assert.equal(groups.length, 2)
+  assert.equal(groups[0].inferredName, 'ellis')
+  assert.equal(groups[1].inferredName, undefined)
 })
 
 test('a name invoked in the next quote by another speaker is the candidate for the preceding unnamed speaker', () => {

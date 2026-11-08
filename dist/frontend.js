@@ -371,25 +371,41 @@ function collectUncastVoiceGroups(segments) {
     }
   }
   const unknownGroups = groups.filter((group) => group.speakerId === UNCAST_SPEAKER_ID);
-  const invokedByGroup = new Map(unknownGroups.map((group) => [group.id, [...new Set(group.speeches.flatMap((speech) => [...speech.matchAll(/,\s*([A-Z][A-Za-z'-]*)\s*[.!?]/gu)].map((match) => match[1].toLowerCase()).filter((name) => !UNCAST_VOCATIVE_STOPWORDS.has(name))))]]));
+  const invokedByGroup = new Map(unknownGroups.map((group) => [group.id, [...new Set(group.speeches.flatMap((speech) => vocativeNames(speech)))]]));
   const invokingGroups = unknownGroups.filter((group) => invokedByGroup.get(group.id)?.length === 1);
+  const knownNames = /* @__PURE__ */ new Set();
+  for (const segment of segments) {
+    const id = segment.speakerId;
+    if (!id || id === UNCAST_SPEAKER_ID || id.startsWith("unconfigured:") || id.startsWith("ghost:") || id === USER_SPEAKER_ID || id === UNRESOLVED_SPEAKER_ID) continue;
+    knownNames.add(id.includes(":") ? id.slice(id.indexOf(":") + 1).toLowerCase() : id.toLowerCase());
+  }
+  const invokedCounts = /* @__PURE__ */ new Map();
+  for (const names of invokedByGroup.values()) for (const name of names) invokedCounts.set(name, (invokedCounts.get(name) ?? 0) + 1);
+  const nameIsEligible = (name) => !isBroadPersonLabel(name) && !knownNames.has(name) && invokedCounts.get(name) === 1;
   if (invokingGroups.length === 2) {
     const [a, b] = invokingGroups;
     const invokedA = invokedByGroup.get(a.id)[0];
     const invokedB = invokedByGroup.get(b.id)[0];
-    const knownNames = /* @__PURE__ */ new Set();
-    for (const segment of segments) {
-      const id = segment.speakerId;
-      if (!id || id === UNCAST_SPEAKER_ID || id.startsWith("unconfigured:") || id.startsWith("ghost:") || id === USER_SPEAKER_ID || id === UNRESOLVED_SPEAKER_ID) continue;
-      knownNames.add(id.includes(":") ? id.slice(id.indexOf(":") + 1).toLowerCase() : id.toLowerCase());
-    }
-    const invokedCounts = /* @__PURE__ */ new Map();
-    for (const names of invokedByGroup.values()) for (const name of names) invokedCounts.set(name, (invokedCounts.get(name) ?? 0) + 1);
-    if (invokedA !== invokedB && !isBroadPersonLabel(invokedA) && !isBroadPersonLabel(invokedB) && !knownNames.has(invokedA) && !knownNames.has(invokedB) && invokedCounts.get(invokedA) === 1 && invokedCounts.get(invokedB) === 1) {
+    if (invokedA !== invokedB && nameIsEligible(invokedA) && nameIsEligible(invokedB)) {
       a.inferredName = invokedB;
       b.inferredName = invokedA;
       a.addressee = invokedB;
       b.addressee = invokedA;
+    }
+  } else if (invokingGroups.length === 1) {
+    const invoker = invokingGroups[0];
+    const invoked = invokedByGroup.get(invoker.id)[0];
+    if (nameIsEligible(invoked) && unknownGroups.length >= 2) {
+      const sorted = [...unknownGroups].sort((x, y) => Math.min(...x.segmentIndexes) - Math.min(...y.segmentIndexes));
+      const index = sorted.indexOf(invoker);
+      const candidates = [sorted[index + 1], sorted[index - 1]].filter(Boolean);
+      const distance = (a, b) => Math.min(...a.segmentIndexes.flatMap((x) => b.segmentIndexes.map((y) => Math.abs(x - y))));
+      candidates.sort((x, y) => distance(x, invoker) - distance(y, invoker) || (x === sorted[index + 1] ? -1 : 1) - (y === sorted[index + 1] ? -1 : 1));
+      const partner = candidates.find((candidate) => !candidate.inferredName && invokedByGroup.get(candidate.id)?.length === 0);
+      if (partner) {
+        partner.inferredName = invoked;
+        partner.addressee = invoked;
+      }
     }
   }
   return groups;
@@ -415,7 +431,7 @@ function narrationNamesInvokedSpeaker(segments, index) {
   const name = named[1].toLowerCase();
   return [segments[index - 1], segments[index + 1]].some((quote) => !!quote && quote.speakerId !== null && vocativeNames(quote.text).includes(name));
 }
-var UNCAST_VOCATIVE_STOPWORDS = /* @__PURE__ */ new Set(["okay", "yeah", "yes", "no", "hello", "hey", "please", "thanks", "sorry", "listen", "look", "wait", "fine", "well", "honey", "sweetie", "darling"]);
+var UNCAST_VOCATIVE_STOPWORDS = /* @__PURE__ */ new Set(["okay", "yeah", "yes", "no", "hello", "hey", "please", "thanks", "sorry", "listen", "look", "wait", "fine", "well", "honey", "sweetie", "darling", "first", "second", "third", "fourth", "fifth", "last", "next", "one", "two", "three", "four", "five", "once", "twice", "again", "then"]);
 function vocativeNames(quote) {
   const found = /* @__PURE__ */ new Set();
   const text = quote.trim();
@@ -455,6 +471,13 @@ function uncastNarrativeNameCandidates(message) {
   }
   const actions = /\b([\p{Lu}][\p{Ll}\p{M}'’-]{1,39})\s+(?:huffs|huffed|slaps|slapped|calls|called|shouts|shouted|speaks|spoke|mutters|muttered|laughs|laughed|glances|glanced|walks|walked|moves|moved|steps|stepped|nods|nodded)\b/gu;
   for (const match of narrative.matchAll(actions)) {
+    const name = normalizeSpeakerName(match[1]);
+    if (!name || NON_NAME_PARAGRAPH_LEADS.has(name.toLowerCase())) continue;
+    names.set(name.toLowerCase(), name);
+    if (names.size >= 20) break;
+  }
+  const dashed = /[—–]\s*([\p{Lu}][\p{Ll}\p{M}'’-]{1,39})\s*(?:[—–]|,)/gu;
+  for (const match of narrative.matchAll(dashed)) {
     const name = normalizeSpeakerName(match[1]);
     if (!name || NON_NAME_PARAGRAPH_LEADS.has(name.toLowerCase())) continue;
     names.set(name.toLowerCase(), name);
