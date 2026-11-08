@@ -163,7 +163,7 @@ export function addFavoriteVoice(existing: FavoriteVoice[], voice: FavoriteVoice
   return [...existing, { ...voice, id }]
 }
 
-export interface UncastVoiceGroup { id: string; speakerId: string; segmentIndexes: number[]; speeches: string[]; context: string[] }
+export interface UncastVoiceGroup { id: string; speakerId: string; segmentIndexes: number[]; speeches: string[]; context: string[]; addressee?: string }
 export interface GhostOccurrenceEvidence { messageId: string; messageHash: string; speechHash: string; version: 'occurrence-1'; reason: string }
 export interface GhostVoice { id: string; speakerId: string; voiceId: string; context: string; occurrenceKeys: string[]; lastSeenMessageId: string; label?: string; createdAtMessageId?: string; lastInvokedAtMessageId?: string; invokedMessageIds?: string[]; aliases?: string[]; conversationHistory?: Array<{ messageId: string; text: string }>; occurrenceEvidence?: GhostOccurrenceEvidence[] }
 export const GHOST_VOICE_LIFETIME_MESSAGES = 10
@@ -307,6 +307,10 @@ export function collectUncastVoiceGroups(segments: PlaybackSegment[]): UncastVoi
     group.context.push([segments[index - 1]?.speakerId === null ? segments[index - 1].text : '', segment.text,
       segments[index + 1]?.speakerId === null ? segments[index + 1].text : ''].filter(Boolean).join(' ').slice(0, 2_000))
   }
+  for (const group of groups) {
+    const addressee = addressedNameAfterGroup(group, segments)
+    if (addressee) group.addressee = addressee
+  }
   return groups
 }
 
@@ -332,6 +336,27 @@ export function availableUncastVoices(favorites: FavoriteVoice[], used: readonly
 
 const UNCAST_VOCATIVE_STOPWORDS = new Set(['okay', 'yeah', 'yes', 'hello', 'hey', 'please', 'thanks', 'sorry', 'listen', 'look', 'wait', 'fine', 'well', 'honey', 'sweetie', 'darling'])
 
+/**
+ * A name addressed in the quotation right after an unnamed group's speech is a
+ * candidate for that group: the next speaker is talking to the group's speaker.
+ * It is only a candidate; the label question decides whether it identifies them.
+ */
+export function addressedNameAfterGroup(group: UncastVoiceGroup, segments: PlaybackSegment[]): string {
+  const last = Math.max(...group.segmentIndexes)
+  const next = segments.slice(last + 1).find(segment => segment.speakerId !== null)
+  if (!next || next.speakerId === group.speakerId) return ''
+  for (const vocative of next.text.matchAll(/(?:^|,\s*)([A-Z][a-z]{2,})\s*[.!?,]/gu)) {
+    const name = vocative[1].toLowerCase()
+    if (!UNCAST_VOCATIVE_STOPWORDS.has(name)) return name
+  }
+  return ''
+}
+
+/** Shared labels plus this group's own addressee candidate, so only that group can take the name. */
+export function groupLabelOptions(group: UncastVoiceGroup, labels: string[]): string[] {
+  return group.addressee && !labels.includes(group.addressee) ? [...labels, group.addressee] : labels
+}
+
 /** Collect possible descriptive identities; Jev decides whether any refers to a speaker. */
 export function uncastIdentityLabels(message: string, ghosts: GhostVoice[]): string[] {
   const labels = new Set<string>()
@@ -339,13 +364,6 @@ export function uncastIdentityLabels(message: string, ghosts: GhostVoice[]): str
   // Offer relationship labels as candidates, not facts: Jev must establish
   // which person speaks, who is addressed, and whose relationship it is.
   const names = addUnconfiguredDialogueSpeakers(message, []).slice(0, 12).map(speaker => speaker.name)
-  // A name addressed inside a quotation may be the unnamed speaker's identity;
-  // the label question still decides whether that person actually speaks.
-  for (const quote of message.matchAll(/"([^"]*)"/gu)) {
-    for (const vocative of quote[1].matchAll(/(?:^|,\s*)([A-Z][a-z]{2,})\s*[.!?,]/gu)) {
-      if (!UNCAST_VOCATIVE_STOPWORDS.has(vocative[1].toLowerCase())) labels.add(vocative[1].toLowerCase())
-    }
-  }
   const relations = [...new Set([...message.matchAll(/\b(?:mom|mother|mum|dad|father|sister|brother|daughter|son|wife|husband|partner|parent|aunt|uncle|friend|boss|doctor|nurse|teacher|assistant)\b/giu)].map(match => match[0].toLowerCase()))]
   for (const name of names) for (const relation of relations) {
     if (labels.size >= 60) break
@@ -408,7 +426,7 @@ export function buildUncastVoiceDecision(groups: UncastVoiceGroup[], voices: Fav
     if (labels.length) questions[`label_${group.id}`] = {
       type: 'choice',
       instructions: `Choose the descriptive label for the person who actually speaks the quoted dialogue in ${group.id}. A person mentioned in narration, observing, or addressed by the speaker is not necessarily speaking. Choose none unless the label identifies the speaker of these quotations.`,
-      criteria: { none: 'No reliable descriptive identity.', ...Object.fromEntries(labels.map((label, index) => [`label_${index}`, label])) },
+      criteria: { none: 'No reliable descriptive identity.', ...Object.fromEntries(groupLabelOptions(group, labels).map((label, index) => [`label_${index}`, label])) },
     }
     if (group.speakerId === UNCAST_SPEAKER_ID && narrativeNames.length) questions[`narrative_name_${group.id}`] = {
       type: 'choice',
@@ -538,7 +556,7 @@ export function buildUncastIdentityReview(groups: UncastVoiceGroup[], answers: R
     const labelIndex = label?.choice.match(/^label_(\d+)$/u)
     const labelProbability = label ? label.probabilities[label.choice] ?? 0 : 0
     const labelRunnerUp = label ? Math.max(0, ...Object.entries(label.probabilities).filter(([key]) => key !== label.choice).map(([, probability]) => probability)) : 0
-    const named = labelIndex && labels[Number(labelIndex[1])] && label && label.confidence >= 0.7 && labelProbability >= 0.7 && labelProbability - labelRunnerUp >= 0.25
+    const named = labelIndex && groupLabelOptions(group, labels)[Number(labelIndex[1])] && label && label.confidence >= 0.7 && labelProbability >= 0.7 && labelProbability - labelRunnerUp >= 0.25
     if (!named) continue
     for (const previous of groups.slice(0, index).slice(-8)) {
       const pair = answers[`same_${group.id}_${previous.id}`]
@@ -548,7 +566,7 @@ export function buildUncastIdentityReview(groups: UncastVoiceGroup[], answers: R
       if (priorNamed || pair?.choice !== 'same' || probability < 0.8 || pair.confidence < 0.6 || pair.confidence >= 0.8) continue
       questions[`review_same_${group.id}_${previous.id}`] = {
         type: 'choice',
-        instructions: `Review whether the speaker of the earlier group ${previous.id} is the same individual as ${group.id}, identified as ${labels[Number(labelIndex![1])]}. Read the entire scene, including intervening turns and narration. Shared occupation, gender, or similar voice alone is not enough.`,
+        instructions: `Review whether the speaker of the earlier group ${previous.id} is the same individual as ${group.id}, identified as ${groupLabelOptions(group, labels)[Number(labelIndex![1])]}. Read the entire scene, including intervening turns and narration. Shared occupation, gender, or similar voice alone is not enough.`,
         criteria: { same: 'The scene clearly establishes that both groups have the same speaker.', different_or_unclear: 'The speakers differ or the evidence is insufficient.' },
       }
       if (Object.keys(questions).length >= 16) break
@@ -627,7 +645,7 @@ export function resolveUncastVoiceDecisions(
     const labelIndex = labelAnswer?.choice.match(/^label_(\d+)$/u)
     const labelProbability = labelAnswer ? labelAnswer.probabilities[labelAnswer.choice] ?? 0 : 0
     const labelRunnerUp = labelAnswer ? Math.max(0, ...Object.entries(labelAnswer.probabilities).filter(([key]) => key !== labelAnswer.choice).map(([, probability]) => probability)) : 0
-    const label = labelIndex && labelAnswer && labelAnswer.confidence >= 0.7 && labelProbability >= 0.7 && labelProbability - labelRunnerUp >= 0.25 ? labels[Number(labelIndex[1])] : undefined
+    const label = labelIndex && labelAnswer && labelAnswer.confidence >= 0.7 && labelProbability >= 0.7 && labelProbability - labelRunnerUp >= 0.25 ? groupLabelOptions(group, labels)[Number(labelIndex[1])] : undefined
     if (label) groupLabels.set(group.id, label)
     const previousGroups = groups.slice(0, groups.indexOf(group)).slice(-8)
     const same = previousGroups.flatMap(previous => {

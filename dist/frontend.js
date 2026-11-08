@@ -326,11 +326,26 @@ function collectUncastVoiceGroups(segments) {
       segments[index + 1]?.speakerId === null ? segments[index + 1].text : ""
     ].filter(Boolean).join(" ").slice(0, 2e3));
   }
+  for (const group of groups) {
+    const addressee = addressedNameAfterGroup(group, segments);
+    if (addressee) group.addressee = addressee;
+  }
   return groups;
 }
 function availableUncastVoices(favorites, used) {
   const reserved = new Set(used.map((voice) => voice.trim()).filter(Boolean));
   return favorites.filter((voice) => !reserved.has(voice.id));
+}
+var UNCAST_VOCATIVE_STOPWORDS = /* @__PURE__ */ new Set(["okay", "yeah", "yes", "hello", "hey", "please", "thanks", "sorry", "listen", "look", "wait", "fine", "well", "honey", "sweetie", "darling"]);
+function addressedNameAfterGroup(group, segments) {
+  const last = Math.max(...group.segmentIndexes);
+  const next = segments.slice(last + 1).find((segment) => segment.speakerId !== null);
+  if (!next || next.speakerId === group.speakerId) return "";
+  for (const vocative of next.text.matchAll(/(?:^|,\s*)([A-Z][a-z]{2,})\s*[.!?,]/gu)) {
+    const name = vocative[1].toLowerCase();
+    if (!UNCAST_VOCATIVE_STOPWORDS.has(name)) return name;
+  }
+  return "";
 }
 function uncastNarrativeNameCandidates(message) {
   const names = /* @__PURE__ */ new Map();

@@ -143,16 +143,13 @@ function availableUncastVoices(favorites, used) {
   const reserved = new Set(used.map((voice) => voice.trim()).filter(Boolean));
   return favorites.filter((voice) => !reserved.has(voice.id));
 }
-var UNCAST_VOCATIVE_STOPWORDS = /* @__PURE__ */ new Set(["okay", "yeah", "yes", "hello", "hey", "please", "thanks", "sorry", "listen", "look", "wait", "fine", "well", "honey", "sweetie", "darling"]);
+function groupLabelOptions(group, labels) {
+  return group.addressee && !labels.includes(group.addressee) ? [...labels, group.addressee] : labels;
+}
 function uncastIdentityLabels(message, ghosts) {
   const labels = /* @__PURE__ */ new Set();
   for (const ghost of ghosts) for (const alias of ghostCastAliases(ghost)) labels.add(alias.toLowerCase());
   const names = addUnconfiguredDialogueSpeakers(message, []).slice(0, 12).map((speaker) => speaker.name);
-  for (const quote of message.matchAll(/"([^"]*)"/gu)) {
-    for (const vocative of quote[1].matchAll(/(?:^|,\s*)([A-Z][a-z]{2,})\s*[.!?,]/gu)) {
-      if (!UNCAST_VOCATIVE_STOPWORDS.has(vocative[1].toLowerCase())) labels.add(vocative[1].toLowerCase());
-    }
-  }
   const relations = [...new Set([...message.matchAll(/\b(?:mom|mother|mum|dad|father|sister|brother|daughter|son|wife|husband|partner|parent|aunt|uncle|friend|boss|doctor|nurse|teacher|assistant)\b/giu)].map((match) => match[0].toLowerCase()))];
   for (const name of names) for (const relation of relations) {
     if (labels.size >= 60) break;
@@ -208,7 +205,7 @@ function buildUncastVoiceDecision(groups, voices, message, ghosts = [], previous
     if (labels.length) questions[`label_${group.id}`] = {
       type: "choice",
       instructions: `Choose the descriptive label for the person who actually speaks the quoted dialogue in ${group.id}. A person mentioned in narration, observing, or addressed by the speaker is not necessarily speaking. Choose none unless the label identifies the speaker of these quotations.`,
-      criteria: { none: "No reliable descriptive identity.", ...Object.fromEntries(labels.map((label, index) => [`label_${index}`, label])) }
+      criteria: { none: "No reliable descriptive identity.", ...Object.fromEntries(groupLabelOptions(group, labels).map((label, index) => [`label_${index}`, label])) }
     };
     if (group.speakerId === UNCAST_SPEAKER_ID && narrativeNames.length) questions[`narrative_name_${group.id}`] = {
       type: "choice",
@@ -333,7 +330,7 @@ function buildUncastIdentityReview(groups, answers, message, ghosts = [], messag
     const labelIndex = label?.choice.match(/^label_(\d+)$/u);
     const labelProbability = label ? label.probabilities[label.choice] ?? 0 : 0;
     const labelRunnerUp = label ? Math.max(0, ...Object.entries(label.probabilities).filter(([key]) => key !== label.choice).map(([, probability2]) => probability2)) : 0;
-    const named = labelIndex && labels[Number(labelIndex[1])] && label && label.confidence >= 0.7 && labelProbability >= 0.7 && labelProbability - labelRunnerUp >= 0.25;
+    const named = labelIndex && groupLabelOptions(group, labels)[Number(labelIndex[1])] && label && label.confidence >= 0.7 && labelProbability >= 0.7 && labelProbability - labelRunnerUp >= 0.25;
     if (!named) continue;
     for (const previous of groups.slice(0, index).slice(-8)) {
       const pair = answers[`same_${group.id}_${previous.id}`];
@@ -343,7 +340,7 @@ function buildUncastIdentityReview(groups, answers, message, ghosts = [], messag
       if (priorNamed || pair?.choice !== "same" || probability2 < 0.8 || pair.confidence < 0.6 || pair.confidence >= 0.8) continue;
       questions[`review_same_${group.id}_${previous.id}`] = {
         type: "choice",
-        instructions: `Review whether the speaker of the earlier group ${previous.id} is the same individual as ${group.id}, identified as ${labels[Number(labelIndex[1])]}. Read the entire scene, including intervening turns and narration. Shared occupation, gender, or similar voice alone is not enough.`,
+        instructions: `Review whether the speaker of the earlier group ${previous.id} is the same individual as ${group.id}, identified as ${groupLabelOptions(group, labels)[Number(labelIndex[1])]}. Read the entire scene, including intervening turns and narration. Shared occupation, gender, or similar voice alone is not enough.`,
         criteria: { same: "The scene clearly establishes that both groups have the same speaker.", different_or_unclear: "The speakers differ or the evidence is insufficient." }
       };
       if (Object.keys(questions).length >= 16) break;
@@ -403,7 +400,7 @@ function resolveUncastVoiceDecisions(groups, voices, answers, ghosts = [], reser
     const labelIndex = labelAnswer?.choice.match(/^label_(\d+)$/u);
     const labelProbability = labelAnswer ? labelAnswer.probabilities[labelAnswer.choice] ?? 0 : 0;
     const labelRunnerUp = labelAnswer ? Math.max(0, ...Object.entries(labelAnswer.probabilities).filter(([key]) => key !== labelAnswer.choice).map(([, probability]) => probability)) : 0;
-    const label = labelIndex && labelAnswer && labelAnswer.confidence >= 0.7 && labelProbability >= 0.7 && labelProbability - labelRunnerUp >= 0.25 ? labels[Number(labelIndex[1])] : void 0;
+    const label = labelIndex && labelAnswer && labelAnswer.confidence >= 0.7 && labelProbability >= 0.7 && labelProbability - labelRunnerUp >= 0.25 ? groupLabelOptions(group, labels)[Number(labelIndex[1])] : void 0;
     if (label) groupLabels.set(group.id, label);
     const previousGroups = groups.slice(0, groups.indexOf(group)).slice(-8);
     const same = previousGroups.flatMap((previous) => {
