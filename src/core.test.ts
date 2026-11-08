@@ -2151,6 +2151,18 @@ test('vocativeNames counts only true invocations, not mentions', () => {
   assert.deepEqual(vocativeNames("Ellis's gone."), [])
 })
 
+test('a name invoked in the next quote by another speaker is the candidate for the preceding unnamed speaker', () => {
+  const segments = [
+    { text: 'Hey!', speakerId: UNCAST_SPEAKER_ID },
+    { text: 'No, B!', speakerId: 'unconfigured:yara' },
+  ] as PlaybackSegment[]
+  const groups = collectUncastVoiceGroups(segments)
+  const x = groups.find(group => group.speakerId === UNCAST_SPEAKER_ID)
+  const y = groups.find(group => group.speakerId === 'unconfigured:yara')
+  assert.equal(x?.addressee, 'b')
+  assert.equal(y?.addressee, undefined)
+})
+
 test('an unnamed speaker takes the name addressed in the preceding quote by someone else', () => {
   const segments = [
     { text: 'Leave it, Ellis.', speakerId: 'unconfigured:hallie' },

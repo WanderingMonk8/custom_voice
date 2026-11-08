@@ -331,7 +331,14 @@ function collectUncastVoiceGroups(segments) {
     if (addressee) group.addressee = addressee;
   }
   for (const group of groups) {
-    if (!group.addressee) continue;
+    if (group.addressee) continue;
+    const last = Math.max(...group.segmentIndexes);
+    const next = segments.slice(last + 1).find((segment) => segment.speakerId !== null);
+    if (!next || next.speakerId === UNCAST_SPEAKER_ID) continue;
+    const named2 = vocativeNames(next.text).find((name) => name !== group.speakerId.replace(/^unconfigured:/u, ""));
+    if (named2) group.addressee = named2;
+  }
+  for (const group of groups) {
     const invoking = segments.findIndex((segment, index) => index < Math.min(...group.segmentIndexes) && segment.speakerId !== null && segment.speakerId !== UNCAST_SPEAKER_ID && new RegExp(`(?:^|,\\s*)${group.addressee}\\s*[.!?,]`, "iu").test(segment.text));
     if (invoking < 0) continue;
     const before = groups.filter((item) => item !== group && item.speakerId === UNCAST_SPEAKER_ID && Math.max(...item.segmentIndexes) < invoking).sort((a, b) => Math.max(...b.segmentIndexes) - Math.max(...a.segmentIndexes))[0];
