@@ -2112,6 +2112,19 @@ test('treats a repeated specific unnamed label as a voice match and ignores broa
   assert.equal(broadAssigned.some(assignment => assignment.ghostId === 'ghost-woman'), false)
 })
 
+test('a name invoked by another speaker boosts the same-person link between the unnamed speakers around it', () => {
+  const segments = [
+    { text: 'Gate is shut.', speakerId: UNCAST_SPEAKER_ID },
+    { text: 'Leave it, Ellis.', speakerId: 'unconfigured:hallie' },
+    { text: 'Not yet.', speakerId: UNCAST_SPEAKER_ID },
+  ] as PlaybackSegment[]
+  const groups = collectUncastVoiceGroups(segments)
+  const [first, second] = groups.filter(group => group.speakerId === UNCAST_SPEAKER_ID)
+  assert.equal(second.addressee, 'ellis')
+  assert.deepEqual(second.flankPartners, [first.id])
+  assert.deepEqual(first.flankPartners, [second.id])
+})
+
 test('an unnamed speaker takes the name addressed in the preceding quote by someone else', () => {
   const segments = [
     { text: 'Leave it, Ellis.', speakerId: 'unconfigured:hallie' },

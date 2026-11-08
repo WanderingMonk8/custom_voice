@@ -330,6 +330,17 @@ function collectUncastVoiceGroups(segments) {
     const addressee = addressedNameBeforeGroup(group, segments);
     if (addressee) group.addressee = addressee;
   }
+  for (const group of groups) {
+    if (!group.addressee) continue;
+    const invoking = segments.findIndex((segment, index) => index < Math.min(...group.segmentIndexes) && segment.speakerId !== null && segment.speakerId !== UNCAST_SPEAKER_ID && new RegExp(`(?:^|,\\s*)${group.addressee}\\s*[.!?,]`, "iu").test(segment.text));
+    if (invoking < 0) continue;
+    const before = groups.filter((item) => item !== group && item.speakerId === UNCAST_SPEAKER_ID && Math.max(...item.segmentIndexes) < invoking).sort((a, b) => Math.max(...b.segmentIndexes) - Math.max(...a.segmentIndexes))[0];
+    const after = group;
+    if (before) {
+      after.flankPartners = [...after.flankPartners ?? [], before.id];
+      before.flankPartners = [...before.flankPartners ?? [], after.id];
+    }
+  }
   return groups;
 }
 function availableUncastVoices(favorites, used) {

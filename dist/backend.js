@@ -408,7 +408,8 @@ function resolveUncastVoiceDecisions(groups, voices, answers, ghosts = [], reser
       if (name && previousName && name !== previousName) return [];
       const review = answers[`review_same_${group.id}_${previous.id}`];
       const answer = review && strongChoice(review) ? review : answers[`same_${group.id}_${previous.id}`];
-      return answer?.choice === "same" && strongChoice(answer) ? [{ previous, probability: answer.probabilities.same ?? 0 }] : [];
+      const boosted = answer?.choice === "same" && answer.confidence >= 0.6 && (answer.probabilities.same ?? 0) >= 0.8 && !!group.flankPartners?.includes(previous.id);
+      return answer?.choice === "same" && strongChoice(answer) || boosted ? [{ previous, probability: answer?.probabilities.same ?? 0 }] : [];
     }).sort((a, b) => b.probability - a.probability);
     if (same[0]) root = roots.get(same[0].previous.id) ?? root;
     else if (label && !isBroadPersonLabel(label) && rootByLabel.has(label)) root = rootByLabel.get(label);

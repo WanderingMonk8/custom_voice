@@ -163,7 +163,7 @@ export function addFavoriteVoice(existing: FavoriteVoice[], voice: FavoriteVoice
   return [...existing, { ...voice, id }]
 }
 
-export interface UncastVoiceGroup { id: string; speakerId: string; segmentIndexes: number[]; speeches: string[]; context: string[]; addressee?: string }
+export interface UncastVoiceGroup { id: string; speakerId: string; segmentIndexes: number[]; speeches: string[]; context: string[]; addressee?: string; flankPartners?: string[] }
 export interface GhostOccurrenceEvidence { messageId: string; messageHash: string; speechHash: string; version: 'occurrence-1'; reason: string }
 export interface GhostVoice { id: string; speakerId: string; voiceId: string; context: string; occurrenceKeys: string[]; lastSeenMessageId: string; label?: string; createdAtMessageId?: string; lastInvokedAtMessageId?: string; invokedMessageIds?: string[]; aliases?: string[]; conversationHistory?: Array<{ messageId: string; text: string }>; occurrenceEvidence?: GhostOccurrenceEvidence[] }
 export const GHOST_VOICE_LIFETIME_MESSAGES = 10
@@ -310,6 +310,17 @@ export function collectUncastVoiceGroups(segments: PlaybackSegment[]): UncastVoi
   for (const group of groups) {
     const addressee = addressedNameBeforeGroup(group, segments)
     if (addressee) group.addressee = addressee
+  }
+  for (const group of groups) {
+    if (!group.addressee) continue
+    const invoking = segments.findIndex((segment, index) => index < Math.min(...group.segmentIndexes) && segment.speakerId !== null && segment.speakerId !== UNCAST_SPEAKER_ID && new RegExp(`(?:^|,\\s*)${group.addressee}\\s*[.!?,]`, 'iu').test(segment.text))
+    if (invoking < 0) continue
+    const before = groups.filter(item => item !== group && item.speakerId === UNCAST_SPEAKER_ID && Math.max(...item.segmentIndexes) < invoking).sort((a, b) => Math.max(...b.segmentIndexes) - Math.max(...a.segmentIndexes))[0]
+    const after = group
+    if (before) {
+      after.flankPartners = [...(after.flankPartners ?? []), before.id]
+      before.flankPartners = [...(before.flankPartners ?? []), after.id]
+    }
   }
   return groups
 }
@@ -654,7 +665,8 @@ export function resolveUncastVoiceDecisions(
       if (name && previousName && name !== previousName) return []
       const review = answers[`review_same_${group.id}_${previous.id}`]
       const answer = review && strongChoice(review) ? review : answers[`same_${group.id}_${previous.id}`]
-      return answer?.choice === 'same' && strongChoice(answer) ? [{ previous, probability: answer.probabilities.same ?? 0 }] : []
+      const boosted = answer?.choice === 'same' && answer.confidence >= 0.6 && (answer.probabilities.same ?? 0) >= 0.8 && !!group.flankPartners?.includes(previous.id)
+      return (answer?.choice === 'same' && strongChoice(answer)) || boosted ? [{ previous, probability: answer?.probabilities.same ?? 0 }] : []
     }).sort((a, b) => b.probability - a.probability)
     if (same[0]) root = roots.get(same[0].previous.id) ?? root
     else if (label && !isBroadPersonLabel(label) && rootByLabel.has(label)) root = rootByLabel.get(label)!
