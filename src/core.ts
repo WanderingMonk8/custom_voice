@@ -237,12 +237,29 @@ export function readCommunityVoice(row: unknown): CommunityVoice | null {
   }
 }
 
-/** Parse a Fish `/model` list payload into community voices plus pagination. */
-export function readCommunityVoiceList(payload: unknown): { items: CommunityVoice[]; total: number; hasMore: boolean } | null {
+/** One level of `{ data }` / `{ result }` wrapping is tolerated so composer envelopes work too. */
+function unwrapCommunityPayload(payload: unknown): Record<string, unknown> | null {
   if (!payload || typeof payload !== 'object') return null
   const row = payload as Record<string, unknown>
-  if (!Array.isArray(row.items)) return null
-  const items = row.items.flatMap(item => {
+  if (Array.isArray(row.items) || Array.isArray(row.data) || Array.isArray(row.models)) return row
+  for (const key of ['data', 'result', 'response'] as const) {
+    const nested = unwrapCommunityPayload(row[key])
+    if (nested) return nested
+  }
+  if (Array.isArray(payload)) return { items: payload }
+  return null
+}
+
+/** Parse a Fish `/model` list payload into community voices plus pagination. */
+export function readCommunityVoiceList(payload: unknown): { items: CommunityVoice[]; total: number; hasMore: boolean } | null {
+  const row = unwrapCommunityPayload(payload)
+  if (!row) return null
+  const rawItems = Array.isArray(row.items) ? row.items
+    : Array.isArray(row.data) ? row.data
+      : Array.isArray(row.models) ? row.models
+        : null
+  if (!rawItems) return null
+  const items = rawItems.flatMap(item => {
     const voice = readCommunityVoice(item)
     return voice ? [voice] : []
   }).slice(0, 100)
@@ -251,6 +268,27 @@ export function readCommunityVoiceList(payload: unknown): { items: CommunityVoic
     total: typeof row.total === 'number' && Number.isFinite(row.total) ? Math.max(0, Math.round(row.total)) : items.length,
     hasMore: row.has_more === true,
   }
+}
+
+/** A short, secret-free summary of a failed catalog payload for diagnostics. */
+export function communityPayloadShape(payload: unknown): string {
+  if (payload === null || payload === undefined) return 'no response body'
+  if (typeof payload === 'string') return `text ${payload.length} chars: ${payload.slice(0, 120)}`
+  if (Array.isArray(payload)) return `array of ${payload.length}`
+  if (typeof payload === 'object') {
+    const row = payload as Record<string, unknown>
+    const parts = Object.keys(row).slice(0, 8).map(key => {
+      const value = row[key]
+      const kind = Array.isArray(value) ? `array(${value.length})` : typeof value
+      return `${key}:${kind}`
+    })
+    const message = typeof row.error === 'string' ? row.error
+      : row.error && typeof row.error === 'object' && typeof (row.error as Record<string, unknown>).message === 'string'
+        ? (row.error as Record<string, unknown>).message as string
+        : typeof row.message === 'string' ? row.message : ''
+    return `${parts.join(', ')}${message ? ` message: ${String(message).slice(0, 120)}` : ''}`
+  }
+  return typeof payload
 }
 
 /** The cached casting pool is stored as favorites so casting code is pool-agnostic. */

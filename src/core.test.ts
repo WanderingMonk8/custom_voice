@@ -135,6 +135,7 @@ import {
   readCommunityVoice,
   readCommunityVoiceList,
   readCommunityVoicePool,
+  communityPayloadShape,
   communityVoiceToFavorite,
   upsertCommunityFavorite,
   voiceCategoryGender,
@@ -2098,6 +2099,12 @@ test('readCommunityVoiceList and readCommunityVoicePool parse Fish payloads and 
   })
   assert.equal(readCommunityVoiceList(null), null)
   assert.equal(readCommunityVoiceList({ items: 'nope' }), null)
+  // Some proxies wrap the body once under { data } or { result }.
+  assert.equal(readCommunityVoiceList({ data: { total: 1, items: [{ _id: 'wrapped' }], has_more: false } })?.items[0]?.id, 'wrapped')
+  assert.equal(readCommunityVoiceList({ result: { data: { total: 1, items: [{ _id: 'nested' }] } } })?.items[0]?.id, 'nested')
+  assert.equal(readCommunityVoiceList([{ _id: 'bare' }])?.items[0]?.id, 'bare')
+  assert.match(communityPayloadShape({ error: { message: 'key rejected' }, items: 'nope' }) ?? '', /items:string/)
+  assert.match(communityPayloadShape('<html>blocked</html>') ?? '', /text 20 chars/)
   // A snapshot way out of bounds is still trimmed to the live pool capacity.
   const pool = readCommunityVoicePool([{ id: 'a' }, { _id: 'b', title: 'fish row' }, null])
   assert.deepEqual(pool.map(entry => entry.id), ['a', 'b'])

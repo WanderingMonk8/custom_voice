@@ -76,6 +76,7 @@ import {
   readFavoriteVoices,
   readGhostVoices,
   readCommunityVoiceList,
+  communityPayloadShape,
   communityVoiceToFavorite,
   selectAutomaticVoice,
   resolveSpeakerDecisionSegments,
@@ -1805,7 +1806,13 @@ async function fetchCommunityModels(fishApiKey: string, request: CommunityModelR
   }
   const payload = typeof response === 'string' ? (() => { try { return JSON.parse(response) } catch { return null } })() : response
   const parsed = readCommunityVoiceList(payload)
-  if (!parsed) throw new Error('Fish Audio returned an unexpected catalog response.')
+  if (!parsed) {
+    const shape = communityPayloadShape(payload)
+    const message = typeof payload === 'object' && payload !== null && typeof (payload as Record<string, unknown>).message === 'string'
+      ? (payload as Record<string, unknown>).message as string
+      : ''
+    throw new Error(`Fish Audio returned an unexpected catalog response [${shape}].${message ? ` Details: ${message.slice(0, 160)}` : ''}`)
+  }
   return parsed
 }
 
