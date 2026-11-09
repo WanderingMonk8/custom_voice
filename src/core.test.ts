@@ -2940,6 +2940,27 @@ test('a same-message created occurrence is confirmed by identity of occurrence d
   assert.deepEqual(ghost, before)
 })
 
+test('a weak different disposition does not de-confirm a self-referential occurrence', () => {
+  // Jev's disposition flipped weakly on one replay (different at 0.43
+  // probability and 0.14 confidence). That is noise on a circular review,
+  // not an explicit "different person": the identical occurrence confirms.
+  const group = collectUncastVoiceGroups([{ speakerId: UNCAST_SPEAKER_ID, text: "I'm on till nine-thirty at the hospital. Nine's no good." }])
+  const ghost = {
+    id: 'man', speakerId: UNCAST_SPEAKER_ID, voiceId: 'man-voice',
+    context: "Then he walked over to the table without being asked, and picked up the pen off the clipboard, and signed. Wren couldn't get up.",
+    occurrenceKeys: [`current:${hashMessageContent("I'm on till nine-thirty at the hospital. Nine's no good.")}`],
+    lastSeenMessageId: 'current', createdAtMessageId: 'current',
+  }
+  const replay = resolveUncastVoiceDecisions(group, readFavoriteVoices([{ id: 'new-voice' }]), {
+    identity_g0: { choice: 'new_or_unclear', confidence: 0.92, probabilities: { new_or_unclear: 0.92, ghost_0: 0.01 } },
+    review_occurrence_g0_0: { choice: 'different_or_unclear', confidence: 0.82, probabilities: { same: 0.09, different_or_unclear: 0.91 } },
+    review_occurrence_disposition_g0_0: { choice: 'different', confidence: 0.14, probabilities: { same: 0.31, different: 0.43, unclear: 0.26 } },
+    voice_g0: confidentDecision('voice_0'),
+  }, [ghost], [], 'current')
+  assert.equal(replay[0]?.ghostId, 'man')
+  assert.equal(replay[0]?.voiceId, 'man-voice')
+})
+
 test('dual same-leaning occurrence reviews confirm the ghost', () => {
   // With a saved context present both occurrence reviews lean 'same'
   // without reaching strong-choice levels; their agreement on the

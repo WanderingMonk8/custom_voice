@@ -413,9 +413,10 @@ function resolveUncastVoiceDecisions(groups, voices, answers, ghosts = [], reser
     const occurrenceReview = occurrenceIndex >= 0 ? answers[`review_occurrence_${group.id}_${occurrenceIndex}`] : void 0;
     const identityAnswer = answers[`identity_${group.id}`];
     const disposition = occurrenceIndex >= 0 ? answers[`review_occurrence_disposition_${group.id}_${occurrenceIndex}`] : void 0;
+    const dispositionDifferent = disposition?.choice === "different" && strongChoice(disposition);
     const reviewedAsGhost = occurrence && group.speakerId === `ghost:${occurrence.id}`;
-    const hollowOccurrence = !!occurrence && ghostLacksSavedEvidence(occurrence) && disposition?.choice !== "different";
-    const selfReferentialOccurrence = !!occurrence && !!messageId && occurrence.createdAtMessageId === messageId && occurrence.lastSeenMessageId === messageId && disposition?.choice !== "different";
+    const hollowOccurrence = !!occurrence && ghostLacksSavedEvidence(occurrence) && !dispositionDifferent;
+    const selfReferentialOccurrence = !!occurrence && !!messageId && occurrence.createdAtMessageId === messageId && occurrence.lastSeenMessageId === messageId && !dispositionDifferent;
     const occurrenceReviewSame = occurrenceReview?.choice === "same" && (occurrenceReview.probabilities?.same ?? 0) >= 0.6;
     const dispositionSame = disposition?.choice === "same" && (disposition.probabilities?.same ?? 0) >= 0.6;
     const occurrenceConfirmed = !!occurrence && (reviewedAsGhost || identityAnswer?.choice === `ghost_${occurrenceIndex}` && strongChoice(identityAnswer) || occurrenceReview?.choice === "same" && strongChoice(occurrenceReview) || hollowOccurrence || selfReferentialOccurrence || occurrenceReviewSame && dispositionSame);

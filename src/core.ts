@@ -907,21 +907,26 @@ export function resolveUncastVoiceDecisions(
     const occurrenceReview = occurrenceIndex >= 0 ? answers[`review_occurrence_${group.id}_${occurrenceIndex}`] : undefined
     const identityAnswer = answers[`identity_${group.id}`]
     const disposition = occurrenceIndex >= 0 ? answers[`review_occurrence_disposition_${group.id}_${occurrenceIndex}`] : undefined
+    // A 'different' disposition only escapes a hollow/self-referential
+    // confirmation when it is a genuinely strong verdict: a weak flip
+    // (e.g. 0.43 probability at 0.14 confidence) is noise on a circular
+    // review, not an explicit "different person" signal.
+    const dispositionDifferent = disposition?.choice === 'different' && strongChoice(disposition)
     const reviewedAsGhost = occurrence && group.speakerId === `ghost:${occurrence.id}`
     // A ghost with no saved evidence (no context, no conversation history)
     // cannot be meaningfully contested: the occurrence review only restates
     // that the evidence is insufficient. The identical occurrence (same
     // message, same speeches) then confirms the ghost by itself, unless
     // Jev's disposition verdict explicitly says a different person.
-    const hollowOccurrence = !!occurrence && ghostLacksSavedEvidence(occurrence) && disposition?.choice !== 'different'
+    const hollowOccurrence = !!occurrence && ghostLacksSavedEvidence(occurrence) && !dispositionDifferent
     // A ghost created during this very message's playback has only
     // self-referential evidence: its saved context is a snippet of this
     // same passage, so the occurrence comparison against it is circular
     // and flips between runs. The identical occurrence confirms it unless
-    // the disposition verdict explicitly says a different person.
+    // the disposition decisively says a different person.
     const selfReferentialOccurrence = !!occurrence && !!messageId
       && occurrence.createdAtMessageId === messageId && occurrence.lastSeenMessageId === messageId
-      && disposition?.choice !== 'different'
+      && !dispositionDifferent
     // When both occurrence questions lean 'same' without reaching
     // strong-choice levels, their agreement on the identical occurrence
     // still confirms it; strength is unnecessary when neither question
