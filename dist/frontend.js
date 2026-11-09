@@ -7074,7 +7074,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
       clearTimeout(pending.timer);
       pendingCommunityRequests.delete(payload.requestId);
       if (payload.error) pending.reject(new Error(payload.error));
-      else pending.resolve({ voices: readCommunityVoicePool(payload.voices), refreshedAt: payload.refreshedAt });
+      else pending.resolve({ items: payload.items, voices: readCommunityVoicePool(payload.voices), refreshedAt: payload.refreshedAt });
       return;
     }
     if (payload.type === "chat_voice_auto_cast_result") {
