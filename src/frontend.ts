@@ -1105,7 +1105,7 @@ export function setup(ctx: SpindleFrontendContext) {
     }
     .chat-voice-add-row { display:grid; grid-template-columns:minmax(0, 1fr) auto; gap:8px; }
     .chat-voice-favorites { display:flex; flex-direction:column; gap:8px; }
-    .chat-voice-favorite-form { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+    .chat-voice-favorite-form { display:grid; grid-template-columns:1fr 1fr; gap:8px; padding:12px; border:1px solid var(--lumiverse-border); border-radius:var(--lumiverse-radius); background:var(--lumiverse-fill-subtle); box-sizing:border-box; }
     .chat-voice-favorite-form input, .chat-voice-rename-input, .chat-voice-favorite-select, .chat-voice-favorite-form select {
       min-width:0; width:100%; box-sizing:border-box; min-height:36px; padding:7px 9px;
       border:1px solid var(--lumiverse-border); border-radius:var(--lumiverse-radius);
