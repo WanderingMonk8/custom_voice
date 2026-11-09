@@ -2870,7 +2870,7 @@ function setup(ctx) {
     .chat-voice-pool-language-row .chat-voice-toggle-hint { grid-column: 1 / -1; }
     .chat-voice-key-row { display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
     .chat-voice-key-row > span:first-child { flex:1 0 100%; }
-    .chat-voice-key-row input { flex:1 1 160px; min-width:0; box-sizing:border-box; min-height:34px; padding:6px 9px; border:1px solid var(--lumiverse-border); border-radius:var(--lumiverse-radius); background:var(--lumiverse-bg-secondary, #222); color:var(--lumiverse-text); font:inherit; font-size:12px; }
+    .chat-voice-key-row input { flex:1 0 100%; min-width:0; box-sizing:border-box; min-height:34px; padding:6px 9px; border:1px solid var(--lumiverse-border); border-radius:var(--lumiverse-radius); background:var(--lumiverse-bg-secondary, #222); color:var(--lumiverse-text); font:inherit; font-size:12px; }
     .chat-voice-key-row .chat-voice-toggle-hint { flex:1 0 100%; }
     .chat-voice-filter-panel { display:flex; flex-direction:column; gap:10px; }
     .chat-voice-filter-panel[hidden] { display:none; }
