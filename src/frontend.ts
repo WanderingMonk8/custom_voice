@@ -4865,11 +4865,14 @@ export function setup(ctx: SpindleFrontendContext) {
       communityError.hidden = false
       return
     }
+    // Set the mode first: if a snapshot refresh is already in flight,
+    // its completion renders the list, and awaiting the refresh joins
+    // that same flight instead of starting a competing one.
     if (communityBestItems.length && !communitySnapshotStale()) {
+      communityBest = true
       showSnapshotListing()
       return
     }
-    if (communityLoading) return
     communityBest = true
     renderCommunityBrowse()
     await refreshCommunitySnapshot()

@@ -6175,10 +6175,10 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
       return;
     }
     if (communityBestItems.length && !communitySnapshotStale()) {
+      communityBest = true;
       showSnapshotListing();
       return;
     }
-    if (communityLoading) return;
     communityBest = true;
     renderCommunityBrowse();
     await refreshCommunitySnapshot();
