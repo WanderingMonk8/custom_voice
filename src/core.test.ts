@@ -140,6 +140,7 @@ import {
   upsertCommunityFavorite,
   voiceAge,
   voiceCategoryGender,
+  voiceDecisionSummary,
   voiceGender,
   voiceGenderCompatible,
   resolveSpeakerDecisionSegments,
@@ -2082,6 +2083,14 @@ test('readFavoriteVoices keeps up to 32 tags and the languages array', () => {
   const [voice] = readFavoriteVoices([{ id: 'voice-1', tags, languages: ['en', 'ja'] }])
   assert.equal(voice.tags?.length, 32)
   assert.deepEqual(voice.languages, ['en', 'ja'])
+})
+
+test('voiceDecisionSummary includes tags and languages for auto-cast ranking', () => {
+  assert.equal(
+    voiceDecisionSummary({ id: 'v1', name: 'Nova', category: 'character', description: 'Warm', tags: ['Young', 'warm', 'young'], languages: ['en'] }),
+    'Nova; character; Warm; tags: young, warm; languages: en',
+  )
+  assert.equal(voiceDecisionSummary({ id: 'v2', name: '', category: '', description: '' }), 'Unnamed voice; unspecified; No description provided.')
 })
 
 test('communityVoiceToFavorite maps Fish metadata onto expanded favorites', () => {

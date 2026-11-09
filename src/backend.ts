@@ -78,6 +78,7 @@ import {
   readCommunityVoiceList,
   communityPayloadShape,
   communityVoiceToFavorite,
+  voiceDecisionSummary,
   selectAutomaticVoice,
   resolveSpeakerDecisionSegments,
   resolveTtsTagAnswers,
@@ -2108,7 +2109,7 @@ spindle.onFrontendMessage(async (rawPayload: unknown, userId, frontendSessionId)
         const questions: Record<string, { type: 'choice'; instructions: string; criteria: Record<string, string> }> = Object.fromEntries(roles.map((role, index) => [`role_${index}`, {
           type: 'choice' as const,
           instructions: `Choose the best available voice for ${role.description}. Compare voice descriptions and gender when established.`,
-          criteria: { ...Object.fromEntries(voices.map((voice, i) => [`voice_${i}`, `${voice.name || voice.id}; ${voice.category}; ${voice.description || 'No description provided'}`])), ...(voices.length === 1 ? { no_match: 'No voice is suitable.' } : {}) },
+          criteria: { ...Object.fromEntries(voices.map((voice, i) => [`voice_${i}`, voiceDecisionSummary(voice)])), ...(voices.length === 1 ? { no_match: 'No voice is suitable.' } : {}) },
         }]))
         roles.forEach((role, index) => {
           if (role.id !== 'narrator') questions[`gender_${index}`] = {

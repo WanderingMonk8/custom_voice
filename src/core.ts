@@ -849,6 +849,22 @@ function ghostPriorMessageIds(ghost: GhostVoice, previousMessages: RelationshipR
   return previousMessages.filter(item => linked.has(item.id)).map(item => item.id)
 }
 
+/** One-line summary of a voice for the auto-cast ranking questions.
+ * Includes tags and languages so Fish metadata (age, use case, qualities,
+ * language) can influence the match, not just title/category/description. */
+export function voiceDecisionSummary(voice: FavoriteVoice): string {
+  const tags = [...new Set((voice.tags ?? []).map(tag => tag.trim().toLowerCase()).filter(Boolean))]
+  const languages = [...new Set((voice.languages ?? []).map(code => code.trim().toLowerCase()).filter(Boolean))]
+  const parts = [
+    voice.name || 'Unnamed voice',
+    voice.category || 'unspecified',
+    voice.description || 'No description provided.',
+  ]
+  if (tags.length) parts.push(`tags: ${tags.join(', ')}`)
+  if (languages.length) parts.push(`languages: ${languages.join(', ')}`)
+  return parts.join('; ')
+}
+
 /** One decision call classifies each uncast group and ranks the available voice descriptions. */
 export function buildUncastVoiceDecision(groups: UncastVoiceGroup[], voices: FavoriteVoice[], message: string, ghosts: GhostVoice[] = [], previousMessages: RelationshipReviewContext['previousMessages'] = []) {
   const labels = uncastIdentityLabels(message, ghosts)
@@ -894,7 +910,7 @@ export function buildUncastVoiceDecision(groups: UncastVoiceGroup[], voices: Fav
     if (!voices.length) continue
     questions[`voice_${group.id}`] = {
       type: 'choice', instructions: `Rank the available voices for the person who actually speaks the quoted dialogue in ${group.id}. Narration-only bystanders and people merely addressed are not speakers. Use the full scene as context, including other character groups only when clearly the same speaker. Select the best available voice.`,
-      criteria: { ...Object.fromEntries(state.voices.map(voice => [voice.option, `${voice.name || 'Unnamed voice'}; ${voice.category}; ${voice.description || 'No description provided.'}`])), ...(state.voices.length === 1 ? { no_match: 'No suitable voice is available.' } : {}) },
+      criteria: { ...Object.fromEntries(voices.map((voice, index) => [`voice_${index}`, voiceDecisionSummary(voice)])), ...(voices.length === 1 ? { no_match: 'No suitable voice is available.' } : {}) },
     }
   }
   return { state, questions }

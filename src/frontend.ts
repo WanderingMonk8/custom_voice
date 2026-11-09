@@ -1195,6 +1195,9 @@ export function setup(ctx: SpindleFrontendContext) {
     .chat-voice-pool-refresh-row { display:flex; align-items:center; flex-wrap:wrap; gap:8px; }
     .chat-voice-pool-language-row { display:grid; grid-template-columns:auto minmax(0, 1fr); gap:8px; align-items:center; }
     .chat-voice-pool-language-row .chat-voice-toggle-hint { grid-column: 1 / -1; }
+    .chat-voice-key-row { display:grid; grid-template-columns:auto minmax(0, 1fr) auto auto; gap:8px; align-items:center; }
+    .chat-voice-key-row input { min-width:0; width:100%; box-sizing:border-box; min-height:34px; padding:6px 9px; border:1px solid var(--lumiverse-border); border-radius:var(--lumiverse-radius); background:var(--lumiverse-bg-secondary, #222); color:var(--lumiverse-text); font:inherit; font-size:12px; }
+    .chat-voice-key-row .chat-voice-toggle-hint { grid-column: 1 / -1; }
     .chat-voice-filter-panel { display:flex; flex-direction:column; gap:10px; }
     .chat-voice-filter-panel[hidden] { display:none; }
     .chat-voice-filter-group { display:flex; flex-direction:column; gap:6px; }
@@ -1809,6 +1812,32 @@ export function setup(ctx: SpindleFrontendContext) {
   snapshotLanguageHint.textContent = 'Top-100 snapshot is drawn only from voices matching this language (all = any language).'
   snapshotLanguageRow.append(snapshotLanguageText, snapshotLanguageSelect, snapshotLanguageHint)
   autoVoicePoolActions.append(autoVoicePoolRefresh, communityPoolStatus)
+  const fishKeyRow = document.createElement('div')
+  fishKeyRow.className = 'chat-voice-key-row'
+  const fishKeyText = document.createElement('span')
+  fishKeyText.textContent = 'Fish API key'
+  const fishKeyInput = document.createElement('input')
+  fishKeyInput.type = 'password'
+  fishKeyInput.autocomplete = 'off'
+  fishKeyInput.spellcheck = false
+  fishKeyInput.placeholder = 'New Fish Audio API key'
+  fishKeyInput.setAttribute('aria-label', 'New Fish Audio API key')
+  const fishKeySave = document.createElement('button')
+  fishKeySave.type = 'button'
+  fishKeySave.className = 'chat-voice-add-button'
+  fishKeySave.textContent = 'Save key'
+  const fishKeyRemove = document.createElement('button')
+  fishKeyRemove.type = 'button'
+  fishKeyRemove.className = 'chat-voice-add-button'
+  fishKeyRemove.textContent = 'Remove'
+  fishKeyRemove.hidden = true
+  const fishKeyStatus = document.createElement('span')
+  fishKeyStatus.className = 'chat-voice-toggle-hint'
+  fishKeyStatus.textContent = 'No Fish API key stored'
+  const fishKeyHint = document.createElement('span')
+  fishKeyHint.className = 'chat-voice-toggle-hint'
+  fishKeyHint.textContent = 'The key is stored only in your global voice settings and is never shown again; only its last four characters identify it here.'
+  fishKeyRow.append(fishKeyText, fishKeyInput, fishKeySave, fishKeyRemove, fishKeyStatus, fishKeyHint)
   const autoPlaybackLabel = document.createElement('label')
   autoPlaybackLabel.className = 'chat-voice-toggle'
   const autoPlaybackToggle = document.createElement('input')
@@ -1877,6 +1906,7 @@ export function setup(ctx: SpindleFrontendContext) {
     autoVoicePoolField.field,
     snapshotLanguageRow,
     autoVoicePoolActions,
+    fishKeyRow,
     autoPlaybackLabel,
     autoPlaybackDelayField.field,
     skipNarrationLabel,
@@ -4982,6 +5012,32 @@ export function setup(ctx: SpindleFrontendContext) {
       .catch(error => setStatus(error instanceof Error ? error.message : 'Could not save the Fish Audio API key.', 'error'))
       .finally(() => { communityKeySave.disabled = false })
   })
+  fishKeySave.addEventListener('click', () => {
+    const key = fishKeyInput.value.trim().slice(0, 512)
+    if (!key) { setStatus('Enter your Fish Audio API key first.', 'error'); return }
+    fishKeySave.disabled = true
+    updateVoiceSettings(current => ({ ...current, chatVoiceFishApiKey: key }))
+      .then(() => {
+        fishApiKey = key
+        fishKeyInput.value = ''
+        setStatus('Fish Audio API key saved globally.', 'saved')
+        updateVoicesTabs()
+        maybeAutoSeedSnapshot()
+      })
+      .catch(error => setStatus(error instanceof Error ? error.message : 'Could not save the Fish Audio API key.', 'error'))
+      .finally(() => { fishKeySave.disabled = !communityIsAvailable() })
+  })
+  fishKeyRemove.addEventListener('click', () => {
+    fishKeyRemove.disabled = true
+    updateVoiceSettings(current => ({ ...current, chatVoiceFishApiKey: '' }))
+      .then(() => {
+        fishApiKey = ''
+        setStatus('Fish Audio API key removed.', 'saved')
+        updateVoicesTabs()
+      })
+      .catch(error => setStatus(error instanceof Error ? error.message : 'Could not remove the Fish Audio API key.', 'error'))
+      .finally(() => { fishKeyRemove.disabled = false })
+  })
   autoVoicePoolSelect.addEventListener('change', () => {
     autoVoiceCastingPool = autoVoicePoolSelect.value === 'community' ? 'community' : 'favorite'
     scheduleAdvancedSettingsSave()
@@ -5026,10 +5082,21 @@ export function setup(ctx: SpindleFrontendContext) {
     autoVoicePoolField.field.hidden = !fish
     snapshotLanguageRow.hidden = !fish
     autoVoicePoolActions.hidden = !fish
+    fishKeyRow.hidden = !fish
     autoVoicePoolSelect.disabled = !autoCastingToggle.checked || !fish
     snapshotLanguageSelect.disabled = !fish || !fishApiKey
     autoVoicePoolRefresh.disabled = !fish || !fishApiKey || communityLoading
+    updateFishKeyStatus()
     refreshPoolStatus()
+  }
+
+  function updateFishKeyStatus(): void {
+    fishKeyStatus.textContent = fishApiKey
+      ? `Stored key ending in ••••${fishApiKey.slice(-4)}`
+      : 'No Fish API key stored'
+    fishKeyRemove.hidden = !fishApiKey
+    fishKeySave.disabled = !communityIsAvailable()
+    fishKeyInput.disabled = !communityIsAvailable()
   }
 
   function communitySnapshotStale(): boolean {
@@ -5058,7 +5125,7 @@ export function setup(ctx: SpindleFrontendContext) {
 
   async function refreshCommunitySnapshot(): Promise<void> {
     if (!fishApiKey) {
-      communityPoolStatus.textContent = 'Add your Fish Audio API key in the Community tab to refresh the pool.'
+      communityPoolStatus.textContent = 'Add or replace your Fish Audio API key in Advanced settings to refresh the pool.'
       setStatus('Add your Fish Audio API key before refreshing the community voice pool.', 'error')
       return
     }

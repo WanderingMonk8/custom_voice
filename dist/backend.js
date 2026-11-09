@@ -298,6 +298,18 @@ function ghostPriorMessageIds(ghost, previousMessages) {
   const linked = /* @__PURE__ */ new Set([ghost.lastSeenMessageId, ...(ghost.conversationHistory ?? []).map((entry) => entry.messageId), ...ghost.occurrenceKeys.map((key) => key.split(":", 1)[0])]);
   return previousMessages.filter((item) => linked.has(item.id)).map((item) => item.id);
 }
+function voiceDecisionSummary(voice) {
+  const tags = [...new Set((voice.tags ?? []).map((tag) => tag.trim().toLowerCase()).filter(Boolean))];
+  const languages = [...new Set((voice.languages ?? []).map((code) => code.trim().toLowerCase()).filter(Boolean))];
+  const parts = [
+    voice.name || "Unnamed voice",
+    voice.category || "unspecified",
+    voice.description || "No description provided."
+  ];
+  if (tags.length) parts.push(`tags: ${tags.join(", ")}`);
+  if (languages.length) parts.push(`languages: ${languages.join(", ")}`);
+  return parts.join("; ");
+}
 function buildUncastVoiceDecision(groups, voices, message, ghosts = [], previousMessages = []) {
   const labels = uncastIdentityLabels(message, ghosts);
   const narrativeNames = uncastNarrativeNameCandidates(message);
@@ -347,7 +359,7 @@ function buildUncastVoiceDecision(groups, voices, message, ghosts = [], previous
     questions[`voice_${group.id}`] = {
       type: "choice",
       instructions: `Rank the available voices for the person who actually speaks the quoted dialogue in ${group.id}. Narration-only bystanders and people merely addressed are not speakers. Use the full scene as context, including other character groups only when clearly the same speaker. Select the best available voice.`,
-      criteria: { ...Object.fromEntries(state.voices.map((voice) => [voice.option, `${voice.name || "Unnamed voice"}; ${voice.category}; ${voice.description || "No description provided."}`])), ...state.voices.length === 1 ? { no_match: "No suitable voice is available." } : {} }
+      criteria: { ...Object.fromEntries(voices.map((voice, index) => [`voice_${index}`, voiceDecisionSummary(voice)])), ...voices.length === 1 ? { no_match: "No suitable voice is available." } : {} }
     };
   }
   return { state, questions };
@@ -6935,7 +6947,7 @@ spindle.onFrontendMessage(async (rawPayload, userId, frontendSessionId) => {
         const questions = Object.fromEntries(roles.map((role, index) => [`role_${index}`, {
           type: "choice",
           instructions: `Choose the best available voice for ${role.description}. Compare voice descriptions and gender when established.`,
-          criteria: { ...Object.fromEntries(voices.map((voice, i) => [`voice_${i}`, `${voice.name || voice.id}; ${voice.category}; ${voice.description || "No description provided"}`])), ...voices.length === 1 ? { no_match: "No voice is suitable." } : {} }
+          criteria: { ...Object.fromEntries(voices.map((voice, i) => [`voice_${i}`, voiceDecisionSummary(voice)])), ...voices.length === 1 ? { no_match: "No voice is suitable." } : {} }
         }]));
         roles.forEach((role, index) => {
           if (role.id !== "narrator") questions[`gender_${index}`] = {
