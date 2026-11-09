@@ -3167,6 +3167,19 @@ test('automatic casting chooses the last compatible unused favorite', () => {
   assert.equal('no_match' in questions.voice_g0.criteria, false)
 })
 
+test('voice ranking shortlists to 32 gender-compatible voices with original indexes', () => {
+  const voices = Array.from({ length: 40 }, (_, index) => ({ id: `voice-${index}`, name: `Voice ${index}`, category: index % 2 ? 'male' : 'female', description: `Description ${index}` }))
+  const group = { ...collectUncastVoiceGroups([{ speakerId: UNCAST_SPEAKER_ID, text: 'Hello.' }])[0], pronounGender: 'male' as const }
+  const plan = buildUncastVoiceDecision([group], voices, 'A speaker says hello.')
+  const keys = Object.keys(plan.questions.voice_g0.criteria)
+  assert.ok(keys.length <= 32)
+  assert.ok(keys.every(key => /^voice_\d+$/.test(key)))
+  assert.ok(keys.every(key => voices[Number(key.slice(6))].category === 'male'))
+  assert.ok(keys.length > 0)
+  assert.deepEqual(plan.state.voices.length, 40)
+  assert.ok(plan.state.voices.every(voice => !('description' in voice)))
+})
+
 test('reviews assistant dialogue attributed to the user when another named subject is present', () => {
   const message = `"Nine-fifteen, Tessa." The voice crackles through the earpiece. Tessa's jaw stays clamped on the phone. Ken's hand rests on her hip.\n\n"Mom. Mom, I heard you."`
   const speakers = addUnconfiguredDialogueSpeakers(message, [{ id: USER_SPEAKER_ID, name: 'Ken' }])

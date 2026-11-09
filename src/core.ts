@@ -875,7 +875,19 @@ export function buildUncastVoiceDecision(groups: UncastVoiceGroup[], voices: Fav
     narrativeNames,
     characters: groups.map(group => ({ id: group.id, identity: group.speakerId, speeches: group.speeches, context: group.context })),
     ghosts: ghosts.map((ghost, index) => ({ option: `ghost_${index}`, identity: ghost.speakerId, label: ghost.label || null, aliases: ghostCastAliases(ghost), priorMessageIds: ghostPriorMessageIds(ghost, previousMessages), context: ghost.context, conversationHistory: ghost.conversationHistory ?? [] })),
-    voices: voices.map((voice, index) => ({ option: `voice_${index}`, name: voice.name, category: voice.category, description: voice.description })),
+    voices: voices.map((voice, index) => ({ option: `voice_${index}`, name: voice.name })),
+  }
+  // Deterministic gender hints prefer what the narration says about the
+  // speaker; the pool is score-ordered, so the earliest compatible voices
+  // are the strongest candidates. The shortlist keeps each ranking
+  // question small enough for the decision gateway while preserving the
+  // original voice indexes for probability lookup.
+  const voiceOptionsFor = (group: UncastVoiceGroup): Array<{ index: number; voice: FavoriteVoice }> => {
+    const hint = group.pronounGender && (group.pronounGender === 'male' || group.pronounGender === 'female') ? group.pronounGender : 'unknown'
+    return voices
+      .map((voice, index) => ({ index, voice }))
+      .filter(({ voice }) => hint === 'unknown' || voiceGenderCompatible(voice, hint))
+      .slice(0, 32)
   }
   const questions: Record<string, { type: 'choice'; instructions: string; criteria: Record<string, string> }> = {}
   for (const group of groups) {
@@ -908,9 +920,10 @@ export function buildUncastVoiceDecision(groups: UncastVoiceGroup[], voices: Fav
       }
     }
     if (!voices.length) continue
+    const options = voiceOptionsFor(group)
     questions[`voice_${group.id}`] = {
       type: 'choice', instructions: `Rank the available voices for the person who actually speaks the quoted dialogue in ${group.id}. Narration-only bystanders and people merely addressed are not speakers. Use the full scene as context, including other character groups only when clearly the same speaker. Select the best available voice.`,
-      criteria: { ...Object.fromEntries(voices.map((voice, index) => [`voice_${index}`, voiceDecisionSummary(voice)])), ...(voices.length === 1 ? { no_match: 'No suitable voice is available.' } : {}) },
+      criteria: { ...Object.fromEntries(options.map(({ index, voice }) => [`voice_${index}`, voiceDecisionSummary(voice)])), ...(options.length === 1 ? { no_match: 'No suitable voice is available.' } : {}) },
     }
   }
   return { state, questions }

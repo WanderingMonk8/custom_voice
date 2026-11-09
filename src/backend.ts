@@ -1990,14 +1990,36 @@ spindle.onFrontendMessage(async (rawPayload: unknown, userId, frontendSessionId)
           const plan = buildUncastVoiceDecision(groups, voices, payload.message.slice(0, 30_000), ghosts, matchingContext.previousMessages)
           const answers: Record<string, SpeakerDecisionChoice> = {}
           let decisionError = ''
-          try {
-            const result = await spindle.decisions.evaluate({ state: plan.state, questions: plan.questions, ...(userId ? { userId } : {}) })
-            for (const [id, answer] of Object.entries(result.answers)) {
-              if (answer.type === 'choice') answers[id] = { choice: answer.choice, probabilities: answer.probabilities, confidence: answer.confidence }
+          const captureAnswers = (result: { answers: Record<string, unknown> }): void => {
+            for (const [id, raw] of Object.entries(result.answers)) {
+              const answer = raw as { type?: string; choice?: string; probabilities?: Record<string, number>; confidence?: number }
+              if (answer.type === 'choice' && typeof answer.choice === 'string' && answer.probabilities && typeof answer.confidence === 'number') answers[id] = { choice: answer.choice, probabilities: answer.probabilities, confidence: answer.confidence }
             }
+          }
+          // Split the evaluation: identity and same-speaker questions are
+          // small but critical (they decide whether fragments share a
+          // voice), while voice-ranking questions carry the bulky voice
+          // list. Evaluating them separately keeps a failure of the
+          // ranking call from fragmenting unnamed characters into
+          // multiple voices.
+          const isVoiceQuestion = (id: string): boolean => id.startsWith('voice_')
+          const identityQuestions = Object.fromEntries(Object.entries(plan.questions).filter(([id]) => !isVoiceQuestion(id)))
+          const voiceQuestions = Object.fromEntries(Object.entries(plan.questions).filter(([id]) => isVoiceQuestion(id)))
+          try {
+            const result = await spindle.decisions.evaluate({ state: plan.state, questions: identityQuestions, ...(userId ? { userId } : {}) })
+            captureAnswers(result)
           } catch (error) {
             decisionError = error instanceof Error ? error.message : String(error)
-            spindle.log.warn(`[Chat Voice] Uncast voice decision failed; using exact ghost matches only: ${decisionError}`)
+            spindle.log.warn(`[Chat Voice] Uncast identity decision failed; using exact ghost matches only: ${decisionError}`)
+          }
+          if (Object.keys(voiceQuestions).length) {
+            try {
+              const result = await spindle.decisions.evaluate({ state: plan.state, questions: voiceQuestions, ...(userId ? { userId } : {}) })
+              captureAnswers(result)
+            } catch (error) {
+              if (!decisionError) decisionError = error instanceof Error ? error.message : String(error)
+              spindle.log.warn(`[Chat Voice] Uncast voice ranking failed: ${decisionError}`)
+            }
           }
           const review = buildUncastIdentityReview(groups, answers, payload.message.slice(0, 30_000), ghosts, payload.messageId, matchingContext.previousMessages)
           let reviewError = ''

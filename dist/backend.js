@@ -319,7 +319,11 @@ function buildUncastVoiceDecision(groups, voices, message, ghosts = [], previous
     narrativeNames,
     characters: groups.map((group) => ({ id: group.id, identity: group.speakerId, speeches: group.speeches, context: group.context })),
     ghosts: ghosts.map((ghost, index) => ({ option: `ghost_${index}`, identity: ghost.speakerId, label: ghost.label || null, aliases: ghostCastAliases(ghost), priorMessageIds: ghostPriorMessageIds(ghost, previousMessages), context: ghost.context, conversationHistory: ghost.conversationHistory ?? [] })),
-    voices: voices.map((voice, index) => ({ option: `voice_${index}`, name: voice.name, category: voice.category, description: voice.description }))
+    voices: voices.map((voice, index) => ({ option: `voice_${index}`, name: voice.name }))
+  };
+  const voiceOptionsFor = (group) => {
+    const hint = group.pronounGender && (group.pronounGender === "male" || group.pronounGender === "female") ? group.pronounGender : "unknown";
+    return voices.map((voice, index) => ({ index, voice })).filter(({ voice }) => hint === "unknown" || voiceGenderCompatible(voice, hint)).slice(0, 32);
   };
   const questions = {};
   for (const group of groups) {
@@ -356,10 +360,11 @@ function buildUncastVoiceDecision(groups, voices, message, ghosts = [], previous
       };
     }
     if (!voices.length) continue;
+    const options = voiceOptionsFor(group);
     questions[`voice_${group.id}`] = {
       type: "choice",
       instructions: `Rank the available voices for the person who actually speaks the quoted dialogue in ${group.id}. Narration-only bystanders and people merely addressed are not speakers. Use the full scene as context, including other character groups only when clearly the same speaker. Select the best available voice.`,
-      criteria: { ...Object.fromEntries(voices.map((voice, index) => [`voice_${index}`, voiceDecisionSummary(voice)])), ...voices.length === 1 ? { no_match: "No suitable voice is available." } : {} }
+      criteria: { ...Object.fromEntries(options.map(({ index, voice }) => [`voice_${index}`, voiceDecisionSummary(voice)])), ...options.length === 1 ? { no_match: "No suitable voice is available." } : {} }
     };
   }
   return { state, questions };
@@ -6837,14 +6842,30 @@ spindle.onFrontendMessage(async (rawPayload, userId, frontendSessionId) => {
           const plan = buildUncastVoiceDecision(groups, voices, payload.message.slice(0, 3e4), ghosts, matchingContext.previousMessages);
           const answers = {};
           let decisionError = "";
-          try {
-            const result = await spindle.decisions.evaluate({ state: plan.state, questions: plan.questions, ...userId ? { userId } : {} });
-            for (const [id, answer] of Object.entries(result.answers)) {
-              if (answer.type === "choice") answers[id] = { choice: answer.choice, probabilities: answer.probabilities, confidence: answer.confidence };
+          const captureAnswers = (result) => {
+            for (const [id, raw] of Object.entries(result.answers)) {
+              const answer = raw;
+              if (answer.type === "choice" && typeof answer.choice === "string" && answer.probabilities && typeof answer.confidence === "number") answers[id] = { choice: answer.choice, probabilities: answer.probabilities, confidence: answer.confidence };
             }
+          };
+          const isVoiceQuestion = (id) => id.startsWith("voice_");
+          const identityQuestions = Object.fromEntries(Object.entries(plan.questions).filter(([id]) => !isVoiceQuestion(id)));
+          const voiceQuestions = Object.fromEntries(Object.entries(plan.questions).filter(([id]) => isVoiceQuestion(id)));
+          try {
+            const result = await spindle.decisions.evaluate({ state: plan.state, questions: identityQuestions, ...userId ? { userId } : {} });
+            captureAnswers(result);
           } catch (error) {
             decisionError = error instanceof Error ? error.message : String(error);
-            spindle.log.warn(`[Chat Voice] Uncast voice decision failed; using exact ghost matches only: ${decisionError}`);
+            spindle.log.warn(`[Chat Voice] Uncast identity decision failed; using exact ghost matches only: ${decisionError}`);
+          }
+          if (Object.keys(voiceQuestions).length) {
+            try {
+              const result = await spindle.decisions.evaluate({ state: plan.state, questions: voiceQuestions, ...userId ? { userId } : {} });
+              captureAnswers(result);
+            } catch (error) {
+              if (!decisionError) decisionError = error instanceof Error ? error.message : String(error);
+              spindle.log.warn(`[Chat Voice] Uncast voice ranking failed: ${decisionError}`);
+            }
           }
           const review = buildUncastIdentityReview(groups, answers, payload.message.slice(0, 3e4), ghosts, payload.messageId, matchingContext.previousMessages);
           let reviewError = "";
