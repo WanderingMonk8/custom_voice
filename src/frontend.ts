@@ -1396,27 +1396,6 @@ export function setup(ctx: SpindleFrontendContext) {
   communitySearchButton.className = 'chat-voice-add-button'
   communitySearchButton.textContent = 'Search'
   communityToolbar.append(communitySearch, communitySort, communitySearchButton)
-  const communitySubtoolbar = document.createElement('div')
-  communitySubtoolbar.className = 'chat-voice-community-subtoolbar'
-  const communityTags = document.createElement('input')
-  communityTags.placeholder = 'Tags (comma-separated)'
-  communityTags.setAttribute('aria-label', 'Community voice tags')
-  const communityGender = document.createElement('select')
-  communityGender.setAttribute('aria-label', 'Community voice gender')
-  for (const [value, label] of [['all', 'All genders'], ['female', 'Female'], ['male', 'Male']] as const) {
-    const option = document.createElement('option')
-    option.value = value
-    option.textContent = label
-    communityGender.appendChild(option)
-  }
-  const communityLanguage = document.createElement('select')
-  communityLanguage.setAttribute('aria-label', 'Community voice language')
-  for (const [value, label] of [['', 'Any language'], ['en', '🇺🇸 English'], ['es', '🇪🇸 Spanish'], ['ar', '🇸🇦 Arabic'], ['ru', '🇷🇺 Russian'], ['ja', '🇯🇵 Japanese'], ['pt', '🇧🇷 Portuguese'], ['zh', '🇨🇳 Chinese'], ['fr', '🇫🇷 French'], ['it', '🇮🇹 Italian']] as const) {
-    const option = document.createElement('option')
-    option.value = value
-    option.textContent = label
-    communityLanguage.appendChild(option)
-  }
   const communityPrev = document.createElement('button')
   communityPrev.type = 'button'
   communityPrev.className = 'chat-voice-add-button'
@@ -1433,6 +1412,9 @@ export function setup(ctx: SpindleFrontendContext) {
   const communityPager = document.createElement('div')
   communityPager.className = 'chat-voice-community-pager'
   communityPager.append(communityPrev, communityPageLabel, communityNext)
+  const communityTags = document.createElement('input')
+  communityTags.placeholder = 'Tags (comma-separated)'
+  communityTags.setAttribute('aria-label', 'Community voice tags')
   const communityFilterPanel = document.createElement('div')
   communityFilterPanel.className = 'chat-voice-filter-panel'
   const communityLanguagesSection = document.createElement('div')
@@ -4606,8 +4588,10 @@ export function setup(ctx: SpindleFrontendContext) {
   communitySearchButton.addEventListener('click', () => {
     communitySearchTitle = communitySearch.value.trim().slice(0, 128)
     communitySearchTags = readCommunityFilterText(communityTags.value)
-    const gender = communityGender.value === 'male' || communityGender.value === 'female' ? communityGender.value : ''
-    if (gender && !communitySearchTags.some(tag => tag.toLowerCase() === gender)) communitySearchTags = [gender, ...communitySearchTags]
+    for (const chip of communityFilterPanel.querySelectorAll<HTMLButtonElement>('.chat-voice-filter-chip[aria-pressed="true"]')) {
+      const tag = chip.dataset.tag ?? ''
+      if (tag && !communitySearchTags.some(existing => existing.toLowerCase() === tag.toLowerCase())) communitySearchTags.push(tag)
+    }
     communitySearchLanguage = communityLanguage.value ? [communityLanguage.value] : []
     communitySortBy = communitySort.value === 'task_count' || communitySort.value === 'created_at' ? communitySort.value : 'score'
     void runCommunitySearch(1)
