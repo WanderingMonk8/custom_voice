@@ -302,6 +302,78 @@ test('Jev resolver uses role fallbacks only when the complete message has no ide
   assert.equal(user.find(segment => segment.text === 'No one has named me.')?.speakerId, USER_SPEAKER_ID)
 })
 
+test('user messages let the user take the default instead of the card title character', () => {
+  const content = '"No one has named me."'
+  const speakers = [{ id: 'ruby', name: 'Ruby' }]
+  const plan = buildSpeakerDecisionPlan(content, speakers, true)
+  const unclear = {
+    choice: 'no_clear_identity',
+    probabilities: { no_clear_identity: 0.9, uncast_character: 0.1 },
+    confidence: 0.9,
+  }
+  const segments = resolveSpeakerDecisionSegments(
+    content,
+    plan,
+    { paragraph_p0: unclear, speech_s0: unclear },
+    speakers,
+    { isUserMessage: true, cardSpeakerId: 'ruby', historicalSpeakerId: null },
+  )
+  assert.equal(segments.find(segment => segment.text === 'No one has named me.')?.speakerId, USER_SPEAKER_ID)
+})
+
+test('best-available review includes the user persona as candidate in user messages', () => {
+  const speakers = [{ id: 'ellis', name: 'Ellis' }, { id: USER_SPEAKER_ID, name: 'April' }]
+  const userPlan = buildSpeakerDecisionPlan('Ellis watches. "April," I repeat. "I came here."', speakers, true)
+  const assistantPlan = buildSpeakerDecisionPlan('Ellis watches. "April," I repeat. "I came here."', speakers, false)
+  const context = { previousMessages: [], ghosts: [] }
+  const answers = { global_uncertain_s0: confidentDecision('no_clear_identity', 0.9, 0.9) }
+  const userReview = buildBestAvailableSpeakerReview(userPlan, answers, context)
+  const assistantReview = buildBestAvailableSpeakerReview(assistantPlan, answers, context)
+  const userOption = decisionOption(userPlan, USER_SPEAKER_ID)
+  assert.ok(userReview.questions.best_guess_s0.criteria[userOption])
+  assert.equal(assistantReview.questions.best_guess_s0.criteria[userOption], undefined)
+})
+
+test('first-person narration in a user message routes to the user voice', () => {
+  const speakers = [{ id: 'ellis', name: 'Ellis' }, { id: USER_SPEAKER_ID, name: 'April' }]
+  const content = '"April," I repeat. "That is before I came here." The rain fell.'
+  const userSegments = parseRosterVoiceSegments(content, null, speakers, '', null, false, true)
+  assert.equal(userSegments.find(segment => segment.text === 'I repeat.')?.speakerId, USER_SPEAKER_ID)
+  assert.equal(userSegments.find(segment => segment.text === 'The rain fell.')?.speakerId, null)
+  const assistantSegments = parseRosterVoiceSegments(content, null, speakers)
+  assert.equal(assistantSegments.find(segment => segment.text === 'I repeat.')?.speakerId, null)
+})
+
+test('first-person cue boosts user confidence and a best-available guess can land on the user', () => {
+  const speakers = [{ id: 'ellis', name: 'Ellis' }, { id: USER_SPEAKER_ID, name: 'April' }]
+  const plan = buildSpeakerDecisionPlan('Ellis watches. "April," I repeat. "That is before I came here."', speakers, true)
+  const ellisOption = decisionOption(plan, 'ellis')
+  const userOption = decisionOption(plan, USER_SPEAKER_ID)
+  const answers: Record<string, SpeakerDecisionChoice> = {
+    paragraph_p0: confidentDecision('no_clear_identity'),
+    speech_s0: { choice: ellisOption, probabilities: { [ellisOption]: 0.45, [userOption]: 0.39, no_clear_identity: 0.16 }, confidence: 0.36 },
+    speech_s1: { choice: userOption, probabilities: { [userOption]: 0.58, [ellisOption]: 0.2, no_clear_identity: 0.22 }, confidence: 0.51 },
+    global_uncertain_s0: confidentDecision('no_clear_identity', 0.9, 0.9),
+    best_guess_s0: { choice: ellisOption, probabilities: { [ellisOption]: 0.61, [userOption]: 0.3, no_clear_identity: 0.09 }, confidence: 0.53 },
+  }
+  const segments = resolveSpeakerDecisionSegments(plan.state.message, plan, answers, speakers, { isUserMessage: true, cardSpeakerId: 'ellis', historicalSpeakerId: null, evidenceOnly: true })
+  assert.equal(segments.find(segment => segment.text === 'April,')?.speakerId, USER_SPEAKER_ID)
+  assert.equal(segments.find(segment => segment.text === 'That is before I came here.')?.speakerId, USER_SPEAKER_ID)
+})
+
+test('user-name invocation in narration boosts the user speech without a first-person cue', () => {
+  const speakers = [{ id: 'ellis', name: 'Ellis' }, { id: USER_SPEAKER_ID, name: 'April' }]
+  const plan = buildSpeakerDecisionPlan('April turns away. "Hello there."', speakers, true)
+  const ellisOption = decisionOption(plan, 'ellis')
+  const userOption = decisionOption(plan, USER_SPEAKER_ID)
+  const answers: Record<string, SpeakerDecisionChoice> = {
+    paragraph_p0: confidentDecision('no_clear_identity'),
+    speech_s0: { choice: ellisOption, probabilities: { [ellisOption]: 0.45, [userOption]: 0.39, no_clear_identity: 0.16 }, confidence: 0.36 },
+  }
+  const segments = resolveSpeakerDecisionSegments(plan.state.message, plan, answers, speakers, { isUserMessage: true, cardSpeakerId: 'ellis', historicalSpeakerId: null })
+  assert.equal(segments.find(segment => segment.text === 'Hello there.')?.speakerId, USER_SPEAKER_ID)
+})
+
 test('Jev uncast identity disables card-title deference and routes to connection default', () => {
   const content = 'The clerk looks up. "Next in line."'
   const speakers = [{ id: 'naomi', name: 'Naomi' }]

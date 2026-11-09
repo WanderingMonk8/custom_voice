@@ -4178,7 +4178,10 @@ export function buildBestAvailableSpeakerReview(plan: SpeakerDecisionPlan, answe
   const options: Record<string, string> = {}
   const criteria: Record<string, string> = {}
   for (const speaker of plan.state.speakers) {
-    if (speaker.id === USER_SPEAKER_ID) continue
+    // User messages share the assistant pipeline: the user persona is a
+    // normal candidate there (assistant messages only admit it once the
+    // persona check confirms it).
+    if (speaker.id === USER_SPEAKER_ID && plan.state.messageRole !== 'user') continue
     if (!grounded.has(speaker.id)) continue
     options[speaker.option] = speaker.id
     criteria[speaker.option] = knownCriteria[speaker.option]
@@ -7735,6 +7738,77 @@ function hasExplicitUncastCue(content: string, skippedTrackerTagPairs = ''): boo
     || SPEAKER_TURN_SWITCH_PATTERN.test(narration)
 }
 
+/**
+ * Whether a span is written in the first person. In a user message that
+ * first-person voice is the user persona; in narration it is the persona
+ * narrating their own actions.
+ */
+function hasFirstPersonPronoun(text: string): boolean {
+  return /\b(?:i|me|my|mine|myself)(?:'(?:m|ve|ll|d|re))?\b/iu.test(text)
+}
+
+/** Whether a span invokes one of the speaker's name aliases. */
+function invokesSpeakerName(text: string, aliases: readonly string[]): boolean {
+  return aliases.some(alias => {
+    const value = alias.trim()
+    return value.length >= 2 && new RegExp(`(^|[^\\p{L}\\p{N}])${escapedPattern(value)}(?=$|[^\\p{L}\\p{N}])`, 'iu').test(text)
+  })
+}
+
+/**
+ * User-message evidence for one speech: first-person "I" in the quotation,
+ * or first-person/named narration immediately around it. Per the user's
+ * usage policy this is only evidence — Jev still evaluates every speech —
+ * but it boosts the user candidate's confidence.
+ */
+function userCueForSpeech(plan: SpeakerDecisionPlan, speech: SpeakerDecisionPlan['state']['speeches'][number]): boolean {
+  const userSpeaker = plan.state.speakers.find(speaker => speaker.id === USER_SPEAKER_ID)
+  const aliases = userSpeaker ? speakerAliases(userSpeaker.name) : []
+  const narration = `${speech.narrativeBefore} ${speech.narrativeAfter}`
+  return hasFirstPersonPronoun(speech.text)
+    || hasFirstPersonPronoun(narration)
+    || invokesSpeakerName(narration, aliases)
+}
+
+/**
+ * Deterministic confidence boost for user messages: when a speech carries
+ * first-person "I" evidence or a user-name invocation in nearby narration,
+ * shift probability toward the user persona option (and lift confidence)
+ * before thresholds, chain decoding, and best-available guesses read it.
+ * Jev's choice only flips when the boosted user option becomes the strict
+ * leader, so a clear Jev verdict for another speaker still stands.
+ */
+export function applyUserCueConfidenceBoost(plan: SpeakerDecisionPlan, answers: Record<string, SpeakerDecisionChoice>): Set<string> {
+  const boosted = new Set<string>()
+  const userOption = Object.keys(plan.optionSpeakerIds).find(option => plan.optionSpeakerIds[option] === USER_SPEAKER_ID)
+  if (!userOption) return boosted
+  for (const speech of plan.state.speeches) {
+    if (!userCueForSpeech(plan, speech)) continue
+    for (const key of [`speech_${speech.id}`, `best_guess_${speech.id}`]) {
+      const answer = answers[key]
+      if (!answer || !Object.hasOwn(answer.probabilities, userOption)) continue
+      const probabilities = { ...answer.probabilities }
+      const current = probabilities[userOption] ?? 0
+      const boostedProbability = Math.min(0.99, current + 0.25)
+      if (boostedProbability <= current) continue
+      const others = 1 - current
+      const scale = others > 0 ? (1 - boostedProbability) / others : 0
+      for (const option of Object.keys(probabilities)) {
+        probabilities[option] = option === userOption ? boostedProbability : (probabilities[option] ?? 0) * scale
+      }
+      const runnerUp = Math.max(0, ...Object.entries(probabilities).filter(([option]) => option !== userOption).map(([, value]) => value))
+      const becomesUser = answer.choice === userOption || boostedProbability > runnerUp
+      answers[key] = {
+        choice: becomesUser ? userOption : answer.choice,
+        probabilities,
+        confidence: becomesUser ? Math.min(1, answer.confidence + 0.15) : answer.confidence,
+      }
+      boosted.add(speech.id)
+    }
+  }
+  return boosted
+}
+
 export function resolveSpeakerDecisionSegments(
   content: string,
   plan: SpeakerDecisionPlan,
@@ -7758,6 +7832,10 @@ export function resolveSpeakerDecisionSegments(
     }
   },
 ): PlaybackSegment[] {
+  // User messages share the assistant pipeline; the only deviations are
+  // that first-person/name cues boost the user candidate, and the user
+  // (not the card title character) takes the default below.
+  const userCueBoosted = options.isUserMessage ? applyUserCueConfidenceBoost(plan, answers) : new Set<string>()
   const paragraphIdentities = new Map(plan.state.paragraphs.map(paragraph => [
     paragraph.id,
     clearDecisionSpeaker(answers[`paragraph_${paragraph.id}`], plan.optionSpeakerIds),
@@ -7869,8 +7947,10 @@ export function resolveSpeakerDecisionSegments(
         ? `an identity cleared ${cardBlockDescription}`
         : `no identity cleared ${cardBlockDescription} (max strength ${maxIdentityStrength.toFixed(2)})`
   // A card-title match owns a message only when no speech identity is strong
-  // enough to contest it. One weak guess must not veto the fallback.
+  // enough to contest it. One weak guess must not veto the fallback, and in
+  // a user message the default belongs to the user persona, never the card.
   const cardIdentity = options.cardSpeakerId
+    && !options.isUserMessage
     && !explicitUncastCue
     && !namedAlternative
     && !hasStrongIdentity
@@ -7960,6 +8040,7 @@ export function resolveSpeakerDecisionSegments(
     options.skippedTrackerTagPairs ?? '',
     null,
     true,
+    options.isUserMessage,
   ).map(segment => {
     if (!segment.debugPath?.some(step => step.startsWith('segment-type:speech'))) {
       return options.includeDebug ? segment : { text: segment.text, speakerId: segment.speakerId }
@@ -7986,6 +8067,7 @@ export function resolveSpeakerDecisionSegments(
           `segment-type:speech (quote ${index + 1})`,
           ...(answers[`first_pass_${speech.id}`] ? decisionAnswerDebug('jev-first-pass-speech', answers[`first_pass_${speech.id}`], plan.optionSpeakerIds) : []),
           ...decisionAnswerDebug('jev-speech', answer, plan.optionSpeakerIds),
+          ...(userCueBoosted.has(speech.id) ? ['user-cue-boost: first-person pronoun or user-name invocation shifts confidence toward user persona'] : []),
           ...decisionAnswerDebug('jev-ungrounded-first-pass', answers[`ungrounded_original_${speech.id}`], plan.optionSpeakerIds),
           ...(answers[`ungrounded_original_${speech.id}`] ? ['jev-grounding:unsupported cast identity excluded from first-pass anchor'] : []),
           ...decisionAnswerDebug('jev-relationship-original', answers[`relationship_original_${speech.id}`], plan.optionSpeakerIds),
@@ -8195,9 +8277,20 @@ function parseRosterVoiceSegmentsInternal(
   preserveLocalOnNullOverride = false,
   lowConfidenceQuoteIndexes?: Set<number>,
   includeDebug = false,
+  isUserMessage = false,
 ): PlaybackSegment[] {
   const playbackContent = preparePlaybackContent(content, skippedTrackerTagPairs)
   const result: PlaybackSegment[] = []
+  const userSpeaker = speakers.find(speaker => speaker.id === USER_SPEAKER_ID)
+  const userAliases = isUserMessage && userSpeaker ? speakerAliases(userSpeaker.name) : []
+  // First-person narration in a user message is the user persona narrating
+  // their own message; narration that invokes the user's name is the user
+  // persona acting. Both take the user voice instead of the narrator's.
+  const narrationSpeakerId = (narration: string): string | null => (
+    isUserMessage && (hasFirstPersonPronoun(narration) || invokesSpeakerName(narration, userAliases))
+      ? USER_SPEAKER_ID
+      : null
+  )
   const quotes = playbackQuotes(playbackContent)
   const paragraphs = playbackParagraphs(playbackContent)
   const openingBackfill = initialDialogueBackfill(paragraphs, speakers)
@@ -8225,10 +8318,11 @@ function parseRosterVoiceSegmentsInternal(
     }
     const bridge = playbackContent.slice(cursor, quote.start)
     const narration = cleanPlaybackText(bridge)
+    const bridgeSpeakerId = narrationSpeakerId(narration)
     if (narration) result.push({
       text: narration,
-      speakerId: null,
-      ...(includeDebug ? { debugPath: ['segment-type:narration', 'routing:narrator-voice'] } : {}),
+      speakerId: bridgeSpeakerId,
+      ...(includeDebug ? { debugPath: ['segment-type:narration', bridgeSpeakerId ? 'routing:user-voice (first-person or user-name cue)' : 'routing:narrator-voice'] } : {}),
     })
     const speech = cleanPlaybackText(quote.text)
     if (speech) {
@@ -8394,10 +8488,11 @@ function parseRosterVoiceSegmentsInternal(
     cursor = quote.end
   }
   const narration = cleanPlaybackText(playbackContent.slice(cursor))
+  const tailSpeakerId = narrationSpeakerId(narration)
   if (narration) result.push({
     text: narration,
-    speakerId: null,
-    ...(includeDebug ? { debugPath: ['segment-type:narration', 'routing:narrator-voice'] } : {}),
+    speakerId: tailSpeakerId,
+    ...(includeDebug ? { debugPath: ['segment-type:narration', tailSpeakerId ? 'routing:user-voice (first-person or user-name cue)' : 'routing:narrator-voice'] } : {}),
   })
   return result
 }
@@ -8409,6 +8504,7 @@ export function parseRosterVoiceSegments(
   skippedTrackerTagPairs = '',
   historicalSpeakerId: string | null = null,
   includeDebug = false,
+  isUserMessage = false,
 ): PlaybackSegment[] {
   return parseRosterVoiceSegmentsInternal(
     content,
@@ -8420,6 +8516,7 @@ export function parseRosterVoiceSegments(
     false,
     undefined,
     includeDebug,
+    isUserMessage,
   )
 }
 

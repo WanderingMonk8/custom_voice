@@ -2264,7 +2264,7 @@ function buildBestAvailableSpeakerReview(plan, answers, context, cardSpeakerId =
   const options = {};
   const criteria = {};
   for (const speaker of plan.state.speakers) {
-    if (speaker.id === USER_SPEAKER_ID) continue;
+    if (speaker.id === USER_SPEAKER_ID && plan.state.messageRole !== "user") continue;
     if (!grounded.has(speaker.id)) continue;
     options[speaker.option] = speaker.id;
     criteria[speaker.option] = knownCriteria[speaker.option];
@@ -4922,7 +4922,53 @@ function hasExplicitUncastCue(content, skippedTrackerTagPairs = "") {
   const narration = cleanPlaybackText(narrativeOnly(playbackContent));
   return ANONYMOUS_ROLE_IDENTITY_PATTERN.test(narration) || hasAnonymousHumanSubject(narration) || SPEAKER_TURN_SWITCH_PATTERN.test(narration);
 }
+function hasFirstPersonPronoun(text) {
+  return /\b(?:i|me|my|mine|myself)(?:'(?:m|ve|ll|d|re))?\b/iu.test(text);
+}
+function invokesSpeakerName(text, aliases) {
+  return aliases.some((alias) => {
+    const value = alias.trim();
+    return value.length >= 2 && new RegExp(`(^|[^\\p{L}\\p{N}])${escapedPattern(value)}(?=$|[^\\p{L}\\p{N}])`, "iu").test(text);
+  });
+}
+function userCueForSpeech(plan, speech) {
+  const userSpeaker = plan.state.speakers.find((speaker) => speaker.id === USER_SPEAKER_ID);
+  const aliases = userSpeaker ? speakerAliases(userSpeaker.name) : [];
+  const narration = `${speech.narrativeBefore} ${speech.narrativeAfter}`;
+  return hasFirstPersonPronoun(speech.text) || hasFirstPersonPronoun(narration) || invokesSpeakerName(narration, aliases);
+}
+function applyUserCueConfidenceBoost(plan, answers) {
+  const boosted = /* @__PURE__ */ new Set();
+  const userOption = Object.keys(plan.optionSpeakerIds).find((option) => plan.optionSpeakerIds[option] === USER_SPEAKER_ID);
+  if (!userOption) return boosted;
+  for (const speech of plan.state.speeches) {
+    if (!userCueForSpeech(plan, speech)) continue;
+    for (const key of [`speech_${speech.id}`, `best_guess_${speech.id}`]) {
+      const answer = answers[key];
+      if (!answer || !Object.hasOwn(answer.probabilities, userOption)) continue;
+      const probabilities = { ...answer.probabilities };
+      const current = probabilities[userOption] ?? 0;
+      const boostedProbability = Math.min(0.99, current + 0.25);
+      if (boostedProbability <= current) continue;
+      const others = 1 - current;
+      const scale = others > 0 ? (1 - boostedProbability) / others : 0;
+      for (const option of Object.keys(probabilities)) {
+        probabilities[option] = option === userOption ? boostedProbability : (probabilities[option] ?? 0) * scale;
+      }
+      const runnerUp = Math.max(0, ...Object.entries(probabilities).filter(([option]) => option !== userOption).map(([, value]) => value));
+      const becomesUser = answer.choice === userOption || boostedProbability > runnerUp;
+      answers[key] = {
+        choice: becomesUser ? userOption : answer.choice,
+        probabilities,
+        confidence: becomesUser ? Math.min(1, answer.confidence + 0.15) : answer.confidence
+      };
+      boosted.add(speech.id);
+    }
+  }
+  return boosted;
+}
 function resolveSpeakerDecisionSegments(content, plan, answers, speakers, options) {
+  const userCueBoosted = options.isUserMessage ? applyUserCueConfidenceBoost(plan, answers) : /* @__PURE__ */ new Set();
   const paragraphIdentities = new Map(plan.state.paragraphs.map((paragraph) => [
     paragraph.id,
     clearDecisionSpeaker(answers[`paragraph_${paragraph.id}`], plan.optionSpeakerIds)
@@ -5002,7 +5048,7 @@ function resolveSpeakerDecisionSegments(content, plan, answers, speakers, option
   const maxIdentityStrength = identityStrengths.length > 0 ? Math.max(...identityStrengths) : 0;
   const cardBlockDescription = `p>=${SPEAKER_CARD_THRESHOLDS.probability},c>=${SPEAKER_CARD_THRESHOLDS.confidence},m>=${SPEAKER_CARD_THRESHOLDS.margin}`;
   const cardReason = explicitUncastCue ? "explicit anonymous role or unnamed turn in narration" : namedAlternative ? "narration names another known speaker" : hasStrongIdentity ? `an identity cleared ${cardBlockDescription}` : `no identity cleared ${cardBlockDescription} (max strength ${maxIdentityStrength.toFixed(2)})`;
-  const cardIdentity = options.cardSpeakerId && !explicitUncastCue && !namedAlternative && !hasStrongIdentity ? options.cardSpeakerId : null;
+  const cardIdentity = options.cardSpeakerId && !options.isUserMessage && !explicitUncastCue && !namedAlternative && !hasStrongIdentity ? options.cardSpeakerId : null;
   const deferredUncast = Boolean(cardIdentity && hasUncastIdentity);
   const routingIdentity = (identity) => {
     if (identity === void 0 || identity === null) return void 0;
@@ -5069,7 +5115,8 @@ function resolveSpeakerDecisionSegments(content, plan, answers, speakers, option
     speakers,
     options.skippedTrackerTagPairs ?? "",
     null,
-    true
+    true,
+    options.isUserMessage
   ).map((segment) => {
     if (!segment.debugPath?.some((step) => step.startsWith("segment-type:speech"))) {
       return options.includeDebug ? segment : { text: segment.text, speakerId: segment.speakerId };
@@ -5092,6 +5139,7 @@ function resolveSpeakerDecisionSegments(content, plan, answers, speakers, option
           `segment-type:speech (quote ${index + 1})`,
           ...answers[`first_pass_${speech.id}`] ? decisionAnswerDebug("jev-first-pass-speech", answers[`first_pass_${speech.id}`], plan.optionSpeakerIds) : [],
           ...decisionAnswerDebug("jev-speech", answer, plan.optionSpeakerIds),
+          ...userCueBoosted.has(speech.id) ? ["user-cue-boost: first-person pronoun or user-name invocation shifts confidence toward user persona"] : [],
           ...decisionAnswerDebug("jev-ungrounded-first-pass", answers[`ungrounded_original_${speech.id}`], plan.optionSpeakerIds),
           ...answers[`ungrounded_original_${speech.id}`] ? ["jev-grounding:unsupported cast identity excluded from first-pass anchor"] : [],
           ...decisionAnswerDebug("jev-relationship-original", answers[`relationship_original_${speech.id}`], plan.optionSpeakerIds),
@@ -5205,9 +5253,12 @@ function discourseSpeechDebug(input) {
   }
   return lines;
 }
-function parseRosterVoiceSegmentsInternal(content, defaultSpeakerId, speakers, skippedTrackerTagPairs = "", quoteSpeakerOverrides, historicalSpeakerId = null, preserveLocalOnNullOverride = false, lowConfidenceQuoteIndexes, includeDebug = false) {
+function parseRosterVoiceSegmentsInternal(content, defaultSpeakerId, speakers, skippedTrackerTagPairs = "", quoteSpeakerOverrides, historicalSpeakerId = null, preserveLocalOnNullOverride = false, lowConfidenceQuoteIndexes, includeDebug = false, isUserMessage = false) {
   const playbackContent = preparePlaybackContent(content, skippedTrackerTagPairs);
   const result = [];
+  const userSpeaker = speakers.find((speaker) => speaker.id === USER_SPEAKER_ID);
+  const userAliases = isUserMessage && userSpeaker ? speakerAliases(userSpeaker.name) : [];
+  const narrationSpeakerId = (narration2) => isUserMessage && (hasFirstPersonPronoun(narration2) || invokesSpeakerName(narration2, userAliases)) ? USER_SPEAKER_ID : null;
   const quotes = playbackQuotes(playbackContent);
   const paragraphs = playbackParagraphs(playbackContent);
   const openingBackfill = initialDialogueBackfill(paragraphs, speakers);
@@ -5233,10 +5284,11 @@ function parseRosterVoiceSegmentsInternal(content, defaultSpeakerId, speakers, s
     }
     const bridge = playbackContent.slice(cursor, quote.start);
     const narration2 = cleanPlaybackText(bridge);
+    const bridgeSpeakerId = narrationSpeakerId(narration2);
     if (narration2) result.push({
       text: narration2,
-      speakerId: null,
-      ...includeDebug ? { debugPath: ["segment-type:narration", "routing:narrator-voice"] } : {}
+      speakerId: bridgeSpeakerId,
+      ...includeDebug ? { debugPath: ["segment-type:narration", bridgeSpeakerId ? "routing:user-voice (first-person or user-name cue)" : "routing:narrator-voice"] } : {}
     });
     const speech = cleanPlaybackText(quote.text);
     if (speech) {
@@ -5321,14 +5373,15 @@ function parseRosterVoiceSegmentsInternal(content, defaultSpeakerId, speakers, s
     cursor = quote.end;
   }
   const narration = cleanPlaybackText(playbackContent.slice(cursor));
+  const tailSpeakerId = narrationSpeakerId(narration);
   if (narration) result.push({
     text: narration,
-    speakerId: null,
-    ...includeDebug ? { debugPath: ["segment-type:narration", "routing:narrator-voice"] } : {}
+    speakerId: tailSpeakerId,
+    ...includeDebug ? { debugPath: ["segment-type:narration", tailSpeakerId ? "routing:user-voice (first-person or user-name cue)" : "routing:narrator-voice"] } : {}
   });
   return result;
 }
-function parseRosterVoiceSegments(content, defaultSpeakerId, speakers, skippedTrackerTagPairs = "", historicalSpeakerId = null, includeDebug = false) {
+function parseRosterVoiceSegments(content, defaultSpeakerId, speakers, skippedTrackerTagPairs = "", historicalSpeakerId = null, includeDebug = false, isUserMessage = false) {
   return parseRosterVoiceSegmentsInternal(
     content,
     defaultSpeakerId,
@@ -5338,7 +5391,8 @@ function parseRosterVoiceSegments(content, defaultSpeakerId, speakers, skippedTr
     historicalSpeakerId,
     false,
     void 0,
-    includeDebug
+    includeDebug,
+    isUserMessage
   );
 }
 function applyConfigToMetadata(metadata, config) {
