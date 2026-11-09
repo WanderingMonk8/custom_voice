@@ -2821,6 +2821,7 @@ function setup(ctx) {
     .chat-voice-copy-report-button:hover:not(:disabled) { filter:brightness(1.08); }
     .chat-voice-copy-report-button:disabled { cursor:not-allowed; opacity:.5; }
     .chat-voice-voices-tabs { display:flex; gap:4px; }
+    .chat-voice-voices-tabs[hidden], .chat-voice-favorites[hidden], .chat-voice-community[hidden] { display:none; }
     .chat-voice-voices-tab { flex:1; min-height:36px; padding:7px 10px; border:1px solid var(--lumiverse-border);
       border-radius:var(--lumiverse-radius); background:var(--lumiverse-fill-subtle); color:var(--lumiverse-text);
       font:inherit; font-size:12px; font-weight:600; cursor:pointer; }
