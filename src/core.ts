@@ -630,6 +630,11 @@ function latestGhostOccurrenceIndex(ghosts: GhostVoice[], key: string): number {
   return found
 }
 
+/** A ghost with no saved narrative evidence for a reviewer to compare against. */
+function ghostLacksSavedEvidence(ghost: GhostVoice): boolean {
+  return !(ghost.context ?? '').trim() && !(ghost.conversationHistory ?? []).length
+}
+
 /** Review borderline same-speaker links when a later turn has a clear label. */
 export function buildUncastIdentityReview(groups: UncastVoiceGroup[], answers: Record<string, SpeakerDecisionChoice>, message: string, ghosts: GhostVoice[] = [], messageId = '', previousMessages: RelationshipReviewContext['previousMessages'] = []) {
   const labels = uncastIdentityLabels(message, ghosts)
@@ -819,11 +824,18 @@ export function resolveUncastVoiceDecisions(
     const occurrence = occurrenceIndex >= 0 ? ghosts[occurrenceIndex] : undefined
     const occurrenceReview = occurrenceIndex >= 0 ? answers[`review_occurrence_${group.id}_${occurrenceIndex}`] : undefined
     const identityAnswer = answers[`identity_${group.id}`]
+    const disposition = occurrenceIndex >= 0 ? answers[`review_occurrence_disposition_${group.id}_${occurrenceIndex}`] : undefined
     const reviewedAsGhost = occurrence && group.speakerId === `ghost:${occurrence.id}`
+    // A ghost with no saved evidence (no context, no conversation history)
+    // cannot be meaningfully contested: the occurrence review only restates
+    // that the evidence is insufficient. The identical occurrence (same
+    // message, same speeches) then confirms the ghost by itself, unless
+    // Jev's disposition verdict explicitly says a different person.
+    const hollowOccurrence = !!occurrence && ghostLacksSavedEvidence(occurrence) && disposition?.choice !== 'different'
     const occurrenceConfirmed = !!occurrence && (reviewedAsGhost
       || (identityAnswer?.choice === `ghost_${occurrenceIndex}` && strongChoice(identityAnswer))
-      || (occurrenceReview?.choice === 'same' && strongChoice(occurrenceReview)))
-    const disposition = occurrenceIndex >= 0 ? answers[`review_occurrence_disposition_${group.id}_${occurrenceIndex}`] : undefined
+      || (occurrenceReview?.choice === 'same' && strongChoice(occurrenceReview))
+      || hollowOccurrence)
     const identityProbability = identityAnswer?.probabilities.new_or_unclear ?? 0
     const identityRunnerUp = identityAnswer ? Math.max(0, ...Object.entries(identityAnswer.probabilities).filter(([key]) => key !== 'new_or_unclear').map(([, value]) => value)) : 0
     const confirmedNew = !!occurrence && disposition?.choice === 'different' && strongChoice(disposition)

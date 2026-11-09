@@ -2782,6 +2782,48 @@ test('a clearly different saved occurrence can receive a new voice without chang
   assert.equal(replay[0]?.ghostId, 'replacement')
 })
 
+test('a hollow occurrence ghost is confirmed by the identical occurrence despite an evidence-free review', () => {
+  // A ghost created in an earlier playback of this message carries no saved
+  // context and no conversation history, so the occurrence review cannot
+  // confirm identity and would otherwise drop the group to the connection
+  // default on every replay. The identical (message, speeches) occurrence
+  // confirms the ghost by itself.
+  const group = collectUncastVoiceGroups([{ speakerId: UNCAST_SPEAKER_ID, text: 'I can take it from here.' }])
+  const hollow = { id: 'man', speakerId: UNCAST_SPEAKER_ID, voiceId: 'man-voice', context: '', occurrenceKeys: [`current:${hashMessageContent('I can take it from here.')}`], lastSeenMessageId: 'current' }
+  const before = structuredClone(hollow)
+  const replay = resolveUncastVoiceDecisions(group, readFavoriteVoices([{ id: 'new-voice' }]), {
+    identity_g0: confidentDecision('new_or_unclear'),
+    review_occurrence_g0_0: confidentDecision('different_or_unclear'),
+    review_occurrence_disposition_g0_0: { choice: 'unclear', probabilities: { same: 0.04, different: 0.11, unclear: 0.85 }, confidence: 0.77 },
+    voice_g0: confidentDecision('voice_0'),
+  }, [hollow], [], 'current')
+  assert.equal(replay[0]?.ghostId, 'man')
+  assert.equal(replay[0]?.voiceId, 'man-voice')
+  assert.match(replay[0]?.matchReason!, /exact message occurrence/u)
+  // A missing review leaves the same linkage instead of dropping the group.
+  const withoutReview = resolveUncastVoiceDecisions(group, readFavoriteVoices([{ id: 'new-voice' }]), {
+    identity_g0: confidentDecision('new_or_unclear'),
+    voice_g0: confidentDecision('voice_0'),
+  }, [hollow], [], 'current')
+  assert.equal(withoutReview[0]?.ghostId, 'man')
+  assert.deepEqual(hollow, before)
+})
+
+test('an explicit different verdict still replaces even a hollow occurrence ghost', () => {
+  const group = collectUncastVoiceGroups([{ speakerId: UNCAST_SPEAKER_ID, text: 'I can take it from here.' }])
+  const hollow = { id: 'man', speakerId: UNCAST_SPEAKER_ID, voiceId: 'man-voice', context: '', occurrenceKeys: [`current:${hashMessageContent('I can take it from here.')}`], lastSeenMessageId: 'current' }
+  const before = structuredClone(hollow)
+  const replaced = resolveUncastVoiceDecisions(group, readFavoriteVoices([{ id: 'new-voice' }]), {
+    identity_g0: confidentDecision('new_or_unclear'),
+    review_occurrence_g0_0: confidentDecision('different_or_unclear'),
+    review_occurrence_disposition_g0_0: confidentDecision('different'),
+    voice_g0: confidentDecision('voice_0'),
+  }, [hollow], [], 'current')
+  assert.equal(replaced[0]?.voiceId, 'new-voice')
+  assert.match(replaced[0]?.ghostId ?? '', /^pending:/u)
+  assert.deepEqual(hollow, before)
+})
+
 test('reviews borderline opening dialogue against a later clearly labeled speaker', () => {
   const groups = collectUncastVoiceGroups([
     { speakerId: null, text: 'Two clerks work. The elder is speaking.' },
