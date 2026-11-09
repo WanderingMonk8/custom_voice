@@ -415,9 +415,10 @@ function resolveUncastVoiceDecisions(groups, voices, answers, ghosts = [], reser
     const disposition = occurrenceIndex >= 0 ? answers[`review_occurrence_disposition_${group.id}_${occurrenceIndex}`] : void 0;
     const reviewedAsGhost = occurrence && group.speakerId === `ghost:${occurrence.id}`;
     const hollowOccurrence = !!occurrence && ghostLacksSavedEvidence(occurrence) && disposition?.choice !== "different";
+    const selfReferentialOccurrence = !!occurrence && !!messageId && occurrence.createdAtMessageId === messageId && occurrence.lastSeenMessageId === messageId && disposition?.choice !== "different";
     const occurrenceReviewSame = occurrenceReview?.choice === "same" && (occurrenceReview.probabilities?.same ?? 0) >= 0.6;
     const dispositionSame = disposition?.choice === "same" && (disposition.probabilities?.same ?? 0) >= 0.6;
-    const occurrenceConfirmed = !!occurrence && (reviewedAsGhost || identityAnswer?.choice === `ghost_${occurrenceIndex}` && strongChoice(identityAnswer) || occurrenceReview?.choice === "same" && strongChoice(occurrenceReview) || hollowOccurrence || occurrenceReviewSame && dispositionSame);
+    const occurrenceConfirmed = !!occurrence && (reviewedAsGhost || identityAnswer?.choice === `ghost_${occurrenceIndex}` && strongChoice(identityAnswer) || occurrenceReview?.choice === "same" && strongChoice(occurrenceReview) || hollowOccurrence || selfReferentialOccurrence || occurrenceReviewSame && dispositionSame);
     const identityProbability = identityAnswer?.probabilities.new_or_unclear ?? 0;
     const identityRunnerUp = identityAnswer ? Math.max(0, ...Object.entries(identityAnswer.probabilities).filter(([key]) => key !== "new_or_unclear").map(([, value]) => value)) : 0;
     const confirmedNew = !!occurrence && disposition?.choice === "different" && strongChoice(disposition) && identityAnswer?.choice === "new_or_unclear" && identityAnswer.confidence >= 0.8 && identityProbability >= 0.8 && identityProbability - identityRunnerUp >= 0.25;

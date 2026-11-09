@@ -914,6 +914,14 @@ export function resolveUncastVoiceDecisions(
     // message, same speeches) then confirms the ghost by itself, unless
     // Jev's disposition verdict explicitly says a different person.
     const hollowOccurrence = !!occurrence && ghostLacksSavedEvidence(occurrence) && disposition?.choice !== 'different'
+    // A ghost created during this very message's playback has only
+    // self-referential evidence: its saved context is a snippet of this
+    // same passage, so the occurrence comparison against it is circular
+    // and flips between runs. The identical occurrence confirms it unless
+    // the disposition verdict explicitly says a different person.
+    const selfReferentialOccurrence = !!occurrence && !!messageId
+      && occurrence.createdAtMessageId === messageId && occurrence.lastSeenMessageId === messageId
+      && disposition?.choice !== 'different'
     // When both occurrence questions lean 'same' without reaching
     // strong-choice levels, their agreement on the identical occurrence
     // still confirms it; strength is unnecessary when neither question
@@ -924,6 +932,7 @@ export function resolveUncastVoiceDecisions(
       || (identityAnswer?.choice === `ghost_${occurrenceIndex}` && strongChoice(identityAnswer))
       || (occurrenceReview?.choice === 'same' && strongChoice(occurrenceReview))
       || hollowOccurrence
+      || selfReferentialOccurrence
       || (occurrenceReviewSame && dispositionSame))
     const identityProbability = identityAnswer?.probabilities.new_or_unclear ?? 0
     const identityRunnerUp = identityAnswer ? Math.max(0, ...Object.entries(identityAnswer.probabilities).filter(([key]) => key !== 'new_or_unclear').map(([, value]) => value)) : 0

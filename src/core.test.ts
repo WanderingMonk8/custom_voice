@@ -2904,6 +2904,42 @@ test('a hollow occurrence ghost is confirmed by the identical occurrence despite
   assert.deepEqual(hollow, before)
 })
 
+test('a same-message created occurrence is confirmed by identity of occurrence despite a flipped review', () => {
+  // A ghost created during an earlier playback of this same message has
+  // only self-referential evidence: its saved context is a snippet of this
+  // very passage, so the occurrence review is circular and flips between
+  // runs. The identical occurrence confirms it unless the disposition
+  // explicitly says a different person.
+  const group = collectUncastVoiceGroups([{ speakerId: UNCAST_SPEAKER_ID, text: "I'm on till nine-thirty at the hospital. Nine's no good." }])
+  const ghost = {
+    id: 'man', speakerId: UNCAST_SPEAKER_ID, voiceId: 'man-voice',
+    context: "Then he walked over to the table without being asked, and picked up the pen off the clipboard, and signed. Wren couldn't get up.",
+    occurrenceKeys: [`current:${hashMessageContent("I'm on till nine-thirty at the hospital. Nine's no good.")}`],
+    lastSeenMessageId: 'current', createdAtMessageId: 'current',
+  }
+  const replay = resolveUncastVoiceDecisions(group, readFavoriteVoices([{ id: 'new-voice' }]), {
+    identity_g0: { choice: 'new_or_unclear', confidence: 0.92, probabilities: { new_or_unclear: 0.92, ghost_0: 0.01 } },
+    review_occurrence_g0_0: { choice: 'different_or_unclear', confidence: 0.72, probabilities: { same: 0.14, different_or_unclear: 0.86 } },
+    review_occurrence_disposition_g0_0: { choice: 'same', confidence: 0.18, probabilities: { same: 0.45, different: 0.31, unclear: 0.24 } },
+    voice_g0: confidentDecision('voice_0'),
+  }, [ghost], [], 'current')
+  assert.equal(replay[0]?.ghostId, 'man')
+  assert.equal(replay[0]?.voiceId, 'man-voice')
+  assert.match(replay[0]?.matchReason!, /exact message occurrence/u)
+  // The disposition is the escape hatch: an explicit 'different' verdict
+  // still lets a new person in.
+  const before = structuredClone(ghost)
+  const flipped = resolveUncastVoiceDecisions(group, readFavoriteVoices([{ id: 'new-voice' }]), {
+    identity_g0: { choice: 'new_or_unclear', confidence: 0.92, probabilities: { new_or_unclear: 0.92, ghost_0: 0.01 } },
+    review_occurrence_g0_0: { choice: 'different_or_unclear', confidence: 0.72, probabilities: { same: 0.14, different_or_unclear: 0.86 } },
+    review_occurrence_disposition_g0_0: { choice: 'different', confidence: 0.92, probabilities: { different: 0.92, same: 0.04, unclear: 0.04 } },
+    voice_g0: confidentDecision('voice_0'),
+  }, [ghost], [], 'current')
+  assert.equal(flipped[0]?.ghostId, 'pending:g0')
+  assert.equal(flipped[0]?.voiceId, 'new-voice')
+  assert.deepEqual(ghost, before)
+})
+
 test('dual same-leaning occurrence reviews confirm the ghost', () => {
   // With a saved context present both occurrence reviews lean 'same'
   // without reaching strong-choice levels; their agreement on the
