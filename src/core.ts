@@ -8040,7 +8040,6 @@ export function resolveSpeakerDecisionSegments(
     options.skippedTrackerTagPairs ?? '',
     null,
     true,
-    options.isUserMessage,
   ).map(segment => {
     if (!segment.debugPath?.some(step => step.startsWith('segment-type:speech'))) {
       return options.includeDebug ? segment : { text: segment.text, speakerId: segment.speakerId }
@@ -8277,20 +8276,9 @@ function parseRosterVoiceSegmentsInternal(
   preserveLocalOnNullOverride = false,
   lowConfidenceQuoteIndexes?: Set<number>,
   includeDebug = false,
-  isUserMessage = false,
 ): PlaybackSegment[] {
   const playbackContent = preparePlaybackContent(content, skippedTrackerTagPairs)
   const result: PlaybackSegment[] = []
-  const userSpeaker = speakers.find(speaker => speaker.id === USER_SPEAKER_ID)
-  const userAliases = isUserMessage && userSpeaker ? speakerAliases(userSpeaker.name) : []
-  // First-person narration in a user message is the user persona narrating
-  // their own message; narration that invokes the user's name is the user
-  // persona acting. Both take the user voice instead of the narrator's.
-  const narrationSpeakerId = (narration: string): string | null => (
-    isUserMessage && (hasFirstPersonPronoun(narration) || invokesSpeakerName(narration, userAliases))
-      ? USER_SPEAKER_ID
-      : null
-  )
   const quotes = playbackQuotes(playbackContent)
   const paragraphs = playbackParagraphs(playbackContent)
   const openingBackfill = initialDialogueBackfill(paragraphs, speakers)
@@ -8318,11 +8306,10 @@ function parseRosterVoiceSegmentsInternal(
     }
     const bridge = playbackContent.slice(cursor, quote.start)
     const narration = cleanPlaybackText(bridge)
-    const bridgeSpeakerId = narrationSpeakerId(narration)
     if (narration) result.push({
       text: narration,
-      speakerId: bridgeSpeakerId,
-      ...(includeDebug ? { debugPath: ['segment-type:narration', bridgeSpeakerId ? 'routing:user-voice (first-person or user-name cue)' : 'routing:narrator-voice'] } : {}),
+      speakerId: null,
+      ...(includeDebug ? { debugPath: ['segment-type:narration', 'routing:narrator-voice'] } : {}),
     })
     const speech = cleanPlaybackText(quote.text)
     if (speech) {
@@ -8488,11 +8475,10 @@ function parseRosterVoiceSegmentsInternal(
     cursor = quote.end
   }
   const narration = cleanPlaybackText(playbackContent.slice(cursor))
-  const tailSpeakerId = narrationSpeakerId(narration)
   if (narration) result.push({
     text: narration,
-    speakerId: tailSpeakerId,
-    ...(includeDebug ? { debugPath: ['segment-type:narration', tailSpeakerId ? 'routing:user-voice (first-person or user-name cue)' : 'routing:narrator-voice'] } : {}),
+    speakerId: null,
+    ...(includeDebug ? { debugPath: ['segment-type:narration', 'routing:narrator-voice'] } : {}),
   })
   return result
 }
@@ -8504,7 +8490,6 @@ export function parseRosterVoiceSegments(
   skippedTrackerTagPairs = '',
   historicalSpeakerId: string | null = null,
   includeDebug = false,
-  isUserMessage = false,
 ): PlaybackSegment[] {
   return parseRosterVoiceSegmentsInternal(
     content,
@@ -8516,7 +8501,6 @@ export function parseRosterVoiceSegments(
     false,
     undefined,
     includeDebug,
-    isUserMessage,
   )
 }
 

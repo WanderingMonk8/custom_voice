@@ -5115,8 +5115,7 @@ function resolveSpeakerDecisionSegments(content, plan, answers, speakers, option
     speakers,
     options.skippedTrackerTagPairs ?? "",
     null,
-    true,
-    options.isUserMessage
+    true
   ).map((segment) => {
     if (!segment.debugPath?.some((step) => step.startsWith("segment-type:speech"))) {
       return options.includeDebug ? segment : { text: segment.text, speakerId: segment.speakerId };
@@ -5253,12 +5252,9 @@ function discourseSpeechDebug(input) {
   }
   return lines;
 }
-function parseRosterVoiceSegmentsInternal(content, defaultSpeakerId, speakers, skippedTrackerTagPairs = "", quoteSpeakerOverrides, historicalSpeakerId = null, preserveLocalOnNullOverride = false, lowConfidenceQuoteIndexes, includeDebug = false, isUserMessage = false) {
+function parseRosterVoiceSegmentsInternal(content, defaultSpeakerId, speakers, skippedTrackerTagPairs = "", quoteSpeakerOverrides, historicalSpeakerId = null, preserveLocalOnNullOverride = false, lowConfidenceQuoteIndexes, includeDebug = false) {
   const playbackContent = preparePlaybackContent(content, skippedTrackerTagPairs);
   const result = [];
-  const userSpeaker = speakers.find((speaker) => speaker.id === USER_SPEAKER_ID);
-  const userAliases = isUserMessage && userSpeaker ? speakerAliases(userSpeaker.name) : [];
-  const narrationSpeakerId = (narration2) => isUserMessage && (hasFirstPersonPronoun(narration2) || invokesSpeakerName(narration2, userAliases)) ? USER_SPEAKER_ID : null;
   const quotes = playbackQuotes(playbackContent);
   const paragraphs = playbackParagraphs(playbackContent);
   const openingBackfill = initialDialogueBackfill(paragraphs, speakers);
@@ -5284,11 +5280,10 @@ function parseRosterVoiceSegmentsInternal(content, defaultSpeakerId, speakers, s
     }
     const bridge = playbackContent.slice(cursor, quote.start);
     const narration2 = cleanPlaybackText(bridge);
-    const bridgeSpeakerId = narrationSpeakerId(narration2);
     if (narration2) result.push({
       text: narration2,
-      speakerId: bridgeSpeakerId,
-      ...includeDebug ? { debugPath: ["segment-type:narration", bridgeSpeakerId ? "routing:user-voice (first-person or user-name cue)" : "routing:narrator-voice"] } : {}
+      speakerId: null,
+      ...includeDebug ? { debugPath: ["segment-type:narration", "routing:narrator-voice"] } : {}
     });
     const speech = cleanPlaybackText(quote.text);
     if (speech) {
@@ -5373,15 +5368,14 @@ function parseRosterVoiceSegmentsInternal(content, defaultSpeakerId, speakers, s
     cursor = quote.end;
   }
   const narration = cleanPlaybackText(playbackContent.slice(cursor));
-  const tailSpeakerId = narrationSpeakerId(narration);
   if (narration) result.push({
     text: narration,
-    speakerId: tailSpeakerId,
-    ...includeDebug ? { debugPath: ["segment-type:narration", tailSpeakerId ? "routing:user-voice (first-person or user-name cue)" : "routing:narrator-voice"] } : {}
+    speakerId: null,
+    ...includeDebug ? { debugPath: ["segment-type:narration", "routing:narrator-voice"] } : {}
   });
   return result;
 }
-function parseRosterVoiceSegments(content, defaultSpeakerId, speakers, skippedTrackerTagPairs = "", historicalSpeakerId = null, includeDebug = false, isUserMessage = false) {
+function parseRosterVoiceSegments(content, defaultSpeakerId, speakers, skippedTrackerTagPairs = "", historicalSpeakerId = null, includeDebug = false) {
   return parseRosterVoiceSegmentsInternal(
     content,
     defaultSpeakerId,
@@ -5391,8 +5385,7 @@ function parseRosterVoiceSegments(content, defaultSpeakerId, speakers, skippedTr
     historicalSpeakerId,
     false,
     void 0,
-    includeDebug,
-    isUserMessage
+    includeDebug
   );
 }
 function applyConfigToMetadata(metadata, config) {

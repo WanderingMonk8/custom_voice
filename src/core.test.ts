@@ -334,11 +334,11 @@ test('best-available review includes the user persona as candidate in user messa
   assert.equal(assistantReview.questions.best_guess_s0.criteria[userOption], undefined)
 })
 
-test('first-person narration in a user message routes to the user voice', () => {
+test('first-person narration in a user message keeps the narrator voice', () => {
   const speakers = [{ id: 'ellis', name: 'Ellis' }, { id: USER_SPEAKER_ID, name: 'April' }]
   const content = '"April," I repeat. "That is before I came here." The rain fell.'
-  const userSegments = parseRosterVoiceSegments(content, null, speakers, '', null, false, true)
-  assert.equal(userSegments.find(segment => segment.text === 'I repeat.')?.speakerId, USER_SPEAKER_ID)
+  const userSegments = parseRosterVoiceSegments(content, null, speakers)
+  assert.equal(userSegments.find(segment => segment.text === 'I repeat.')?.speakerId, null)
   assert.equal(userSegments.find(segment => segment.text === 'The rain fell.')?.speakerId, null)
   const assistantSegments = parseRosterVoiceSegments(content, null, speakers)
   assert.equal(assistantSegments.find(segment => segment.text === 'I repeat.')?.speakerId, null)
