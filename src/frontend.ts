@@ -1175,6 +1175,7 @@ export function setup(ctx: SpindleFrontendContext) {
     .chat-voice-community-copy small { display:block; color:var(--lumiverse-text-muted); }
     .chat-voice-community-stats { color:var(--lumiverse-text-muted); font-size:11px; white-space:nowrap; }
     .chat-voice-pool-row { display:grid; grid-template-columns:minmax(0, 1fr) auto; gap:8px; align-items:center; }
+    .chat-voice-pool-refresh-row { display:flex; align-items:center; flex-wrap:wrap; gap:8px; }
     .chat-voice-pool-row select {
       min-width:0; min-height:36px; padding:7px 9px; border:1px solid var(--lumiverse-border);
       border-radius:var(--lumiverse-radius); background:var(--lumiverse-bg-secondary, #222); color:var(--lumiverse-text); font:inherit; font-size:12px;
@@ -1508,10 +1509,9 @@ export function setup(ctx: SpindleFrontendContext) {
   const autoCastingText = document.createElement('span')
   autoCastingText.textContent = 'Automatically cast voices'
   autoCastingLabel.append(autoCastingToggle, autoCastingText)
-  const autoVoicePoolRow = document.createElement('label')
-  autoVoicePoolRow.className = 'chat-voice-toggle'
-  const autoVoicePoolCopy = document.createElement('span')
-  autoVoicePoolCopy.className = 'chat-voice-toggle-copy'
+  const autoVoicePoolField = createField('Auto-cast voice pool')
+  const autoVoicePoolText = document.createElement('span')
+  autoVoicePoolText.textContent = 'Auto-cast voice pool'
   const autoVoicePoolSelect = document.createElement('select')
   autoVoicePoolSelect.className = 'chat-voice-favorite-select'
   autoVoicePoolSelect.setAttribute('aria-label', 'Auto-cast voice pool')
@@ -1521,12 +1521,12 @@ export function setup(ctx: SpindleFrontendContext) {
     option.textContent = label
     autoVoicePoolSelect.appendChild(option)
   }
-  const autoVoicePoolText = document.createElement('span')
-  autoVoicePoolText.textContent = 'Auto-cast voice pool'
   const autoVoicePoolHint = document.createElement('span')
-  autoVoicePoolHint.className = 'chat-voice-toggle-hint'
+  autoVoicePoolHint.className = 'chat-voice-hint'
   autoVoicePoolHint.textContent = 'Choose Favorites or the cached Fish community snapshot when auto-casting. The Community tab is available with Fish vocal tags; this pool only samples snapshot voices.'
-  autoVoicePoolCopy.append(autoVoicePoolText, autoVoicePoolSelect, autoVoicePoolHint)
+  autoVoicePoolField.slot.append(autoVoicePoolSelect, autoVoicePoolHint)
+  const autoVoicePoolActions = document.createElement('div')
+  autoVoicePoolActions.className = 'chat-voice-pool-refresh-row'
   const autoVoicePoolRefresh = document.createElement('button')
   autoVoicePoolRefresh.type = 'button'
   autoVoicePoolRefresh.className = 'chat-voice-add-button'
@@ -1534,7 +1534,7 @@ export function setup(ctx: SpindleFrontendContext) {
   const communityPoolStatus = document.createElement('span')
   communityPoolStatus.className = 'chat-voice-hint'
   communityPoolStatus.textContent = ''
-  autoVoicePoolRow.append(autoVoicePoolCopy, autoVoicePoolRefresh, communityPoolStatus)
+  autoVoicePoolActions.append(autoVoicePoolRefresh, communityPoolStatus)
   const autoPlaybackLabel = document.createElement('label')
   autoPlaybackLabel.className = 'chat-voice-toggle'
   const autoPlaybackToggle = document.createElement('input')
@@ -1600,7 +1600,8 @@ export function setup(ctx: SpindleFrontendContext) {
     ghostLifetimeField.field,
     speakerLookbackField.field,
     autoCastingLabel,
-    autoVoicePoolRow,
+    autoVoicePoolField.field,
+    autoVoicePoolActions,
     autoPlaybackLabel,
     autoPlaybackDelayField.field,
     skipNarrationLabel,
@@ -4505,7 +4506,8 @@ export function setup(ctx: SpindleFrontendContext) {
 
   function updatePoolControls(): void {
     const fish = communityIsAvailable()
-    autoVoicePoolRow.hidden = !fish
+    autoVoicePoolField.field.hidden = !fish
+    autoVoicePoolActions.hidden = !fish
     autoVoicePoolSelect.disabled = !autoCastingToggle.checked || !fish
     autoVoicePoolRefresh.disabled = !fish || !fishApiKey || communityLoading
     refreshPoolStatus()
