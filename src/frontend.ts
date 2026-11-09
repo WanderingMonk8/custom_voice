@@ -1196,6 +1196,7 @@ export function setup(ctx: SpindleFrontendContext) {
     .chat-voice-pool-language-row { display:grid; grid-template-columns:auto minmax(0, 1fr); gap:8px; align-items:center; }
     .chat-voice-pool-language-row .chat-voice-toggle-hint { grid-column: 1 / -1; }
     .chat-voice-filter-panel { display:flex; flex-direction:column; gap:10px; }
+    .chat-voice-filter-panel[hidden] { display:none; }
     .chat-voice-filter-group { display:flex; flex-direction:column; gap:6px; }
     .chat-voice-filter-title { color:var(--lumiverse-text-muted); font-size:11px; font-weight:700; letter-spacing:.04em; text-transform:uppercase; }
     .chat-voice-filter-chips { display:flex; flex-wrap:wrap; gap:6px; }
