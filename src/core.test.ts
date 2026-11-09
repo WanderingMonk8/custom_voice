@@ -2088,6 +2088,11 @@ test('narrationFirstPronounClass reads a single-gender pronoun chain but refuses
   assert.equal(backwardNarrationPronounGender([nar('Then he walked over to the table.'), speech('“I am fine.”')], 1), 'male')
   assert.equal(backwardNarrationPronounGender([nar('He sat down.'), nar('Another man came into the room.'), speech('“I am fine.”')], 2), null)
   assert.equal(backwardNarrationPronounGender([nar('Wren knelt by the table.'), nar('Then he looked up.'), speech('“I am fine.”')], 2), 'male')
+  // A cast speaker's paragraph never anchors an uncast chain, even when it
+  // starts with that speaker's pronoun: the backward scan skips it and so
+  // keeps looking for the introduced person's own chain.
+  const castSegments = [nar('Then he walked over to the table.'), { text: '“Of course not.” Wren said from the floor.', speakerId: 'npc:wren' }, nar('Wren said from the floor.'), speech('“Then I sat.”')]
+  assert.equal(backwardNarrationPronounGender(castSegments, 3), 'male')
   assert.equal(backwardNarrationPronounGender([nar('Then she stood up.'), nar('She laughed once.'), speech('“I am fine.”')], 2), 'female')
   assert.equal(backwardNarrationPronounGender([nar('Then he walked to the door.'), nar('She never turned around.'), speech('“I am fine.”')], 2), 'female')
   assert.equal(backwardNarrationPronounGender([nar('The fire was low.'), speech('“I am fine.”')], 1), null)

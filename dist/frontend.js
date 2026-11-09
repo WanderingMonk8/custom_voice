@@ -309,10 +309,25 @@ function narrationFirstPronounClass(text) {
   return null;
 }
 function backwardNarrationPronounGender(segments, fromIndex) {
+  const castNames = /* @__PURE__ */ new Set();
+  for (const segment of segments) {
+    const id = segment.speakerId;
+    if (id?.startsWith("npc:") || id?.startsWith("unconfigured:")) {
+      const name = id.slice(id.indexOf(":") + 1).trim().toLowerCase();
+      if (name) castNames.add(name);
+    }
+  }
+  const mentionsCastCharacter = (text) => {
+    if (!castNames.size) return false;
+    const words = new Set(text.toLowerCase().replace(/[^a-z'-]+/gu, " ").split(/\s+/u).filter(Boolean));
+    for (const name of castNames) if (words.has(name)) return true;
+    return false;
+  };
   for (let index = fromIndex - 1; index >= 0; index -= 1) {
     const segment = segments[index];
     if (!segment || segment.speakerId !== null) continue;
     const text = segment.text;
+    if (mentionsCastCharacter(text)) continue;
     if (/(^|[.!?]\s+)(another|second|third|other)\s+(man|woman|girl|boy|lady|guy)\b/iu.test(text)) return null;
     const introduction = text.match(/(?:^|[.!?]\s+)(?:a|an|the|one)\s+(man|woman|girl|boy|lady|guy)(?:\s+\w+){0,2}?\s+(?:came|entered|arrived|appeared|walked in|stepped in|strode in|drew close)\b/iu);
     if (introduction) return labelGenderHint(`the ${introduction[1]}`);

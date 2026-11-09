@@ -291,10 +291,27 @@ export function narrationFirstPronounClass(text: string): 'male' | 'female' | nu
  * came…") or a contrary pronoun. Speech does not count.
  */
 export function backwardNarrationPronounGender(segments: PlaybackSegment[], fromIndex: number): 'male' | 'female' | null {
+  const castNames = new Set<string>()
+  for (const segment of segments) {
+    const id = segment.speakerId
+    if (id?.startsWith('npc:') || id?.startsWith('unconfigured:')) {
+      const name = id.slice(id.indexOf(':') + 1).trim().toLowerCase()
+      if (name) castNames.add(name)
+    }
+  }
+  const mentionsCastCharacter = (text: string): boolean => {
+    if (!castNames.size) return false
+    const words = new Set(text.toLowerCase().replace(/[^a-z'-]+/gu, ' ').split(/\s+/u).filter(Boolean))
+    for (const name of castNames) if (words.has(name)) return true
+    return false
+  }
   for (let index = fromIndex - 1; index >= 0; index -= 1) {
     const segment = segments[index]
     if (!segment || segment.speakerId !== null) continue
     const text = segment.text
+    // Narration that names a cast character describes that character, not
+    // an emerging uncast chain.
+    if (mentionsCastCharacter(text)) continue
     if (/(^|[.!?]\s+)(another|second|third|other)\s+(man|woman|girl|boy|lady|guy)\b/iu.test(text)) return null
     const introduction = text.match(/(?:^|[.!?]\s+)(?:a|an|the|one)\s+(man|woman|girl|boy|lady|guy)(?:\s+\w+){0,2}?\s+(?:came|entered|arrived|appeared|walked in|stepped in|strode in|drew close)\b/iu)
     if (introduction) return labelGenderHint(`the ${introduction[1]}`)
@@ -1033,7 +1050,8 @@ export function resolveUncastVoiceDecisions(
     // unknown gender, never overrules an established one. A pronoun chain
     // ("he", "she") left by the narration behind the fragments fills in next.
     const labelHint = labelGenderHint(ghost?.label || members.map(group => groupLabels.get(group.id)).find(Boolean) || '')
-    const gender = jevGender !== 'unknown' ? jevGender : labelHint || members.find(member => member.pronounGender)?.pronounGender || 'unknown'
+    const pronounHint = members.find(member => member.pronounGender && member.pronounPartners?.length)?.pronounGender
+    const gender = jevGender !== 'unknown' ? jevGender : labelHint || pronounHint || 'unknown'
     if (!ghost) {
       const matches = members.map(group => answers[`voice_${group.id}`]).filter((answer): answer is SpeakerDecisionChoice => !!answer)
       const eligible = voices.flatMap((voice, index) => {
