@@ -305,18 +305,26 @@ export function backwardNarrationPronounGender(segments: PlaybackSegment[], from
     for (const name of castNames) if (words.has(name)) return true
     return false
   }
+  // Walk narration the same way a reader would: the paragraph nearest to
+  // the speech decides its pronoun gender. One multi-paragraph narration
+  // segment can introduce a man and later describe a cast speaker, so
+  // classify paragraph by paragraph rather than segment by segment.
   for (let index = fromIndex - 1; index >= 0; index -= 1) {
     const segment = segments[index]
     if (!segment || segment.speakerId !== null) continue
-    const text = segment.text
-    // Narration that names a cast character describes that character, not
-    // an emerging uncast chain.
-    if (mentionsCastCharacter(text)) continue
-    if (/(^|[.!?]\s+)(another|second|third|other)\s+(man|woman|girl|boy|lady|guy)\b/iu.test(text)) return null
-    const introduction = text.match(/(?:^|[.!?]\s+)(?:a|an|the|one)\s+(man|woman|girl|boy|lady|guy)(?:\s+\w+){0,2}?\s+(?:came|entered|arrived|appeared|walked in|stepped in|strode in|drew close)\b/iu)
-    if (introduction) return labelGenderHint(`the ${introduction[1]}`)
-    const klass = narrationFirstPronounClass(text)
-    if (klass) return klass
+    const paragraphs = segment.text.split(/\n\s*\n/u).filter(paragraph => paragraph.trim())
+    for (let paragraphIndex = paragraphs.length - 1; paragraphIndex >= 0; paragraphIndex -= 1) {
+      const text = paragraphs[paragraphIndex]
+      // A paragraph that names a cast character describes that character,
+      // not an emerging uncast chain; other paragraphs in the same segment
+      // can still anchor the uncast chain.
+      if (mentionsCastCharacter(text)) continue
+      if (/(^|[.!?]\s+)(another|second|third|other)\s+(man|woman|girl|boy|lady|guy)\b/iu.test(text)) return null
+      const introduction = text.match(/(?:^|[.!?]\s+)(?:a|an|the|one)\s+(man|woman|girl|boy|lady|guy)(?:\s+\w+){0,2}?\s+(?:came|entered|arrived|appeared|walked in|stepped in|strode in|drew close)\b/iu)
+      if (introduction) return labelGenderHint(`the ${introduction[1]}`)
+      const klass = narrationFirstPronounClass(text)
+      if (klass) return klass
+    }
   }
   return null
 }

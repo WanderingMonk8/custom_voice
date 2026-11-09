@@ -2138,6 +2138,37 @@ test('a pronoun chain links fragments of one introduced man to a single voice', 
   ])
 })
 
+test('a pronoun chain inside one multi-paragraph narration links the man to a single voice', () => {
+  // One narration segment runs through Wren's paragraph, the man's
+  // introduction, and more Wren prose. The chain must find the man's
+  // paragraph even though the same segment names a cast speaker, so all
+  // three uncast fragments anchor male and share one voice.
+  const mega = 'She went back at it with her eyes up and her hand cupped and no more discussion about it, and the wet drag of it carried through the room.'
+    + '\n\nThe doors swung and a man came in with a jacket over his arm — thirties, tired around the eyes, a badge on his belt —'
+    + '\n\nThen he walked over to the table without being asked, and picked up the pen off the clipboard, and signed.'
+    + '\n\nWren couldn\'t get up. She had a hand on his hip and her mouth full and she stayed exactly where she was, eyes up.'
+  const segments = [
+    { text: 'She pushed her glasses up with a knuckle.', speakerId: null },
+    { text: '"Okay. So. Fine." Wren said from the floor.', speakerId: 'npc:wren' },
+    { text: mega, speakerId: null },
+    { text: "I'm on till nine-thirty at the hospital. Nine's no good.", speakerId: UNCAST_SPEAKER_ID },
+    { text: 'Wren said, and her voice came out wrecked.', speakerId: null },
+    { text: 'Six-thirty. Union hall.', speakerId: 'npc:wren' },
+    { text: 'Yeah. I know.', speakerId: UNCAST_SPEAKER_ID },
+    { text: 'He looked at her a second, then at the poster.', speakerId: null },
+    { text: 'You want a napkin?', speakerId: UNCAST_SPEAKER_ID },
+    { text: "There's some by the forks.", speakerId: 'npc:wren' },
+    { text: "He brought her a stack of them, three, and set them on the table's edge, and said,", speakerId: null },
+    { text: 'Good luck with it.', speakerId: UNCAST_SPEAKER_ID },
+  ]
+  const groups = collectUncastVoiceGroups(segments)
+  assert.deepEqual(groups.map(group => [group.id, group.segmentIndexes, group.pronounPartners ?? [], group.pronounGender ?? null]), [
+    ['g0', [3], ['g1'], 'male'],
+    ['g1', [6, 8], ['g0', 'g2'], 'male'],
+    ['g2', [11], ['g1'], 'male'],
+  ])
+})
+
 test('a gendered label picks a gender-matched voice when Jev leaves the gender unknown', () => {
   const message = 'The girl turns toward the stairs. "I see it."'
   const groups = collectUncastVoiceGroups([{ text: 'I see it.', speakerId: UNCAST_SPEAKER_ID }])

@@ -326,13 +326,16 @@ function backwardNarrationPronounGender(segments, fromIndex) {
   for (let index = fromIndex - 1; index >= 0; index -= 1) {
     const segment = segments[index];
     if (!segment || segment.speakerId !== null) continue;
-    const text = segment.text;
-    if (mentionsCastCharacter(text)) continue;
-    if (/(^|[.!?]\s+)(another|second|third|other)\s+(man|woman|girl|boy|lady|guy)\b/iu.test(text)) return null;
-    const introduction = text.match(/(?:^|[.!?]\s+)(?:a|an|the|one)\s+(man|woman|girl|boy|lady|guy)(?:\s+\w+){0,2}?\s+(?:came|entered|arrived|appeared|walked in|stepped in|strode in|drew close)\b/iu);
-    if (introduction) return labelGenderHint(`the ${introduction[1]}`);
-    const klass = narrationFirstPronounClass(text);
-    if (klass) return klass;
+    const paragraphs = segment.text.split(/\n\s*\n/u).filter((paragraph) => paragraph.trim());
+    for (let paragraphIndex = paragraphs.length - 1; paragraphIndex >= 0; paragraphIndex -= 1) {
+      const text = paragraphs[paragraphIndex];
+      if (mentionsCastCharacter(text)) continue;
+      if (/(^|[.!?]\s+)(another|second|third|other)\s+(man|woman|girl|boy|lady|guy)\b/iu.test(text)) return null;
+      const introduction = text.match(/(?:^|[.!?]\s+)(?:a|an|the|one)\s+(man|woman|girl|boy|lady|guy)(?:\s+\w+){0,2}?\s+(?:came|entered|arrived|appeared|walked in|stepped in|strode in|drew close)\b/iu);
+      if (introduction) return labelGenderHint(`the ${introduction[1]}`);
+      const klass = narrationFirstPronounClass(text);
+      if (klass) return klass;
+    }
   }
   return null;
 }
