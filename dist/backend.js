@@ -6640,17 +6640,29 @@ async function fetchCommunityModels(fishApiKey, request) {
     ]);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error ?? "");
-    if (/401|403/.test(message)) throw new Error("Fish Audio rejected the API key. Check the key in the Community tab.");
-    if (/429/.test(message)) throw new Error("Fish Audio rate limited the catalog request. Wait a moment and retry.");
     throw new Error(message || "The Fish Audio catalog could not be reached.");
   }
-  const payload = typeof response === "string" ? (() => {
-    try {
-      return JSON.parse(response);
-    } catch {
-      return null;
+  let payload = response;
+  let httpStatus = null;
+  if (response && typeof response === "object" && !Array.isArray(response)) {
+    const envelope = response;
+    if (typeof envelope.status === "number") {
+      httpStatus = envelope.status;
+      payload = "body" in envelope ? envelope.body : response;
     }
-  })() : response;
+  }
+  if (typeof payload === "string") {
+    try {
+      payload = JSON.parse(payload);
+    } catch {
+    }
+  }
+  if (httpStatus !== null && httpStatus >= 400) {
+    const reason = typeof payload === "object" && payload !== null && typeof payload.message === "string" ? payload.message : typeof payload === "string" ? payload : "";
+    if (httpStatus === 401 || httpStatus === 403) throw new Error(`Fish Audio rejected the API key (${httpStatus}). Check the key in the Community tab.${reason ? ` Details: ${reason.slice(0, 160)}` : ""}`);
+    if (httpStatus === 429) throw new Error("Fish Audio rate limited the catalog request. Wait a moment and retry.");
+    throw new Error(`Fish Audio catalog request failed (${httpStatus}).${reason ? ` Details: ${reason.slice(0, 160)}` : ""}`);
+  }
   const parsed = readCommunityVoiceList(payload);
   if (!parsed) {
     const shape = communityPayloadShape(payload);

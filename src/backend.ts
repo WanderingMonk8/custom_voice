@@ -1800,11 +1800,31 @@ async function fetchCommunityModels(fishApiKey: string, request: CommunityModelR
     ])
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error ?? '')
-    if (/401|403/.test(message)) throw new Error('Fish Audio rejected the API key. Check the key in the Community tab.')
-    if (/429/.test(message)) throw new Error('Fish Audio rate limited the catalog request. Wait a moment and retry.')
     throw new Error(message || 'The Fish Audio catalog could not be reached.')
   }
-  const payload = typeof response === 'string' ? (() => { try { return JSON.parse(response) } catch { return null } })() : response
+  // The proxy resolves with a response envelope ({ status, body }) for HTTP
+  // responses; the raw Fish JSON lives in its body as text or parsed JSON.
+  let payload: unknown = response
+  let httpStatus: number | null = null
+  if (response && typeof response === 'object' && !Array.isArray(response)) {
+    const envelope = response as Record<string, unknown>
+    if (typeof envelope.status === 'number') {
+      httpStatus = envelope.status
+      payload = 'body' in envelope ? envelope.body : response
+    }
+  }
+  if (typeof payload === 'string') {
+    try { payload = JSON.parse(payload) } catch { /* keep the raw text for the shape diagnostic */ }
+  }
+  if (httpStatus !== null && httpStatus >= 400) {
+    const reason = typeof payload === 'object' && payload !== null
+      && typeof (payload as Record<string, unknown>).message === 'string'
+      ? (payload as Record<string, unknown>).message as string
+      : typeof payload === 'string' ? payload : ''
+    if (httpStatus === 401 || httpStatus === 403) throw new Error(`Fish Audio rejected the API key (${httpStatus}). Check the key in the Community tab.${reason ? ` Details: ${reason.slice(0, 160)}` : ''}`)
+    if (httpStatus === 429) throw new Error('Fish Audio rate limited the catalog request. Wait a moment and retry.')
+    throw new Error(`Fish Audio catalog request failed (${httpStatus}).${reason ? ` Details: ${reason.slice(0, 160)}` : ''}`)
+  }
   const parsed = readCommunityVoiceList(payload)
   if (!parsed) {
     const shape = communityPayloadShape(payload)
