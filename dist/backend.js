@@ -436,7 +436,8 @@ function resolveUncastVoiceDecisions(groups, voices, answers, ghosts = [], reser
       const review = answers[`review_same_${group.id}_${previous.id}`];
       const answer = review && strongChoice(review) ? review : answers[`same_${group.id}_${previous.id}`];
       const boosted = answer?.choice === "same" && answer.confidence >= 0.6 && (answer.probabilities.same ?? 0) >= 0.8 && !!group.flankPartners?.includes(previous.id);
-      return answer?.choice === "same" && strongChoice(answer) || boosted ? [{ previous, probability: answer?.probabilities.same ?? 0 }] : [];
+      const pronounLinked = answer?.choice === "same" && answer.confidence >= 0.3 && (answer.probabilities.same ?? 0) >= 0.6 && !!group.pronounPartners?.includes(previous.id);
+      return answer?.choice === "same" && strongChoice(answer) || boosted || pronounLinked ? [{ previous, probability: answer?.probabilities.same ?? 0 }] : [];
     }).sort((a, b) => b.probability - a.probability);
     const narratedPartner = previousGroups.find((previous) => narrationBoostsPair(group, previous));
     if (same[0]) root = roots.get(same[0].previous.id) ?? root;
@@ -549,7 +550,7 @@ function resolveUncastVoiceDecisions(groups, voices, answers, ghosts = [], reser
     const jevGender = genders.size === 1 ? genderVotes[0].choice : "unknown";
     let ghost = linkedGhosts.get(root);
     const labelHint = labelGenderHint(ghost?.label || members.map((group) => groupLabels.get(group.id)).find(Boolean) || "");
-    const gender = jevGender !== "unknown" ? jevGender : labelHint ?? "unknown";
+    const gender = jevGender !== "unknown" ? jevGender : labelHint || members.find((member) => member.pronounGender)?.pronounGender || "unknown";
     if (!ghost) {
       const matches = members.map((group) => answers[`voice_${group.id}`]).filter((answer) => !!answer);
       const eligible = voices.flatMap((voice, index) => {

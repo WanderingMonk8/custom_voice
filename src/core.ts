@@ -149,7 +149,7 @@ export function addFavoriteVoice(existing: FavoriteVoice[], voice: FavoriteVoice
   return [...existing, { ...voice, id }]
 }
 
-export interface UncastVoiceGroup { id: string; speakerId: string; segmentIndexes: number[]; speeches: string[]; context: string[]; addressee?: string; flankPartners?: string[]; narratedName?: string; inferredName?: string }
+export interface UncastVoiceGroup { id: string; speakerId: string; segmentIndexes: number[]; speeches: string[]; context: string[]; addressee?: string; flankPartners?: string[]; pronounPartners?: string[]; pronounGender?: 'male' | 'female'; narratedName?: string; inferredName?: string }
 export interface GhostOccurrenceEvidence { messageId: string; messageHash: string; speechHash: string; version: 'occurrence-1'; reason: string }
 export interface GhostVoice { id: string; speakerId: string; voiceId: string; context: string; occurrenceKeys: string[]; lastSeenMessageId: string; label?: string; createdAtMessageId?: string; lastInvokedAtMessageId?: string; invokedMessageIds?: string[]; aliases?: string[]; conversationHistory?: Array<{ messageId: string; text: string }>; occurrenceEvidence?: GhostOccurrenceEvidence[] }
 export const GHOST_VOICE_LIFETIME_MESSAGES = 10
@@ -270,6 +270,40 @@ function hasStrongNarrativeName(text: string): boolean {
   }
   return false
 }
+const STORY_NARRATION_SKIP_STARTERS = new Set(['then', 'so', 'and', 'but', 'still', 'yet', 'meanwhile', 'now', 'anyway'])
+const STORY_MALE_PRONOUNS = new Set(['he', 'him', 'hisself', 'himself', 'his'])
+const STORY_FEMALE_PRONOUNS = new Set(['she', 'her', 'herself', 'hers'])
+/** Gender of a narration paragraph's first-subject pronoun; named or neutral starts carry none. */
+export function narrationFirstPronounClass(text: string): 'male' | 'female' | null {
+  const tokens = text.toLowerCase().replace(/[^a-z'-]+/gu, ' ').split(/\s+/u).filter(Boolean)
+  let head = tokens[0]
+  if (!head) return null
+  if (STORY_NARRATION_SKIP_STARTERS.has(head)) head = tokens[1] ?? ''
+  if (STORY_MALE_PRONOUNS.has(head)) return 'male'
+  if (STORY_FEMALE_PRONOUNS.has(head)) return 'female'
+  return null
+}
+/**
+ * The gendered pronoun class a group's first speech inherits from the
+ * narration before it: the nearest class-bearing paragraph ("…then he
+ * walked…"), a character introduction ("a man came in…"), or nothing when
+ * the chain is interrupted by an explicit new character ("another man
+ * came…") or a contrary pronoun. Speech does not count.
+ */
+export function backwardNarrationPronounGender(segments: PlaybackSegment[], fromIndex: number): 'male' | 'female' | null {
+  for (let index = fromIndex - 1; index >= 0; index -= 1) {
+    const segment = segments[index]
+    if (!segment || segment.speakerId !== null) continue
+    const text = segment.text
+    if (/(^|[.!?]\s+)(another|second|third|other)\s+(man|woman|girl|boy|lady|guy)\b/iu.test(text)) return null
+    const introduction = text.match(/(?:^|[.!?]\s+)(?:a|an|the|one)\s+(man|woman|girl|boy|lady|guy)(?:\s+\w+){0,2}?\s+(?:came|entered|arrived|appeared|walked in|stepped in|strode in|drew close)\b/iu)
+    if (introduction) return labelGenderHint(`the ${introduction[1]}`)
+    const klass = narrationFirstPronounClass(text)
+    if (klass) return klass
+  }
+  return null
+}
+
 export function collectUncastVoiceGroups(segments: PlaybackSegment[]): UncastVoiceGroup[] {
   const groups: UncastVoiceGroup[] = []
   const named = new Map<string, UncastVoiceGroup>()
@@ -348,6 +382,29 @@ export function collectUncastVoiceGroups(segments: PlaybackSegment[]): UncastVoi
       after.flankPartners = [...(after.flankPartners ?? []), before.id]
       before.flankPartners = [...(before.flankPartners ?? []), after.id]
     }
+  }
+  // Pronoun-continuity partners: consecutive unnamed fragments whose first
+  // speeches inherit the same gendered pronoun chain from the narration
+  // before them ("…then he walked…", "…then she stood…") are the same
+  // introduced character even when Jev only leans 'same'.
+  const unnamedInOrder = groups
+    .filter(group => group.speakerId === UNCAST_SPEAKER_ID)
+    .sort((a, b) => Math.min(...a.segmentIndexes) - Math.min(...b.segmentIndexes))
+  for (const group of unnamedInOrder) {
+    group.pronounGender = backwardNarrationPronounGender(segments, Math.min(...group.segmentIndexes)) ?? undefined
+  }
+  for (let index = 1; index < unnamedInOrder.length; index += 1) {
+    const previous = unnamedInOrder[index - 1]
+    const group = unnamedInOrder[index]
+    const gender = group.pronounGender
+    if (!gender || gender !== previous.pronounGender) {
+      // A fragment that does not join the chain keeps no pronoun credit:
+      // its narration may describe somebody else (e.g. a cast speaker).
+      group.pronounGender = undefined
+      continue
+    }
+    previous.pronounPartners = [...(previous.pronounPartners ?? []), group.id]
+    group.pronounPartners = [...(group.pronounPartners ?? []), previous.id]
   }
   // Mutual naming: two unnamed voices that each invoke a distinct name for
   // the other are those names, even when the message holds more voices than
@@ -860,7 +917,11 @@ export function resolveUncastVoiceDecisions(
       const review = answers[`review_same_${group.id}_${previous.id}`]
       const answer = review && strongChoice(review) ? review : answers[`same_${group.id}_${previous.id}`]
       const boosted = answer?.choice === 'same' && answer.confidence >= 0.6 && (answer.probabilities.same ?? 0) >= 0.8 && !!group.flankPartners?.includes(previous.id)
-      return (answer?.choice === 'same' && strongChoice(answer)) || boosted ? [{ previous, probability: answer?.probabilities.same ?? 0 }] : []
+      // A pronoun-continuity chain ("…then he walked…", "…then she stood…")
+      // is a deterministic fact like a flank pair, so a lean of at least
+      // 0.6 same lets the pair share a voice even below Jev's thresholds.
+      const pronounLinked = answer?.choice === 'same' && answer.confidence >= 0.3 && (answer.probabilities.same ?? 0) >= 0.6 && !!group.pronounPartners?.includes(previous.id)
+      return (answer?.choice === 'same' && strongChoice(answer)) || boosted || pronounLinked ? [{ previous, probability: answer?.probabilities.same ?? 0 }] : []
     }).sort((a, b) => b.probability - a.probability)
     const narratedPartner = previousGroups.find(previous => narrationBoostsPair(group, previous))
     if (same[0]) root = roots.get(same[0].previous.id) ?? root
@@ -962,9 +1023,10 @@ export function resolveUncastVoiceDecisions(
     let ghost = linkedGhosts.get(root)
     // A gendered descriptive label ("the girl", "the lady", "the man") is
     // deterministic evidence Jev may have missed; it only fills in an
-    // unknown gender, never overrules an established one.
+    // unknown gender, never overrules an established one. A pronoun chain
+    // ("he", "she") left by the narration behind the fragments fills in next.
     const labelHint = labelGenderHint(ghost?.label || members.map(group => groupLabels.get(group.id)).find(Boolean) || '')
-    const gender = jevGender !== 'unknown' ? jevGender : labelHint ?? 'unknown'
+    const gender = jevGender !== 'unknown' ? jevGender : labelHint || members.find(member => member.pronounGender)?.pronounGender || 'unknown'
     if (!ghost) {
       const matches = members.map(group => answers[`voice_${group.id}`]).filter((answer): answer is SpeakerDecisionChoice => !!answer)
       const eligible = voices.flatMap((voice, index) => {

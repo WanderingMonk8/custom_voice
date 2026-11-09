@@ -296,6 +296,31 @@ function hasStrongNarrativeName(text) {
   }
   return false;
 }
+var STORY_NARRATION_SKIP_STARTERS = /* @__PURE__ */ new Set(["then", "so", "and", "but", "still", "yet", "meanwhile", "now", "anyway"]);
+var STORY_MALE_PRONOUNS = /* @__PURE__ */ new Set(["he", "him", "hisself", "himself", "his"]);
+var STORY_FEMALE_PRONOUNS = /* @__PURE__ */ new Set(["she", "her", "herself", "hers"]);
+function narrationFirstPronounClass(text) {
+  const tokens = text.toLowerCase().replace(/[^a-z'-]+/gu, " ").split(/\s+/u).filter(Boolean);
+  let head = tokens[0];
+  if (!head) return null;
+  if (STORY_NARRATION_SKIP_STARTERS.has(head)) head = tokens[1] ?? "";
+  if (STORY_MALE_PRONOUNS.has(head)) return "male";
+  if (STORY_FEMALE_PRONOUNS.has(head)) return "female";
+  return null;
+}
+function backwardNarrationPronounGender(segments, fromIndex) {
+  for (let index = fromIndex - 1; index >= 0; index -= 1) {
+    const segment = segments[index];
+    if (!segment || segment.speakerId !== null) continue;
+    const text = segment.text;
+    if (/(^|[.!?]\s+)(another|second|third|other)\s+(man|woman|girl|boy|lady|guy)\b/iu.test(text)) return null;
+    const introduction = text.match(/(?:^|[.!?]\s+)(?:a|an|the|one)\s+(man|woman|girl|boy|lady|guy)(?:\s+\w+){0,2}?\s+(?:came|entered|arrived|appeared|walked in|stepped in|strode in|drew close)\b/iu);
+    if (introduction) return labelGenderHint(`the ${introduction[1]}`);
+    const klass = narrationFirstPronounClass(text);
+    if (klass) return klass;
+  }
+  return null;
+}
 function collectUncastVoiceGroups(segments) {
   const groups = [];
   const named = /* @__PURE__ */ new Map();
@@ -374,6 +399,21 @@ function collectUncastVoiceGroups(segments) {
       after.flankPartners = [...after.flankPartners ?? [], before.id];
       before.flankPartners = [...before.flankPartners ?? [], after.id];
     }
+  }
+  const unnamedInOrder = groups.filter((group) => group.speakerId === UNCAST_SPEAKER_ID).sort((a, b) => Math.min(...a.segmentIndexes) - Math.min(...b.segmentIndexes));
+  for (const group of unnamedInOrder) {
+    group.pronounGender = backwardNarrationPronounGender(segments, Math.min(...group.segmentIndexes)) ?? void 0;
+  }
+  for (let index = 1; index < unnamedInOrder.length; index += 1) {
+    const previous = unnamedInOrder[index - 1];
+    const group = unnamedInOrder[index];
+    const gender = group.pronounGender;
+    if (!gender || gender !== previous.pronounGender) {
+      group.pronounGender = void 0;
+      continue;
+    }
+    previous.pronounPartners = [...previous.pronounPartners ?? [], group.id];
+    group.pronounPartners = [...group.pronounPartners ?? [], previous.id];
   }
   const unknownGroups = groups.filter((group) => group.speakerId === UNCAST_SPEAKER_ID);
   const invokedByGroup = new Map(unknownGroups.map((group) => [group.id, [...new Set(group.speeches.flatMap((speech) => vocativeNames(speech)))]]));
@@ -499,6 +539,18 @@ var LABEL_GENDER_TOKENS = new Map(
     ...["boy", "boys", "man", "men", "gentleman", "gentlemen", "male", "males", "father", "fathers", "dad", "dads", "brother", "brothers", "husband", "husbands", "son", "sons", "uncle", "uncles", "nephew", "nephews", "grandfather", "grandfathers", "grandpa", "grandpas", "groom", "grooms", "prince", "princes", "monk", "monks", "guy", "guys", "mr", "sir", "he", "him", "his", "himself"].map((token) => [token, "male"])
   ]
 );
+function labelGenderHint(label) {
+  const genders = /* @__PURE__ */ new Set();
+  for (const token of label.toLowerCase().replace(/[^a-z]+/gu, " ").split(/\s+/u)) {
+    if (!token) continue;
+    const gender = LABEL_GENDER_TOKENS.get(token);
+    if (gender) {
+      genders.add(gender);
+      if (genders.size > 1) return null;
+    }
+  }
+  return genders.size === 1 ? [...genders][0] : null;
+}
 function speakersForMessageRole(speakers, _isUserMessage, userName = "User") {
   const nonUserSpeakers = speakers.filter((speaker) => speaker.id !== USER_SPEAKER_ID);
   return [

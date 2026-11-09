@@ -10,6 +10,8 @@ import {
   groupLabelOptions,
   labelGenderHint,
   mutuallyInvoked,
+  narrationFirstPronounClass,
+  backwardNarrationPronounGender,
   narrationBoostsPair,
   vocativeNames,
   type PlaybackSegment,
@@ -2072,6 +2074,63 @@ test('labelGenderHint reads gendered nouns but refuses ambiguous labels', () => 
   assert.equal(labelGenderHint(''), null)
   assert.equal(labelGenderHint('the man and the girl'), null)
   assert.equal(labelGenderHint('the lady beside him'), null)
+})
+
+test('narrationFirstPronounClass reads a single-gender pronoun chain but refuses mixtures and explicit new characters', () => {
+  assert.equal(narrationFirstPronounClass('Then he walked over to the table.'), 'male')
+  assert.equal(narrationFirstPronounClass('A man came in with a jacket over his arm.'), null)
+  assert.equal(narrationFirstPronounClass('Then she stood up.'), 'female')
+  assert.equal(narrationFirstPronounClass('Wren knelt by the table.'), null)
+  assert.equal(narrationFirstPronounClass('The fire was low.'), null)
+  const nar = (text: string) => ({ text, speakerId: null })
+  const speech = (text: string) => ({ text, speakerId: UNCAST_SPEAKER_ID })
+  assert.equal(backwardNarrationPronounGender([nar('A man came in with a jacket over his arm.'), speech('“I am fine.”')], 1), 'male')
+  assert.equal(backwardNarrationPronounGender([nar('Then he walked over to the table.'), speech('“I am fine.”')], 1), 'male')
+  assert.equal(backwardNarrationPronounGender([nar('He sat down.'), nar('Another man came into the room.'), speech('“I am fine.”')], 2), null)
+  assert.equal(backwardNarrationPronounGender([nar('Wren knelt by the table.'), nar('Then he looked up.'), speech('“I am fine.”')], 2), 'male')
+  assert.equal(backwardNarrationPronounGender([nar('Then she stood up.'), nar('She laughed once.'), speech('“I am fine.”')], 2), 'female')
+  assert.equal(backwardNarrationPronounGender([nar('Then he walked to the door.'), nar('She never turned around.'), speech('“I am fine.”')], 2), 'female')
+  assert.equal(backwardNarrationPronounGender([nar('The fire was low.'), speech('“I am fine.”')], 1), null)
+})
+
+test('a pronoun chain links fragments of one introduced man to a single voice', () => {
+  const segments = [
+    { text: 'The doors swung and a man came in with a jacket over his arm, tired around the eyes.', speakerId: null },
+    { text: 'Then he walked over to the table and picked up the pen off the clipboard.', speakerId: null },
+    { text: "I'm on till nine-thirty at the hospital.", speakerId: UNCAST_SPEAKER_ID },
+    { text: 'Wren, still kneeling on the tile, nodded up at him.', speakerId: null },
+    { text: '"Or only if something changes." Wren said from the floor.', speakerId: 'wren' },
+    { text: 'Only if something changes.', speakerId: UNCAST_SPEAKER_ID },
+    { text: 'He looked at her a second, then put the pen back.', speakerId: null },
+    { text: 'Wren stared at her own hands and said nothing more.', speakerId: null },
+    { text: '"Then I stay." Wren said beside the press area.', speakerId: 'wren' },
+    { text: 'Good luck with it.', speakerId: UNCAST_SPEAKER_ID },
+  ]
+  const groups = collectUncastVoiceGroups(segments)
+  assert.deepEqual(groups.map(group => [group.id, group.segmentIndexes, group.pronounPartners ?? [], group.pronounGender ?? null]), [
+    ['g0', [2], ['g1'], 'male'],
+    ['g1', [5], ['g0', 'g2'], 'male'],
+    ['g2', [9], ['g1'], 'male'],
+  ])
+  const voices = readFavoriteVoices([
+    { id: 'female-voice', category: 'female', description: 'lullaby alto' },
+    { id: 'male-voice', category: 'male', description: 'baritone heater' },
+  ])
+  const result = resolveUncastVoiceDecisions(groups, voices, {
+    same_g1_g0: { choice: 'same', confidence: 0.36, probabilities: { same: 0.68, different_or_unclear: 0.32 } },
+    same_g2_g1: { choice: 'same', confidence: 0.52, probabilities: { same: 0.76, different_or_unclear: 0.24 } },
+    gender_g0: confidentDecision('unknown'),
+    gender_g1: confidentDecision('unknown'),
+    gender_g2: confidentDecision('unknown'),
+    voice_g0: { choice: 'voice_0', probabilities: { voice_0: 0.4, voice_1: 0.6 }, confidence: 0.5 },
+    voice_g1: { choice: 'voice_1', probabilities: { voice_0: 0.3, voice_1: 0.7 }, confidence: 0.5 },
+    voice_g2: { choice: 'voice_0', probabilities: { voice_0: 0.5, voice_1: 0.5 }, confidence: 0.5 },
+  }, [], [], '', '')
+  assert.deepEqual(result.map(item => [item.groupId, item.voiceId, item.gender]), [
+    ['g0', 'male-voice', 'male'],
+    ['g1', 'male-voice', 'male'],
+    ['g2', 'male-voice', 'male'],
+  ])
 })
 
 test('a gendered label picks a gender-matched voice when Jev leaves the gender unknown', () => {
