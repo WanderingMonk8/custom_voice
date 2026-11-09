@@ -1112,6 +1112,7 @@ export function setup(ctx: SpindleFrontendContext) {
       background:var(--lumiverse-bg-secondary, #222); color:var(--lumiverse-text); font:inherit; font-size:12px;
     }
     .chat-voice-favorite-span { grid-column: 1 / -1; }
+    .chat-voice-favorite-add { grid-column: 1 / -1; justify-self: center; min-width: 168px; min-height: 42px; padding: 10px 28px; font-size: 13px; }
     .chat-voice-favorite-row { display:flex; flex-wrap:wrap; align-items:center; gap:8px;
       padding:8px; border:1px solid var(--lumiverse-border); border-radius:var(--lumiverse-radius); }
     .chat-voice-favorite-edit { flex:1 0 100%; display:flex; flex-wrap:wrap; gap:6px; }
@@ -1688,7 +1689,7 @@ export function setup(ctx: SpindleFrontendContext) {
   })
   const favoriteAdd = document.createElement('button')
   favoriteAdd.type = 'button'
-  favoriteAdd.className = 'chat-voice-add-button'
+  favoriteAdd.className = 'chat-voice-add-button chat-voice-favorite-add'
   favoriteAdd.textContent = 'Add favorite'
   favoriteForm.append(favoriteName, favoriteId, favoriteDescription, favoriteMetaExpand, favoriteMetaPanel, favoriteAdd)
   const favoriteFilter = document.createElement('select')
