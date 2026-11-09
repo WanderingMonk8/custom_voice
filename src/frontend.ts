@@ -1177,6 +1177,13 @@ export function setup(ctx: SpindleFrontendContext) {
     .chat-voice-community-stats { color:var(--lumiverse-text-muted); font-size:11px; white-space:nowrap; }
     .chat-voice-pool-row { display:grid; grid-template-columns:minmax(0, 1fr) auto; gap:8px; align-items:center; }
     .chat-voice-pool-refresh-row { display:flex; align-items:center; flex-wrap:wrap; gap:8px; }
+    .chat-voice-filter-panel { display:flex; flex-direction:column; gap:10px; }
+    .chat-voice-filter-group { display:flex; flex-direction:column; gap:6px; }
+    .chat-voice-filter-title { color:var(--lumiverse-text-muted); font-size:11px; font-weight:700; letter-spacing:.04em; text-transform:uppercase; }
+    .chat-voice-filter-chips { display:flex; flex-wrap:wrap; gap:6px; }
+    .chat-voice-filter-chip { border-radius:999px !important; font-size:11px !important; }
+    .chat-voice-filter-chip[aria-pressed="true"] { background:var(--lumiverse-accent, #7a68f4); color:#fff; }
+    .chat-voice-expand-more { border:0; background:transparent; color:var(--lumiverse-text-muted); font:inherit; font-size:11px; cursor:pointer; align-self:flex-start; }
     .chat-voice-community-pager { display:flex; align-items:center; gap:8px; }
     .chat-voice-community-pager .chat-voice-add-button { min-width:48px; }
     @media (max-width: 560px) {
@@ -1404,7 +1411,7 @@ export function setup(ctx: SpindleFrontendContext) {
   }
   const communityLanguage = document.createElement('select')
   communityLanguage.setAttribute('aria-label', 'Community voice language')
-  for (const [value, label] of [['', 'Any language'], ['en', 'English'], ['ja', 'Japanese'], ['zh', 'Chinese'], ['es', 'Spanish'], ['fr', 'French'], ['de', 'German'], ['ko', 'Korean'], ['pt', 'Portuguese'], ['ru', 'Russian'], ['it', 'Italian'], ['ar', 'Arabic'], ['hi', 'Hindi'], ['nl', 'Dutch'], ['pl', 'Polish'], ['tr', 'Turkish'], ['vi', 'Vietnamese'], ['th', 'Thai'], ['id', 'Indonesian']] as const) {
+  for (const [value, label] of [['', 'Any language'], ['en', '🇺🇸 English'], ['es', '🇪🇸 Spanish'], ['ar', '🇸🇦 Arabic'], ['ru', '🇷🇺 Russian'], ['ja', '🇯🇵 Japanese'], ['pt', '🇧🇷 Portuguese'], ['zh', '🇨🇳 Chinese'], ['fr', '🇫🇷 French'], ['it', '🇮🇹 Italian']] as const) {
     const option = document.createElement('option')
     option.value = value
     option.textContent = label
@@ -1426,8 +1433,129 @@ export function setup(ctx: SpindleFrontendContext) {
   const communityPager = document.createElement('div')
   communityPager.className = 'chat-voice-community-pager'
   communityPager.append(communityPrev, communityPageLabel, communityNext)
-  communitySubtoolbar.append(communityTags, communityGender, communityLanguage)
-  communitySection.append(communityToolbar, communitySubtoolbar, communityPager)
+  const communityFilterPanel = document.createElement('div')
+  communityFilterPanel.className = 'chat-voice-filter-panel'
+  const communityLanguagesSection = document.createElement('div')
+  communityLanguagesSection.className = 'chat-voice-filter-group'
+  const communityLanguagesTitle = document.createElement('div')
+  communityLanguagesTitle.className = 'chat-voice-filter-title'
+  communityLanguagesTitle.textContent = 'Languages'
+  const communityLanguagesHint = document.createElement('div')
+  communityLanguagesHint.className = 'chat-voice-hint'
+  communityLanguagesHint.textContent = 'Models must match the selected language.'
+  const communityLanguage = document.createElement('select')
+  communityLanguage.setAttribute('aria-label', 'Community voice language')
+  for (const [value, label] of [['', 'Any language'], ['en', '🇺🇸 English'], ['es', '🇪🇸 Spanish'], ['ar', '🇸🇦 Arabic'], ['ru', '🇷🇺 Russian'], ['ja', '🇯🇵 Japanese'], ['pt', '🇧🇷 Portuguese'], ['zh', '🇨🇳 Chinese'], ['fr', '🇫🇷 French'], ['it', '🇮🇹 Italian']] as const) {
+    const option = document.createElement('option')
+    option.value = value
+    option.textContent = label
+    communityLanguage.appendChild(option)
+  }
+  communityLanguagesSection.append(communityLanguagesTitle, communityLanguagesHint, communityLanguage)
+  const communityFilterTags = document.createElement('div')
+  communityFilterTags.className = 'chat-voice-filter-group'
+  const communityFilterTagsTitle = document.createElement('div')
+  communityFilterTagsTitle.className = 'chat-voice-filter-title'
+  communityFilterTagsTitle.textContent = 'Tags'
+  communityTags.placeholder = 'Tags (comma-separated)'
+  communityTags.setAttribute('aria-label', 'Community voice tags')
+  communityFilterTags.append(communityFilterTagsTitle, communityTags)
+  const communityFilterGroups: Array<{ title?: string; tags: Array<[string, string]>; exclusive?: boolean }> = [    { title: 'Gender', tags: [['male', 'Male'], ['female', 'Female']], exclusive: true },
+    { title: 'Age', tags: [['young', 'Young'], ['middle aged', 'Middle Aged'], ['old', 'Old']], exclusive: true },
+    { title: 'Use Case', tags: [['conversational', 'Conversational'], ['narration', 'Narration'], ['character voice', 'Character Voice'], ['social media', 'Social Media'], ['educational', 'Educational'], ['advertisement', 'Advertisement'], ['entertainment', 'Entertainment']] },
+    { title: 'Voice Qualities', tags: [['deep', 'Deep'], ['low', 'Low'], ['medium', 'Medium'], ['high', 'High'], ['soft', 'Soft'], ['bright', 'Bright']] },
+  ]
+  const communityFilterQualityExtended: Array<[string, string]> = [
+    ['warm', 'Warm'], ['dark', 'Dark'], ['raspy', 'Raspy'], ['smooth', 'Smooth'], ['breathy', 'Breathy'], ['husky', 'Husky'],
+    ['energetic', 'Energetic'], ['calm', 'Calm'], ['relaxed', 'Relaxed'], ['fast', 'Fast'], ['slow', 'Slow'], ['measured', 'Measured'],
+    ['dynamic', 'Dynamic'], ['sexy', 'Sexy'], ['friendly', 'Friendly'], ['professional', 'Professional'], ['serious', 'Serious'],
+    ['cheerful', 'Cheerful'], ['enthusiastic', 'Enthusiastic'], ['confident', 'Confident'], ['authoritative', 'Authoritative'], ['gentle', 'Gentle'],
+    ['empathetic', 'Empathetic'], ['playful', 'Playful'], ['dramatic', 'Dramatic'], ['intimate', 'Intimate'], ['mysterious', 'Mysterious'],
+    ['sad', 'Sad'], ['angry', 'Angry'], ['clear', 'Clear'], ['crisp', 'Crisp'], ['neutral tone', 'Neutral Tone'],
+    ['expressive', 'Expressive'], ['monotone', 'Monotone'], ['animated', 'Animated'], ['storytelling', 'Storytelling'], ['narrative', 'Narrative'],
+    ['character', 'Character'], ['announcer', 'Announcer'], ['host', 'Host'], ['teacher', 'Teacher'], ['coach', 'Coach'],
+    ['anime', 'Anime'], ['gaming', 'Gaming'], ['cinematic', 'Cinematic'], ['documentary', 'Documentary'], ['radio', 'Radio'], ['podcast', 'Podcast'],
+  ]
+  const communityAdvancedFilters = document.createElement('div')
+  communityAdvancedFilters.className = 'chat-voice-filter-advanced'
+  communityAdvancedFilters.hidden = true
+  communityFilterPanel.append(communityLanguagesSection, communityFilterTags, communityAdvancedFilters)
+  const communityExpandMore = document.createElement('button')
+  communityExpandMore.type = 'button'
+  communityExpandMore.className = 'chat-voice-expand-more'
+  communityExpandMore.textContent = '⋯ More filters'
+  for (const group of communityFilterGroups) {
+    const section = document.createElement('div')
+    section.className = 'chat-voice-filter-group'
+    const title = document.createElement('div')
+    title.className = 'chat-voice-filter-title'
+    title.textContent = group.title ?? ''
+    section.appendChild(title)
+    const chips = document.createElement('div')
+    chips.className = 'chat-voice-filter-chips'
+    for (const [tag, label] of group.tags) {
+      const chip = document.createElement('button')
+      chip.type = 'button'
+      chip.className = 'chat-voice-add-button chat-voice-filter-chip'
+      chip.dataset.tag = tag
+      chip.dataset.group = group.title ?? ''
+      chip.setAttribute('aria-pressed', 'false')
+      chip.textContent = `+ ${label}`
+      chip.addEventListener('click', () => {
+        const engaged = chip.getAttribute('aria-pressed') === 'true'
+        if (group.exclusive) {
+          for (const other of chips.querySelectorAll<HTMLButtonElement>('.chat-voice-filter-chip')) {
+            other.setAttribute('aria-pressed', 'false')
+            other.textContent = other.textContent.replace(/^✓ /, '+ ')
+          }
+        }
+        chip.setAttribute('aria-pressed', String(!engaged))
+        chip.textContent = `${engaged ? '+' : '✓'} ${label}`
+      })
+      chips.appendChild(chip)
+    }
+    if (group.title === 'Voice Qualities') {
+      for (const [tag, label] of communityFilterQualityExtended) {
+        const chip = document.createElement('button')
+        chip.type = 'button'
+        chip.className = 'chat-voice-add-button chat-voice-filter-chip'
+        chip.dataset.tag = tag
+        chip.dataset.group = group.title
+        chip.hidden = true
+        chip.setAttribute('aria-pressed', 'false')
+        chip.textContent = `+ ${label}`
+        chip.addEventListener('click', () => {
+          const engaged = chip.getAttribute('aria-pressed') === 'true'
+          chip.setAttribute('aria-pressed', String(!engaged))
+          chip.textContent = `${engaged ? '+' : '✓'} ${label}`
+        })
+        chips.appendChild(chip)
+      }
+      const more = document.createElement('button')
+      more.type = 'button'
+      more.className = 'chat-voice-expand-more'
+      more.textContent = `+ ${communityFilterQualityExtended.length} more`
+      let qualityExpanded = false
+      more.addEventListener('click', () => {
+        qualityExpanded = !qualityExpanded
+        for (const chip of chips.querySelectorAll<HTMLButtonElement>('.chat-voice-filter-chip')) {
+          if ((chip.dataset.group ?? '') !== 'Voice Qualities') continue
+          if (qualityExpanded) chip.hidden = false
+          else if (!['deep', 'low', 'medium', 'high', 'soft', 'bright'].includes(chip.dataset.tag ?? '')) chip.hidden = true
+        }
+        more.textContent = qualityExpanded ? 'Show less' : `+ ${communityFilterQualityExtended.length} more`
+      })
+      chips.appendChild(more)
+    }
+    section.appendChild(chips)
+    communityAdvancedFilters.appendChild(section)
+  }
+  communityExpandMore.addEventListener('click', () => {
+    communityAdvancedFilters.hidden = !communityAdvancedFilters.hidden
+    communityExpandMore.textContent = communityAdvancedFilters.hidden ? '⋯ More filters' : 'Show less'
+  })
+  communityFilterPanel.appendChild(communityExpandMore)
+  communitySection.append(communityToolbar, communityFilterPanel, communityPager)
   const communityList = document.createElement('div')
   communityList.className = 'chat-voice-favorite-list'
   communityList.setAttribute('role', 'region')
