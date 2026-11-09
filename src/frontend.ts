@@ -412,6 +412,7 @@ interface PlaybackPreferences {
   fishApiKey: string
   communityVoicePool: FavoriteVoice[]
   communityVoicePoolAt: string
+  communityVoiceLanguage: string
   autoVoiceCastingPool: 'favorite' | 'community'
 }
 
@@ -489,6 +490,7 @@ async function loadPlaybackPreferences(): Promise<PlaybackPreferences> {
     fishApiKey: '',
     communityVoicePool: [],
     communityVoicePoolAt: '',
+    communityVoiceLanguage: '',
     autoVoiceCastingPool: 'favorite',
   }
   const row = await response.json() as { value?: Record<string, unknown> }
@@ -554,6 +556,9 @@ async function loadPlaybackPreferences(): Promise<PlaybackPreferences> {
       : '',
     communityVoicePool: readFavoriteVoices(row.value?.chatVoiceCommunityVoicePool),
     communityVoicePoolAt: typeof row.value?.chatVoiceCommunityVoicePoolAt === 'string' ? row.value.chatVoiceCommunityVoicePoolAt.slice(0, 32) : '',
+    communityVoiceLanguage: typeof row.value?.chatVoiceCommunityVoiceLanguage === 'string'
+      ? row.value.chatVoiceCommunityVoiceLanguage.trim().slice(0, 32).toLowerCase()
+      : '',
     autoVoiceCastingPool: row.value?.chatVoiceAutoCastPool === 'community' ? 'community' : 'favorite',
   }
 }
@@ -1179,6 +1184,8 @@ export function setup(ctx: SpindleFrontendContext) {
     .chat-voice-community-stats { color:var(--lumiverse-text-muted); font-size:11px; white-space:nowrap; }
     .chat-voice-pool-row { display:grid; grid-template-columns:minmax(0, 1fr) auto; gap:8px; align-items:center; }
     .chat-voice-pool-refresh-row { display:flex; align-items:center; flex-wrap:wrap; gap:8px; }
+    .chat-voice-pool-language-row { display:grid; grid-template-columns:auto minmax(0, 1fr); gap:8px; align-items:center; }
+    .chat-voice-pool-language-row .chat-voice-toggle-hint { grid-column: 1 / -1; }
     .chat-voice-filter-panel { display:flex; flex-direction:column; gap:10px; }
     .chat-voice-filter-group { display:flex; flex-direction:column; gap:6px; }
     .chat-voice-filter-title { color:var(--lumiverse-text-muted); font-size:11px; font-weight:700; letter-spacing:.04em; text-transform:uppercase; }
@@ -1774,6 +1781,23 @@ export function setup(ctx: SpindleFrontendContext) {
   const communityPoolStatus = document.createElement('span')
   communityPoolStatus.className = 'chat-voice-hint'
   communityPoolStatus.textContent = ''
+  const snapshotLanguageRow = document.createElement('label')
+  snapshotLanguageRow.className = 'chat-voice-pool-language-row'
+  const snapshotLanguageText = document.createElement('span')
+  snapshotLanguageText.textContent = 'Snapshot language'
+  const snapshotLanguageSelect = document.createElement('select')
+  snapshotLanguageSelect.className = 'chat-voice-favorite-select'
+  snapshotLanguageSelect.setAttribute('aria-label', 'Community snapshot language')
+  for (const [value, label] of [['', 'All languages'], ['en', '🇺🇸 English'], ['es', '🇪🇸 Spanish'], ['ar', '🇸🇦 Arabic'], ['ru', '🇷🇺 Russian'], ['ja', '🇯🇵 Japanese'], ['pt', '🇧🇷 Portuguese'], ['zh', '🇨🇳 Chinese'], ['fr', '🇫🇷 French'], ['it', '🇮🇹 Italian']] as const) {
+    const option = document.createElement('option')
+    option.value = value
+    option.textContent = label
+    snapshotLanguageSelect.appendChild(option)
+  }
+  const snapshotLanguageHint = document.createElement('span')
+  snapshotLanguageHint.className = 'chat-voice-toggle-hint'
+  snapshotLanguageHint.textContent = 'Top-100 snapshot is drawn only from voices matching this language (all = any language).'
+  snapshotLanguageRow.append(snapshotLanguageText, snapshotLanguageSelect, snapshotLanguageHint)
   autoVoicePoolActions.append(autoVoicePoolRefresh, communityPoolStatus)
   const autoPlaybackLabel = document.createElement('label')
   autoPlaybackLabel.className = 'chat-voice-toggle'
@@ -1841,6 +1865,7 @@ export function setup(ctx: SpindleFrontendContext) {
     speakerLookbackField.field,
     autoCastingLabel,
     autoVoicePoolField.field,
+    snapshotLanguageRow,
     autoVoicePoolActions,
     autoPlaybackLabel,
     autoPlaybackDelayField.field,
@@ -1871,6 +1896,7 @@ export function setup(ctx: SpindleFrontendContext) {
   // Fish community voices. The pool dropdown is only visible when the
   // user has chosen Fish vocal tags; otherwise the UI stays as it was.
   let fishApiKey = ''
+  let communityVoiceLanguage = ''
   let autoVoiceCastingPool: 'favorite' | 'community' = 'favorite'
   let communityVoices: FavoriteVoice[] = []
   let communityVoicesAt = ''
@@ -2635,7 +2661,7 @@ export function setup(ctx: SpindleFrontendContext) {
         reject(new Error('Community snapshot refresh timed out.'))
       }, 35_000)
       pendingCommunityRequests.set(requestId, { resolve: value => resolve({ items: value.items ?? [], voices: value.voices ?? [], refreshedAt: value.refreshedAt ?? '' }), reject, timer })
-      ctx.sendToBackend({ type: 'chat_voice_refresh_community_snapshot', requestId, fishApiKey })
+      ctx.sendToBackend({ type: 'chat_voice_refresh_community_snapshot', requestId, fishApiKey, language: communityVoiceLanguage })
     })
   }
 
@@ -4757,6 +4783,15 @@ export function setup(ctx: SpindleFrontendContext) {
     scheduleAdvancedSettingsSave()
     if (autoVoiceCastingPool === 'community') maybeAutoSeedSnapshot()
   })
+  snapshotLanguageSelect.addEventListener('change', () => {
+    communityVoiceLanguage = snapshotLanguageSelect.value
+    void updateVoiceSettings(current => ({ ...current, chatVoiceCommunityVoiceLanguage: communityVoiceLanguage }))
+      .then(() => {
+        setStatus('Community snapshot language saved.', 'saved')
+        if (fishApiKey) void refreshCommunitySnapshot()
+      })
+      .catch(error => setStatus(error instanceof Error ? error.message : 'Could not save the snapshot language.', 'error'))
+  })
   autoVoicePoolRefresh.addEventListener('click', () => void refreshCommunitySnapshot())
 
   function communityIsAvailable(): boolean {
@@ -4785,8 +4820,10 @@ export function setup(ctx: SpindleFrontendContext) {
   function updatePoolControls(): void {
     const fish = communityIsAvailable()
     autoVoicePoolField.field.hidden = !fish
+    snapshotLanguageRow.hidden = !fish
     autoVoicePoolActions.hidden = !fish
     autoVoicePoolSelect.disabled = !autoCastingToggle.checked || !fish
+    snapshotLanguageSelect.disabled = !fish || !fishApiKey
     autoVoicePoolRefresh.disabled = !fish || !fishApiKey || communityLoading
     refreshPoolStatus()
   }
@@ -5397,6 +5434,8 @@ export function setup(ctx: SpindleFrontendContext) {
         autoVoiceCastingPool = preferences.autoVoiceCastingPool
         autoVoicePoolSelect.value = autoVoiceCastingPool
         fishApiKey = preferences.fishApiKey
+        communityVoiceLanguage = preferences.communityVoiceLanguage
+        snapshotLanguageSelect.value = communityVoiceLanguage === 'en' || communityVoiceLanguage === 'es' || communityVoiceLanguage === 'ar' || communityVoiceLanguage === 'ru' || communityVoiceLanguage === 'ja' || communityVoiceLanguage === 'pt' || communityVoiceLanguage === 'zh' || communityVoiceLanguage === 'fr' || communityVoiceLanguage === 'it' ? communityVoiceLanguage : ''
         communityVoices = preferences.communityVoicePool
         communityVoicesAt = preferences.communityVoicePoolAt
         refreshPoolStatus()

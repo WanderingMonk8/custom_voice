@@ -158,7 +158,7 @@ type FrontendMessage =
       pageNumber?: number
       pageSize?: number
     }
-  | { type: 'chat_voice_refresh_community_snapshot'; requestId: string; fishApiKey: string }
+  | { type: 'chat_voice_refresh_community_snapshot'; requestId: string; fishApiKey: string; language?: string }
   | { type: 'chat_voice_scan'; chatId: string; messageLimit: number; tagLlmConnectionId?: string }
   | { type: 'chat_voice_auto_cast'; requestId: string; chatId: string; voices: FavoriteVoice[]; reserved: string[]; narratorMissing: boolean; userMissing: boolean; ghostLifetime: number }
   | { type: 'chat_voice_ghost_edit'; chatId: string; ghostId: string; voice?: string; promote?: boolean; remove?: boolean }
@@ -1919,9 +1919,13 @@ spindle.onFrontendMessage(async (rawPayload: unknown, userId, frontendSessionId)
       }
     } else if (payload?.type === 'chat_voice_refresh_community_snapshot') {
       try {
-        // The pool is only refreshed on demand; the refresh call is the
-        // costly one, so keep it a single top-ranked page.
-        const parsed = await fetchCommunityModels(payload.fishApiKey, { sortBy: 'score', pageNumber: 1, pageSize: 100 })
+        // The pool is only drawn from the single language chosen in
+        // Advanced settings, so every refresh button re-fetches the same
+        // top-ranked page the pool serves for that language.
+        const parsed = await fetchCommunityModels(payload.fishApiKey, {
+          sortBy: 'score', pageNumber: 1, pageSize: 100,
+          language: (payload.language ?? '').trim() ? [(payload.language ?? '').trim().slice(0, 32)] : [],
+        })
         sendFrontend({
           type: 'chat_voice_community_snapshot_result',
           requestId: payload.requestId,

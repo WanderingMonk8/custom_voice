@@ -2255,6 +2255,7 @@ async function loadPlaybackPreferences() {
     fishApiKey: "",
     communityVoicePool: [],
     communityVoicePoolAt: "",
+    communityVoiceLanguage: "",
     autoVoiceCastingPool: "favorite"
   };
   const row = await response.json();
@@ -2302,6 +2303,7 @@ async function loadPlaybackPreferences() {
     fishApiKey: typeof row.value?.chatVoiceFishApiKey === "string" ? row.value.chatVoiceFishApiKey.trim().slice(0, 512) : "",
     communityVoicePool: readFavoriteVoices(row.value?.chatVoiceCommunityVoicePool),
     communityVoicePoolAt: typeof row.value?.chatVoiceCommunityVoicePoolAt === "string" ? row.value.chatVoiceCommunityVoicePoolAt.slice(0, 32) : "",
+    communityVoiceLanguage: typeof row.value?.chatVoiceCommunityVoiceLanguage === "string" ? row.value.chatVoiceCommunityVoiceLanguage.trim().slice(0, 32).toLowerCase() : "",
     autoVoiceCastingPool: row.value?.chatVoiceAutoCastPool === "community" ? "community" : "favorite"
   };
 }
@@ -2849,6 +2851,8 @@ function setup(ctx) {
     .chat-voice-community-stats { color:var(--lumiverse-text-muted); font-size:11px; white-space:nowrap; }
     .chat-voice-pool-row { display:grid; grid-template-columns:minmax(0, 1fr) auto; gap:8px; align-items:center; }
     .chat-voice-pool-refresh-row { display:flex; align-items:center; flex-wrap:wrap; gap:8px; }
+    .chat-voice-pool-language-row { display:grid; grid-template-columns:auto minmax(0, 1fr); gap:8px; align-items:center; }
+    .chat-voice-pool-language-row .chat-voice-toggle-hint { grid-column: 1 / -1; }
     .chat-voice-filter-panel { display:flex; flex-direction:column; gap:10px; }
     .chat-voice-filter-group { display:flex; flex-direction:column; gap:6px; }
     .chat-voice-filter-title { color:var(--lumiverse-text-muted); font-size:11px; font-weight:700; letter-spacing:.04em; text-transform:uppercase; }
@@ -3472,6 +3476,23 @@ function setup(ctx) {
   const communityPoolStatus = document.createElement("span");
   communityPoolStatus.className = "chat-voice-hint";
   communityPoolStatus.textContent = "";
+  const snapshotLanguageRow = document.createElement("label");
+  snapshotLanguageRow.className = "chat-voice-pool-language-row";
+  const snapshotLanguageText = document.createElement("span");
+  snapshotLanguageText.textContent = "Snapshot language";
+  const snapshotLanguageSelect = document.createElement("select");
+  snapshotLanguageSelect.className = "chat-voice-favorite-select";
+  snapshotLanguageSelect.setAttribute("aria-label", "Community snapshot language");
+  for (const [value, label] of [["", "All languages"], ["en", "\u{1F1FA}\u{1F1F8} English"], ["es", "\u{1F1EA}\u{1F1F8} Spanish"], ["ar", "\u{1F1F8}\u{1F1E6} Arabic"], ["ru", "\u{1F1F7}\u{1F1FA} Russian"], ["ja", "\u{1F1EF}\u{1F1F5} Japanese"], ["pt", "\u{1F1E7}\u{1F1F7} Portuguese"], ["zh", "\u{1F1E8}\u{1F1F3} Chinese"], ["fr", "\u{1F1EB}\u{1F1F7} French"], ["it", "\u{1F1EE}\u{1F1F9} Italian"]]) {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = label;
+    snapshotLanguageSelect.appendChild(option);
+  }
+  const snapshotLanguageHint = document.createElement("span");
+  snapshotLanguageHint.className = "chat-voice-toggle-hint";
+  snapshotLanguageHint.textContent = "Top-100 snapshot is drawn only from voices matching this language (all = any language).";
+  snapshotLanguageRow.append(snapshotLanguageText, snapshotLanguageSelect, snapshotLanguageHint);
   autoVoicePoolActions.append(autoVoicePoolRefresh, communityPoolStatus);
   const autoPlaybackLabel = document.createElement("label");
   autoPlaybackLabel.className = "chat-voice-toggle";
@@ -3541,6 +3562,7 @@ function setup(ctx) {
     speakerLookbackField.field,
     autoCastingLabel,
     autoVoicePoolField.field,
+    snapshotLanguageRow,
     autoVoicePoolActions,
     autoPlaybackLabel,
     autoPlaybackDelayField.field,
@@ -3568,6 +3590,7 @@ function setup(ctx) {
   let favoritesSaving = false;
   let editingFavoriteVoiceId = null;
   let fishApiKey = "";
+  let communityVoiceLanguage = "";
   let autoVoiceCastingPool = "favorite";
   let communityVoices = [];
   let communityVoicesAt = "";
@@ -4258,7 +4281,7 @@ function setup(ctx) {
         reject(new Error("Community snapshot refresh timed out."));
       }, 35e3);
       pendingCommunityRequests.set(requestId, { resolve: (value) => resolve({ items: value.items ?? [], voices: value.voices ?? [], refreshedAt: value.refreshedAt ?? "" }), reject, timer });
-      ctx.sendToBackend({ type: "chat_voice_refresh_community_snapshot", requestId, fishApiKey });
+      ctx.sendToBackend({ type: "chat_voice_refresh_community_snapshot", requestId, fishApiKey, language: communityVoiceLanguage });
     });
   }
   function speakerDebugName(speakerId, speakers) {
@@ -6072,6 +6095,13 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
     scheduleAdvancedSettingsSave();
     if (autoVoiceCastingPool === "community") maybeAutoSeedSnapshot();
   });
+  snapshotLanguageSelect.addEventListener("change", () => {
+    communityVoiceLanguage = snapshotLanguageSelect.value;
+    void updateVoiceSettings((current) => ({ ...current, chatVoiceCommunityVoiceLanguage: communityVoiceLanguage })).then(() => {
+      setStatus("Community snapshot language saved.", "saved");
+      if (fishApiKey) void refreshCommunitySnapshot();
+    }).catch((error) => setStatus(error instanceof Error ? error.message : "Could not save the snapshot language.", "error"));
+  });
   autoVoicePoolRefresh.addEventListener("click", () => void refreshCommunitySnapshot());
   function communityIsAvailable() {
     return ttsTagStyle === "fish";
@@ -6100,8 +6130,10 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
   function updatePoolControls() {
     const fish = communityIsAvailable();
     autoVoicePoolField.field.hidden = !fish;
+    snapshotLanguageRow.hidden = !fish;
     autoVoicePoolActions.hidden = !fish;
     autoVoicePoolSelect.disabled = !autoCastingToggle.checked || !fish;
+    snapshotLanguageSelect.disabled = !fish || !fishApiKey;
     autoVoicePoolRefresh.disabled = !fish || !fishApiKey || communityLoading;
     refreshPoolStatus();
   }
@@ -6707,6 +6739,8 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
         autoVoiceCastingPool = preferences.autoVoiceCastingPool;
         autoVoicePoolSelect.value = autoVoiceCastingPool;
         fishApiKey = preferences.fishApiKey;
+        communityVoiceLanguage = preferences.communityVoiceLanguage;
+        snapshotLanguageSelect.value = communityVoiceLanguage === "en" || communityVoiceLanguage === "es" || communityVoiceLanguage === "ar" || communityVoiceLanguage === "ru" || communityVoiceLanguage === "ja" || communityVoiceLanguage === "pt" || communityVoiceLanguage === "zh" || communityVoiceLanguage === "fr" || communityVoiceLanguage === "it" ? communityVoiceLanguage : "";
         communityVoices = preferences.communityVoicePool;
         communityVoicesAt = preferences.communityVoicePoolAt;
         refreshPoolStatus();

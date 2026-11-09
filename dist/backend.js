@@ -47,7 +47,8 @@ function readFavoriteVoices(value) {
       ...typeof row.author === "string" && row.author.trim() ? { author: row.author.trim().slice(0, 128) } : {},
       ...row.source === "community" || row.source === "favorite" ? { source: row.source } : {},
       ...typeof row.communityLink === "string" && row.communityLink.trim() ? { communityLink: row.communityLink.trim().slice(0, 512) } : {},
-      ...Array.isArray(row.tags) ? { tags: row.tags.filter((value2) => typeof value2 === "string").map((value2) => value2.trim().slice(0, 64)).filter(Boolean).slice(0, 8) } : {}
+      ...Array.isArray(row.tags) ? { tags: row.tags.filter((value2) => typeof value2 === "string").map((value2) => value2.trim().slice(0, 64)).filter(Boolean).slice(0, 8) } : {},
+      ...Array.isArray(row.languages) ? { languages: row.languages.filter((value2) => typeof value2 === "string").map((value2) => value2.trim().slice(0, 32)).filter(Boolean).slice(0, 8) } : {}
     });
   }
   return result;
@@ -135,7 +136,8 @@ function communityVoiceToFavorite(voice) {
     ...voice.author ? { author: voice.author } : {},
     source: "community",
     communityLink: voice.communityLink,
-    ...voice.tags.length ? { tags: voice.tags } : {}
+    ...voice.tags.length ? { tags: voice.tags } : {},
+    ...voice.languages.length ? { languages: voice.languages } : {}
   };
 }
 var GHOST_VOICE_LIFETIME_MESSAGES = 10;
@@ -6758,7 +6760,12 @@ spindle.onFrontendMessage(async (rawPayload, userId, frontendSessionId) => {
       }
     } else if (payload?.type === "chat_voice_refresh_community_snapshot") {
       try {
-        const parsed = await fetchCommunityModels(payload.fishApiKey, { sortBy: "score", pageNumber: 1, pageSize: 100 });
+        const parsed = await fetchCommunityModels(payload.fishApiKey, {
+          sortBy: "score",
+          pageNumber: 1,
+          pageSize: 100,
+          language: (payload.language ?? "").trim() ? [(payload.language ?? "").trim().slice(0, 32)] : []
+        });
         sendFrontend({
           type: "chat_voice_community_snapshot_result",
           requestId: payload.requestId,
