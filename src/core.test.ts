@@ -138,6 +138,7 @@ import {
   communityPayloadShape,
   communityVoiceToFavorite,
   upsertCommunityFavorite,
+  voiceAge,
   voiceCategoryGender,
   voiceGender,
   voiceGenderCompatible,
@@ -2066,6 +2067,21 @@ test('voiceGender prefers an explicit hint, then category, then tags', () => {
   assert.equal(voiceGenderCompatible({ category: 'young male' }, 'female'), false)
   assert.equal(voiceGenderCompatible({ category: 'anime character' }, 'female'), true)
   assert.equal(voiceGenderCompatible({ category: 'female' }, 'unknown'), true)
+})
+
+test('voiceAge reads the age tag case-insensitively, else unknown', () => {
+  assert.equal(voiceAge({ tags: ['young'] }), 'young')
+  assert.equal(voiceAge({ tags: ['Middle Aged'] }), 'middle aged')
+  assert.equal(voiceAge({ tags: ['deep', 'Old'] }), 'old')
+  assert.equal(voiceAge({ tags: ['deep'] }), 'unknown')
+  assert.equal(voiceAge({}), 'unknown')
+})
+
+test('readFavoriteVoices keeps up to 32 tags and the languages array', () => {
+  const tags = Array.from({ length: 40 }, (_, index) => `tag-${index}`)
+  const [voice] = readFavoriteVoices([{ id: 'voice-1', tags, languages: ['en', 'ja'] }])
+  assert.equal(voice.tags?.length, 32)
+  assert.deepEqual(voice.languages, ['en', 'ja'])
 })
 
 test('communityVoiceToFavorite maps Fish metadata onto expanded favorites', () => {

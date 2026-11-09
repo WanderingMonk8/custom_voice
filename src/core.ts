@@ -122,6 +122,7 @@ export interface FavoriteVoice {
   source?: 'community' | 'favorite' | undefined
   communityLink?: string
   tags?: string[] | undefined
+  languages?: string[] | undefined
 }
 
 /** Derive a male/female hint from a free-form category string. */
@@ -141,6 +142,15 @@ export function voiceGender(voice: { category: string; tags?: readonly string[];
   for (const tag of voice.tags ?? []) {
     const tagGender = voiceCategoryGender(tag)
     if (tagGender !== 'unspecified') return tagGender
+  }
+  return 'unknown'
+}
+
+/** Age hint for a stored favorite, read from its tags. */
+export function voiceAge(voice: { tags?: readonly string[] }): 'young' | 'middle aged' | 'old' | 'unknown' {
+  for (const tag of voice.tags ?? []) {
+    const value = tag.trim().toLowerCase()
+    if (value === 'young' || value === 'middle aged' || value === 'old') return value
   }
   return 'unknown'
 }
@@ -175,7 +185,10 @@ export function readFavoriteVoices(value: unknown): FavoriteVoice[] {
       ...(row.source === 'community' || row.source === 'favorite' ? { source: row.source } : {}),
       ...(typeof row.communityLink === 'string' && row.communityLink.trim() ? { communityLink: row.communityLink.trim().slice(0, 512) } : {}),
       ...(Array.isArray(row.tags)
-        ? { tags: row.tags.filter((value): value is string => typeof value === 'string').map(value => value.trim().slice(0, 64)).filter(Boolean).slice(0, 8) }
+        ? { tags: row.tags.filter((value): value is string => typeof value === 'string').map(value => value.trim().slice(0, 64)).filter(Boolean).slice(0, 32) }
+        : {}),
+      ...(Array.isArray(row.languages)
+        ? { languages: row.languages.filter((value): value is string => typeof value === 'string').map(value => value.trim().slice(0, 32)).filter(Boolean).slice(0, 8) }
         : {}),
     })
   }
@@ -319,6 +332,7 @@ export function communityVoiceToFavorite(voice: CommunityVoice): FavoriteVoice {
     source: 'community',
     communityLink: voice.communityLink,
     ...(voice.tags.length ? { tags: voice.tags } : {}),
+    ...(voice.languages.length ? { languages: voice.languages } : {}),
   }
 }
 

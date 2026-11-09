@@ -49,6 +49,7 @@ import {
   communityVoiceToFavorite,
   readCommunityVoicePool,
   upsertCommunityFavorite,
+  voiceAge,
   voiceGender,
   reducedRequestWindowLimit,
   rollingRequestWindowDelay,
@@ -1119,6 +1120,13 @@ export function setup(ctx: SpindleFrontendContext) {
     .chat-voice-favorite-edit textarea { min-height:72px; resize:vertical; }
     .chat-voice-favorite-copy { flex:1 1 100px; min-width:0; overflow-wrap:anywhere; color:var(--lumiverse-text); font-size:12px; }
     .chat-voice-favorite-copy small { display:block; color:var(--lumiverse-text-muted); }
+    .chat-voice-favorite-basics { flex:1 0 100%; display:flex; flex-wrap:wrap; gap:8px; align-items:flex-end; }
+    .chat-voice-favorite-basic { display:flex; flex-direction:column; gap:2px; flex:1 1 110px; min-width:0; }
+    .chat-voice-favorite-basic > span { color:var(--lumiverse-text-muted); font-size:11px; font-weight:700; letter-spacing:.04em; text-transform:uppercase; }
+    .chat-voice-favorite-basic select { min-width:0; width:100%; box-sizing:border-box; min-height:32px; padding:5px 7px; border:1px solid var(--lumiverse-border); border-radius:var(--lumiverse-radius); background:var(--lumiverse-bg-secondary, #222); color:var(--lumiverse-text); font:inherit; font-size:12px; }
+    .chat-voice-favorite-details { flex:1 0 100%; display:flex; flex-direction:column; gap:10px; border-top:1px solid var(--lumiverse-border); padding-top:8px; }
+    .chat-voice-favorite-details[hidden] { display:none; }
+    .chat-voice-favorite-details input { min-width:0; width:100%; box-sizing:border-box; min-height:34px; padding:6px 9px; border:1px solid var(--lumiverse-border); border-radius:var(--lumiverse-radius); background:var(--lumiverse-bg-secondary, #222); color:var(--lumiverse-text); font:inherit; font-size:12px; }
     .chat-voice-preview-button { min-height:28px; padding:0 8px; border:1px solid var(--lumiverse-border);
       border-radius:6px; background:var(--lumiverse-fill-subtle); color:var(--lumiverse-text); font:inherit; font-size:11px; cursor:pointer; }
     .chat-voice-add-button, .chat-voice-rename-button, .chat-voice-delete-button {
@@ -1893,6 +1901,10 @@ export function setup(ctx: SpindleFrontendContext) {
   let favoriteVoices: FavoriteVoice[] = []
   let favoritesSaving = false
   let editingFavoriteVoiceId: string | null = null
+  // Which favorite rows have their metadata details panel expanded.
+  // Kept across re-renders (which happen on every save) so editing
+  // metadata does not collapse the panel under the user.
+  const favoriteDetailsOpen = new Set<string>()
   // Fish community voices. The pool dropdown is only visible when the
   // user has chosen Fish vocal tags; otherwise the UI stays as it was.
   let fishApiKey = ''
@@ -4591,44 +4603,234 @@ export function setup(ctx: SpindleFrontendContext) {
         copy.appendChild(description)
       }
       {
-        const metaText = [
-          voice.tags?.length ? voice.tags.join(', ') : '',
-          voice.languages?.length ? voice.languages.join(', ') : '',
+        // One glanceable line of the basics; the rest is edited in the panel.
+        const basicsText = [
+          voiceGender(voice) === 'male' ? 'Male' : voiceGender(voice) === 'female' ? 'Female' : '',
+          voiceAge(voice) === 'young' ? 'Young' : voiceAge(voice) === 'middle aged' ? 'Middle Aged' : voiceAge(voice) === 'old' ? 'Old' : '',
+          voice.languages?.length ? voice.languages.map(code => ({ en: 'English', es: 'Spanish', ar: 'Arabic', ru: 'Russian', ja: 'Japanese', pt: 'Portuguese', zh: 'Chinese', fr: 'French', it: 'Italian' } as Record<string, string>)[code.toLowerCase()] ?? code).join(' + ') : '',
           voice.author ? `by ${voice.author}` : '',
         ].filter(Boolean).join(' · ')
-        if (metaText) {
-          const meta = document.createElement('small')
-          meta.textContent = metaText
-          copy.appendChild(meta)
+        if (basicsText) {
+          const basics = document.createElement('small')
+          basics.textContent = basicsText
+          copy.appendChild(basics)
         }
       }
-      const category = document.createElement('select')
-      category.className = 'chat-voice-favorite-select'
-      category.style.width = 'auto'
-      category.setAttribute('aria-label', `Classification for ${voice.name || voice.id}`)
-      for (const [value, label] of [['unspecified', 'Unspecified'], ['female', 'Female'], ['male', 'Male']]) {
+      const GENDER_TAGS = ['male', 'female']
+      const AGE_TAGS = ['young', 'middle aged', 'old']
+      const USE_CASE_TAGS: Array<[string, string]> = [['conversational', 'Conversational'], ['narration', 'Narration'], ['character voice', 'Character Voice'], ['social media', 'Social Media'], ['educational', 'Educational'], ['advertisement', 'Advertisement'], ['entertainment', 'Entertainment']]
+      const QUALITY_TAGS: Array<[string, string]> = [['deep', 'Deep'], ['low', 'Low'], ['medium', 'Medium'], ['high', 'High'], ['soft', 'Soft'], ['bright', 'Bright']]
+      const LANGUAGE_OPTIONS: Array<[string, string]> = [['en', '🇺🇸 English'], ['es', '🇪🇸 Spanish'], ['ar', '🇸🇦 Arabic'], ['ru', '🇷🇺 Russian'], ['ja', '🇯🇵 Japanese'], ['pt', '🇧🇷 Portuguese'], ['zh', '🇨🇳 Chinese'], ['fr', '🇫🇷 French'], ['it', '🇮🇹 Italian']]
+      const KNOWN_TAGS = new Set([...GENDER_TAGS, ...AGE_TAGS, ...USE_CASE_TAGS.map(([tag]) => tag), ...QUALITY_TAGS.map(([tag]) => tag), ...communityFilterQualityExtended.map(([tag]) => tag)])
+      const lowerTags = (item: FavoriteVoice) => new Set((item.tags ?? []).map(tag => tag.trim().toLowerCase()).filter(Boolean))
+      const patchVoice = (update: (item: FavoriteVoice) => FavoriteVoice): Promise<boolean> =>
+        saveFavoriteVoices(favoriteVoices.map(item => item.id === voice.id ? update(item) : item))
+      const withTags = (item: FavoriteVoice, tags: string[]): FavoriteVoice => {
+        const deduped = [...new Set(tags.map(tag => tag.trim().toLowerCase()).filter(Boolean))].slice(0, 32)
+        return deduped.length ? { ...item, tags: deduped } : { ...item, tags: undefined }
+      }
+      const withoutTags = (item: FavoriteVoice, excluded: string[]): FavoriteVoice =>
+        withTags(item, (item.tags ?? []).filter(tag => !excluded.includes(tag.trim().toLowerCase())))
+      // The most basic metadata, always visible: Gender / Age / Language.
+      const basics = document.createElement('div')
+      basics.className = 'chat-voice-favorite-basics'
+      const makeBasic = (label: string, aria: string): HTMLSelectElement => {
+        const field = document.createElement('label')
+        field.className = 'chat-voice-favorite-basic'
+        const name = document.createElement('span')
+        name.textContent = label
+        const select = document.createElement('select')
+        select.setAttribute('aria-label', aria)
+        field.append(name, select)
+        basics.appendChild(field)
+        return select
+      }
+      const genderSelect = makeBasic('Gender', `Gender for ${voice.name || voice.id}`)
+      for (const [value, text] of [['unspecified', 'Unspecified'], ['female', 'Female'], ['male', 'Male']]) {
         const option = document.createElement('option')
         option.value = value
-        option.textContent = label
-        category.appendChild(option)
+        option.textContent = text
+        genderSelect.appendChild(option)
       }
+      // A free-form legacy category that is not a bare gender word still
+      // wins the displayed value until the user picks a new gender.
       if (voice.category && !['unspecified', 'male', 'female'].includes(voice.category)) {
         const option = document.createElement('option')
         option.value = voice.category
         option.textContent = voice.category
-        category.appendChild(option)
+        genderSelect.appendChild(option)
       }
-      category.value = voice.category
-      category.addEventListener('change', () => {
-        const legacy = voice.category === 'male' || voice.category === 'female' || voice.category === 'unspecified'
-        const nextCategory = category.value === 'male' || category.value === 'female'
-          ? category.value
-          : (legacy ? 'unspecified' : category.value || 'unspecified')
-        category.disabled = true
-        void saveFavoriteVoices(favoriteVoices.map(item => item.id === voice.id
-          ? { ...item, category: nextCategory } : item))
-          .then(saved => { if (!saved) { category.value = voice.category; category.disabled = false } })
+      genderSelect.value = voiceGender(voice) === 'unknown' ? (voice.category || 'unspecified') : voiceGender(voice)
+      genderSelect.addEventListener('change', () => {
+        const next = genderSelect.value
+        genderSelect.disabled = true
+        void patchVoice(item => {
+          const cleared = withoutTags(item, GENDER_TAGS)
+          if (next === 'male' || next === 'female') {
+            return { ...cleared, gender: next, category: next, tags: [...new Set([...(cleared.tags ?? []), next])] }
+          }
+          const legacy = ['male', 'female', 'unspecified'].includes(item.category)
+          return { ...cleared, gender: undefined, category: legacy ? 'unspecified' : (item.category || 'unspecified') }
+        }).then(saved => { if (!saved) genderSelect.disabled = false })
       })
+      const ageSelect = makeBasic('Age', `Age for ${voice.name || voice.id}`)
+      for (const [value, text] of [['unknown', 'Any age'], ['young', 'Young'], ['middle aged', 'Middle Aged'], ['old', 'Old']]) {
+        const option = document.createElement('option')
+        option.value = value
+        option.textContent = text
+        ageSelect.appendChild(option)
+      }
+      ageSelect.value = voiceAge(voice)
+      ageSelect.addEventListener('change', () => {
+        const next = ageSelect.value
+        ageSelect.disabled = true
+        void patchVoice(item => {
+          const cleared = withoutTags(item, AGE_TAGS)
+          return next === 'unknown' ? cleared : withTags(cleared, [...(cleared.tags ?? []), next])
+        }).then(saved => { if (!saved) ageSelect.disabled = false })
+      })
+      const languageSelect = makeBasic('Language', `Language for ${voice.name || voice.id}`)
+      for (const [value, text] of [['', 'Any language'], ...LANGUAGE_OPTIONS]) {
+        const option = document.createElement('option')
+        option.value = value
+        option.textContent = text
+        languageSelect.appendChild(option)
+      }
+      languageSelect.value = voice.languages?.length === 1 ? voice.languages[0].toLowerCase() : voice.languages?.length ? (voice.languages[0].toLowerCase() || '') : ''
+      languageSelect.addEventListener('change', () => {
+        const next = languageSelect.value
+        languageSelect.disabled = true
+        void patchVoice(item => ({ ...item, languages: next ? [next] : undefined }))
+          .then(saved => { if (!saved) languageSelect.disabled = false })
+      })
+      // Fine-grained details behind the same ⋯ expander as Fish.
+      const detailsToggle = document.createElement('button')
+      detailsToggle.type = 'button'
+      detailsToggle.className = 'chat-voice-expand-more'
+      const detailsOpen = () => favoriteDetailsOpen.has(voice.id)
+      detailsToggle.textContent = detailsOpen() ? 'Show less' : '⋯ Details'
+      detailsToggle.setAttribute('aria-expanded', String(detailsOpen()))
+      const details = document.createElement('div')
+      details.className = 'chat-voice-favorite-details'
+      details.hidden = !detailsOpen()
+      detailsToggle.addEventListener('click', () => {
+        if (detailsOpen()) favoriteDetailsOpen.delete(voice.id)
+        else favoriteDetailsOpen.add(voice.id)
+        details.hidden = !detailsOpen()
+        detailsToggle.textContent = detailsOpen() ? 'Show less' : '⋯ Details'
+        detailsToggle.setAttribute('aria-expanded', String(detailsOpen()))
+      })
+      const makeChipGroup = (title: string, entries: Array<[string, string]>, isOn: (tag: string) => boolean, toggle: (tag: string) => void, more?: Array<[string, string]>) => {
+        const section = document.createElement('div')
+        section.className = 'chat-voice-filter-group'
+        const heading = document.createElement('div')
+        heading.className = 'chat-voice-filter-title'
+        heading.textContent = title
+        const chips = document.createElement('div')
+        chips.className = 'chat-voice-filter-chips'
+        const addChip = ([tag, label]: [string, string], hidden: boolean) => {
+          const chip = document.createElement('button')
+          chip.type = 'button'
+          chip.className = 'chat-voice-add-button chat-voice-filter-chip'
+          chip.dataset.tag = tag
+          chip.dataset.kind = title
+          chip.hidden = hidden
+          chip.setAttribute('aria-pressed', String(isOn(tag)))
+          chip.textContent = `${isOn(tag) ? '✓' : '+'} ${label}`
+          chip.addEventListener('click', () => toggle(tag))
+          chips.appendChild(chip)
+          return chip
+        }
+        for (const entry of entries) addChip(entry, false)
+        if (more?.length) {
+          for (const entry of more) addChip(entry, true)
+          const expand = document.createElement('button')
+          expand.type = 'button'
+          expand.className = 'chat-voice-expand-more'
+          expand.textContent = `+ ${more.length} more`
+          let expanded = false
+          expand.addEventListener('click', () => {
+            expanded = !expanded
+            for (const chip of chips.querySelectorAll<HTMLButtonElement>('.chat-voice-filter-chip')) {
+              const tag = chip.dataset.tag ?? ''
+              if (more.some(([entryTag]) => entryTag === tag)) chip.hidden = !expanded
+            }
+            expand.textContent = expanded ? 'Show less' : `+ ${more.length} more`
+          })
+          chips.appendChild(expand)
+        }
+        section.append(heading, chips)
+        return section
+      }
+      const current = () => favoriteVoices.find(item => item.id === voice.id) ?? voice
+      details.appendChild(makeChipGroup('Languages', LANGUAGE_OPTIONS, tag => (current().languages ?? []).some(code => code.toLowerCase() === tag), tag => {
+        patchVoice(item => {
+          const codes = (item.languages ?? []).map(code => code.toLowerCase())
+          const next = codes.includes(tag) ? codes.filter(code => code !== tag) : [...codes, tag]
+          return { ...item, languages: next.length ? next : undefined }
+        })
+      }))
+      details.appendChild(makeChipGroup('Use Case', USE_CASE_TAGS, tag => lowerTags(current()).has(tag), tag => {
+        patchVoice(item => {
+          const set = lowerTags(item)
+          if (set.has(tag)) set.delete(tag); else set.add(tag)
+          return withTags(item, [...set])
+        })
+      }))
+      details.appendChild(makeChipGroup('Voice Qualities', QUALITY_TAGS, tag => lowerTags(current()).has(tag), tag => {
+        patchVoice(item => {
+          const set = lowerTags(item)
+          if (set.has(tag)) set.delete(tag); else set.add(tag)
+          return withTags(item, [...set])
+        })
+      }, communityFilterQualityExtended))
+      const authorGroup = document.createElement('div')
+      authorGroup.className = 'chat-voice-filter-group'
+      const authorTitle = document.createElement('div')
+      authorTitle.className = 'chat-voice-filter-title'
+      authorTitle.textContent = 'Author'
+      const authorInput = document.createElement('input')
+      authorInput.placeholder = 'Voice author (optional)'
+      authorInput.maxLength = 128
+      authorInput.value = voice.author ?? ''
+      authorInput.setAttribute('aria-label', `Author for ${voice.name || voice.id}`)
+      authorInput.addEventListener('change', () => {
+        const value = authorInput.value.trim().slice(0, 128)
+        patchVoice(item => ({ ...item, author: value || undefined }))
+      })
+      authorGroup.append(authorTitle, authorInput)
+      details.appendChild(authorGroup)
+      const tagsGroup = document.createElement('div')
+      tagsGroup.className = 'chat-voice-filter-group'
+      const tagsTitle = document.createElement('div')
+      tagsTitle.className = 'chat-voice-filter-title'
+      tagsTitle.textContent = 'Tags'
+      const tagsInput = document.createElement('input')
+      tagsInput.placeholder = 'Other tags (comma-separated)'
+      tagsInput.maxLength = 512
+      tagsInput.value = (voice.tags ?? []).filter(tag => !KNOWN_TAGS.has(tag.trim().toLowerCase())).join(', ')
+      tagsInput.setAttribute('aria-label', `Other tags for ${voice.name || voice.id}`)
+      const tagsHint = document.createElement('div')
+      tagsHint.className = 'chat-voice-hint'
+      tagsHint.textContent = 'Gender, age, use case, and voice quality chips also count as tags and are managed above.'
+      tagsInput.addEventListener('change', () => {
+        const custom = tagsInput.value.split(',').map(tag => tag.trim().slice(0, 64)).filter(Boolean)
+        patchVoice(item => {
+          const pressed = [...details.querySelectorAll<HTMLButtonElement>('.chat-voice-filter-chip[aria-pressed="true"]')]
+            .filter(chip => chip.dataset.kind !== 'Languages')
+            .map(chip => chip.dataset.tag ?? '')
+          const gendered = [voiceGender(item), voiceAge(item)].filter(value => value !== 'unknown') as string[]
+          return withTags(item, [...pressed, ...gendered, ...custom])
+        })
+      })
+      tagsGroup.append(tagsTitle, tagsHint, tagsInput)
+      details.appendChild(tagsGroup)
+      if (voice.communityLink) {
+        const linkLine = document.createElement('div')
+        linkLine.className = 'chat-voice-hint'
+        linkLine.textContent = `Imported from ${voice.communityLink}`
+        details.appendChild(linkLine)
+      }
       const preview = createCastPreviewButton(() => voice.name || voice.id, () => voice.id)
       const editForm = document.createElement('form')
       editForm.className = 'chat-voice-favorite-edit'
@@ -4701,7 +4903,7 @@ export function setup(ctx: SpindleFrontendContext) {
       remove.textContent = '×'
       remove.setAttribute('aria-label', `Remove favorite ${voice.name || voice.id}`)
       remove.addEventListener('click', () => { void saveFavoriteVoices(favoriteVoices.filter(item => item.id !== voice.id)) })
-      row.append(copy, category, preview, rename, describe, remove, editForm)
+      row.append(copy, preview, detailsToggle, rename, describe, remove, basics, details, editForm)
       favoriteList.appendChild(row)
     }
   }
@@ -4718,7 +4920,7 @@ export function setup(ctx: SpindleFrontendContext) {
       category: gender ?? 'unspecified',
       description: favoriteDescription.value.trim().slice(0, 500),
       ...(gender ? { gender } : {}),
-      ...(selectedTags.length ? { tags: selectedTags.slice(0, 8) } : {}),
+      ...(selectedTags.length ? { tags: selectedTags.slice(0, 32) } : {}),
       ...(favoriteLanguages.value ? { languages: [favoriteLanguages.value] } : {}),
     }
     let next: FavoriteVoice[]
