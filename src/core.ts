@@ -889,10 +889,17 @@ export function resolveUncastVoiceDecisions(
     // message, same speeches) then confirms the ghost by itself, unless
     // Jev's disposition verdict explicitly says a different person.
     const hollowOccurrence = !!occurrence && ghostLacksSavedEvidence(occurrence) && disposition?.choice !== 'different'
+    // When both occurrence questions lean 'same' without reaching
+    // strong-choice levels, their agreement on the identical occurrence
+    // still confirms it; strength is unnecessary when neither question
+    // found a contradiction.
+    const occurrenceReviewSame = occurrenceReview?.choice === 'same' && (occurrenceReview.probabilities?.same ?? 0) >= 0.6
+    const dispositionSame = disposition?.choice === 'same' && (disposition.probabilities?.same ?? 0) >= 0.6
     const occurrenceConfirmed = !!occurrence && (reviewedAsGhost
       || (identityAnswer?.choice === `ghost_${occurrenceIndex}` && strongChoice(identityAnswer))
       || (occurrenceReview?.choice === 'same' && strongChoice(occurrenceReview))
-      || hollowOccurrence)
+      || hollowOccurrence
+      || (occurrenceReviewSame && dispositionSame))
     const identityProbability = identityAnswer?.probabilities.new_or_unclear ?? 0
     const identityRunnerUp = identityAnswer ? Math.max(0, ...Object.entries(identityAnswer.probabilities).filter(([key]) => key !== 'new_or_unclear').map(([, value]) => value)) : 0
     const confirmedNew = !!occurrence && disposition?.choice === 'different' && strongChoice(disposition)

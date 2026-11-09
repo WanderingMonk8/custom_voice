@@ -1809,6 +1809,8 @@ spindle.onFrontendMessage(async (rawPayload: unknown, userId, frontendSessionId)
           context: (group.context ?? []).slice(0, 20).map(context => context.slice(0, 2_000)),
           ...(group.addressee ? { addressee: group.addressee } : {}),
           ...(group.flankPartners ? { flankPartners: group.flankPartners.slice(0, 20) } : {}),
+          ...(group.pronounPartners ? { pronounPartners: group.pronounPartners.slice(0, 20) } : {}),
+          ...(group.pronounGender ? { pronounGender: group.pronounGender } : {}),
           ...(group.narratedName ? { narratedName: group.narratedName } : {}),
           ...(group.inferredName ? { inferredName: group.inferredName } : {}),
         }))

@@ -2868,6 +2868,31 @@ test('a hollow occurrence ghost is confirmed by the identical occurrence despite
   assert.deepEqual(hollow, before)
 })
 
+test('dual same-leaning occurrence reviews confirm the ghost', () => {
+  // With a saved context present both occurrence reviews lean 'same'
+  // without reaching strong-choice levels; their agreement on the
+  // identical occurrence confirms the ghost instead of dropping the group.
+  const group = collectUncastVoiceGroups([{ speakerId: UNCAST_SPEAKER_ID, text: 'I stay on the night shift.' }])
+  const ghost = { id: 'man', speakerId: UNCAST_SPEAKER_ID, voiceId: 'man-voice', context: 'The man stands at the door with a badge.', occurrenceKeys: [`current:${hashMessageContent('I stay on the night shift.')}`], lastSeenMessageId: 'current' }
+  const replay = resolveUncastVoiceDecisions(group, readFavoriteVoices([{ id: 'new-voice' }]), {
+    identity_g0: confidentDecision('new_or_unclear'),
+    review_occurrence_g0_0: { choice: 'same', probabilities: { same: 0.69, different_or_unclear: 0.31 }, confidence: 0.38 },
+    review_occurrence_disposition_g0_0: { choice: 'same', probabilities: { same: 0.63, different: 0.04, unclear: 0.33 }, confidence: 0.44 },
+    voice_g0: confidentDecision('voice_0'),
+  }, [ghost], [], 'current')
+  assert.equal(replay[0]?.ghostId, 'man')
+  assert.equal(replay[0]?.voiceId, 'man-voice')
+  assert.match(replay[0]?.matchReason!, /exact message occurrence/u)
+  // A lean that still leans unclear stays contested.
+  const leaningUnclear = resolveUncastVoiceDecisions(group, readFavoriteVoices([{ id: 'new-voice' }]), {
+    identity_g0: confidentDecision('new_or_unclear'),
+    review_occurrence_g0_0: { choice: 'same', probabilities: { same: 0.69, different_or_unclear: 0.31 }, confidence: 0.38 },
+    review_occurrence_disposition_g0_0: { choice: 'unclear', probabilities: { same: 0.3, different: 0.1, unclear: 0.6 }, confidence: 0.5 },
+    voice_g0: confidentDecision('voice_0'),
+  }, [ghost], [], 'current')
+  assert.deepEqual(leaningUnclear, [])
+})
+
 test('an explicit different verdict still replaces even a hollow occurrence ghost', () => {
   const group = collectUncastVoiceGroups([{ speakerId: UNCAST_SPEAKER_ID, text: 'I can take it from here.' }])
   const hollow = { id: 'man', speakerId: UNCAST_SPEAKER_ID, voiceId: 'man-voice', context: '', occurrenceKeys: [`current:${hashMessageContent('I can take it from here.')}`], lastSeenMessageId: 'current' }
