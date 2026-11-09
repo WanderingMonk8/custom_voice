@@ -3165,6 +3165,12 @@ function setup(ctx) {
   communityExpandMore.type = "button";
   communityExpandMore.className = "chat-voice-expand-more";
   communityExpandMore.textContent = "\u22EF More filters";
+  const communityBestButton = document.createElement("button");
+  communityBestButton.type = "button";
+  communityBestButton.className = "chat-voice-add-button";
+  communityBestButton.textContent = "Community Best";
+  communityBestButton.title = "Load the cached top community voices for browsing";
+  communityFilterPanel.append(communityLanguagesSection, communityFilterTags, communityBestButton);
   for (const group of communityFilterGroups) {
     const section = document.createElement("div");
     section.className = "chat-voice-filter-group";
@@ -3476,6 +3482,8 @@ function setup(ctx) {
   let communityTotal = 0;
   let communityHasMore = false;
   let communityLoading = false;
+  let communityBest = false;
+  let communityBestItems = [];
   let communityAutoSeeded = false;
   let previewController = null;
   let previewAudio = null;
@@ -4150,7 +4158,7 @@ function setup(ctx) {
         pendingCommunityRequests.delete(requestId);
         reject(new Error("Community snapshot refresh timed out."));
       }, 35e3);
-      pendingCommunityRequests.set(requestId, { resolve: (value) => resolve({ voices: value.voices ?? [], refreshedAt: value.refreshedAt ?? "" }), reject, timer });
+      pendingCommunityRequests.set(requestId, { resolve: (value) => resolve({ items: value.items ?? [], voices: value.voices ?? [], refreshedAt: value.refreshedAt ?? "" }), reject, timer });
       ctx.sendToBackend({ type: "chat_voice_refresh_community_snapshot", requestId, fishApiKey });
     });
   }
@@ -5884,11 +5892,12 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
       }
     });
   });
+  communityBestButton.addEventListener("click", () => void showCommunityBest());
   communityTabButton.addEventListener("click", () => {
     voicesTab = "community";
     updateVoicesTabs();
     renderCommunityBrowse();
-    maybeAutoSeedSnapshot();
+    void showCommunityBest();
   });
   favoriteTabButton.addEventListener("click", () => {
     voicesTab = "favorite";
@@ -5898,6 +5907,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
     return value.split(",").map((item) => item.trim()).filter(Boolean).slice(0, 8);
   }
   communitySearchButton.addEventListener("click", () => {
+    communityBest = false;
     communitySearchTitle = communitySearch.value.trim().slice(0, 128);
     communitySearchTags = readCommunityFilterText(communityTags.value);
     for (const chip of communityFilterPanel.querySelectorAll('.chat-voice-filter-chip[aria-pressed="true"]')) {
@@ -6004,9 +6014,10 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
     communityPoolStatus.textContent = "Refreshing snapshot\u2026";
     setStatus("Refreshing the community voice pool snapshot\u2026");
     try {
-      const { voices, refreshedAt } = await requestCommunitySnapshotRefresh();
+      const { items, voices, refreshedAt } = await requestCommunitySnapshotRefresh();
       if (!voices.length) throw new Error("Fish Audio returned no community voices.");
       communityVoices = voices;
+      communityBestItems = items;
       communityVoicesAt = refreshedAt;
       await updateVoiceSettings((current) => ({
         ...current,
@@ -6014,6 +6025,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
         chatVoiceCommunityVoicePoolAt: refreshedAt
       }));
       setStatus("Community voice pool refreshed.", "saved");
+      if (communityBest) showSnapshotListing();
     } catch (error) {
       communityPoolStatus.textContent = error instanceof Error ? error.message : "Community pool refresh failed.";
       setStatus(error instanceof Error ? error.message : "Community pool refresh failed.", "error");
@@ -6021,6 +6033,32 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
       communityLoading = false;
       updatePoolControls();
     }
+  }
+  function showSnapshotListing() {
+    communityBest = communityBestItems.length > 0;
+    if (!communityBest) return;
+    communityPage = 1;
+    communityItems = communityBestItems;
+    communityTotal = communityBestItems.length;
+    communityHasMore = false;
+    renderCommunityBrowse();
+  }
+  async function showCommunityBest() {
+    if (!communityIsAvailable()) return;
+    if (!fishApiKey) {
+      communityError.textContent = "Add your Fish Audio API key first to load the community snapshot.";
+      communityError.hidden = false;
+      return;
+    }
+    if (communityBestItems.length && !communitySnapshotStale()) {
+      showSnapshotListing();
+      return;
+    }
+    if (communityLoading) return;
+    communityBest = true;
+    renderCommunityBrowse();
+    await refreshCommunitySnapshot();
+    showSnapshotListing();
   }
   function maybeAutoSeedSnapshot() {
     if (communityAutoSeeded || communityLoading || !fishApiKey) return;
@@ -6044,7 +6082,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
     } else if (!fishApiKey) {
       empty("Add your Fish Audio API key above to browse community voices. It is stored only in your global voice settings.");
     } else if (!communityItems.length) {
-      empty("No community voices match this search.");
+      empty(communityBest ? "The community snapshot is empty. Refresh it, or search instead." : "No community voices match this search.");
     } else {
       for (const voice of communityItems) {
         const row = document.createElement("div");
@@ -6078,9 +6116,9 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
         communityList.appendChild(row);
       }
     }
-    communityPageLabel.textContent = communityItems.length ? `Page ${communityPage}${communityTotal > 0 ? ` of ${Math.max(1, Math.ceil(communityTotal / 20))}` : ""}` : "";
-    communityPrev.disabled = communityPage <= 1 || communityLoading || !fishApiKey;
-    communityNext.disabled = !communityHasMore || communityLoading || !fishApiKey;
+    communityPageLabel.textContent = communityBest && communityItems.length ? `Community Best \xB7 ${communityItems.length} voices` : communityItems.length ? `Page ${communityPage}${communityTotal > 0 ? ` of ${Math.max(1, Math.ceil(communityTotal / 20))}` : ""}` : "";
+    communityPrev.disabled = communityBest || communityPage <= 1 || communityLoading || !fishApiKey;
+    communityNext.disabled = communityBest || !communityHasMore || communityLoading || !fishApiKey;
     communitySearchButton.disabled = communityLoading || !fishApiKey;
   }
   async function runCommunitySearch(page) {

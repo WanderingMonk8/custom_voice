@@ -330,6 +330,7 @@ interface CommunityResultsPayload {
 interface CommunitySnapshotPayload {
   type: 'chat_voice_community_snapshot_result'
   requestId: string
+  items?: CommunityVoice[]
   voices: FavoriteVoice[]
   refreshedAt: string
   error?: string
@@ -1466,6 +1467,12 @@ export function setup(ctx: SpindleFrontendContext) {
   communityExpandMore.type = 'button'
   communityExpandMore.className = 'chat-voice-expand-more'
   communityExpandMore.textContent = '⋯ More filters'
+  const communityBestButton = document.createElement('button')
+  communityBestButton.type = 'button'
+  communityBestButton.className = 'chat-voice-add-button'
+  communityBestButton.textContent = 'Community Best'
+  communityBestButton.title = 'Load the cached top community voices for browsing'
+  communityFilterPanel.append(communityLanguagesSection, communityFilterTags, communityBestButton)
   for (const group of communityFilterGroups) {
     const section = document.createElement('div')
     section.className = 'chat-voice-filter-group'
@@ -1780,6 +1787,8 @@ export function setup(ctx: SpindleFrontendContext) {
   let communityTotal = 0
   let communityHasMore = false
   let communityLoading = false
+  let communityBest = false
+  let communityBestItems: CommunityVoice[] = []
   let communityAutoSeeded = false
   let previewController: AbortController | null = null
   let previewAudio: HTMLAudioElement | null = null
@@ -2521,14 +2530,14 @@ export function setup(ctx: SpindleFrontendContext) {
     })
   }
 
-  function requestCommunitySnapshotRefresh(): Promise<{ voices: FavoriteVoice[]; refreshedAt: string }> {
+  function requestCommunitySnapshotRefresh(): Promise<{ items: CommunityVoice[]; voices: FavoriteVoice[]; refreshedAt: string }> {
     const requestId = `community-snapshot-${Date.now().toString(36)}-${++communityRequestSequence}`
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         pendingCommunityRequests.delete(requestId)
         reject(new Error('Community snapshot refresh timed out.'))
       }, 35_000)
-      pendingCommunityRequests.set(requestId, { resolve: value => resolve({ voices: value.voices ?? [], refreshedAt: value.refreshedAt ?? '' }), reject, timer })
+      pendingCommunityRequests.set(requestId, { resolve: value => resolve({ items: value.items ?? [], voices: value.voices ?? [], refreshedAt: value.refreshedAt ?? '' }), reject, timer })
       ctx.sendToBackend({ type: 'chat_voice_refresh_community_snapshot', requestId, fishApiKey })
     })
   }
@@ -4580,12 +4589,14 @@ export function setup(ctx: SpindleFrontendContext) {
       .then(saved => { if (saved) { favoriteName.value = ''; favoriteId.value = ''; favoriteDescription.value = '' } })
   })
 
-  communityTabButton.addEventListener('click', () => { voicesTab = 'community'; updateVoicesTabs(); renderCommunityBrowse(); maybeAutoSeedSnapshot() })
+  communityBestButton.addEventListener('click', () => void showCommunityBest())
+  communityTabButton.addEventListener('click', () => { voicesTab = 'community'; updateVoicesTabs(); renderCommunityBrowse(); void showCommunityBest() })
   favoriteTabButton.addEventListener('click', () => { voicesTab = 'favorite'; updateVoicesTabs() })
   function readCommunityFilterText(value: string): string[] {
     return value.split(',').map(item => item.trim()).filter(Boolean).slice(0, 8)
   }
   communitySearchButton.addEventListener('click', () => {
+    communityBest = false
     communitySearchTitle = communitySearch.value.trim().slice(0, 128)
     communitySearchTags = readCommunityFilterText(communityTags.value)
     for (const chip of communityFilterPanel.querySelectorAll<HTMLButtonElement>('.chat-voice-filter-chip[aria-pressed="true"]')) {
@@ -4689,9 +4700,10 @@ export function setup(ctx: SpindleFrontendContext) {
     communityPoolStatus.textContent = 'Refreshing snapshot…'
     setStatus('Refreshing the community voice pool snapshot…')
     try {
-      const { voices, refreshedAt } = await requestCommunitySnapshotRefresh()
+      const { items, voices, refreshedAt } = await requestCommunitySnapshotRefresh()
       if (!voices.length) throw new Error('Fish Audio returned no community voices.')
       communityVoices = voices
+      communityBestItems = items
       communityVoicesAt = refreshedAt
       await updateVoiceSettings(current => ({
         ...current,
@@ -4699,6 +4711,7 @@ export function setup(ctx: SpindleFrontendContext) {
         chatVoiceCommunityVoicePoolAt: refreshedAt,
       }))
       setStatus('Community voice pool refreshed.', 'saved')
+      if (communityBest) showSnapshotListing()
     } catch (error) {
       communityPoolStatus.textContent = error instanceof Error ? error.message : 'Community pool refresh failed.'
       setStatus(error instanceof Error ? error.message : 'Community pool refresh failed.', 'error')
@@ -4706,6 +4719,34 @@ export function setup(ctx: SpindleFrontendContext) {
       communityLoading = false
       updatePoolControls()
     }
+  }
+
+  function showSnapshotListing(): void {
+    communityBest = communityBestItems.length > 0
+    if (!communityBest) return
+    communityPage = 1
+    communityItems = communityBestItems
+    communityTotal = communityBestItems.length
+    communityHasMore = false
+    renderCommunityBrowse()
+  }
+
+  async function showCommunityBest(): Promise<void> {
+    if (!communityIsAvailable()) return
+    if (!fishApiKey) {
+      communityError.textContent = 'Add your Fish Audio API key first to load the community snapshot.'
+      communityError.hidden = false
+      return
+    }
+    if (communityBestItems.length && !communitySnapshotStale()) {
+      showSnapshotListing()
+      return
+    }
+    if (communityLoading) return
+    communityBest = true
+    renderCommunityBrowse()
+    await refreshCommunitySnapshot()
+    showSnapshotListing()
   }
 
   function maybeAutoSeedSnapshot(): void {
@@ -4728,7 +4769,7 @@ export function setup(ctx: SpindleFrontendContext) {
     } else if (!fishApiKey) {
       empty('Add your Fish Audio API key above to browse community voices. It is stored only in your global voice settings.')
     } else if (!communityItems.length) {
-      empty('No community voices match this search.')
+      empty(communityBest ? 'The community snapshot is empty. Refresh it, or search instead.' : 'No community voices match this search.')
     } else {
       for (const voice of communityItems) {
         const row = document.createElement('div')
@@ -4762,9 +4803,9 @@ export function setup(ctx: SpindleFrontendContext) {
         communityList.appendChild(row)
       }
     }
-    communityPageLabel.textContent = communityItems.length ? `Page ${communityPage}${communityTotal > 0 ? ` of ${Math.max(1, Math.ceil(communityTotal / 20))}` : ''}` : ''
-    communityPrev.disabled = communityPage <= 1 || communityLoading || !fishApiKey
-    communityNext.disabled = !communityHasMore || communityLoading || !fishApiKey
+    communityPageLabel.textContent = communityBest && communityItems.length ? `Community Best · ${communityItems.length} voices` : (communityItems.length ? `Page ${communityPage}${communityTotal > 0 ? ` of ${Math.max(1, Math.ceil(communityTotal / 20))}` : ''}` : '')
+    communityPrev.disabled = communityBest || communityPage <= 1 || communityLoading || !fishApiKey
+    communityNext.disabled = communityBest || !communityHasMore || communityLoading || !fishApiKey
     communitySearchButton.disabled = communityLoading || !fishApiKey
   }
 

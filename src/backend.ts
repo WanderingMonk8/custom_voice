@@ -1925,6 +1925,7 @@ spindle.onFrontendMessage(async (rawPayload: unknown, userId, frontendSessionId)
         sendFrontend({
           type: 'chat_voice_community_snapshot_result',
           requestId: payload.requestId,
+          items: parsed.items,
           voices: parsed.items.map(communityVoiceToFavorite),
           refreshedAt: new Date().toISOString(),
           error: '',
