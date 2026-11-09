@@ -6,6 +6,27 @@ var UNRESOLVED_SPEAKER_ID = "__chat_voice_unresolved__";
 var DEFAULT_MESSAGE_LIMIT = 20;
 var MIN_MESSAGE_LIMIT = 1;
 var MAX_MESSAGE_LIMIT = 500;
+function voiceCategoryGender(category) {
+  const value = (category ?? "").trim().toLowerCase();
+  if (!value) return "unspecified";
+  if (/\bfemale\b/.test(value)) return "female";
+  if (/\bmale\b/.test(value)) return "male";
+  return "unspecified";
+}
+function voiceGender(voice) {
+  if (voice.gender === "male" || voice.gender === "female") return voice.gender;
+  const fromCategory = voiceCategoryGender(voice.category);
+  if (fromCategory !== "unspecified") return fromCategory;
+  for (const tag of voice.tags ?? []) {
+    const tagGender = voiceCategoryGender(tag);
+    if (tagGender !== "unspecified") return tagGender;
+  }
+  return "unknown";
+}
+function voiceGenderCompatible(voice, gender) {
+  const hint = voiceGender(voice);
+  return gender === "unknown" || hint === "unknown" || hint === gender;
+}
 function readFavoriteVoices(value) {
   if (!Array.isArray(value)) return [];
   const seen = /* @__PURE__ */ new Set();
@@ -20,11 +41,74 @@ function readFavoriteVoices(value) {
     result.push({
       id,
       name: typeof row.name === "string" ? row.name.trim().slice(0, 128) : "",
-      category: row.category === "male" || row.category === "female" ? row.category : "unspecified",
-      description: typeof row.description === "string" ? row.description.trim().slice(0, 500) : ""
+      category: typeof row.category === "string" && row.category.trim() ? row.category.trim().slice(0, 64) : "unspecified",
+      description: typeof row.description === "string" ? row.description.trim().slice(0, 500) : "",
+      ...row.gender === "male" || row.gender === "female" ? { gender: row.gender } : {},
+      ...typeof row.author === "string" && row.author.trim() ? { author: row.author.trim().slice(0, 128) } : {},
+      ...row.source === "community" || row.source === "favorite" ? { source: row.source } : {},
+      ...typeof row.communityLink === "string" && row.communityLink.trim() ? { communityLink: row.communityLink.trim().slice(0, 512) } : {},
+      ...Array.isArray(row.tags) ? { tags: row.tags.filter((value2) => typeof value2 === "string").map((value2) => value2.trim().slice(0, 64)).filter(Boolean).slice(0, 8) } : {}
     });
   }
   return result;
+}
+var FISH_LANGUAGE_WORDS = /* @__PURE__ */ new Set(["english", "japanese", "chinese", "french", "german", "spanish", "korean", "italian", "russian", "portuguese", "arabic", "hindi", "dutch", "polish", "turkish", "vietnamese", "thai", "indonesian", "en", "ja", "zh", "fr", "de", "es", "ko", "it", "ru", "pt", "ar", "hi", "nl", "pl", "tr", "vi", "th", "id"]);
+function readCommunityVoice(row) {
+  if (!row || typeof row !== "object") return null;
+  const item = row;
+  const id = typeof item._id === "string" ? item._id.trim().slice(0, 512) : "";
+  if (!id) return null;
+  const title = typeof item.title === "string" ? item.title.trim().slice(0, 128) : "";
+  const description = typeof item.description === "string" ? item.description.trim().slice(0, 500) : "";
+  const tags = Array.isArray(item.tags) ? item.tags.filter((value) => typeof value === "string").map((value) => value.trim().slice(0, 64)).filter(Boolean).slice(0, 16) : [];
+  const languages = Array.isArray(item.languages) ? item.languages.filter((value) => typeof value === "string").map((value) => value.trim().slice(0, 32)).filter(Boolean).slice(0, 8) : [];
+  const author = item.author && typeof item.author === "object" && typeof item.author.nickname === "string" ? item.author.nickname : "";
+  const likeCount = typeof item.like_count === "number" && Number.isFinite(item.like_count) ? Math.max(0, Math.round(item.like_count)) : 0;
+  const taskCount = typeof item.task_count === "number" && Number.isFinite(item.task_count) ? Math.max(0, Math.round(item.task_count)) : 0;
+  const licensed = item.licensed === true;
+  const classification = tags.find((tag) => !["male", "female"].includes(tag.toLowerCase()) && !FISH_LANGUAGE_WORDS.has(tag.toLowerCase()));
+  return {
+    id,
+    title,
+    description,
+    category: classification ?? "",
+    tags,
+    languages,
+    author: author.trim().slice(0, 128),
+    likeCount,
+    taskCount,
+    licensed,
+    licensedNote: licensed ? "Licensed by Fish Audio (rights secured from the voice owner)" : null,
+    communityLink: `https://fish.audio/m/${id}`
+  };
+}
+function readCommunityVoiceList(payload) {
+  if (!payload || typeof payload !== "object") return null;
+  const row = payload;
+  if (!Array.isArray(row.items)) return null;
+  const items = row.items.flatMap((item) => {
+    const voice = readCommunityVoice(item);
+    return voice ? [voice] : [];
+  }).slice(0, 100);
+  return {
+    items,
+    total: typeof row.total === "number" && Number.isFinite(row.total) ? Math.max(0, Math.round(row.total)) : items.length,
+    hasMore: row.has_more === true
+  };
+}
+function communityVoiceToFavorite(voice) {
+  const gender = ["male", "female"].find((tag) => voice.tags.some((item) => item.toLowerCase() === tag));
+  return {
+    id: voice.id,
+    name: voice.title,
+    category: voice.category || (gender ?? "unspecified"),
+    description: voice.description,
+    ...gender ? { gender } : {},
+    ...voice.author ? { author: voice.author } : {},
+    source: "community",
+    communityLink: voice.communityLink,
+    ...voice.tags.length ? { tags: voice.tags } : {}
+  };
 }
 var GHOST_VOICE_LIFETIME_MESSAGES = 10;
 function readGhostVoices(value) {
@@ -127,7 +211,7 @@ function canReserveAutomaticVoice(voiceId, reserved, ghosts, existingGhostId = "
   return !!voiceId && !reserved.has(voiceId) && !ghosts.some((ghost) => ghost.voiceId === voiceId && ghost.id !== existingGhostId);
 }
 function selectAutomaticVoice(voices, used, answer, gender) {
-  const eligible = voices.map((voice, index) => ({ voice, probability: answer.probabilities[`voice_${index}`] ?? 0 })).filter((item) => !used.has(item.voice.id) && (gender === "unknown" || item.voice.category === "unspecified" || item.voice.category === gender));
+  const eligible = voices.map((voice, index) => ({ voice, probability: answer.probabilities[`voice_${index}`] ?? 0 })).filter((item) => !used.has(item.voice.id) && voiceGenderCompatible(item.voice, gender));
   if (eligible.length === 1) return eligible[0].voice.id;
   if (answer.choice === "no_match") return "";
   return eligible.filter((item) => item.probability > 0).sort((a, b) => b.probability - a.probability)[0]?.voice.id ?? "";
@@ -559,7 +643,7 @@ function resolveUncastVoiceDecisions(groups, voices, answers, ghosts = [], reser
     if (!ghost) {
       const matches = members.map((group) => answers[`voice_${group.id}`]).filter((answer) => !!answer);
       const eligible = voices.flatMap((voice, index) => {
-        if (used.has(voice.id) || gender !== "unknown" && voice.category !== "unspecified" && voice.category !== gender) return [];
+        if (used.has(voice.id) || !voiceGenderCompatible(voice, gender)) return [];
         const scores = matches.map((match) => match.probabilities[`voice_${index}`] ?? 0).filter((score) => Number.isFinite(score) && score > 0);
         return [{ voice, score: scores.length ? scores.reduce((sum, score) => sum + score, 0) / scores.length : 0, index }];
       });
@@ -6504,6 +6588,45 @@ function queueScan(payload, userId, frontendSessionId) {
   saveQueues.set(queueKey, nextTask);
   return nextTask;
 }
+var FISH_AUDIO_MODEL_URL = "https://api.fish.audio/model";
+var FISH_COMMUNITY_REQUEST_TIMEOUT_MS = 3e4;
+async function fetchCommunityModels(fishApiKey, request) {
+  const key = (fishApiKey ?? "").trim();
+  if (!key) throw new Error("Add your Fish Audio API key in the Community tab first.");
+  const params = new URLSearchParams();
+  const title = (request.title ?? "").trim();
+  if (title) params.set("title", title.slice(0, 128));
+  for (const tag of (request.tags ?? []).map((value) => value.trim()).filter(Boolean).slice(0, 8)) params.append("tag", tag.slice(0, 64));
+  for (const language of (request.language ?? []).map((value) => value.trim()).filter(Boolean).slice(0, 4)) params.append("language", language.slice(0, 32));
+  const sortBy = ["score", "task_count", "created_at"].includes(request.sortBy ?? "") ? request.sortBy : "score";
+  params.set("sort_by", sortBy);
+  params.set("page_number", String(Math.max(1, Math.round(request.pageNumber ?? 1))));
+  params.set("page_size", String(Math.min(100, Math.max(1, Math.round(request.pageSize ?? 20)))));
+  params.set("self", "false");
+  const url = `${FISH_AUDIO_MODEL_URL}?${params.toString()}`;
+  let response;
+  try {
+    response = await Promise.race([
+      spindle.cors(url, { method: "GET", headers: { Authorization: `Bearer ${key}` } }),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("Fish Audio catalog request timed out.")), FISH_COMMUNITY_REQUEST_TIMEOUT_MS))
+    ]);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error ?? "");
+    if (/401|403/.test(message)) throw new Error("Fish Audio rejected the API key. Check the key in the Community tab.");
+    if (/429/.test(message)) throw new Error("Fish Audio rate limited the catalog request. Wait a moment and retry.");
+    throw new Error(message || "The Fish Audio catalog could not be reached.");
+  }
+  const payload = typeof response === "string" ? (() => {
+    try {
+      return JSON.parse(response);
+    } catch {
+      return null;
+    }
+  })() : response;
+  const parsed = readCommunityVoiceList(payload);
+  if (!parsed) throw new Error("Fish Audio returned an unexpected catalog response.");
+  return parsed;
+}
 spindle.onFrontendMessage(async (rawPayload, userId, frontendSessionId) => {
   const payload = rawPayload;
   try {
@@ -6559,6 +6682,53 @@ spindle.onFrontendMessage(async (rawPayload, userId, frontendSessionId) => {
           requestId: payload.requestId,
           connections: [],
           error: error instanceof Error ? error.message : "Could not load LLM connections."
+        }, userId, frontendSessionId);
+      }
+    } else if (payload?.type === "chat_voice_search_community") {
+      try {
+        const parsed = await fetchCommunityModels(payload.fishApiKey, {
+          title: payload.title,
+          tags: payload.tags,
+          language: payload.language,
+          sortBy: payload.sortBy,
+          pageNumber: payload.pageNumber,
+          pageSize: payload.pageSize
+        });
+        sendFrontend({
+          type: "chat_voice_community_results",
+          requestId: payload.requestId,
+          items: parsed.items,
+          total: parsed.total,
+          hasMore: parsed.hasMore,
+          error: ""
+        }, userId, frontendSessionId);
+      } catch (error) {
+        sendFrontend({
+          type: "chat_voice_community_results",
+          requestId: payload.requestId,
+          items: [],
+          total: 0,
+          hasMore: false,
+          error: error instanceof Error ? error.message : "The Fish Audio catalog could not be reached."
+        }, userId, frontendSessionId);
+      }
+    } else if (payload?.type === "chat_voice_refresh_community_snapshot") {
+      try {
+        const parsed = await fetchCommunityModels(payload.fishApiKey, { sortBy: "score", pageNumber: 1, pageSize: 100 });
+        sendFrontend({
+          type: "chat_voice_community_snapshot_result",
+          requestId: payload.requestId,
+          voices: parsed.items.map(communityVoiceToFavorite),
+          refreshedAt: (/* @__PURE__ */ new Date()).toISOString(),
+          error: ""
+        }, userId, frontendSessionId);
+      } catch (error) {
+        sendFrontend({
+          type: "chat_voice_community_snapshot_result",
+          requestId: payload.requestId,
+          voices: [],
+          refreshedAt: "",
+          error: error instanceof Error ? error.message : "The Fish Audio catalog could not be reached."
         }, userId, frontendSessionId);
       }
     } else if (payload?.type === "chat_voice_match_uncast") {

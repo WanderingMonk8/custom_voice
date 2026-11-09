@@ -75,6 +75,8 @@ import {
   readConfig,
   readFavoriteVoices,
   readGhostVoices,
+  readCommunityVoiceList,
+  communityVoiceToFavorite,
   selectAutomaticVoice,
   resolveSpeakerDecisionSegments,
   resolveTtsTagAnswers,
@@ -102,6 +104,7 @@ import {
   type TtsTagStyle,
   type TtsTagOption,
   type FavoriteVoice,
+  type CommunityVoice,
   type UncastVoiceGroup,
   type GhostVoice,
 } from './core'
@@ -143,6 +146,18 @@ type FrontendMessage =
   | { type: 'chat_voice_refresh'; chatId?: string | null; requestId?: string; ghostLifetime?: number }
   | { type: 'chat_voice_decision_status'; requestId?: string }
   | { type: 'chat_voice_list_llm_connections'; requestId: string }
+  | {
+      type: 'chat_voice_search_community'
+      requestId: string
+      fishApiKey: string
+      title?: string
+      tags?: string[]
+      language?: string[]
+      sortBy?: string
+      pageNumber?: number
+      pageSize?: number
+    }
+  | { type: 'chat_voice_refresh_community_snapshot'; requestId: string; fishApiKey: string }
   | { type: 'chat_voice_scan'; chatId: string; messageLimit: number; tagLlmConnectionId?: string }
   | { type: 'chat_voice_auto_cast'; requestId: string; chatId: string; voices: FavoriteVoice[]; reserved: string[]; narratorMissing: boolean; userMissing: boolean; ghostLifetime: number }
   | { type: 'chat_voice_ghost_edit'; chatId: string; ghostId: string; voice?: string; promote?: boolean; remove?: boolean }
@@ -1747,6 +1762,53 @@ function queueScan(
   return nextTask
 }
 
+const FISH_AUDIO_MODEL_URL = 'https://api.fish.audio/model'
+const FISH_COMMUNITY_REQUEST_TIMEOUT_MS = 30_000
+
+interface CommunityModelRequest {
+  title?: string
+  tags?: string[]
+  language?: string[]
+  sortBy?: string
+  pageNumber?: number
+  pageSize?: number
+}
+
+/** Query the public Fish voice library with the user's own API key. */
+async function fetchCommunityModels(fishApiKey: string, request: CommunityModelRequest) {
+  const key = (fishApiKey ?? '').trim()
+  if (!key) throw new Error('Add your Fish Audio API key in the Community tab first.')
+  const params = new URLSearchParams()
+  const title = (request.title ?? '').trim()
+  if (title) params.set('title', title.slice(0, 128))
+  for (const tag of (request.tags ?? []).map(value => value.trim()).filter(Boolean).slice(0, 8)) params.append('tag', tag.slice(0, 64))
+  for (const language of (request.language ?? []).map(value => value.trim()).filter(Boolean).slice(0, 4)) params.append('language', language.slice(0, 32))
+  const sortBy = ['score', 'task_count', 'created_at'].includes(request.sortBy ?? '')
+    ? request.sortBy!
+    : 'score'
+  params.set('sort_by', sortBy)
+  params.set('page_number', String(Math.max(1, Math.round(request.pageNumber ?? 1))))
+  params.set('page_size', String(Math.min(100, Math.max(1, Math.round(request.pageSize ?? 20)))))
+  params.set('self', 'false')
+  const url = `${FISH_AUDIO_MODEL_URL}?${params.toString()}`
+  let response: unknown
+  try {
+    response = await Promise.race([
+      spindle.cors(url, { method: 'GET', headers: { Authorization: `Bearer ${key}` } }),
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error('Fish Audio catalog request timed out.')), FISH_COMMUNITY_REQUEST_TIMEOUT_MS)),
+    ])
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error ?? '')
+    if (/401|403/.test(message)) throw new Error('Fish Audio rejected the API key. Check the key in the Community tab.')
+    if (/429/.test(message)) throw new Error('Fish Audio rate limited the catalog request. Wait a moment and retry.')
+    throw new Error(message || 'The Fish Audio catalog could not be reached.')
+  }
+  const payload = typeof response === 'string' ? (() => { try { return JSON.parse(response) } catch { return null } })() : response
+  const parsed = readCommunityVoiceList(payload)
+  if (!parsed) throw new Error('Fish Audio returned an unexpected catalog response.')
+  return parsed
+}
+
 spindle.onFrontendMessage(async (rawPayload: unknown, userId, frontendSessionId) => {
   const payload = rawPayload as FrontendMessage
   try {
@@ -1798,6 +1860,55 @@ spindle.onFrontendMessage(async (rawPayload: unknown, userId, frontendSessionId)
           requestId: payload.requestId,
           connections: [],
           error: error instanceof Error ? error.message : 'Could not load LLM connections.',
+        }, userId, frontendSessionId)
+      }
+    } else if (payload?.type === 'chat_voice_search_community') {
+      try {
+        const parsed = await fetchCommunityModels(payload.fishApiKey, {
+          title: payload.title,
+          tags: payload.tags,
+          language: payload.language,
+          sortBy: payload.sortBy,
+          pageNumber: payload.pageNumber,
+          pageSize: payload.pageSize,
+        })
+        sendFrontend({
+          type: 'chat_voice_community_results',
+          requestId: payload.requestId,
+          items: parsed.items,
+          total: parsed.total,
+          hasMore: parsed.hasMore,
+          error: '',
+        }, userId, frontendSessionId)
+      } catch (error) {
+        sendFrontend({
+          type: 'chat_voice_community_results',
+          requestId: payload.requestId,
+          items: [],
+          total: 0,
+          hasMore: false,
+          error: error instanceof Error ? error.message : 'The Fish Audio catalog could not be reached.',
+        }, userId, frontendSessionId)
+      }
+    } else if (payload?.type === 'chat_voice_refresh_community_snapshot') {
+      try {
+        // The pool is only refreshed on demand; the refresh call is the
+        // costly one, so keep it a single top-ranked page.
+        const parsed = await fetchCommunityModels(payload.fishApiKey, { sortBy: 'score', pageNumber: 1, pageSize: 100 })
+        sendFrontend({
+          type: 'chat_voice_community_snapshot_result',
+          requestId: payload.requestId,
+          voices: parsed.items.map(communityVoiceToFavorite),
+          refreshedAt: new Date().toISOString(),
+          error: '',
+        }, userId, frontendSessionId)
+      } catch (error) {
+        sendFrontend({
+          type: 'chat_voice_community_snapshot_result',
+          requestId: payload.requestId,
+          voices: [],
+          refreshedAt: '',
+          error: error instanceof Error ? error.message : 'The Fish Audio catalog could not be reached.',
         }, userId, frontendSessionId)
       }
     } else if (payload?.type === 'chat_voice_match_uncast') {

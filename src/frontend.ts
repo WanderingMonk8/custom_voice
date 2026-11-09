@@ -46,6 +46,10 @@ import {
   preparePlaybackContent,
   readSavedAudioHistory,
   readFavoriteVoices,
+  communityVoiceToFavorite,
+  readCommunityVoicePool,
+  upsertCommunityFavorite,
+  voiceGender,
   reducedRequestWindowLimit,
   rollingRequestWindowDelay,
   speakerAliases,
@@ -58,6 +62,7 @@ import {
   UNRESOLVED_SPEAKER_ID,
   USER_SPEAKER_ID,
   upsertSavedAudioRecord,
+  type CommunityVoice,
   type GhostVoice,
   type PlaybackSegment,
   type SpeakerAssignmentSource,
@@ -313,6 +318,23 @@ interface UncastMatchPayload {
   error?: string
 }
 
+interface CommunityResultsPayload {
+  type: 'chat_voice_community_results'
+  requestId: string
+  items: CommunityVoice[]
+  total: number
+  hasMore: boolean
+  error?: string
+}
+
+interface CommunitySnapshotPayload {
+  type: 'chat_voice_community_snapshot_result'
+  requestId: string
+  voices: FavoriteVoice[]
+  refreshedAt: string
+  error?: string
+}
+
 /** Result of asking the backend for reviewed speaker assignments. */
 interface SpeakerParseReview {
   segments: PlaybackSegment[]
@@ -386,6 +408,10 @@ interface PlaybackPreferences {
   defaultNarratorVoice: string
   defaultUserVoice: string
   favoriteVoices: FavoriteVoice[]
+  fishApiKey: string
+  communityVoicePool: FavoriteVoice[]
+  communityVoicePoolAt: string
+  autoVoiceCastingPool: 'favorite' | 'community'
 }
 
 function clampIntegerSetting(value: unknown, fallback: number, maximum: number): number {
@@ -459,6 +485,10 @@ async function loadPlaybackPreferences(): Promise<PlaybackPreferences> {
     defaultNarratorVoice: '',
     defaultUserVoice: '',
     favoriteVoices: [],
+    fishApiKey: '',
+    communityVoicePool: [],
+    communityVoicePoolAt: '',
+    autoVoiceCastingPool: 'favorite',
   }
   const row = await response.json() as { value?: Record<string, unknown> }
   const speed = typeof row.value?.ttsSpeed === 'number' ? row.value.ttsSpeed : 1
@@ -518,6 +548,12 @@ async function loadPlaybackPreferences(): Promise<PlaybackPreferences> {
       ? row.value.chatVoiceDefaultUserVoice.trim().slice(0, 512)
       : '',
     favoriteVoices: readFavoriteVoices(row.value?.chatVoiceFavoriteVoices),
+    fishApiKey: typeof row.value?.chatVoiceFishApiKey === 'string'
+      ? row.value.chatVoiceFishApiKey.trim().slice(0, 512)
+      : '',
+    communityVoicePool: readFavoriteVoices(row.value?.chatVoiceCommunityVoicePool),
+    communityVoicePoolAt: typeof row.value?.chatVoiceCommunityVoicePoolAt === 'string' ? row.value.chatVoiceCommunityVoicePoolAt.slice(0, 32) : '',
+    autoVoiceCastingPool: row.value?.chatVoiceAutoCastPool === 'community' ? 'community' : 'favorite',
   }
 }
 
@@ -606,6 +642,7 @@ function saveAdvancedPlaybackPreferences(
   autoPlaybackDelaySeconds: number,
   speakerLookback: number,
   skipNarration: boolean,
+  autoVoiceCastingPool: 'favorite' | 'community',
 ): Promise<void> {
   return updateVoiceSettings(current => ({
     ...current,
@@ -629,6 +666,7 @@ function saveAdvancedPlaybackPreferences(
     chatVoiceAutoCasting: autoVoiceCasting,
     chatVoiceAutoPlayback: autoPlayback,
     chatVoiceAutoPlaybackDelaySeconds: readAutoplayDelaySeconds(autoPlaybackDelaySeconds),
+    chatVoiceAutoCastPool: autoVoiceCastingPool,
     chatVoiceGhostVoiceLifetime: clampIntegerSetting(ghostVoiceLifetime, GHOST_VOICE_LIFETIME_MESSAGES, 1000),
     chatVoiceSpeakerLookback: clampIntegerSetting(speakerLookback, DEFAULT_SPEAKER_LOOKBACK, MAX_SPEAKER_LOOKBACK),
   }))
@@ -1113,6 +1151,34 @@ export function setup(ctx: SpindleFrontendContext) {
     }
     .chat-voice-copy-report-button:hover:not(:disabled) { filter:brightness(1.08); }
     .chat-voice-copy-report-button:disabled { cursor:not-allowed; opacity:.5; }
+    .chat-voice-voices-tabs { display:flex; gap:4px; }
+    .chat-voice-voices-tab { flex:1; min-height:36px; padding:7px 10px; border:1px solid var(--lumiverse-border);
+      border-radius:var(--lumiverse-radius); background:var(--lumiverse-fill-subtle); color:var(--lumiverse-text);
+      font:inherit; font-size:12px; font-weight:600; cursor:pointer; }
+    .chat-voice-voices-tab[aria-selected="true"] { background:var(--lumiverse-accent, #7a68f4); color:#fff; }
+    .chat-voice-community { display:flex; flex-direction:column; gap:8px; }
+    .chat-voice-community-toolbar { display:grid; grid-template-columns:minmax(0, 2fr) minmax(0, 1fr) auto; gap:8px; }
+    .chat-voice-community-toolbar input, .chat-voice-community-toolbar select {
+      min-width:0; width:100%; box-sizing:border-box; min-height:36px; padding:7px 9px;
+      border:1px solid var(--lumiverse-border); border-radius:var(--lumiverse-radius);
+      background:var(--lumiverse-bg-secondary, #222); color:var(--lumiverse-text); font:inherit; font-size:12px;
+    }
+    .chat-voice-community-subtoolbar { display:grid; grid-template-columns:minmax(0, 1fr) minmax(0, 1fr) auto auto; gap:8px; align-items:center; }
+    .chat-voice-community-subtoolbar input, .chat-voice-community-subtoolbar select {
+      min-width:0; width:100%; box-sizing:border-box; min-height:36px; padding:7px 9px;
+      border:1px solid var(--lumiverse-border); border-radius:var(--lumiverse-radius);
+      background:var(--lumiverse-bg-secondary, #222); color:var(--lumiverse-text); font:inherit; font-size:12px;
+    }
+    .chat-voice-community-row { display:flex; flex-wrap:wrap; align-items:center; gap:8px;
+      padding:8px; border:1px solid var(--lumiverse-border); border-radius:var(--lumiverse-radius); }
+    .chat-voice-community-copy { flex:1 1 220px; min-width:0; overflow-wrap:anywhere; color:var(--lumiverse-text); font-size:12px; }
+    .chat-voice-community-copy small { display:block; color:var(--lumiverse-text-muted); }
+    .chat-voice-community-stats { color:var(--lumiverse-text-muted); font-size:11px; white-space:nowrap; }
+    .chat-voice-pool-row { display:grid; grid-template-columns:minmax(0, 1fr) auto; gap:8px; align-items:center; }
+    .chat-voice-pool-row select {
+      min-width:0; min-height:36px; padding:7px 9px; border:1px solid var(--lumiverse-border);
+      border-radius:var(--lumiverse-radius); background:var(--lumiverse-bg-secondary, #222); color:var(--lumiverse-text); font:inherit; font-size:12px;
+    }
   `)
 
   const tab = ctx.ui.registerDrawerTab({
@@ -1256,6 +1322,91 @@ export function setup(ctx: SpindleFrontendContext) {
   const favoritesTitle = document.createElement('div')
   favoritesTitle.className = 'chat-voice-section-title'
   favoritesTitle.textContent = 'Favorite voices'
+  const voicesTabStrip = document.createElement('div')
+  voicesTabStrip.className = 'chat-voice-voices-tabs'
+  voicesTabStrip.setAttribute('role', 'tablist')
+  voicesTabStrip.setAttribute('aria-label', 'Voice library')
+  const communityTabButton = document.createElement('button')
+  communityTabButton.type = 'button'
+  communityTabButton.className = 'chat-voice-voices-tab'
+  communityTabButton.textContent = 'Community'
+  communityTabButton.setAttribute('role', 'tab')
+  const favoriteTabButton = document.createElement('button')
+  favoriteTabButton.type = 'button'
+  favoriteTabButton.className = 'chat-voice-voices-tab'
+  favoriteTabButton.textContent = 'Favorite'
+  favoriteTabButton.setAttribute('role', 'tab')
+  voicesTabStrip.append(communityTabButton, favoriteTabButton)
+  const communitySection = document.createElement('div')
+  communitySection.className = 'chat-voice-community'
+  const communityKeyRow = document.createElement('div')
+  communityKeyRow.className = 'chat-voice-invisible'
+  communityKeyRow.hidden = true
+  const communityKeyInput = document.createElement('input')
+  communityKeyInput.type = 'password'
+  communityKeyInput.autocomplete = 'off'
+  communityKeyInput.spellcheck = false
+  communityKeyInput.placeholder = 'Fish Audio API key'
+  communityKeyInput.setAttribute('aria-label', 'Fish Audio API key')
+  const communityKeySave = document.createElement('button')
+  communityKeySave.type = 'button'
+  communityKeySave.className = 'chat-voice-add-button'
+  communityKeySave.textContent = 'Save key'
+  communityKeyRow.append(communityKeyInput, communityKeySave)
+  communitySection.appendChild(communityKeyRow)
+  const communityError = document.createElement('div')
+  communityError.className = 'chat-voice-status'
+  communityError.dataset.state = 'error'
+  communityError.setAttribute('role', 'alert')
+  communityError.hidden = true
+  communitySection.appendChild(communityError)
+  const communityToolbar = document.createElement('div')
+  communityToolbar.className = 'chat-voice-community-toolbar'
+  const communitySearch = document.createElement('input')
+  communitySearch.placeholder = 'Search community voices'
+  communitySearch.setAttribute('aria-label', 'Search community voices')
+  const communitySort = document.createElement('select')
+  communitySort.setAttribute('aria-label', 'Sort community voices')
+  for (const [value, label] of [['score', 'Best score'], ['task_count', 'Most played'], ['created_at', 'Newest']] as const) {
+    const option = document.createElement('option')
+    option.value = value
+    option.textContent = label
+    communitySort.appendChild(option)
+  }
+  const communitySearchButton = document.createElement('button')
+  communitySearchButton.type = 'button'
+  communitySearchButton.className = 'chat-voice-add-button'
+  communitySearchButton.textContent = 'Search'
+  communityToolbar.append(communitySearch, communitySort, communitySearchButton)
+  const communitySubtoolbar = document.createElement('div')
+  communitySubtoolbar.className = 'chat-voice-community-subtoolbar'
+  const communityTags = document.createElement('input')
+  communityTags.placeholder = 'Tags (comma-separated)'
+  communityTags.setAttribute('aria-label', 'Community voice tags')
+  const communityLanguage = document.createElement('input')
+  communityLanguage.placeholder = 'Language (e.g. en)'
+  communityLanguage.setAttribute('aria-label', 'Community voice language')
+  const communityPrev = document.createElement('button')
+  communityPrev.type = 'button'
+  communityPrev.className = 'chat-voice-add-button'
+  communityPrev.textContent = '←'
+  communityPrev.setAttribute('aria-label', 'Previous results page')
+  const communityNext = document.createElement('button')
+  communityNext.type = 'button'
+  communityNext.className = 'chat-voice-add-button'
+  communityNext.textContent = '→'
+  communityNext.setAttribute('aria-label', 'Next results page')
+  const communityPageLabel = document.createElement('span')
+  communityPageLabel.className = 'chat-voice-community-stats'
+  communityPageLabel.textContent = ''
+  communitySubtoolbar.append(communityTags, communityLanguage, communityPrev, communityNext)
+  communitySection.append(communityToolbar, communitySubtoolbar)
+  const communityList = document.createElement('div')
+  communityList.className = 'chat-voice-favorite-list'
+  communityList.setAttribute('role', 'region')
+  communityList.setAttribute('aria-label', 'Community voices')
+  communityList.tabIndex = 0
+  communitySection.appendChild(communityList)
   const favoritesSection = document.createElement('div')
   favoritesSection.className = 'chat-voice-favorites'
   const favoriteForm = document.createElement('div')
@@ -1335,7 +1486,9 @@ export function setup(ctx: SpindleFrontendContext) {
     characterTitle,
     characterList,
     favoritesTitle,
+    voicesTabStrip,
     favoritesSection,
+    communitySection,
     status,
     advancedSection,
   )
@@ -1355,6 +1508,33 @@ export function setup(ctx: SpindleFrontendContext) {
   const autoCastingText = document.createElement('span')
   autoCastingText.textContent = 'Automatically cast voices'
   autoCastingLabel.append(autoCastingToggle, autoCastingText)
+  const autoVoicePoolRow = document.createElement('label')
+  autoVoicePoolRow.className = 'chat-voice-toggle'
+  const autoVoicePoolCopy = document.createElement('span')
+  autoVoicePoolCopy.className = 'chat-voice-toggle-copy'
+  const autoVoicePoolSelect = document.createElement('select')
+  autoVoicePoolSelect.className = 'chat-voice-favorite-select'
+  autoVoicePoolSelect.setAttribute('aria-label', 'Auto-cast voice pool')
+  for (const [value, label] of [['favorite', 'Favorites'], ['community', 'Community snapshot']] as const) {
+    const option = document.createElement('option')
+    option.value = value
+    option.textContent = label
+    autoVoicePoolSelect.appendChild(option)
+  }
+  const autoVoicePoolText = document.createElement('span')
+  autoVoicePoolText.textContent = 'Auto-cast voice pool'
+  const autoVoicePoolHint = document.createElement('span')
+  autoVoicePoolHint.className = 'chat-voice-toggle-hint'
+  autoVoicePoolHint.textContent = 'Choose Favorites or the cached Fish community snapshot when auto-casting. The Community tab is available with Fish vocal tags; this pool only samples snapshot voices.'
+  autoVoicePoolCopy.append(autoVoicePoolText, autoVoicePoolSelect, autoVoicePoolHint)
+  const autoVoicePoolRefresh = document.createElement('button')
+  autoVoicePoolRefresh.type = 'button'
+  autoVoicePoolRefresh.className = 'chat-voice-add-button'
+  autoVoicePoolRefresh.textContent = 'Refresh snapshot'
+  const communityPoolStatus = document.createElement('span')
+  communityPoolStatus.className = 'chat-voice-hint'
+  communityPoolStatus.textContent = ''
+  autoVoicePoolRow.append(autoVoicePoolCopy, autoVoicePoolRefresh, communityPoolStatus)
   const autoPlaybackLabel = document.createElement('label')
   autoPlaybackLabel.className = 'chat-voice-toggle'
   const autoPlaybackToggle = document.createElement('input')
@@ -1420,6 +1600,7 @@ export function setup(ctx: SpindleFrontendContext) {
     ghostLifetimeField.field,
     speakerLookbackField.field,
     autoCastingLabel,
+    autoVoicePoolRow,
     autoPlaybackLabel,
     autoPlaybackDelayField.field,
     skipNarrationLabel,
@@ -1446,6 +1627,23 @@ export function setup(ctx: SpindleFrontendContext) {
   let favoriteVoices: FavoriteVoice[] = []
   let favoritesSaving = false
   let editingFavoriteVoiceId: string | null = null
+  // Fish community voices. The pool dropdown is only visible when the
+  // user has chosen Fish vocal tags; otherwise the UI stays as it was.
+  let fishApiKey = ''
+  let autoVoiceCastingPool: 'favorite' | 'community' = 'favorite'
+  let communityVoices: FavoriteVoice[] = []
+  let communityVoicesAt = ''
+  let voicesTab: 'community' | 'favorite' = 'community'
+  let communitySearchTitle = ''
+  let communitySearchTags: string[] = []
+  let communitySearchLanguage: string[] = []
+  let communitySortBy: 'score' | 'task_count' | 'created_at' = 'score'
+  let communityPage = 1
+  let communityItems: CommunityVoice[] = []
+  let communityTotal = 0
+  let communityHasMore = false
+  let communityLoading = false
+  let communityAutoSeeded = false
   let previewController: AbortController | null = null
   let previewAudio: HTMLAudioElement | null = null
   let previewUrl: string | null = null
@@ -1990,7 +2188,7 @@ export function setup(ctx: SpindleFrontendContext) {
   rateLimitWaitInput.addEventListener('change', onRateLimitWaitInput)
   speakerDebugToggle.addEventListener('change', onSpeakerDebugChanged)
   skipNarrationToggle.addEventListener('change', onSkipNarrationChanged)
-  autoCastingToggle.addEventListener('change', () => { autoVoiceCasting = autoCastingToggle.checked; scheduleAdvancedSettingsSave() })
+  autoCastingToggle.addEventListener('change', () => { autoVoiceCasting = autoCastingToggle.checked; updatePoolControls(); scheduleAdvancedSettingsSave() })
   autoPlaybackToggle.addEventListener('change', onAutoPlaybackChanged)
 
   const addNpcInput = ctx.components.mountTextInput(addNpcInputSlot, {
@@ -2164,6 +2362,37 @@ export function setup(ctx: SpindleFrontendContext) {
       }, 35_000)
       pendingUncastRequests.set(requestId, { resolve, reject, timer })
       ctx.sendToBackend({ type: 'chat_voice_match_uncast', requestId, chatId, messageId, message, sourceHash, groups, voices, reserved, lifetime, speakerLookback, skippedTrackerTags })
+    })
+  }
+
+  const pendingCommunityRequests = new Map<string, {
+    resolve: (value: { items?: CommunityVoice[]; total?: number; hasMore?: boolean; voices?: FavoriteVoice[]; refreshedAt?: string }) => void
+    reject: (error: Error) => void
+    timer: ReturnType<typeof setTimeout>
+  }>()
+  let communityRequestSequence = 0
+
+  function requestCommunitySearch(query: { title?: string; tags?: string[]; language?: string[]; sortBy?: string; pageNumber?: number; pageSize?: number }): Promise<{ items: CommunityVoice[]; total: number; hasMore: boolean }> {
+    const requestId = `community-${Date.now().toString(36)}-${++communityRequestSequence}`
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        pendingCommunityRequests.delete(requestId)
+        reject(new Error('Community voice search timed out.'))
+      }, 35_000)
+      pendingCommunityRequests.set(requestId, { resolve: value => resolve({ items: value.items ?? [], total: value.total ?? 0, hasMore: value.hasMore ?? false }), reject, timer })
+      ctx.sendToBackend({ type: 'chat_voice_search_community', requestId, fishApiKey, title: query.title ?? '', tags: query.tags ?? [], language: query.language ?? [], sortBy: query.sortBy ?? 'score', pageNumber: query.pageNumber ?? 1, pageSize: query.pageSize ?? 20 })
+    })
+  }
+
+  function requestCommunitySnapshotRefresh(): Promise<{ voices: FavoriteVoice[]; refreshedAt: string }> {
+    const requestId = `community-snapshot-${Date.now().toString(36)}-${++communityRequestSequence}`
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        pendingCommunityRequests.delete(requestId)
+        reject(new Error('Community snapshot refresh timed out.'))
+      }, 35_000)
+      pendingCommunityRequests.set(requestId, { resolve: value => resolve({ voices: value.voices ?? [], refreshedAt: value.refreshedAt ?? '' }), reject, timer })
+      ctx.sendToBackend({ type: 'chat_voice_refresh_community_snapshot', requestId, fishApiKey })
     })
   }
 
@@ -2622,6 +2851,7 @@ export function setup(ctx: SpindleFrontendContext) {
     tagLlmModelConnectionId = modelConnectionId
     tagLlmModelComboboxEnabled = llmEnabled
     if (llmEnabled && (connectionChanged || becameEnabled)) tagLlmModelInput.refresh()
+    updateVoicesTabs()
   }
 
   function onTtsTagStyleChanged(value: string): void {
@@ -2904,9 +3134,9 @@ export function setup(ctx: SpindleFrontendContext) {
       connections.find(connection => connection.id === connectionId)?.voice ?? ''
     ).trim()
     let autoCastDiagnostics: string[] = []
-    if (preferences.autoVoiceCasting && favoriteVoices.length && (!config.narratorVoice || !config.userVoice || playbackChat.characters.some(character => !config.characterVoices[character.id]))) {
+    if (preferences.autoVoiceCasting && poolVoicesForAutoCast().length && (!config.narratorVoice || !config.userVoice || playbackChat.characters.some(character => !config.characterVoices[character.id]))) {
       flushSave()
-      const autoResult = await requestAutoCast(playbackChat.id, favoriteVoices, [connectionProfileVoice, config.narratorVoice, config.userVoice, ...Object.values(config.characterVoices)].filter(Boolean), !config.narratorVoice, !config.userVoice)
+      const autoResult = await requestAutoCast(playbackChat.id, poolVoicesForAutoCast(), [connectionProfileVoice, config.narratorVoice, config.userVoice, ...Object.values(config.characterVoices)].filter(Boolean), !config.narratorVoice, !config.userVoice)
       if (!ownsStartup()) return
       const assigned = autoResult.assignments
       autoCastDiagnostics = autoResult.diagnostics
@@ -3046,7 +3276,9 @@ export function setup(ctx: SpindleFrontendContext) {
       const reservedVoices = [
         ...Object.values(config.characterVoices), config.narratorVoice, config.userVoice, connectionProfileVoice,
       ]
-      const uncastVoices = availableUncastVoices(favoriteVoices, reservedVoices)
+      const poolVoices = poolVoicesForAutoCast()
+      if (preferences.autoVoiceCasting && speakerAssignmentDebug) appendSpeakerDebugLog(`Voice pool: ${autoVoiceCastingPool === 'community' && communityIsAvailable() ? `community (${communityVoices.length} snapshot voices)` : 'favorites'}.`)
+      const uncastVoices = availableUncastVoices(poolVoices, reservedVoices)
       const uncastMatchPromise = preferences.autoVoiceCasting && uncastGroups.length
         ? requestUncastVoiceMatches(
             playbackChat.id, messageId, preparePlaybackContent(message.content, preferences.skippedTrackerTags), hashMessageContent(message.content),
@@ -3875,7 +4107,7 @@ export function setup(ctx: SpindleFrontendContext) {
       placeholder.textContent = favoriteVoices.length ? 'Choose a favorite voice…' : 'No favorite voices yet'
       picker.appendChild(placeholder)
       for (const [category, label] of [['female', 'Female'], ['male', 'Male'], ['unspecified', 'Unspecified']] as const) {
-        const entries = favoriteVoices.filter(voice => voice.category === category)
+        const entries = favoriteVoices.filter(voice => (category === 'unspecified' ? voiceGender(voice) === 'unknown' : voiceGender(voice) === category))
         if (!entries.length) continue
         const group = document.createElement('optgroup')
         group.label = label
@@ -3918,7 +4150,7 @@ export function setup(ctx: SpindleFrontendContext) {
       if (picker.disabled) view.details.open = false
       view.options.replaceChildren()
       for (const [category, label] of [['female', 'Female'], ['male', 'Male'], ['unspecified', 'Unspecified']] as const) {
-        const entries = favoriteVoices.filter(voice => voice.category === category)
+        const entries = favoriteVoices.filter(voice => (category === 'unspecified' ? voiceGender(voice) === 'unknown' : voiceGender(voice) === category))
         if (!entries.length) continue
         const heading = document.createElement('div')
         heading.className = 'chat-voice-favorite-category'
@@ -4069,7 +4301,7 @@ export function setup(ctx: SpindleFrontendContext) {
       favoriteList.appendChild(empty)
       return
     }
-    const visibleVoices = favoriteVoices.filter(voice => favoriteFilter.value === 'unspecified' || voice.category === favoriteFilter.value)
+    const visibleVoices = favoriteVoices.filter(voice => favoriteFilter.value === 'unspecified' || voiceGender(voice) === favoriteFilter.value)
     if (!visibleVoices.length) {
       const empty = document.createElement('div')
       empty.className = 'chat-voice-hint'
@@ -4099,10 +4331,18 @@ export function setup(ctx: SpindleFrontendContext) {
         option.textContent = label
         category.appendChild(option)
       }
+      if (voice.category && !['unspecified', 'male', 'female'].includes(voice.category)) {
+        const option = document.createElement('option')
+        option.value = voice.category
+        option.textContent = voice.category
+        category.appendChild(option)
+      }
       category.value = voice.category
       category.addEventListener('change', () => {
+        const legacy = voice.category === 'male' || voice.category === 'female' || voice.category === 'unspecified'
         const nextCategory = category.value === 'male' || category.value === 'female'
-          ? category.value : 'unspecified'
+          ? category.value
+          : (legacy ? 'unspecified' : category.value || 'unspecified')
         category.disabled = true
         void saveFavoriteVoices(favoriteVoices.map(item => item.id === voice.id
           ? { ...item, category: nextCategory } : item))
@@ -4202,6 +4442,230 @@ export function setup(ctx: SpindleFrontendContext) {
     void saveFavoriteVoices(next, voice)
       .then(saved => { if (saved) { favoriteName.value = ''; favoriteId.value = ''; favoriteDescription.value = '' } })
   })
+
+  communityTabButton.addEventListener('click', () => { voicesTab = 'community'; updateVoicesTabs(); renderCommunityBrowse(); maybeAutoSeedSnapshot() })
+  favoriteTabButton.addEventListener('click', () => { voicesTab = 'favorite'; updateVoicesTabs() })
+  function readCommunityFilterText(value: string): string[] {
+    return value.split(',').map(item => item.trim()).filter(Boolean).slice(0, 8)
+  }
+  communitySearchButton.addEventListener('click', () => {
+    communitySearchTitle = communitySearch.value.trim().slice(0, 128)
+    communitySearchTags = readCommunityFilterText(communityTags.value)
+    communitySearchLanguage = readCommunityFilterText(communityLanguage.value)
+    communitySortBy = communitySort.value === 'task_count' || communitySort.value === 'created_at' ? communitySort.value : 'score'
+    void runCommunitySearch(1)
+  })
+  communitySearch.addEventListener('keydown', event => { if (event.key === 'Enter') { event.preventDefault(); communitySearchButton.click() } })
+  communityPrev.addEventListener('click', () => void runCommunitySearch(Math.max(1, communityPage - 1)))
+  communityNext.addEventListener('click', () => void runCommunitySearch(communityPage + 1))
+  communityKeySave.addEventListener('click', () => {
+    const key = communityKeyInput.value.trim().slice(0, 512)
+    if (!key) { setStatus('Enter your Fish Audio API key first.', 'error'); return }
+    communityKeySave.disabled = true
+    updateVoiceSettings(current => ({ ...current, chatVoiceFishApiKey: key }))
+      .then(() => {
+        fishApiKey = key
+        communityKeyInput.value = ''
+        setStatus('Fish Audio API key saved globally.', 'saved')
+        updateVoicesTabs()
+        maybeAutoSeedSnapshot()
+      })
+      .catch(error => setStatus(error instanceof Error ? error.message : 'Could not save the Fish Audio API key.', 'error'))
+      .finally(() => { communityKeySave.disabled = false })
+  })
+  autoVoicePoolSelect.addEventListener('change', () => {
+    autoVoiceCastingPool = autoVoicePoolSelect.value === 'community' ? 'community' : 'favorite'
+    scheduleAdvancedSettingsSave()
+    if (autoVoiceCastingPool === 'community') maybeAutoSeedSnapshot()
+  })
+  autoVoicePoolRefresh.addEventListener('click', () => void refreshCommunitySnapshot())
+
+  function communityIsAvailable(): boolean {
+    return ttsTagStyle === 'fish'
+  }
+
+  function updateVoicesTabs(): void {
+    const fish = communityIsAvailable()
+    voicesTabStrip.hidden = !fish
+    favoritesTitle.textContent = fish ? 'Voice library' : 'Favorite voices'
+    if (!fish) {
+      if (voicesTab === 'community') voicesTab = 'favorite'
+      favoritesSection.hidden = false
+      communitySection.hidden = true
+    } else {
+      favoritesSection.hidden = voicesTab !== 'favorite'
+      communitySection.hidden = voicesTab !== 'community'
+    }
+    communityTabButton.setAttribute('aria-selected', String(voicesTab === 'community'))
+    favoriteTabButton.setAttribute('aria-selected', String(voicesTab === 'favorite'))
+    communityKeyRow.hidden = !fish || !!fishApiKey
+    updatePoolControls()
+    if (fish) { maybeAutoSeedSnapshot(); renderCommunityBrowse() }
+  }
+
+  function updatePoolControls(): void {
+    const fish = communityIsAvailable()
+    autoVoicePoolRow.hidden = !fish
+    autoVoicePoolSelect.disabled = !autoCastingToggle.checked || !fish
+    autoVoicePoolRefresh.disabled = !fish || !fishApiKey || communityLoading
+    refreshPoolStatus()
+  }
+
+  function communitySnapshotStale(): boolean {
+    if (!communityVoices.length) return true
+    if (!communityVoicesAt) return true
+    const at = Date.parse(communityVoicesAt)
+    return !Number.isFinite(at) || Date.now() - at > 24 * 60 * 60 * 1000
+  }
+
+  function refreshPoolStatus(): void {
+    if (!communityVoices.length) {
+      communityPoolStatus.textContent = 'Pool snapshot is empty. Refresh it, or browse the Community tab to import voices into favorites.'
+      return
+    }
+    const at = communityVoicesAt ? new Date(communityVoicesAt).toLocaleString() : 'unknown time'
+    communityPoolStatus.textContent = `Pool snapshot: ${communityVoices.length} voices refreshed at ${at}.`
+  }
+
+  function poolVoicesForAutoCast(): FavoriteVoice[] {
+    if (autoVoiceCastingPool === 'community' && communityIsAvailable()) {
+      if (communityVoices.length) return communityVoices
+      if (speakerAssignmentDebug) appendSpeakerDebugLog('Voice pool: community pool is empty or snapshot unavailable; favorites are used instead.')
+    }
+    return favoriteVoices
+  }
+
+  async function refreshCommunitySnapshot(): Promise<void> {
+    if (!fishApiKey) {
+      communityPoolStatus.textContent = 'Add your Fish Audio API key in the Community tab to refresh the pool.'
+      setStatus('Add your Fish Audio API key before refreshing the community voice pool.', 'error')
+      return
+    }
+    if (communityLoading) return
+    communityLoading = true
+    autoVoicePoolRefresh.disabled = true
+    communityPoolStatus.textContent = 'Refreshing snapshot…'
+    setStatus('Refreshing the community voice pool snapshot…')
+    try {
+      const { voices, refreshedAt } = await requestCommunitySnapshotRefresh()
+      if (!voices.length) throw new Error('Fish Audio returned no community voices.')
+      communityVoices = voices
+      communityVoicesAt = refreshedAt
+      await updateVoiceSettings(current => ({
+        ...current,
+        chatVoiceCommunityVoicePool: voices,
+        chatVoiceCommunityVoicePoolAt: refreshedAt,
+      }))
+      setStatus('Community voice pool refreshed.', 'saved')
+    } catch (error) {
+      communityPoolStatus.textContent = error instanceof Error ? error.message : 'Community pool refresh failed.'
+      setStatus(error instanceof Error ? error.message : 'Community pool refresh failed.', 'error')
+    } finally {
+      communityLoading = false
+      updatePoolControls()
+    }
+  }
+
+  function maybeAutoSeedSnapshot(): void {
+    if (communityAutoSeeded || communityLoading || !fishApiKey) return
+    if (!communitySnapshotStale()) { communityAutoSeeded = true; return }
+    communityAutoSeeded = true
+    void refreshCommunitySnapshot()
+  }
+
+  function renderCommunityBrowse(): void {
+    communityList.replaceChildren()
+    const empty = (text: string) => {
+      const line = document.createElement('div')
+      line.className = 'chat-voice-hint'
+      line.textContent = text
+      communityList.appendChild(line)
+    }
+    if (communityLoading) {
+      empty('Searching Fish community voices…')
+    } else if (!fishApiKey) {
+      empty('Add your Fish Audio API key above to browse community voices. It is stored only in your global voice settings.')
+    } else if (!communityItems.length) {
+      empty('No community voices match this search.')
+    } else {
+      for (const voice of communityItems) {
+        const row = document.createElement('div')
+        row.className = 'chat-voice-community-row'
+        const copy = document.createElement('span')
+        copy.className = 'chat-voice-community-copy'
+        copy.textContent = voice.title || voice.id
+        copy.title = voice.id
+        if (voice.author) {
+          const author = document.createElement('small')
+          author.textContent = `by ${voice.author}`
+          copy.appendChild(author)
+        }
+        if (voice.description) {
+          const description = document.createElement('small')
+          description.textContent = voice.description
+          copy.appendChild(description)
+        }
+        const stats = document.createElement('span')
+        stats.className = 'chat-voice-community-stats'
+        stats.textContent = `${voice.likeCount.toLocaleString()} likes · ${voice.taskCount.toLocaleString()} plays${voice.licensedNote ? ' · ' + voice.licensedNote : ''}${voice.tags.length ? ` · ${voice.tags.join(', ')}` : ''}`
+        const preview = createCastPreviewButton(() => voice.title || voice.id, () => voice.id)
+        const alreadyFavorited = favoriteVoices.some(item => item.id === voice.id)
+        const importButton = document.createElement('button')
+        importButton.type = 'button'
+        importButton.className = 'chat-voice-add-button'
+        importButton.textContent = alreadyFavorited ? 'Favorited' : 'Import'
+        importButton.disabled = alreadyFavorited
+        importButton.addEventListener('click', () => importCommunityVoice(voice))
+        row.append(copy, stats, preview, importButton)
+        communityList.appendChild(row)
+      }
+    }
+    communityPageLabel.textContent = communityItems.length ? `Page ${communityPage}${communityTotal > 0 ? ` of ${Math.max(1, Math.ceil(communityTotal / 20))}` : ''}` : ''
+    communityPrev.disabled = communityPage <= 1 || communityLoading || !fishApiKey
+    communityNext.disabled = !communityHasMore || communityLoading || !fishApiKey
+    communitySearchButton.disabled = communityLoading || !fishApiKey
+  }
+
+  async function runCommunitySearch(page: number): Promise<void> {
+    if (!fishApiKey) return
+    communityPage = page
+    communityLoading = true
+    communityError.hidden = true
+    renderCommunityBrowse()
+    try {
+      const { items, total, hasMore } = await requestCommunitySearch({
+        title: communitySearchTitle,
+        tags: communitySearchTags,
+        language: communitySearchLanguage,
+        sortBy: communitySortBy,
+        pageNumber: page,
+        pageSize: 20,
+      })
+      communityItems = items
+      communityTotal = total
+      communityHasMore = hasMore
+    } catch (error) {
+      communityItems = []
+      communityError.textContent = error instanceof Error ? error.message : 'Community voice search failed.'
+      communityError.hidden = false
+    } finally {
+      communityLoading = false
+      renderCommunityBrowse()
+    }
+  }
+
+  function importCommunityVoice(voice: CommunityVoice): void {
+    try {
+      const favorite = communityVoiceToFavorite(voice)
+      const next = upsertCommunityFavorite(favoriteVoices, voice)
+      favoriteError.hidden = true
+      void saveFavoriteVoices(next)
+        .then(saved => { if (saved) renderCommunityBrowse() })
+        .catch(() => undefined) // saveFavoriteVoices already shows the error status
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : 'That community voice could not be imported.', 'error')
+    }
+  }
 
   function removeExpiredGhostCards() {
     if (!activeChat) return
@@ -4617,6 +5081,12 @@ export function setup(ctx: SpindleFrontendContext) {
         refreshLocalState()
         autoVoiceCasting = preferences.autoVoiceCasting
         autoCastingToggle.checked = autoVoiceCasting
+        autoVoiceCastingPool = preferences.autoVoiceCastingPool
+        autoVoicePoolSelect.value = autoVoiceCastingPool
+        fishApiKey = preferences.fishApiKey
+        communityVoices = preferences.communityVoicePool
+        communityVoicesAt = preferences.communityVoicePoolAt
+        refreshPoolStatus()
         if (autoPlayback !== preferences.autoPlayback) {
           autoPlaybackEpoch += 1
           autoPlaybackRequests.cancelAll()
@@ -4792,6 +5262,7 @@ export function setup(ctx: SpindleFrontendContext) {
         autoPlaybackDelaySeconds,
         speakerLookback,
         skipNarration,
+        autoVoiceCastingPool,
       )
       setStatus('Advanced playback settings saved globally.', 'saved')
     } catch (error) {
@@ -5008,7 +5479,27 @@ export function setup(ctx: SpindleFrontendContext) {
       | LlmConnectionsPayload
       | TagPlacementPayload
       | UncastMatchPayload
+      | CommunityResultsPayload
+      | CommunitySnapshotPayload
       | AutoCastPayload
+    if (payload.type === 'chat_voice_community_results') {
+      const pending = pendingCommunityRequests.get(payload.requestId)
+      if (!pending) return
+      clearTimeout(pending.timer)
+      pendingCommunityRequests.delete(payload.requestId)
+      if (payload.error) pending.reject(new Error(payload.error))
+      else pending.resolve({ items: payload.items, total: payload.total, hasMore: payload.hasMore })
+      return
+    }
+    if (payload.type === 'chat_voice_community_snapshot_result') {
+      const pending = pendingCommunityRequests.get(payload.requestId)
+      if (!pending) return
+      clearTimeout(pending.timer)
+      pendingCommunityRequests.delete(payload.requestId)
+      if (payload.error) pending.reject(new Error(payload.error))
+      else pending.resolve({ voices: readCommunityVoicePool(payload.voices), refreshedAt: payload.refreshedAt })
+      return
+    }
     if (payload.type === 'chat_voice_auto_cast_result') {
       const pending = pendingAutoCast.get(payload.requestId)
       if (pending) { clearTimeout(pending.timer); pendingAutoCast.delete(payload.requestId); pending.resolve({ assignments: payload.assignments, diagnostics: payload.diagnostics ?? [] }) }
@@ -5137,6 +5628,11 @@ export function setup(ctx: SpindleFrontendContext) {
         pending.reject(new Error('The active chat changed before uncast voice matching completed.'))
       }
       pendingUncastRequests.clear()
+      for (const pending of pendingCommunityRequests.values()) {
+        clearTimeout(pending.timer)
+        pending.reject(new Error('The active chat changed before the community voice request completed.'))
+      }
+      pendingCommunityRequests.clear()
       for (const pending of pendingDecisionStatusRequests.values()) {
         clearTimeout(pending.timer)
         pending.reject(new Error('The active chat changed before the Decision connection check completed.'))
@@ -5332,6 +5828,11 @@ export function setup(ctx: SpindleFrontendContext) {
       pending.reject(new Error('Chat Voice was closed.'))
     }
     pendingUncastRequests.clear()
+    for (const pending of pendingCommunityRequests.values()) {
+      clearTimeout(pending.timer)
+      pending.reject(new Error('Chat Voice was closed.'))
+    }
+    pendingCommunityRequests.clear()
     for (const pending of pendingAutoCast.values()) { clearTimeout(pending.timer); pending.resolve({ assignments: {}, diagnostics: [] }) }
     pendingAutoCast.clear()
     for (const pending of pendingDecisionStatusRequests.values()) {
@@ -5389,6 +5890,7 @@ export function setup(ctx: SpindleFrontendContext) {
         autoPlaybackDelaySeconds,
         speakerLookback,
         skipNarration,
+        autoVoiceCastingPool,
       )
     }
     skippedTrackerTagsInput.destroy()

@@ -132,6 +132,14 @@ import {
   readConfig,
   readSavedAudioHistory,
   readFavoriteVoices,
+  readCommunityVoice,
+  readCommunityVoiceList,
+  readCommunityVoicePool,
+  communityVoiceToFavorite,
+  upsertCommunityFavorite,
+  voiceCategoryGender,
+  voiceGender,
+  voiceGenderCompatible,
   resolveSpeakerDecisionSegments,
   resolveSpeakerDiscourseAnswers,
   resolveTtsTagAnswers,
@@ -2009,8 +2017,22 @@ test('validates favorite voice IDs and classifications', () => {
   ]), [
     { id: 'voice-1', name: 'Alice', category: 'female', description: 'warm and gentle' },
     { id: 'voice-2', name: 'Bob', category: 'male', description: '' },
-    { id: 'voice-3', name: '', category: 'unspecified', description: '' },
+    { id: 'voice-3', name: '', category: 'other', description: '' },
   ])
+  // Legacy rows without a recognized category still default to unspecified.
+  assert.deepEqual(readFavoriteVoices([{ id: 'voice-4' }]), [
+    { id: 'voice-4', name: '', category: 'unspecified', description: '' },
+  ])
+  // Community metadata survives a save/load round trip.
+  assert.deepEqual(readFavoriteVoices([{
+    id: 'voice-5', name: 'Mother Jinx', category: 'anime character', description: 'commanding',
+    author: 'someone', source: 'community', communityLink: 'https://fish.audio/m/voice-5',
+    tags: ['anime', 'female', 'english'],
+  }]), [{
+    id: 'voice-5', name: 'Mother Jinx', category: 'anime character', description: 'commanding',
+    author: 'someone', source: 'community', communityLink: 'https://fish.audio/m/voice-5',
+    tags: ['anime', 'female', 'english'],
+  }])
   assert.deepEqual(readFavoriteVoices(null), [])
 })
 
@@ -2020,6 +2042,76 @@ test('rejects duplicate favorite voice IDs even if names differ or whitespace is
   assert.throws(() => addFavoriteVoice(existing, duplicate), /already a favorite/u)
   assert.deepEqual(existing.map(voice => voice.name), ['First'])
   assert.equal(addFavoriteVoice(existing, { ...duplicate, id: 'voice-1' }).length, 2)
+})
+
+test('voiceCategoryGender reads expanded categories with word boundaries', () => {
+  assert.equal(voiceCategoryGender('female'), 'female')
+  assert.equal(voiceCategoryGender('Female voice'), 'female')
+  assert.equal(voiceCategoryGender('young female'), 'female')
+  assert.equal(voiceCategoryGender('male'), 'male')
+  assert.equal(voiceCategoryGender('Young Male'), 'male')
+  assert.equal(voiceCategoryGender('elderly man'), 'unspecified')
+  assert.equal(voiceCategoryGender('anime character'), 'unspecified')
+  assert.equal(voiceCategoryGender('unspecified'), 'unspecified')
+  assert.equal(voiceCategoryGender(''), 'unspecified')
+})
+
+test('voiceGender prefers an explicit hint, then category, then tags', () => {
+  assert.equal(voiceGender({ category: 'anime character' }), 'unknown')
+  assert.equal(voiceGender({ category: 'anime character', tags: ['female', 'english'] }), 'female')
+  assert.equal(voiceGender({ category: 'female', tags: ['male'] }), 'female')
+  assert.equal(voiceGender({ category: 'anime character', gender: 'male' }), 'male')
+  assert.equal(voiceGenderCompatible({ category: 'young male' }, 'male'), true)
+  assert.equal(voiceGenderCompatible({ category: 'young male' }, 'female'), false)
+  assert.equal(voiceGenderCompatible({ category: 'anime character' }, 'female'), true)
+  assert.equal(voiceGenderCompatible({ category: 'female' }, 'unknown'), true)
+})
+
+test('communityVoiceToFavorite maps Fish metadata onto expanded favorites', () => {
+  const voice = readCommunityVoice({
+    _id: 'model-1',
+    title: 'Mother Jinx',
+    description: 'A commanding and mature female voice with a theatrical, dramatic flair.',
+    tags: ['anime', 'female', 'english'],
+    languages: ['en'],
+    author: { _id: 'author-1', nickname: 'someone' },
+    like_count: 123,
+    task_count: 45,
+    licensed: true,
+  })
+  assert.ok(voice)
+  assert.deepEqual([voice.id, voice.title, voice.category, voice.author, voice.communityLink, voice.likeCount, voice.taskCount], [
+    'model-1', 'Mother Jinx', 'anime', 'someone', 'https://fish.audio/m/model-1', 123, 45,
+  ])
+  const favorite = communityVoiceToFavorite(voice)
+  assert.equal(favorite.category, 'anime')
+  assert.deepEqual(favorite.tags, ['anime', 'female', 'english'])
+  assert.equal(voiceGender(favorite), 'female')
+  assert.equal(readCommunityVoice({ title: 'no id' }), null)
+  assert.equal(readCommunityVoice(null), null)
+})
+
+test('readCommunityVoiceList and readCommunityVoicePool parse Fish payloads and snapshots tolerantly', () => {
+  assert.deepEqual(readCommunityVoiceList({ total: 2, items: [{ _id: 'one' }, { title: 'skipped' }], has_more: true }), {
+    items: [{ id: 'one', title: '', description: '', category: '', tags: [], languages: [], author: '', likeCount: 0, taskCount: 0, licensed: false, licensedNote: null, communityLink: 'https://fish.audio/m/one' }],
+    total: 2, hasMore: true,
+  })
+  assert.equal(readCommunityVoiceList(null), null)
+  assert.equal(readCommunityVoiceList({ items: 'nope' }), null)
+  // A snapshot way out of bounds is still trimmed to the live pool capacity.
+  const pool = readCommunityVoicePool([{ id: 'a' }, { _id: 'b', title: 'fish row' }, null])
+  assert.deepEqual(pool.map(entry => entry.id), ['a', 'b'])
+})
+
+test('upsertCommunityFavorite adds once and updates metadata in place', () => {
+  const voice = readCommunityVoice({ _id: 'model-1', title: 'First name', tags: ['anime', 'male'] })!
+  const added = upsertCommunityFavorite([], voice)
+  assert.equal(added.length, 1)
+  assert.equal(added[0].source, 'community')
+  const updated = upsertCommunityFavorite(added, { ...voice, title: 'Renamed' })
+  assert.equal(updated.length, 1)
+  assert.equal(updated[0].name, 'Renamed')
+  assert.ok(!JSON.stringify(updated).includes('undefined'))
 })
 
 test('matches uncast voice groups without using cast voices or crossing gender categories', () => {

@@ -114,8 +114,41 @@ export const MAX_SAVED_AUDIO_LIMIT = 10_000
 export interface FavoriteVoice {
   id: string
   name: string
-  category: 'male' | 'female' | 'unspecified'
+  /** Free-form classification. Legacy values 'male'/'female'/'unspecified' still read fine. */
+  category: string
   description: string
+  gender?: 'male' | 'female' | undefined
+  author?: string
+  source?: 'community' | 'favorite' | undefined
+  communityLink?: string
+  tags?: string[] | undefined
+}
+
+/** Derive a male/female hint from a free-form category string. */
+export function voiceCategoryGender(category: string): 'male' | 'female' | 'unspecified' {
+  const value = (category ?? '').trim().toLowerCase()
+  if (!value) return 'unspecified'
+  if (/\bfemale\b/.test(value)) return 'female'
+  if (/\bmale\b/.test(value)) return 'male'
+  return 'unspecified'
+}
+
+/** Gender hint for a stored favorite, falling back to tag/category inspection. */
+export function voiceGender(voice: { category: string; tags?: readonly string[]; gender?: 'male' | 'female' | undefined }): 'male' | 'female' | 'unknown' {
+  if (voice.gender === 'male' || voice.gender === 'female') return voice.gender
+  const fromCategory = voiceCategoryGender(voice.category)
+  if (fromCategory !== 'unspecified') return fromCategory
+  for (const tag of voice.tags ?? []) {
+    const tagGender = voiceCategoryGender(tag)
+    if (tagGender !== 'unspecified') return tagGender
+  }
+  return 'unknown'
+}
+
+/** A voice is eligible for a gendered role when its hint agrees or is unknown. */
+export function voiceGenderCompatible(voice: { category: string; tags?: readonly string[]; gender?: 'male' | 'female' | undefined }, gender: 'male' | 'female' | 'unknown'): boolean {
+  const hint = voiceGender(voice)
+  return gender === 'unknown' || hint === 'unknown' || hint === gender
 }
 
 /** Validate globally saved favorites without changing the case of provider IDs. */
@@ -133,11 +166,134 @@ export function readFavoriteVoices(value: unknown): FavoriteVoice[] {
     result.push({
       id,
       name: typeof row.name === 'string' ? row.name.trim().slice(0, 128) : '',
-      category: row.category === 'male' || row.category === 'female' ? row.category : 'unspecified',
+      category: typeof row.category === 'string' && row.category.trim()
+        ? row.category.trim().slice(0, 64)
+        : 'unspecified',
       description: typeof row.description === 'string' ? row.description.trim().slice(0, 500) : '',
+      ...(row.gender === 'male' || row.gender === 'female' ? { gender: row.gender } : {}),
+      ...(typeof row.author === 'string' && row.author.trim() ? { author: row.author.trim().slice(0, 128) } : {}),
+      ...(row.source === 'community' || row.source === 'favorite' ? { source: row.source } : {}),
+      ...(typeof row.communityLink === 'string' && row.communityLink.trim() ? { communityLink: row.communityLink.trim().slice(0, 512) } : {}),
+      ...(Array.isArray(row.tags)
+        ? { tags: row.tags.filter((value): value is string => typeof value === 'string').map(value => value.trim().slice(0, 64)).filter(Boolean).slice(0, 8) }
+        : {}),
     })
   }
   return result
+}
+
+/** A normalized Fish Audio community voice, safe to store and display. */
+export interface CommunityVoice {
+  id: string
+  title: string
+  description: string
+  category: string
+  tags: string[]
+  languages: string[]
+  author: string
+  likeCount: number
+  taskCount: number
+  licensed: boolean
+  licensedNote: string | null
+  communityLink: string
+}
+
+const FISH_LANGUAGE_WORDS = new Set(['english', 'japanese', 'chinese', 'french', 'german', 'spanish', 'korean', 'italian', 'russian', 'portuguese', 'arabic', 'hindi', 'dutch', 'polish', 'turkish', 'vietnamese', 'thai', 'indonesian', 'en', 'ja', 'zh', 'fr', 'de', 'es', 'ko', 'it', 'ru', 'pt', 'ar', 'hi', 'nl', 'pl', 'tr', 'vi', 'th', 'id'])
+
+/** Normalize one Fish `/model` payload entry into a community voice. */
+export function readCommunityVoice(row: unknown): CommunityVoice | null {
+  if (!row || typeof row !== 'object') return null
+  const item = row as Record<string, unknown>
+  const id = typeof item._id === 'string' ? item._id.trim().slice(0, 512) : ''
+  if (!id) return null
+  const title = typeof item.title === 'string' ? item.title.trim().slice(0, 128) : ''
+  const description = typeof item.description === 'string' ? item.description.trim().slice(0, 500) : ''
+  const tags = Array.isArray(item.tags)
+    ? item.tags.filter((value): value is string => typeof value === 'string').map(value => value.trim().slice(0, 64)).filter(Boolean).slice(0, 16)
+    : []
+  const languages = Array.isArray(item.languages)
+    ? item.languages.filter((value): value is string => typeof value === 'string').map(value => value.trim().slice(0, 32)).filter(Boolean).slice(0, 8)
+    : []
+  const author = item.author && typeof item.author === 'object' && typeof (item.author as Record<string, unknown>).nickname === 'string'
+    ? (item.author as Record<string, unknown>).nickname as string
+    : ''
+  const likeCount = typeof item.like_count === 'number' && Number.isFinite(item.like_count) ? Math.max(0, Math.round(item.like_count)) : 0
+  const taskCount = typeof item.task_count === 'number' && Number.isFinite(item.task_count) ? Math.max(0, Math.round(item.task_count)) : 0
+  const licensed = item.licensed === true
+  const classification = tags.find(tag => !['male', 'female'].includes(tag.toLowerCase()) && !FISH_LANGUAGE_WORDS.has(tag.toLowerCase()))
+  return {
+    id,
+    title,
+    description,
+    category: classification ?? '',
+    tags,
+    languages,
+    author: author.trim().slice(0, 128),
+    likeCount,
+    taskCount,
+    licensed,
+    licensedNote: licensed ? 'Licensed by Fish Audio (rights secured from the voice owner)' : null,
+    communityLink: `https://fish.audio/m/${id}`,
+  }
+}
+
+/** Parse a Fish `/model` list payload into community voices plus pagination. */
+export function readCommunityVoiceList(payload: unknown): { items: CommunityVoice[]; total: number; hasMore: boolean } | null {
+  if (!payload || typeof payload !== 'object') return null
+  const row = payload as Record<string, unknown>
+  if (!Array.isArray(row.items)) return null
+  const items = row.items.flatMap(item => {
+    const voice = readCommunityVoice(item)
+    return voice ? [voice] : []
+  }).slice(0, 100)
+  return {
+    items,
+    total: typeof row.total === 'number' && Number.isFinite(row.total) ? Math.max(0, Math.round(row.total)) : items.length,
+    hasMore: row.has_more === true,
+  }
+}
+
+/** The cached casting pool is stored as favorites so casting code is pool-agnostic. */
+export function readCommunityVoicePool(value: unknown): FavoriteVoice[] {
+  if (!Array.isArray(value)) return []
+  return value.slice(0, 500).flatMap(item => {
+    if (!item || typeof item !== 'object') return []
+    const row = item as Record<string, unknown>
+    const voice = readCommunityVoice(row)
+    if (!voice) {
+      const fallback = readFavoriteVoices([row])
+      return fallback
+    }
+    return [communityVoiceToFavorite(voice)]
+  })
+}
+
+/** Import a community voice into the user's favorites with its metadata preserved. */
+export function communityVoiceToFavorite(voice: CommunityVoice): FavoriteVoice {
+  const gender = ['male', 'female'].find(tag => voice.tags.some(item => item.toLowerCase() === tag)) as 'male' | 'female' | undefined
+  return {
+    id: voice.id,
+    name: voice.title,
+    category: voice.category || (gender ?? 'unspecified'),
+    description: voice.description,
+    ...(gender ? { gender } : {}),
+    ...(voice.author ? { author: voice.author } : {}),
+    source: 'community',
+    communityLink: voice.communityLink,
+    ...(voice.tags.length ? { tags: voice.tags } : {}),
+  }
+}
+
+/** Add or update a favorite from the community catalog so imports are idempotent. */
+export function upsertCommunityFavorite(existing: FavoriteVoice[], voice: CommunityVoice): FavoriteVoice[] {
+  const favorite = communityVoiceToFavorite(voice)
+  const id = favorite.id.trim().slice(0, 512)
+  if (!id) throw new Error('That community voice has no voice ID.')
+  if (!existing.some(item => item.id === id) && existing.length >= 500) throw new Error('The favorites list is limited to 500 voices.')
+  if (existing.some(item => item.id === id)) {
+    return existing.map(item => (item.id === id ? { ...item, ...favorite, id } : item))
+  }
+  return [...existing, favorite]
 }
 
 /** Reject duplicate provider IDs while preserving all existing favorites. */
@@ -501,7 +657,7 @@ export function canReserveAutomaticVoice(voiceId: string, reserved: ReadonlySet<
 /** Select a suitable unused favorite from Jev's ranking, respecting known gender. */
 export function selectAutomaticVoice(voices: FavoriteVoice[], used: ReadonlySet<string>, answer: SpeakerDecisionChoice, gender: string): string {
   const eligible = voices.map((voice, index) => ({ voice, probability: answer.probabilities[`voice_${index}`] ?? 0 }))
-    .filter(item => !used.has(item.voice.id) && (gender === 'unknown' || item.voice.category === 'unspecified' || item.voice.category === gender))
+    .filter(item => !used.has(item.voice.id) && voiceGenderCompatible(item.voice, gender as 'male' | 'female' | 'unknown'))
   if (eligible.length === 1) return eligible[0].voice.id
   if (answer.choice === 'no_match') return ''
   return eligible.filter(item => item.probability > 0).sort((a, b) => b.probability - a.probability)[0]?.voice.id ?? ''
@@ -1077,7 +1233,7 @@ export function resolveUncastVoiceDecisions(
     if (!ghost) {
       const matches = members.map(group => answers[`voice_${group.id}`]).filter((answer): answer is SpeakerDecisionChoice => !!answer)
       const eligible = voices.flatMap((voice, index) => {
-        if (used.has(voice.id) || (gender !== 'unknown' && voice.category !== 'unspecified' && voice.category !== gender)) return []
+        if (used.has(voice.id) || !voiceGenderCompatible(voice, gender as 'male' | 'female' | 'unknown')) return []
         const scores = matches.map(match => match.probabilities[`voice_${index}`] ?? 0).filter(score => Number.isFinite(score) && score > 0)
         return [{ voice, score: scores.length ? scores.reduce((sum, score) => sum + score, 0) / scores.length : 0, index }]
       })
