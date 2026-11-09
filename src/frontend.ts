@@ -1177,6 +1177,15 @@ export function setup(ctx: SpindleFrontendContext) {
     .chat-voice-community-stats { color:var(--lumiverse-text-muted); font-size:11px; white-space:nowrap; }
     .chat-voice-pool-row { display:grid; grid-template-columns:minmax(0, 1fr) auto; gap:8px; align-items:center; }
     .chat-voice-pool-refresh-row { display:flex; align-items:center; flex-wrap:wrap; gap:8px; }
+    .chat-voice-community-pager { display:flex; align-items:center; gap:8px; }
+    .chat-voice-community-pager .chat-voice-add-button { min-width:48px; }
+    @media (max-width: 560px) {
+      .chat-voice-favorite-form { grid-template-columns: minmax(0, 1fr); }
+      .chat-voice-community-toolbar { grid-template-columns: minmax(0, 1fr) minmax(0, auto); }
+      .chat-voice-community-toolbar .chat-voice-add-button { grid-column: 1 / -1; }
+      .chat-voice-community-subtoolbar { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+      .chat-voice-community-stats { white-space: normal; overflow-wrap: anywhere; }
+    }
     .chat-voice-pool-row select {
       min-width:0; min-height:36px; padding:7px 9px; border:1px solid var(--lumiverse-border);
       border-radius:var(--lumiverse-radius); background:var(--lumiverse-bg-secondary, #222); color:var(--lumiverse-text); font:inherit; font-size:12px;
@@ -1401,8 +1410,11 @@ export function setup(ctx: SpindleFrontendContext) {
   const communityPageLabel = document.createElement('span')
   communityPageLabel.className = 'chat-voice-community-stats'
   communityPageLabel.textContent = ''
-  communitySubtoolbar.append(communityTags, communityLanguage, communityPrev, communityNext)
-  communitySection.append(communityToolbar, communitySubtoolbar)
+  const communityPager = document.createElement('div')
+  communityPager.className = 'chat-voice-community-pager'
+  communityPager.append(communityPrev, communityPageLabel, communityNext)
+  communitySubtoolbar.append(communityTags, communityLanguage)
+  communitySection.append(communityToolbar, communitySubtoolbar, communityPager)
   const communityList = document.createElement('div')
   communityList.className = 'chat-voice-favorite-list'
   communityList.setAttribute('role', 'region')
