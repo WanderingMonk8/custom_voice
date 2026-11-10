@@ -2369,9 +2369,6 @@ function invalidSpeakerReviewAnswers(questions, answers) {
     return [];
   });
 }
-var BEST_AVAILABLE_KNOWN_CAST_MIN_PROBABILITY = 0.65;
-var BEST_AVAILABLE_KNOWN_CAST_MIN_CONFIDENCE = 0.55;
-var BEST_AVAILABLE_KNOWN_CAST_MIN_MARGIN = 0.15;
 function buildBestAvailableSpeakerReview(plan, answers, context, cardSpeakerId = null) {
   const grounded = independentlyGroundedSpeakerIds(plan, context, cardSpeakerId);
   const knownCriteria = speakerDecisionCriteria(plan.state.speakers.slice(0, 220));
@@ -2411,26 +2408,10 @@ function buildBestAvailableSpeakerReview(plan, answers, context, cardSpeakerId =
 function applyBestAvailableSpeakerReview(plan, answers, review, results) {
   for (const [id, question] of Object.entries(review.questions)) {
     const answer = results[id];
-    if (invalidSpeakerReviewAnswers({ [id]: question }, { [id]: answer }).length || !Object.hasOwn(review.options, answer.choice)) continue;
+    if (invalidSpeakerReviewAnswers({ [id]: question }, { [id]: answer }).length || !Object.hasOwn(review.options, answer.choice) || answer.confidence < 0.2 || (answer.probabilities[answer.choice] ?? 0) < 0.25) continue;
     const speechId = id.slice("best_guess_".length);
     if (!answers[`global_uncertain_${speechId}`]) continue;
-    const identity = review.options[answer.choice];
-    const isTemporaryGhost = identity?.startsWith("ghost:");
-    const isKnownSpeaker = !isTemporaryGhost && identity !== UNCAST_SPEAKER_ID && identity !== "no_clear_identity";
-    if (isKnownSpeaker) {
-      const probability = answer.probabilities[answer.choice] ?? 0;
-      const runnerUp = Math.max(0, ...Object.entries(answer.probabilities).filter(([choice]) => choice !== answer.choice).map(([, value]) => value));
-      const uncastOption = Object.entries(review.options).find(([, optionIdentity]) => optionIdentity === UNCAST_SPEAKER_ID)?.[0];
-      if (probability < BEST_AVAILABLE_KNOWN_CAST_MIN_PROBABILITY || answer.confidence < BEST_AVAILABLE_KNOWN_CAST_MIN_CONFIDENCE || probability - runnerUp < BEST_AVAILABLE_KNOWN_CAST_MIN_MARGIN) {
-        if (uncastOption) {
-          plan.optionSpeakerIds[uncastOption] = UNCAST_SPEAKER_ID;
-          answers[id] = { choice: uncastOption, probabilities: { [uncastOption]: 1 }, confidence: 1 };
-        }
-        continue;
-      }
-    }
-    if (answer.confidence < 0.2 || (answer.probabilities[answer.choice] ?? 0) < 0.25) continue;
-    plan.optionSpeakerIds[answer.choice] = identity;
+    plan.optionSpeakerIds[answer.choice] = review.options[answer.choice];
     answers[id] = answer;
   }
 }

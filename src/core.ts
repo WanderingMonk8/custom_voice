@@ -4335,14 +4335,6 @@ export function invalidSpeakerReviewAnswers(questions: SpeakerDecisionPlan['ques
   })
 }
 
-/** A best-available guess is a last resort, so assigning a known cast voice to
- * an unnamed exchange requires stronger evidence than an ordinary first-pass
- * answer. Weak guesses are left for the uncast pool, where recurring ghosts
- * can still reuse their established voices. */
-export const BEST_AVAILABLE_KNOWN_CAST_MIN_PROBABILITY = 0.65
-export const BEST_AVAILABLE_KNOWN_CAST_MIN_CONFIDENCE = 0.55
-export const BEST_AVAILABLE_KNOWN_CAST_MIN_MARGIN = 0.15
-
 /** A last-resort, scene-bounded guess. Results are never used as anchors. */
 export function buildBestAvailableSpeakerReview(plan: SpeakerDecisionPlan, answers: Record<string, SpeakerDecisionChoice>, context: RelationshipReviewContext, cardSpeakerId: string | null = null) {
   const grounded = independentlyGroundedSpeakerIds(plan, context, cardSpeakerId)
@@ -4384,29 +4376,10 @@ export function buildBestAvailableSpeakerReview(plan: SpeakerDecisionPlan, answe
 export function applyBestAvailableSpeakerReview(plan: SpeakerDecisionPlan, answers: Record<string, SpeakerDecisionChoice>, review: ReturnType<typeof buildBestAvailableSpeakerReview>, results: Record<string, SpeakerDecisionChoice>): void {
   for (const [id, question] of Object.entries(review.questions)) {
     const answer = results[id]
-    if (invalidSpeakerReviewAnswers({ [id]: question }, { [id]: answer }).length || !Object.hasOwn(review.options, answer.choice)) continue
+    if (invalidSpeakerReviewAnswers({ [id]: question }, { [id]: answer }).length || !Object.hasOwn(review.options, answer.choice) || answer.confidence < 0.2 || (answer.probabilities[answer.choice] ?? 0) < 0.25) continue
     const speechId = id.slice('best_guess_'.length)
     if (!answers[`global_uncertain_${speechId}`]) continue
-    const identity = review.options[answer.choice]
-    const isTemporaryGhost = identity?.startsWith('ghost:')
-    const isKnownSpeaker = !isTemporaryGhost && identity !== UNCAST_SPEAKER_ID && identity !== 'no_clear_identity'
-    if (isKnownSpeaker) {
-      const probability = answer.probabilities[answer.choice] ?? 0
-      const runnerUp = Math.max(0, ...Object.entries(answer.probabilities).filter(([choice]) => choice !== answer.choice).map(([, value]) => value))
-      const uncastOption = Object.entries(review.options).find(([, optionIdentity]) => optionIdentity === UNCAST_SPEAKER_ID)?.[0]
-      if (probability < BEST_AVAILABLE_KNOWN_CAST_MIN_PROBABILITY || answer.confidence < BEST_AVAILABLE_KNOWN_CAST_MIN_CONFIDENCE || probability - runnerUp < BEST_AVAILABLE_KNOWN_CAST_MIN_MARGIN) {
-        // A weakly grounded known-cast guess must not steal an unnamed role.
-        // Leave the quote in the uncast pool so the same speaker can keep a
-        // ghost/voice across consecutive scenes without inventing a new one.
-        if (uncastOption) {
-          plan.optionSpeakerIds[uncastOption] = UNCAST_SPEAKER_ID
-          answers[id] = { choice: uncastOption, probabilities: { [uncastOption]: 1 }, confidence: 1 }
-        }
-        continue
-      }
-    }
-    if (answer.confidence < 0.2 || (answer.probabilities[answer.choice] ?? 0) < 0.25) continue
-    plan.optionSpeakerIds[answer.choice] = identity
+    plan.optionSpeakerIds[answer.choice] = review.options[answer.choice]
     answers[id] = answer
   }
 }
