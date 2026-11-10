@@ -714,13 +714,17 @@ export function canReserveAutomaticVoice(voiceId: string, reserved: ReadonlySet<
   return !!voiceId && !reserved.has(voiceId) && !ghosts.some(ghost => ghost.voiceId === voiceId && ghost.id !== existingGhostId)
 }
 
-/** Select a suitable unused favorite from Jev's ranking, respecting known gender. */
-export function selectAutomaticVoice(voices: FavoriteVoice[], used: ReadonlySet<string>, answer: SpeakerDecisionChoice, gender: string): string {
-  const eligible = voices.map((voice, index) => ({ voice, probability: answer.probabilities[`voice_${index}`] ?? 0 }))
-    .filter(item => !used.has(item.voice.id) && voiceGenderCompatible(item.voice, gender as 'male' | 'female' | 'unknown'))
-  if (eligible.length === 1) return eligible[0].voice.id
-  if (answer.choice === 'no_match') return ''
-  return eligible.filter(item => item.probability > 0).sort((a, b) => b.probability - a.probability)[0]?.voice.id ?? ''
+/**
+ * Select a random unused favorite that matches the established gender. Jev
+ * still decides identity and gender; the final voice is drawn uniformly from
+ * the compatible pool so repeated casting does not keep returning the same
+ * few top-ranked favorites.
+ */
+export function selectAutomaticVoice(voices: FavoriteVoice[], used: ReadonlySet<string>, answer: SpeakerDecisionChoice, gender: string, random: () => number = Math.random): string {
+  const eligible = voices.filter(voice => !used.has(voice.id) && voiceGenderCompatible(voice, gender as 'male' | 'female' | 'unknown'))
+  if (eligible.length === 1) return eligible[0].id
+  if (answer.choice === 'no_match' || !eligible.length) return ''
+  return eligible[Math.min(eligible.length - 1, Math.floor(random() * eligible.length))].id
 }
 
 /** Only unassigned favorites may be used; unspecified categories remain eligible. */
@@ -1121,6 +1125,7 @@ export function narrationBoostsPair(group: UncastVoiceGroup, partner: UncastVoic
 export function resolveUncastVoiceDecisions(
   groups: UncastVoiceGroup[], voices: FavoriteVoice[], answers: Record<string, SpeakerDecisionChoice>,
   ghosts: GhostVoice[] = [], reserved: readonly string[] = [], messageId = '', message = '', previousMessageIds: readonly string[] = [],
+  random: () => number = Math.random,
 ): UncastVoiceAssignment[] {
   const used = new Set<string>(reserved.filter(Boolean))
   const assignments: UncastVoiceAssignment[] = []
@@ -1326,30 +1331,24 @@ export function resolveUncastVoiceDecisions(
     const labelHint = labelGenderHint(ghost?.label || members.map(group => groupLabels.get(group.id)).find(Boolean) || '')
     const pronounHint = members.find(member => member.pronounGender && member.pronounPartners?.length)?.pronounGender
     let gender: 'male' | 'female' | 'unknown' = jevGender !== 'unknown' ? jevGender : labelHint || pronounHint || 'unknown'
-    // The voice shortlist was built from the narration's own pronoun class
-    // (group.pronounGender), so it may hold one gender only. When Jev's
-    // answer contradicts that class, every ranked option is filtered out and
-    // the character drops to the connection default; the narration class is
-    // what shaped the shortlist, so it wins as the fallback.
+    // The narration's own pronoun class shaped the voice shortlist, so it
+    // defines the compatible pool even when Jev's gender answer disagrees.
+    // A Jev gender only decides the pool when narration left none.
     const rankingHint = members.find(member => member.pronounGender === 'male' || member.pronounGender === 'female')?.pronounGender
     if (!ghost) {
       const matches = members.map(group => answers[`voice_${group.id}`]).filter((answer): answer is SpeakerDecisionChoice => !!answer)
-      const rank = (hint: 'male' | 'female' | 'unknown') => {
-        const eligible = voices.flatMap((voice, index) => {
-          if (used.has(voice.id) || !voiceGenderCompatible(voice, hint)) return []
-          const scores = matches.map(match => match.probabilities[`voice_${index}`] ?? 0).filter(score => Number.isFinite(score) && score > 0)
-          return [{ voice, score: scores.length ? scores.reduce((sum, score) => sum + score, 0) / scores.length : 0, index }]
-        })
-        return { eligible, ranked: eligible.filter(item => item.score > 0).sort((a, b) => b.score - a.score || a.index - b.index) }
-      }
-      let { eligible, ranked } = rank(gender)
-      if (!ranked.length && rankingHint && rankingHint !== gender) {
-        ({ eligible, ranked } = rank(rankingHint))
-        if (ranked.length) gender = rankingHint
-      }
-      if (!ranked.length && eligible.length === 1 && matches.length) ranked.push(eligible[0])
-      if (!ranked[0]) continue
-      ghost = { id: `pending:${root}`, speakerId: members[0].speakerId, voiceId: ranked[0].voice.id, context: members.flatMap(group => group.context).join(' ').slice(0, 2_000), occurrenceKeys: [], lastSeenMessageId: messageId }
+      const poolGender: 'male' | 'female' | 'unknown' = rankingHint ?? gender
+      const candidates = voices.filter(voice => !used.has(voice.id) && voiceGenderCompatible(voice, poolGender))
+      if (poolGender !== gender) gender = poolGender
+      // Jev decides identity and gender; the voice itself is drawn uniformly
+      // from every compatible unused favorite so the same few top-ranked
+      // voices do not repeat. A voice question still gates the assignment
+      // (except for a lone compatible voice), and an explicit no_match on a
+      // real choice is respected instead of forcing a random voice.
+      if (!candidates.length || !matches.length) continue
+      if (candidates.length > 1 && matches.every(match => match.choice === 'no_match')) continue
+      const chosen = candidates[Math.min(candidates.length - 1, Math.floor(random() * candidates.length))]
+      ghost = { id: `pending:${root}`, speakerId: members[0].speakerId, voiceId: chosen.id, context: members.flatMap(group => group.context).join(' ').slice(0, 2_000), occurrenceKeys: [], lastSeenMessageId: messageId }
       linkReasons.set(root, 'new voice selected from favorites')
     }
     used.add(ghost.voiceId)

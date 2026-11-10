@@ -240,11 +240,11 @@ function purgeExpiredGhostContexts(ghosts, assistantMessageIds, lifetime) {
 function canReserveAutomaticVoice(voiceId, reserved, ghosts, existingGhostId = "") {
   return !!voiceId && !reserved.has(voiceId) && !ghosts.some((ghost) => ghost.voiceId === voiceId && ghost.id !== existingGhostId);
 }
-function selectAutomaticVoice(voices, used, answer, gender) {
-  const eligible = voices.map((voice, index) => ({ voice, probability: answer.probabilities[`voice_${index}`] ?? 0 })).filter((item) => !used.has(item.voice.id) && voiceGenderCompatible(item.voice, gender));
-  if (eligible.length === 1) return eligible[0].voice.id;
-  if (answer.choice === "no_match") return "";
-  return eligible.filter((item) => item.probability > 0).sort((a, b) => b.probability - a.probability)[0]?.voice.id ?? "";
+function selectAutomaticVoice(voices, used, answer, gender, random = Math.random) {
+  const eligible = voices.filter((voice) => !used.has(voice.id) && voiceGenderCompatible(voice, gender));
+  if (eligible.length === 1) return eligible[0].id;
+  if (answer.choice === "no_match" || !eligible.length) return "";
+  return eligible[Math.min(eligible.length - 1, Math.floor(random() * eligible.length))].id;
 }
 function availableUncastVoices(favorites, used) {
   const reserved = new Set(used.map((voice) => voice.trim()).filter(Boolean));
@@ -515,7 +515,7 @@ function labelGenderHint(label) {
 function narrationBoostsPair(group, partner) {
   return !!group.narratedName && group.flankPartners?.includes(partner.id) === true && partner.addressee === group.narratedName;
 }
-function resolveUncastVoiceDecisions(groups, voices, answers, ghosts = [], reserved = [], messageId = "", message = "", previousMessageIds = []) {
+function resolveUncastVoiceDecisions(groups, voices, answers, ghosts = [], reserved = [], messageId = "", message = "", previousMessageIds = [], random = Math.random) {
   const used = new Set(reserved.filter(Boolean));
   const assignments = [];
   const roots = /* @__PURE__ */ new Map();
@@ -693,22 +693,13 @@ function resolveUncastVoiceDecisions(groups, voices, answers, ghosts = [], reser
     const rankingHint = members.find((member) => member.pronounGender === "male" || member.pronounGender === "female")?.pronounGender;
     if (!ghost) {
       const matches = members.map((group) => answers[`voice_${group.id}`]).filter((answer) => !!answer);
-      const rank = (hint) => {
-        const eligible2 = voices.flatMap((voice, index) => {
-          if (used.has(voice.id) || !voiceGenderCompatible(voice, hint)) return [];
-          const scores = matches.map((match) => match.probabilities[`voice_${index}`] ?? 0).filter((score) => Number.isFinite(score) && score > 0);
-          return [{ voice, score: scores.length ? scores.reduce((sum, score) => sum + score, 0) / scores.length : 0, index }];
-        });
-        return { eligible: eligible2, ranked: eligible2.filter((item) => item.score > 0).sort((a, b) => b.score - a.score || a.index - b.index) };
-      };
-      let { eligible, ranked } = rank(gender);
-      if (!ranked.length && rankingHint && rankingHint !== gender) {
-        ({ eligible, ranked } = rank(rankingHint));
-        if (ranked.length) gender = rankingHint;
-      }
-      if (!ranked.length && eligible.length === 1 && matches.length) ranked.push(eligible[0]);
-      if (!ranked[0]) continue;
-      ghost = { id: `pending:${root}`, speakerId: members[0].speakerId, voiceId: ranked[0].voice.id, context: members.flatMap((group) => group.context).join(" ").slice(0, 2e3), occurrenceKeys: [], lastSeenMessageId: messageId };
+      const poolGender = rankingHint ?? gender;
+      const candidates = voices.filter((voice) => !used.has(voice.id) && voiceGenderCompatible(voice, poolGender));
+      if (poolGender !== gender) gender = poolGender;
+      if (!candidates.length || !matches.length) continue;
+      if (candidates.length > 1 && matches.every((match) => match.choice === "no_match")) continue;
+      const chosen = candidates[Math.min(candidates.length - 1, Math.floor(random() * candidates.length))];
+      ghost = { id: `pending:${root}`, speakerId: members[0].speakerId, voiceId: chosen.id, context: members.flatMap((group) => group.context).join(" ").slice(0, 2e3), occurrenceKeys: [], lastSeenMessageId: messageId };
       linkReasons.set(root, "new voice selected from favorites");
     }
     used.add(ghost.voiceId);

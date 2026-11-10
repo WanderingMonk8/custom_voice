@@ -1584,11 +1584,20 @@ export function setup(ctx: SpindleFrontendContext) {
   favoriteId.placeholder = 'Voice ID'
   favoriteId.maxLength = 512
   favoriteId.setAttribute('aria-label', 'Favorite voice ID')
+  const favoriteGender = document.createElement('select')
+  favoriteGender.className = 'chat-voice-favorite-select'
+  favoriteGender.setAttribute('aria-label', 'Favorite voice gender (required)')
+  favoriteGender.setAttribute('aria-required', 'true')
+  for (const [value, label] of [['', 'Gender (required)'], ['male', 'Male'], ['female', 'Female']] as const) {
+    const option = document.createElement('option')
+    option.value = value
+    option.textContent = label
+    favoriteGender.appendChild(option)
+  }
   const favoriteDescription = document.createElement('input')
   favoriteDescription.placeholder = 'Description (e.g. gentle, tired)'
   favoriteDescription.maxLength = 500
   favoriteDescription.setAttribute('aria-label', 'Favorite voice description')
-  favoriteDescription.classList.add('chat-voice-favorite-span')
   const favoriteMetaExpand = document.createElement('button')
   favoriteMetaExpand.type = 'button'
   favoriteMetaExpand.className = 'chat-voice-expand-more'
@@ -1607,7 +1616,6 @@ export function setup(ctx: SpindleFrontendContext) {
     favoriteLanguages.appendChild(option)
   }
   const favoriteMetaGroups: Array<{ title?: string; tags: Array<[string, string]>; exclusive?: boolean }> = [
-    { title: 'Gender', tags: [['male', 'Male'], ['female', 'Female']], exclusive: true },
     { title: 'Age', tags: [['young', 'Young'], ['middle aged', 'Middle Aged'], ['old', 'Old']], exclusive: true },
     { title: 'Use Case', tags: [['conversational', 'Conversational'], ['narration', 'Narration'], ['character voice', 'Character Voice'], ['social media', 'Social Media'], ['educational', 'Educational'], ['advertisement', 'Advertisement'], ['entertainment', 'Entertainment']] },
     { title: 'Voice Qualities', tags: [['deep', 'Deep'], ['low', 'Low'], ['medium', 'Medium'], ['high', 'High'], ['soft', 'Soft'], ['bright', 'Bright']] },
@@ -1696,7 +1704,7 @@ export function setup(ctx: SpindleFrontendContext) {
   favoriteAdd.type = 'button'
   favoriteAdd.className = 'chat-voice-add-button chat-voice-favorite-add'
   favoriteAdd.textContent = 'Add favorite'
-  favoriteForm.append(favoriteName, favoriteId, favoriteDescription, favoriteMetaExpand, favoriteMetaPanel, favoriteAdd)
+  favoriteForm.append(favoriteName, favoriteId, favoriteGender, favoriteDescription, favoriteMetaExpand, favoriteMetaPanel, favoriteAdd)
   const favoriteFilter = document.createElement('select')
   favoriteFilter.className = 'chat-voice-favorite-select'
   favoriteFilter.setAttribute('aria-label', 'Filter favorite voices')
@@ -4946,11 +4954,17 @@ export function setup(ctx: SpindleFrontendContext) {
     const selectedTags = [...favoriteMetaPanel.querySelectorAll<HTMLButtonElement>('.chat-voice-filter-chip[aria-pressed="true"]')]
       .map(chip => chip.dataset.tag ?? '')
       .filter(Boolean)
-    const gender = selectedTags.find(tag => tag === 'male' || tag === 'female') as 'male' | 'female' | undefined
+    const gender = favoriteGender.value === 'male' || favoriteGender.value === 'female' ? favoriteGender.value : undefined
+    if (!gender) {
+      favoriteError.textContent = 'Choose a gender (male or female) before adding a favorite voice.'
+      favoriteError.hidden = false
+      favoriteGender.focus()
+      return
+    }
     const voice: FavoriteVoice = {
       id,
       name: favoriteName.value.trim().slice(0, 128),
-      category: gender ?? 'unspecified',
+      category: gender,
       description: favoriteDescription.value.trim().slice(0, 500),
       ...(gender ? { gender } : {}),
       ...(selectedTags.length ? { tags: selectedTags.slice(0, 32) } : {}),
@@ -4970,6 +4984,7 @@ export function setup(ctx: SpindleFrontendContext) {
         if (!saved) return
         favoriteName.value = ''; favoriteId.value = ''; favoriteDescription.value = ''
         favoriteLanguages.value = ''
+        favoriteGender.value = ''
         for (const chip of favoriteMetaPanel.querySelectorAll<HTMLButtonElement>('.chat-voice-filter-chip')) {
           chip.setAttribute('aria-pressed', 'false')
           chip.textContent = chip.textContent.replace(/^✓ /, '+ ')
