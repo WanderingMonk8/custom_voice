@@ -1016,8 +1016,31 @@ export function buildUncastVoiceDecision(groups: UncastVoiceGroup[], voices: Fav
     message,
     previousMessages,
     narrativeNames,
-    characters: groups.map(group => ({ id: group.id, identity: group.speakerId, speeches: group.speeches, context: group.context })),
-    ghosts: ghosts.map((ghost, index) => ({ option: `ghost_${index}`, identity: ghost.speakerId, label: ghost.label || null, aliases: ghostCastAliases(ghost), priorMessageIds: ghostPriorMessageIds(ghost, previousMessages), context: ghost.context, conversationHistory: ghost.conversationHistory ?? [] })),
+    characters: groups.map(group => ({
+      id: group.id,
+      identity: group.speakerId,
+      speeches: group.speeches,
+      context: group.context,
+      anchors: interactionAnchors([...group.speeches, ...group.context].join(' ')),
+      ...(group.addressee ? { addressee: group.addressee } : {}),
+      ...(group.flankPartners ? { flankPartners: group.flankPartners } : {}),
+      ...(group.pronounPartners ? { pronounPartners: group.pronounPartners } : {}),
+      ...(group.pronounGender ? { pronounGender: group.pronounGender } : {}),
+      ...(group.inferredName ? { inferredName: group.inferredName } : {}),
+    })),
+    ghosts: ghosts.map((ghost, index) => {
+      const history = ghost.conversationHistory?.flatMap(entry => [entry.text]) ?? []
+      return {
+        option: `ghost_${index}`,
+        identity: ghost.speakerId,
+        label: ghost.label || null,
+        aliases: ghostCastAliases(ghost),
+        priorMessageIds: ghostPriorMessageIds(ghost, previousMessages),
+        context: ghost.context,
+        conversationHistory: ghost.conversationHistory ?? [],
+        anchors: interactionAnchors([ghost.context, ...history].join(' ')),
+      }
+    }),
     voices: voices.map((voice, index) => ({ option: `voice_${index}`, name: voice.name })),
   }
   // Deterministic gender hints prefer what the narration says about the
@@ -1050,7 +1073,7 @@ export function buildUncastVoiceDecision(groups: UncastVoiceGroup[], voices: Fav
     }
     const earlier = groups.slice(0, groups.indexOf(group))
     if (ghosts.length || earlier.length) questions[`identity_${group.id}`] = {
-      type: 'choice', instructions: `Does character ${group.id} clearly represent the same individual as one prior character? Compare the current exchange with previousMessages and the prior character's own conversation history. Trace distinctive objects or workstations, physical location, actions, conversation topic, who addresses whom, and continuing relationships, including across user messages. Several agreeing details can identify someone when their name is revealed later. A shared object, setting, gender, occupation, or voice alone is insufficient; check for multiple people, scene changes, interruptions, and names that identify an addressee or bystander rather than the speaker. Do not confuse the speaker with the person they address. Select new_or_unclear unless identity is clear.`,
+      type: 'choice', instructions: `Does character ${group.id} clearly represent the same individual as one prior character? Compare the CURRENT exchange with previousMessages and the prior character's own conversation history. Use topic, activity, actions, objects, physical location, actors, addressees and continuing pair relationships as intra-message and inter-message anchors. The state provides anchors for each group and ghost to make those repeated verbs, nouns and situation phrases explicit; also compare who acts with whom, who receives the action, and who addresses whom before and after the target speech. Several agreeing anchors can identify someone when their name is revealed later. A shared object, setting, gender, occupation, topic or voice alone is insufficient; check for multiple people, scene changes, interruptions, and names that identify an addressee or bystander rather than the speaker. Do not confuse the speaker with the person they address. Select new_or_unclear unless identity is clear.`,
       criteria: { new_or_unclear: 'A new character, or identity cannot be reliably established.',
         ...Object.fromEntries(ghosts.map((ghost, index) => [`ghost_${index}`, `Previously seen character ${ghostCastAliases(ghost).join(" / ") || ghost.speakerId}; context: ${ghost.context}`])),
         ...Object.fromEntries(earlier.map(previous => [`group_${previous.id}`, `Earlier character ${previous.id}; context: ${previous.context.join(' ').slice(0, 2_000)}`])) },
@@ -1132,7 +1155,7 @@ export function buildUncastIdentityReview(groups: UncastVoiceGroup[], answers: R
       && (probability < 0.8 || identity.confidence < 0.8 || probability - runnerUp < 0.25)) {
       questions[`review_ghost_${group.id}_${ghostChoice![1]}`] = {
         type: 'choice',
-        instructions: `Compare the speaker in current group ${group.id} with the previously seen character ${candidate.label || candidate.speakerId}. Read the prior character's conversation history and the full current scene, including other participants? dialogue, relationship clues, and continuity from phone to in-person. Confirm only if they are the same person; distinguish callers, people addressed, and people merely mentioned.`,
+        instructions: `Compare the speaker in current group ${group.id} with the previously seen character ${candidate.label || candidate.speakerId}. Read the prior character's conversation history and the full current scene, including other participants' dialogue, relationship clues, actor/addressee pairs, topic and activity anchors, and continuity from phone to in-person. Confirm only if they are the same person; distinguish callers, people addressed, and people merely mentioned.`,
         criteria: { same: 'The prior character and current speaker are clearly the same person.', different_or_unclear: 'They differ or the evidence is insufficient.' },
       }
     }
@@ -1169,7 +1192,7 @@ export function buildUncastIdentityReview(groups: UncastVoiceGroup[], answers: R
         if (previousMessages.length && ghost.conversationHistory?.length && Object.keys(questions).length < 16) {
           questions[`review_scene_${group.id}_${ghostIndex}`] = {
             type: 'choice',
-            instructions: `Re-read previousMessages, ghost_${ghostIndex}'s own saved conversation history, and the CURRENT exchange. Has the previously unnamed person who spoke in that history now been identified as ${revealedName}, the actual speaker of ${group.id}? Trace who speaks to whom, a continuing conversation, distinctive objects or workstations and their location, associated actions and later naming. Use several agreeing clues together, including intervening user messages. A shared setting, object, profession, or gender alone does not prove identity. Consider multiple people, a new arrival or scene change, and whether the name belongs to an addressee or bystander. Select different_or_unclear when these details do not clearly establish the same individual.`,
+            instructions: `Re-read previousMessages, ghost_${ghostIndex}'s own saved conversation history, and the CURRENT exchange. Has the previously unnamed person who spoke in that history now been identified as ${revealedName}, the actual speaker of ${group.id}? Trace who speaks to whom, the continuing conversation, activity and topic anchors, objects and workstations and their locations, associated actions, actor/addressee pairings and later naming. Use several agreeing clues together, including intervening user messages. A shared setting, object, profession, gender, topic or voice alone does not prove identity. Consider multiple people, a new arrival or scene change, and whether the name belongs to an addressee or bystander. Select different_or_unclear when these details do not clearly establish the same individual.`,
             criteria: { same: 'The earlier unnamed character and the newly named speaker are clearly the same individual.', different_or_unclear: 'Different individuals, or continuity is not clearly established.' },
           }
         }
@@ -2897,6 +2920,51 @@ function cleanPlaybackText(value: string): string {
     .trim()
 }
 
+const INTERACTION_STOPWORDS = new Set([
+  'a', 'an', 'and', 'are', 'as', 'at', 'be', 'been', 'but', 'by', 'can', 'could', 'did', 'do', 'does', 'doing', 'for', 'from', 'had', 'has', 'have', 'he', 'her', 'here', 'hers', 'him', 'his', 'i', 'if', 'in', 'into', 'is', 'it', 'its', 'just', 'me', 'my', 'of', 'on', 'or', 'our', 'out', 'said', 'says', 'she', 'so', 'than', 'that', 'the', 'their', 'them', 'then', 'there', 'these', 'they', 'this', 'those', 'to', 'up', 'upon', 'us', 'very', 'was', 'we', 'were', 'what', 'when', 'which', 'who', 'will', 'with', 'you', 'your',
+  'about', 'after', 'again', 'also', 'another', 'because', 'before', 'being', 'but', 'each', 'every', 'first', 'get', 'gets', 'got', 'had', 'has', 'have', 'having', 'here', 'how', 'into', 'itself', 'like', 'made', 'make', 'many', 'more', 'most', 'much', 'now', 'off', 'only', 'other', 'over', 'same', 'some', 'such', 'take', 'than', 'then', 'through', 'too', 'under', 'where', 'while', 'would', 'their', 'there', 'these', 'those', 'one', 'two', 'three', 'well', 'okay', 'said',
+])
+
+const INTERACTION_TOKEN_PATTERN = /[\p{L}\p{M}\p{N}]+/gu
+
+const stemInteractionToken = (token: string): string => {
+  if (token.length > 5 && token.endsWith('ing')) {
+    const stem = token.slice(0, -3)
+    return stem.endsWith('e') ? stem.slice(0, -1) : stem
+  }
+  if (token.length > 4 && token.endsWith('ies')) return `${token.slice(0, -3)}y`
+  if (token.length > 5 && /(?:shes|ches|xes|zes|sses)$/u.test(token)) return token.slice(0, -2)
+  if (token.length > 4 && token.endsWith('s')) return token.slice(0, -1)
+  return token
+}
+
+/** Distinctive content words that help a model see continuing behavior. */
+export function interactionAnchors(text: string, limit = 12): string[] {
+  const tokens = (text.toLowerCase().match(INTERACTION_TOKEN_PATTERN) ?? [])
+    .map(stemInteractionToken)
+    .filter(token => token.length >= 3 && !INTERACTION_STOPWORDS.has(token) && !/^\d+$/u.test(token))
+  const counts = new Map<string, number>()
+  const first = new Map<string, number>()
+  const bump = (value: string, weight: number, index: number) => {
+    counts.set(value, (counts.get(value) ?? 0) + weight)
+    if (!first.has(value)) first.set(value, index)
+  }
+  for (let index = 0; index < tokens.length; index += 1) {
+    bump(tokens[index], 3, index)
+    if (index < tokens.length - 1) bump(`${tokens[index]} ${tokens[index + 1]}`, 2, index)
+  }
+  return [...counts.entries()]
+    .sort((a, b) => b[1] - a[1] || (first.get(a[0]) ?? 0) - (first.get(b[0]) ?? 0) || a[0].localeCompare(b[0]))
+    .slice(0, Math.max(1, Math.round(limit)))
+    .map(([anchor]) => anchor)
+}
+
+/** Shared continuity anchors, preserving current scene order. */
+export function interactionAnchorOverlap(left: readonly string[], right: readonly string[]): string[] {
+  const rightSet = new Set(right.map(anchor => anchor.toLowerCase()))
+  return [...new Set(left.map(anchor => anchor.toLowerCase()).filter(anchor => rightSet.has(anchor)))]
+}
+
 function appendGenericSegments(result: PlaybackSegment[], text: string, defaultSpeakerId: string | null): void {
   const quotePattern = /["“]([\s\S]*?)["”]/g
   let cursor = 0
@@ -4254,7 +4322,7 @@ export function buildRelationshipSpeakerReview(plan: SpeakerDecisionPlan, answer
       if (local.identity && local.identity !== UNCAST_SPEAKER_ID && !conflict && !phoneExchange && !globalOptions?.targets.includes(speech.id) && !openingTargets.has(speech.id)) continue
       questions[`relationship_${speech.id}`] = {
         type: 'choice',
-        instructions: `Who actually speaks quotation ${speech.id}? Read its entire dialogue run together, including later quotations and narration in the current message. Compare the topic and wording with the preceding role-labeled exchange, including user messages: identify who spoke, whom they addressed, and whether this quote responds or continues. For an opening reply, consider the recipient of the preceding relevant utterance as a candidate, and trace distinctive objects, actions and pronouns into the current scene. A user message may contain several utterances or descriptions: identify the relevant exchange, not just its last name or the message author. Weigh semantic continuity and the whole run, but do not assume the addressee responds or that all quotes share a speaker. Connect people across messages using names, aliases, actions, pronouns and carried objects. A person who merely observes, is addressed, or passes by is not automatically speaking. Distinguish in-person dialogue from a caller or text sender. Pronouns are evidence, not proof of gender or identity. Prefer explicit attribution and select no_clear_identity when evidence is insufficient.`,
+        instructions: `Who actually speaks quotation ${speech.id}? Read its entire dialogue run together, including later quotations and narration in the current message. Treat actors, addressees, participants and the continuing activity as anchors within and across messages: same pair, same topic, same ongoing activity and role are strong continuity clues, while a new addressee, changed activity or changed scene can break them. Compare the topic and wording with the preceding role-labeled exchange, including user messages: identify who spoke, whom they addressed, and whether this quote responds or continues. For an opening reply, consider the recipient of the preceding relevant utterance as a candidate, and trace distinctive objects, actions and pronouns into the current scene. A user message may contain several utterances or descriptions: identify the relevant exchange, not just its last name or the message author. Weigh semantic continuity and the whole run, but do not assume the addressee responds or that all quotes share a speaker. Connect people across messages using names, aliases, actions, pronouns and carried objects. A person who merely observes, is addressed, or passes by is not automatically speaking. Distinguish in-person dialogue from a caller or text sender. Pronouns are evidence, not proof of gender or identity. Prefer explicit attribution and select no_clear_identity when evidence is insufficient.`,
         criteria,
       }
       if (globalOptions && globalOptions.strategy !== 'run') {

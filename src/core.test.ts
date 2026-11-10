@@ -142,6 +142,8 @@ import {
   voiceAge,
   voiceCategoryGender,
   voiceDecisionSummary,
+  interactionAnchorOverlap,
+  interactionAnchors,
   voiceDescriptionTagHints,
   voiceGender,
   voiceGenderCompatible,
@@ -2182,6 +2184,14 @@ test('voiceDescriptionTagHints scores descriptions across Fish quality tags', ()
   assert.deepEqual(voiceDescriptionTagHints('Fast, animated storytelling with a confident and measured delivery.'), ['fast', 'measured', 'confident', 'animated', 'storytelling'])
   assert.deepEqual(voiceDescriptionTagHints('Not warm, not calm, but crisp.'), ['crisp'])
   assert.deepEqual(voiceDescriptionTagHints('English narrator for tutorials.'), ['narration', 'educational'])
+})
+
+test('interaction anchors expose repeated activity and actor-addressee pairs without overfitting', () => {
+  const anchors = interactionAnchors('Ash kneels on the gravel. Rose tells Ash to kneel again. They continue the mouth work, maintaining the same pair interaction.')
+  assert.ok(anchors.includes('gravel') || anchors.includes('mouth work'))
+  assert.ok(anchors.includes('ash') || anchors.includes('rose'))
+  assert.ok(interactionAnchorOverlap(anchors, interactionAnchors('The mouth work continues. Ash and Rose remain paired in the activity.')).length >= 3)
+  assert.deepEqual(interactionAnchors('one one two three'), [])
 })
 
 test('communityVoiceToFavorite maps Fish metadata onto expanded favorites', () => {
