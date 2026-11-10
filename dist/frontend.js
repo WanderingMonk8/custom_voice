@@ -431,6 +431,9 @@ function backwardNarrationPronounGender(segments, fromIndex) {
       if (/(^|[.!?]\s+)(another|second|third|other)\s+(man|woman|girl|boy|lady|guy)\b/iu.test(text)) return null;
       const introduction = text.match(/(?:^|[.!?]\s+)(?:a|an|the|one)\s+(man|woman|girl|boy|lady|guy)(?:\s+\w+){0,2}?\s+(?:came|entered|arrived|appeared|walked in|stepped in|strode in|drew close)\b/iu);
       if (introduction) return labelGenderHint(`the ${introduction[1]}`);
+      const lead = text.trimStart().match(/^(?:the|a|an)\s+(?:(?:young|younger|old|older|elderly|middle-aged|tall|short|thin|heavy|bald|bearded|blond|blonde|brunette)\s+)*([a-z-]+)\b/iu);
+      const leadHint = lead ? labelGenderHint(lead[1]) : null;
+      if (leadHint) return leadHint;
       const klass = narrationFirstPronounClass(text);
       if (klass) return klass;
     }

@@ -530,6 +530,14 @@ export function backwardNarrationPronounGender(segments: PlaybackSegment[], from
       if (/(^|[.!?]\s+)(another|second|third|other)\s+(man|woman|girl|boy|lady|guy)\b/iu.test(text)) return null
       const introduction = text.match(/(?:^|[.!?]\s+)(?:a|an|the|one)\s+(man|woman|girl|boy|lady|guy)(?:\s+\w+){0,2}?\s+(?:came|entered|arrived|appeared|walked in|stepped in|strode in|drew close)\b/iu)
       if (introduction) return labelGenderHint(`the ${introduction[1]}`)
+      // A paragraph that opens on a gendered person ("The guy stops…",
+      // "A tall woman turns…") describes that person even though the
+      // sentence has no leading pronoun. Without this, the scan skips the
+      // introduction and inherits a gender from an earlier paragraph about
+      // somebody else.
+      const lead = text.trimStart().match(/^(?:the|a|an)\s+(?:(?:young|younger|old|older|elderly|middle-aged|tall|short|thin|heavy|bald|bearded|blond|blonde|brunette)\s+)*([a-z-]+)\b/iu)
+      const leadHint = lead ? labelGenderHint(lead[1]) : null
+      if (leadHint) return leadHint
       const klass = narrationFirstPronounClass(text)
       if (klass) return klass
     }
@@ -1302,7 +1310,7 @@ export function resolveUncastVoiceDecisions(
     const members = groups.filter(group => roots.get(group.id) === root)
     const genderVotes = members.map(group => answers[`gender_${group.id}`]).filter(answer => answer && (answer.choice === 'male' || answer.choice === 'female') && answer.confidence >= 0.6 && (answer.probabilities[answer.choice] ?? 0) >= 0.6)
     const genders = new Set(genderVotes.map(answer => answer.choice))
-    const jevGender = genders.size === 1 ? genderVotes[0].choice : 'unknown'
+    const jevGender = genders.size === 1 ? genderVotes[0].choice as 'male' | 'female' : 'unknown'
     let ghost = linkedGhosts.get(root)
     // A gendered descriptive label ("the girl", "the lady", "the man") is
     // deterministic evidence Jev may have missed; it only fills in an
@@ -1310,15 +1318,28 @@ export function resolveUncastVoiceDecisions(
     // ("he", "she") left by the narration behind the fragments fills in next.
     const labelHint = labelGenderHint(ghost?.label || members.map(group => groupLabels.get(group.id)).find(Boolean) || '')
     const pronounHint = members.find(member => member.pronounGender && member.pronounPartners?.length)?.pronounGender
-    const gender = jevGender !== 'unknown' ? jevGender : labelHint || pronounHint || 'unknown'
+    let gender: 'male' | 'female' | 'unknown' = jevGender !== 'unknown' ? jevGender : labelHint || pronounHint || 'unknown'
+    // The voice shortlist was built from the narration's own pronoun class
+    // (group.pronounGender), so it may hold one gender only. When Jev's
+    // answer contradicts that class, every ranked option is filtered out and
+    // the character drops to the connection default; the narration class is
+    // what shaped the shortlist, so it wins as the fallback.
+    const rankingHint = members.find(member => member.pronounGender === 'male' || member.pronounGender === 'female')?.pronounGender
     if (!ghost) {
       const matches = members.map(group => answers[`voice_${group.id}`]).filter((answer): answer is SpeakerDecisionChoice => !!answer)
-      const eligible = voices.flatMap((voice, index) => {
-        if (used.has(voice.id) || !voiceGenderCompatible(voice, gender as 'male' | 'female' | 'unknown')) return []
-        const scores = matches.map(match => match.probabilities[`voice_${index}`] ?? 0).filter(score => Number.isFinite(score) && score > 0)
-        return [{ voice, score: scores.length ? scores.reduce((sum, score) => sum + score, 0) / scores.length : 0, index }]
-      })
-      const ranked = eligible.filter(item => item.score > 0).sort((a, b) => b.score - a.score || a.index - b.index)
+      const rank = (hint: 'male' | 'female' | 'unknown') => {
+        const eligible = voices.flatMap((voice, index) => {
+          if (used.has(voice.id) || !voiceGenderCompatible(voice, hint)) return []
+          const scores = matches.map(match => match.probabilities[`voice_${index}`] ?? 0).filter(score => Number.isFinite(score) && score > 0)
+          return [{ voice, score: scores.length ? scores.reduce((sum, score) => sum + score, 0) / scores.length : 0, index }]
+        })
+        return { eligible, ranked: eligible.filter(item => item.score > 0).sort((a, b) => b.score - a.score || a.index - b.index) }
+      }
+      let { eligible, ranked } = rank(gender)
+      if (!ranked.length && rankingHint && rankingHint !== gender) {
+        ({ eligible, ranked } = rank(rankingHint))
+        if (ranked.length) gender = rankingHint
+      }
       if (!ranked.length && eligible.length === 1 && matches.length) ranked.push(eligible[0])
       if (!ranked[0]) continue
       ghost = { id: `pending:${root}`, speakerId: members[0].speakerId, voiceId: ranked[0].voice.id, context: members.flatMap(group => group.context).join(' ').slice(0, 2_000), occurrenceKeys: [], lastSeenMessageId: messageId }

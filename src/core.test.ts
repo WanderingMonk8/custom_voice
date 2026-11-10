@@ -2294,6 +2294,42 @@ test('narrationFirstPronounClass reads a single-gender pronoun chain but refuses
   assert.equal(backwardNarrationPronounGender([nar('The fire was low.'), speech('“I am fine.”')], 1), null)
 })
 
+test('a paragraph opening on "The guy …" anchors male instead of inheriting an earlier woman', () => {
+  const nar = (text: string) => ({ text, speakerId: null })
+  const speech = (text: string) => ({ text, speakerId: UNCAST_SPEAKER_ID })
+  const segments = [
+    nar('She leans down over her knees, hair falling forward across her cheek.'),
+    nar('The guy stops, shifts the skateboard to his other hip, and reaches for the pen.'),
+    speech('Yeah, alright. Where do I put it?'),
+  ]
+  assert.equal(backwardNarrationPronounGender(segments, 2), 'male')
+  assert.equal(collectUncastVoiceGroups(segments)[0].pronounGender, 'male')
+})
+
+test('a Jev gender that contradicts the narration class falls back to that class instead of dropping the voice', () => {
+  const segments = [
+    { text: 'She leans down over her knees, hair falling forward across her cheek.', speakerId: null },
+    { text: 'The guy stops, shifts the skateboard to his other hip, and reaches for the pen.', speakerId: null },
+    { text: 'Yeah, alright. Where do I put it?', speakerId: UNCAST_SPEAKER_ID },
+  ]
+  const groups = collectUncastVoiceGroups(segments)
+  assert.equal(groups[0].pronounGender, 'male')
+  const voices = readFavoriteVoices([
+    { id: 'female-1', category: 'female' }, { id: 'male-1', category: 'male' },
+    { id: 'female-2', category: 'female' }, { id: 'male-2', category: 'male' },
+  ])
+  const plan = buildUncastVoiceDecision(groups, voices, segments.map(segment => segment.text).join('\n\n'))
+  const keys = Object.keys(plan.questions.voice_g0.criteria)
+  assert.ok(keys.length > 0)
+  assert.ok(keys.every(key => voices[Number(key.slice(6))].category === 'male'))
+  const result = resolveUncastVoiceDecisions(groups, voices, {
+    identity_g0: confidentDecision('new_or_unclear'),
+    gender_g0: confidentDecision('female'),
+    voice_g0: confidentDecision('voice_3'),
+  })
+  assert.deepEqual(result.map(item => [item.voiceId, item.gender]), [['male-2', 'male']])
+})
+
 test('a pronoun chain links fragments of one introduced man to a single voice', () => {
   const segments = [
     { text: 'The doors swung and a man came in with a jacket over his arm, tired around the eyes.', speakerId: null },
