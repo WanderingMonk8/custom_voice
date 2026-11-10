@@ -66,20 +66,6 @@ export function refreshAutoplaySwipe(message: { swipe_id?: number; content: stri
   return current
 }
 
-/** Validate the original swipe, regardless of which swipe is currently visible. */
-export function targetSwipeContentMatches(targetSwipeContent: unknown, expected: { contentHash: string }): boolean {
-  return typeof targetSwipeContent === 'string' && hashMessageContent(targetSwipeContent) === expected.contentHash
-}
-
-/** Read a specific swipe without accidentally substituting another active swipe. */
-export function readMessageSwipeContent(message: { swipe_id?: number; swipes?: unknown; content?: string }, swipeId: number): string | null {
-  if (!Number.isInteger(swipeId) || swipeId < 0) return null
-  if (Array.isArray(message.swipes) && message.swipes.length > 0) {
-    return typeof message.swipes[swipeId] === 'string' ? message.swipes[swipeId] : null
-  }
-  return (message.swipe_id ?? 0) === swipeId && typeof message.content === 'string' ? message.content : null
-}
-
 export function swipeSynthesisKey(chatId: string, messageId: string, swipeId: number): string {
   return `${chatId}\u0000${messageId}\u0000${swipeId}`
 }
@@ -128,8 +114,51 @@ export const MAX_SAVED_AUDIO_LIMIT = 10_000
 export interface FavoriteVoice {
   id: string
   name: string
-  category: 'male' | 'female' | 'unspecified'
+  /** Free-form classification. Legacy values 'male'/'female'/'unspecified' still read fine. */
+  category: string
   description: string
+  gender?: 'male' | 'female' | undefined
+  author?: string
+  source?: 'community' | 'favorite' | undefined
+  communityLink?: string
+  tags?: string[] | undefined
+  languages?: string[] | undefined
+}
+
+/** Derive a male/female hint from a free-form category string. */
+export function voiceCategoryGender(category: string): 'male' | 'female' | 'unspecified' {
+  const value = (category ?? '').trim().toLowerCase()
+  if (!value) return 'unspecified'
+  if (/\bfemale\b/.test(value)) return 'female'
+  if (/\bmale\b/.test(value)) return 'male'
+  return 'unspecified'
+}
+
+/** Gender hint for a stored favorite, falling back to tag/category inspection. */
+export function voiceGender(voice: { category: string; tags?: readonly string[]; gender?: 'male' | 'female' | undefined }): 'male' | 'female' | 'unknown' {
+  if (voice.gender === 'male' || voice.gender === 'female') return voice.gender
+  const fromCategory = voiceCategoryGender(voice.category)
+  if (fromCategory !== 'unspecified') return fromCategory
+  for (const tag of voice.tags ?? []) {
+    const tagGender = voiceCategoryGender(tag)
+    if (tagGender !== 'unspecified') return tagGender
+  }
+  return 'unknown'
+}
+
+/** Age hint for a stored favorite, read from its tags. */
+export function voiceAge(voice: { tags?: readonly string[] }): 'young' | 'middle aged' | 'old' | 'unknown' {
+  for (const tag of voice.tags ?? []) {
+    const value = tag.trim().toLowerCase()
+    if (value === 'young' || value === 'middle aged' || value === 'old') return value
+  }
+  return 'unknown'
+}
+
+/** A voice is eligible for a gendered role when its hint agrees or is unknown. */
+export function voiceGenderCompatible(voice: { category: string; tags?: readonly string[]; gender?: 'male' | 'female' | undefined }, gender: 'male' | 'female' | 'unknown'): boolean {
+  const hint = voiceGender(voice)
+  return gender === 'unknown' || hint === 'unknown' || hint === gender
 }
 
 /** Validate globally saved favorites without changing the case of provider IDs. */
@@ -147,11 +176,176 @@ export function readFavoriteVoices(value: unknown): FavoriteVoice[] {
     result.push({
       id,
       name: typeof row.name === 'string' ? row.name.trim().slice(0, 128) : '',
-      category: row.category === 'male' || row.category === 'female' ? row.category : 'unspecified',
+      category: typeof row.category === 'string' && row.category.trim()
+        ? row.category.trim().slice(0, 64)
+        : 'unspecified',
       description: typeof row.description === 'string' ? row.description.trim().slice(0, 500) : '',
+      ...(row.gender === 'male' || row.gender === 'female' ? { gender: row.gender } : {}),
+      ...(typeof row.author === 'string' && row.author.trim() ? { author: row.author.trim().slice(0, 128) } : {}),
+      ...(row.source === 'community' || row.source === 'favorite' ? { source: row.source } : {}),
+      ...(typeof row.communityLink === 'string' && row.communityLink.trim() ? { communityLink: row.communityLink.trim().slice(0, 512) } : {}),
+      ...(Array.isArray(row.tags)
+        ? { tags: row.tags.filter((value): value is string => typeof value === 'string').map(value => value.trim().slice(0, 64)).filter(Boolean).slice(0, 32) }
+        : {}),
+      ...(Array.isArray(row.languages)
+        ? { languages: row.languages.filter((value): value is string => typeof value === 'string').map(value => value.trim().slice(0, 32)).filter(Boolean).slice(0, 8) }
+        : {}),
     })
   }
   return result
+}
+
+/** A normalized Fish Audio community voice, safe to store and display. */
+export interface CommunityVoice {
+  id: string
+  title: string
+  description: string
+  category: string
+  tags: string[]
+  languages: string[]
+  author: string
+  likeCount: number
+  taskCount: number
+  licensed: boolean
+  licensedNote: string | null
+  communityLink: string
+}
+
+const FISH_LANGUAGE_WORDS = new Set(['english', 'japanese', 'chinese', 'french', 'german', 'spanish', 'korean', 'italian', 'russian', 'portuguese', 'arabic', 'hindi', 'dutch', 'polish', 'turkish', 'vietnamese', 'thai', 'indonesian', 'en', 'ja', 'zh', 'fr', 'de', 'es', 'ko', 'it', 'ru', 'pt', 'ar', 'hi', 'nl', 'pl', 'tr', 'vi', 'th', 'id'])
+
+/** Normalize one Fish `/model` payload entry into a community voice. */
+export function readCommunityVoice(row: unknown): CommunityVoice | null {
+  if (!row || typeof row !== 'object') return null
+  const item = row as Record<string, unknown>
+  const id = typeof item._id === 'string' ? item._id.trim().slice(0, 512) : ''
+  if (!id) return null
+  const title = typeof item.title === 'string' ? item.title.trim().slice(0, 128) : ''
+  const description = typeof item.description === 'string' ? item.description.trim().slice(0, 500) : ''
+  const tags = Array.isArray(item.tags)
+    ? item.tags.filter((value): value is string => typeof value === 'string').map(value => value.trim().slice(0, 64)).filter(Boolean).slice(0, 16)
+    : []
+  const languages = Array.isArray(item.languages)
+    ? item.languages.filter((value): value is string => typeof value === 'string').map(value => value.trim().slice(0, 32)).filter(Boolean).slice(0, 8)
+    : []
+  const author = item.author && typeof item.author === 'object' && typeof (item.author as Record<string, unknown>).nickname === 'string'
+    ? (item.author as Record<string, unknown>).nickname as string
+    : ''
+  const likeCount = typeof item.like_count === 'number' && Number.isFinite(item.like_count) ? Math.max(0, Math.round(item.like_count)) : 0
+  const taskCount = typeof item.task_count === 'number' && Number.isFinite(item.task_count) ? Math.max(0, Math.round(item.task_count)) : 0
+  const licensed = item.licensed === true
+  const classification = tags.find(tag => !['male', 'female'].includes(tag.toLowerCase()) && !FISH_LANGUAGE_WORDS.has(tag.toLowerCase()))
+  return {
+    id,
+    title,
+    description,
+    category: classification ?? '',
+    tags,
+    languages,
+    author: author.trim().slice(0, 128),
+    likeCount,
+    taskCount,
+    licensed,
+    licensedNote: licensed ? 'Licensed by Fish Audio (rights secured from the voice owner)' : null,
+    communityLink: `https://fish.audio/m/${id}`,
+  }
+}
+
+/** One level of `{ data }` / `{ result }` wrapping is tolerated so composer envelopes work too. */
+function unwrapCommunityPayload(payload: unknown): Record<string, unknown> | null {
+  if (!payload || typeof payload !== 'object') return null
+  const row = payload as Record<string, unknown>
+  if (Array.isArray(row.items) || Array.isArray(row.data) || Array.isArray(row.models)) return row
+  for (const key of ['data', 'result', 'response'] as const) {
+    const nested = unwrapCommunityPayload(row[key])
+    if (nested) return nested
+  }
+  if (Array.isArray(payload)) return { items: payload }
+  return null
+}
+
+/** Parse a Fish `/model` list payload into community voices plus pagination. */
+export function readCommunityVoiceList(payload: unknown): { items: CommunityVoice[]; total: number; hasMore: boolean } | null {
+  const row = unwrapCommunityPayload(payload)
+  if (!row) return null
+  const rawItems = Array.isArray(row.items) ? row.items
+    : Array.isArray(row.data) ? row.data
+      : Array.isArray(row.models) ? row.models
+        : null
+  if (!rawItems) return null
+  const items = rawItems.flatMap(item => {
+    const voice = readCommunityVoice(item)
+    return voice ? [voice] : []
+  }).slice(0, 100)
+  return {
+    items,
+    total: typeof row.total === 'number' && Number.isFinite(row.total) ? Math.max(0, Math.round(row.total)) : items.length,
+    hasMore: row.has_more === true,
+  }
+}
+
+/** A short, secret-free summary of a failed catalog payload for diagnostics. */
+export function communityPayloadShape(payload: unknown): string {
+  if (payload === null || payload === undefined) return 'no response body'
+  if (typeof payload === 'string') return `text ${payload.length} chars: ${payload.slice(0, 120)}`
+  if (Array.isArray(payload)) return `array of ${payload.length}`
+  if (typeof payload === 'object') {
+    const row = payload as Record<string, unknown>
+    const parts = Object.keys(row).slice(0, 8).map(key => {
+      const value = row[key]
+      const kind = Array.isArray(value) ? `array(${value.length})` : typeof value
+      return `${key}:${kind}`
+    })
+    const message = typeof row.error === 'string' ? row.error
+      : row.error && typeof row.error === 'object' && typeof (row.error as Record<string, unknown>).message === 'string'
+        ? (row.error as Record<string, unknown>).message as string
+        : typeof row.message === 'string' ? row.message : ''
+    return `${parts.join(', ')}${message ? ` message: ${String(message).slice(0, 120)}` : ''}`
+  }
+  return typeof payload
+}
+
+/** The cached casting pool is stored as favorites so casting code is pool-agnostic. */
+export function readCommunityVoicePool(value: unknown): FavoriteVoice[] {
+  if (!Array.isArray(value)) return []
+  return value.slice(0, 500).flatMap(item => {
+    if (!item || typeof item !== 'object') return []
+    const row = item as Record<string, unknown>
+    const voice = readCommunityVoice(row)
+    if (!voice) {
+      const fallback = readFavoriteVoices([row])
+      return fallback
+    }
+    return [communityVoiceToFavorite(voice)]
+  })
+}
+
+/** Import a community voice into the user's favorites with its metadata preserved. */
+export function communityVoiceToFavorite(voice: CommunityVoice): FavoriteVoice {
+  const gender = ['male', 'female'].find(tag => voice.tags.some(item => item.toLowerCase() === tag)) as 'male' | 'female' | undefined
+  return {
+    id: voice.id,
+    name: voice.title,
+    category: voice.category || (gender ?? 'unspecified'),
+    description: voice.description,
+    ...(gender ? { gender } : {}),
+    ...(voice.author ? { author: voice.author } : {}),
+    source: 'community',
+    communityLink: voice.communityLink,
+    ...(voice.tags.length ? { tags: voice.tags } : {}),
+    ...(voice.languages.length ? { languages: voice.languages } : {}),
+  }
+}
+
+/** Add or update a favorite from the community catalog so imports are idempotent. */
+export function upsertCommunityFavorite(existing: FavoriteVoice[], voice: CommunityVoice): FavoriteVoice[] {
+  const favorite = communityVoiceToFavorite(voice)
+  const id = favorite.id.trim().slice(0, 512)
+  if (!id) throw new Error('That community voice has no voice ID.')
+  if (!existing.some(item => item.id === id) && existing.length >= 500) throw new Error('The favorites list is limited to 500 voices.')
+  if (existing.some(item => item.id === id)) {
+    return existing.map(item => (item.id === id ? { ...item, ...favorite, id } : item))
+  }
+  return [...existing, favorite]
 }
 
 /** Reject duplicate provider IDs while preserving all existing favorites. */
@@ -163,7 +357,7 @@ export function addFavoriteVoice(existing: FavoriteVoice[], voice: FavoriteVoice
   return [...existing, { ...voice, id }]
 }
 
-export interface UncastVoiceGroup { id: string; speakerId: string; segmentIndexes: number[]; speeches: string[]; context: string[]; addressee?: string; flankPartners?: string[]; narratedName?: string; inferredName?: string }
+export interface UncastVoiceGroup { id: string; speakerId: string; segmentIndexes: number[]; speeches: string[]; context: string[]; addressee?: string; flankPartners?: string[]; pronounPartners?: string[]; pronounGender?: 'male' | 'female'; narratedName?: string; inferredName?: string }
 export interface GhostOccurrenceEvidence { messageId: string; messageHash: string; speechHash: string; version: 'occurrence-1'; reason: string }
 export interface GhostVoice { id: string; speakerId: string; voiceId: string; context: string; occurrenceKeys: string[]; lastSeenMessageId: string; label?: string; createdAtMessageId?: string; lastInvokedAtMessageId?: string; invokedMessageIds?: string[]; aliases?: string[]; conversationHistory?: Array<{ messageId: string; text: string }>; occurrenceEvidence?: GhostOccurrenceEvidence[] }
 export const GHOST_VOICE_LIFETIME_MESSAGES = 10
@@ -284,6 +478,73 @@ function hasStrongNarrativeName(text: string): boolean {
   }
   return false
 }
+const STORY_NARRATION_SKIP_STARTERS = new Set(['then', 'so', 'and', 'but', 'still', 'yet', 'meanwhile', 'now', 'anyway'])
+const STORY_MALE_PRONOUNS = new Set(['he', 'him', 'hisself', 'himself', 'his'])
+const STORY_FEMALE_PRONOUNS = new Set(['she', 'her', 'herself', 'hers'])
+/** Gender of a narration paragraph's first-subject pronoun; named or neutral starts carry none. */
+export function narrationFirstPronounClass(text: string): 'male' | 'female' | null {
+  const tokens = text.toLowerCase().replace(/[^a-z'-]+/gu, ' ').split(/\s+/u).filter(Boolean)
+  let head = tokens[0]
+  if (!head) return null
+  if (STORY_NARRATION_SKIP_STARTERS.has(head)) head = tokens[1] ?? ''
+  if (STORY_MALE_PRONOUNS.has(head)) return 'male'
+  if (STORY_FEMALE_PRONOUNS.has(head)) return 'female'
+  return null
+}
+/**
+ * The gendered pronoun class a group's first speech inherits from the
+ * narration before it: the nearest class-bearing paragraph ("…then he
+ * walked…"), a character introduction ("a man came in…"), or nothing when
+ * the chain is interrupted by an explicit new character ("another man
+ * came…") or a contrary pronoun. Speech does not count.
+ */
+export function backwardNarrationPronounGender(segments: PlaybackSegment[], fromIndex: number): 'male' | 'female' | null {
+  const castNames = new Set<string>()
+  for (const segment of segments) {
+    const id = segment.speakerId
+    if (id?.startsWith('npc:') || id?.startsWith('unconfigured:')) {
+      const name = id.slice(id.indexOf(':') + 1).trim().toLowerCase()
+      if (name) castNames.add(name)
+    }
+  }
+  const mentionsCastCharacter = (text: string): boolean => {
+    if (!castNames.size) return false
+    const words = new Set(text.toLowerCase().replace(/[^a-z'-]+/gu, ' ').split(/\s+/u).filter(Boolean))
+    for (const name of castNames) if (words.has(name)) return true
+    return false
+  }
+  // Walk narration the same way a reader would: the paragraph nearest to
+  // the speech decides its pronoun gender. One multi-paragraph narration
+  // segment can introduce a man and later describe a cast speaker, so
+  // classify paragraph by paragraph rather than segment by segment.
+  for (let index = fromIndex - 1; index >= 0; index -= 1) {
+    const segment = segments[index]
+    if (!segment || segment.speakerId !== null) continue
+    const paragraphs = segment.text.split(/\n\s*\n/u).filter(paragraph => paragraph.trim())
+    for (let paragraphIndex = paragraphs.length - 1; paragraphIndex >= 0; paragraphIndex -= 1) {
+      const text = paragraphs[paragraphIndex]
+      // A paragraph that names a cast character describes that character,
+      // not an emerging uncast chain; other paragraphs in the same segment
+      // can still anchor the uncast chain.
+      if (mentionsCastCharacter(text)) continue
+      if (/(^|[.!?]\s+)(another|second|third|other)\s+(man|woman|girl|boy|lady|guy)\b/iu.test(text)) return null
+      const introduction = text.match(/(?:^|[.!?]\s+)(?:a|an|the|one)\s+(man|woman|girl|boy|lady|guy)(?:\s+\w+){0,2}?\s+(?:came|entered|arrived|appeared|walked in|stepped in|strode in|drew close)\b/iu)
+      if (introduction) return labelGenderHint(`the ${introduction[1]}`)
+      // A paragraph that opens on a gendered person ("The guy stops…",
+      // "A tall woman turns…") describes that person even though the
+      // sentence has no leading pronoun. Without this, the scan skips the
+      // introduction and inherits a gender from an earlier paragraph about
+      // somebody else.
+      const lead = text.trimStart().match(/^(?:the|a|an)\s+(?:(?:young|younger|old|older|elderly|middle-aged|tall|short|thin|heavy|bald|bearded|blond|blonde|brunette)\s+)*([a-z-]+)\b/iu)
+      const leadHint = lead ? labelGenderHint(lead[1]) : null
+      if (leadHint) return leadHint
+      const klass = narrationFirstPronounClass(text)
+      if (klass) return klass
+    }
+  }
+  return null
+}
+
 export function collectUncastVoiceGroups(segments: PlaybackSegment[]): UncastVoiceGroup[] {
   const groups: UncastVoiceGroup[] = []
   const named = new Map<string, UncastVoiceGroup>()
@@ -340,7 +601,7 @@ export function collectUncastVoiceGroups(segments: PlaybackSegment[]): UncastVoi
     const first = Math.min(...group.segmentIndexes)
     const lead = segments[first - 1]
     if (!lead || lead.speakerId !== null) continue
-    const named = lead.text.match(/^([A-Z][a-z]{2,})\s+(?:says|said|murmurs|murmured|whispers|whispered|mutters|muttered|replies|replied|answers|answered|calls|called)\b/u)
+    const named = lead.text.match(/^(\p{Lu}[\p{Ll}\p{M}'’-]{2,})\s+(?:says|said|asks|asked|murmurs|murmured|whispers|whispered|mutters|muttered|replies|replied|answers|answered|calls|called|tells|told|informs|informed|adds|added|continues|continued|shouts|shouted|yells|yelled|remarked|remarks|cries|cried|sighs|sighed|snaps|snapped)\b/u)
     if (named) group.narratedName = named[1].toLowerCase()
   }
   for (const group of groups) {
@@ -362,6 +623,29 @@ export function collectUncastVoiceGroups(segments: PlaybackSegment[]): UncastVoi
       after.flankPartners = [...(after.flankPartners ?? []), before.id]
       before.flankPartners = [...(before.flankPartners ?? []), after.id]
     }
+  }
+  // Pronoun-continuity partners: consecutive unnamed fragments whose first
+  // speeches inherit the same gendered pronoun chain from the narration
+  // before them ("…then he walked…", "…then she stood…") are the same
+  // introduced character even when Jev only leans 'same'.
+  const unnamedInOrder = groups
+    .filter(group => group.speakerId === UNCAST_SPEAKER_ID)
+    .sort((a, b) => Math.min(...a.segmentIndexes) - Math.min(...b.segmentIndexes))
+  for (const group of unnamedInOrder) {
+    group.pronounGender = backwardNarrationPronounGender(segments, Math.min(...group.segmentIndexes)) ?? undefined
+  }
+  for (let index = 1; index < unnamedInOrder.length; index += 1) {
+    const previous = unnamedInOrder[index - 1]
+    const group = unnamedInOrder[index]
+    const gender = group.pronounGender
+    if (!gender || gender !== previous.pronounGender) {
+      // A fragment that does not join the chain keeps no pronoun credit:
+      // its narration may describe somebody else (e.g. a cast speaker).
+      group.pronounGender = undefined
+      continue
+    }
+    previous.pronounPartners = [...(previous.pronounPartners ?? []), group.id]
+    group.pronounPartners = [...(group.pronounPartners ?? []), previous.id]
   }
   // Mutual naming: two unnamed voices that each invoke a distinct name for
   // the other are those names, even when the message holds more voices than
@@ -430,13 +714,43 @@ export function canReserveAutomaticVoice(voiceId: string, reserved: ReadonlySet<
   return !!voiceId && !reserved.has(voiceId) && !ghosts.some(ghost => ghost.voiceId === voiceId && ghost.id !== existingGhostId)
 }
 
-/** Select a suitable unused favorite from Jev's ranking, respecting known gender. */
-export function selectAutomaticVoice(voices: FavoriteVoice[], used: ReadonlySet<string>, answer: SpeakerDecisionChoice, gender: string): string {
-  const eligible = voices.map((voice, index) => ({ voice, probability: answer.probabilities[`voice_${index}`] ?? 0 }))
-    .filter(item => !used.has(item.voice.id) && (gender === 'unknown' || item.voice.category === 'unspecified' || item.voice.category === gender))
+/**
+ * Select a random unused favorite from Jev's top-ranked candidates. Jev
+ * decides which voices match the character from the available metadata
+ * (category, tags, languages, description); the final voice is drawn
+ * uniformly from that shortlist so the same candidate does not always win.
+ */
+export function selectAutomaticVoice(voices: FavoriteVoice[], used: ReadonlySet<string>, answer: SpeakerDecisionChoice, gender: string, random: () => number = Math.random): string {
+  const eligible = voices.flatMap((voice, index) => {
+    if (used.has(voice.id) || !voiceGenderCompatible(voice, gender as 'male' | 'female' | 'unknown')) return []
+    return [{ voice, score: answer.probabilities[`voice_${index}`] ?? 0 }]
+  })
   if (eligible.length === 1) return eligible[0].voice.id
-  if (answer.choice === 'no_match') return ''
-  return eligible.filter(item => item.probability > 0).sort((a, b) => b.probability - a.probability)[0]?.voice.id ?? ''
+  if (answer.choice === 'no_match' || !eligible.length) return ''
+  const shortlist = shortlistRankedVoices(eligible, entry => entry.score)
+  return shortlist[Math.min(shortlist.length - 1, Math.floor(random() * shortlist.length))].voice.id
+}
+
+/** Voices kept for the random pick, and how far below the top score a voice
+ * may fall and still qualify. */
+export const AUTO_VOICE_SHORTLIST_LIMIT = 5
+export const AUTO_VOICE_SHORTLIST_FLOOR_RATIO = 0.2
+
+/**
+ * Keep the strongest Jev-ranked candidates and drop the also-rans. Voices
+ * that never received a score (for example because the ranking call failed)
+ * are not punished: when nothing scored, the whole compatible pool is
+ * returned unchanged, and missing metadata never excludes a voice here.
+ */
+export function shortlistRankedVoices<T>(candidates: readonly T[], scoreOf: (candidate: T) => number, limit = AUTO_VOICE_SHORTLIST_LIMIT, floorRatio = AUTO_VOICE_SHORTLIST_FLOOR_RATIO): T[] {
+  const scored = candidates.map(candidate => {
+    const score = scoreOf(candidate)
+    return { candidate, score: Number.isFinite(score) && score > 0 ? score : 0 }
+  })
+  const ranked = scored.filter(entry => entry.score > 0).sort((a, b) => b.score - a.score)
+  if (!ranked.length) return [...candidates]
+  const floor = ranked[0].score * Math.max(0, Math.min(1, floorRatio))
+  return ranked.filter(entry => entry.score >= floor).slice(0, Math.max(1, Math.round(limit))).map(entry => entry.candidate)
 }
 
 /** Only unassigned favorites may be used; unspecified categories remain eligible. */
@@ -573,6 +887,127 @@ function ghostPriorMessageIds(ghost: GhostVoice, previousMessages: RelationshipR
   return previousMessages.filter(item => linked.has(item.id)).map(item => item.id)
 }
 
+const VOICE_DESCRIPTION_TAG_ALIASES: ReadonlyArray<readonly [string, readonly string[]]> = [
+  ['young', ['young', 'youthful', 'adolescent', 'teen', 'teenage', 'teenaged', 'childlike']],
+  ['middle aged', ['middle aged', 'mature']],
+  ['old', ['old', 'aged', 'elderly', 'senior']],
+  ['conversational', ['conversational', 'chatty', 'casual']],
+  ['narration', ['narration', 'narrator']],
+  ['character voice', ['character voice', 'roleplay', 'role play']],
+  ['social media', ['social media']],
+  ['educational', ['educational', 'tutorial', 'tutorials', 'instructional']],
+  ['advertisement', ['advertisement', 'commercial', 'advert']],
+  ['entertainment', ['entertainment', 'performer']],
+  ['deep', ['deep', 'basso']],
+  ['low', ['low', 'low pitched', 'baritone']],
+  ['medium', ['medium', 'midrange', 'mid range']],
+  ['high', ['high', 'high pitched', 'soprano', 'treble']],
+  ['soft', ['soft', 'soft spoken']],
+  ['bright', ['bright']],
+  ['warm', ['warm', 'warmth']],
+  ['dark', ['dark']],
+  ['raspy', ['raspy', 'raspiness']],
+  ['smooth', ['smooth']],
+  ['breathy', ['breathy', 'breathiness']],
+  ['husky', ['husky', 'huskiness']],
+  ['energetic', ['energetic', 'lively', 'vigorous']],
+  ['calm', ['calm', 'soothing']],
+  ['relaxed', ['relaxed', 'laid back', 'unhurried']],
+  ['fast', ['fast', 'quick', 'rapid']],
+  ['slow', ['slow']],
+  ['measured', ['measured', 'deliberate', 'steady', 'even']],
+  ['dynamic', ['dynamic', 'varied']],
+  ['sexy', ['sexy', 'sultry']],
+  ['friendly', ['friendly', 'approachable']],
+  ['professional', ['professional', 'polished', 'corporate']],
+  ['serious', ['serious', 'grave']],
+  ['cheerful', ['cheerful', 'upbeat', 'sunny']],
+  ['enthusiastic', ['enthusiastic', 'excited']],
+  ['confident', ['confident', 'assured']],
+  ['authoritative', ['authoritative', 'commanding']],
+  ['gentle', ['gentle', 'tender']],
+  ['empathetic', ['empathetic', 'compassionate']],
+  ['playful', ['playful', 'mischievous']],
+  ['dramatic', ['dramatic', 'theatrical']],
+  ['intimate', ['intimate', 'intimacy', 'hushed', 'close']],
+  ['mysterious', ['mysterious', 'enigmatic']],
+  ['sad', ['sad', 'melancholic', 'mournful']],
+  ['angry', ['angry', 'furious']],
+  ['clear', ['clear', 'articulate']],
+  ['crisp', ['crisp']],
+  ['neutral tone', ['neutral tone', 'neutral']],
+  ['expressive', ['expressive', 'emotive']],
+  ['monotone', ['monotone', 'monotonous', 'flat']],
+  ['animated', ['animated', 'animatedly']],
+  ['storytelling', ['storytelling', 'storyteller']],
+  ['narrative', ['narrative']],
+  ['character', ['character']],
+  ['announcer', ['announcer', 'announcing']],
+  ['host', ['host', 'hosting']],
+  ['teacher', ['teacher', 'teaching']],
+  ['coach', ['coach', 'coaching']],
+  ['anime', ['anime']],
+  ['gaming', ['gaming']],
+  ['cinematic', ['cinematic', 'filmic']],
+  ['documentary', ['documentary']],
+  ['radio', ['radio']],
+  ['podcast', ['podcast']],
+]
+
+const escapeVoiceHintPattern = (value: string): string => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+
+const normalizeVoiceHintText = (value: string): string => value
+  .toLowerCase()
+  .replace(/[\u2013\u2014]/gu, '-')
+  .replace(/[.!?;:]+/gu, ' § ')
+  .replace(/\b(?:but|though|however|although|yet)\b/gu, ' § ')
+  .replace(/[-_\u2018\u2019']/gu, ' ')
+  .replace(/[^\p{L}\p{N}\s§]/gu, ' ')
+  .replace(/\s+/gu, ' ')
+  .trim()
+
+/** Canonical Fish quality tags supported by a free-form description. */
+export function voiceDescriptionTagHints(description: string): string[] {
+  const text = normalizeVoiceHintText(description)
+  if (!text) return []
+  const hinted: string[] = []
+  for (const [tag, aliases] of VOICE_DESCRIPTION_TAG_ALIASES) {
+    const supports = aliases.some(alias => {
+      const aliasText = normalizeVoiceHintText(alias)
+      const pattern = new RegExp(`(?<![\\p{L}\\p{N}])${escapeVoiceHintPattern(aliasText)}(?![\\p{L}\\p{N}])`, 'gu')
+      return text.split('§').some(clause => {
+        return [...clause.matchAll(pattern)].some(match => {
+          const start = match.index ?? 0
+          const before = clause.slice(Math.max(0, start - 24), start)
+          return !/\b(?:not|never|no|without|lacks|lacking|barely)\b/u.test(before)
+        })
+      })
+    })
+    if (supports) hinted.push(tag)
+  }
+  return hinted
+}
+
+/** One-line summary of a voice for the auto-cast ranking questions.
+ * Includes tags and languages so Fish metadata (age, use case, qualities,
+ * language) can influence the match, not just title/category/description.
+ * Descriptions are broken down into the tags they support so their qualities
+ * are scored across the tag system instead of as a vague, lengthy vote.
+ * Missing fields are simply omitted: a sparse voice must not look worse than
+ * a fully described one. */
+export function voiceDecisionSummary(voice: FavoriteVoice): string {
+  const tags = [...new Set((voice.tags ?? []).map(tag => tag.trim().toLowerCase()).filter(Boolean))]
+  const languages = [...new Set((voice.languages ?? []).map(code => code.trim().toLowerCase()).filter(Boolean))]
+  const description = (voice.description ?? '').replace(/\s+/gu, ' ').trim()
+  const descriptionSupport = voiceDescriptionTagHints(description)
+  const parts = [voice.name, voice.category].map(part => (part ?? '').replace(/\s+/gu, ' ').trim()).filter(Boolean)
+  if (languages.length) parts.push(`languages: ${languages.join(', ')}`)
+  if (tags.length) parts.push(`tags: ${tags.join(', ')}`)
+  if (descriptionSupport.length) parts.push(`description supports: ${descriptionSupport.join(', ')}`)
+  if (description) parts.push(`description: ${description}`)
+  return parts.join('; ') || 'No details provided.'
+}
+
 /** One decision call classifies each uncast group and ranks the available voice descriptions. */
 export function buildUncastVoiceDecision(groups: UncastVoiceGroup[], voices: FavoriteVoice[], message: string, ghosts: GhostVoice[] = [], previousMessages: RelationshipReviewContext['previousMessages'] = []) {
   const labels = uncastIdentityLabels(message, ghosts)
@@ -583,7 +1018,19 @@ export function buildUncastVoiceDecision(groups: UncastVoiceGroup[], voices: Fav
     narrativeNames,
     characters: groups.map(group => ({ id: group.id, identity: group.speakerId, speeches: group.speeches, context: group.context })),
     ghosts: ghosts.map((ghost, index) => ({ option: `ghost_${index}`, identity: ghost.speakerId, label: ghost.label || null, aliases: ghostCastAliases(ghost), priorMessageIds: ghostPriorMessageIds(ghost, previousMessages), context: ghost.context, conversationHistory: ghost.conversationHistory ?? [] })),
-    voices: voices.map((voice, index) => ({ option: `voice_${index}`, name: voice.name, category: voice.category, description: voice.description })),
+    voices: voices.map((voice, index) => ({ option: `voice_${index}`, name: voice.name })),
+  }
+  // Deterministic gender hints prefer what the narration says about the
+  // speaker; the pool is score-ordered, so the earliest compatible voices
+  // are the strongest candidates. The shortlist keeps each ranking
+  // question small enough for the decision gateway while preserving the
+  // original voice indexes for probability lookup.
+  const voiceOptionsFor = (group: UncastVoiceGroup): Array<{ index: number; voice: FavoriteVoice }> => {
+    const hint = group.pronounGender && (group.pronounGender === 'male' || group.pronounGender === 'female') ? group.pronounGender : 'unknown'
+    return voices
+      .map((voice, index) => ({ index, voice }))
+      .filter(({ voice }) => hint === 'unknown' || voiceGenderCompatible(voice, hint))
+      .slice(0, 32)
   }
   const questions: Record<string, { type: 'choice'; instructions: string; criteria: Record<string, string> }> = {}
   for (const group of groups) {
@@ -616,9 +1063,10 @@ export function buildUncastVoiceDecision(groups: UncastVoiceGroup[], voices: Fav
       }
     }
     if (!voices.length) continue
+    const options = voiceOptionsFor(group)
     questions[`voice_${group.id}`] = {
-      type: 'choice', instructions: `Rank the available voices for the person who actually speaks the quoted dialogue in ${group.id}. Narration-only bystanders and people merely addressed are not speakers. Use the full scene as context, including other character groups only when clearly the same speaker. Select the best available voice.`,
-      criteria: { ...Object.fromEntries(state.voices.map(voice => [voice.option, `${voice.name || 'Unnamed voice'}; ${voice.category}; ${voice.description || 'No description provided.'}`])), ...(state.voices.length === 1 ? { no_match: 'No suitable voice is available.' } : {}) },
+      type: 'choice', instructions: `Rank the available voices for the person who actually speaks the quoted dialogue in ${group.id}. Narration-only bystanders and people merely addressed are not speakers. Use the full scene as context, including other character groups only when clearly the same speaker. Score voices by metadata cues, not prose length: name is weak context, category and languages contribute one compatibility cue in aggregate, each explicit tag is one cue, and each tag listed in "description supports" is one cue. The description is evidence for those tags, not an extra vote, and support for an explicit tag counts once rather than twice. Balance tags against that description evidence instead of letting a long description outweigh otherwise better matches. Missing fields are not a reason to rank a voice lower. Select the best available voice.`,
+      criteria: { ...Object.fromEntries(options.map(({ index, voice }) => [`voice_${index}`, voiceDecisionSummary(voice)])), ...(options.length === 1 ? { no_match: 'No suitable voice is available.' } : {}) },
     }
   }
   return { state, questions }
@@ -642,6 +1090,11 @@ function latestGhostOccurrenceIndex(ghosts: GhostVoice[], key: string): number {
   let found = -1
   if (key) for (let index = 0; index < ghosts.length; index++) if (ghosts[index].occurrenceKeys.includes(key)) found = index
   return found
+}
+
+/** A ghost with no saved narrative evidence for a reviewer to compare against. */
+function ghostLacksSavedEvidence(ghost: GhostVoice): boolean {
+  return !(ghost.context ?? '').trim() && !(ghost.conversationHistory ?? []).length
 }
 
 /** Review borderline same-speaker links when a later turn has a clear label. */
@@ -762,6 +1215,32 @@ export function isDescriptiveGhostLabel(label: string): boolean {
   return isBroadPersonLabel(label) || /^(?:the|a|an)\s/iu.test(label.trim()) || /['’]s\s/iu.test(label.trim())
 }
 
+const LABEL_GENDER_TOKENS: ReadonlyMap<string, 'male' | 'female'> = new Map(
+  [
+    ...['girl', 'girls', 'woman', 'women', 'lady', 'ladies', 'female', 'females', 'mother', 'mothers', 'mum', 'mums', 'mom', 'moms', 'sister', 'sisters', 'wife', 'wives', 'daughter', 'daughters', 'aunt', 'aunts', 'niece', 'nieces', 'grandmother', 'grandmothers', 'grandma', 'grandmas', 'granny', 'grannies', 'nanny', 'nannies', 'maid', 'maids', 'bride', 'brides', 'princess', 'princesses', 'madam', 'mrs', 'miss', 'she', 'her', 'hers', 'herself'].map(token => [token, 'female'] as const),
+    ...['boy', 'boys', 'man', 'men', 'gentleman', 'gentlemen', 'male', 'males', 'father', 'fathers', 'dad', 'dads', 'brother', 'brothers', 'husband', 'husbands', 'son', 'sons', 'uncle', 'uncles', 'nephew', 'nephews', 'grandfather', 'grandfathers', 'grandpa', 'grandpas', 'groom', 'grooms', 'prince', 'princes', 'monk', 'monks', 'guy', 'guys', 'mr', 'sir', 'he', 'him', 'his', 'himself'].map(token => [token, 'male'] as const),
+  ],
+)
+
+/**
+ * Deterministic gender hint from a descriptive label ("the girl", "the
+ * taller man"). A label can be too broad to identify an individual yet still
+ * state their gender. Returns null when no gendered token appears, or when
+ * both genders appear (e.g. "the man and the girl").
+ */
+export function labelGenderHint(label: string): 'male' | 'female' | null {
+  const genders = new Set<'male' | 'female'>()
+  for (const token of label.toLowerCase().replace(/[^a-z]+/gu, ' ').split(/\s+/u)) {
+    if (!token) continue
+    const gender = LABEL_GENDER_TOKENS.get(token)
+    if (gender) {
+      genders.add(gender)
+      if (genders.size > 1) return null
+    }
+  }
+  return genders.size === 1 ? [...genders][0] : null
+}
+
 /** Two unnamed groups that each invoke the other's name are the same pair of speakers. */
 export function mutuallyInvoked(a: UncastVoiceGroup, b: UncastVoiceGroup, answers: Record<string, SpeakerDecisionChoice> = {}, message = ''): boolean {
   const nameA = revealedUncastName(a, answers, message).toLowerCase()
@@ -777,6 +1256,7 @@ export function narrationBoostsPair(group: UncastVoiceGroup, partner: UncastVoic
 export function resolveUncastVoiceDecisions(
   groups: UncastVoiceGroup[], voices: FavoriteVoice[], answers: Record<string, SpeakerDecisionChoice>,
   ghosts: GhostVoice[] = [], reserved: readonly string[] = [], messageId = '', message = '', previousMessageIds: readonly string[] = [],
+  random: () => number = Math.random,
 ): UncastVoiceAssignment[] {
   const used = new Set<string>(reserved.filter(Boolean))
   const assignments: UncastVoiceAssignment[] = []
@@ -803,21 +1283,55 @@ export function resolveUncastVoiceDecisions(
     let root = group.id
     const occurrenceKey = messageId ? `${messageId}:${hashMessageContent(group.speeches.join('\n'))}` : ''
     const name = revealedUncastName(group, answers, message).toLowerCase()
+    // Narration that explicitly names the speaker ("Voss says…") is
+    // deterministic evidence even when the parser left the quote anonymous
+    // and Jev did not independently resolve the name. Use it only to find an
+    // existing ghost with that exact alias, never to invent a new identity.
+    const narratedName = normalizeSpeakerName(group.narratedName ?? '').toLowerCase()
+    const matchNames = [...new Set([name, narratedName].filter(value => value && !isBroadPersonLabel(value)))]
     const occurrenceIndex = latestGhostOccurrenceIndex(ghosts, occurrenceKey)
     const occurrence = occurrenceIndex >= 0 ? ghosts[occurrenceIndex] : undefined
     const occurrenceReview = occurrenceIndex >= 0 ? answers[`review_occurrence_${group.id}_${occurrenceIndex}`] : undefined
     const identityAnswer = answers[`identity_${group.id}`]
+    const disposition = occurrenceIndex >= 0 ? answers[`review_occurrence_disposition_${group.id}_${occurrenceIndex}`] : undefined
+    // A 'different' disposition only escapes a hollow/self-referential
+    // confirmation when it is a genuinely strong verdict: a weak flip
+    // (e.g. 0.43 probability at 0.14 confidence) is noise on a circular
+    // review, not an explicit "different person" signal.
+    const dispositionDifferent = disposition?.choice === 'different' && strongChoice(disposition)
     const reviewedAsGhost = occurrence && group.speakerId === `ghost:${occurrence.id}`
+    // A ghost with no saved evidence (no context, no conversation history)
+    // cannot be meaningfully contested: the occurrence review only restates
+    // that the evidence is insufficient. The identical occurrence (same
+    // message, same speeches) then confirms the ghost by itself, unless
+    // Jev's disposition verdict explicitly says a different person.
+    const hollowOccurrence = !!occurrence && ghostLacksSavedEvidence(occurrence) && !dispositionDifferent
+    // A ghost created during this very message's playback has only
+    // self-referential evidence: its saved context is a snippet of this
+    // same passage, so the occurrence comparison against it is circular
+    // and flips between runs. The identical occurrence confirms it unless
+    // the disposition decisively says a different person.
+    const selfReferentialOccurrence = !!occurrence && !!messageId
+      && occurrence.createdAtMessageId === messageId && occurrence.lastSeenMessageId === messageId
+      && !dispositionDifferent
+    // When both occurrence questions lean 'same' without reaching
+    // strong-choice levels, their agreement on the identical occurrence
+    // still confirms it; strength is unnecessary when neither question
+    // found a contradiction.
+    const occurrenceReviewSame = occurrenceReview?.choice === 'same' && (occurrenceReview.probabilities?.same ?? 0) >= 0.6
+    const dispositionSame = disposition?.choice === 'same' && (disposition.probabilities?.same ?? 0) >= 0.6
     const occurrenceConfirmed = !!occurrence && (reviewedAsGhost
       || (identityAnswer?.choice === `ghost_${occurrenceIndex}` && strongChoice(identityAnswer))
-      || (occurrenceReview?.choice === 'same' && strongChoice(occurrenceReview)))
-    const disposition = occurrenceIndex >= 0 ? answers[`review_occurrence_disposition_${group.id}_${occurrenceIndex}`] : undefined
+      || (occurrenceReview?.choice === 'same' && strongChoice(occurrenceReview))
+      || hollowOccurrence
+      || selfReferentialOccurrence
+      || (occurrenceReviewSame && dispositionSame))
     const identityProbability = identityAnswer?.probabilities.new_or_unclear ?? 0
     const identityRunnerUp = identityAnswer ? Math.max(0, ...Object.entries(identityAnswer.probabilities).filter(([key]) => key !== 'new_or_unclear').map(([, value]) => value)) : 0
     const confirmedNew = !!occurrence && disposition?.choice === 'different' && strongChoice(disposition)
       && identityAnswer?.choice === 'new_or_unclear' && identityAnswer.confidence >= 0.8 && identityProbability >= 0.8 && identityProbability - identityRunnerUp >= 0.25
     const occurrenceConflict = !!occurrence && !occurrenceConfirmed && !confirmedNew
-    const aliasMatches = name && !isBroadPersonLabel(name) ? ghosts.filter(item => (!confirmedNew || item.id !== occurrence?.id) && ghostCastAliases(item).some(alias => alias.toLowerCase() === name)) : []
+    const aliasMatches = matchNames.length ? ghosts.filter(item => (!confirmedNew || item.id !== occurrence?.id) && ghostCastAliases(item).some(alias => matchNames.includes(alias.toLowerCase()))) : []
     const exact = (occurrenceConfirmed ? occurrence : undefined)
       ?? (group.speakerId !== UNCAST_SPEAKER_ID && !isBroadPersonLabel(name) ? ghosts.find(item => item.speakerId === group.speakerId && (!confirmedNew || item.id !== occurrence?.id)) : undefined)
       ?? (aliasMatches.length === 1 ? aliasMatches[0] : undefined)
@@ -836,7 +1350,11 @@ export function resolveUncastVoiceDecisions(
       const review = answers[`review_same_${group.id}_${previous.id}`]
       const answer = review && strongChoice(review) ? review : answers[`same_${group.id}_${previous.id}`]
       const boosted = answer?.choice === 'same' && answer.confidence >= 0.6 && (answer.probabilities.same ?? 0) >= 0.8 && !!group.flankPartners?.includes(previous.id)
-      return (answer?.choice === 'same' && strongChoice(answer)) || boosted ? [{ previous, probability: answer?.probabilities.same ?? 0 }] : []
+      // A pronoun-continuity chain ("…then he walked…", "…then she stood…")
+      // is a deterministic fact like a flank pair, so a lean of at least
+      // 0.6 same lets the pair share a voice even below Jev's thresholds.
+      const pronounLinked = answer?.choice === 'same' && answer.confidence >= 0.3 && (answer.probabilities.same ?? 0) >= 0.6 && !!group.pronounPartners?.includes(previous.id)
+      return (answer?.choice === 'same' && strongChoice(answer)) || boosted || pronounLinked ? [{ previous, probability: answer?.probabilities.same ?? 0 }] : []
     }).sort((a, b) => b.probability - a.probability)
     const narratedPartner = previousGroups.find(previous => narrationBoostsPair(group, previous))
     if (same[0]) root = roots.get(same[0].previous.id) ?? root
@@ -857,7 +1375,8 @@ export function resolveUncastVoiceDecisions(
     const priorGhost = rankedGhosts[0]?.recent >= 0 && (rankedGhosts.length === 1 || rankedGhosts[0].recent > rankedGhosts[1].recent) ? rankedGhosts[0].item : undefined
     const reviewedGhost = group.speakerId.startsWith('ghost:') ? ghosts.find(item => item.id === group.speakerId.slice('ghost:'.length) && (!confirmedNew || item.id !== occurrence?.id)) : undefined
     let ghost = reviewedGhost ?? (namedGhosts.length === 1 ? namedGhosts[0] : priorGhost ?? exact)
-    let reason = reviewedGhost ? 'speaker relationship review' : ghost === occurrence && ghost ? 'exact message occurrence' : ghost && namedGhosts.includes(ghost) ? 'label or alias match' : ghost ? 'speaker name or alias match' : ''
+    const narratedMatch = !!ghost && ghost === exact && !!narratedName && !name
+    let reason = reviewedGhost ? 'speaker relationship review' : ghost === occurrence && ghost ? 'exact message occurrence' : narratedMatch ? 'narrated name match' : ghost && namedGhosts.includes(ghost) ? 'label or alias match' : ghost ? 'speaker name or alias match' : ''
     if (occurrenceConflict && ghost?.id === occurrence?.id) {
       const alternatives = ghosts.flatMap((candidate, index) => {
         if (candidate.id === occurrence.id) return []
@@ -934,19 +1453,39 @@ export function resolveUncastVoiceDecisions(
     const members = groups.filter(group => roots.get(group.id) === root)
     const genderVotes = members.map(group => answers[`gender_${group.id}`]).filter(answer => answer && (answer.choice === 'male' || answer.choice === 'female') && answer.confidence >= 0.6 && (answer.probabilities[answer.choice] ?? 0) >= 0.6)
     const genders = new Set(genderVotes.map(answer => answer.choice))
-    const gender = genders.size === 1 ? genderVotes[0].choice : 'unknown'
+    const jevGender = genders.size === 1 ? genderVotes[0].choice as 'male' | 'female' : 'unknown'
     let ghost = linkedGhosts.get(root)
+    // A gendered descriptive label ("the girl", "the lady", "the man") is
+    // deterministic evidence Jev may have missed; it only fills in an
+    // unknown gender, never overrules an established one. A pronoun chain
+    // ("he", "she") left by the narration behind the fragments fills in next.
+    const labelHint = labelGenderHint(ghost?.label || members.map(group => groupLabels.get(group.id)).find(Boolean) || '')
+    const pronounHint = members.find(member => member.pronounGender && member.pronounPartners?.length)?.pronounGender
+    let gender: 'male' | 'female' | 'unknown' = jevGender !== 'unknown' ? jevGender : labelHint || pronounHint || 'unknown'
+    // The narration's own pronoun class shaped the voice shortlist, so it
+    // defines the compatible pool even when Jev's gender answer disagrees.
+    // A Jev gender only decides the pool when narration left none.
+    const rankingHint = members.find(member => member.pronounGender === 'male' || member.pronounGender === 'female')?.pronounGender
     if (!ghost) {
       const matches = members.map(group => answers[`voice_${group.id}`]).filter((answer): answer is SpeakerDecisionChoice => !!answer)
-      const eligible = voices.flatMap((voice, index) => {
-        if (used.has(voice.id) || (gender !== 'unknown' && voice.category !== 'unspecified' && voice.category !== gender)) return []
+      const poolGender: 'male' | 'female' | 'unknown' = rankingHint ?? gender
+      const candidates = voices.flatMap((voice, index) => {
+        if (used.has(voice.id) || !voiceGenderCompatible(voice, poolGender)) return []
         const scores = matches.map(match => match.probabilities[`voice_${index}`] ?? 0).filter(score => Number.isFinite(score) && score > 0)
-        return [{ voice, score: scores.length ? scores.reduce((sum, score) => sum + score, 0) / scores.length : 0, index }]
+        return [{ voice, score: scores.length ? scores.reduce((sum, score) => sum + score, 0) / scores.length : 0 }]
       })
-      const ranked = eligible.filter(item => item.score > 0).sort((a, b) => b.score - a.score || a.index - b.index)
-      if (!ranked.length && eligible.length === 1 && matches.length) ranked.push(eligible[0])
-      if (!ranked[0]) continue
-      ghost = { id: `pending:${root}`, speakerId: members[0].speakerId, voiceId: ranked[0].voice.id, context: members.flatMap(group => group.context).join(' ').slice(0, 2_000), occurrenceKeys: [], lastSeenMessageId: messageId }
+      if (poolGender !== gender) gender = poolGender
+      // Jev ranks the voices from their Fish metadata; randomization happens
+      // only inside the shortlist of strong candidates, so quality still
+      // leads the choice while new characters stop reusing the same voice.
+      // A voice question still gates the assignment (except for a lone
+      // compatible voice), and an explicit no_match on a real choice is
+      // respected instead of forcing a random voice.
+      if (!candidates.length || !matches.length) continue
+      if (candidates.length > 1 && matches.every(match => match.choice === 'no_match')) continue
+      const shortlist = shortlistRankedVoices(candidates, entry => entry.score)
+      const chosen = shortlist[Math.min(shortlist.length - 1, Math.floor(random() * shortlist.length))].voice
+      ghost = { id: `pending:${root}`, speakerId: members[0].speakerId, voiceId: chosen.id, context: members.flatMap(group => group.context).join(' ').slice(0, 2_000), occurrenceKeys: [], lastSeenMessageId: messageId }
       linkReasons.set(root, 'new voice selected from favorites')
     }
     used.add(ghost.voiceId)
@@ -3803,7 +4342,10 @@ export function buildBestAvailableSpeakerReview(plan: SpeakerDecisionPlan, answe
   const options: Record<string, string> = {}
   const criteria: Record<string, string> = {}
   for (const speaker of plan.state.speakers) {
-    if (speaker.id === USER_SPEAKER_ID) continue
+    // User messages share the assistant pipeline: the user persona is a
+    // normal candidate there (assistant messages only admit it once the
+    // persona check confirms it).
+    if (speaker.id === USER_SPEAKER_ID && plan.state.messageRole !== 'user') continue
     if (!grounded.has(speaker.id)) continue
     options[speaker.option] = speaker.id
     criteria[speaker.option] = knownCriteria[speaker.option]
@@ -7360,6 +7902,77 @@ function hasExplicitUncastCue(content: string, skippedTrackerTagPairs = ''): boo
     || SPEAKER_TURN_SWITCH_PATTERN.test(narration)
 }
 
+/**
+ * Whether a span is written in the first person. In a user message that
+ * first-person voice is the user persona; in narration it is the persona
+ * narrating their own actions.
+ */
+function hasFirstPersonPronoun(text: string): boolean {
+  return /\b(?:i|me|my|mine|myself)(?:'(?:m|ve|ll|d|re))?\b/iu.test(text)
+}
+
+/** Whether a span invokes one of the speaker's name aliases. */
+function invokesSpeakerName(text: string, aliases: readonly string[]): boolean {
+  return aliases.some(alias => {
+    const value = alias.trim()
+    return value.length >= 2 && new RegExp(`(^|[^\\p{L}\\p{N}])${escapedPattern(value)}(?=$|[^\\p{L}\\p{N}])`, 'iu').test(text)
+  })
+}
+
+/**
+ * User-message evidence for one speech: first-person "I" in the quotation,
+ * or first-person/named narration immediately around it. Per the user's
+ * usage policy this is only evidence — Jev still evaluates every speech —
+ * but it boosts the user candidate's confidence.
+ */
+function userCueForSpeech(plan: SpeakerDecisionPlan, speech: SpeakerDecisionPlan['state']['speeches'][number]): boolean {
+  const userSpeaker = plan.state.speakers.find(speaker => speaker.id === USER_SPEAKER_ID)
+  const aliases = userSpeaker ? speakerAliases(userSpeaker.name) : []
+  const narration = `${speech.narrativeBefore} ${speech.narrativeAfter}`
+  return hasFirstPersonPronoun(speech.text)
+    || hasFirstPersonPronoun(narration)
+    || invokesSpeakerName(narration, aliases)
+}
+
+/**
+ * Deterministic confidence boost for user messages: when a speech carries
+ * first-person "I" evidence or a user-name invocation in nearby narration,
+ * shift probability toward the user persona option (and lift confidence)
+ * before thresholds, chain decoding, and best-available guesses read it.
+ * Jev's choice only flips when the boosted user option becomes the strict
+ * leader, so a clear Jev verdict for another speaker still stands.
+ */
+export function applyUserCueConfidenceBoost(plan: SpeakerDecisionPlan, answers: Record<string, SpeakerDecisionChoice>): Set<string> {
+  const boosted = new Set<string>()
+  const userOption = Object.keys(plan.optionSpeakerIds).find(option => plan.optionSpeakerIds[option] === USER_SPEAKER_ID)
+  if (!userOption) return boosted
+  for (const speech of plan.state.speeches) {
+    if (!userCueForSpeech(plan, speech)) continue
+    for (const key of [`speech_${speech.id}`, `best_guess_${speech.id}`]) {
+      const answer = answers[key]
+      if (!answer || !Object.hasOwn(answer.probabilities, userOption)) continue
+      const probabilities = { ...answer.probabilities }
+      const current = probabilities[userOption] ?? 0
+      const boostedProbability = Math.min(0.99, current + 0.25)
+      if (boostedProbability <= current) continue
+      const others = 1 - current
+      const scale = others > 0 ? (1 - boostedProbability) / others : 0
+      for (const option of Object.keys(probabilities)) {
+        probabilities[option] = option === userOption ? boostedProbability : (probabilities[option] ?? 0) * scale
+      }
+      const runnerUp = Math.max(0, ...Object.entries(probabilities).filter(([option]) => option !== userOption).map(([, value]) => value))
+      const becomesUser = answer.choice === userOption || boostedProbability > runnerUp
+      answers[key] = {
+        choice: becomesUser ? userOption : answer.choice,
+        probabilities,
+        confidence: becomesUser ? Math.min(1, answer.confidence + 0.15) : answer.confidence,
+      }
+      boosted.add(speech.id)
+    }
+  }
+  return boosted
+}
+
 export function resolveSpeakerDecisionSegments(
   content: string,
   plan: SpeakerDecisionPlan,
@@ -7383,6 +7996,10 @@ export function resolveSpeakerDecisionSegments(
     }
   },
 ): PlaybackSegment[] {
+  // User messages share the assistant pipeline; the only deviations are
+  // that first-person/name cues boost the user candidate, and the user
+  // (not the card title character) takes the default below.
+  const userCueBoosted = options.isUserMessage ? applyUserCueConfidenceBoost(plan, answers) : new Set<string>()
   const paragraphIdentities = new Map(plan.state.paragraphs.map(paragraph => [
     paragraph.id,
     clearDecisionSpeaker(answers[`paragraph_${paragraph.id}`], plan.optionSpeakerIds),
@@ -7494,8 +8111,10 @@ export function resolveSpeakerDecisionSegments(
         ? `an identity cleared ${cardBlockDescription}`
         : `no identity cleared ${cardBlockDescription} (max strength ${maxIdentityStrength.toFixed(2)})`
   // A card-title match owns a message only when no speech identity is strong
-  // enough to contest it. One weak guess must not veto the fallback.
+  // enough to contest it. One weak guess must not veto the fallback, and in
+  // a user message the default belongs to the user persona, never the card.
   const cardIdentity = options.cardSpeakerId
+    && !options.isUserMessage
     && !explicitUncastCue
     && !namedAlternative
     && !hasStrongIdentity
@@ -7611,6 +8230,7 @@ export function resolveSpeakerDecisionSegments(
           `segment-type:speech (quote ${index + 1})`,
           ...(answers[`first_pass_${speech.id}`] ? decisionAnswerDebug('jev-first-pass-speech', answers[`first_pass_${speech.id}`], plan.optionSpeakerIds) : []),
           ...decisionAnswerDebug('jev-speech', answer, plan.optionSpeakerIds),
+          ...(userCueBoosted.has(speech.id) ? ['user-cue-boost: first-person pronoun or user-name invocation shifts confidence toward user persona'] : []),
           ...decisionAnswerDebug('jev-ungrounded-first-pass', answers[`ungrounded_original_${speech.id}`], plan.optionSpeakerIds),
           ...(answers[`ungrounded_original_${speech.id}`] ? ['jev-grounding:unsupported cast identity excluded from first-pass anchor'] : []),
           ...decisionAnswerDebug('jev-relationship-original', answers[`relationship_original_${speech.id}`], plan.optionSpeakerIds),

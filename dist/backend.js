@@ -2,17 +2,31 @@
 var CONFIG_KEY = "chat_voice";
 var USER_SPEAKER_ID = "__chat_voice_user__";
 var UNCAST_SPEAKER_ID = "__chat_voice_uncast__";
-function readMessageSwipeContent(message, swipeId) {
-  if (!Number.isInteger(swipeId) || swipeId < 0) return null;
-  if (Array.isArray(message.swipes) && message.swipes.length > 0) {
-    return typeof message.swipes[swipeId] === "string" ? message.swipes[swipeId] : null;
-  }
-  return (message.swipe_id ?? 0) === swipeId && typeof message.content === "string" ? message.content : null;
-}
 var UNRESOLVED_SPEAKER_ID = "__chat_voice_unresolved__";
 var DEFAULT_MESSAGE_LIMIT = 20;
 var MIN_MESSAGE_LIMIT = 1;
 var MAX_MESSAGE_LIMIT = 500;
+function voiceCategoryGender(category) {
+  const value = (category ?? "").trim().toLowerCase();
+  if (!value) return "unspecified";
+  if (/\bfemale\b/.test(value)) return "female";
+  if (/\bmale\b/.test(value)) return "male";
+  return "unspecified";
+}
+function voiceGender(voice) {
+  if (voice.gender === "male" || voice.gender === "female") return voice.gender;
+  const fromCategory = voiceCategoryGender(voice.category);
+  if (fromCategory !== "unspecified") return fromCategory;
+  for (const tag of voice.tags ?? []) {
+    const tagGender = voiceCategoryGender(tag);
+    if (tagGender !== "unspecified") return tagGender;
+  }
+  return "unknown";
+}
+function voiceGenderCompatible(voice, gender) {
+  const hint = voiceGender(voice);
+  return gender === "unknown" || hint === "unknown" || hint === gender;
+}
 function readFavoriteVoices(value) {
   if (!Array.isArray(value)) return [];
   const seen = /* @__PURE__ */ new Set();
@@ -27,11 +41,104 @@ function readFavoriteVoices(value) {
     result.push({
       id,
       name: typeof row.name === "string" ? row.name.trim().slice(0, 128) : "",
-      category: row.category === "male" || row.category === "female" ? row.category : "unspecified",
-      description: typeof row.description === "string" ? row.description.trim().slice(0, 500) : ""
+      category: typeof row.category === "string" && row.category.trim() ? row.category.trim().slice(0, 64) : "unspecified",
+      description: typeof row.description === "string" ? row.description.trim().slice(0, 500) : "",
+      ...row.gender === "male" || row.gender === "female" ? { gender: row.gender } : {},
+      ...typeof row.author === "string" && row.author.trim() ? { author: row.author.trim().slice(0, 128) } : {},
+      ...row.source === "community" || row.source === "favorite" ? { source: row.source } : {},
+      ...typeof row.communityLink === "string" && row.communityLink.trim() ? { communityLink: row.communityLink.trim().slice(0, 512) } : {},
+      ...Array.isArray(row.tags) ? { tags: row.tags.filter((value2) => typeof value2 === "string").map((value2) => value2.trim().slice(0, 64)).filter(Boolean).slice(0, 32) } : {},
+      ...Array.isArray(row.languages) ? { languages: row.languages.filter((value2) => typeof value2 === "string").map((value2) => value2.trim().slice(0, 32)).filter(Boolean).slice(0, 8) } : {}
     });
   }
   return result;
+}
+var FISH_LANGUAGE_WORDS = /* @__PURE__ */ new Set(["english", "japanese", "chinese", "french", "german", "spanish", "korean", "italian", "russian", "portuguese", "arabic", "hindi", "dutch", "polish", "turkish", "vietnamese", "thai", "indonesian", "en", "ja", "zh", "fr", "de", "es", "ko", "it", "ru", "pt", "ar", "hi", "nl", "pl", "tr", "vi", "th", "id"]);
+function readCommunityVoice(row) {
+  if (!row || typeof row !== "object") return null;
+  const item = row;
+  const id = typeof item._id === "string" ? item._id.trim().slice(0, 512) : "";
+  if (!id) return null;
+  const title = typeof item.title === "string" ? item.title.trim().slice(0, 128) : "";
+  const description = typeof item.description === "string" ? item.description.trim().slice(0, 500) : "";
+  const tags = Array.isArray(item.tags) ? item.tags.filter((value) => typeof value === "string").map((value) => value.trim().slice(0, 64)).filter(Boolean).slice(0, 16) : [];
+  const languages = Array.isArray(item.languages) ? item.languages.filter((value) => typeof value === "string").map((value) => value.trim().slice(0, 32)).filter(Boolean).slice(0, 8) : [];
+  const author = item.author && typeof item.author === "object" && typeof item.author.nickname === "string" ? item.author.nickname : "";
+  const likeCount = typeof item.like_count === "number" && Number.isFinite(item.like_count) ? Math.max(0, Math.round(item.like_count)) : 0;
+  const taskCount = typeof item.task_count === "number" && Number.isFinite(item.task_count) ? Math.max(0, Math.round(item.task_count)) : 0;
+  const licensed = item.licensed === true;
+  const classification = tags.find((tag) => !["male", "female"].includes(tag.toLowerCase()) && !FISH_LANGUAGE_WORDS.has(tag.toLowerCase()));
+  return {
+    id,
+    title,
+    description,
+    category: classification ?? "",
+    tags,
+    languages,
+    author: author.trim().slice(0, 128),
+    likeCount,
+    taskCount,
+    licensed,
+    licensedNote: licensed ? "Licensed by Fish Audio (rights secured from the voice owner)" : null,
+    communityLink: `https://fish.audio/m/${id}`
+  };
+}
+function unwrapCommunityPayload(payload) {
+  if (!payload || typeof payload !== "object") return null;
+  const row = payload;
+  if (Array.isArray(row.items) || Array.isArray(row.data) || Array.isArray(row.models)) return row;
+  for (const key of ["data", "result", "response"]) {
+    const nested = unwrapCommunityPayload(row[key]);
+    if (nested) return nested;
+  }
+  if (Array.isArray(payload)) return { items: payload };
+  return null;
+}
+function readCommunityVoiceList(payload) {
+  const row = unwrapCommunityPayload(payload);
+  if (!row) return null;
+  const rawItems = Array.isArray(row.items) ? row.items : Array.isArray(row.data) ? row.data : Array.isArray(row.models) ? row.models : null;
+  if (!rawItems) return null;
+  const items = rawItems.flatMap((item) => {
+    const voice = readCommunityVoice(item);
+    return voice ? [voice] : [];
+  }).slice(0, 100);
+  return {
+    items,
+    total: typeof row.total === "number" && Number.isFinite(row.total) ? Math.max(0, Math.round(row.total)) : items.length,
+    hasMore: row.has_more === true
+  };
+}
+function communityPayloadShape(payload) {
+  if (payload === null || payload === void 0) return "no response body";
+  if (typeof payload === "string") return `text ${payload.length} chars: ${payload.slice(0, 120)}`;
+  if (Array.isArray(payload)) return `array of ${payload.length}`;
+  if (typeof payload === "object") {
+    const row = payload;
+    const parts = Object.keys(row).slice(0, 8).map((key) => {
+      const value = row[key];
+      const kind = Array.isArray(value) ? `array(${value.length})` : typeof value;
+      return `${key}:${kind}`;
+    });
+    const message = typeof row.error === "string" ? row.error : row.error && typeof row.error === "object" && typeof row.error.message === "string" ? row.error.message : typeof row.message === "string" ? row.message : "";
+    return `${parts.join(", ")}${message ? ` message: ${String(message).slice(0, 120)}` : ""}`;
+  }
+  return typeof payload;
+}
+function communityVoiceToFavorite(voice) {
+  const gender = ["male", "female"].find((tag) => voice.tags.some((item) => item.toLowerCase() === tag));
+  return {
+    id: voice.id,
+    name: voice.title,
+    category: voice.category || (gender ?? "unspecified"),
+    description: voice.description,
+    ...gender ? { gender } : {},
+    ...voice.author ? { author: voice.author } : {},
+    source: "community",
+    communityLink: voice.communityLink,
+    ...voice.tags.length ? { tags: voice.tags } : {},
+    ...voice.languages.length ? { languages: voice.languages } : {}
+  };
 }
 var GHOST_VOICE_LIFETIME_MESSAGES = 10;
 function readGhostVoices(value) {
@@ -133,11 +240,27 @@ function purgeExpiredGhostContexts(ghosts, assistantMessageIds, lifetime) {
 function canReserveAutomaticVoice(voiceId, reserved, ghosts, existingGhostId = "") {
   return !!voiceId && !reserved.has(voiceId) && !ghosts.some((ghost) => ghost.voiceId === voiceId && ghost.id !== existingGhostId);
 }
-function selectAutomaticVoice(voices, used, answer, gender) {
-  const eligible = voices.map((voice, index) => ({ voice, probability: answer.probabilities[`voice_${index}`] ?? 0 })).filter((item) => !used.has(item.voice.id) && (gender === "unknown" || item.voice.category === "unspecified" || item.voice.category === gender));
+function selectAutomaticVoice(voices, used, answer, gender, random = Math.random) {
+  const eligible = voices.flatMap((voice, index) => {
+    if (used.has(voice.id) || !voiceGenderCompatible(voice, gender)) return [];
+    return [{ voice, score: answer.probabilities[`voice_${index}`] ?? 0 }];
+  });
   if (eligible.length === 1) return eligible[0].voice.id;
-  if (answer.choice === "no_match") return "";
-  return eligible.filter((item) => item.probability > 0).sort((a, b) => b.probability - a.probability)[0]?.voice.id ?? "";
+  if (answer.choice === "no_match" || !eligible.length) return "";
+  const shortlist = shortlistRankedVoices(eligible, (entry) => entry.score);
+  return shortlist[Math.min(shortlist.length - 1, Math.floor(random() * shortlist.length))].voice.id;
+}
+var AUTO_VOICE_SHORTLIST_LIMIT = 5;
+var AUTO_VOICE_SHORTLIST_FLOOR_RATIO = 0.2;
+function shortlistRankedVoices(candidates, scoreOf, limit = AUTO_VOICE_SHORTLIST_LIMIT, floorRatio = AUTO_VOICE_SHORTLIST_FLOOR_RATIO) {
+  const scored = candidates.map((candidate) => {
+    const score = scoreOf(candidate);
+    return { candidate, score: Number.isFinite(score) && score > 0 ? score : 0 };
+  });
+  const ranked = scored.filter((entry) => entry.score > 0).sort((a, b) => b.score - a.score);
+  if (!ranked.length) return [...candidates];
+  const floor = ranked[0].score * Math.max(0, Math.min(1, floorRatio));
+  return ranked.filter((entry) => entry.score >= floor).slice(0, Math.max(1, Math.round(limit))).map((entry) => entry.candidate);
 }
 function availableUncastVoices(favorites, used) {
   const reserved = new Set(used.map((voice) => voice.trim()).filter(Boolean));
@@ -191,6 +314,106 @@ function ghostPriorMessageIds(ghost, previousMessages) {
   const linked = /* @__PURE__ */ new Set([ghost.lastSeenMessageId, ...(ghost.conversationHistory ?? []).map((entry) => entry.messageId), ...ghost.occurrenceKeys.map((key) => key.split(":", 1)[0])]);
   return previousMessages.filter((item) => linked.has(item.id)).map((item) => item.id);
 }
+var VOICE_DESCRIPTION_TAG_ALIASES = [
+  ["young", ["young", "youthful", "adolescent", "teen", "teenage", "teenaged", "childlike"]],
+  ["middle aged", ["middle aged", "mature"]],
+  ["old", ["old", "aged", "elderly", "senior"]],
+  ["conversational", ["conversational", "chatty", "casual"]],
+  ["narration", ["narration", "narrator"]],
+  ["character voice", ["character voice", "roleplay", "role play"]],
+  ["social media", ["social media"]],
+  ["educational", ["educational", "tutorial", "tutorials", "instructional"]],
+  ["advertisement", ["advertisement", "commercial", "advert"]],
+  ["entertainment", ["entertainment", "performer"]],
+  ["deep", ["deep", "basso"]],
+  ["low", ["low", "low pitched", "baritone"]],
+  ["medium", ["medium", "midrange", "mid range"]],
+  ["high", ["high", "high pitched", "soprano", "treble"]],
+  ["soft", ["soft", "soft spoken"]],
+  ["bright", ["bright"]],
+  ["warm", ["warm", "warmth"]],
+  ["dark", ["dark"]],
+  ["raspy", ["raspy", "raspiness"]],
+  ["smooth", ["smooth"]],
+  ["breathy", ["breathy", "breathiness"]],
+  ["husky", ["husky", "huskiness"]],
+  ["energetic", ["energetic", "lively", "vigorous"]],
+  ["calm", ["calm", "soothing"]],
+  ["relaxed", ["relaxed", "laid back", "unhurried"]],
+  ["fast", ["fast", "quick", "rapid"]],
+  ["slow", ["slow"]],
+  ["measured", ["measured", "deliberate", "steady", "even"]],
+  ["dynamic", ["dynamic", "varied"]],
+  ["sexy", ["sexy", "sultry"]],
+  ["friendly", ["friendly", "approachable"]],
+  ["professional", ["professional", "polished", "corporate"]],
+  ["serious", ["serious", "grave"]],
+  ["cheerful", ["cheerful", "upbeat", "sunny"]],
+  ["enthusiastic", ["enthusiastic", "excited"]],
+  ["confident", ["confident", "assured"]],
+  ["authoritative", ["authoritative", "commanding"]],
+  ["gentle", ["gentle", "tender"]],
+  ["empathetic", ["empathetic", "compassionate"]],
+  ["playful", ["playful", "mischievous"]],
+  ["dramatic", ["dramatic", "theatrical"]],
+  ["intimate", ["intimate", "intimacy", "hushed", "close"]],
+  ["mysterious", ["mysterious", "enigmatic"]],
+  ["sad", ["sad", "melancholic", "mournful"]],
+  ["angry", ["angry", "furious"]],
+  ["clear", ["clear", "articulate"]],
+  ["crisp", ["crisp"]],
+  ["neutral tone", ["neutral tone", "neutral"]],
+  ["expressive", ["expressive", "emotive"]],
+  ["monotone", ["monotone", "monotonous", "flat"]],
+  ["animated", ["animated", "animatedly"]],
+  ["storytelling", ["storytelling", "storyteller"]],
+  ["narrative", ["narrative"]],
+  ["character", ["character"]],
+  ["announcer", ["announcer", "announcing"]],
+  ["host", ["host", "hosting"]],
+  ["teacher", ["teacher", "teaching"]],
+  ["coach", ["coach", "coaching"]],
+  ["anime", ["anime"]],
+  ["gaming", ["gaming"]],
+  ["cinematic", ["cinematic", "filmic"]],
+  ["documentary", ["documentary"]],
+  ["radio", ["radio"]],
+  ["podcast", ["podcast"]]
+];
+var escapeVoiceHintPattern = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+var normalizeVoiceHintText = (value) => value.toLowerCase().replace(/[\u2013\u2014]/gu, "-").replace(/[.!?;:]+/gu, " \xA7 ").replace(/\b(?:but|though|however|although|yet)\b/gu, " \xA7 ").replace(/[-_\u2018\u2019']/gu, " ").replace(/[^\p{L}\p{N}\s§]/gu, " ").replace(/\s+/gu, " ").trim();
+function voiceDescriptionTagHints(description) {
+  const text = normalizeVoiceHintText(description);
+  if (!text) return [];
+  const hinted = [];
+  for (const [tag, aliases] of VOICE_DESCRIPTION_TAG_ALIASES) {
+    const supports = aliases.some((alias) => {
+      const aliasText = normalizeVoiceHintText(alias);
+      const pattern = new RegExp(`(?<![\\p{L}\\p{N}])${escapeVoiceHintPattern(aliasText)}(?![\\p{L}\\p{N}])`, "gu");
+      return text.split("\xA7").some((clause) => {
+        return [...clause.matchAll(pattern)].some((match) => {
+          const start = match.index ?? 0;
+          const before = clause.slice(Math.max(0, start - 24), start);
+          return !/\b(?:not|never|no|without|lacks|lacking|barely)\b/u.test(before);
+        });
+      });
+    });
+    if (supports) hinted.push(tag);
+  }
+  return hinted;
+}
+function voiceDecisionSummary(voice) {
+  const tags = [...new Set((voice.tags ?? []).map((tag) => tag.trim().toLowerCase()).filter(Boolean))];
+  const languages = [...new Set((voice.languages ?? []).map((code) => code.trim().toLowerCase()).filter(Boolean))];
+  const description = (voice.description ?? "").replace(/\s+/gu, " ").trim();
+  const descriptionSupport = voiceDescriptionTagHints(description);
+  const parts = [voice.name, voice.category].map((part) => (part ?? "").replace(/\s+/gu, " ").trim()).filter(Boolean);
+  if (languages.length) parts.push(`languages: ${languages.join(", ")}`);
+  if (tags.length) parts.push(`tags: ${tags.join(", ")}`);
+  if (descriptionSupport.length) parts.push(`description supports: ${descriptionSupport.join(", ")}`);
+  if (description) parts.push(`description: ${description}`);
+  return parts.join("; ") || "No details provided.";
+}
 function buildUncastVoiceDecision(groups, voices, message, ghosts = [], previousMessages = []) {
   const labels = uncastIdentityLabels(message, ghosts);
   const narrativeNames = uncastNarrativeNameCandidates(message);
@@ -200,7 +423,11 @@ function buildUncastVoiceDecision(groups, voices, message, ghosts = [], previous
     narrativeNames,
     characters: groups.map((group) => ({ id: group.id, identity: group.speakerId, speeches: group.speeches, context: group.context })),
     ghosts: ghosts.map((ghost, index) => ({ option: `ghost_${index}`, identity: ghost.speakerId, label: ghost.label || null, aliases: ghostCastAliases(ghost), priorMessageIds: ghostPriorMessageIds(ghost, previousMessages), context: ghost.context, conversationHistory: ghost.conversationHistory ?? [] })),
-    voices: voices.map((voice, index) => ({ option: `voice_${index}`, name: voice.name, category: voice.category, description: voice.description }))
+    voices: voices.map((voice, index) => ({ option: `voice_${index}`, name: voice.name }))
+  };
+  const voiceOptionsFor = (group) => {
+    const hint = group.pronounGender && (group.pronounGender === "male" || group.pronounGender === "female") ? group.pronounGender : "unknown";
+    return voices.map((voice, index) => ({ index, voice })).filter(({ voice }) => hint === "unknown" || voiceGenderCompatible(voice, hint)).slice(0, 32);
   };
   const questions = {};
   for (const group of groups) {
@@ -237,10 +464,11 @@ function buildUncastVoiceDecision(groups, voices, message, ghosts = [], previous
       };
     }
     if (!voices.length) continue;
+    const options = voiceOptionsFor(group);
     questions[`voice_${group.id}`] = {
       type: "choice",
-      instructions: `Rank the available voices for the person who actually speaks the quoted dialogue in ${group.id}. Narration-only bystanders and people merely addressed are not speakers. Use the full scene as context, including other character groups only when clearly the same speaker. Select the best available voice.`,
-      criteria: { ...Object.fromEntries(state.voices.map((voice) => [voice.option, `${voice.name || "Unnamed voice"}; ${voice.category}; ${voice.description || "No description provided."}`])), ...state.voices.length === 1 ? { no_match: "No suitable voice is available." } : {} }
+      instructions: `Rank the available voices for the person who actually speaks the quoted dialogue in ${group.id}. Narration-only bystanders and people merely addressed are not speakers. Use the full scene as context, including other character groups only when clearly the same speaker. Score voices by metadata cues, not prose length: name is weak context, category and languages contribute one compatibility cue in aggregate, each explicit tag is one cue, and each tag listed in "description supports" is one cue. The description is evidence for those tags, not an extra vote, and support for an explicit tag counts once rather than twice. Balance tags against that description evidence instead of letting a long description outweigh otherwise better matches. Missing fields are not a reason to rank a voice lower. Select the best available voice.`,
+      criteria: { ...Object.fromEntries(options.map(({ index, voice }) => [`voice_${index}`, voiceDecisionSummary(voice)])), ...options.length === 1 ? { no_match: "No suitable voice is available." } : {} }
     };
   }
   return { state, questions };
@@ -263,6 +491,9 @@ function latestGhostOccurrenceIndex(ghosts, key) {
     for (let index = 0; index < ghosts.length; index++) if (ghosts[index].occurrenceKeys.includes(key)) found = index;
   }
   return found;
+}
+function ghostLacksSavedEvidence(ghost) {
+  return !(ghost.context ?? "").trim() && !(ghost.conversationHistory ?? []).length;
 }
 function buildUncastIdentityReview(groups, answers, message, ghosts = [], messageId = "", previousMessages = []) {
   const labels = uncastIdentityLabels(message, ghosts);
@@ -367,10 +598,28 @@ function isGenericAdultLabel(label) {
 function isDescriptiveGhostLabel(label) {
   return isBroadPersonLabel(label) || /^(?:the|a|an)\s/iu.test(label.trim()) || /['’]s\s/iu.test(label.trim());
 }
+var LABEL_GENDER_TOKENS = new Map(
+  [
+    ...["girl", "girls", "woman", "women", "lady", "ladies", "female", "females", "mother", "mothers", "mum", "mums", "mom", "moms", "sister", "sisters", "wife", "wives", "daughter", "daughters", "aunt", "aunts", "niece", "nieces", "grandmother", "grandmothers", "grandma", "grandmas", "granny", "grannies", "nanny", "nannies", "maid", "maids", "bride", "brides", "princess", "princesses", "madam", "mrs", "miss", "she", "her", "hers", "herself"].map((token) => [token, "female"]),
+    ...["boy", "boys", "man", "men", "gentleman", "gentlemen", "male", "males", "father", "fathers", "dad", "dads", "brother", "brothers", "husband", "husbands", "son", "sons", "uncle", "uncles", "nephew", "nephews", "grandfather", "grandfathers", "grandpa", "grandpas", "groom", "grooms", "prince", "princes", "monk", "monks", "guy", "guys", "mr", "sir", "he", "him", "his", "himself"].map((token) => [token, "male"])
+  ]
+);
+function labelGenderHint(label) {
+  const genders = /* @__PURE__ */ new Set();
+  for (const token of label.toLowerCase().replace(/[^a-z]+/gu, " ").split(/\s+/u)) {
+    if (!token) continue;
+    const gender = LABEL_GENDER_TOKENS.get(token);
+    if (gender) {
+      genders.add(gender);
+      if (genders.size > 1) return null;
+    }
+  }
+  return genders.size === 1 ? [...genders][0] : null;
+}
 function narrationBoostsPair(group, partner) {
   return !!group.narratedName && group.flankPartners?.includes(partner.id) === true && partner.addressee === group.narratedName;
 }
-function resolveUncastVoiceDecisions(groups, voices, answers, ghosts = [], reserved = [], messageId = "", message = "", previousMessageIds = []) {
+function resolveUncastVoiceDecisions(groups, voices, answers, ghosts = [], reserved = [], messageId = "", message = "", previousMessageIds = [], random = Math.random) {
   const used = new Set(reserved.filter(Boolean));
   const assignments = [];
   const roots = /* @__PURE__ */ new Map();
@@ -394,18 +643,25 @@ function resolveUncastVoiceDecisions(groups, voices, answers, ghosts = [], reser
     let root = group.id;
     const occurrenceKey = messageId ? `${messageId}:${hashMessageContent(group.speeches.join("\n"))}` : "";
     const name = revealedUncastName(group, answers, message).toLowerCase();
+    const narratedName = normalizeSpeakerName(group.narratedName ?? "").toLowerCase();
+    const matchNames = [...new Set([name, narratedName].filter((value) => value && !isBroadPersonLabel(value)))];
     const occurrenceIndex = latestGhostOccurrenceIndex(ghosts, occurrenceKey);
     const occurrence = occurrenceIndex >= 0 ? ghosts[occurrenceIndex] : void 0;
     const occurrenceReview = occurrenceIndex >= 0 ? answers[`review_occurrence_${group.id}_${occurrenceIndex}`] : void 0;
     const identityAnswer = answers[`identity_${group.id}`];
-    const reviewedAsGhost = occurrence && group.speakerId === `ghost:${occurrence.id}`;
-    const occurrenceConfirmed = !!occurrence && (reviewedAsGhost || identityAnswer?.choice === `ghost_${occurrenceIndex}` && strongChoice(identityAnswer) || occurrenceReview?.choice === "same" && strongChoice(occurrenceReview));
     const disposition = occurrenceIndex >= 0 ? answers[`review_occurrence_disposition_${group.id}_${occurrenceIndex}`] : void 0;
+    const dispositionDifferent = disposition?.choice === "different" && strongChoice(disposition);
+    const reviewedAsGhost = occurrence && group.speakerId === `ghost:${occurrence.id}`;
+    const hollowOccurrence = !!occurrence && ghostLacksSavedEvidence(occurrence) && !dispositionDifferent;
+    const selfReferentialOccurrence = !!occurrence && !!messageId && occurrence.createdAtMessageId === messageId && occurrence.lastSeenMessageId === messageId && !dispositionDifferent;
+    const occurrenceReviewSame = occurrenceReview?.choice === "same" && (occurrenceReview.probabilities?.same ?? 0) >= 0.6;
+    const dispositionSame = disposition?.choice === "same" && (disposition.probabilities?.same ?? 0) >= 0.6;
+    const occurrenceConfirmed = !!occurrence && (reviewedAsGhost || identityAnswer?.choice === `ghost_${occurrenceIndex}` && strongChoice(identityAnswer) || occurrenceReview?.choice === "same" && strongChoice(occurrenceReview) || hollowOccurrence || selfReferentialOccurrence || occurrenceReviewSame && dispositionSame);
     const identityProbability = identityAnswer?.probabilities.new_or_unclear ?? 0;
     const identityRunnerUp = identityAnswer ? Math.max(0, ...Object.entries(identityAnswer.probabilities).filter(([key]) => key !== "new_or_unclear").map(([, value]) => value)) : 0;
     const confirmedNew = !!occurrence && disposition?.choice === "different" && strongChoice(disposition) && identityAnswer?.choice === "new_or_unclear" && identityAnswer.confidence >= 0.8 && identityProbability >= 0.8 && identityProbability - identityRunnerUp >= 0.25;
     const occurrenceConflict = !!occurrence && !occurrenceConfirmed && !confirmedNew;
-    const aliasMatches = name && !isBroadPersonLabel(name) ? ghosts.filter((item) => (!confirmedNew || item.id !== occurrence?.id) && ghostCastAliases(item).some((alias) => alias.toLowerCase() === name)) : [];
+    const aliasMatches = matchNames.length ? ghosts.filter((item) => (!confirmedNew || item.id !== occurrence?.id) && ghostCastAliases(item).some((alias) => matchNames.includes(alias.toLowerCase()))) : [];
     const exact = (occurrenceConfirmed ? occurrence : void 0) ?? (group.speakerId !== UNCAST_SPEAKER_ID && !isBroadPersonLabel(name) ? ghosts.find((item) => item.speakerId === group.speakerId && (!confirmedNew || item.id !== occurrence?.id)) : void 0) ?? (aliasMatches.length === 1 ? aliasMatches[0] : void 0) ?? (!confirmedNew ? occurrence : void 0);
     const identity = answers[`identity_${group.id}`];
     const labelAnswer = answers[`label_${group.id}`];
@@ -421,7 +677,8 @@ function resolveUncastVoiceDecisions(groups, voices, answers, ghosts = [], reser
       const review = answers[`review_same_${group.id}_${previous.id}`];
       const answer = review && strongChoice(review) ? review : answers[`same_${group.id}_${previous.id}`];
       const boosted = answer?.choice === "same" && answer.confidence >= 0.6 && (answer.probabilities.same ?? 0) >= 0.8 && !!group.flankPartners?.includes(previous.id);
-      return answer?.choice === "same" && strongChoice(answer) || boosted ? [{ previous, probability: answer?.probabilities.same ?? 0 }] : [];
+      const pronounLinked = answer?.choice === "same" && answer.confidence >= 0.3 && (answer.probabilities.same ?? 0) >= 0.6 && !!group.pronounPartners?.includes(previous.id);
+      return answer?.choice === "same" && strongChoice(answer) || boosted || pronounLinked ? [{ previous, probability: answer?.probabilities.same ?? 0 }] : [];
     }).sort((a, b) => b.probability - a.probability);
     const narratedPartner = previousGroups.find((previous) => narrationBoostsPair(group, previous));
     if (same[0]) root = roots.get(same[0].previous.id) ?? root;
@@ -442,7 +699,8 @@ function resolveUncastVoiceDecisions(groups, voices, answers, ghosts = [], reser
     const priorGhost = rankedGhosts[0]?.recent >= 0 && (rankedGhosts.length === 1 || rankedGhosts[0].recent > rankedGhosts[1].recent) ? rankedGhosts[0].item : void 0;
     const reviewedGhost = group.speakerId.startsWith("ghost:") ? ghosts.find((item) => item.id === group.speakerId.slice("ghost:".length) && (!confirmedNew || item.id !== occurrence?.id)) : void 0;
     let ghost = reviewedGhost ?? (namedGhosts.length === 1 ? namedGhosts[0] : priorGhost ?? exact);
-    let reason = reviewedGhost ? "speaker relationship review" : ghost === occurrence && ghost ? "exact message occurrence" : ghost && namedGhosts.includes(ghost) ? "label or alias match" : ghost ? "speaker name or alias match" : "";
+    const narratedMatch = !!ghost && ghost === exact && !!narratedName && !name;
+    let reason = reviewedGhost ? "speaker relationship review" : ghost === occurrence && ghost ? "exact message occurrence" : narratedMatch ? "narrated name match" : ghost && namedGhosts.includes(ghost) ? "label or alias match" : ghost ? "speaker name or alias match" : "";
     if (occurrenceConflict && ghost?.id === occurrence?.id) {
       const alternatives = ghosts.flatMap((candidate, index) => {
         if (candidate.id === occurrence.id) return [];
@@ -531,19 +789,26 @@ function resolveUncastVoiceDecisions(groups, voices, answers, ghosts = [], reser
     const members = groups.filter((group) => roots.get(group.id) === root);
     const genderVotes = members.map((group) => answers[`gender_${group.id}`]).filter((answer) => answer && (answer.choice === "male" || answer.choice === "female") && answer.confidence >= 0.6 && (answer.probabilities[answer.choice] ?? 0) >= 0.6);
     const genders = new Set(genderVotes.map((answer) => answer.choice));
-    const gender = genders.size === 1 ? genderVotes[0].choice : "unknown";
+    const jevGender = genders.size === 1 ? genderVotes[0].choice : "unknown";
     let ghost = linkedGhosts.get(root);
+    const labelHint = labelGenderHint(ghost?.label || members.map((group) => groupLabels.get(group.id)).find(Boolean) || "");
+    const pronounHint = members.find((member) => member.pronounGender && member.pronounPartners?.length)?.pronounGender;
+    let gender = jevGender !== "unknown" ? jevGender : labelHint || pronounHint || "unknown";
+    const rankingHint = members.find((member) => member.pronounGender === "male" || member.pronounGender === "female")?.pronounGender;
     if (!ghost) {
       const matches = members.map((group) => answers[`voice_${group.id}`]).filter((answer) => !!answer);
-      const eligible = voices.flatMap((voice, index) => {
-        if (used.has(voice.id) || gender !== "unknown" && voice.category !== "unspecified" && voice.category !== gender) return [];
+      const poolGender = rankingHint ?? gender;
+      const candidates = voices.flatMap((voice, index) => {
+        if (used.has(voice.id) || !voiceGenderCompatible(voice, poolGender)) return [];
         const scores = matches.map((match) => match.probabilities[`voice_${index}`] ?? 0).filter((score) => Number.isFinite(score) && score > 0);
-        return [{ voice, score: scores.length ? scores.reduce((sum, score) => sum + score, 0) / scores.length : 0, index }];
+        return [{ voice, score: scores.length ? scores.reduce((sum, score) => sum + score, 0) / scores.length : 0 }];
       });
-      const ranked = eligible.filter((item) => item.score > 0).sort((a, b) => b.score - a.score || a.index - b.index);
-      if (!ranked.length && eligible.length === 1 && matches.length) ranked.push(eligible[0]);
-      if (!ranked[0]) continue;
-      ghost = { id: `pending:${root}`, speakerId: members[0].speakerId, voiceId: ranked[0].voice.id, context: members.flatMap((group) => group.context).join(" ").slice(0, 2e3), occurrenceKeys: [], lastSeenMessageId: messageId };
+      if (poolGender !== gender) gender = poolGender;
+      if (!candidates.length || !matches.length) continue;
+      if (candidates.length > 1 && matches.every((match) => match.choice === "no_match")) continue;
+      const shortlist = shortlistRankedVoices(candidates, (entry) => entry.score);
+      const chosen = shortlist[Math.min(shortlist.length - 1, Math.floor(random() * shortlist.length))].voice;
+      ghost = { id: `pending:${root}`, speakerId: members[0].speakerId, voiceId: chosen.id, context: members.flatMap((group) => group.context).join(" ").slice(0, 2e3), occurrenceKeys: [], lastSeenMessageId: messageId };
       linkReasons.set(root, "new voice selected from favorites");
     }
     used.add(ghost.voiceId);
@@ -2110,7 +2375,7 @@ function buildBestAvailableSpeakerReview(plan, answers, context, cardSpeakerId =
   const options = {};
   const criteria = {};
   for (const speaker of plan.state.speakers) {
-    if (speaker.id === USER_SPEAKER_ID) continue;
+    if (speaker.id === USER_SPEAKER_ID && plan.state.messageRole !== "user") continue;
     if (!grounded.has(speaker.id)) continue;
     options[speaker.option] = speaker.id;
     criteria[speaker.option] = knownCriteria[speaker.option];
@@ -4768,7 +5033,53 @@ function hasExplicitUncastCue(content, skippedTrackerTagPairs = "") {
   const narration = cleanPlaybackText(narrativeOnly(playbackContent));
   return ANONYMOUS_ROLE_IDENTITY_PATTERN.test(narration) || hasAnonymousHumanSubject(narration) || SPEAKER_TURN_SWITCH_PATTERN.test(narration);
 }
+function hasFirstPersonPronoun(text) {
+  return /\b(?:i|me|my|mine|myself)(?:'(?:m|ve|ll|d|re))?\b/iu.test(text);
+}
+function invokesSpeakerName(text, aliases) {
+  return aliases.some((alias) => {
+    const value = alias.trim();
+    return value.length >= 2 && new RegExp(`(^|[^\\p{L}\\p{N}])${escapedPattern(value)}(?=$|[^\\p{L}\\p{N}])`, "iu").test(text);
+  });
+}
+function userCueForSpeech(plan, speech) {
+  const userSpeaker = plan.state.speakers.find((speaker) => speaker.id === USER_SPEAKER_ID);
+  const aliases = userSpeaker ? speakerAliases(userSpeaker.name) : [];
+  const narration = `${speech.narrativeBefore} ${speech.narrativeAfter}`;
+  return hasFirstPersonPronoun(speech.text) || hasFirstPersonPronoun(narration) || invokesSpeakerName(narration, aliases);
+}
+function applyUserCueConfidenceBoost(plan, answers) {
+  const boosted = /* @__PURE__ */ new Set();
+  const userOption = Object.keys(plan.optionSpeakerIds).find((option) => plan.optionSpeakerIds[option] === USER_SPEAKER_ID);
+  if (!userOption) return boosted;
+  for (const speech of plan.state.speeches) {
+    if (!userCueForSpeech(plan, speech)) continue;
+    for (const key of [`speech_${speech.id}`, `best_guess_${speech.id}`]) {
+      const answer = answers[key];
+      if (!answer || !Object.hasOwn(answer.probabilities, userOption)) continue;
+      const probabilities = { ...answer.probabilities };
+      const current = probabilities[userOption] ?? 0;
+      const boostedProbability = Math.min(0.99, current + 0.25);
+      if (boostedProbability <= current) continue;
+      const others = 1 - current;
+      const scale = others > 0 ? (1 - boostedProbability) / others : 0;
+      for (const option of Object.keys(probabilities)) {
+        probabilities[option] = option === userOption ? boostedProbability : (probabilities[option] ?? 0) * scale;
+      }
+      const runnerUp = Math.max(0, ...Object.entries(probabilities).filter(([option]) => option !== userOption).map(([, value]) => value));
+      const becomesUser = answer.choice === userOption || boostedProbability > runnerUp;
+      answers[key] = {
+        choice: becomesUser ? userOption : answer.choice,
+        probabilities,
+        confidence: becomesUser ? Math.min(1, answer.confidence + 0.15) : answer.confidence
+      };
+      boosted.add(speech.id);
+    }
+  }
+  return boosted;
+}
 function resolveSpeakerDecisionSegments(content, plan, answers, speakers, options) {
+  const userCueBoosted = options.isUserMessage ? applyUserCueConfidenceBoost(plan, answers) : /* @__PURE__ */ new Set();
   const paragraphIdentities = new Map(plan.state.paragraphs.map((paragraph) => [
     paragraph.id,
     clearDecisionSpeaker(answers[`paragraph_${paragraph.id}`], plan.optionSpeakerIds)
@@ -4848,7 +5159,7 @@ function resolveSpeakerDecisionSegments(content, plan, answers, speakers, option
   const maxIdentityStrength = identityStrengths.length > 0 ? Math.max(...identityStrengths) : 0;
   const cardBlockDescription = `p>=${SPEAKER_CARD_THRESHOLDS.probability},c>=${SPEAKER_CARD_THRESHOLDS.confidence},m>=${SPEAKER_CARD_THRESHOLDS.margin}`;
   const cardReason = explicitUncastCue ? "explicit anonymous role or unnamed turn in narration" : namedAlternative ? "narration names another known speaker" : hasStrongIdentity ? `an identity cleared ${cardBlockDescription}` : `no identity cleared ${cardBlockDescription} (max strength ${maxIdentityStrength.toFixed(2)})`;
-  const cardIdentity = options.cardSpeakerId && !explicitUncastCue && !namedAlternative && !hasStrongIdentity ? options.cardSpeakerId : null;
+  const cardIdentity = options.cardSpeakerId && !options.isUserMessage && !explicitUncastCue && !namedAlternative && !hasStrongIdentity ? options.cardSpeakerId : null;
   const deferredUncast = Boolean(cardIdentity && hasUncastIdentity);
   const routingIdentity = (identity) => {
     if (identity === void 0 || identity === null) return void 0;
@@ -4938,6 +5249,7 @@ function resolveSpeakerDecisionSegments(content, plan, answers, speakers, option
           `segment-type:speech (quote ${index + 1})`,
           ...answers[`first_pass_${speech.id}`] ? decisionAnswerDebug("jev-first-pass-speech", answers[`first_pass_${speech.id}`], plan.optionSpeakerIds) : [],
           ...decisionAnswerDebug("jev-speech", answer, plan.optionSpeakerIds),
+          ...userCueBoosted.has(speech.id) ? ["user-cue-boost: first-person pronoun or user-name invocation shifts confidence toward user persona"] : [],
           ...decisionAnswerDebug("jev-ungrounded-first-pass", answers[`ungrounded_original_${speech.id}`], plan.optionSpeakerIds),
           ...answers[`ungrounded_original_${speech.id}`] ? ["jev-grounding:unsupported cast identity excluded from first-pass anchor"] : [],
           ...decisionAnswerDebug("jev-relationship-original", answers[`relationship_original_${speech.id}`], plan.optionSpeakerIds),
@@ -5214,6 +5526,50 @@ function applyConfigToMetadata(metadata, config) {
   if (voiceOverrides.narrator || voiceOverrides.characters) result.voiceOverrides = voiceOverrides;
   else delete result.voiceOverrides;
   return result;
+}
+
+// src/uuid.ts
+var lastTimestamp = 0;
+var counter = 0;
+var uuidBytes = () => {
+  const now = Math.max(0, Math.min(Number(2n ** 48n - 1n), Date.now()));
+  let timestamp = now;
+  if (timestamp === lastTimestamp) {
+    counter = counter + 1 & 4095;
+    if (counter === 0 && timestamp < Number(2n ** 48n - 1n)) {
+      timestamp += 1;
+      lastTimestamp = timestamp;
+    } else {
+      lastTimestamp = timestamp;
+    }
+  } else {
+    counter = 0;
+    lastTimestamp = timestamp;
+  }
+  const bytes = new Uint8Array(16);
+  const value = BigInt(timestamp);
+  bytes[0] = Number(value >> 40n & 0xffn);
+  bytes[1] = Number(value >> 32n & 0xffn);
+  bytes[2] = Number(value >> 24n & 0xffn);
+  bytes[3] = Number(value >> 16n & 0xffn);
+  bytes[4] = Number(value >> 8n & 0xffn);
+  bytes[5] = Number(value & 0xffn);
+  bytes[6] = 112 | counter >> 8 & 15;
+  bytes[7] = counter & 255;
+  for (let index = 8; index < 16; index += 1) bytes[index] = Math.floor(Math.random() * 256);
+  bytes[8] = bytes[8] & 63 | 128;
+  return bytes;
+};
+var UUID_HEX = Array.from({ length: 256 }, (_, index) => index.toString(16).padStart(2, "0"));
+function generateUuidV7() {
+  const bytes = uuidBytes();
+  return [
+    UUID_HEX[bytes[0]] + UUID_HEX[bytes[1]] + UUID_HEX[bytes[2]] + UUID_HEX[bytes[3]],
+    UUID_HEX[bytes[4]] + UUID_HEX[bytes[5]],
+    UUID_HEX[bytes[6]] + UUID_HEX[bytes[7]],
+    UUID_HEX[bytes[8]] + UUID_HEX[bytes[9]],
+    Array.from(bytes.slice(10), (byte) => UUID_HEX[byte]).join("")
+  ].join("-");
 }
 
 // src/backend.ts
@@ -5695,6 +6051,15 @@ async function scanCardCast(cards, userId, preferredConnectionId) {
     return { detected: [], usedFallback: true };
   }
 }
+async function createGhostVoiceId() {
+  try {
+    const id = await spindle.uuid?.v7?.();
+    if (id) return id;
+  } catch (error) {
+    spindle.log.warn(`Spindle UUID helper failed; using local fallback: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  return generateUuidV7();
+}
 var saveQueues = /* @__PURE__ */ new Map();
 async function saveGhostVoiceAssignments(chatId, messageId, assistantIds, groups, assignments, userId, anchorId = messageId, reserved = [], lifetime = 10, conversation = "", sourceHash = "", ghostSnapshotHash = "") {
   const queueKey = `${userId ?? "user"}:${chatId}`;
@@ -5722,7 +6087,7 @@ async function saveGhostVoiceAssignments(chatId, messageId, assistantIds, groups
         const existing = pendingIds.get(ghostId);
         if (existing) ghostId = existing;
         else {
-          const newId = `ghost-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+          const newId = `ghost-${await createGhostVoiceId()}`;
           pendingIds.set(ghostId, newId);
           ghostId = newId;
         }
@@ -6481,6 +6846,61 @@ function queueScan(payload, userId, frontendSessionId) {
   saveQueues.set(queueKey, nextTask);
   return nextTask;
 }
+var FISH_AUDIO_MODEL_URL = "https://api.fish.audio/model";
+var FISH_COMMUNITY_REQUEST_TIMEOUT_MS = 3e4;
+async function fetchCommunityModels(fishApiKey, request) {
+  const key = (fishApiKey ?? "").trim();
+  if (!key) throw new Error("Add your Fish Audio API key in the Community tab first.");
+  const params = new URLSearchParams();
+  const title = (request.title ?? "").trim();
+  if (title) params.set("title", title.slice(0, 128));
+  for (const tag of (request.tags ?? []).map((value) => value.trim()).filter(Boolean).slice(0, 8)) params.append("tag", tag.slice(0, 64));
+  for (const language of (request.language ?? []).map((value) => value.trim()).filter(Boolean).slice(0, 4)) params.append("language", language.slice(0, 32));
+  const sortBy = ["score", "task_count", "created_at"].includes(request.sortBy ?? "") ? request.sortBy : "score";
+  params.set("sort_by", sortBy);
+  params.set("page_number", String(Math.max(1, Math.round(request.pageNumber ?? 1))));
+  params.set("page_size", String(Math.min(100, Math.max(1, Math.round(request.pageSize ?? 20)))));
+  params.set("self", "false");
+  const url = `${FISH_AUDIO_MODEL_URL}?${params.toString()}`;
+  let response;
+  try {
+    response = await Promise.race([
+      spindle.cors(url, { method: "GET", headers: { Authorization: `Bearer ${key}` } }),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("Fish Audio catalog request timed out.")), FISH_COMMUNITY_REQUEST_TIMEOUT_MS))
+    ]);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error ?? "");
+    throw new Error(message || "The Fish Audio catalog could not be reached.");
+  }
+  let payload = response;
+  let httpStatus = null;
+  if (response && typeof response === "object" && !Array.isArray(response)) {
+    const envelope = response;
+    if (typeof envelope.status === "number") {
+      httpStatus = envelope.status;
+      payload = "body" in envelope ? envelope.body : response;
+    }
+  }
+  if (typeof payload === "string") {
+    try {
+      payload = JSON.parse(payload);
+    } catch {
+    }
+  }
+  if (httpStatus !== null && httpStatus >= 400) {
+    const reason = typeof payload === "object" && payload !== null && typeof payload.message === "string" ? payload.message : typeof payload === "string" ? payload : "";
+    if (httpStatus === 401 || httpStatus === 403) throw new Error(`Fish Audio rejected the API key (${httpStatus}). Check the key in the Community tab.${reason ? ` Details: ${reason.slice(0, 160)}` : ""}`);
+    if (httpStatus === 429) throw new Error("Fish Audio rate limited the catalog request. Wait a moment and retry.");
+    throw new Error(`Fish Audio catalog request failed (${httpStatus}).${reason ? ` Details: ${reason.slice(0, 160)}` : ""}`);
+  }
+  const parsed = readCommunityVoiceList(payload);
+  if (!parsed) {
+    const shape = communityPayloadShape(payload);
+    const message = typeof payload === "object" && payload !== null && typeof payload.message === "string" ? payload.message : "";
+    throw new Error(`Fish Audio returned an unexpected catalog response [${shape}].${message ? ` Details: ${message.slice(0, 160)}` : ""}`);
+  }
+  return parsed;
+}
 spindle.onFrontendMessage(async (rawPayload, userId, frontendSessionId) => {
   const payload = rawPayload;
   try {
@@ -6538,6 +6958,59 @@ spindle.onFrontendMessage(async (rawPayload, userId, frontendSessionId) => {
           error: error instanceof Error ? error.message : "Could not load LLM connections."
         }, userId, frontendSessionId);
       }
+    } else if (payload?.type === "chat_voice_search_community") {
+      try {
+        const parsed = await fetchCommunityModels(payload.fishApiKey, {
+          title: payload.title,
+          tags: payload.tags,
+          language: payload.language,
+          sortBy: payload.sortBy,
+          pageNumber: payload.pageNumber,
+          pageSize: payload.pageSize
+        });
+        sendFrontend({
+          type: "chat_voice_community_results",
+          requestId: payload.requestId,
+          items: parsed.items,
+          total: parsed.total,
+          hasMore: parsed.hasMore,
+          error: ""
+        }, userId, frontendSessionId);
+      } catch (error) {
+        sendFrontend({
+          type: "chat_voice_community_results",
+          requestId: payload.requestId,
+          items: [],
+          total: 0,
+          hasMore: false,
+          error: error instanceof Error ? error.message : "The Fish Audio catalog could not be reached."
+        }, userId, frontendSessionId);
+      }
+    } else if (payload?.type === "chat_voice_refresh_community_snapshot") {
+      try {
+        const parsed = await fetchCommunityModels(payload.fishApiKey, {
+          sortBy: "score",
+          pageNumber: 1,
+          pageSize: 100,
+          language: (payload.language ?? "").trim() ? [(payload.language ?? "").trim().slice(0, 32)] : []
+        });
+        sendFrontend({
+          type: "chat_voice_community_snapshot_result",
+          requestId: payload.requestId,
+          items: parsed.items,
+          voices: parsed.items.map(communityVoiceToFavorite),
+          refreshedAt: (/* @__PURE__ */ new Date()).toISOString(),
+          error: ""
+        }, userId, frontendSessionId);
+      } catch (error) {
+        sendFrontend({
+          type: "chat_voice_community_snapshot_result",
+          requestId: payload.requestId,
+          voices: [],
+          refreshedAt: "",
+          error: error instanceof Error ? error.message : "The Fish Audio catalog could not be reached."
+        }, userId, frontendSessionId);
+      }
     } else if (payload?.type === "chat_voice_match_uncast") {
       try {
         const groups = payload.groups.slice(0, 64).map((group) => ({
@@ -6548,6 +7021,8 @@ spindle.onFrontendMessage(async (rawPayload, userId, frontendSessionId) => {
           context: (group.context ?? []).slice(0, 20).map((context) => context.slice(0, 2e3)),
           ...group.addressee ? { addressee: group.addressee } : {},
           ...group.flankPartners ? { flankPartners: group.flankPartners.slice(0, 20) } : {},
+          ...group.pronounPartners ? { pronounPartners: group.pronounPartners.slice(0, 20) } : {},
+          ...group.pronounGender ? { pronounGender: group.pronounGender } : {},
           ...group.narratedName ? { narratedName: group.narratedName } : {},
           ...group.inferredName ? { inferredName: group.inferredName } : {}
         }));
@@ -6578,14 +7053,30 @@ spindle.onFrontendMessage(async (rawPayload, userId, frontendSessionId) => {
           const plan = buildUncastVoiceDecision(groups, voices, payload.message.slice(0, 3e4), ghosts, matchingContext.previousMessages);
           const answers = {};
           let decisionError = "";
-          try {
-            const result = await spindle.decisions.evaluate({ state: plan.state, questions: plan.questions, ...userId ? { userId } : {} });
-            for (const [id, answer] of Object.entries(result.answers)) {
-              if (answer.type === "choice") answers[id] = { choice: answer.choice, probabilities: answer.probabilities, confidence: answer.confidence };
+          const captureAnswers = (result) => {
+            for (const [id, raw] of Object.entries(result.answers)) {
+              const answer = raw;
+              if (answer.type === "choice" && typeof answer.choice === "string" && answer.probabilities && typeof answer.confidence === "number") answers[id] = { choice: answer.choice, probabilities: answer.probabilities, confidence: answer.confidence };
             }
+          };
+          const isVoiceQuestion = (id) => id.startsWith("voice_");
+          const identityQuestions = Object.fromEntries(Object.entries(plan.questions).filter(([id]) => !isVoiceQuestion(id)));
+          const voiceQuestions = Object.fromEntries(Object.entries(plan.questions).filter(([id]) => isVoiceQuestion(id)));
+          try {
+            const result = await spindle.decisions.evaluate({ state: plan.state, questions: identityQuestions, ...userId ? { userId } : {} });
+            captureAnswers(result);
           } catch (error) {
             decisionError = error instanceof Error ? error.message : String(error);
-            spindle.log.warn(`[Chat Voice] Uncast voice decision failed; using exact ghost matches only: ${decisionError}`);
+            spindle.log.warn(`[Chat Voice] Uncast identity decision failed; using exact ghost matches only: ${decisionError}`);
+          }
+          if (Object.keys(voiceQuestions).length) {
+            try {
+              const result = await spindle.decisions.evaluate({ state: plan.state, questions: voiceQuestions, ...userId ? { userId } : {} });
+              captureAnswers(result);
+            } catch (error) {
+              if (!decisionError) decisionError = error instanceof Error ? error.message : String(error);
+              spindle.log.warn(`[Chat Voice] Uncast voice ranking failed: ${decisionError}`);
+            }
           }
           const review = buildUncastIdentityReview(groups, answers, payload.message.slice(0, 3e4), ghosts, payload.messageId, matchingContext.previousMessages);
           let reviewError = "";
@@ -6607,13 +7098,14 @@ spindle.onFrontendMessage(async (rawPayload, userId, frontendSessionId) => {
           }
           const diagnostics = groups.map((group) => {
             const identity = answers[`identity_${group.id}`];
+            const gender = answers[`gender_${group.id}`];
             const label = answers[`label_${group.id}`];
             const voice = answers[`voice_${group.id}`];
             const comparisons = Object.entries(answers).filter(([key]) => key.startsWith(`same_${group.id}_`) || key.startsWith(`review_same_${group.id}_`) || key.startsWith(`review_ghost_${group.id}_`) || key.startsWith(`review_occurrence_${group.id}_`) || key.startsWith(`review_occurrence_disposition_${group.id}_`) || key.startsWith(`review_reveal_${group.id}_`) || key.startsWith(`review_scene_${group.id}_`) || key.startsWith(`review_continuity_${group.id}_`)).map(([key, answer]) => `${key}=${answer.choice} confidence=${answer.confidence} probabilities=${JSON.stringify(answer.probabilities)}`).join(";") || "none";
             const narrativeName = answers[`narrative_name_${group.id}`];
             const assignment = assignments.find((item) => item.groupId === group.id);
             const proposed = proposedAssignments.find((item) => item.groupId === group.id);
-            return `${group.id} segments=${group.segmentIndexes.map((index) => index + 1).join(",")} identity=${identity ? `${identity.choice} confidence=${identity.confidence} probabilities=${JSON.stringify(identity.probabilities)}` : "none"} label=${label ? `${label.choice} confidence=${label.confidence} probabilities=${JSON.stringify(label.probabilities)}` : "none"} narrative-name=${narrativeName ? `${narrativeName.choice} (${plan.state.narrativeNames[Number(narrativeName.choice.replace("name_", ""))] ?? "none"}) confidence=${narrativeName.confidence} probabilities=${JSON.stringify(narrativeName.probabilities)}` : "none"} comparisons=${comparisons} proposed=${proposed ? `${proposed.ghostId} / ${proposed.voiceId} / ${proposed.gender}` : "none"} match-reason=${proposed?.matchReason ?? "none"} voice-choice=${voice ? `${voice.choice} confidence=${voice.confidence} probabilities=${JSON.stringify(voice.probabilities)}` : "none"} final=${assignment ? `${assignment.label || "unnamed"} / ${assignment.ghostId} / ${assignment.voiceId}` : "connection default"}`;
+            return `${group.id} segments=${group.segmentIndexes.map((index) => index + 1).join(",")} identity=${identity ? `${identity.choice} confidence=${identity.confidence} probabilities=${JSON.stringify(identity.probabilities)}` : "none"} gender=${gender ? `${gender.choice} confidence=${gender.confidence} probabilities=${JSON.stringify(gender.probabilities)}` : "none"} label=${label ? `${label.choice} confidence=${label.confidence} probabilities=${JSON.stringify(label.probabilities)}` : "none"} narrative-name=${narrativeName ? `${narrativeName.choice} (${plan.state.narrativeNames[Number(narrativeName.choice.replace("name_", ""))] ?? "none"}) confidence=${narrativeName.confidence} probabilities=${JSON.stringify(narrativeName.probabilities)}` : "none"} comparisons=${comparisons} proposed=${proposed ? `${proposed.ghostId} / ${proposed.voiceId} / ${proposed.gender}` : "none"} match-reason=${proposed?.matchReason ?? "none"} voice-choice=${voice ? `${voice.choice} confidence=${voice.confidence} probabilities=${JSON.stringify(voice.probabilities)}` : "none"} final=${assignment ? `${assignment.label || "unnamed"} / ${assignment.ghostId} / ${assignment.voiceId}` : "connection default"}`;
           });
           diagnostics.unshift(`Available favorites=${voices.length}, historical ghosts=${ghosts.length}, current ghosts=${currentGhosts.length}; prior messages=${matchingContext.previousMessages.length}${decisionError ? `; Jev failed: ${decisionError}` : ""}; identity review questions=${Object.keys(review.questions).length}${reviewError ? `; review failed: ${reviewError}` : ""}.`);
           diagnostics.splice(1, 0, `Candidate context: ${ghosts.map((ghost, index) => `ghost_${index}=${ghost.id} last=${ghost.lastSeenMessageId || "none"} history=${(ghost.conversationHistory ?? []).map((entry) => `${entry.messageId}(${entry.text.length} chars)`).join(",") || "none"} context=${ghost.context.length} chars`).join("; ") || "none"}; prior=${matchingContext.previousMessages.map((item) => `${item.role ?? "unknown"}:${item.id}(${item.text.length} chars)`).join(",") || "none"}.`);
@@ -6655,9 +7147,6 @@ spindle.onFrontendMessage(async (rawPayload, userId, frontendSessionId) => {
             content: message.content ?? "",
             swipe_id: message.swipe_id,
             swipe_dates: message.swipe_dates,
-            ...Number.isInteger(payload.targetSwipeId) && (payload.targetSwipeId ?? -1) >= 0 ? {
-              targetSwipeContent: readMessageSwipeContent(message, payload.targetSwipeId)
-            } : {},
             extra: message.extra ?? {}
           } : null,
           ...!message ? { error: "The message is no longer available." } : {}
@@ -6690,8 +7179,8 @@ spindle.onFrontendMessage(async (rawPayload, userId, frontendSessionId) => {
       if (roles.length && voices.length) {
         const questions = Object.fromEntries(roles.map((role, index) => [`role_${index}`, {
           type: "choice",
-          instructions: `Choose the best available voice for ${role.description}. Compare voice descriptions and gender when established.`,
-          criteria: { ...Object.fromEntries(voices.map((voice, i) => [`voice_${i}`, `${voice.name || voice.id}; ${voice.category}; ${voice.description || "No description provided"}`])), ...voices.length === 1 ? { no_match: "No voice is suitable." } : {} }
+          instructions: `Choose the best available voice for ${role.description}. Gender is a hard compatibility cue when established. For style, score voices by metadata cues rather than prose length: name is weak context, category and languages contribute one compatibility cue in aggregate, each explicit tag is one cue, and each tag listed in "description supports" is one cue. The description is evidence for those tags, not an extra vote, and support for an explicit tag counts once rather than twice. Balance tags against that description evidence instead of letting a long description outweigh otherwise better matches. Some voices list less metadata than others; missing fields are not a reason to rank a voice lower.`,
+          criteria: { ...Object.fromEntries(voices.map((voice, i) => [`voice_${i}`, voiceDecisionSummary(voice)])), ...voices.length === 1 ? { no_match: "No voice is suitable." } : {} }
         }]));
         roles.forEach((role, index) => {
           if (role.id !== "narrator") questions[`gender_${index}`] = {

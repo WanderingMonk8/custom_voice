@@ -8,7 +8,10 @@ import {
   addUnconfiguredDialogueSpeakers,
   addFavoriteVoice,
   groupLabelOptions,
+  labelGenderHint,
   mutuallyInvoked,
+  narrationFirstPronounClass,
+  backwardNarrationPronounGender,
   narrationBoostsPair,
   vocativeNames,
   type PlaybackSegment,
@@ -43,8 +46,6 @@ import {
   autoplaySwipeSnapshot,
   autoplaySwipeMatches,
   refreshAutoplaySwipe,
-  readMessageSwipeContent,
-  targetSwipeContentMatches,
   swipeSynthesisKey,
   savedAudioMatchesSwipe,
   automaticPlaybackSkipReason,
@@ -80,6 +81,7 @@ import {
   availableUncastVoices,
   canReserveAutomaticVoice,
   selectAutomaticVoice,
+  shortlistRankedVoices,
   activeGhostVoices,
   purgeExpiredGhostContexts,
   markGhostVoiceInvoked,
@@ -131,6 +133,18 @@ import {
   readConfig,
   readSavedAudioHistory,
   readFavoriteVoices,
+  readCommunityVoice,
+  readCommunityVoiceList,
+  readCommunityVoicePool,
+  communityPayloadShape,
+  communityVoiceToFavorite,
+  upsertCommunityFavorite,
+  voiceAge,
+  voiceCategoryGender,
+  voiceDecisionSummary,
+  voiceDescriptionTagHints,
+  voiceGender,
+  voiceGenderCompatible,
   resolveSpeakerDecisionSegments,
   resolveSpeakerDiscourseAnswers,
   resolveTtsTagAnswers,
@@ -156,6 +170,14 @@ import {
   type ChatVoiceConfig,
   type SpeakerDecisionChoice,
 } from './core'
+import { generateUuidV7 } from './uuid'
+
+test('local UUID v7 fallback is RFC-shaped, unique, and does not use browser crypto', () => {
+  const first = generateUuidV7()
+  const second = generateUuidV7()
+  assert.match(first, /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u)
+  assert.notEqual(first, second)
+})
 
 test('combines decoded segments into one resampled PCM WAV', () => {
   const wav = encodeConcatenatedWav([
@@ -288,6 +310,78 @@ test('Jev resolver uses role fallbacks only when the complete message has no ide
 
   assert.equal(assistant.find(segment => segment.text === 'No one has named me.')?.speakerId, 'ruby')
   assert.equal(user.find(segment => segment.text === 'No one has named me.')?.speakerId, USER_SPEAKER_ID)
+})
+
+test('user messages let the user take the default instead of the card title character', () => {
+  const content = '"No one has named me."'
+  const speakers = [{ id: 'ruby', name: 'Ruby' }]
+  const plan = buildSpeakerDecisionPlan(content, speakers, true)
+  const unclear = {
+    choice: 'no_clear_identity',
+    probabilities: { no_clear_identity: 0.9, uncast_character: 0.1 },
+    confidence: 0.9,
+  }
+  const segments = resolveSpeakerDecisionSegments(
+    content,
+    plan,
+    { paragraph_p0: unclear, speech_s0: unclear },
+    speakers,
+    { isUserMessage: true, cardSpeakerId: 'ruby', historicalSpeakerId: null },
+  )
+  assert.equal(segments.find(segment => segment.text === 'No one has named me.')?.speakerId, USER_SPEAKER_ID)
+})
+
+test('best-available review includes the user persona as candidate in user messages', () => {
+  const speakers = [{ id: 'ellis', name: 'Ellis' }, { id: USER_SPEAKER_ID, name: 'April' }]
+  const userPlan = buildSpeakerDecisionPlan('Ellis watches. "April," I repeat. "I came here."', speakers, true)
+  const assistantPlan = buildSpeakerDecisionPlan('Ellis watches. "April," I repeat. "I came here."', speakers, false)
+  const context = { previousMessages: [], ghosts: [] }
+  const answers = { global_uncertain_s0: confidentDecision('no_clear_identity', 0.9, 0.9) }
+  const userReview = buildBestAvailableSpeakerReview(userPlan, answers, context)
+  const assistantReview = buildBestAvailableSpeakerReview(assistantPlan, answers, context)
+  const userOption = decisionOption(userPlan, USER_SPEAKER_ID)
+  assert.ok(userReview.questions.best_guess_s0.criteria[userOption])
+  assert.equal(assistantReview.questions.best_guess_s0.criteria[userOption], undefined)
+})
+
+test('first-person narration in a user message keeps the narrator voice', () => {
+  const speakers = [{ id: 'ellis', name: 'Ellis' }, { id: USER_SPEAKER_ID, name: 'April' }]
+  const content = '"April," I repeat. "That is before I came here." The rain fell.'
+  const userSegments = parseRosterVoiceSegments(content, null, speakers)
+  assert.equal(userSegments.find(segment => segment.text === 'I repeat.')?.speakerId, null)
+  assert.equal(userSegments.find(segment => segment.text === 'The rain fell.')?.speakerId, null)
+  const assistantSegments = parseRosterVoiceSegments(content, null, speakers)
+  assert.equal(assistantSegments.find(segment => segment.text === 'I repeat.')?.speakerId, null)
+})
+
+test('first-person cue boosts user confidence and a best-available guess can land on the user', () => {
+  const speakers = [{ id: 'ellis', name: 'Ellis' }, { id: USER_SPEAKER_ID, name: 'April' }]
+  const plan = buildSpeakerDecisionPlan('Ellis watches. "April," I repeat. "That is before I came here."', speakers, true)
+  const ellisOption = decisionOption(plan, 'ellis')
+  const userOption = decisionOption(plan, USER_SPEAKER_ID)
+  const answers: Record<string, SpeakerDecisionChoice> = {
+    paragraph_p0: confidentDecision('no_clear_identity'),
+    speech_s0: { choice: ellisOption, probabilities: { [ellisOption]: 0.45, [userOption]: 0.39, no_clear_identity: 0.16 }, confidence: 0.36 },
+    speech_s1: { choice: userOption, probabilities: { [userOption]: 0.58, [ellisOption]: 0.2, no_clear_identity: 0.22 }, confidence: 0.51 },
+    global_uncertain_s0: confidentDecision('no_clear_identity', 0.9, 0.9),
+    best_guess_s0: { choice: ellisOption, probabilities: { [ellisOption]: 0.61, [userOption]: 0.3, no_clear_identity: 0.09 }, confidence: 0.53 },
+  }
+  const segments = resolveSpeakerDecisionSegments(plan.state.message, plan, answers, speakers, { isUserMessage: true, cardSpeakerId: 'ellis', historicalSpeakerId: null, evidenceOnly: true })
+  assert.equal(segments.find(segment => segment.text === 'April,')?.speakerId, USER_SPEAKER_ID)
+  assert.equal(segments.find(segment => segment.text === 'That is before I came here.')?.speakerId, USER_SPEAKER_ID)
+})
+
+test('user-name invocation in narration boosts the user speech without a first-person cue', () => {
+  const speakers = [{ id: 'ellis', name: 'Ellis' }, { id: USER_SPEAKER_ID, name: 'April' }]
+  const plan = buildSpeakerDecisionPlan('April turns away. "Hello there."', speakers, true)
+  const ellisOption = decisionOption(plan, 'ellis')
+  const userOption = decisionOption(plan, USER_SPEAKER_ID)
+  const answers: Record<string, SpeakerDecisionChoice> = {
+    paragraph_p0: confidentDecision('no_clear_identity'),
+    speech_s0: { choice: ellisOption, probabilities: { [ellisOption]: 0.45, [userOption]: 0.39, no_clear_identity: 0.16 }, confidence: 0.36 },
+  }
+  const segments = resolveSpeakerDecisionSegments(plan.state.message, plan, answers, speakers, { isUserMessage: true, cardSpeakerId: 'ellis', historicalSpeakerId: null })
+  assert.equal(segments.find(segment => segment.text === 'Hello there.')?.speakerId, USER_SPEAKER_ID)
 })
 
 test('Jev uncast identity disables card-title deference and routes to connection default', () => {
@@ -2008,8 +2102,22 @@ test('validates favorite voice IDs and classifications', () => {
   ]), [
     { id: 'voice-1', name: 'Alice', category: 'female', description: 'warm and gentle' },
     { id: 'voice-2', name: 'Bob', category: 'male', description: '' },
-    { id: 'voice-3', name: '', category: 'unspecified', description: '' },
+    { id: 'voice-3', name: '', category: 'other', description: '' },
   ])
+  // Legacy rows without a recognized category still default to unspecified.
+  assert.deepEqual(readFavoriteVoices([{ id: 'voice-4' }]), [
+    { id: 'voice-4', name: '', category: 'unspecified', description: '' },
+  ])
+  // Community metadata survives a save/load round trip.
+  assert.deepEqual(readFavoriteVoices([{
+    id: 'voice-5', name: 'Mother Jinx', category: 'anime character', description: 'commanding',
+    author: 'someone', source: 'community', communityLink: 'https://fish.audio/m/voice-5',
+    tags: ['anime', 'female', 'english'],
+  }]), [{
+    id: 'voice-5', name: 'Mother Jinx', category: 'anime character', description: 'commanding',
+    author: 'someone', source: 'community', communityLink: 'https://fish.audio/m/voice-5',
+    tags: ['anime', 'female', 'english'],
+  }])
   assert.deepEqual(readFavoriteVoices(null), [])
 })
 
@@ -2019,6 +2127,114 @@ test('rejects duplicate favorite voice IDs even if names differ or whitespace is
   assert.throws(() => addFavoriteVoice(existing, duplicate), /already a favorite/u)
   assert.deepEqual(existing.map(voice => voice.name), ['First'])
   assert.equal(addFavoriteVoice(existing, { ...duplicate, id: 'voice-1' }).length, 2)
+})
+
+test('voiceCategoryGender reads expanded categories with word boundaries', () => {
+  assert.equal(voiceCategoryGender('female'), 'female')
+  assert.equal(voiceCategoryGender('Female voice'), 'female')
+  assert.equal(voiceCategoryGender('young female'), 'female')
+  assert.equal(voiceCategoryGender('male'), 'male')
+  assert.equal(voiceCategoryGender('Young Male'), 'male')
+  assert.equal(voiceCategoryGender('elderly man'), 'unspecified')
+  assert.equal(voiceCategoryGender('anime character'), 'unspecified')
+  assert.equal(voiceCategoryGender('unspecified'), 'unspecified')
+  assert.equal(voiceCategoryGender(''), 'unspecified')
+})
+
+test('voiceGender prefers an explicit hint, then category, then tags', () => {
+  assert.equal(voiceGender({ category: 'anime character' }), 'unknown')
+  assert.equal(voiceGender({ category: 'anime character', tags: ['female', 'english'] }), 'female')
+  assert.equal(voiceGender({ category: 'female', tags: ['male'] }), 'female')
+  assert.equal(voiceGender({ category: 'anime character', gender: 'male' }), 'male')
+  assert.equal(voiceGenderCompatible({ category: 'young male' }, 'male'), true)
+  assert.equal(voiceGenderCompatible({ category: 'young male' }, 'female'), false)
+  assert.equal(voiceGenderCompatible({ category: 'anime character' }, 'female'), true)
+  assert.equal(voiceGenderCompatible({ category: 'female' }, 'unknown'), true)
+})
+
+test('voiceAge reads the age tag case-insensitively, else unknown', () => {
+  assert.equal(voiceAge({ tags: ['young'] }), 'young')
+  assert.equal(voiceAge({ tags: ['Middle Aged'] }), 'middle aged')
+  assert.equal(voiceAge({ tags: ['deep', 'Old'] }), 'old')
+  assert.equal(voiceAge({ tags: ['deep'] }), 'unknown')
+  assert.equal(voiceAge({}), 'unknown')
+})
+
+test('readFavoriteVoices keeps up to 32 tags and the languages array', () => {
+  const tags = Array.from({ length: 40 }, (_, index) => `tag-${index}`)
+  const [voice] = readFavoriteVoices([{ id: 'voice-1', tags, languages: ['en', 'ja'] }])
+  assert.equal(voice.tags?.length, 32)
+  assert.deepEqual(voice.languages, ['en', 'ja'])
+})
+
+test('voiceDecisionSummary includes tags and omits missing metadata without penalizing sparse voices', () => {
+  assert.equal(
+    voiceDecisionSummary({ id: 'v1', name: 'Nova', category: 'character', description: 'Warm', tags: ['Young', 'warm', 'young'], languages: ['en'] }),
+    'Nova; character; languages: en; tags: young, warm; description supports: warm; description: Warm',
+  )
+  assert.equal(voiceDecisionSummary({ id: 'v2', name: '', category: '', description: '' }), 'No details provided.')
+  assert.equal(voiceDecisionSummary({ id: 'v3', name: '', category: 'female', description: 'Warm' }), 'female; description supports: warm; description: Warm')
+  assert.equal(voiceDecisionSummary({ id: 'v4', name: 'Nova', category: '', description: '' }), 'Nova')
+})
+
+test('voiceDescriptionTagHints scores descriptions across Fish quality tags', () => {
+  assert.deepEqual(voiceDescriptionTagHints('A warm, raspy voice with soft-spoken intimacy.'), ['soft', 'warm', 'raspy', 'intimate'])
+  assert.deepEqual(voiceDescriptionTagHints('Fast, animated storytelling with a confident and measured delivery.'), ['fast', 'measured', 'confident', 'animated', 'storytelling'])
+  assert.deepEqual(voiceDescriptionTagHints('Not warm, not calm, but crisp.'), ['crisp'])
+  assert.deepEqual(voiceDescriptionTagHints('English narrator for tutorials.'), ['narration', 'educational'])
+})
+
+test('communityVoiceToFavorite maps Fish metadata onto expanded favorites', () => {
+  const voice = readCommunityVoice({
+    _id: 'model-1',
+    title: 'Mother Jinx',
+    description: 'A commanding and mature female voice with a theatrical, dramatic flair.',
+    tags: ['anime', 'female', 'english'],
+    languages: ['en'],
+    author: { _id: 'author-1', nickname: 'someone' },
+    like_count: 123,
+    task_count: 45,
+    licensed: true,
+  })
+  assert.ok(voice)
+  assert.deepEqual([voice.id, voice.title, voice.category, voice.author, voice.communityLink, voice.likeCount, voice.taskCount], [
+    'model-1', 'Mother Jinx', 'anime', 'someone', 'https://fish.audio/m/model-1', 123, 45,
+  ])
+  const favorite = communityVoiceToFavorite(voice)
+  assert.equal(favorite.category, 'anime')
+  assert.deepEqual(favorite.tags, ['anime', 'female', 'english'])
+  assert.equal(voiceGender(favorite), 'female')
+  assert.equal(readCommunityVoice({ title: 'no id' }), null)
+  assert.equal(readCommunityVoice(null), null)
+})
+
+test('readCommunityVoiceList and readCommunityVoicePool parse Fish payloads and snapshots tolerantly', () => {
+  assert.deepEqual(readCommunityVoiceList({ total: 2, items: [{ _id: 'one' }, { title: 'skipped' }], has_more: true }), {
+    items: [{ id: 'one', title: '', description: '', category: '', tags: [], languages: [], author: '', likeCount: 0, taskCount: 0, licensed: false, licensedNote: null, communityLink: 'https://fish.audio/m/one' }],
+    total: 2, hasMore: true,
+  })
+  assert.equal(readCommunityVoiceList(null), null)
+  assert.equal(readCommunityVoiceList({ items: 'nope' }), null)
+  // Some proxies wrap the body once under { data } or { result }.
+  assert.equal(readCommunityVoiceList({ data: { total: 1, items: [{ _id: 'wrapped' }], has_more: false } })?.items[0]?.id, 'wrapped')
+  assert.equal(readCommunityVoiceList({ result: { data: { total: 1, items: [{ _id: 'nested' }] } } })?.items[0]?.id, 'nested')
+  assert.equal(readCommunityVoiceList([{ _id: 'bare' }])?.items[0]?.id, 'bare')
+  assert.match(communityPayloadShape({ error: { message: 'key rejected' }, items: 'nope' }) ?? '', /items:string/)
+  assert.match(communityPayloadShape('<html>blocked</html>') ?? '', /text 20 chars/)
+  // A snapshot way out of bounds is still trimmed to the live pool capacity.
+  const pool = readCommunityVoicePool([{ id: 'a' }, { _id: 'b', title: 'fish row' }, null])
+  assert.deepEqual(pool.map(entry => entry.id), ['a', 'b'])
+})
+
+test('upsertCommunityFavorite adds once and updates metadata in place', () => {
+  const voice = readCommunityVoice({ _id: 'model-1', title: 'First name', tags: ['anime', 'male'] })!
+  const added = upsertCommunityFavorite([], voice)
+  assert.equal(added.length, 1)
+  assert.equal(added[0].source, 'community')
+  const updated = upsertCommunityFavorite(added, { ...voice, title: 'Renamed' })
+  assert.equal(updated.length, 1)
+  assert.equal(updated[0].name, 'Renamed')
+  assert.ok(!JSON.stringify(updated).includes('undefined'))
 })
 
 test('matches uncast voice groups without using cast voices or crossing gender categories', () => {
@@ -2056,6 +2272,199 @@ test('matches uncast voice groups without using cast voices or crossing gender c
   assert.deepEqual(resolveUncastVoiceDecisions(groups, available, {
     voice_g0: confidentDecision('no_match'),
   }), [])
+})
+
+test('labelGenderHint reads gendered nouns but refuses ambiguous labels', () => {
+  assert.equal(labelGenderHint('the girl'), 'female')
+  assert.equal(labelGenderHint('The Lady'), 'female')
+  assert.equal(labelGenderHint('the taller woman'), 'female')
+  assert.equal(labelGenderHint('her mother'), 'female')
+  assert.equal(labelGenderHint('the man'), 'male')
+  assert.equal(labelGenderHint('THE BOY'), 'male')
+  assert.equal(labelGenderHint('the gentleman'), 'male')
+  assert.equal(labelGenderHint('his father'), 'male')
+  assert.equal(labelGenderHint('the firefighter'), null)
+  assert.equal(labelGenderHint('the stranger'), null)
+  assert.equal(labelGenderHint('the person'), null)
+  assert.equal(labelGenderHint(''), null)
+  assert.equal(labelGenderHint('the man and the girl'), null)
+  assert.equal(labelGenderHint('the lady beside him'), null)
+})
+
+test('narrationFirstPronounClass reads a single-gender pronoun chain but refuses mixtures and explicit new characters', () => {
+  assert.equal(narrationFirstPronounClass('Then he walked over to the table.'), 'male')
+  assert.equal(narrationFirstPronounClass('A man came in with a jacket over his arm.'), null)
+  assert.equal(narrationFirstPronounClass('Then she stood up.'), 'female')
+  assert.equal(narrationFirstPronounClass('Wren knelt by the table.'), null)
+  assert.equal(narrationFirstPronounClass('The fire was low.'), null)
+  const nar = (text: string) => ({ text, speakerId: null })
+  const speech = (text: string) => ({ text, speakerId: UNCAST_SPEAKER_ID })
+  assert.equal(backwardNarrationPronounGender([nar('A man came in with a jacket over his arm.'), speech('“I am fine.”')], 1), 'male')
+  assert.equal(backwardNarrationPronounGender([nar('Then he walked over to the table.'), speech('“I am fine.”')], 1), 'male')
+  assert.equal(backwardNarrationPronounGender([nar('He sat down.'), nar('Another man came into the room.'), speech('“I am fine.”')], 2), null)
+  assert.equal(backwardNarrationPronounGender([nar('Wren knelt by the table.'), nar('Then he looked up.'), speech('“I am fine.”')], 2), 'male')
+  // A cast speaker's paragraph never anchors an uncast chain, even when it
+  // starts with that speaker's pronoun: the backward scan skips it and so
+  // keeps looking for the introduced person's own chain.
+  const castSegments = [nar('Then he walked over to the table.'), { text: '“Of course not.” Wren said from the floor.', speakerId: 'npc:wren' }, nar('Wren said from the floor.'), speech('“Then I sat.”')]
+  assert.equal(backwardNarrationPronounGender(castSegments, 3), 'male')
+  assert.equal(backwardNarrationPronounGender([nar('Then she stood up.'), nar('She laughed once.'), speech('“I am fine.”')], 2), 'female')
+  assert.equal(backwardNarrationPronounGender([nar('Then he walked to the door.'), nar('She never turned around.'), speech('“I am fine.”')], 2), 'female')
+  assert.equal(backwardNarrationPronounGender([nar('The fire was low.'), speech('“I am fine.”')], 1), null)
+})
+
+test('a paragraph opening on "The guy …" anchors male instead of inheriting an earlier woman', () => {
+  const nar = (text: string) => ({ text, speakerId: null })
+  const speech = (text: string) => ({ text, speakerId: UNCAST_SPEAKER_ID })
+  const segments = [
+    nar('She leans down over her knees, hair falling forward across her cheek.'),
+    nar('The guy stops, shifts the skateboard to his other hip, and reaches for the pen.'),
+    speech('Yeah, alright. Where do I put it?'),
+  ]
+  assert.equal(backwardNarrationPronounGender(segments, 2), 'male')
+  assert.equal(collectUncastVoiceGroups(segments)[0].pronounGender, 'male')
+})
+
+test('a Jev gender that contradicts the narration class falls back to that class instead of dropping the voice', () => {
+  const segments = [
+    { text: 'She leans down over her knees, hair falling forward across her cheek.', speakerId: null },
+    { text: 'The guy stops, shifts the skateboard to his other hip, and reaches for the pen.', speakerId: null },
+    { text: 'Yeah, alright. Where do I put it?', speakerId: UNCAST_SPEAKER_ID },
+  ]
+  const groups = collectUncastVoiceGroups(segments)
+  assert.equal(groups[0].pronounGender, 'male')
+  const voices = readFavoriteVoices([
+    { id: 'female-1', category: 'female' }, { id: 'male-1', category: 'male' },
+    { id: 'female-2', category: 'female' }, { id: 'male-2', category: 'male' },
+  ])
+  const plan = buildUncastVoiceDecision(groups, voices, segments.map(segment => segment.text).join('\n\n'))
+  const keys = Object.keys(plan.questions.voice_g0.criteria)
+  assert.ok(keys.length > 0)
+  assert.ok(keys.every(key => voices[Number(key.slice(6))].category === 'male'))
+  const result = resolveUncastVoiceDecisions(groups, voices, {
+    identity_g0: confidentDecision('new_or_unclear'),
+    gender_g0: confidentDecision('female'),
+    voice_g0: confidentDecision('voice_3'),
+  })
+  assert.deepEqual(result.map(item => [item.voiceId, item.gender]), [['male-2', 'male']])
+})
+
+test('a pronoun chain links fragments of one introduced man to a single voice', () => {
+  const segments = [
+    { text: 'The doors swung and a man came in with a jacket over his arm, tired around the eyes.', speakerId: null },
+    { text: 'Then he walked over to the table and picked up the pen off the clipboard.', speakerId: null },
+    { text: "I'm on till nine-thirty at the hospital.", speakerId: UNCAST_SPEAKER_ID },
+    { text: 'Wren, still kneeling on the tile, nodded up at him.', speakerId: null },
+    { text: '"Or only if something changes." Wren said from the floor.', speakerId: 'wren' },
+    { text: 'Only if something changes.', speakerId: UNCAST_SPEAKER_ID },
+    { text: 'He looked at her a second, then put the pen back.', speakerId: null },
+    { text: 'Wren stared at her own hands and said nothing more.', speakerId: null },
+    { text: '"Then I stay." Wren said beside the press area.', speakerId: 'wren' },
+    { text: 'Good luck with it.', speakerId: UNCAST_SPEAKER_ID },
+  ]
+  const groups = collectUncastVoiceGroups(segments)
+  assert.deepEqual(groups.map(group => [group.id, group.segmentIndexes, group.pronounPartners ?? [], group.pronounGender ?? null]), [
+    ['g0', [2], ['g1'], 'male'],
+    ['g1', [5], ['g0', 'g2'], 'male'],
+    ['g2', [9], ['g1'], 'male'],
+  ])
+  const voices = readFavoriteVoices([
+    { id: 'female-voice', category: 'female', description: 'lullaby alto' },
+    { id: 'male-voice', category: 'male', description: 'baritone heater' },
+  ])
+  const result = resolveUncastVoiceDecisions(groups, voices, {
+    same_g1_g0: { choice: 'same', confidence: 0.36, probabilities: { same: 0.68, different_or_unclear: 0.32 } },
+    same_g2_g1: { choice: 'same', confidence: 0.52, probabilities: { same: 0.76, different_or_unclear: 0.24 } },
+    gender_g0: confidentDecision('unknown'),
+    gender_g1: confidentDecision('unknown'),
+    gender_g2: confidentDecision('unknown'),
+    voice_g0: { choice: 'voice_0', probabilities: { voice_0: 0.4, voice_1: 0.6 }, confidence: 0.5 },
+    voice_g1: { choice: 'voice_1', probabilities: { voice_0: 0.3, voice_1: 0.7 }, confidence: 0.5 },
+    voice_g2: { choice: 'voice_0', probabilities: { voice_0: 0.5, voice_1: 0.5 }, confidence: 0.5 },
+  }, [], [], '', '')
+  assert.deepEqual(result.map(item => [item.groupId, item.voiceId, item.gender]), [
+    ['g0', 'male-voice', 'male'],
+    ['g1', 'male-voice', 'male'],
+    ['g2', 'male-voice', 'male'],
+  ])
+})
+
+test('a pronoun chain inside one multi-paragraph narration links the man to a single voice', () => {
+  // One narration segment runs through Wren's paragraph, the man's
+  // introduction, and more Wren prose. The chain must find the man's
+  // paragraph even though the same segment names a cast speaker, so all
+  // three uncast fragments anchor male and share one voice.
+  const mega = 'She went back at it with her eyes up and her hand cupped and no more discussion about it, and the wet drag of it carried through the room.'
+    + '\n\nThe doors swung and a man came in with a jacket over his arm — thirties, tired around the eyes, a badge on his belt —'
+    + '\n\nThen he walked over to the table without being asked, and picked up the pen off the clipboard, and signed.'
+    + '\n\nWren couldn\'t get up. She had a hand on his hip and her mouth full and she stayed exactly where she was, eyes up.'
+  const segments = [
+    { text: 'She pushed her glasses up with a knuckle.', speakerId: null },
+    { text: '"Okay. So. Fine." Wren said from the floor.', speakerId: 'npc:wren' },
+    { text: mega, speakerId: null },
+    { text: "I'm on till nine-thirty at the hospital. Nine's no good.", speakerId: UNCAST_SPEAKER_ID },
+    { text: 'Wren said, and her voice came out wrecked.', speakerId: null },
+    { text: 'Six-thirty. Union hall.', speakerId: 'npc:wren' },
+    { text: 'Yeah. I know.', speakerId: UNCAST_SPEAKER_ID },
+    { text: 'He looked at her a second, then at the poster.', speakerId: null },
+    { text: 'You want a napkin?', speakerId: UNCAST_SPEAKER_ID },
+    { text: "There's some by the forks.", speakerId: 'npc:wren' },
+    { text: "He brought her a stack of them, three, and set them on the table's edge, and said,", speakerId: null },
+    { text: 'Good luck with it.', speakerId: UNCAST_SPEAKER_ID },
+  ]
+  const groups = collectUncastVoiceGroups(segments)
+  assert.deepEqual(groups.map(group => [group.id, group.segmentIndexes, group.pronounPartners ?? [], group.pronounGender ?? null]), [
+    ['g0', [3], ['g1'], 'male'],
+    ['g1', [6, 8], ['g0', 'g2'], 'male'],
+    ['g2', [11], ['g1'], 'male'],
+  ])
+})
+
+test('a gendered label picks a gender-matched voice when Jev leaves the gender unknown', () => {
+  const message = 'The girl turns toward the stairs. "I see it."'
+  const groups = collectUncastVoiceGroups([{ text: 'I see it.', speakerId: UNCAST_SPEAKER_ID }])
+  const voices = readFavoriteVoices([
+    { id: 'male', category: 'male', description: 'commanding' },
+    { id: 'female', category: 'female', description: 'gentle warm' },
+  ])
+  const options = groupLabelOptions(groups[0], uncastIdentityLabels(message, []))
+  const labelIndex = options.indexOf('the girl')
+  assert.ok(labelIndex >= 0)
+  const matches = resolveUncastVoiceDecisions(groups, voices, {
+    gender_g0: confidentDecision('unknown'),
+    [`label_g0`]: { choice: `label_${labelIndex}`, probabilities: { [`label_${labelIndex}`]: 0.92 }, confidence: 0.9 },
+    voice_g0: { choice: 'voice_0', probabilities: { voice_0: 0.85, voice_1: 0.15 }, confidence: 0.8 },
+  }, [], [], 'message-1', message)
+  assert.deepEqual(matches.map(match => [match.voiceId, match.gender]), [['female', 'female']])
+  const manMessage = 'The man turns toward the stairs. "I see it."'
+  const manGroups = collectUncastVoiceGroups([{ text: 'I see it.', speakerId: UNCAST_SPEAKER_ID }])
+  const manOptions = groupLabelOptions(manGroups[0], uncastIdentityLabels(manMessage, []))
+  const manLabelIndex = manOptions.indexOf('the man')
+  assert.ok(manLabelIndex >= 0)
+  const manMatches = resolveUncastVoiceDecisions(manGroups, voices, {
+    gender_g0: confidentDecision('unknown'),
+    [`label_g0`]: { choice: `label_${manLabelIndex}`, probabilities: { [`label_${manLabelIndex}`]: 0.92 }, confidence: 0.9 },
+    voice_g0: { choice: 'voice_1', probabilities: { voice_0: 0.15, voice_1: 0.85 }, confidence: 0.8 },
+  }, [], [], 'message-1', manMessage)
+  assert.deepEqual(manMatches.map(match => [match.voiceId, match.gender]), [['male', 'male']])
+})
+
+test('an established Jev gender outranks a contradictory label hint', () => {
+  const message = 'The man turns toward the stairs. "I see it."'
+  const groups = collectUncastVoiceGroups([{ text: 'I see it.', speakerId: UNCAST_SPEAKER_ID }])
+  const voices = readFavoriteVoices([
+    { id: 'male', category: 'male', description: 'commanding' },
+    { id: 'female', category: 'female', description: 'gentle warm' },
+  ])
+  const options = groupLabelOptions(groups[0], uncastIdentityLabels(message, []))
+  const labelIndex = options.indexOf('the man')
+  assert.ok(labelIndex >= 0)
+  const matches = resolveUncastVoiceDecisions(groups, voices, {
+    gender_g0: confidentDecision('female'),
+    [`label_g0`]: { choice: `label_${labelIndex}`, probabilities: { [`label_${labelIndex}`]: 0.92 }, confidence: 0.9 },
+    voice_g0: { choice: 'voice_0', probabilities: { voice_0: 0.85, voice_1: 0.15 }, confidence: 0.8 },
+  }, [], [], 'message-1', message)
+  assert.deepEqual(matches.map(match => [match.voiceId, match.gender]), [['female', 'female']])
 })
 
 test('keeps ghost voices for the configured count of assistant messages and never links weak identities', () => {
@@ -2182,7 +2591,7 @@ test('a three-voice message where two unnamed speakers invoke each other names b
     voice_g0: confidentDecision('voice_0'), voice_g1: confidentDecision('voice_1'),
     gender_g0: confidentDecision('male'), gender_g1: confidentDecision('female'),
   }, [], [], 'first', 'Gate. Hallie. Ellis.')
-  assert.deepEqual(assigned.map(item => item.voiceId).sort(), ['voice-1', 'voice-2'])
+  assert.deepEqual(assigned.map(item => item.voiceId), ['voice-1', 'voice-2'])
   assert.notEqual(assigned[0].ghostId, assigned[1].ghostId)
   assert.deepEqual(assigned.map(item => item.aliases?.[0]).sort(), ['ellis', 'hallie'])
 })
@@ -2549,6 +2958,34 @@ test('automatic casting respects reserved voices, gender, and no match', () => {
   assert.equal(selectAutomaticVoice(voices, new Set(), { ...answer, choice: 'no_match' }, 'unknown'), '')
 })
 
+test('shortlist keeps Jev-ranked favorites and randomizes only inside them', () => {
+  const voices = readFavoriteVoices([
+    { id: 'male', category: 'male' },
+    ...Array.from({ length: 7 }, (_, index) => ({ id: `female-${index}`, category: 'female' })),
+  ])
+  const answer: SpeakerDecisionChoice = {
+    choice: 'voice_1',
+    probabilities: { voice_0: 0.99, voice_1: 0.6, voice_2: 0.5, voice_3: 0.45, voice_4: 0.3, voice_5: 0.25, voice_6: 0.2, voice_7: 0.15 },
+    confidence: 0.9,
+  }
+  const eligible = voices.slice(1).map(voice => voice.id)
+  assert.deepEqual(shortlistRankedVoices(eligible, id => ({ 'female-0': 0.6, 'female-1': 0.5, 'female-2': 0.45, 'female-3': 0.3, 'female-4': 0.25, 'female-5': 0.2, 'female-6': 0.15 })[id] ?? 0), ['female-0', 'female-1', 'female-2', 'female-3', 'female-4'])
+  assert.equal(selectAutomaticVoice(voices, new Set(), answer, 'female', () => 0), 'female-0')
+  assert.equal(selectAutomaticVoice(voices, new Set(), answer, 'female', () => 0.999), 'female-4')
+  assert.equal(selectAutomaticVoice(voices, new Set(['female-0']), answer, 'female', () => 0), 'female-1')
+
+  const decisive: SpeakerDecisionChoice = { choice: 'voice_1', probabilities: { voice_0: 0.01, voice_1: 0.95, voice_2: 0.02, voice_3: 0.02 }, confidence: 0.95 }
+  assert.equal(selectAutomaticVoice(voices, new Set(), decisive, 'female', () => 0.999), 'female-0')
+
+  const groups = collectUncastVoiceGroups([{ speakerId: UNCAST_SPEAKER_ID, text: 'Hello.' }])
+  const flat: SpeakerDecisionChoice = { choice: 'voice_1', probabilities: { voice_1: 0.2, voice_2: 0.2, voice_3: 0.2, voice_4: 0.2 }, confidence: 0.8 }
+  const answers = { gender_g0: confidentDecision('female'), voice_g0: flat }
+  assert.equal(resolveUncastVoiceDecisions(groups, voices, answers, [], [], '', '', [], () => 0)[0]?.voiceId, 'female-0')
+  assert.equal(resolveUncastVoiceDecisions(groups, voices, answers, [], [], '', '', [], () => 0.999)[0]?.voiceId, 'female-3')
+  const unscored = { gender_g0: confidentDecision('female'), voice_g0: { choice: 'voice_1', probabilities: {}, confidence: 0.5 } }
+  assert.equal(resolveUncastVoiceDecisions(groups, voices, unscored, [], [], '', '', [], () => 0.999)[0]?.voiceId, 'female-6')
+})
+
 test('automatic voice reservations reject exhausted voices and preserve existing ghost ownership', () => {
   const ghost = { id: 'one', speakerId: UNCAST_SPEAKER_ID, voiceId: 'last-voice', context: '', occurrenceKeys: [], lastSeenMessageId: 'message' }
   assert.equal(canReserveAutomaticVoice('last-voice', new Set(), [ghost]), false)
@@ -2645,6 +3082,31 @@ test('retains confirmed ghost aliases for matching and promotion', () => {
   assert.deepEqual(ambiguous, [])
 })
 
+test('narration that names an anonymous speaker reuses that ghost instead of creating a new one', () => {
+  const ghost = readGhostVoices([{ id: 'voss-ghost', speakerId: UNCAST_SPEAKER_ID, label: 'voss', voiceId: 'voss-voice', context: 'Voss works the counter.', occurrenceKeys: [], lastSeenMessageId: 'previous' }])[0]
+  const groups = collectUncastVoiceGroups([
+    { text: 'Voss tells her, without looking up from the urn.', speakerId: null },
+    { text: 'Ten-fifty-five.', speakerId: UNCAST_SPEAKER_ID },
+  ] as PlaybackSegment[])
+  assert.equal(groups[0]?.narratedName, 'voss')
+  const assigned = resolveUncastVoiceDecisions(groups, readFavoriteVoices([{ id: 'other-voice' }]), {
+    identity_g0: confidentDecision('new_or_unclear'),
+    voice_g0: confidentDecision('voice_0'),
+  }, [ghost], [], 'current')
+  assert.equal(assigned[0]?.ghostId, 'voss-ghost')
+  assert.equal(assigned[0]?.voiceId, 'voss-voice')
+  assert.match(assigned[0]?.matchReason!, /narrated name match/u)
+
+  // A narrated name that no ghost carries must not steal an unrelated voice.
+  const unrelated = { ...ghost, label: 'ken', aliases: ['ken'] }
+  const fresh = resolveUncastVoiceDecisions(groups, readFavoriteVoices([{ id: 'other-voice' }]), {
+    identity_g0: confidentDecision('new_or_unclear'),
+    voice_g0: confidentDecision('voice_0'),
+  }, [unrelated], [], 'current')
+  assert.match(fresh[0]?.ghostId ?? '', /^pending:/u)
+  assert.equal(fresh[0]?.voiceId, 'other-voice')
+})
+
 test('keeps bounded occurrence provenance while preserving legacy occurrence keys', () => {
   const ghost = readGhostVoices([{ id: 'g', speakerId: UNCAST_SPEAKER_ID, voiceId: 'v', context: '', occurrenceKeys: ['old:legacy'], lastSeenMessageId: 'old' }])[0]
   recordGhostOccurrence(ghost, 'new', 'message-hash', 'speech-hash', 'Jev identity match')
@@ -2719,6 +3181,130 @@ test('a clearly different saved occurrence can receive a new voice without chang
   assert.equal(replay[0]?.ghostId, 'replacement')
 })
 
+test('a hollow occurrence ghost is confirmed by the identical occurrence despite an evidence-free review', () => {
+  // A ghost created in an earlier playback of this message carries no saved
+  // context and no conversation history, so the occurrence review cannot
+  // confirm identity and would otherwise drop the group to the connection
+  // default on every replay. The identical (message, speeches) occurrence
+  // confirms the ghost by itself.
+  const group = collectUncastVoiceGroups([{ speakerId: UNCAST_SPEAKER_ID, text: 'I can take it from here.' }])
+  const hollow = { id: 'man', speakerId: UNCAST_SPEAKER_ID, voiceId: 'man-voice', context: '', occurrenceKeys: [`current:${hashMessageContent('I can take it from here.')}`], lastSeenMessageId: 'current' }
+  const before = structuredClone(hollow)
+  const replay = resolveUncastVoiceDecisions(group, readFavoriteVoices([{ id: 'new-voice' }]), {
+    identity_g0: confidentDecision('new_or_unclear'),
+    review_occurrence_g0_0: confidentDecision('different_or_unclear'),
+    review_occurrence_disposition_g0_0: { choice: 'unclear', probabilities: { same: 0.04, different: 0.11, unclear: 0.85 }, confidence: 0.77 },
+    voice_g0: confidentDecision('voice_0'),
+  }, [hollow], [], 'current')
+  assert.equal(replay[0]?.ghostId, 'man')
+  assert.equal(replay[0]?.voiceId, 'man-voice')
+  assert.match(replay[0]?.matchReason!, /exact message occurrence/u)
+  // A missing review leaves the same linkage instead of dropping the group.
+  const withoutReview = resolveUncastVoiceDecisions(group, readFavoriteVoices([{ id: 'new-voice' }]), {
+    identity_g0: confidentDecision('new_or_unclear'),
+    voice_g0: confidentDecision('voice_0'),
+  }, [hollow], [], 'current')
+  assert.equal(withoutReview[0]?.ghostId, 'man')
+  assert.deepEqual(hollow, before)
+})
+
+test('a same-message created occurrence is confirmed by identity of occurrence despite a flipped review', () => {
+  // A ghost created during an earlier playback of this same message has
+  // only self-referential evidence: its saved context is a snippet of this
+  // very passage, so the occurrence review is circular and flips between
+  // runs. The identical occurrence confirms it unless the disposition
+  // explicitly says a different person.
+  const group = collectUncastVoiceGroups([{ speakerId: UNCAST_SPEAKER_ID, text: "I'm on till nine-thirty at the hospital. Nine's no good." }])
+  const ghost = {
+    id: 'man', speakerId: UNCAST_SPEAKER_ID, voiceId: 'man-voice',
+    context: "Then he walked over to the table without being asked, and picked up the pen off the clipboard, and signed. Wren couldn't get up.",
+    occurrenceKeys: [`current:${hashMessageContent("I'm on till nine-thirty at the hospital. Nine's no good.")}`],
+    lastSeenMessageId: 'current', createdAtMessageId: 'current',
+  }
+  const replay = resolveUncastVoiceDecisions(group, readFavoriteVoices([{ id: 'new-voice' }]), {
+    identity_g0: { choice: 'new_or_unclear', confidence: 0.92, probabilities: { new_or_unclear: 0.92, ghost_0: 0.01 } },
+    review_occurrence_g0_0: { choice: 'different_or_unclear', confidence: 0.72, probabilities: { same: 0.14, different_or_unclear: 0.86 } },
+    review_occurrence_disposition_g0_0: { choice: 'same', confidence: 0.18, probabilities: { same: 0.45, different: 0.31, unclear: 0.24 } },
+    voice_g0: confidentDecision('voice_0'),
+  }, [ghost], [], 'current')
+  assert.equal(replay[0]?.ghostId, 'man')
+  assert.equal(replay[0]?.voiceId, 'man-voice')
+  assert.match(replay[0]?.matchReason!, /exact message occurrence/u)
+  // The disposition is the escape hatch: an explicit 'different' verdict
+  // still lets a new person in.
+  const before = structuredClone(ghost)
+  const flipped = resolveUncastVoiceDecisions(group, readFavoriteVoices([{ id: 'new-voice' }]), {
+    identity_g0: { choice: 'new_or_unclear', confidence: 0.92, probabilities: { new_or_unclear: 0.92, ghost_0: 0.01 } },
+    review_occurrence_g0_0: { choice: 'different_or_unclear', confidence: 0.72, probabilities: { same: 0.14, different_or_unclear: 0.86 } },
+    review_occurrence_disposition_g0_0: { choice: 'different', confidence: 0.92, probabilities: { different: 0.92, same: 0.04, unclear: 0.04 } },
+    voice_g0: confidentDecision('voice_0'),
+  }, [ghost], [], 'current')
+  assert.equal(flipped[0]?.ghostId, 'pending:g0')
+  assert.equal(flipped[0]?.voiceId, 'new-voice')
+  assert.deepEqual(ghost, before)
+})
+
+test('a weak different disposition does not de-confirm a self-referential occurrence', () => {
+  // Jev's disposition flipped weakly on one replay (different at 0.43
+  // probability and 0.14 confidence). That is noise on a circular review,
+  // not an explicit "different person": the identical occurrence confirms.
+  const group = collectUncastVoiceGroups([{ speakerId: UNCAST_SPEAKER_ID, text: "I'm on till nine-thirty at the hospital. Nine's no good." }])
+  const ghost = {
+    id: 'man', speakerId: UNCAST_SPEAKER_ID, voiceId: 'man-voice',
+    context: "Then he walked over to the table without being asked, and picked up the pen off the clipboard, and signed. Wren couldn't get up.",
+    occurrenceKeys: [`current:${hashMessageContent("I'm on till nine-thirty at the hospital. Nine's no good.")}`],
+    lastSeenMessageId: 'current', createdAtMessageId: 'current',
+  }
+  const replay = resolveUncastVoiceDecisions(group, readFavoriteVoices([{ id: 'new-voice' }]), {
+    identity_g0: { choice: 'new_or_unclear', confidence: 0.92, probabilities: { new_or_unclear: 0.92, ghost_0: 0.01 } },
+    review_occurrence_g0_0: { choice: 'different_or_unclear', confidence: 0.82, probabilities: { same: 0.09, different_or_unclear: 0.91 } },
+    review_occurrence_disposition_g0_0: { choice: 'different', confidence: 0.14, probabilities: { same: 0.31, different: 0.43, unclear: 0.26 } },
+    voice_g0: confidentDecision('voice_0'),
+  }, [ghost], [], 'current')
+  assert.equal(replay[0]?.ghostId, 'man')
+  assert.equal(replay[0]?.voiceId, 'man-voice')
+})
+
+test('dual same-leaning occurrence reviews confirm the ghost', () => {
+  // With a saved context present both occurrence reviews lean 'same'
+  // without reaching strong-choice levels; their agreement on the
+  // identical occurrence confirms the ghost instead of dropping the group.
+  const group = collectUncastVoiceGroups([{ speakerId: UNCAST_SPEAKER_ID, text: 'I stay on the night shift.' }])
+  const ghost = { id: 'man', speakerId: UNCAST_SPEAKER_ID, voiceId: 'man-voice', context: 'The man stands at the door with a badge.', occurrenceKeys: [`current:${hashMessageContent('I stay on the night shift.')}`], lastSeenMessageId: 'current' }
+  const replay = resolveUncastVoiceDecisions(group, readFavoriteVoices([{ id: 'new-voice' }]), {
+    identity_g0: confidentDecision('new_or_unclear'),
+    review_occurrence_g0_0: { choice: 'same', probabilities: { same: 0.69, different_or_unclear: 0.31 }, confidence: 0.38 },
+    review_occurrence_disposition_g0_0: { choice: 'same', probabilities: { same: 0.63, different: 0.04, unclear: 0.33 }, confidence: 0.44 },
+    voice_g0: confidentDecision('voice_0'),
+  }, [ghost], [], 'current')
+  assert.equal(replay[0]?.ghostId, 'man')
+  assert.equal(replay[0]?.voiceId, 'man-voice')
+  assert.match(replay[0]?.matchReason!, /exact message occurrence/u)
+  // A lean that still leans unclear stays contested.
+  const leaningUnclear = resolveUncastVoiceDecisions(group, readFavoriteVoices([{ id: 'new-voice' }]), {
+    identity_g0: confidentDecision('new_or_unclear'),
+    review_occurrence_g0_0: { choice: 'same', probabilities: { same: 0.69, different_or_unclear: 0.31 }, confidence: 0.38 },
+    review_occurrence_disposition_g0_0: { choice: 'unclear', probabilities: { same: 0.3, different: 0.1, unclear: 0.6 }, confidence: 0.5 },
+    voice_g0: confidentDecision('voice_0'),
+  }, [ghost], [], 'current')
+  assert.deepEqual(leaningUnclear, [])
+})
+
+test('an explicit different verdict still replaces even a hollow occurrence ghost', () => {
+  const group = collectUncastVoiceGroups([{ speakerId: UNCAST_SPEAKER_ID, text: 'I can take it from here.' }])
+  const hollow = { id: 'man', speakerId: UNCAST_SPEAKER_ID, voiceId: 'man-voice', context: '', occurrenceKeys: [`current:${hashMessageContent('I can take it from here.')}`], lastSeenMessageId: 'current' }
+  const before = structuredClone(hollow)
+  const replaced = resolveUncastVoiceDecisions(group, readFavoriteVoices([{ id: 'new-voice' }]), {
+    identity_g0: confidentDecision('new_or_unclear'),
+    review_occurrence_g0_0: confidentDecision('different_or_unclear'),
+    review_occurrence_disposition_g0_0: confidentDecision('different'),
+    voice_g0: confidentDecision('voice_0'),
+  }, [hollow], [], 'current')
+  assert.equal(replaced[0]?.voiceId, 'new-voice')
+  assert.match(replaced[0]?.ghostId ?? '', /^pending:/u)
+  assert.deepEqual(hollow, before)
+})
+
 test('reviews borderline opening dialogue against a later clearly labeled speaker', () => {
   const groups = collectUncastVoiceGroups([
     { speakerId: null, text: 'Two clerks work. The elder is speaking.' },
@@ -2759,6 +3345,19 @@ test('automatic casting chooses the last compatible unused favorite', () => {
   assert.deepEqual(resolveUncastVoiceDecisions(groups, one, { voice_g0: confidentDecision('no_match'), gender_g0: confidentDecision('male') }), [])
   const questions = buildUncastVoiceDecision(groups, voices, 'A speaker says hello.').questions
   assert.equal('no_match' in questions.voice_g0.criteria, false)
+})
+
+test('voice ranking shortlists to 32 gender-compatible voices with original indexes', () => {
+  const voices = Array.from({ length: 40 }, (_, index) => ({ id: `voice-${index}`, name: `Voice ${index}`, category: index % 2 ? 'male' : 'female', description: `Description ${index}` }))
+  const group = { ...collectUncastVoiceGroups([{ speakerId: UNCAST_SPEAKER_ID, text: 'Hello.' }])[0], pronounGender: 'male' as const }
+  const plan = buildUncastVoiceDecision([group], voices, 'A speaker says hello.')
+  const keys = Object.keys(plan.questions.voice_g0.criteria)
+  assert.ok(keys.length <= 32)
+  assert.ok(keys.every(key => /^voice_\d+$/.test(key)))
+  assert.ok(keys.every(key => voices[Number(key.slice(6))].category === 'male'))
+  assert.ok(keys.length > 0)
+  assert.deepEqual(plan.state.voices.length, 40)
+  assert.ok(plan.state.voices.every(voice => !('description' in voice)))
 })
 
 test('reviews assistant dialogue attributed to the user when another named subject is present', () => {
@@ -3506,12 +4105,19 @@ test('synthesis and save validation remain scoped to the original swipe after na
   const snapshot = autoplaySwipeSnapshot(initial)
   const navigated = { swipe_id: 2, content: 'Third version.', swipes: ['First version.', 'Second version.', 'Third version.'] }
   assert.equal(autoplaySwipeMatches(navigated, snapshot), false)
-  assert.equal(targetSwipeContentMatches(readMessageSwipeContent(navigated, snapshot.swipeId), snapshot), true)
-  assert.equal(targetSwipeContentMatches(readMessageSwipeContent({ ...navigated, swipes: ['First version.', 'Edited.', 'Third version.'] }, 1), snapshot), false)
-  assert.equal(targetSwipeContentMatches(readMessageSwipeContent({ ...navigated, swipes: ['First version.', 'Third version.'] }, 1), snapshot), false)
-  assert.equal(readMessageSwipeContent({ swipe_id: 2, content: 'Third version.' }, 1), null)
   assert.notEqual(swipeSynthesisKey('chat', 'message', 1), swipeSynthesisKey('chat', 'message', 2))
   assert.equal(swipeSynthesisKey('chat', 'message', 1), swipeSynthesisKey('chat', 'message', 1))
+})
+
+test('the save check accepts same-swipe refinements but still refuses navigation', () => {
+  const started = { swipe_id: 2, content: 'Generated text.', swipe_dates: [10, 20, 30] }
+  const original = autoplaySwipeSnapshot(started)
+  const refined = { swipe_id: 2, content: 'Improved text.', swipe_dates: [10, 20, 30] }
+  const refreshed = refreshAutoplaySwipe(refined, original)
+  assert.ok(refreshed)
+  assert.notEqual(refreshed.contentHash, original.contentHash)
+  assert.equal(refreshAutoplaySwipe({ swipe_id: 3, content: 'Improved text.', swipe_dates: [10, 20, 30] }, original), null)
+  assert.equal(refreshAutoplaySwipe({ swipe_id: 2, content: 'Improved text.', swipe_dates: [10, 20, 99] }, original), null)
 })
 
 test('saved audio confirmation requires the requested swipe and attachment', () => {

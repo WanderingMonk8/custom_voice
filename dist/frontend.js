@@ -217,9 +217,6 @@ function refreshAutoplaySwipe(message, original) {
   if (original.swipeDate !== void 0 && current.swipeDate !== original.swipeDate) return null;
   return current;
 }
-function targetSwipeContentMatches(targetSwipeContent, expected) {
-  return typeof targetSwipeContent === "string" && hashMessageContent(targetSwipeContent) === expected.contentHash;
-}
 function swipeSynthesisKey(chatId, messageId, swipeId) {
   return `${chatId}\0${messageId}\0${swipeId}`;
 }
@@ -250,6 +247,30 @@ function resolveGlobalTtsConnection(preference, connections) {
 var UNRESOLVED_SPEAKER_ID = "__chat_voice_unresolved__";
 var DEFAULT_SAVED_AUDIO_LIMIT = 50;
 var MAX_SAVED_AUDIO_LIMIT = 1e4;
+function voiceCategoryGender(category) {
+  const value = (category ?? "").trim().toLowerCase();
+  if (!value) return "unspecified";
+  if (/\bfemale\b/.test(value)) return "female";
+  if (/\bmale\b/.test(value)) return "male";
+  return "unspecified";
+}
+function voiceGender(voice) {
+  if (voice.gender === "male" || voice.gender === "female") return voice.gender;
+  const fromCategory = voiceCategoryGender(voice.category);
+  if (fromCategory !== "unspecified") return fromCategory;
+  for (const tag of voice.tags ?? []) {
+    const tagGender = voiceCategoryGender(tag);
+    if (tagGender !== "unspecified") return tagGender;
+  }
+  return "unknown";
+}
+function voiceAge(voice) {
+  for (const tag of voice.tags ?? []) {
+    const value = tag.trim().toLowerCase();
+    if (value === "young" || value === "middle aged" || value === "old") return value;
+  }
+  return "unknown";
+}
 function readFavoriteVoices(value) {
   if (!Array.isArray(value)) return [];
   const seen = /* @__PURE__ */ new Set();
@@ -264,11 +285,85 @@ function readFavoriteVoices(value) {
     result.push({
       id,
       name: typeof row.name === "string" ? row.name.trim().slice(0, 128) : "",
-      category: row.category === "male" || row.category === "female" ? row.category : "unspecified",
-      description: typeof row.description === "string" ? row.description.trim().slice(0, 500) : ""
+      category: typeof row.category === "string" && row.category.trim() ? row.category.trim().slice(0, 64) : "unspecified",
+      description: typeof row.description === "string" ? row.description.trim().slice(0, 500) : "",
+      ...row.gender === "male" || row.gender === "female" ? { gender: row.gender } : {},
+      ...typeof row.author === "string" && row.author.trim() ? { author: row.author.trim().slice(0, 128) } : {},
+      ...row.source === "community" || row.source === "favorite" ? { source: row.source } : {},
+      ...typeof row.communityLink === "string" && row.communityLink.trim() ? { communityLink: row.communityLink.trim().slice(0, 512) } : {},
+      ...Array.isArray(row.tags) ? { tags: row.tags.filter((value2) => typeof value2 === "string").map((value2) => value2.trim().slice(0, 64)).filter(Boolean).slice(0, 32) } : {},
+      ...Array.isArray(row.languages) ? { languages: row.languages.filter((value2) => typeof value2 === "string").map((value2) => value2.trim().slice(0, 32)).filter(Boolean).slice(0, 8) } : {}
     });
   }
   return result;
+}
+var FISH_LANGUAGE_WORDS = /* @__PURE__ */ new Set(["english", "japanese", "chinese", "french", "german", "spanish", "korean", "italian", "russian", "portuguese", "arabic", "hindi", "dutch", "polish", "turkish", "vietnamese", "thai", "indonesian", "en", "ja", "zh", "fr", "de", "es", "ko", "it", "ru", "pt", "ar", "hi", "nl", "pl", "tr", "vi", "th", "id"]);
+function readCommunityVoice(row) {
+  if (!row || typeof row !== "object") return null;
+  const item = row;
+  const id = typeof item._id === "string" ? item._id.trim().slice(0, 512) : "";
+  if (!id) return null;
+  const title = typeof item.title === "string" ? item.title.trim().slice(0, 128) : "";
+  const description = typeof item.description === "string" ? item.description.trim().slice(0, 500) : "";
+  const tags = Array.isArray(item.tags) ? item.tags.filter((value) => typeof value === "string").map((value) => value.trim().slice(0, 64)).filter(Boolean).slice(0, 16) : [];
+  const languages = Array.isArray(item.languages) ? item.languages.filter((value) => typeof value === "string").map((value) => value.trim().slice(0, 32)).filter(Boolean).slice(0, 8) : [];
+  const author = item.author && typeof item.author === "object" && typeof item.author.nickname === "string" ? item.author.nickname : "";
+  const likeCount = typeof item.like_count === "number" && Number.isFinite(item.like_count) ? Math.max(0, Math.round(item.like_count)) : 0;
+  const taskCount = typeof item.task_count === "number" && Number.isFinite(item.task_count) ? Math.max(0, Math.round(item.task_count)) : 0;
+  const licensed = item.licensed === true;
+  const classification = tags.find((tag) => !["male", "female"].includes(tag.toLowerCase()) && !FISH_LANGUAGE_WORDS.has(tag.toLowerCase()));
+  return {
+    id,
+    title,
+    description,
+    category: classification ?? "",
+    tags,
+    languages,
+    author: author.trim().slice(0, 128),
+    likeCount,
+    taskCount,
+    licensed,
+    licensedNote: licensed ? "Licensed by Fish Audio (rights secured from the voice owner)" : null,
+    communityLink: `https://fish.audio/m/${id}`
+  };
+}
+function readCommunityVoicePool(value) {
+  if (!Array.isArray(value)) return [];
+  return value.slice(0, 500).flatMap((item) => {
+    if (!item || typeof item !== "object") return [];
+    const row = item;
+    const voice = readCommunityVoice(row);
+    if (!voice) {
+      const fallback = readFavoriteVoices([row]);
+      return fallback;
+    }
+    return [communityVoiceToFavorite(voice)];
+  });
+}
+function communityVoiceToFavorite(voice) {
+  const gender = ["male", "female"].find((tag) => voice.tags.some((item) => item.toLowerCase() === tag));
+  return {
+    id: voice.id,
+    name: voice.title,
+    category: voice.category || (gender ?? "unspecified"),
+    description: voice.description,
+    ...gender ? { gender } : {},
+    ...voice.author ? { author: voice.author } : {},
+    source: "community",
+    communityLink: voice.communityLink,
+    ...voice.tags.length ? { tags: voice.tags } : {},
+    ...voice.languages.length ? { languages: voice.languages } : {}
+  };
+}
+function upsertCommunityFavorite(existing, voice) {
+  const favorite = communityVoiceToFavorite(voice);
+  const id = favorite.id.trim().slice(0, 512);
+  if (!id) throw new Error("That community voice has no voice ID.");
+  if (!existing.some((item) => item.id === id) && existing.length >= 500) throw new Error("The favorites list is limited to 500 voices.");
+  if (existing.some((item) => item.id === id)) {
+    return existing.map((item) => item.id === id ? { ...item, ...favorite, id } : item);
+  }
+  return [...existing, favorite];
 }
 function addFavoriteVoice(existing, voice) {
   const id = voice.id.trim().slice(0, 512);
@@ -298,6 +393,52 @@ function hasStrongNarrativeName(text) {
     if (name && !NON_NAME_PARAGRAPH_LEADS.has(name.toLowerCase())) return true;
   }
   return false;
+}
+var STORY_NARRATION_SKIP_STARTERS = /* @__PURE__ */ new Set(["then", "so", "and", "but", "still", "yet", "meanwhile", "now", "anyway"]);
+var STORY_MALE_PRONOUNS = /* @__PURE__ */ new Set(["he", "him", "hisself", "himself", "his"]);
+var STORY_FEMALE_PRONOUNS = /* @__PURE__ */ new Set(["she", "her", "herself", "hers"]);
+function narrationFirstPronounClass(text) {
+  const tokens = text.toLowerCase().replace(/[^a-z'-]+/gu, " ").split(/\s+/u).filter(Boolean);
+  let head = tokens[0];
+  if (!head) return null;
+  if (STORY_NARRATION_SKIP_STARTERS.has(head)) head = tokens[1] ?? "";
+  if (STORY_MALE_PRONOUNS.has(head)) return "male";
+  if (STORY_FEMALE_PRONOUNS.has(head)) return "female";
+  return null;
+}
+function backwardNarrationPronounGender(segments, fromIndex) {
+  const castNames = /* @__PURE__ */ new Set();
+  for (const segment of segments) {
+    const id = segment.speakerId;
+    if (id?.startsWith("npc:") || id?.startsWith("unconfigured:")) {
+      const name = id.slice(id.indexOf(":") + 1).trim().toLowerCase();
+      if (name) castNames.add(name);
+    }
+  }
+  const mentionsCastCharacter = (text) => {
+    if (!castNames.size) return false;
+    const words = new Set(text.toLowerCase().replace(/[^a-z'-]+/gu, " ").split(/\s+/u).filter(Boolean));
+    for (const name of castNames) if (words.has(name)) return true;
+    return false;
+  };
+  for (let index = fromIndex - 1; index >= 0; index -= 1) {
+    const segment = segments[index];
+    if (!segment || segment.speakerId !== null) continue;
+    const paragraphs = segment.text.split(/\n\s*\n/u).filter((paragraph) => paragraph.trim());
+    for (let paragraphIndex = paragraphs.length - 1; paragraphIndex >= 0; paragraphIndex -= 1) {
+      const text = paragraphs[paragraphIndex];
+      if (mentionsCastCharacter(text)) continue;
+      if (/(^|[.!?]\s+)(another|second|third|other)\s+(man|woman|girl|boy|lady|guy)\b/iu.test(text)) return null;
+      const introduction = text.match(/(?:^|[.!?]\s+)(?:a|an|the|one)\s+(man|woman|girl|boy|lady|guy)(?:\s+\w+){0,2}?\s+(?:came|entered|arrived|appeared|walked in|stepped in|strode in|drew close)\b/iu);
+      if (introduction) return labelGenderHint(`the ${introduction[1]}`);
+      const lead = text.trimStart().match(/^(?:the|a|an)\s+(?:(?:young|younger|old|older|elderly|middle-aged|tall|short|thin|heavy|bald|bearded|blond|blonde|brunette)\s+)*([a-z-]+)\b/iu);
+      const leadHint = lead ? labelGenderHint(lead[1]) : null;
+      if (leadHint) return leadHint;
+      const klass = narrationFirstPronounClass(text);
+      if (klass) return klass;
+    }
+  }
+  return null;
 }
 function collectUncastVoiceGroups(segments) {
   const groups = [];
@@ -355,7 +496,7 @@ function collectUncastVoiceGroups(segments) {
     const first = Math.min(...group.segmentIndexes);
     const lead = segments[first - 1];
     if (!lead || lead.speakerId !== null) continue;
-    const named2 = lead.text.match(/^([A-Z][a-z]{2,})\s+(?:says|said|murmurs|murmured|whispers|whispered|mutters|muttered|replies|replied|answers|answered|calls|called)\b/u);
+    const named2 = lead.text.match(/^(\p{Lu}[\p{Ll}\p{M}'’-]{2,})\s+(?:says|said|asks|asked|murmurs|murmured|whispers|whispered|mutters|muttered|replies|replied|answers|answered|calls|called|tells|told|informs|informed|adds|added|continues|continued|shouts|shouted|yells|yelled|remarked|remarks|cries|cried|sighs|sighed|snaps|snapped)\b/u);
     if (named2) group.narratedName = named2[1].toLowerCase();
   }
   for (const group of groups) {
@@ -377,6 +518,21 @@ function collectUncastVoiceGroups(segments) {
       after.flankPartners = [...after.flankPartners ?? [], before.id];
       before.flankPartners = [...before.flankPartners ?? [], after.id];
     }
+  }
+  const unnamedInOrder = groups.filter((group) => group.speakerId === UNCAST_SPEAKER_ID).sort((a, b) => Math.min(...a.segmentIndexes) - Math.min(...b.segmentIndexes));
+  for (const group of unnamedInOrder) {
+    group.pronounGender = backwardNarrationPronounGender(segments, Math.min(...group.segmentIndexes)) ?? void 0;
+  }
+  for (let index = 1; index < unnamedInOrder.length; index += 1) {
+    const previous = unnamedInOrder[index - 1];
+    const group = unnamedInOrder[index];
+    const gender = group.pronounGender;
+    if (!gender || gender !== previous.pronounGender) {
+      group.pronounGender = void 0;
+      continue;
+    }
+    previous.pronounPartners = [...previous.pronounPartners ?? [], group.id];
+    group.pronounPartners = [...group.pronounPartners ?? [], previous.id];
   }
   const unknownGroups = groups.filter((group) => group.speakerId === UNCAST_SPEAKER_ID);
   const invokedByGroup = new Map(unknownGroups.map((group) => [group.id, [...new Set(group.speeches.flatMap((speech) => vocativeNames(speech)))]]));
@@ -495,6 +651,24 @@ function uncastNarrativeNameCandidates(message) {
 }
 function isBroadPersonLabel(label) {
   return /^(?:(?:the|a|an)\s+)?(?:(?:young|younger|old|older|elderly|middle-aged|tall|short)\s+)*(?:woman|man|person|girl|boy|guy|lady|stranger|someone|somebody)$/iu.test(label.trim());
+}
+var LABEL_GENDER_TOKENS = new Map(
+  [
+    ...["girl", "girls", "woman", "women", "lady", "ladies", "female", "females", "mother", "mothers", "mum", "mums", "mom", "moms", "sister", "sisters", "wife", "wives", "daughter", "daughters", "aunt", "aunts", "niece", "nieces", "grandmother", "grandmothers", "grandma", "grandmas", "granny", "grannies", "nanny", "nannies", "maid", "maids", "bride", "brides", "princess", "princesses", "madam", "mrs", "miss", "she", "her", "hers", "herself"].map((token) => [token, "female"]),
+    ...["boy", "boys", "man", "men", "gentleman", "gentlemen", "male", "males", "father", "fathers", "dad", "dads", "brother", "brothers", "husband", "husbands", "son", "sons", "uncle", "uncles", "nephew", "nephews", "grandfather", "grandfathers", "grandpa", "grandpas", "groom", "grooms", "prince", "princes", "monk", "monks", "guy", "guys", "mr", "sir", "he", "him", "his", "himself"].map((token) => [token, "male"])
+  ]
+);
+function labelGenderHint(label) {
+  const genders = /* @__PURE__ */ new Set();
+  for (const token of label.toLowerCase().replace(/[^a-z]+/gu, " ").split(/\s+/u)) {
+    if (!token) continue;
+    const gender = LABEL_GENDER_TOKENS.get(token);
+    if (gender) {
+      genders.add(gender);
+      if (genders.size > 1) return null;
+    }
+  }
+  return genders.size === 1 ? [...genders][0] : null;
 }
 function speakersForMessageRole(speakers, _isUserMessage, userName = "User") {
   const nonUserSpeakers = speakers.filter((speaker) => speaker.id !== USER_SPEAKER_ID);
@@ -2087,7 +2261,12 @@ async function loadPlaybackPreferences() {
     skipNarration: false,
     defaultNarratorVoice: "",
     defaultUserVoice: "",
-    favoriteVoices: []
+    favoriteVoices: [],
+    fishApiKey: "",
+    communityVoicePool: [],
+    communityVoicePoolAt: "",
+    communityVoiceLanguage: "",
+    autoVoiceCastingPool: "favorite"
   };
   const row = await response.json();
   const speed = typeof row.value?.ttsSpeed === "number" ? row.value.ttsSpeed : 1;
@@ -2130,7 +2309,12 @@ async function loadPlaybackPreferences() {
     skipNarration: row.value?.chatVoiceSkipNarration === true,
     defaultNarratorVoice: typeof row.value?.chatVoiceDefaultNarratorVoice === "string" ? row.value.chatVoiceDefaultNarratorVoice.trim().slice(0, 512) : "",
     defaultUserVoice: typeof row.value?.chatVoiceDefaultUserVoice === "string" ? row.value.chatVoiceDefaultUserVoice.trim().slice(0, 512) : "",
-    favoriteVoices: readFavoriteVoices(row.value?.chatVoiceFavoriteVoices)
+    favoriteVoices: readFavoriteVoices(row.value?.chatVoiceFavoriteVoices),
+    fishApiKey: typeof row.value?.chatVoiceFishApiKey === "string" ? row.value.chatVoiceFishApiKey.trim().slice(0, 512) : "",
+    communityVoicePool: readFavoriteVoices(row.value?.chatVoiceCommunityVoicePool),
+    communityVoicePoolAt: typeof row.value?.chatVoiceCommunityVoicePoolAt === "string" ? row.value.chatVoiceCommunityVoicePoolAt.slice(0, 32) : "",
+    communityVoiceLanguage: typeof row.value?.chatVoiceCommunityVoiceLanguage === "string" ? row.value.chatVoiceCommunityVoiceLanguage.trim().slice(0, 32).toLowerCase() : "",
+    autoVoiceCastingPool: row.value?.chatVoiceAutoCastPool === "community" ? "community" : "favorite"
   };
 }
 var voiceSettingsWriteQueue = Promise.resolve();
@@ -2190,7 +2374,7 @@ function saveTtsTagPreferences(style, placement, connectionId, model) {
     chatVoiceTagLlmModel: model.trim().slice(0, 256)
   }));
 }
-function saveAdvancedPlaybackPreferences(bufferSegments, concurrentGenerations, rateLimitWaitSeconds, speakerAssignmentDebug, ghostVoiceLifetime, autoVoiceCasting, autoPlayback, autoPlaybackDelaySeconds, speakerLookback, skipNarration) {
+function saveAdvancedPlaybackPreferences(bufferSegments, concurrentGenerations, rateLimitWaitSeconds, speakerAssignmentDebug, ghostVoiceLifetime, autoVoiceCasting, autoPlayback, autoPlaybackDelaySeconds, speakerLookback, skipNarration, autoVoiceCastingPool) {
   return updateVoiceSettings((current) => ({
     ...current,
     chatVoicePlaybackBufferSegments: clampIntegerSetting(
@@ -2213,6 +2397,7 @@ function saveAdvancedPlaybackPreferences(bufferSegments, concurrentGenerations, 
     chatVoiceAutoCasting: autoVoiceCasting,
     chatVoiceAutoPlayback: autoPlayback,
     chatVoiceAutoPlaybackDelaySeconds: readAutoplayDelaySeconds(autoPlaybackDelaySeconds),
+    chatVoiceAutoCastPool: autoVoiceCastingPool,
     chatVoiceGhostVoiceLifetime: clampIntegerSetting(ghostVoiceLifetime, GHOST_VOICE_LIFETIME_MESSAGES, 1e3),
     chatVoiceSpeakerLookback: clampIntegerSetting(speakerLookback, DEFAULT_SPEAKER_LOOKBACK, MAX_SPEAKER_LOOKBACK)
   }));
@@ -2596,12 +2781,14 @@ function setup(ctx) {
     }
     .chat-voice-add-row { display:grid; grid-template-columns:minmax(0, 1fr) auto; gap:8px; }
     .chat-voice-favorites { display:flex; flex-direction:column; gap:8px; }
-    .chat-voice-favorite-form { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+    .chat-voice-favorite-form { display:grid; grid-template-columns:1fr 1fr; gap:8px; padding:12px; border:1px solid var(--lumiverse-border); border-radius:var(--lumiverse-radius); background:var(--lumiverse-fill-subtle); box-sizing:border-box; }
     .chat-voice-favorite-form input, .chat-voice-rename-input, .chat-voice-favorite-select, .chat-voice-favorite-form select {
       min-width:0; width:100%; box-sizing:border-box; min-height:36px; padding:7px 9px;
       border:1px solid var(--lumiverse-border); border-radius:var(--lumiverse-radius);
       background:var(--lumiverse-bg-secondary, #222); color:var(--lumiverse-text); font:inherit; font-size:12px;
     }
+    .chat-voice-favorite-span { grid-column: 1 / -1; }
+    .chat-voice-favorite-add { grid-column: 1 / -1; justify-self: center; min-width: 168px; min-height: 42px; padding: 10px 28px; font-size: 13px; }
     .chat-voice-favorite-row { display:flex; flex-wrap:wrap; align-items:center; gap:8px;
       padding:8px; border:1px solid var(--lumiverse-border); border-radius:var(--lumiverse-radius); }
     .chat-voice-favorite-edit { flex:1 0 100%; display:flex; flex-wrap:wrap; gap:6px; }
@@ -2610,6 +2797,13 @@ function setup(ctx) {
     .chat-voice-favorite-edit textarea { min-height:72px; resize:vertical; }
     .chat-voice-favorite-copy { flex:1 1 100px; min-width:0; overflow-wrap:anywhere; color:var(--lumiverse-text); font-size:12px; }
     .chat-voice-favorite-copy small { display:block; color:var(--lumiverse-text-muted); }
+    .chat-voice-favorite-basics { flex:1 0 100%; display:flex; flex-wrap:wrap; gap:8px; align-items:flex-end; }
+    .chat-voice-favorite-basic { display:flex; flex-direction:column; gap:2px; flex:1 1 110px; min-width:0; }
+    .chat-voice-favorite-basic > span { color:var(--lumiverse-text-muted); font-size:11px; font-weight:700; letter-spacing:.04em; text-transform:uppercase; }
+    .chat-voice-favorite-basic select { min-width:0; width:100%; box-sizing:border-box; min-height:32px; padding:5px 7px; border:1px solid var(--lumiverse-border); border-radius:var(--lumiverse-radius); background:var(--lumiverse-bg-secondary, #222); color:var(--lumiverse-text); font:inherit; font-size:12px; }
+    .chat-voice-favorite-details { flex:1 0 100%; display:flex; flex-direction:column; gap:10px; border-top:1px solid var(--lumiverse-border); padding-top:8px; }
+    .chat-voice-favorite-details[hidden] { display:none; }
+    .chat-voice-favorite-details input { min-width:0; width:100%; box-sizing:border-box; min-height:34px; padding:6px 9px; border:1px solid var(--lumiverse-border); border-radius:var(--lumiverse-radius); background:var(--lumiverse-bg-secondary, #222); color:var(--lumiverse-text); font:inherit; font-size:12px; }
     .chat-voice-preview-button { min-height:28px; padding:0 8px; border:1px solid var(--lumiverse-border);
       border-radius:6px; background:var(--lumiverse-fill-subtle); color:var(--lumiverse-text); font:inherit; font-size:11px; cursor:pointer; }
     .chat-voice-add-button, .chat-voice-rename-button, .chat-voice-delete-button {
@@ -2649,6 +2843,59 @@ function setup(ctx) {
     }
     .chat-voice-copy-report-button:hover:not(:disabled) { filter:brightness(1.08); }
     .chat-voice-copy-report-button:disabled { cursor:not-allowed; opacity:.5; }
+    .chat-voice-voices-tabs { display:flex; gap:4px; }
+    .chat-voice-voices-tabs[hidden], .chat-voice-favorites[hidden], .chat-voice-community[hidden] { display:none; }
+    .chat-voice-voices-tab { flex:1; min-height:36px; padding:7px 10px; border:1px solid var(--lumiverse-border);
+      border-radius:var(--lumiverse-radius); background:var(--lumiverse-fill-subtle); color:var(--lumiverse-text);
+      font:inherit; font-size:12px; font-weight:600; cursor:pointer; }
+    .chat-voice-voices-tab[aria-selected="true"] { background:var(--lumiverse-accent, #7a68f4); color:#fff; }
+    .chat-voice-community { display:flex; flex-direction:column; gap:8px; }
+    .chat-voice-community-toolbar { display:grid; grid-template-columns:minmax(0, 2fr) minmax(0, 1fr) auto; gap:8px; }
+    .chat-voice-community-toolbar input, .chat-voice-community-toolbar select {
+      min-width:0; width:100%; box-sizing:border-box; min-height:36px; padding:7px 9px;
+      border:1px solid var(--lumiverse-border); border-radius:var(--lumiverse-radius);
+      background:var(--lumiverse-bg-secondary, #222); color:var(--lumiverse-text); font:inherit; font-size:12px;
+    }
+    .chat-voice-community-subtoolbar { display:grid; grid-template-columns:minmax(0, 1fr) minmax(0, 1fr) auto auto; gap:8px; align-items:center; }
+    .chat-voice-community-subtoolbar input, .chat-voice-community-subtoolbar select {
+      min-width:0; width:100%; box-sizing:border-box; min-height:36px; padding:7px 9px;
+      border:1px solid var(--lumiverse-border); border-radius:var(--lumiverse-radius);
+      background:var(--lumiverse-bg-secondary, #222); color:var(--lumiverse-text); font:inherit; font-size:12px;
+    }
+    .chat-voice-community-row { display:flex; flex-wrap:wrap; align-items:center; gap:8px;
+      padding:8px; border:1px solid var(--lumiverse-border); border-radius:var(--lumiverse-radius); }
+    .chat-voice-community-copy { flex:1 1 220px; min-width:0; overflow-wrap:anywhere; color:var(--lumiverse-text); font-size:12px; }
+    .chat-voice-community-copy small { display:block; color:var(--lumiverse-text-muted); }
+    .chat-voice-community-stats { color:var(--lumiverse-text-muted); font-size:11px; white-space:nowrap; }
+    .chat-voice-pool-row { display:grid; grid-template-columns:minmax(0, 1fr) auto; gap:8px; align-items:center; }
+    .chat-voice-pool-refresh-row { display:flex; align-items:center; flex-wrap:wrap; gap:8px; }
+    .chat-voice-pool-language-row { display:grid; grid-template-columns:auto minmax(0, 1fr); gap:8px; align-items:center; }
+    .chat-voice-pool-language-row .chat-voice-toggle-hint { grid-column: 1 / -1; }
+    .chat-voice-key-row { display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
+    .chat-voice-key-row > span:first-child { flex:1 0 100%; }
+    .chat-voice-key-row input { flex:1 0 100%; min-width:0; box-sizing:border-box; min-height:34px; padding:6px 9px; border:1px solid var(--lumiverse-border); border-radius:var(--lumiverse-radius); background:var(--lumiverse-bg-secondary, #222); color:var(--lumiverse-text); font:inherit; font-size:12px; }
+    .chat-voice-key-row .chat-voice-toggle-hint { flex:1 0 100%; }
+    .chat-voice-filter-panel { display:flex; flex-direction:column; gap:10px; }
+    .chat-voice-filter-panel[hidden] { display:none; }
+    .chat-voice-filter-group { display:flex; flex-direction:column; gap:6px; }
+    .chat-voice-filter-title { color:var(--lumiverse-text-muted); font-size:11px; font-weight:700; letter-spacing:.04em; text-transform:uppercase; }
+    .chat-voice-filter-chips { display:flex; flex-wrap:wrap; gap:6px; }
+    .chat-voice-filter-chip { border-radius:999px !important; font-size:11px !important; }
+    .chat-voice-filter-chip[aria-pressed="true"] { background:var(--lumiverse-accent, #7a68f4); color:#fff; }
+    .chat-voice-expand-more { border:0; background:transparent; color:var(--lumiverse-text-muted); font:inherit; font-size:11px; cursor:pointer; align-self:flex-start; }
+    .chat-voice-community-pager { display:flex; align-items:center; gap:8px; }
+    .chat-voice-community-pager .chat-voice-add-button { min-width:48px; }
+    @media (max-width: 560px) {
+      .chat-voice-favorite-form { grid-template-columns: minmax(0, 1fr); }
+      .chat-voice-community-toolbar { grid-template-columns: minmax(0, 1fr) minmax(0, auto); }
+      .chat-voice-community-toolbar .chat-voice-add-button { grid-column: 1 / -1; }
+      .chat-voice-community-subtoolbar { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+      .chat-voice-community-stats { white-space: normal; overflow-wrap: anywhere; }
+    }
+    .chat-voice-pool-row select {
+      min-width:0; min-height:36px; padding:7px 9px; border:1px solid var(--lumiverse-border);
+      border-radius:var(--lumiverse-radius); background:var(--lumiverse-bg-secondary, #222); color:var(--lumiverse-text); font:inherit; font-size:12px;
+    }
   `);
   const tab = ctx.ui.registerDrawerTab({
     id: "chat-voice",
@@ -2782,6 +3029,256 @@ function setup(ctx) {
   const favoritesTitle = document.createElement("div");
   favoritesTitle.className = "chat-voice-section-title";
   favoritesTitle.textContent = "Favorite voices";
+  const voicesTabStrip = document.createElement("div");
+  voicesTabStrip.className = "chat-voice-voices-tabs";
+  voicesTabStrip.setAttribute("role", "tablist");
+  voicesTabStrip.setAttribute("aria-label", "Voice library");
+  const communityTabButton = document.createElement("button");
+  communityTabButton.type = "button";
+  communityTabButton.className = "chat-voice-voices-tab";
+  communityTabButton.textContent = "Community";
+  communityTabButton.setAttribute("role", "tab");
+  const favoriteTabButton = document.createElement("button");
+  favoriteTabButton.type = "button";
+  favoriteTabButton.className = "chat-voice-voices-tab";
+  favoriteTabButton.textContent = "Favorite";
+  favoriteTabButton.setAttribute("role", "tab");
+  voicesTabStrip.append(communityTabButton, favoriteTabButton);
+  const communitySection = document.createElement("div");
+  communitySection.className = "chat-voice-community";
+  const communityKeyRow = document.createElement("div");
+  communityKeyRow.className = "chat-voice-invisible";
+  communityKeyRow.hidden = true;
+  const communityKeyInput = document.createElement("input");
+  communityKeyInput.type = "password";
+  communityKeyInput.autocomplete = "off";
+  communityKeyInput.spellcheck = false;
+  communityKeyInput.placeholder = "Fish Audio API key";
+  communityKeyInput.setAttribute("aria-label", "Fish Audio API key");
+  const communityKeySave = document.createElement("button");
+  communityKeySave.type = "button";
+  communityKeySave.className = "chat-voice-add-button";
+  communityKeySave.textContent = "Save key";
+  communityKeyRow.append(communityKeyInput, communityKeySave);
+  communitySection.appendChild(communityKeyRow);
+  const communityError = document.createElement("div");
+  communityError.className = "chat-voice-status";
+  communityError.dataset.state = "error";
+  communityError.setAttribute("role", "alert");
+  communityError.hidden = true;
+  communitySection.appendChild(communityError);
+  const communityToolbar = document.createElement("div");
+  communityToolbar.className = "chat-voice-community-toolbar";
+  const communitySearch = document.createElement("input");
+  communitySearch.placeholder = "Search community voices";
+  communitySearch.setAttribute("aria-label", "Search community voices");
+  const communitySort = document.createElement("select");
+  communitySort.setAttribute("aria-label", "Sort community voices");
+  for (const [value, label] of [["score", "Best score"], ["task_count", "Most played"], ["created_at", "Newest"]]) {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = label;
+    communitySort.appendChild(option);
+  }
+  const communitySearchButton = document.createElement("button");
+  communitySearchButton.type = "button";
+  communitySearchButton.className = "chat-voice-add-button";
+  communitySearchButton.textContent = "Search";
+  communityToolbar.append(communitySearch, communitySort, communitySearchButton);
+  const communityPrev = document.createElement("button");
+  communityPrev.type = "button";
+  communityPrev.className = "chat-voice-add-button";
+  communityPrev.textContent = "\u2190";
+  communityPrev.setAttribute("aria-label", "Previous results page");
+  const communityNext = document.createElement("button");
+  communityNext.type = "button";
+  communityNext.className = "chat-voice-add-button";
+  communityNext.textContent = "\u2192";
+  communityNext.setAttribute("aria-label", "Next results page");
+  const communityPageLabel = document.createElement("span");
+  communityPageLabel.className = "chat-voice-community-stats";
+  communityPageLabel.textContent = "";
+  const communityPager = document.createElement("div");
+  communityPager.className = "chat-voice-community-pager";
+  communityPager.append(communityPrev, communityPageLabel, communityNext);
+  const communityTags = document.createElement("input");
+  communityTags.placeholder = "Tags (comma-separated)";
+  communityTags.setAttribute("aria-label", "Community voice tags");
+  const communityFilterPanel = document.createElement("div");
+  communityFilterPanel.className = "chat-voice-filter-panel";
+  const communityLanguagesSection = document.createElement("div");
+  communityLanguagesSection.className = "chat-voice-filter-group";
+  const communityLanguagesTitle = document.createElement("div");
+  communityLanguagesTitle.className = "chat-voice-filter-title";
+  communityLanguagesTitle.textContent = "Languages";
+  const communityLanguagesHint = document.createElement("div");
+  communityLanguagesHint.className = "chat-voice-hint";
+  communityLanguagesHint.textContent = "Models must match the selected language.";
+  const communityLanguage = document.createElement("select");
+  communityLanguage.setAttribute("aria-label", "Community voice language");
+  for (const [value, label] of [["", "Any language"], ["en", "\u{1F1FA}\u{1F1F8} English"], ["es", "\u{1F1EA}\u{1F1F8} Spanish"], ["ar", "\u{1F1F8}\u{1F1E6} Arabic"], ["ru", "\u{1F1F7}\u{1F1FA} Russian"], ["ja", "\u{1F1EF}\u{1F1F5} Japanese"], ["pt", "\u{1F1E7}\u{1F1F7} Portuguese"], ["zh", "\u{1F1E8}\u{1F1F3} Chinese"], ["fr", "\u{1F1EB}\u{1F1F7} French"], ["it", "\u{1F1EE}\u{1F1F9} Italian"]]) {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = label;
+    communityLanguage.appendChild(option);
+  }
+  communityLanguagesSection.append(communityLanguagesTitle, communityLanguagesHint, communityLanguage);
+  const communityFilterTags = document.createElement("div");
+  communityFilterTags.className = "chat-voice-filter-group";
+  const communityFilterTagsTitle = document.createElement("div");
+  communityFilterTagsTitle.className = "chat-voice-filter-title";
+  communityFilterTagsTitle.textContent = "Tags";
+  communityTags.placeholder = "Tags (comma-separated)";
+  communityTags.setAttribute("aria-label", "Community voice tags");
+  communityFilterTags.append(communityFilterTagsTitle, communityTags);
+  const communityFilterGroups = [
+    { title: "Gender", tags: [["male", "Male"], ["female", "Female"]], exclusive: true },
+    { title: "Age", tags: [["young", "Young"], ["middle aged", "Middle Aged"], ["old", "Old"]], exclusive: true },
+    { title: "Use Case", tags: [["conversational", "Conversational"], ["narration", "Narration"], ["character voice", "Character Voice"], ["social media", "Social Media"], ["educational", "Educational"], ["advertisement", "Advertisement"], ["entertainment", "Entertainment"]] },
+    { title: "Voice Qualities", tags: [["deep", "Deep"], ["low", "Low"], ["medium", "Medium"], ["high", "High"], ["soft", "Soft"], ["bright", "Bright"]] }
+  ];
+  const communityFilterQualityExtended = [
+    ["warm", "Warm"],
+    ["dark", "Dark"],
+    ["raspy", "Raspy"],
+    ["smooth", "Smooth"],
+    ["breathy", "Breathy"],
+    ["husky", "Husky"],
+    ["energetic", "Energetic"],
+    ["calm", "Calm"],
+    ["relaxed", "Relaxed"],
+    ["fast", "Fast"],
+    ["slow", "Slow"],
+    ["measured", "Measured"],
+    ["dynamic", "Dynamic"],
+    ["sexy", "Sexy"],
+    ["friendly", "Friendly"],
+    ["professional", "Professional"],
+    ["serious", "Serious"],
+    ["cheerful", "Cheerful"],
+    ["enthusiastic", "Enthusiastic"],
+    ["confident", "Confident"],
+    ["authoritative", "Authoritative"],
+    ["gentle", "Gentle"],
+    ["empathetic", "Empathetic"],
+    ["playful", "Playful"],
+    ["dramatic", "Dramatic"],
+    ["intimate", "Intimate"],
+    ["mysterious", "Mysterious"],
+    ["sad", "Sad"],
+    ["angry", "Angry"],
+    ["clear", "Clear"],
+    ["crisp", "Crisp"],
+    ["neutral tone", "Neutral Tone"],
+    ["expressive", "Expressive"],
+    ["monotone", "Monotone"],
+    ["animated", "Animated"],
+    ["storytelling", "Storytelling"],
+    ["narrative", "Narrative"],
+    ["character", "Character"],
+    ["announcer", "Announcer"],
+    ["host", "Host"],
+    ["teacher", "Teacher"],
+    ["coach", "Coach"],
+    ["anime", "Anime"],
+    ["gaming", "Gaming"],
+    ["cinematic", "Cinematic"],
+    ["documentary", "Documentary"],
+    ["radio", "Radio"],
+    ["podcast", "Podcast"]
+  ];
+  const communityAdvancedFilters = document.createElement("div");
+  communityAdvancedFilters.className = "chat-voice-filter-advanced";
+  communityAdvancedFilters.hidden = true;
+  communityFilterPanel.append(communityLanguagesSection, communityFilterTags, communityAdvancedFilters);
+  const communityExpandMore = document.createElement("button");
+  communityExpandMore.type = "button";
+  communityExpandMore.className = "chat-voice-expand-more";
+  communityExpandMore.textContent = "\u22EF More filters";
+  const communityBestButton = document.createElement("button");
+  communityBestButton.type = "button";
+  communityBestButton.className = "chat-voice-add-button";
+  communityBestButton.textContent = "Community Best";
+  communityBestButton.title = "Load the cached top community voices for browsing";
+  communityFilterPanel.append(communityLanguagesSection, communityFilterTags, communityBestButton);
+  for (const group of communityFilterGroups) {
+    const section = document.createElement("div");
+    section.className = "chat-voice-filter-group";
+    const title = document.createElement("div");
+    title.className = "chat-voice-filter-title";
+    title.textContent = group.title ?? "";
+    section.appendChild(title);
+    const chips = document.createElement("div");
+    chips.className = "chat-voice-filter-chips";
+    for (const [tag, label] of group.tags) {
+      const chip = document.createElement("button");
+      chip.type = "button";
+      chip.className = "chat-voice-add-button chat-voice-filter-chip";
+      chip.dataset.tag = tag;
+      chip.dataset.group = group.title ?? "";
+      chip.setAttribute("aria-pressed", "false");
+      chip.textContent = `+ ${label}`;
+      chip.addEventListener("click", () => {
+        const engaged = chip.getAttribute("aria-pressed") === "true";
+        if (group.exclusive) {
+          for (const other of chips.querySelectorAll(".chat-voice-filter-chip")) {
+            other.setAttribute("aria-pressed", "false");
+            other.textContent = other.textContent.replace(/^✓ /, "+ ");
+          }
+        }
+        chip.setAttribute("aria-pressed", String(!engaged));
+        chip.textContent = `${engaged ? "+" : "\u2713"} ${label}`;
+      });
+      chips.appendChild(chip);
+    }
+    if (group.title === "Voice Qualities") {
+      for (const [tag, label] of communityFilterQualityExtended) {
+        const chip = document.createElement("button");
+        chip.type = "button";
+        chip.className = "chat-voice-add-button chat-voice-filter-chip";
+        chip.dataset.tag = tag;
+        chip.dataset.group = group.title;
+        chip.hidden = true;
+        chip.setAttribute("aria-pressed", "false");
+        chip.textContent = `+ ${label}`;
+        chip.addEventListener("click", () => {
+          const engaged = chip.getAttribute("aria-pressed") === "true";
+          chip.setAttribute("aria-pressed", String(!engaged));
+          chip.textContent = `${engaged ? "+" : "\u2713"} ${label}`;
+        });
+        chips.appendChild(chip);
+      }
+      const more = document.createElement("button");
+      more.type = "button";
+      more.className = "chat-voice-expand-more";
+      more.textContent = `+ ${communityFilterQualityExtended.length} more`;
+      let qualityExpanded = false;
+      more.addEventListener("click", () => {
+        qualityExpanded = !qualityExpanded;
+        for (const chip of chips.querySelectorAll(".chat-voice-filter-chip")) {
+          if ((chip.dataset.group ?? "") !== "Voice Qualities") continue;
+          if (qualityExpanded) chip.hidden = false;
+          else if (!["deep", "low", "medium", "high", "soft", "bright"].includes(chip.dataset.tag ?? "")) chip.hidden = true;
+        }
+        more.textContent = qualityExpanded ? "Show less" : `+ ${communityFilterQualityExtended.length} more`;
+      });
+      chips.appendChild(more);
+    }
+    section.appendChild(chips);
+    communityAdvancedFilters.appendChild(section);
+  }
+  communityExpandMore.addEventListener("click", () => {
+    communityAdvancedFilters.hidden = !communityAdvancedFilters.hidden;
+    communityExpandMore.textContent = communityAdvancedFilters.hidden ? "\u22EF More filters" : "Show less";
+  });
+  communityFilterPanel.appendChild(communityExpandMore);
+  communitySection.append(communityToolbar, communityFilterPanel, communityPager);
+  const communityList = document.createElement("div");
+  communityList.className = "chat-voice-favorite-list";
+  communityList.setAttribute("role", "region");
+  communityList.setAttribute("aria-label", "Community voices");
+  communityList.tabIndex = 0;
+  communitySection.appendChild(communityList);
   const favoritesSection = document.createElement("div");
   favoritesSection.className = "chat-voice-favorites";
   const favoriteForm = document.createElement("div");
@@ -2793,23 +3290,127 @@ function setup(ctx) {
   favoriteId.placeholder = "Voice ID";
   favoriteId.maxLength = 512;
   favoriteId.setAttribute("aria-label", "Favorite voice ID");
+  const favoriteGender = document.createElement("select");
+  favoriteGender.className = "chat-voice-favorite-select";
+  favoriteGender.setAttribute("aria-label", "Favorite voice gender (required)");
+  favoriteGender.setAttribute("aria-required", "true");
+  for (const [value, label] of [["", "Gender (required)"], ["male", "Male"], ["female", "Female"]]) {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = label;
+    favoriteGender.appendChild(option);
+  }
   const favoriteDescription = document.createElement("input");
   favoriteDescription.placeholder = "Description (e.g. gentle, tired)";
   favoriteDescription.maxLength = 500;
   favoriteDescription.setAttribute("aria-label", "Favorite voice description");
-  const favoriteCategory = document.createElement("select");
-  favoriteCategory.setAttribute("aria-label", "Favorite voice classification");
-  for (const [value, label] of [["unspecified", "Unspecified"], ["female", "Female"], ["male", "Male"]]) {
+  const favoriteMetaExpand = document.createElement("button");
+  favoriteMetaExpand.type = "button";
+  favoriteMetaExpand.className = "chat-voice-expand-more";
+  favoriteMetaExpand.textContent = "\u22EF Metadata";
+  const favoriteMetaPanel = document.createElement("div");
+  favoriteMetaPanel.className = "chat-voice-filter-panel";
+  favoriteMetaPanel.hidden = true;
+  favoriteMetaPanel.classList.add("chat-voice-favorite-span");
+  const favoriteLanguages = document.createElement("select");
+  favoriteLanguages.className = "chat-voice-favorite-select";
+  favoriteLanguages.setAttribute("aria-label", "Favorite voice language");
+  for (const [value, label] of [["", "Any language"], ["en", "\u{1F1FA}\u{1F1F8} English"], ["es", "\u{1F1EA}\u{1F1F8} Spanish"], ["ar", "\u{1F1F8}\u{1F1E6} Arabic"], ["ru", "\u{1F1F7}\u{1F1FA} Russian"], ["ja", "\u{1F1EF}\u{1F1F5} Japanese"], ["pt", "\u{1F1E7}\u{1F1F7} Portuguese"], ["zh", "\u{1F1E8}\u{1F1F3} Chinese"], ["fr", "\u{1F1EB}\u{1F1F7} French"], ["it", "\u{1F1EE}\u{1F1F9} Italian"]]) {
     const option = document.createElement("option");
     option.value = value;
     option.textContent = label;
-    favoriteCategory.appendChild(option);
+    favoriteLanguages.appendChild(option);
   }
+  const favoriteMetaGroups = [
+    { title: "Age", tags: [["young", "Young"], ["middle aged", "Middle Aged"], ["old", "Old"]], exclusive: true },
+    { title: "Use Case", tags: [["conversational", "Conversational"], ["narration", "Narration"], ["character voice", "Character Voice"], ["social media", "Social Media"], ["educational", "Educational"], ["advertisement", "Advertisement"], ["entertainment", "Entertainment"]] },
+    { title: "Voice Qualities", tags: [["deep", "Deep"], ["low", "Low"], ["medium", "Medium"], ["high", "High"], ["soft", "Soft"], ["bright", "Bright"]] }
+  ];
+  for (const group of favoriteMetaGroups) {
+    const section = document.createElement("div");
+    section.className = "chat-voice-filter-group";
+    const title = document.createElement("div");
+    title.className = "chat-voice-filter-title";
+    title.textContent = group.title ?? "";
+    section.appendChild(title);
+    const chips = document.createElement("div");
+    chips.className = "chat-voice-filter-chips";
+    for (const [tag, label] of group.tags) {
+      const chip = document.createElement("button");
+      chip.type = "button";
+      chip.className = "chat-voice-add-button chat-voice-filter-chip";
+      chip.dataset.tag = tag;
+      chip.dataset.group = group.title ?? "";
+      chip.setAttribute("aria-pressed", "false");
+      chip.textContent = `+ ${label}`;
+      chip.addEventListener("click", () => {
+        const engaged = chip.getAttribute("aria-pressed") === "true";
+        if (group.exclusive) {
+          for (const other of chips.querySelectorAll(".chat-voice-filter-chip")) {
+            other.setAttribute("aria-pressed", "false");
+            other.textContent = other.textContent.replace(/^✓ /, "+ ");
+          }
+        }
+        chip.setAttribute("aria-pressed", String(!engaged));
+        chip.textContent = `${engaged ? "+" : "\u2713"} ${label}`;
+      });
+      chips.appendChild(chip);
+    }
+    if (group.title === "Voice Qualities") {
+      for (const [tag, label] of communityFilterQualityExtended) {
+        const chip = document.createElement("button");
+        chip.type = "button";
+        chip.className = "chat-voice-add-button chat-voice-filter-chip";
+        chip.dataset.tag = tag;
+        chip.dataset.group = group.title;
+        chip.hidden = true;
+        chip.setAttribute("aria-pressed", "false");
+        chip.textContent = `+ ${label}`;
+        chip.addEventListener("click", () => {
+          const engaged = chip.getAttribute("aria-pressed") === "true";
+          chip.setAttribute("aria-pressed", String(!engaged));
+          chip.textContent = `${engaged ? "+" : "\u2713"} ${label}`;
+        });
+        chips.appendChild(chip);
+      }
+      const more = document.createElement("button");
+      more.type = "button";
+      more.className = "chat-voice-expand-more";
+      more.textContent = `+ ${communityFilterQualityExtended.length} more`;
+      let qualityExpanded = false;
+      more.addEventListener("click", () => {
+        qualityExpanded = !qualityExpanded;
+        for (const chip of chips.querySelectorAll(".chat-voice-filter-chip")) {
+          if ((chip.dataset.group ?? "") !== "Voice Qualities") continue;
+          if (qualityExpanded) chip.hidden = false;
+          else if (!["deep", "low", "medium", "high", "soft", "bright"].includes(chip.dataset.tag ?? "")) chip.hidden = true;
+        }
+        more.textContent = qualityExpanded ? "Show less" : `+ ${communityFilterQualityExtended.length} more`;
+      });
+      chips.appendChild(more);
+    }
+    section.appendChild(chips);
+    favoriteMetaPanel.appendChild(section);
+  }
+  const favoriteLanguageSection = document.createElement("div");
+  favoriteLanguageSection.className = "chat-voice-filter-group";
+  const favoriteLanguageTitle = document.createElement("div");
+  favoriteLanguageTitle.className = "chat-voice-filter-title";
+  favoriteLanguageTitle.textContent = "Languages";
+  const favoriteLanguageHint = document.createElement("div");
+  favoriteLanguageHint.className = "chat-voice-hint";
+  favoriteLanguageHint.textContent = "Models must match the selected language.";
+  favoriteLanguageSection.append(favoriteLanguageTitle, favoriteLanguageHint, favoriteLanguages);
+  favoriteMetaPanel.prepend(favoriteLanguageSection);
+  favoriteMetaExpand.addEventListener("click", () => {
+    favoriteMetaPanel.hidden = !favoriteMetaPanel.hidden;
+    favoriteMetaExpand.textContent = favoriteMetaPanel.hidden ? "\u22EF Metadata" : "Show less";
+  });
   const favoriteAdd = document.createElement("button");
   favoriteAdd.type = "button";
-  favoriteAdd.className = "chat-voice-add-button";
+  favoriteAdd.className = "chat-voice-add-button chat-voice-favorite-add";
   favoriteAdd.textContent = "Add favorite";
-  favoriteForm.append(favoriteName, favoriteId, favoriteDescription, favoriteCategory, favoriteAdd);
+  favoriteForm.append(favoriteName, favoriteId, favoriteGender, favoriteDescription, favoriteMetaExpand, favoriteMetaPanel, favoriteAdd);
   const favoriteFilter = document.createElement("select");
   favoriteFilter.className = "chat-voice-favorite-select";
   favoriteFilter.setAttribute("aria-label", "Filter favorite voices");
@@ -2860,7 +3461,9 @@ function setup(ctx) {
     characterTitle,
     characterList,
     favoritesTitle,
+    voicesTabStrip,
     favoritesSection,
+    communitySection,
     status,
     advancedSection
   );
@@ -2879,6 +3482,75 @@ function setup(ctx) {
   const autoCastingText = document.createElement("span");
   autoCastingText.textContent = "Automatically cast voices";
   autoCastingLabel.append(autoCastingToggle, autoCastingText);
+  const autoVoicePoolField = createField("Auto-cast voice pool");
+  const autoVoicePoolText = document.createElement("span");
+  autoVoicePoolText.textContent = "Auto-cast voice pool";
+  const autoVoicePoolSelect = document.createElement("select");
+  autoVoicePoolSelect.className = "chat-voice-favorite-select";
+  autoVoicePoolSelect.setAttribute("aria-label", "Auto-cast voice pool");
+  for (const [value, label] of [["favorite", "Favorites"], ["community", "Community snapshot"]]) {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = label;
+    autoVoicePoolSelect.appendChild(option);
+  }
+  const autoVoicePoolHint = document.createElement("span");
+  autoVoicePoolHint.className = "chat-voice-hint";
+  autoVoicePoolHint.textContent = "Choose Favorites or the cached Fish community snapshot when auto-casting. The Community tab is available with Fish vocal tags; this pool only samples snapshot voices.";
+  autoVoicePoolField.slot.append(autoVoicePoolSelect, autoVoicePoolHint);
+  const autoVoicePoolActions = document.createElement("div");
+  autoVoicePoolActions.className = "chat-voice-pool-refresh-row";
+  const autoVoicePoolRefresh = document.createElement("button");
+  autoVoicePoolRefresh.type = "button";
+  autoVoicePoolRefresh.className = "chat-voice-add-button";
+  autoVoicePoolRefresh.textContent = "Refresh snapshot";
+  const communityPoolStatus = document.createElement("span");
+  communityPoolStatus.className = "chat-voice-hint";
+  communityPoolStatus.textContent = "";
+  const snapshotLanguageRow = document.createElement("label");
+  snapshotLanguageRow.className = "chat-voice-pool-language-row";
+  const snapshotLanguageText = document.createElement("span");
+  snapshotLanguageText.textContent = "Snapshot language";
+  const snapshotLanguageSelect = document.createElement("select");
+  snapshotLanguageSelect.className = "chat-voice-favorite-select";
+  snapshotLanguageSelect.setAttribute("aria-label", "Community snapshot language");
+  for (const [value, label] of [["", "All languages"], ["en", "\u{1F1FA}\u{1F1F8} English"], ["es", "\u{1F1EA}\u{1F1F8} Spanish"], ["ar", "\u{1F1F8}\u{1F1E6} Arabic"], ["ru", "\u{1F1F7}\u{1F1FA} Russian"], ["ja", "\u{1F1EF}\u{1F1F5} Japanese"], ["pt", "\u{1F1E7}\u{1F1F7} Portuguese"], ["zh", "\u{1F1E8}\u{1F1F3} Chinese"], ["fr", "\u{1F1EB}\u{1F1F7} French"], ["it", "\u{1F1EE}\u{1F1F9} Italian"]]) {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = label;
+    snapshotLanguageSelect.appendChild(option);
+  }
+  const snapshotLanguageHint = document.createElement("span");
+  snapshotLanguageHint.className = "chat-voice-toggle-hint";
+  snapshotLanguageHint.textContent = "Top-100 snapshot is drawn only from voices matching this language (all = any language).";
+  snapshotLanguageRow.append(snapshotLanguageText, snapshotLanguageSelect, snapshotLanguageHint);
+  autoVoicePoolActions.append(autoVoicePoolRefresh, communityPoolStatus);
+  const fishKeyRow = document.createElement("div");
+  fishKeyRow.className = "chat-voice-key-row";
+  const fishKeyText = document.createElement("span");
+  fishKeyText.textContent = "Fish API key";
+  const fishKeyInput = document.createElement("input");
+  fishKeyInput.type = "password";
+  fishKeyInput.autocomplete = "off";
+  fishKeyInput.spellcheck = false;
+  fishKeyInput.placeholder = "New Fish Audio API key";
+  fishKeyInput.setAttribute("aria-label", "New Fish Audio API key");
+  const fishKeySave = document.createElement("button");
+  fishKeySave.type = "button";
+  fishKeySave.className = "chat-voice-add-button";
+  fishKeySave.textContent = "Save key";
+  const fishKeyRemove = document.createElement("button");
+  fishKeyRemove.type = "button";
+  fishKeyRemove.className = "chat-voice-add-button";
+  fishKeyRemove.textContent = "Remove";
+  fishKeyRemove.hidden = true;
+  const fishKeyStatus = document.createElement("span");
+  fishKeyStatus.className = "chat-voice-toggle-hint";
+  fishKeyStatus.textContent = "No Fish API key stored";
+  const fishKeyHint = document.createElement("span");
+  fishKeyHint.className = "chat-voice-toggle-hint";
+  fishKeyHint.textContent = "The key is stored only in your global voice settings and is never shown again; only its last four characters identify it here.";
+  fishKeyRow.append(fishKeyText, fishKeyInput, fishKeySave, fishKeyRemove, fishKeyStatus, fishKeyHint);
   const autoPlaybackLabel = document.createElement("label");
   autoPlaybackLabel.className = "chat-voice-toggle";
   const autoPlaybackToggle = document.createElement("input");
@@ -2946,6 +3618,10 @@ function setup(ctx) {
     ghostLifetimeField.field,
     speakerLookbackField.field,
     autoCastingLabel,
+    autoVoicePoolField.field,
+    snapshotLanguageRow,
+    autoVoicePoolActions,
+    fishKeyRow,
     autoPlaybackLabel,
     autoPlaybackDelayField.field,
     skipNarrationLabel,
@@ -2971,6 +3647,25 @@ function setup(ctx) {
   let favoriteVoices = [];
   let favoritesSaving = false;
   let editingFavoriteVoiceId = null;
+  const favoriteDetailsOpen = /* @__PURE__ */ new Set();
+  let fishApiKey = "";
+  let communityVoiceLanguage = "";
+  let autoVoiceCastingPool = "favorite";
+  let communityVoices = [];
+  let communityVoicesAt = "";
+  let voicesTab = "community";
+  let communitySearchTitle = "";
+  let communitySearchTags = [];
+  let communitySearchLanguage = [];
+  let communitySortBy = "score";
+  let communityPage = 1;
+  let communityItems = [];
+  let communityTotal = 0;
+  let communityHasMore = false;
+  let communityLoading = false;
+  let communityBest = false;
+  let communityBestItems = [];
+  let communityAutoSeeded = false;
   let previewController = null;
   let previewAudio = null;
   let previewUrl = null;
@@ -3462,6 +4157,7 @@ function setup(ctx) {
   skipNarrationToggle.addEventListener("change", onSkipNarrationChanged);
   autoCastingToggle.addEventListener("change", () => {
     autoVoiceCasting = autoCastingToggle.checked;
+    updatePoolControls();
     scheduleAdvancedSettingsSave();
   });
   autoPlaybackToggle.addEventListener("change", onAutoPlaybackChanged);
@@ -3563,7 +4259,7 @@ function setup(ctx) {
     updatePlaybackButtons();
     nativeButtonStates.clear();
   }
-  function requestPlaybackMessage(chatId, messageId, targetSwipeId) {
+  function requestPlaybackMessage(chatId, messageId) {
     const requestId = `${Date.now().toString(36)}-${++messageRequestSequence}`;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -3571,7 +4267,7 @@ function setup(ctx) {
         reject(new Error("Timed out while loading the message for playback."));
       }, 15e3);
       pendingMessageRequests.set(requestId, { resolve, reject, timer });
-      ctx.sendToBackend({ type: "chat_voice_get_message", chatId, messageId, requestId, ...targetSwipeId !== void 0 ? { targetSwipeId } : {} });
+      ctx.sendToBackend({ type: "chat_voice_get_message", chatId, messageId, requestId });
     });
   }
   function requestSpeakerReviewedSegments(chatId, messageId, preferences) {
@@ -3621,6 +4317,30 @@ function setup(ctx) {
       }, 35e3);
       pendingUncastRequests.set(requestId, { resolve, reject, timer });
       ctx.sendToBackend({ type: "chat_voice_match_uncast", requestId, chatId, messageId, message, sourceHash, groups, voices, reserved, lifetime, speakerLookback: speakerLookback2, skippedTrackerTags: skippedTrackerTags2 });
+    });
+  }
+  const pendingCommunityRequests = /* @__PURE__ */ new Map();
+  let communityRequestSequence = 0;
+  function requestCommunitySearch(query) {
+    const requestId = `community-${Date.now().toString(36)}-${++communityRequestSequence}`;
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        pendingCommunityRequests.delete(requestId);
+        reject(new Error("Community voice search timed out."));
+      }, 35e3);
+      pendingCommunityRequests.set(requestId, { resolve: (value) => resolve({ items: value.items ?? [], total: value.total ?? 0, hasMore: value.hasMore ?? false }), reject, timer });
+      ctx.sendToBackend({ type: "chat_voice_search_community", requestId, fishApiKey, title: query.title ?? "", tags: query.tags ?? [], language: query.language ?? [], sortBy: query.sortBy ?? "score", pageNumber: query.pageNumber ?? 1, pageSize: query.pageSize ?? 20 });
+    });
+  }
+  function requestCommunitySnapshotRefresh() {
+    const requestId = `community-snapshot-${Date.now().toString(36)}-${++communityRequestSequence}`;
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        pendingCommunityRequests.delete(requestId);
+        reject(new Error("Community snapshot refresh timed out."));
+      }, 35e3);
+      pendingCommunityRequests.set(requestId, { resolve: (value) => resolve({ items: value.items ?? [], voices: value.voices ?? [], refreshedAt: value.refreshedAt ?? "" }), reject, timer });
+      ctx.sendToBackend({ type: "chat_voice_refresh_community_snapshot", requestId, fishApiKey, language: communityVoiceLanguage });
     });
   }
   function speakerDebugName(speakerId, speakers) {
@@ -3939,6 +4659,7 @@ function setup(ctx) {
     tagLlmModelConnectionId = modelConnectionId;
     tagLlmModelComboboxEnabled = llmEnabled;
     if (llmEnabled && (connectionChanged || becameEnabled)) tagLlmModelInput.refresh();
+    updateVoicesTabs();
   }
   function onTtsTagStyleChanged(value) {
     ttsTagStyle = value === "gemini" || value === "gemini38" || value === "fish" ? value : "off";
@@ -4186,9 +4907,9 @@ function setup(ctx) {
       }
       const connectionProfileVoice = (connections.find((connection) => connection.id === connectionId)?.voice ?? "").trim();
       let autoCastDiagnostics = [];
-      if (preferences.autoVoiceCasting && favoriteVoices.length && (!config.narratorVoice || !config.userVoice || playbackChat.characters.some((character) => !config.characterVoices[character.id]))) {
+      if (preferences.autoVoiceCasting && poolVoicesForAutoCast().length && (!config.narratorVoice || !config.userVoice || playbackChat.characters.some((character) => !config.characterVoices[character.id]))) {
         flushSave();
-        const autoResult = await requestAutoCast(playbackChat.id, favoriteVoices, [connectionProfileVoice, config.narratorVoice, config.userVoice, ...Object.values(config.characterVoices)].filter(Boolean), !config.narratorVoice, !config.userVoice);
+        const autoResult = await requestAutoCast(playbackChat.id, poolVoicesForAutoCast(), [connectionProfileVoice, config.narratorVoice, config.userVoice, ...Object.values(config.characterVoices)].filter(Boolean), !config.narratorVoice, !config.userVoice);
         if (!ownsStartup()) return;
         const assigned = autoResult.assignments;
         autoCastDiagnostics = autoResult.diagnostics;
@@ -4331,7 +5052,9 @@ function setup(ctx) {
           config.userVoice,
           connectionProfileVoice
         ];
-        const uncastVoices = availableUncastVoices(favoriteVoices, reservedVoices);
+        const poolVoices = poolVoicesForAutoCast();
+        if (preferences.autoVoiceCasting && speakerAssignmentDebug) appendSpeakerDebugLog(`Voice pool: ${autoVoiceCastingPool === "community" && communityIsAvailable() ? `community (${communityVoices.length} snapshot voices)` : "favorites"}.`);
+        const uncastVoices = availableUncastVoices(poolVoices, reservedVoices);
         const uncastMatchPromise = preferences.autoVoiceCasting && uncastGroups.length ? requestUncastVoiceMatches(
           playbackChat.id,
           messageId,
@@ -4775,10 +5498,15 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
               },
               async () => {
                 if (!Number.isInteger(message.swipe_id) || (message.swipe_id ?? -1) < 0) throw new Error("Cannot safely save audio: the target swipe ID is unavailable.");
-                const latest = await requestPlaybackMessage(playbackChat.id, messageId, message.swipe_id);
-                if (synthesisController.signal.aborted || latest.is_user || !targetSwipeContentMatches(latest.targetSwipeContent, autoplaySwipeSnapshot(message))) {
-                  appendSpeakerDebugLog(`Audio save cancelled: message ${messageId}, swipe ${message.swipe_id}, was removed or changed since playback began.`);
+                const latest = await requestPlaybackMessage(playbackChat.id, messageId);
+                const originalSwipe = autoplaySwipeSnapshot(message);
+                const refreshedSwipe = refreshAutoplaySwipe(latest, originalSwipe);
+                if (synthesisController.signal.aborted || latest.is_user || !refreshedSwipe) {
+                  appendSpeakerDebugLog(`Audio save cancelled: message ${messageId}, swipe ${message.swipe_id}, was removed, navigated, or replaced since playback began.`);
                   throw new DOMException("Target swipe changed before audio save.", "AbortError");
+                }
+                if (refreshedSwipe.contentHash !== originalSwipe.contentHash) {
+                  appendSpeakerDebugLog(`Audio save: message ${messageId}, swipe ${message.swipe_id}, message text was refined on the same swipe since playback began; saving the audio of the text as played.`);
                 }
               }
             );
@@ -4994,7 +5722,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
       placeholder.textContent = favoriteVoices.length ? "Choose a favorite voice\u2026" : "No favorite voices yet";
       picker.appendChild(placeholder);
       for (const [category, label] of [["female", "Female"], ["male", "Male"], ["unspecified", "Unspecified"]]) {
-        const entries = favoriteVoices.filter((voice) => voice.category === category);
+        const entries = favoriteVoices.filter((voice) => category === "unspecified" ? voiceGender(voice) === "unknown" : voiceGender(voice) === category);
         if (!entries.length) continue;
         const group = document.createElement("optgroup");
         group.label = label;
@@ -5039,7 +5767,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
       if (picker.disabled) view.details.open = false;
       view.options.replaceChildren();
       for (const [category, label] of [["female", "Female"], ["male", "Male"], ["unspecified", "Unspecified"]]) {
-        const entries = favoriteVoices.filter((voice) => voice.category === category);
+        const entries = favoriteVoices.filter((voice) => category === "unspecified" ? voiceGender(voice) === "unknown" : voiceGender(voice) === category);
         if (!entries.length) continue;
         const heading = document.createElement("div");
         heading.className = "chat-voice-favorite-category";
@@ -5197,7 +5925,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
       favoriteList.appendChild(empty);
       return;
     }
-    const visibleVoices = favoriteVoices.filter((voice) => favoriteFilter.value === "unspecified" || voice.category === favoriteFilter.value);
+    const visibleVoices = favoriteVoices.filter((voice) => favoriteFilter.value === "unspecified" || voiceGender(voice) === favoriteFilter.value);
     if (!visibleVoices.length) {
       const empty = document.createElement("div");
       empty.className = "chat-voice-hint";
@@ -5217,27 +5945,233 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
         description.textContent = voice.description;
         copy.appendChild(description);
       }
-      const category = document.createElement("select");
-      category.className = "chat-voice-favorite-select";
-      category.style.width = "auto";
-      category.setAttribute("aria-label", `Classification for ${voice.name || voice.id}`);
-      for (const [value, label] of [["unspecified", "Unspecified"], ["female", "Female"], ["male", "Male"]]) {
+      {
+        const basicsText = [
+          voiceGender(voice) === "male" ? "Male" : voiceGender(voice) === "female" ? "Female" : "",
+          voiceAge(voice) === "young" ? "Young" : voiceAge(voice) === "middle aged" ? "Middle Aged" : voiceAge(voice) === "old" ? "Old" : "",
+          voice.languages?.length ? voice.languages.map((code) => ({ en: "English", es: "Spanish", ar: "Arabic", ru: "Russian", ja: "Japanese", pt: "Portuguese", zh: "Chinese", fr: "French", it: "Italian" })[code.toLowerCase()] ?? code).join(" + ") : "",
+          voice.author ? `by ${voice.author}` : ""
+        ].filter(Boolean).join(" \xB7 ");
+        if (basicsText) {
+          const basics2 = document.createElement("small");
+          basics2.textContent = basicsText;
+          copy.appendChild(basics2);
+        }
+      }
+      const GENDER_TAGS = ["male", "female"];
+      const AGE_TAGS = ["young", "middle aged", "old"];
+      const USE_CASE_TAGS = [["conversational", "Conversational"], ["narration", "Narration"], ["character voice", "Character Voice"], ["social media", "Social Media"], ["educational", "Educational"], ["advertisement", "Advertisement"], ["entertainment", "Entertainment"]];
+      const QUALITY_TAGS = [["deep", "Deep"], ["low", "Low"], ["medium", "Medium"], ["high", "High"], ["soft", "Soft"], ["bright", "Bright"]];
+      const LANGUAGE_OPTIONS = [["en", "\u{1F1FA}\u{1F1F8} English"], ["es", "\u{1F1EA}\u{1F1F8} Spanish"], ["ar", "\u{1F1F8}\u{1F1E6} Arabic"], ["ru", "\u{1F1F7}\u{1F1FA} Russian"], ["ja", "\u{1F1EF}\u{1F1F5} Japanese"], ["pt", "\u{1F1E7}\u{1F1F7} Portuguese"], ["zh", "\u{1F1E8}\u{1F1F3} Chinese"], ["fr", "\u{1F1EB}\u{1F1F7} French"], ["it", "\u{1F1EE}\u{1F1F9} Italian"]];
+      const KNOWN_TAGS = /* @__PURE__ */ new Set([...GENDER_TAGS, ...AGE_TAGS, ...USE_CASE_TAGS.map(([tag]) => tag), ...QUALITY_TAGS.map(([tag]) => tag), ...communityFilterQualityExtended.map(([tag]) => tag)]);
+      const lowerTags = (item) => new Set((item.tags ?? []).map((tag) => tag.trim().toLowerCase()).filter(Boolean));
+      const patchVoice = (update) => saveFavoriteVoices(favoriteVoices.map((item) => item.id === voice.id ? update(item) : item));
+      const withTags = (item, tags) => {
+        const deduped = [...new Set(tags.map((tag) => tag.trim().toLowerCase()).filter(Boolean))].slice(0, 32);
+        return deduped.length ? { ...item, tags: deduped } : { ...item, tags: void 0 };
+      };
+      const withoutTags = (item, excluded) => withTags(item, (item.tags ?? []).filter((tag) => !excluded.includes(tag.trim().toLowerCase())));
+      const basics = document.createElement("div");
+      basics.className = "chat-voice-favorite-basics";
+      const makeBasic = (label, aria) => {
+        const field = document.createElement("label");
+        field.className = "chat-voice-favorite-basic";
+        const name = document.createElement("span");
+        name.textContent = label;
+        const select = document.createElement("select");
+        select.setAttribute("aria-label", aria);
+        field.append(name, select);
+        basics.appendChild(field);
+        return select;
+      };
+      const genderSelect = makeBasic("Gender", `Gender for ${voice.name || voice.id}`);
+      for (const [value, text] of [["unspecified", "Unspecified"], ["female", "Female"], ["male", "Male"]]) {
         const option = document.createElement("option");
         option.value = value;
-        option.textContent = label;
-        category.appendChild(option);
+        option.textContent = text;
+        genderSelect.appendChild(option);
       }
-      category.value = voice.category;
-      category.addEventListener("change", () => {
-        const nextCategory = category.value === "male" || category.value === "female" ? category.value : "unspecified";
-        category.disabled = true;
-        void saveFavoriteVoices(favoriteVoices.map((item) => item.id === voice.id ? { ...item, category: nextCategory } : item)).then((saved) => {
-          if (!saved) {
-            category.value = voice.category;
-            category.disabled = false;
+      if (voice.category && !["unspecified", "male", "female"].includes(voice.category)) {
+        const option = document.createElement("option");
+        option.value = voice.category;
+        option.textContent = voice.category;
+        genderSelect.appendChild(option);
+      }
+      genderSelect.value = voiceGender(voice) === "unknown" ? voice.category || "unspecified" : voiceGender(voice);
+      genderSelect.addEventListener("change", () => {
+        const next = genderSelect.value;
+        genderSelect.disabled = true;
+        void patchVoice((item) => {
+          const cleared = withoutTags(item, GENDER_TAGS);
+          if (next === "male" || next === "female") {
+            return { ...cleared, gender: next, category: next, tags: [.../* @__PURE__ */ new Set([...cleared.tags ?? [], next])] };
           }
+          const legacy = ["male", "female", "unspecified"].includes(item.category);
+          return { ...cleared, gender: void 0, category: legacy ? "unspecified" : item.category || "unspecified" };
+        }).then((saved) => {
+          if (!saved) genderSelect.disabled = false;
         });
       });
+      const ageSelect = makeBasic("Age", `Age for ${voice.name || voice.id}`);
+      for (const [value, text] of [["unknown", "Any age"], ["young", "Young"], ["middle aged", "Middle Aged"], ["old", "Old"]]) {
+        const option = document.createElement("option");
+        option.value = value;
+        option.textContent = text;
+        ageSelect.appendChild(option);
+      }
+      ageSelect.value = voiceAge(voice);
+      ageSelect.addEventListener("change", () => {
+        const next = ageSelect.value;
+        ageSelect.disabled = true;
+        void patchVoice((item) => {
+          const cleared = withoutTags(item, AGE_TAGS);
+          return next === "unknown" ? cleared : withTags(cleared, [...cleared.tags ?? [], next]);
+        }).then((saved) => {
+          if (!saved) ageSelect.disabled = false;
+        });
+      });
+      const languageSelect = makeBasic("Language", `Language for ${voice.name || voice.id}`);
+      for (const [value, text] of [["", "Any language"], ...LANGUAGE_OPTIONS]) {
+        const option = document.createElement("option");
+        option.value = value;
+        option.textContent = text;
+        languageSelect.appendChild(option);
+      }
+      languageSelect.value = voice.languages?.length === 1 ? voice.languages[0].toLowerCase() : voice.languages?.length ? voice.languages[0].toLowerCase() || "" : "";
+      languageSelect.addEventListener("change", () => {
+        const next = languageSelect.value;
+        languageSelect.disabled = true;
+        void patchVoice((item) => ({ ...item, languages: next ? [next] : void 0 })).then((saved) => {
+          if (!saved) languageSelect.disabled = false;
+        });
+      });
+      const detailsToggle = document.createElement("button");
+      detailsToggle.type = "button";
+      detailsToggle.className = "chat-voice-expand-more";
+      const detailsOpen = () => favoriteDetailsOpen.has(voice.id);
+      detailsToggle.textContent = detailsOpen() ? "Show less" : "\u22EF Details";
+      detailsToggle.setAttribute("aria-expanded", String(detailsOpen()));
+      const details = document.createElement("div");
+      details.className = "chat-voice-favorite-details";
+      details.hidden = !detailsOpen();
+      detailsToggle.addEventListener("click", () => {
+        if (detailsOpen()) favoriteDetailsOpen.delete(voice.id);
+        else favoriteDetailsOpen.add(voice.id);
+        details.hidden = !detailsOpen();
+        detailsToggle.textContent = detailsOpen() ? "Show less" : "\u22EF Details";
+        detailsToggle.setAttribute("aria-expanded", String(detailsOpen()));
+      });
+      const makeChipGroup = (title, entries, isOn, toggle, more) => {
+        const section = document.createElement("div");
+        section.className = "chat-voice-filter-group";
+        const heading = document.createElement("div");
+        heading.className = "chat-voice-filter-title";
+        heading.textContent = title;
+        const chips = document.createElement("div");
+        chips.className = "chat-voice-filter-chips";
+        const addChip = ([tag, label], hidden) => {
+          const chip = document.createElement("button");
+          chip.type = "button";
+          chip.className = "chat-voice-add-button chat-voice-filter-chip";
+          chip.dataset.tag = tag;
+          chip.dataset.kind = title;
+          chip.hidden = hidden;
+          chip.setAttribute("aria-pressed", String(isOn(tag)));
+          chip.textContent = `${isOn(tag) ? "\u2713" : "+"} ${label}`;
+          chip.addEventListener("click", () => toggle(tag));
+          chips.appendChild(chip);
+          return chip;
+        };
+        for (const entry of entries) addChip(entry, false);
+        if (more?.length) {
+          for (const entry of more) addChip(entry, true);
+          const expand = document.createElement("button");
+          expand.type = "button";
+          expand.className = "chat-voice-expand-more";
+          expand.textContent = `+ ${more.length} more`;
+          let expanded = false;
+          expand.addEventListener("click", () => {
+            expanded = !expanded;
+            for (const chip of chips.querySelectorAll(".chat-voice-filter-chip")) {
+              const tag = chip.dataset.tag ?? "";
+              if (more.some(([entryTag]) => entryTag === tag)) chip.hidden = !expanded;
+            }
+            expand.textContent = expanded ? "Show less" : `+ ${more.length} more`;
+          });
+          chips.appendChild(expand);
+        }
+        section.append(heading, chips);
+        return section;
+      };
+      const current = () => favoriteVoices.find((item) => item.id === voice.id) ?? voice;
+      details.appendChild(makeChipGroup("Languages", LANGUAGE_OPTIONS, (tag) => (current().languages ?? []).some((code) => code.toLowerCase() === tag), (tag) => {
+        patchVoice((item) => {
+          const codes = (item.languages ?? []).map((code) => code.toLowerCase());
+          const next = codes.includes(tag) ? codes.filter((code) => code !== tag) : [...codes, tag];
+          return { ...item, languages: next.length ? next : void 0 };
+        });
+      }));
+      details.appendChild(makeChipGroup("Use Case", USE_CASE_TAGS, (tag) => lowerTags(current()).has(tag), (tag) => {
+        patchVoice((item) => {
+          const set = lowerTags(item);
+          if (set.has(tag)) set.delete(tag);
+          else set.add(tag);
+          return withTags(item, [...set]);
+        });
+      }));
+      details.appendChild(makeChipGroup("Voice Qualities", QUALITY_TAGS, (tag) => lowerTags(current()).has(tag), (tag) => {
+        patchVoice((item) => {
+          const set = lowerTags(item);
+          if (set.has(tag)) set.delete(tag);
+          else set.add(tag);
+          return withTags(item, [...set]);
+        });
+      }, communityFilterQualityExtended));
+      const authorGroup = document.createElement("div");
+      authorGroup.className = "chat-voice-filter-group";
+      const authorTitle = document.createElement("div");
+      authorTitle.className = "chat-voice-filter-title";
+      authorTitle.textContent = "Author";
+      const authorInput = document.createElement("input");
+      authorInput.placeholder = "Voice author (optional)";
+      authorInput.maxLength = 128;
+      authorInput.value = voice.author ?? "";
+      authorInput.setAttribute("aria-label", `Author for ${voice.name || voice.id}`);
+      authorInput.addEventListener("change", () => {
+        const value = authorInput.value.trim().slice(0, 128);
+        patchVoice((item) => ({ ...item, author: value || void 0 }));
+      });
+      authorGroup.append(authorTitle, authorInput);
+      details.appendChild(authorGroup);
+      const tagsGroup = document.createElement("div");
+      tagsGroup.className = "chat-voice-filter-group";
+      const tagsTitle = document.createElement("div");
+      tagsTitle.className = "chat-voice-filter-title";
+      tagsTitle.textContent = "Tags";
+      const tagsInput = document.createElement("input");
+      tagsInput.placeholder = "Other tags (comma-separated)";
+      tagsInput.maxLength = 512;
+      tagsInput.value = (voice.tags ?? []).filter((tag) => !KNOWN_TAGS.has(tag.trim().toLowerCase())).join(", ");
+      tagsInput.setAttribute("aria-label", `Other tags for ${voice.name || voice.id}`);
+      const tagsHint = document.createElement("div");
+      tagsHint.className = "chat-voice-hint";
+      tagsHint.textContent = "Gender, age, use case, and voice quality chips also count as tags and are managed above.";
+      tagsInput.addEventListener("change", () => {
+        const custom = tagsInput.value.split(",").map((tag) => tag.trim().slice(0, 64)).filter(Boolean);
+        patchVoice((item) => {
+          const pressed = [...details.querySelectorAll('.chat-voice-filter-chip[aria-pressed="true"]')].filter((chip) => chip.dataset.kind !== "Languages").map((chip) => chip.dataset.tag ?? "");
+          const gendered = [voiceGender(item), voiceAge(item)].filter((value) => value !== "unknown");
+          return withTags(item, [...pressed, ...gendered, ...custom]);
+        });
+      });
+      tagsGroup.append(tagsTitle, tagsHint, tagsInput);
+      details.appendChild(tagsGroup);
+      if (voice.communityLink) {
+        const linkLine = document.createElement("div");
+        linkLine.className = "chat-voice-hint";
+        linkLine.textContent = `Imported from ${voice.communityLink}`;
+        details.appendChild(linkLine);
+      }
       const preview = createCastPreviewButton(() => voice.name || voice.id, () => voice.id);
       const editForm = document.createElement("form");
       editForm.className = "chat-voice-favorite-edit";
@@ -5261,14 +6195,14 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
       cancelEdit.textContent = "Cancel";
       let editKind = "name";
       const openEdit = (kind) => {
-        const current = favoriteVoices.find((item) => item.id === voice.id);
-        if (!current) return;
+        const current2 = favoriteVoices.find((item) => item.id === voice.id);
+        if (!current2) return;
         for (const other of favoriteList.querySelectorAll(".chat-voice-favorite-edit")) other.hidden = true;
         editKind = kind;
         editingFavoriteVoiceId = voice.id;
         editLabel.textContent = kind === "name" ? "Voice name (leave blank to display the ID)" : "Voice description";
-        nameInput.value = current.name;
-        descriptionInput.value = current.description;
+        nameInput.value = current2.name;
+        descriptionInput.value = current2.description;
         nameInput.hidden = kind !== "name";
         descriptionInput.hidden = kind !== "description";
         editForm.hidden = false;
@@ -5311,14 +6245,29 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
       remove.addEventListener("click", () => {
         void saveFavoriteVoices(favoriteVoices.filter((item) => item.id !== voice.id));
       });
-      row.append(copy, category, preview, rename, describe, remove, editForm);
+      row.append(copy, preview, detailsToggle, rename, describe, remove, basics, details, editForm);
       favoriteList.appendChild(row);
     }
   }
   favoriteAdd.addEventListener("click", () => {
     const id = favoriteId.value.trim().slice(0, 512);
-    const category = favoriteCategory.value === "male" || favoriteCategory.value === "female" ? favoriteCategory.value : "unspecified";
-    const voice = { id, name: favoriteName.value.trim().slice(0, 128), category, description: favoriteDescription.value.trim().slice(0, 500) };
+    const selectedTags = [...favoriteMetaPanel.querySelectorAll('.chat-voice-filter-chip[aria-pressed="true"]')].map((chip) => chip.dataset.tag ?? "").filter(Boolean);
+    const gender = favoriteGender.value === "male" || favoriteGender.value === "female" ? favoriteGender.value : void 0;
+    if (!gender) {
+      favoriteError.textContent = "Choose a gender (male or female) before adding a favorite voice.";
+      favoriteError.hidden = false;
+      favoriteGender.focus();
+      return;
+    }
+    const voice = {
+      id,
+      name: favoriteName.value.trim().slice(0, 128),
+      category: gender,
+      description: favoriteDescription.value.trim().slice(0, 500),
+      ...gender ? { gender } : {},
+      ...selectedTags.length ? { tags: selectedTags.slice(0, 32) } : {},
+      ...favoriteLanguages.value ? { languages: [favoriteLanguages.value] } : {}
+    };
     let next;
     try {
       next = addFavoriteVoice(favoriteVoices, voice);
@@ -5331,13 +6280,330 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
     }
     favoriteError.hidden = true;
     void saveFavoriteVoices(next, voice).then((saved) => {
-      if (saved) {
-        favoriteName.value = "";
-        favoriteId.value = "";
-        favoriteDescription.value = "";
+      if (!saved) return;
+      favoriteName.value = "";
+      favoriteId.value = "";
+      favoriteDescription.value = "";
+      favoriteLanguages.value = "";
+      favoriteGender.value = "";
+      for (const chip of favoriteMetaPanel.querySelectorAll(".chat-voice-filter-chip")) {
+        chip.setAttribute("aria-pressed", "false");
+        chip.textContent = chip.textContent.replace(/^✓ /, "+ ");
       }
     });
   });
+  communityBestButton.addEventListener("click", () => void showCommunityBest());
+  communityTabButton.addEventListener("click", () => {
+    voicesTab = "community";
+    updateVoicesTabs();
+    renderCommunityBrowse();
+    void showCommunityBest();
+  });
+  favoriteTabButton.addEventListener("click", () => {
+    voicesTab = "favorite";
+    updateVoicesTabs();
+  });
+  function readCommunityFilterText(value) {
+    return value.split(",").map((item) => item.trim()).filter(Boolean).slice(0, 8);
+  }
+  communitySearchButton.addEventListener("click", () => {
+    communityBest = false;
+    communitySearchTitle = communitySearch.value.trim().slice(0, 128);
+    communitySearchTags = readCommunityFilterText(communityTags.value);
+    for (const chip of communityFilterPanel.querySelectorAll('.chat-voice-filter-chip[aria-pressed="true"]')) {
+      const tag = chip.dataset.tag ?? "";
+      if (tag && !communitySearchTags.some((existing) => existing.toLowerCase() === tag.toLowerCase())) communitySearchTags.push(tag);
+    }
+    communitySearchLanguage = communityLanguage.value ? [communityLanguage.value] : [];
+    communitySortBy = communitySort.value === "task_count" || communitySort.value === "created_at" ? communitySort.value : "score";
+    void runCommunitySearch(1);
+  });
+  communitySearch.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      communitySearchButton.click();
+    }
+  });
+  communityPrev.addEventListener("click", () => void runCommunitySearch(Math.max(1, communityPage - 1)));
+  communityNext.addEventListener("click", () => void runCommunitySearch(communityPage + 1));
+  communityKeySave.addEventListener("click", () => {
+    const key = communityKeyInput.value.trim().slice(0, 512);
+    if (!key) {
+      setStatus("Enter your Fish Audio API key first.", "error");
+      return;
+    }
+    communityKeySave.disabled = true;
+    updateVoiceSettings((current) => ({ ...current, chatVoiceFishApiKey: key })).then(() => {
+      fishApiKey = key;
+      communityKeyInput.value = "";
+      setStatus("Fish Audio API key saved globally.", "saved");
+      updateVoicesTabs();
+      maybeAutoSeedSnapshot();
+    }).catch((error) => setStatus(error instanceof Error ? error.message : "Could not save the Fish Audio API key.", "error")).finally(() => {
+      communityKeySave.disabled = false;
+    });
+  });
+  fishKeySave.addEventListener("click", () => {
+    const key = fishKeyInput.value.trim().slice(0, 512);
+    if (!key) {
+      setStatus("Enter your Fish Audio API key first.", "error");
+      return;
+    }
+    fishKeySave.disabled = true;
+    updateVoiceSettings((current) => ({ ...current, chatVoiceFishApiKey: key })).then(() => {
+      fishApiKey = key;
+      fishKeyInput.value = "";
+      setStatus("Fish Audio API key saved globally.", "saved");
+      updateVoicesTabs();
+      maybeAutoSeedSnapshot();
+    }).catch((error) => setStatus(error instanceof Error ? error.message : "Could not save the Fish Audio API key.", "error")).finally(() => {
+      fishKeySave.disabled = !communityIsAvailable();
+    });
+  });
+  fishKeyRemove.addEventListener("click", () => {
+    fishKeyRemove.disabled = true;
+    updateVoiceSettings((current) => ({ ...current, chatVoiceFishApiKey: "" })).then(() => {
+      fishApiKey = "";
+      setStatus("Fish Audio API key removed.", "saved");
+      updateVoicesTabs();
+    }).catch((error) => setStatus(error instanceof Error ? error.message : "Could not remove the Fish Audio API key.", "error")).finally(() => {
+      fishKeyRemove.disabled = false;
+    });
+  });
+  autoVoicePoolSelect.addEventListener("change", () => {
+    autoVoiceCastingPool = autoVoicePoolSelect.value === "community" ? "community" : "favorite";
+    scheduleAdvancedSettingsSave();
+    if (autoVoiceCastingPool === "community") maybeAutoSeedSnapshot();
+  });
+  snapshotLanguageSelect.addEventListener("change", () => {
+    communityVoiceLanguage = snapshotLanguageSelect.value;
+    void updateVoiceSettings((current) => ({ ...current, chatVoiceCommunityVoiceLanguage: communityVoiceLanguage })).then(() => {
+      setStatus("Community snapshot language saved.", "saved");
+      if (fishApiKey) void refreshCommunitySnapshot();
+    }).catch((error) => setStatus(error instanceof Error ? error.message : "Could not save the snapshot language.", "error"));
+  });
+  autoVoicePoolRefresh.addEventListener("click", () => void refreshCommunitySnapshot());
+  function communityIsAvailable() {
+    return ttsTagStyle === "fish";
+  }
+  function updateVoicesTabs() {
+    const fish = communityIsAvailable();
+    voicesTabStrip.hidden = !fish;
+    favoritesTitle.textContent = fish ? "Voice library" : "Favorite voices";
+    if (!fish) {
+      if (voicesTab === "community") voicesTab = "favorite";
+      favoritesSection.hidden = false;
+      communitySection.hidden = true;
+    } else {
+      favoritesSection.hidden = voicesTab !== "favorite";
+      communitySection.hidden = voicesTab !== "community";
+    }
+    communityTabButton.setAttribute("aria-selected", String(voicesTab === "community"));
+    favoriteTabButton.setAttribute("aria-selected", String(voicesTab === "favorite"));
+    communityKeyRow.hidden = !fish || !!fishApiKey;
+    updatePoolControls();
+    if (fish) {
+      maybeAutoSeedSnapshot();
+      renderCommunityBrowse();
+    }
+  }
+  function updatePoolControls() {
+    const fish = communityIsAvailable();
+    autoVoicePoolField.field.hidden = !fish;
+    snapshotLanguageRow.hidden = !fish;
+    autoVoicePoolActions.hidden = !fish;
+    fishKeyRow.hidden = !fish;
+    autoVoicePoolSelect.disabled = !autoCastingToggle.checked || !fish;
+    snapshotLanguageSelect.disabled = !fish || !fishApiKey;
+    autoVoicePoolRefresh.disabled = !fish || !fishApiKey || communityLoading;
+    updateFishKeyStatus();
+    refreshPoolStatus();
+  }
+  function updateFishKeyStatus() {
+    fishKeyStatus.textContent = fishApiKey ? `Stored key ending in \u2022\u2022\u2022\u2022${fishApiKey.slice(-4)}` : "No Fish API key stored";
+    fishKeyRemove.hidden = !fishApiKey;
+    fishKeySave.disabled = !communityIsAvailable();
+    fishKeyInput.disabled = !communityIsAvailable();
+  }
+  function communitySnapshotStale() {
+    if (!communityVoices.length) return true;
+    if (!communityVoicesAt) return true;
+    const at = Date.parse(communityVoicesAt);
+    return !Number.isFinite(at) || Date.now() - at > 24 * 60 * 60 * 1e3;
+  }
+  function refreshPoolStatus() {
+    if (!communityVoices.length) {
+      communityPoolStatus.textContent = "Pool snapshot is empty. Refresh it, or browse the Community tab to import voices into favorites.";
+      return;
+    }
+    const at = communityVoicesAt ? new Date(communityVoicesAt).toLocaleString() : "unknown time";
+    communityPoolStatus.textContent = `Pool snapshot: ${communityVoices.length} voices refreshed at ${at}.`;
+  }
+  function poolVoicesForAutoCast() {
+    if (autoVoiceCastingPool === "community" && communityIsAvailable()) {
+      if (communityVoices.length) return communityVoices;
+      if (speakerAssignmentDebug) appendSpeakerDebugLog("Voice pool: community pool is empty or snapshot unavailable; favorites are used instead.");
+    }
+    return favoriteVoices;
+  }
+  async function refreshCommunitySnapshot() {
+    if (!fishApiKey) {
+      communityPoolStatus.textContent = "Add or replace your Fish Audio API key in Advanced settings to refresh the pool.";
+      setStatus("Add your Fish Audio API key before refreshing the community voice pool.", "error");
+      return;
+    }
+    if (communityLoading) return;
+    communityLoading = true;
+    autoVoicePoolRefresh.disabled = true;
+    communityPoolStatus.textContent = "Refreshing snapshot\u2026";
+    setStatus("Refreshing the community voice pool snapshot\u2026");
+    try {
+      const { items, voices, refreshedAt } = await requestCommunitySnapshotRefresh();
+      if (!voices.length) throw new Error("Fish Audio returned no community voices.");
+      communityVoices = voices;
+      communityBestItems = items;
+      communityVoicesAt = refreshedAt;
+      await updateVoiceSettings((current) => ({
+        ...current,
+        chatVoiceCommunityVoicePool: voices,
+        chatVoiceCommunityVoicePoolAt: refreshedAt
+      }));
+      setStatus("Community voice pool refreshed.", "saved");
+      if (communityBest) showSnapshotListing();
+    } catch (error) {
+      communityPoolStatus.textContent = error instanceof Error ? error.message : "Community pool refresh failed.";
+      setStatus(error instanceof Error ? error.message : "Community pool refresh failed.", "error");
+    } finally {
+      communityLoading = false;
+      updatePoolControls();
+    }
+  }
+  function showSnapshotListing() {
+    communityBest = communityBestItems.length > 0;
+    if (!communityBest) return;
+    communityPage = 1;
+    communityItems = communityBestItems;
+    communityTotal = communityBestItems.length;
+    communityHasMore = false;
+    renderCommunityBrowse();
+  }
+  async function showCommunityBest() {
+    if (!communityIsAvailable()) return;
+    if (!fishApiKey) {
+      communityError.textContent = "Add your Fish Audio API key first to load the community snapshot.";
+      communityError.hidden = false;
+      return;
+    }
+    if (communityBestItems.length && !communitySnapshotStale()) {
+      communityBest = true;
+      showSnapshotListing();
+      return;
+    }
+    communityBest = true;
+    renderCommunityBrowse();
+    await refreshCommunitySnapshot();
+    showSnapshotListing();
+  }
+  function maybeAutoSeedSnapshot() {
+    if (communityAutoSeeded || communityLoading || !fishApiKey) return;
+    if (!communitySnapshotStale()) {
+      communityAutoSeeded = true;
+      return;
+    }
+    communityAutoSeeded = true;
+    void refreshCommunitySnapshot();
+  }
+  function renderCommunityBrowse() {
+    communityList.replaceChildren();
+    const empty = (text) => {
+      const line = document.createElement("div");
+      line.className = "chat-voice-hint";
+      line.textContent = text;
+      communityList.appendChild(line);
+    };
+    if (communityLoading) {
+      empty("Searching Fish community voices\u2026");
+    } else if (!fishApiKey) {
+      empty("Add your Fish Audio API key above to browse community voices. It is stored only in your global voice settings.");
+    } else if (!communityItems.length) {
+      empty(communityBest ? "The community snapshot is empty. Refresh it, or search instead." : "No community voices match this search.");
+    } else {
+      for (const voice of communityItems) {
+        const row = document.createElement("div");
+        row.className = "chat-voice-community-row";
+        const copy = document.createElement("span");
+        copy.className = "chat-voice-community-copy";
+        copy.textContent = voice.title || voice.id;
+        copy.title = voice.id;
+        if (voice.author) {
+          const author = document.createElement("small");
+          author.textContent = `by ${voice.author}`;
+          copy.appendChild(author);
+        }
+        if (voice.description) {
+          const description = document.createElement("small");
+          description.textContent = voice.description;
+          copy.appendChild(description);
+        }
+        const stats = document.createElement("span");
+        stats.className = "chat-voice-community-stats";
+        stats.textContent = `${voice.likeCount.toLocaleString()} likes \xB7 ${voice.taskCount.toLocaleString()} plays${voice.licensedNote ? " \xB7 " + voice.licensedNote : ""}${voice.tags.length ? ` \xB7 ${voice.tags.join(", ")}` : ""}`;
+        const preview = createCastPreviewButton(() => voice.title || voice.id, () => voice.id);
+        const alreadyFavorited = favoriteVoices.some((item) => item.id === voice.id);
+        const importButton = document.createElement("button");
+        importButton.type = "button";
+        importButton.className = "chat-voice-add-button";
+        importButton.textContent = alreadyFavorited ? "Favorited" : "Import";
+        importButton.disabled = alreadyFavorited;
+        importButton.addEventListener("click", () => importCommunityVoice(voice));
+        row.append(copy, stats, preview, importButton);
+        communityList.appendChild(row);
+      }
+    }
+    communityPageLabel.textContent = communityBest && communityItems.length ? `Community Best \xB7 ${communityItems.length} voices` : communityItems.length ? `Page ${communityPage}${communityTotal > 0 ? ` of ${Math.max(1, Math.ceil(communityTotal / 20))}` : ""}` : "";
+    communityPrev.disabled = communityBest || communityPage <= 1 || communityLoading || !fishApiKey;
+    communityNext.disabled = communityBest || !communityHasMore || communityLoading || !fishApiKey;
+    communitySearchButton.disabled = communityLoading || !fishApiKey;
+  }
+  async function runCommunitySearch(page) {
+    if (!fishApiKey) return;
+    communityPage = page;
+    communityLoading = true;
+    communityError.hidden = true;
+    renderCommunityBrowse();
+    try {
+      const { items, total, hasMore } = await requestCommunitySearch({
+        title: communitySearchTitle,
+        tags: communitySearchTags,
+        language: communitySearchLanguage,
+        sortBy: communitySortBy,
+        pageNumber: page,
+        pageSize: 20
+      });
+      communityItems = items;
+      communityTotal = total;
+      communityHasMore = hasMore;
+    } catch (error) {
+      communityItems = [];
+      communityError.textContent = error instanceof Error ? error.message : "Community voice search failed.";
+      communityError.hidden = false;
+    } finally {
+      communityLoading = false;
+      renderCommunityBrowse();
+    }
+  }
+  function importCommunityVoice(voice) {
+    try {
+      const favorite = communityVoiceToFavorite(voice);
+      const next = upsertCommunityFavorite(favoriteVoices, voice);
+      favoriteError.hidden = true;
+      void saveFavoriteVoices(next).then((saved) => {
+        if (saved) renderCommunityBrowse();
+      }).catch(() => void 0);
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : "That community voice could not be imported.", "error");
+    }
+  }
   function removeExpiredGhostCards() {
     if (!activeChat) return;
     const ids = activeChat.assistantMessageIds ?? [];
@@ -5758,6 +7024,14 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
         refreshLocalState();
         autoVoiceCasting = preferences.autoVoiceCasting;
         autoCastingToggle.checked = autoVoiceCasting;
+        autoVoiceCastingPool = preferences.autoVoiceCastingPool;
+        autoVoicePoolSelect.value = autoVoiceCastingPool;
+        fishApiKey = preferences.fishApiKey;
+        communityVoiceLanguage = preferences.communityVoiceLanguage;
+        snapshotLanguageSelect.value = communityVoiceLanguage === "en" || communityVoiceLanguage === "es" || communityVoiceLanguage === "ar" || communityVoiceLanguage === "ru" || communityVoiceLanguage === "ja" || communityVoiceLanguage === "pt" || communityVoiceLanguage === "zh" || communityVoiceLanguage === "fr" || communityVoiceLanguage === "it" ? communityVoiceLanguage : "";
+        communityVoices = preferences.communityVoicePool;
+        communityVoicesAt = preferences.communityVoicePoolAt;
+        refreshPoolStatus();
         if (autoPlayback !== preferences.autoPlayback) {
           autoPlaybackEpoch += 1;
           autoPlaybackRequests.cancelAll();
@@ -5916,7 +7190,8 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
         autoPlayback,
         autoPlaybackDelaySeconds,
         speakerLookback,
-        skipNarration
+        skipNarration,
+        autoVoiceCastingPool
       );
       setStatus("Advanced playback settings saved globally.", "saved");
     } catch (error) {
@@ -6106,6 +7381,24 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
   hostWindow.requestAnimationFrame(updatePlaybackButtons);
   const unsubscribeBackend = ctx.onBackendMessage((rawPayload) => {
     const payload = rawPayload;
+    if (payload.type === "chat_voice_community_results") {
+      const pending = pendingCommunityRequests.get(payload.requestId);
+      if (!pending) return;
+      clearTimeout(pending.timer);
+      pendingCommunityRequests.delete(payload.requestId);
+      if (payload.error) pending.reject(new Error(payload.error));
+      else pending.resolve({ items: payload.items, total: payload.total, hasMore: payload.hasMore });
+      return;
+    }
+    if (payload.type === "chat_voice_community_snapshot_result") {
+      const pending = pendingCommunityRequests.get(payload.requestId);
+      if (!pending) return;
+      clearTimeout(pending.timer);
+      pendingCommunityRequests.delete(payload.requestId);
+      if (payload.error) pending.reject(new Error(payload.error));
+      else pending.resolve({ items: payload.items, voices: readCommunityVoicePool(payload.voices), refreshedAt: payload.refreshedAt });
+      return;
+    }
     if (payload.type === "chat_voice_auto_cast_result") {
       const pending = pendingAutoCast.get(payload.requestId);
       if (pending) {
@@ -6237,6 +7530,11 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
         pending.reject(new Error("The active chat changed before uncast voice matching completed."));
       }
       pendingUncastRequests.clear();
+      for (const pending of pendingCommunityRequests.values()) {
+        clearTimeout(pending.timer);
+        pending.reject(new Error("The active chat changed before the community voice request completed."));
+      }
+      pendingCommunityRequests.clear();
       for (const pending of pendingDecisionStatusRequests.values()) {
         clearTimeout(pending.timer);
         pending.reject(new Error("The active chat changed before the Decision connection check completed."));
@@ -6433,6 +7731,11 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
       pending.reject(new Error("Chat Voice was closed."));
     }
     pendingUncastRequests.clear();
+    for (const pending of pendingCommunityRequests.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(new Error("Chat Voice was closed."));
+    }
+    pendingCommunityRequests.clear();
     for (const pending of pendingAutoCast.values()) {
       clearTimeout(pending.timer);
       pending.resolve({ assignments: {}, diagnostics: [] });
@@ -6492,7 +7795,8 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
         autoPlayback,
         autoPlaybackDelaySeconds,
         speakerLookback,
-        skipNarration
+        skipNarration,
+        autoVoiceCastingPool
       );
     }
     skippedTrackerTagsInput.destroy();

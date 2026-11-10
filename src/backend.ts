@@ -55,7 +55,6 @@ import {
   extractGenerationText,
   formatTtsTag,
   hashMessageContent,
-  readMessageSwipeContent,
   ghostCastAliases,
   mergeGhostAliases,
   updateGhostConversationHistory,
@@ -76,6 +75,10 @@ import {
   readConfig,
   readFavoriteVoices,
   readGhostVoices,
+  readCommunityVoiceList,
+  communityPayloadShape,
+  communityVoiceToFavorite,
+  voiceDecisionSummary,
   selectAutomaticVoice,
   resolveSpeakerDecisionSegments,
   resolveTtsTagAnswers,
@@ -103,9 +106,11 @@ import {
   type TtsTagStyle,
   type TtsTagOption,
   type FavoriteVoice,
+  type CommunityVoice,
   type UncastVoiceGroup,
   type GhostVoice,
 } from './core'
+import { generateUuidV7 } from './uuid'
 
 declare const spindle: import('lumiverse-spindle-types').SpindleAPI
 
@@ -144,10 +149,22 @@ type FrontendMessage =
   | { type: 'chat_voice_refresh'; chatId?: string | null; requestId?: string; ghostLifetime?: number }
   | { type: 'chat_voice_decision_status'; requestId?: string }
   | { type: 'chat_voice_list_llm_connections'; requestId: string }
+  | {
+      type: 'chat_voice_search_community'
+      requestId: string
+      fishApiKey: string
+      title?: string
+      tags?: string[]
+      language?: string[]
+      sortBy?: string
+      pageNumber?: number
+      pageSize?: number
+    }
+  | { type: 'chat_voice_refresh_community_snapshot'; requestId: string; fishApiKey: string; language?: string }
   | { type: 'chat_voice_scan'; chatId: string; messageLimit: number; tagLlmConnectionId?: string }
   | { type: 'chat_voice_auto_cast'; requestId: string; chatId: string; voices: FavoriteVoice[]; reserved: string[]; narratorMissing: boolean; userMissing: boolean; ghostLifetime: number }
   | { type: 'chat_voice_ghost_edit'; chatId: string; ghostId: string; voice?: string; promote?: boolean; remove?: boolean }
-  | { type: 'chat_voice_get_message'; chatId: string; messageId: string; requestId: string; targetSwipeId?: number }
+  | { type: 'chat_voice_get_message'; chatId: string; messageId: string; requestId: string }
   | { type: 'chat_voice_match_uncast'; requestId: string; chatId: string; messageId: string; message: string; sourceHash: string; groups: UncastVoiceGroup[]; voices: FavoriteVoice[]; reserved: string[]; lifetime: number; speakerLookback?: number; skippedTrackerTags?: string }
   | {
       type: 'chat_voice_parse_message'
@@ -917,6 +934,18 @@ async function scanCardCast(
   }
 }
 
+/** Use Spindle's backend UUID helper when available; older hosts fall back
+ * to a local RFC 9562-compatible v7 without touching browser crypto APIs. */
+async function createGhostVoiceId(): Promise<string> {
+  try {
+    const id = await spindle.uuid?.v7?.()
+    if (id) return id
+  } catch (error) {
+    spindle.log.warn(`Spindle UUID helper failed; using local fallback: ${error instanceof Error ? error.message : String(error)}`)
+  }
+  return generateUuidV7()
+}
+
 const saveQueues = new Map<string, Promise<void>>()
 
 async function saveGhostVoiceAssignments(
@@ -949,7 +978,7 @@ async function saveGhostVoiceAssignments(
         const existing = pendingIds.get(ghostId)
         if (existing) ghostId = existing
         else {
-          const newId = `ghost-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
+          const newId = `ghost-${await createGhostVoiceId()}`
           pendingIds.set(ghostId, newId)
           ghostId = newId
         }
@@ -1748,6 +1777,79 @@ function queueScan(
   return nextTask
 }
 
+const FISH_AUDIO_MODEL_URL = 'https://api.fish.audio/model'
+const FISH_COMMUNITY_REQUEST_TIMEOUT_MS = 30_000
+
+interface CommunityModelRequest {
+  title?: string
+  tags?: string[]
+  language?: string[]
+  sortBy?: string
+  pageNumber?: number
+  pageSize?: number
+}
+
+/** Query the public Fish voice library with the user's own API key. */
+async function fetchCommunityModels(fishApiKey: string, request: CommunityModelRequest) {
+  const key = (fishApiKey ?? '').trim()
+  if (!key) throw new Error('Add your Fish Audio API key in the Community tab first.')
+  const params = new URLSearchParams()
+  const title = (request.title ?? '').trim()
+  if (title) params.set('title', title.slice(0, 128))
+  for (const tag of (request.tags ?? []).map(value => value.trim()).filter(Boolean).slice(0, 8)) params.append('tag', tag.slice(0, 64))
+  for (const language of (request.language ?? []).map(value => value.trim()).filter(Boolean).slice(0, 4)) params.append('language', language.slice(0, 32))
+  const sortBy = ['score', 'task_count', 'created_at'].includes(request.sortBy ?? '')
+    ? request.sortBy!
+    : 'score'
+  params.set('sort_by', sortBy)
+  params.set('page_number', String(Math.max(1, Math.round(request.pageNumber ?? 1))))
+  params.set('page_size', String(Math.min(100, Math.max(1, Math.round(request.pageSize ?? 20)))))
+  params.set('self', 'false')
+  const url = `${FISH_AUDIO_MODEL_URL}?${params.toString()}`
+  let response: unknown
+  try {
+    response = await Promise.race([
+      spindle.cors(url, { method: 'GET', headers: { Authorization: `Bearer ${key}` } }),
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error('Fish Audio catalog request timed out.')), FISH_COMMUNITY_REQUEST_TIMEOUT_MS)),
+    ])
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error ?? '')
+    throw new Error(message || 'The Fish Audio catalog could not be reached.')
+  }
+  // The proxy resolves with a response envelope ({ status, body }) for HTTP
+  // responses; the raw Fish JSON lives in its body as text or parsed JSON.
+  let payload: unknown = response
+  let httpStatus: number | null = null
+  if (response && typeof response === 'object' && !Array.isArray(response)) {
+    const envelope = response as Record<string, unknown>
+    if (typeof envelope.status === 'number') {
+      httpStatus = envelope.status
+      payload = 'body' in envelope ? envelope.body : response
+    }
+  }
+  if (typeof payload === 'string') {
+    try { payload = JSON.parse(payload) } catch { /* keep the raw text for the shape diagnostic */ }
+  }
+  if (httpStatus !== null && httpStatus >= 400) {
+    const reason = typeof payload === 'object' && payload !== null
+      && typeof (payload as Record<string, unknown>).message === 'string'
+      ? (payload as Record<string, unknown>).message as string
+      : typeof payload === 'string' ? payload : ''
+    if (httpStatus === 401 || httpStatus === 403) throw new Error(`Fish Audio rejected the API key (${httpStatus}). Check the key in the Community tab.${reason ? ` Details: ${reason.slice(0, 160)}` : ''}`)
+    if (httpStatus === 429) throw new Error('Fish Audio rate limited the catalog request. Wait a moment and retry.')
+    throw new Error(`Fish Audio catalog request failed (${httpStatus}).${reason ? ` Details: ${reason.slice(0, 160)}` : ''}`)
+  }
+  const parsed = readCommunityVoiceList(payload)
+  if (!parsed) {
+    const shape = communityPayloadShape(payload)
+    const message = typeof payload === 'object' && payload !== null && typeof (payload as Record<string, unknown>).message === 'string'
+      ? (payload as Record<string, unknown>).message as string
+      : ''
+    throw new Error(`Fish Audio returned an unexpected catalog response [${shape}].${message ? ` Details: ${message.slice(0, 160)}` : ''}`)
+  }
+  return parsed
+}
+
 spindle.onFrontendMessage(async (rawPayload: unknown, userId, frontendSessionId) => {
   const payload = rawPayload as FrontendMessage
   try {
@@ -1801,6 +1903,60 @@ spindle.onFrontendMessage(async (rawPayload: unknown, userId, frontendSessionId)
           error: error instanceof Error ? error.message : 'Could not load LLM connections.',
         }, userId, frontendSessionId)
       }
+    } else if (payload?.type === 'chat_voice_search_community') {
+      try {
+        const parsed = await fetchCommunityModels(payload.fishApiKey, {
+          title: payload.title,
+          tags: payload.tags,
+          language: payload.language,
+          sortBy: payload.sortBy,
+          pageNumber: payload.pageNumber,
+          pageSize: payload.pageSize,
+        })
+        sendFrontend({
+          type: 'chat_voice_community_results',
+          requestId: payload.requestId,
+          items: parsed.items,
+          total: parsed.total,
+          hasMore: parsed.hasMore,
+          error: '',
+        }, userId, frontendSessionId)
+      } catch (error) {
+        sendFrontend({
+          type: 'chat_voice_community_results',
+          requestId: payload.requestId,
+          items: [],
+          total: 0,
+          hasMore: false,
+          error: error instanceof Error ? error.message : 'The Fish Audio catalog could not be reached.',
+        }, userId, frontendSessionId)
+      }
+    } else if (payload?.type === 'chat_voice_refresh_community_snapshot') {
+      try {
+        // The pool is only drawn from the single language chosen in
+        // Advanced settings, so every refresh button re-fetches the same
+        // top-ranked page the pool serves for that language.
+        const parsed = await fetchCommunityModels(payload.fishApiKey, {
+          sortBy: 'score', pageNumber: 1, pageSize: 100,
+          language: (payload.language ?? '').trim() ? [(payload.language ?? '').trim().slice(0, 32)] : [],
+        })
+        sendFrontend({
+          type: 'chat_voice_community_snapshot_result',
+          requestId: payload.requestId,
+          items: parsed.items,
+          voices: parsed.items.map(communityVoiceToFavorite),
+          refreshedAt: new Date().toISOString(),
+          error: '',
+        }, userId, frontendSessionId)
+      } catch (error) {
+        sendFrontend({
+          type: 'chat_voice_community_snapshot_result',
+          requestId: payload.requestId,
+          voices: [],
+          refreshedAt: '',
+          error: error instanceof Error ? error.message : 'The Fish Audio catalog could not be reached.',
+        }, userId, frontendSessionId)
+      }
     } else if (payload?.type === 'chat_voice_match_uncast') {
       try {
         const groups = payload.groups.slice(0, 64).map(group => ({
@@ -1810,6 +1966,8 @@ spindle.onFrontendMessage(async (rawPayload: unknown, userId, frontendSessionId)
           context: (group.context ?? []).slice(0, 20).map(context => context.slice(0, 2_000)),
           ...(group.addressee ? { addressee: group.addressee } : {}),
           ...(group.flankPartners ? { flankPartners: group.flankPartners.slice(0, 20) } : {}),
+          ...(group.pronounPartners ? { pronounPartners: group.pronounPartners.slice(0, 20) } : {}),
+          ...(group.pronounGender ? { pronounGender: group.pronounGender } : {}),
           ...(group.narratedName ? { narratedName: group.narratedName } : {}),
           ...(group.inferredName ? { inferredName: group.inferredName } : {}),
         }))
@@ -1845,14 +2003,36 @@ spindle.onFrontendMessage(async (rawPayload: unknown, userId, frontendSessionId)
           const plan = buildUncastVoiceDecision(groups, voices, payload.message.slice(0, 30_000), ghosts, matchingContext.previousMessages)
           const answers: Record<string, SpeakerDecisionChoice> = {}
           let decisionError = ''
-          try {
-            const result = await spindle.decisions.evaluate({ state: plan.state, questions: plan.questions, ...(userId ? { userId } : {}) })
-            for (const [id, answer] of Object.entries(result.answers)) {
-              if (answer.type === 'choice') answers[id] = { choice: answer.choice, probabilities: answer.probabilities, confidence: answer.confidence }
+          const captureAnswers = (result: { answers: Record<string, unknown> }): void => {
+            for (const [id, raw] of Object.entries(result.answers)) {
+              const answer = raw as { type?: string; choice?: string; probabilities?: Record<string, number>; confidence?: number }
+              if (answer.type === 'choice' && typeof answer.choice === 'string' && answer.probabilities && typeof answer.confidence === 'number') answers[id] = { choice: answer.choice, probabilities: answer.probabilities, confidence: answer.confidence }
             }
+          }
+          // Split the evaluation: identity and same-speaker questions are
+          // small but critical (they decide whether fragments share a
+          // voice), while voice-ranking questions carry the bulky voice
+          // list. Evaluating them separately keeps a failure of the
+          // ranking call from fragmenting unnamed characters into
+          // multiple voices.
+          const isVoiceQuestion = (id: string): boolean => id.startsWith('voice_')
+          const identityQuestions = Object.fromEntries(Object.entries(plan.questions).filter(([id]) => !isVoiceQuestion(id)))
+          const voiceQuestions = Object.fromEntries(Object.entries(plan.questions).filter(([id]) => isVoiceQuestion(id)))
+          try {
+            const result = await spindle.decisions.evaluate({ state: plan.state, questions: identityQuestions, ...(userId ? { userId } : {}) })
+            captureAnswers(result)
           } catch (error) {
             decisionError = error instanceof Error ? error.message : String(error)
-            spindle.log.warn(`[Chat Voice] Uncast voice decision failed; using exact ghost matches only: ${decisionError}`)
+            spindle.log.warn(`[Chat Voice] Uncast identity decision failed; using exact ghost matches only: ${decisionError}`)
+          }
+          if (Object.keys(voiceQuestions).length) {
+            try {
+              const result = await spindle.decisions.evaluate({ state: plan.state, questions: voiceQuestions, ...(userId ? { userId } : {}) })
+              captureAnswers(result)
+            } catch (error) {
+              if (!decisionError) decisionError = error instanceof Error ? error.message : String(error)
+              spindle.log.warn(`[Chat Voice] Uncast voice ranking failed: ${decisionError}`)
+            }
           }
           const review = buildUncastIdentityReview(groups, answers, payload.message.slice(0, 30_000), ghosts, payload.messageId, matchingContext.previousMessages)
           let reviewError = ''
@@ -1874,13 +2054,14 @@ spindle.onFrontendMessage(async (rawPayload: unknown, userId, frontendSessionId)
           }
           const diagnostics = groups.map(group => {
             const identity = answers[`identity_${group.id}`]
+            const gender = answers[`gender_${group.id}`]
             const label = answers[`label_${group.id}`]
             const voice = answers[`voice_${group.id}`]
             const comparisons = Object.entries(answers).filter(([key]) => key.startsWith(`same_${group.id}_`) || key.startsWith(`review_same_${group.id}_`) || key.startsWith(`review_ghost_${group.id}_`) || key.startsWith(`review_occurrence_${group.id}_`) || key.startsWith(`review_occurrence_disposition_${group.id}_`) || key.startsWith(`review_reveal_${group.id}_`) || key.startsWith(`review_scene_${group.id}_`) || key.startsWith(`review_continuity_${group.id}_`)).map(([key, answer]) => `${key}=${answer.choice} confidence=${answer.confidence} probabilities=${JSON.stringify(answer.probabilities)}`).join(';') || 'none'
             const narrativeName = answers[`narrative_name_${group.id}`]
             const assignment = assignments.find(item => item.groupId === group.id)
             const proposed = proposedAssignments.find(item => item.groupId === group.id)
-            return `${group.id} segments=${group.segmentIndexes.map(index => index + 1).join(',')} identity=${identity ? `${identity.choice} confidence=${identity.confidence} probabilities=${JSON.stringify(identity.probabilities)}` : 'none'} label=${label ? `${label.choice} confidence=${label.confidence} probabilities=${JSON.stringify(label.probabilities)}` : 'none'} narrative-name=${narrativeName ? `${narrativeName.choice} (${plan.state.narrativeNames[Number(narrativeName.choice.replace('name_', ''))] ?? 'none'}) confidence=${narrativeName.confidence} probabilities=${JSON.stringify(narrativeName.probabilities)}` : 'none'} comparisons=${comparisons} proposed=${proposed ? `${proposed.ghostId} / ${proposed.voiceId} / ${proposed.gender}` : 'none'} match-reason=${proposed?.matchReason ?? 'none'} voice-choice=${voice ? `${voice.choice} confidence=${voice.confidence} probabilities=${JSON.stringify(voice.probabilities)}` : 'none'} final=${assignment ? `${assignment.label || 'unnamed'} / ${assignment.ghostId} / ${assignment.voiceId}` : 'connection default'}`
+            return `${group.id} segments=${group.segmentIndexes.map(index => index + 1).join(',')} identity=${identity ? `${identity.choice} confidence=${identity.confidence} probabilities=${JSON.stringify(identity.probabilities)}` : 'none'} gender=${gender ? `${gender.choice} confidence=${gender.confidence} probabilities=${JSON.stringify(gender.probabilities)}` : 'none'} label=${label ? `${label.choice} confidence=${label.confidence} probabilities=${JSON.stringify(label.probabilities)}` : 'none'} narrative-name=${narrativeName ? `${narrativeName.choice} (${plan.state.narrativeNames[Number(narrativeName.choice.replace('name_', ''))] ?? 'none'}) confidence=${narrativeName.confidence} probabilities=${JSON.stringify(narrativeName.probabilities)}` : 'none'} comparisons=${comparisons} proposed=${proposed ? `${proposed.ghostId} / ${proposed.voiceId} / ${proposed.gender}` : 'none'} match-reason=${proposed?.matchReason ?? 'none'} voice-choice=${voice ? `${voice.choice} confidence=${voice.confidence} probabilities=${JSON.stringify(voice.probabilities)}` : 'none'} final=${assignment ? `${assignment.label || 'unnamed'} / ${assignment.ghostId} / ${assignment.voiceId}` : 'connection default'}`
           })
           diagnostics.unshift(`Available favorites=${voices.length}, historical ghosts=${ghosts.length}, current ghosts=${currentGhosts.length}; prior messages=${matchingContext.previousMessages.length}${decisionError ? `; Jev failed: ${decisionError}` : ''}; identity review questions=${Object.keys(review.questions).length}${reviewError ? `; review failed: ${reviewError}` : ''}.`)
           diagnostics.splice(1, 0, `Candidate context: ${ghosts.map((ghost, index) => `ghost_${index}=${ghost.id} last=${ghost.lastSeenMessageId || 'none'} history=${(ghost.conversationHistory ?? []).map(entry => `${entry.messageId}(${entry.text.length} chars)`).join(',') || 'none'} context=${ghost.context.length} chars`).join('; ') || 'none'}; prior=${matchingContext.previousMessages.map(item => `${item.role ?? 'unknown'}:${item.id}(${item.text.length} chars)`).join(',') || 'none'}.`)
@@ -1931,9 +2112,6 @@ spindle.onFrontendMessage(async (rawPayload: unknown, userId, frontendSessionId)
             content: message.content ?? '',
             swipe_id: message.swipe_id,
             swipe_dates: message.swipe_dates,
-            ...(Number.isInteger(payload.targetSwipeId) && (payload.targetSwipeId ?? -1) >= 0 ? {
-              targetSwipeContent: readMessageSwipeContent(message, payload.targetSwipeId!),
-            } : {}),
             extra: message.extra ?? {},
           } : null,
           ...(!message ? { error: 'The message is no longer available.' } : {}),
@@ -1966,8 +2144,8 @@ spindle.onFrontendMessage(async (rawPayload: unknown, userId, frontendSessionId)
       if (roles.length && voices.length) {
         const questions: Record<string, { type: 'choice'; instructions: string; criteria: Record<string, string> }> = Object.fromEntries(roles.map((role, index) => [`role_${index}`, {
           type: 'choice' as const,
-          instructions: `Choose the best available voice for ${role.description}. Compare voice descriptions and gender when established.`,
-          criteria: { ...Object.fromEntries(voices.map((voice, i) => [`voice_${i}`, `${voice.name || voice.id}; ${voice.category}; ${voice.description || 'No description provided'}`])), ...(voices.length === 1 ? { no_match: 'No voice is suitable.' } : {}) },
+          instructions: `Choose the best available voice for ${role.description}. Gender is a hard compatibility cue when established. For style, score voices by metadata cues rather than prose length: name is weak context, category and languages contribute one compatibility cue in aggregate, each explicit tag is one cue, and each tag listed in "description supports" is one cue. The description is evidence for those tags, not an extra vote, and support for an explicit tag counts once rather than twice. Balance tags against that description evidence instead of letting a long description outweigh otherwise better matches. Some voices list less metadata than others; missing fields are not a reason to rank a voice lower.`,
+          criteria: { ...Object.fromEntries(voices.map((voice, i) => [`voice_${i}`, voiceDecisionSummary(voice)])), ...(voices.length === 1 ? { no_match: 'No voice is suitable.' } : {}) },
         }]))
         roles.forEach((role, index) => {
           if (role.id !== 'narrator') questions[`gender_${index}`] = {
