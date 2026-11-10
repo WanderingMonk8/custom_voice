@@ -110,6 +110,7 @@ import {
   type UncastVoiceGroup,
   type GhostVoice,
 } from './core'
+import { generateUuidV7 } from './uuid'
 
 declare const spindle: import('lumiverse-spindle-types').SpindleAPI
 
@@ -933,6 +934,18 @@ async function scanCardCast(
   }
 }
 
+/** Use Spindle's backend UUID helper when available; older hosts fall back
+ * to a local RFC 9562-compatible v7 without touching browser crypto APIs. */
+async function createGhostVoiceId(): Promise<string> {
+  try {
+    const id = await spindle.uuid?.v7?.()
+    if (id) return id
+  } catch (error) {
+    spindle.log.warn(`Spindle UUID helper failed; using local fallback: ${error instanceof Error ? error.message : String(error)}`)
+  }
+  return generateUuidV7()
+}
+
 const saveQueues = new Map<string, Promise<void>>()
 
 async function saveGhostVoiceAssignments(
@@ -965,7 +978,7 @@ async function saveGhostVoiceAssignments(
         const existing = pendingIds.get(ghostId)
         if (existing) ghostId = existing
         else {
-          const newId = `ghost-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
+          const newId = `ghost-${await createGhostVoiceId()}`
           pendingIds.set(ghostId, newId)
           ghostId = newId
         }

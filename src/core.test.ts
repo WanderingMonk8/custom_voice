@@ -170,6 +170,14 @@ import {
   type ChatVoiceConfig,
   type SpeakerDecisionChoice,
 } from './core'
+import { generateUuidV7 } from './uuid'
+
+test('local UUID v7 fallback is RFC-shaped, unique, and does not use browser crypto', () => {
+  const first = generateUuidV7()
+  const second = generateUuidV7()
+  assert.match(first, /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u)
+  assert.notEqual(first, second)
+})
 
 test('combines decoded segments into one resampled PCM WAV', () => {
   const wav = encodeConcatenatedWav([
