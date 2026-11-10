@@ -90,6 +90,7 @@ import {
   uncastNarrativeNameCandidates,
   ghostCastAliases,
   updateGhostConversationHistory,
+  updateGhostInteractivityTrail,
   uncastIdentityLabels,
   mergeGhostAliases,
   readGhostVoices,
@@ -3539,29 +3540,38 @@ test('reviews a name introduced in narration for an otherwise uncast speaker', (
 
 test('retains conversation exchanges and relationship labels for later ghost identity review', () => {
   const ids = ['one', 'two', 'three', 'four']
-  const ghost = { id: 'mother', speakerId: UNCAST_SPEAKER_ID, voiceId: 'voice', context: '', occurrenceKeys: [], lastSeenMessageId: 'one', conversationHistory: [] as Array<{ messageId: string; text: string }> }
+  const ghost: Parameters<typeof updateGhostInteractivityTrail>[0] = { id: 'mother', speakerId: UNCAST_SPEAKER_ID, voiceId: 'voice', context: '', occurrenceKeys: [], lastSeenMessageId: 'one', conversationHistory: [] as Array<{ messageId: string; text: string }> }
   const first = `"Nine-fifteen, Tessa." Tessa holds the phone. "Mom, I heard you."`
   const second = `Tessa listens to the phone. "Mom, I said I'm coming." "I'm on Maple, Tessa."`
   const third = `Marisol arrives. Her daughter Tessa sees her. "Seven minutes."`
   updateGhostConversationHistory(ghost, 'one', first, ids)
   updateGhostConversationHistory(ghost, 'two', second, ids)
-  assert.deepEqual(ghost.conversationHistory.map(item => item.messageId), ['one', 'two'])
-  assert.match(ghost.conversationHistory[0].text, /Mom, I heard you/u)
+  updateGhostInteractivityTrail(ghost, 'one', 'They discuss the phone conversation about Maple and Tessa coming later.', ids)
+  updateGhostInteractivityTrail(ghost, 'two', 'The same phone conversation continues with Maple, Tessa and coming over.', ids)
+  updateGhostInteractivityTrail(ghost, 'three', 'The activity shifts from the phone call to walking toward the visit.', ids)
+  assert.deepEqual(ghost.interactivityTrail?.map(item => item.messageId), ['one', 'two', 'three'])
+  assert.ok(ghost.interactivityTrail?.every(item => item.anchors.length > 0))
+  assert.deepEqual(ghost.conversationHistory!.map(item => item.messageId), ['one', 'two'])
+  assert.match(ghost.conversationHistory![0].text, /Mom, I heard you/u)
   const labels = uncastIdentityLabels(first, [])
   assert.ok(labels.includes("tessa's mom"))
   const groups = collectUncastVoiceGroups([{ speakerId: 'unconfigured:marisol', text: 'Seven minutes.' }])
   const plan = buildUncastVoiceDecision(groups, [], third, [ghost])
   assert.match(plan.questions.identity_g0.instructions, /person they address/u)
-  assert.equal(plan.state.ghosts[0].conversationHistory[1].text, second)
+  assert.equal(plan.state.ghosts[0].conversationHistory![1].text, second)
   const assignment = resolveUncastVoiceDecisions(groups, [], { identity_g0: confidentDecision('ghost_0') }, [ghost], [], 'three', third, ids.slice(0, 2))
   assert.equal(assignment[0]?.voiceId, 'voice')
   assert.deepEqual(assignment[0]?.aliases, ['marisol'])
   updateGhostConversationHistory(ghost, 'three', third, ids)
   updateGhostConversationHistory(ghost, 'four', 'A later conversation.', ids)
   updateGhostConversationHistory(ghost, 'one', first, ids)
-  assert.deepEqual(ghost.conversationHistory.map(item => item.messageId), ['two', 'three', 'four'])
+  updateGhostInteractivityTrail(ghost, 'four', 'A later conversation about a visit and a train.', ids)
+  updateGhostInteractivityTrail(ghost, 'one', 'They discuss the phone conversation about Maple and Tessa coming later.', ids)
+  assert.deepEqual(ghost.conversationHistory!.map(item => item.messageId), ['two', 'three', 'four'])
+  assert.deepEqual(ghost.interactivityTrail?.map(item => item.messageId), ['one', 'two', 'three', 'four'])
   const reloaded = readGhostVoices([ghost])[0]
   assert.equal(reloaded.conversationHistory?.length, 3)
+  assert.equal(reloaded.interactivityTrail?.length, 4)
 })
 
 test('relationship review preserves caller identity, excludes future context, and routes to the existing ghost', () => {
@@ -3574,6 +3584,8 @@ test('relationship review preserves caller identity, excludes future context, an
   const context = relationshipReviewContext(messages, 'current', [ghost], 'tracker')
   assert.doesNotMatch(JSON.stringify(context), /secret prior|Marisol/u)
   assert.match(context.ghosts[0].conversationHistory[0].text, /Mom, are you there/u)
+  assert.deepEqual(context.previousMessages.map(item => item.role), ['assistant'])
+  assert.ok(context.previousMessages.every(item => item.anchors?.length))
   const speakers = [{ id: 'npc:tessa', name: 'Tessa' }, { id: USER_SPEAKER_ID, name: 'Ken' }]
   const plan = buildSpeakerDecisionPlan(messages[1].content, speakers, false)
   const answers = { speech_s0: confidentDecision('known_0'), speech_s1: confidentDecision('uncast_character') }

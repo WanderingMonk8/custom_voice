@@ -359,7 +359,8 @@ export function addFavoriteVoice(existing: FavoriteVoice[], voice: FavoriteVoice
 
 export interface UncastVoiceGroup { id: string; speakerId: string; segmentIndexes: number[]; speeches: string[]; context: string[]; addressee?: string; flankPartners?: string[]; pronounPartners?: string[]; pronounGender?: 'male' | 'female'; narratedName?: string; inferredName?: string }
 export interface GhostOccurrenceEvidence { messageId: string; messageHash: string; speechHash: string; version: 'occurrence-1'; reason: string }
-export interface GhostVoice { id: string; speakerId: string; voiceId: string; context: string; occurrenceKeys: string[]; lastSeenMessageId: string; label?: string; createdAtMessageId?: string; lastInvokedAtMessageId?: string; invokedMessageIds?: string[]; aliases?: string[]; conversationHistory?: Array<{ messageId: string; text: string }>; occurrenceEvidence?: GhostOccurrenceEvidence[] }
+export interface GhostInteractivitySample { [key: string]: string | string[]; messageId: string; anchors: string[] }
+export interface GhostVoice { id: string; speakerId: string; voiceId: string; context: string; occurrenceKeys: string[]; lastSeenMessageId: string; label?: string; createdAtMessageId?: string; lastInvokedAtMessageId?: string; invokedMessageIds?: string[]; aliases?: string[]; conversationHistory?: Array<{ messageId: string; text: string }>; occurrenceEvidence?: GhostOccurrenceEvidence[]; interactivityTrail?: GhostInteractivitySample[] }
 export const GHOST_VOICE_LIFETIME_MESSAGES = 10
 
 export function readGhostVoices(value: unknown): GhostVoice[] {
@@ -387,6 +388,14 @@ export function readGhostVoices(value: unknown): GhostVoice[] {
         return typeof item.messageId === 'string' && typeof item.text === 'string' && item.messageId && item.text
           ? [{ messageId: item.messageId.slice(0, 256), text: item.text.slice(0, 6_000) }] : []
       }).slice(-3) : [],
+      interactivityTrail: Array.isArray(row.interactivityTrail) ? row.interactivityTrail.flatMap(entry => {
+        if (!entry || typeof entry !== 'object') return []
+        const item = entry as Record<string, unknown>
+        const anchors = Array.isArray(item.anchors)
+          ? [...new Set(item.anchors.filter((anchor): anchor is string => typeof anchor === 'string').map(anchor => anchor.trim().toLowerCase().slice(0, 128)).filter(Boolean))].slice(0, 12)
+          : []
+        return typeof item.messageId === 'string' && item.messageId && anchors.length ? [{ messageId: item.messageId.slice(0, 256), anchors }] : []
+      }).slice(-12) : [],
       ...(typeof row.createdAtMessageId === 'string' && row.createdAtMessageId ? { createdAtMessageId: row.createdAtMessageId } : {}),
       ...(typeof row.lastInvokedAtMessageId === 'string' && row.lastInvokedAtMessageId ? { lastInvokedAtMessageId: row.lastInvokedAtMessageId } : {}) }]
   })
@@ -408,6 +417,16 @@ export function updateGhostConversationHistory(ghost: GhostVoice, messageId: str
   entries.push({ messageId, text })
   entries.sort((a, b) => assistantMessageIds.indexOf(a.messageId) - assistantMessageIds.indexOf(b.messageId))
   ghost.conversationHistory = entries.slice(-3)
+}
+
+/** Keep a bounded trajectory of evolving activity/topic anchors for the ghost. */
+export function updateGhostInteractivityTrail(ghost: GhostVoice, messageId: string, message: string, assistantMessageIds: readonly string[]): void {
+  const anchors = interactionAnchors(message, 12)
+  if (!messageId || !anchors.length) return
+  const entries = (ghost.interactivityTrail ?? []).filter(item => item.messageId !== messageId)
+  entries.push({ messageId: messageId.slice(0, 256), anchors })
+  entries.sort((a, b) => assistantMessageIds.indexOf(a.messageId) - assistantMessageIds.indexOf(b.messageId))
+  ghost.interactivityTrail = entries.slice(-12)
 }
 
 /** Keep only unique, complete aliases within the regular cast name limit. */
@@ -1039,6 +1058,7 @@ export function buildUncastVoiceDecision(groups: UncastVoiceGroup[], voices: Fav
         context: ghost.context,
         conversationHistory: ghost.conversationHistory ?? [],
         anchors: interactionAnchors([ghost.context, ...history].join(' ')),
+        ...(ghost.interactivityTrail?.length ? { interactivityTrail: ghost.interactivityTrail.slice(-4) } : {}),
       }
     }),
     voices: voices.map((voice, index) => ({ option: `voice_${index}`, name: voice.name })),
@@ -1073,7 +1093,7 @@ export function buildUncastVoiceDecision(groups: UncastVoiceGroup[], voices: Fav
     }
     const earlier = groups.slice(0, groups.indexOf(group))
     if (ghosts.length || earlier.length) questions[`identity_${group.id}`] = {
-      type: 'choice', instructions: `Does character ${group.id} clearly represent the same individual as one prior character? Compare the CURRENT exchange with previousMessages and the prior character's own conversation history. Use topic, activity, actions, objects, physical location, actors, addressees and continuing pair relationships as intra-message and inter-message anchors. The state provides anchors for each group and ghost to make those repeated verbs, nouns and situation phrases explicit; also compare who acts with whom, who receives the action, and who addresses whom before and after the target speech. Several agreeing anchors can identify someone when their name is revealed later. A shared object, setting, gender, occupation, topic or voice alone is insufficient; check for multiple people, scene changes, interruptions, and names that identify an addressee or bystander rather than the speaker. Do not confuse the speaker with the person they address. Select new_or_unclear unless identity is clear.`,
+      type: 'choice', instructions: `Does character ${group.id} clearly represent the same individual as one prior character? Compare the CURRENT exchange with previousMessages and the prior character's own conversation history. Use topic, activity, actions, objects, physical location, actors, addressees and continuing pair relationships as intra-message and inter-message anchors. Activities and conversation topics can evolve over time; use anchors and interactivityTrail as a sequence to trace that evolution rather than requiring identical phrasing or a static topic. Compare who acts with whom, who receives the action, and who addresses whom before and after the target speech. Several agreeing anchors can identify someone when their name is revealed later. A shared object, setting, gender, occupation, topic or voice alone is insufficient; check for multiple people, scene changes, interruptions, and names that identify an addressee or bystander rather than the speaker. Do not confuse the speaker with the person they address. Select new_or_unclear unless identity is clear.`,
       criteria: { new_or_unclear: 'A new character, or identity cannot be reliably established.',
         ...Object.fromEntries(ghosts.map((ghost, index) => [`ghost_${index}`, `Previously seen character ${ghostCastAliases(ghost).join(" / ") || ghost.speakerId}; context: ${ghost.context}`])),
         ...Object.fromEntries(earlier.map(previous => [`group_${previous.id}`, `Earlier character ${previous.id}; context: ${previous.context.join(' ').slice(0, 2_000)}`])) },
@@ -1155,7 +1175,7 @@ export function buildUncastIdentityReview(groups: UncastVoiceGroup[], answers: R
       && (probability < 0.8 || identity.confidence < 0.8 || probability - runnerUp < 0.25)) {
       questions[`review_ghost_${group.id}_${ghostChoice![1]}`] = {
         type: 'choice',
-        instructions: `Compare the speaker in current group ${group.id} with the previously seen character ${candidate.label || candidate.speakerId}. Read the prior character's conversation history and the full current scene, including other participants' dialogue, relationship clues, actor/addressee pairs, topic and activity anchors, and continuity from phone to in-person. Confirm only if they are the same person; distinguish callers, people addressed, and people merely mentioned.`,
+        instructions: `Compare the speaker in current group ${group.id} with the previously seen character ${candidate.label || candidate.speakerId}. Read the prior character's conversation history, interactivityTrail, and the full current scene, including other participants' dialogue, evolving topic, activity, actor/addressee pairs and anchors. Activities and conversation topics can evolve over time, so recognize related shifts instead of demanding identical wording. Confirm only if they are the same person; distinguish callers, people addressed, and people merely mentioned.`,
         criteria: { same: 'The prior character and current speaker are clearly the same person.', different_or_unclear: 'They differ or the evidence is insufficient.' },
       }
     }
@@ -1192,7 +1212,7 @@ export function buildUncastIdentityReview(groups: UncastVoiceGroup[], answers: R
         if (previousMessages.length && ghost.conversationHistory?.length && Object.keys(questions).length < 16) {
           questions[`review_scene_${group.id}_${ghostIndex}`] = {
             type: 'choice',
-            instructions: `Re-read previousMessages, ghost_${ghostIndex}'s own saved conversation history, and the CURRENT exchange. Has the previously unnamed person who spoke in that history now been identified as ${revealedName}, the actual speaker of ${group.id}? Trace who speaks to whom, the continuing conversation, activity and topic anchors, objects and workstations and their locations, associated actions, actor/addressee pairings and later naming. Use several agreeing clues together, including intervening user messages. A shared setting, object, profession, gender, topic or voice alone does not prove identity. Consider multiple people, a new arrival or scene change, and whether the name belongs to an addressee or bystander. Select different_or_unclear when these details do not clearly establish the same individual.`,
+            instructions: `Re-read previousMessages, ghost_${ghostIndex}'s own saved conversation history, interactivityTrail, and the CURRENT exchange. Has the previously unnamed person who spoke in that history now been identified as ${revealedName}, the actual speaker of ${group.id}? Trace who speaks to whom, the continuing or evolving conversation, topic/activity anchors, objects and workstations and their locations, associated actions, actor/addressee pairings and later naming. Activities and topics can evolve, so use the sequence rather than identical phrasing. Use several agreeing clues together, including intervening user messages. A shared setting, object, profession, gender, topic or voice alone does not prove identity. Consider multiple people, a new arrival or scene change, and whether the name belongs to an addressee or bystander. Select different_or_unclear when these details do not clearly establish the same individual.`,
             criteria: { same: 'The earlier unnamed character and the newly named speaker are clearly the same individual.', different_or_unclear: 'Different individuals, or continuity is not clearly established.' },
           }
         }
@@ -3991,8 +4011,8 @@ export function applyAssistantUserSpeakerReview(plan: SpeakerDecisionPlan, answe
 }
 
 export interface RelationshipReviewContext {
-  previousMessages: Array<{ id: string; text: string; role?: 'user' | 'assistant' }>
-  ghosts: Array<{ id: string; label: string; aliases: string[]; context: string; conversationHistory: Array<{ messageId: string; text: string }> }>
+  previousMessages: Array<{ id: string; text: string; role?: 'user' | 'assistant'; anchors?: string[] }>
+  ghosts: Array<{ id: string; label: string; aliases: string[]; context: string; conversationHistory: Array<{ messageId: string; text: string }>; interactivityTrail?: GhostInteractivitySample[] }>
 }
 
 /** Recheck user-voice assignments made by any stage, with prior conversation. */
@@ -4230,7 +4250,7 @@ export function relationshipReviewContext(messages: Array<{ id: string; is_user:
     if (remaining <= 0) return []
     const text = preparePlaybackContent(message.content ?? '', skippedTags).slice(-Math.min(4_000, remaining))
     remaining -= text.length
-    return text ? [{ id: message.id, role: message.is_user ? 'user' as const : 'assistant' as const, text }] : []
+    return text ? [{ id: message.id, role: message.is_user ? 'user' as const : 'assistant' as const, text, anchors: interactionAnchors(text, 8) }] : []
   }).reverse()
   let ghostBudget = 12_000
   const takeGhostText = (text: string, limit: number): string => {
@@ -4251,7 +4271,8 @@ export function relationshipReviewContext(messages: Array<{ id: string; is_user:
   const safeGhosts = candidates.map(({ ghost, index, safeCurrent, historical }) => {
     const context = safeCurrent ? takeGhostText(ghost.context, 1_200) : ''
     const conversationHistory = historical.slice(-3).reverse().map(entry => ({ messageId: entry.messageId, text: takeGhostText(entry.text, 1_200) })).filter(entry => entry.text).reverse()
-    return { index, value: { id: ghost.id, label: safeCurrent ? ghost.label ?? '' : '', aliases: safeCurrent ? ghostCastAliases(ghost) : [], context, conversationHistory } }
+    const interactivityTrail = (ghost.interactivityTrail ?? []).slice(-4)
+    return { index, value: { id: ghost.id, label: safeCurrent ? ghost.label ?? '' : '', aliases: safeCurrent ? ghostCastAliases(ghost) : [], context, conversationHistory, ...(interactivityTrail.length ? { interactivityTrail } : {}) } }
   }).sort((a, b) => a.index - b.index).map(item => item.value)
   return { previousMessages, ghosts: safeGhosts }
 }

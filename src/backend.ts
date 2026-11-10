@@ -58,6 +58,7 @@ import {
   ghostCastAliases,
   mergeGhostAliases,
   updateGhostConversationHistory,
+  updateGhostInteractivityTrail,
   hasNamedSpeakerSubject,
   normalizeSpeakerName,
   normalizeCustomTtsEmotionTag,
@@ -1001,6 +1002,7 @@ async function saveGhostVoiceAssignments(
       if (revealedName && (!ghost.label || isDescriptiveGhostLabel(ghost.label))) ghost.label = revealedName
       else if (!ghost.label && assignment.label) ghost.label = assignment.label
       updateGhostConversationHistory(ghost, messageId, conversation, currentAssistantIds)
+      updateGhostInteractivityTrail(ghost, messageId, conversation, currentAssistantIds)
       const occurrence = `${messageId}:${hashMessageContent(group.speeches.join('\n'))}`
       if (!ghost.occurrenceKeys.includes(occurrence)) ghost.occurrenceKeys = [...ghost.occurrenceKeys, occurrence].slice(-100)
       recordGhostOccurrence(ghost, messageId, sourceHash, hashMessageContent(group.speeches.join('\n')), assignment.matchReason ?? 'unspecified')
