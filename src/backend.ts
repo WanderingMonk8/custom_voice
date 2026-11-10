@@ -2131,7 +2131,7 @@ spindle.onFrontendMessage(async (rawPayload: unknown, userId, frontendSessionId)
       if (roles.length && voices.length) {
         const questions: Record<string, { type: 'choice'; instructions: string; criteria: Record<string, string> }> = Object.fromEntries(roles.map((role, index) => [`role_${index}`, {
           type: 'choice' as const,
-          instructions: `Choose the best available voice for ${role.description}. Compare voice descriptions and gender when established.`,
+          instructions: `Choose the best available voice for ${role.description}. Gender is a hard compatibility cue when established. For style, score voices by metadata cues rather than prose length: name is weak context, category and languages contribute one compatibility cue in aggregate, each explicit tag is one cue, and each tag listed in "description supports" is one cue. The description is evidence for those tags, not an extra vote, and support for an explicit tag counts once rather than twice. Balance tags against that description evidence instead of letting a long description outweigh otherwise better matches. Some voices list less metadata than others; missing fields are not a reason to rank a voice lower.`,
           criteria: { ...Object.fromEntries(voices.map((voice, i) => [`voice_${i}`, voiceDecisionSummary(voice)])), ...(voices.length === 1 ? { no_match: 'No voice is suitable.' } : {}) },
         }]))
         roles.forEach((role, index) => {

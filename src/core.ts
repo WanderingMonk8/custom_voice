@@ -715,16 +715,42 @@ export function canReserveAutomaticVoice(voiceId: string, reserved: ReadonlySet<
 }
 
 /**
- * Select a random unused favorite that matches the established gender. Jev
- * still decides identity and gender; the final voice is drawn uniformly from
- * the compatible pool so repeated casting does not keep returning the same
- * few top-ranked favorites.
+ * Select a random unused favorite from Jev's top-ranked candidates. Jev
+ * decides which voices match the character from the available metadata
+ * (category, tags, languages, description); the final voice is drawn
+ * uniformly from that shortlist so the same candidate does not always win.
  */
 export function selectAutomaticVoice(voices: FavoriteVoice[], used: ReadonlySet<string>, answer: SpeakerDecisionChoice, gender: string, random: () => number = Math.random): string {
-  const eligible = voices.filter(voice => !used.has(voice.id) && voiceGenderCompatible(voice, gender as 'male' | 'female' | 'unknown'))
-  if (eligible.length === 1) return eligible[0].id
+  const eligible = voices.flatMap((voice, index) => {
+    if (used.has(voice.id) || !voiceGenderCompatible(voice, gender as 'male' | 'female' | 'unknown')) return []
+    return [{ voice, score: answer.probabilities[`voice_${index}`] ?? 0 }]
+  })
+  if (eligible.length === 1) return eligible[0].voice.id
   if (answer.choice === 'no_match' || !eligible.length) return ''
-  return eligible[Math.min(eligible.length - 1, Math.floor(random() * eligible.length))].id
+  const shortlist = shortlistRankedVoices(eligible, entry => entry.score)
+  return shortlist[Math.min(shortlist.length - 1, Math.floor(random() * shortlist.length))].voice.id
+}
+
+/** Voices kept for the random pick, and how far below the top score a voice
+ * may fall and still qualify. */
+export const AUTO_VOICE_SHORTLIST_LIMIT = 5
+export const AUTO_VOICE_SHORTLIST_FLOOR_RATIO = 0.2
+
+/**
+ * Keep the strongest Jev-ranked candidates and drop the also-rans. Voices
+ * that never received a score (for example because the ranking call failed)
+ * are not punished: when nothing scored, the whole compatible pool is
+ * returned unchanged, and missing metadata never excludes a voice here.
+ */
+export function shortlistRankedVoices<T>(candidates: readonly T[], scoreOf: (candidate: T) => number, limit = AUTO_VOICE_SHORTLIST_LIMIT, floorRatio = AUTO_VOICE_SHORTLIST_FLOOR_RATIO): T[] {
+  const scored = candidates.map(candidate => {
+    const score = scoreOf(candidate)
+    return { candidate, score: Number.isFinite(score) && score > 0 ? score : 0 }
+  })
+  const ranked = scored.filter(entry => entry.score > 0).sort((a, b) => b.score - a.score)
+  if (!ranked.length) return [...candidates]
+  const floor = ranked[0].score * Math.max(0, Math.min(1, floorRatio))
+  return ranked.filter(entry => entry.score >= floor).slice(0, Math.max(1, Math.round(limit))).map(entry => entry.candidate)
 }
 
 /** Only unassigned favorites may be used; unspecified categories remain eligible. */
@@ -861,20 +887,125 @@ function ghostPriorMessageIds(ghost: GhostVoice, previousMessages: RelationshipR
   return previousMessages.filter(item => linked.has(item.id)).map(item => item.id)
 }
 
+const VOICE_DESCRIPTION_TAG_ALIASES: ReadonlyArray<readonly [string, readonly string[]]> = [
+  ['young', ['young', 'youthful', 'adolescent', 'teen', 'teenage', 'teenaged', 'childlike']],
+  ['middle aged', ['middle aged', 'mature']],
+  ['old', ['old', 'aged', 'elderly', 'senior']],
+  ['conversational', ['conversational', 'chatty', 'casual']],
+  ['narration', ['narration', 'narrator']],
+  ['character voice', ['character voice', 'roleplay', 'role play']],
+  ['social media', ['social media']],
+  ['educational', ['educational', 'tutorial', 'tutorials', 'instructional']],
+  ['advertisement', ['advertisement', 'commercial', 'advert']],
+  ['entertainment', ['entertainment', 'performer']],
+  ['deep', ['deep', 'basso']],
+  ['low', ['low', 'low pitched', 'baritone']],
+  ['medium', ['medium', 'midrange', 'mid range']],
+  ['high', ['high', 'high pitched', 'soprano', 'treble']],
+  ['soft', ['soft', 'soft spoken']],
+  ['bright', ['bright']],
+  ['warm', ['warm', 'warmth']],
+  ['dark', ['dark']],
+  ['raspy', ['raspy', 'raspiness']],
+  ['smooth', ['smooth']],
+  ['breathy', ['breathy', 'breathiness']],
+  ['husky', ['husky', 'huskiness']],
+  ['energetic', ['energetic', 'lively', 'vigorous']],
+  ['calm', ['calm', 'soothing']],
+  ['relaxed', ['relaxed', 'laid back', 'unhurried']],
+  ['fast', ['fast', 'quick', 'rapid']],
+  ['slow', ['slow']],
+  ['measured', ['measured', 'deliberate', 'steady', 'even']],
+  ['dynamic', ['dynamic', 'varied']],
+  ['sexy', ['sexy', 'sultry']],
+  ['friendly', ['friendly', 'approachable']],
+  ['professional', ['professional', 'polished', 'corporate']],
+  ['serious', ['serious', 'grave']],
+  ['cheerful', ['cheerful', 'upbeat', 'sunny']],
+  ['enthusiastic', ['enthusiastic', 'excited']],
+  ['confident', ['confident', 'assured']],
+  ['authoritative', ['authoritative', 'commanding']],
+  ['gentle', ['gentle', 'tender']],
+  ['empathetic', ['empathetic', 'compassionate']],
+  ['playful', ['playful', 'mischievous']],
+  ['dramatic', ['dramatic', 'theatrical']],
+  ['intimate', ['intimate', 'intimacy', 'hushed', 'close']],
+  ['mysterious', ['mysterious', 'enigmatic']],
+  ['sad', ['sad', 'melancholic', 'mournful']],
+  ['angry', ['angry', 'furious']],
+  ['clear', ['clear', 'articulate']],
+  ['crisp', ['crisp']],
+  ['neutral tone', ['neutral tone', 'neutral']],
+  ['expressive', ['expressive', 'emotive']],
+  ['monotone', ['monotone', 'monotonous', 'flat']],
+  ['animated', ['animated', 'animatedly']],
+  ['storytelling', ['storytelling', 'storyteller']],
+  ['narrative', ['narrative']],
+  ['character', ['character']],
+  ['announcer', ['announcer', 'announcing']],
+  ['host', ['host', 'hosting']],
+  ['teacher', ['teacher', 'teaching']],
+  ['coach', ['coach', 'coaching']],
+  ['anime', ['anime']],
+  ['gaming', ['gaming']],
+  ['cinematic', ['cinematic', 'filmic']],
+  ['documentary', ['documentary']],
+  ['radio', ['radio']],
+  ['podcast', ['podcast']],
+]
+
+const escapeVoiceHintPattern = (value: string): string => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+
+const normalizeVoiceHintText = (value: string): string => value
+  .toLowerCase()
+  .replace(/[\u2013\u2014]/gu, '-')
+  .replace(/[.!?;:]+/gu, ' § ')
+  .replace(/\b(?:but|though|however|although|yet)\b/gu, ' § ')
+  .replace(/[-_\u2018\u2019']/gu, ' ')
+  .replace(/[^\p{L}\p{N}\s§]/gu, ' ')
+  .replace(/\s+/gu, ' ')
+  .trim()
+
+/** Canonical Fish quality tags supported by a free-form description. */
+export function voiceDescriptionTagHints(description: string): string[] {
+  const text = normalizeVoiceHintText(description)
+  if (!text) return []
+  const hinted: string[] = []
+  for (const [tag, aliases] of VOICE_DESCRIPTION_TAG_ALIASES) {
+    const supports = aliases.some(alias => {
+      const aliasText = normalizeVoiceHintText(alias)
+      const pattern = new RegExp(`(?<![\\p{L}\\p{N}])${escapeVoiceHintPattern(aliasText)}(?![\\p{L}\\p{N}])`, 'gu')
+      return text.split('§').some(clause => {
+        return [...clause.matchAll(pattern)].some(match => {
+          const start = match.index ?? 0
+          const before = clause.slice(Math.max(0, start - 24), start)
+          return !/\b(?:not|never|no|without|lacks|lacking|barely)\b/u.test(before)
+        })
+      })
+    })
+    if (supports) hinted.push(tag)
+  }
+  return hinted
+}
+
 /** One-line summary of a voice for the auto-cast ranking questions.
  * Includes tags and languages so Fish metadata (age, use case, qualities,
- * language) can influence the match, not just title/category/description. */
+ * language) can influence the match, not just title/category/description.
+ * Descriptions are broken down into the tags they support so their qualities
+ * are scored across the tag system instead of as a vague, lengthy vote.
+ * Missing fields are simply omitted: a sparse voice must not look worse than
+ * a fully described one. */
 export function voiceDecisionSummary(voice: FavoriteVoice): string {
   const tags = [...new Set((voice.tags ?? []).map(tag => tag.trim().toLowerCase()).filter(Boolean))]
   const languages = [...new Set((voice.languages ?? []).map(code => code.trim().toLowerCase()).filter(Boolean))]
-  const parts = [
-    voice.name || 'Unnamed voice',
-    voice.category || 'unspecified',
-    voice.description || 'No description provided.',
-  ]
-  if (tags.length) parts.push(`tags: ${tags.join(', ')}`)
+  const description = (voice.description ?? '').replace(/\s+/gu, ' ').trim()
+  const descriptionSupport = voiceDescriptionTagHints(description)
+  const parts = [voice.name, voice.category].map(part => (part ?? '').replace(/\s+/gu, ' ').trim()).filter(Boolean)
   if (languages.length) parts.push(`languages: ${languages.join(', ')}`)
-  return parts.join('; ')
+  if (tags.length) parts.push(`tags: ${tags.join(', ')}`)
+  if (descriptionSupport.length) parts.push(`description supports: ${descriptionSupport.join(', ')}`)
+  if (description) parts.push(`description: ${description}`)
+  return parts.join('; ') || 'No details provided.'
 }
 
 /** One decision call classifies each uncast group and ranks the available voice descriptions. */
@@ -934,7 +1065,7 @@ export function buildUncastVoiceDecision(groups: UncastVoiceGroup[], voices: Fav
     if (!voices.length) continue
     const options = voiceOptionsFor(group)
     questions[`voice_${group.id}`] = {
-      type: 'choice', instructions: `Rank the available voices for the person who actually speaks the quoted dialogue in ${group.id}. Narration-only bystanders and people merely addressed are not speakers. Use the full scene as context, including other character groups only when clearly the same speaker. Select the best available voice.`,
+      type: 'choice', instructions: `Rank the available voices for the person who actually speaks the quoted dialogue in ${group.id}. Narration-only bystanders and people merely addressed are not speakers. Use the full scene as context, including other character groups only when clearly the same speaker. Score voices by metadata cues, not prose length: name is weak context, category and languages contribute one compatibility cue in aggregate, each explicit tag is one cue, and each tag listed in "description supports" is one cue. The description is evidence for those tags, not an extra vote, and support for an explicit tag counts once rather than twice. Balance tags against that description evidence instead of letting a long description outweigh otherwise better matches. Missing fields are not a reason to rank a voice lower. Select the best available voice.`,
       criteria: { ...Object.fromEntries(options.map(({ index, voice }) => [`voice_${index}`, voiceDecisionSummary(voice)])), ...(options.length === 1 ? { no_match: 'No suitable voice is available.' } : {}) },
     }
   }
@@ -1338,16 +1469,22 @@ export function resolveUncastVoiceDecisions(
     if (!ghost) {
       const matches = members.map(group => answers[`voice_${group.id}`]).filter((answer): answer is SpeakerDecisionChoice => !!answer)
       const poolGender: 'male' | 'female' | 'unknown' = rankingHint ?? gender
-      const candidates = voices.filter(voice => !used.has(voice.id) && voiceGenderCompatible(voice, poolGender))
+      const candidates = voices.flatMap((voice, index) => {
+        if (used.has(voice.id) || !voiceGenderCompatible(voice, poolGender)) return []
+        const scores = matches.map(match => match.probabilities[`voice_${index}`] ?? 0).filter(score => Number.isFinite(score) && score > 0)
+        return [{ voice, score: scores.length ? scores.reduce((sum, score) => sum + score, 0) / scores.length : 0 }]
+      })
       if (poolGender !== gender) gender = poolGender
-      // Jev decides identity and gender; the voice itself is drawn uniformly
-      // from every compatible unused favorite so the same few top-ranked
-      // voices do not repeat. A voice question still gates the assignment
-      // (except for a lone compatible voice), and an explicit no_match on a
-      // real choice is respected instead of forcing a random voice.
+      // Jev ranks the voices from their Fish metadata; randomization happens
+      // only inside the shortlist of strong candidates, so quality still
+      // leads the choice while new characters stop reusing the same voice.
+      // A voice question still gates the assignment (except for a lone
+      // compatible voice), and an explicit no_match on a real choice is
+      // respected instead of forcing a random voice.
       if (!candidates.length || !matches.length) continue
       if (candidates.length > 1 && matches.every(match => match.choice === 'no_match')) continue
-      const chosen = candidates[Math.min(candidates.length - 1, Math.floor(random() * candidates.length))]
+      const shortlist = shortlistRankedVoices(candidates, entry => entry.score)
+      const chosen = shortlist[Math.min(shortlist.length - 1, Math.floor(random() * shortlist.length))].voice
       ghost = { id: `pending:${root}`, speakerId: members[0].speakerId, voiceId: chosen.id, context: members.flatMap(group => group.context).join(' ').slice(0, 2_000), occurrenceKeys: [], lastSeenMessageId: messageId }
       linkReasons.set(root, 'new voice selected from favorites')
     }

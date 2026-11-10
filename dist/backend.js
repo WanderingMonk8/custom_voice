@@ -241,10 +241,26 @@ function canReserveAutomaticVoice(voiceId, reserved, ghosts, existingGhostId = "
   return !!voiceId && !reserved.has(voiceId) && !ghosts.some((ghost) => ghost.voiceId === voiceId && ghost.id !== existingGhostId);
 }
 function selectAutomaticVoice(voices, used, answer, gender, random = Math.random) {
-  const eligible = voices.filter((voice) => !used.has(voice.id) && voiceGenderCompatible(voice, gender));
-  if (eligible.length === 1) return eligible[0].id;
+  const eligible = voices.flatMap((voice, index) => {
+    if (used.has(voice.id) || !voiceGenderCompatible(voice, gender)) return [];
+    return [{ voice, score: answer.probabilities[`voice_${index}`] ?? 0 }];
+  });
+  if (eligible.length === 1) return eligible[0].voice.id;
   if (answer.choice === "no_match" || !eligible.length) return "";
-  return eligible[Math.min(eligible.length - 1, Math.floor(random() * eligible.length))].id;
+  const shortlist = shortlistRankedVoices(eligible, (entry) => entry.score);
+  return shortlist[Math.min(shortlist.length - 1, Math.floor(random() * shortlist.length))].voice.id;
+}
+var AUTO_VOICE_SHORTLIST_LIMIT = 5;
+var AUTO_VOICE_SHORTLIST_FLOOR_RATIO = 0.2;
+function shortlistRankedVoices(candidates, scoreOf, limit = AUTO_VOICE_SHORTLIST_LIMIT, floorRatio = AUTO_VOICE_SHORTLIST_FLOOR_RATIO) {
+  const scored = candidates.map((candidate) => {
+    const score = scoreOf(candidate);
+    return { candidate, score: Number.isFinite(score) && score > 0 ? score : 0 };
+  });
+  const ranked = scored.filter((entry) => entry.score > 0).sort((a, b) => b.score - a.score);
+  if (!ranked.length) return [...candidates];
+  const floor = ranked[0].score * Math.max(0, Math.min(1, floorRatio));
+  return ranked.filter((entry) => entry.score >= floor).slice(0, Math.max(1, Math.round(limit))).map((entry) => entry.candidate);
 }
 function availableUncastVoices(favorites, used) {
   const reserved = new Set(used.map((voice) => voice.trim()).filter(Boolean));
@@ -298,17 +314,105 @@ function ghostPriorMessageIds(ghost, previousMessages) {
   const linked = /* @__PURE__ */ new Set([ghost.lastSeenMessageId, ...(ghost.conversationHistory ?? []).map((entry) => entry.messageId), ...ghost.occurrenceKeys.map((key) => key.split(":", 1)[0])]);
   return previousMessages.filter((item) => linked.has(item.id)).map((item) => item.id);
 }
+var VOICE_DESCRIPTION_TAG_ALIASES = [
+  ["young", ["young", "youthful", "adolescent", "teen", "teenage", "teenaged", "childlike"]],
+  ["middle aged", ["middle aged", "mature"]],
+  ["old", ["old", "aged", "elderly", "senior"]],
+  ["conversational", ["conversational", "chatty", "casual"]],
+  ["narration", ["narration", "narrator"]],
+  ["character voice", ["character voice", "roleplay", "role play"]],
+  ["social media", ["social media"]],
+  ["educational", ["educational", "tutorial", "tutorials", "instructional"]],
+  ["advertisement", ["advertisement", "commercial", "advert"]],
+  ["entertainment", ["entertainment", "performer"]],
+  ["deep", ["deep", "basso"]],
+  ["low", ["low", "low pitched", "baritone"]],
+  ["medium", ["medium", "midrange", "mid range"]],
+  ["high", ["high", "high pitched", "soprano", "treble"]],
+  ["soft", ["soft", "soft spoken"]],
+  ["bright", ["bright"]],
+  ["warm", ["warm", "warmth"]],
+  ["dark", ["dark"]],
+  ["raspy", ["raspy", "raspiness"]],
+  ["smooth", ["smooth"]],
+  ["breathy", ["breathy", "breathiness"]],
+  ["husky", ["husky", "huskiness"]],
+  ["energetic", ["energetic", "lively", "vigorous"]],
+  ["calm", ["calm", "soothing"]],
+  ["relaxed", ["relaxed", "laid back", "unhurried"]],
+  ["fast", ["fast", "quick", "rapid"]],
+  ["slow", ["slow"]],
+  ["measured", ["measured", "deliberate", "steady", "even"]],
+  ["dynamic", ["dynamic", "varied"]],
+  ["sexy", ["sexy", "sultry"]],
+  ["friendly", ["friendly", "approachable"]],
+  ["professional", ["professional", "polished", "corporate"]],
+  ["serious", ["serious", "grave"]],
+  ["cheerful", ["cheerful", "upbeat", "sunny"]],
+  ["enthusiastic", ["enthusiastic", "excited"]],
+  ["confident", ["confident", "assured"]],
+  ["authoritative", ["authoritative", "commanding"]],
+  ["gentle", ["gentle", "tender"]],
+  ["empathetic", ["empathetic", "compassionate"]],
+  ["playful", ["playful", "mischievous"]],
+  ["dramatic", ["dramatic", "theatrical"]],
+  ["intimate", ["intimate", "intimacy", "hushed", "close"]],
+  ["mysterious", ["mysterious", "enigmatic"]],
+  ["sad", ["sad", "melancholic", "mournful"]],
+  ["angry", ["angry", "furious"]],
+  ["clear", ["clear", "articulate"]],
+  ["crisp", ["crisp"]],
+  ["neutral tone", ["neutral tone", "neutral"]],
+  ["expressive", ["expressive", "emotive"]],
+  ["monotone", ["monotone", "monotonous", "flat"]],
+  ["animated", ["animated", "animatedly"]],
+  ["storytelling", ["storytelling", "storyteller"]],
+  ["narrative", ["narrative"]],
+  ["character", ["character"]],
+  ["announcer", ["announcer", "announcing"]],
+  ["host", ["host", "hosting"]],
+  ["teacher", ["teacher", "teaching"]],
+  ["coach", ["coach", "coaching"]],
+  ["anime", ["anime"]],
+  ["gaming", ["gaming"]],
+  ["cinematic", ["cinematic", "filmic"]],
+  ["documentary", ["documentary"]],
+  ["radio", ["radio"]],
+  ["podcast", ["podcast"]]
+];
+var escapeVoiceHintPattern = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+var normalizeVoiceHintText = (value) => value.toLowerCase().replace(/[\u2013\u2014]/gu, "-").replace(/[.!?;:]+/gu, " \xA7 ").replace(/\b(?:but|though|however|although|yet)\b/gu, " \xA7 ").replace(/[-_\u2018\u2019']/gu, " ").replace(/[^\p{L}\p{N}\s§]/gu, " ").replace(/\s+/gu, " ").trim();
+function voiceDescriptionTagHints(description) {
+  const text = normalizeVoiceHintText(description);
+  if (!text) return [];
+  const hinted = [];
+  for (const [tag, aliases] of VOICE_DESCRIPTION_TAG_ALIASES) {
+    const supports = aliases.some((alias) => {
+      const aliasText = normalizeVoiceHintText(alias);
+      const pattern = new RegExp(`(?<![\\p{L}\\p{N}])${escapeVoiceHintPattern(aliasText)}(?![\\p{L}\\p{N}])`, "gu");
+      return text.split("\xA7").some((clause) => {
+        return [...clause.matchAll(pattern)].some((match) => {
+          const start = match.index ?? 0;
+          const before = clause.slice(Math.max(0, start - 24), start);
+          return !/\b(?:not|never|no|without|lacks|lacking|barely)\b/u.test(before);
+        });
+      });
+    });
+    if (supports) hinted.push(tag);
+  }
+  return hinted;
+}
 function voiceDecisionSummary(voice) {
   const tags = [...new Set((voice.tags ?? []).map((tag) => tag.trim().toLowerCase()).filter(Boolean))];
   const languages = [...new Set((voice.languages ?? []).map((code) => code.trim().toLowerCase()).filter(Boolean))];
-  const parts = [
-    voice.name || "Unnamed voice",
-    voice.category || "unspecified",
-    voice.description || "No description provided."
-  ];
-  if (tags.length) parts.push(`tags: ${tags.join(", ")}`);
+  const description = (voice.description ?? "").replace(/\s+/gu, " ").trim();
+  const descriptionSupport = voiceDescriptionTagHints(description);
+  const parts = [voice.name, voice.category].map((part) => (part ?? "").replace(/\s+/gu, " ").trim()).filter(Boolean);
   if (languages.length) parts.push(`languages: ${languages.join(", ")}`);
-  return parts.join("; ");
+  if (tags.length) parts.push(`tags: ${tags.join(", ")}`);
+  if (descriptionSupport.length) parts.push(`description supports: ${descriptionSupport.join(", ")}`);
+  if (description) parts.push(`description: ${description}`);
+  return parts.join("; ") || "No details provided.";
 }
 function buildUncastVoiceDecision(groups, voices, message, ghosts = [], previousMessages = []) {
   const labels = uncastIdentityLabels(message, ghosts);
@@ -363,7 +467,7 @@ function buildUncastVoiceDecision(groups, voices, message, ghosts = [], previous
     const options = voiceOptionsFor(group);
     questions[`voice_${group.id}`] = {
       type: "choice",
-      instructions: `Rank the available voices for the person who actually speaks the quoted dialogue in ${group.id}. Narration-only bystanders and people merely addressed are not speakers. Use the full scene as context, including other character groups only when clearly the same speaker. Select the best available voice.`,
+      instructions: `Rank the available voices for the person who actually speaks the quoted dialogue in ${group.id}. Narration-only bystanders and people merely addressed are not speakers. Use the full scene as context, including other character groups only when clearly the same speaker. Score voices by metadata cues, not prose length: name is weak context, category and languages contribute one compatibility cue in aggregate, each explicit tag is one cue, and each tag listed in "description supports" is one cue. The description is evidence for those tags, not an extra vote, and support for an explicit tag counts once rather than twice. Balance tags against that description evidence instead of letting a long description outweigh otherwise better matches. Missing fields are not a reason to rank a voice lower. Select the best available voice.`,
       criteria: { ...Object.fromEntries(options.map(({ index, voice }) => [`voice_${index}`, voiceDecisionSummary(voice)])), ...options.length === 1 ? { no_match: "No suitable voice is available." } : {} }
     };
   }
@@ -694,11 +798,16 @@ function resolveUncastVoiceDecisions(groups, voices, answers, ghosts = [], reser
     if (!ghost) {
       const matches = members.map((group) => answers[`voice_${group.id}`]).filter((answer) => !!answer);
       const poolGender = rankingHint ?? gender;
-      const candidates = voices.filter((voice) => !used.has(voice.id) && voiceGenderCompatible(voice, poolGender));
+      const candidates = voices.flatMap((voice, index) => {
+        if (used.has(voice.id) || !voiceGenderCompatible(voice, poolGender)) return [];
+        const scores = matches.map((match) => match.probabilities[`voice_${index}`] ?? 0).filter((score) => Number.isFinite(score) && score > 0);
+        return [{ voice, score: scores.length ? scores.reduce((sum, score) => sum + score, 0) / scores.length : 0 }];
+      });
       if (poolGender !== gender) gender = poolGender;
       if (!candidates.length || !matches.length) continue;
       if (candidates.length > 1 && matches.every((match) => match.choice === "no_match")) continue;
-      const chosen = candidates[Math.min(candidates.length - 1, Math.floor(random() * candidates.length))];
+      const shortlist = shortlistRankedVoices(candidates, (entry) => entry.score);
+      const chosen = shortlist[Math.min(shortlist.length - 1, Math.floor(random() * shortlist.length))].voice;
       ghost = { id: `pending:${root}`, speakerId: members[0].speakerId, voiceId: chosen.id, context: members.flatMap((group) => group.context).join(" ").slice(0, 2e3), occurrenceKeys: [], lastSeenMessageId: messageId };
       linkReasons.set(root, "new voice selected from favorites");
     }
@@ -7017,7 +7126,7 @@ spindle.onFrontendMessage(async (rawPayload, userId, frontendSessionId) => {
       if (roles.length && voices.length) {
         const questions = Object.fromEntries(roles.map((role, index) => [`role_${index}`, {
           type: "choice",
-          instructions: `Choose the best available voice for ${role.description}. Compare voice descriptions and gender when established.`,
+          instructions: `Choose the best available voice for ${role.description}. Gender is a hard compatibility cue when established. For style, score voices by metadata cues rather than prose length: name is weak context, category and languages contribute one compatibility cue in aggregate, each explicit tag is one cue, and each tag listed in "description supports" is one cue. The description is evidence for those tags, not an extra vote, and support for an explicit tag counts once rather than twice. Balance tags against that description evidence instead of letting a long description outweigh otherwise better matches. Some voices list less metadata than others; missing fields are not a reason to rank a voice lower.`,
           criteria: { ...Object.fromEntries(voices.map((voice, i) => [`voice_${i}`, voiceDecisionSummary(voice)])), ...voices.length === 1 ? { no_match: "No voice is suitable." } : {} }
         }]));
         roles.forEach((role, index) => {

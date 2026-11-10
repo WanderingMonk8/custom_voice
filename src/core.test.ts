@@ -81,6 +81,7 @@ import {
   availableUncastVoices,
   canReserveAutomaticVoice,
   selectAutomaticVoice,
+  shortlistRankedVoices,
   activeGhostVoices,
   purgeExpiredGhostContexts,
   markGhostVoiceInvoked,
@@ -141,6 +142,7 @@ import {
   voiceAge,
   voiceCategoryGender,
   voiceDecisionSummary,
+  voiceDescriptionTagHints,
   voiceGender,
   voiceGenderCompatible,
   resolveSpeakerDecisionSegments,
@@ -2157,12 +2159,21 @@ test('readFavoriteVoices keeps up to 32 tags and the languages array', () => {
   assert.deepEqual(voice.languages, ['en', 'ja'])
 })
 
-test('voiceDecisionSummary includes tags and languages for auto-cast ranking', () => {
+test('voiceDecisionSummary includes tags and omits missing metadata without penalizing sparse voices', () => {
   assert.equal(
     voiceDecisionSummary({ id: 'v1', name: 'Nova', category: 'character', description: 'Warm', tags: ['Young', 'warm', 'young'], languages: ['en'] }),
-    'Nova; character; Warm; tags: young, warm; languages: en',
+    'Nova; character; languages: en; tags: young, warm; description supports: warm; description: Warm',
   )
-  assert.equal(voiceDecisionSummary({ id: 'v2', name: '', category: '', description: '' }), 'Unnamed voice; unspecified; No description provided.')
+  assert.equal(voiceDecisionSummary({ id: 'v2', name: '', category: '', description: '' }), 'No details provided.')
+  assert.equal(voiceDecisionSummary({ id: 'v3', name: '', category: 'female', description: 'Warm' }), 'female; description supports: warm; description: Warm')
+  assert.equal(voiceDecisionSummary({ id: 'v4', name: 'Nova', category: '', description: '' }), 'Nova')
+})
+
+test('voiceDescriptionTagHints scores descriptions across Fish quality tags', () => {
+  assert.deepEqual(voiceDescriptionTagHints('A warm, raspy voice with soft-spoken intimacy.'), ['soft', 'warm', 'raspy', 'intimate'])
+  assert.deepEqual(voiceDescriptionTagHints('Fast, animated storytelling with a confident and measured delivery.'), ['fast', 'measured', 'confident', 'animated', 'storytelling'])
+  assert.deepEqual(voiceDescriptionTagHints('Not warm, not calm, but crisp.'), ['crisp'])
+  assert.deepEqual(voiceDescriptionTagHints('English narrator for tutorials.'), ['narration', 'educational'])
 })
 
 test('communityVoiceToFavorite maps Fish metadata onto expanded favorites', () => {
@@ -2327,10 +2338,7 @@ test('a Jev gender that contradicts the narration class falls back to that class
     gender_g0: confidentDecision('female'),
     voice_g0: confidentDecision('voice_3'),
   })
-  // The narration class still gates the pool even though the selected voice
-  // is now random among the compatible candidates.
-  assert.equal(result[0]?.gender, 'male')
-  assert.match(result[0]?.voiceId ?? '', /^male-/u)
+  assert.deepEqual(result.map(item => [item.voiceId, item.gender]), [['male-2', 'male']])
 })
 
 test('a pronoun chain links fragments of one introduced man to a single voice', () => {
@@ -2535,7 +2543,7 @@ test('mutually invoked unnamed-speaker pairs establish distinct named voices', (
   const ellis = { id: 'g1', speakerId: 'unconfigured:ellis', segmentIndexes: [2], speeches: ['Not yet, Hallie.'], context: [], addressee: 'hallie' }
   const voices = readFavoriteVoices([{ id: 'voice-1', description: 'friendly and warm' }, { id: 'voice-2', description: 'warm female' }])
   const assigned = resolveUncastVoiceDecisions([hallie, ellis], voices, { voice_g0: confidentDecision('voice_0'), voice_g1: confidentDecision('voice_1') }, [], [], 'later', 'Leave it, Ellis. Not yet, Hallie.')
-  assert.deepEqual(assigned.map(item => item.voiceId).sort(), ['voice-1', 'voice-2'])
+  assert.deepEqual(assigned.map(item => item.voiceId), ['voice-1', 'voice-2'])
   assert.notEqual(assigned[0].ghostId, assigned[1].ghostId)
   assert.deepEqual(assigned.map(item => item.aliases), [['hallie'], ['ellis']])
 })
@@ -2575,7 +2583,7 @@ test('a three-voice message where two unnamed speakers invoke each other names b
     voice_g0: confidentDecision('voice_0'), voice_g1: confidentDecision('voice_1'),
     gender_g0: confidentDecision('male'), gender_g1: confidentDecision('female'),
   }, [], [], 'first', 'Gate. Hallie. Ellis.')
-  assert.deepEqual(assigned.map(item => item.voiceId).sort(), ['voice-1', 'voice-2'])
+  assert.deepEqual(assigned.map(item => item.voiceId), ['voice-1', 'voice-2'])
   assert.notEqual(assigned[0].ghostId, assigned[1].ghostId)
   assert.deepEqual(assigned.map(item => item.aliases?.[0]).sort(), ['ellis', 'hallie'])
 })
@@ -2942,25 +2950,32 @@ test('automatic casting respects reserved voices, gender, and no match', () => {
   assert.equal(selectAutomaticVoice(voices, new Set(), { ...answer, choice: 'no_match' }, 'unknown'), '')
 })
 
-test('random casting draws uniformly from compatible unused voices instead of the top-ranked one', () => {
+test('shortlist keeps Jev-ranked favorites and randomizes only inside them', () => {
   const voices = readFavoriteVoices([
     { id: 'male', category: 'male' },
-    { id: 'female-a', category: 'female' },
-    { id: 'female-b', category: 'female' },
-    { id: 'female-c', category: 'female' },
+    ...Array.from({ length: 7 }, (_, index) => ({ id: `female-${index}`, category: 'female' })),
   ])
-  const answer: SpeakerDecisionChoice = { choice: 'voice_1', probabilities: { voice_0: 0.98, voice_1: 0.01, voice_2: 0.01 }, confidence: 0.9 }
-  assert.equal(selectAutomaticVoice(voices, new Set(), answer, 'female', () => 0), 'female-a')
-  assert.equal(selectAutomaticVoice(voices, new Set(), answer, 'female', () => 0.5), 'female-b')
-  assert.equal(selectAutomaticVoice(voices, new Set(), answer, 'female', () => 0.999), 'female-c')
-  assert.equal(selectAutomaticVoice(voices, new Set(['female-a']), answer, 'female', () => 0), 'female-b')
+  const answer: SpeakerDecisionChoice = {
+    choice: 'voice_1',
+    probabilities: { voice_0: 0.99, voice_1: 0.6, voice_2: 0.5, voice_3: 0.45, voice_4: 0.3, voice_5: 0.25, voice_6: 0.2, voice_7: 0.15 },
+    confidence: 0.9,
+  }
+  const eligible = voices.slice(1).map(voice => voice.id)
+  assert.deepEqual(shortlistRankedVoices(eligible, id => ({ 'female-0': 0.6, 'female-1': 0.5, 'female-2': 0.45, 'female-3': 0.3, 'female-4': 0.25, 'female-5': 0.2, 'female-6': 0.15 })[id] ?? 0), ['female-0', 'female-1', 'female-2', 'female-3', 'female-4'])
+  assert.equal(selectAutomaticVoice(voices, new Set(), answer, 'female', () => 0), 'female-0')
+  assert.equal(selectAutomaticVoice(voices, new Set(), answer, 'female', () => 0.999), 'female-4')
+  assert.equal(selectAutomaticVoice(voices, new Set(['female-0']), answer, 'female', () => 0), 'female-1')
+
+  const decisive: SpeakerDecisionChoice = { choice: 'voice_1', probabilities: { voice_0: 0.01, voice_1: 0.95, voice_2: 0.02, voice_3: 0.02 }, confidence: 0.95 }
+  assert.equal(selectAutomaticVoice(voices, new Set(), decisive, 'female', () => 0.999), 'female-0')
 
   const groups = collectUncastVoiceGroups([{ speakerId: UNCAST_SPEAKER_ID, text: 'Hello.' }])
-  const answers = { gender_g0: confidentDecision('female'), voice_g0: answer }
-  const first = resolveUncastVoiceDecisions(groups, voices, answers, [], [], '', '', [], () => 0)
-  const last = resolveUncastVoiceDecisions(groups, voices, answers, [], [], '', '', [], () => 0.999)
-  assert.equal(first[0]?.voiceId, 'female-a')
-  assert.equal(last[0]?.voiceId, 'female-c')
+  const flat: SpeakerDecisionChoice = { choice: 'voice_1', probabilities: { voice_1: 0.2, voice_2: 0.2, voice_3: 0.2, voice_4: 0.2 }, confidence: 0.8 }
+  const answers = { gender_g0: confidentDecision('female'), voice_g0: flat }
+  assert.equal(resolveUncastVoiceDecisions(groups, voices, answers, [], [], '', '', [], () => 0)[0]?.voiceId, 'female-0')
+  assert.equal(resolveUncastVoiceDecisions(groups, voices, answers, [], [], '', '', [], () => 0.999)[0]?.voiceId, 'female-3')
+  const unscored = { gender_g0: confidentDecision('female'), voice_g0: { choice: 'voice_1', probabilities: {}, confidence: 0.5 } }
+  assert.equal(resolveUncastVoiceDecisions(groups, voices, unscored, [], [], '', '', [], () => 0.999)[0]?.voiceId, 'female-6')
 })
 
 test('automatic voice reservations reject exhausted voices and preserve existing ghost ownership', () => {
@@ -3301,13 +3316,13 @@ test('reviews borderline opening dialogue against a later clearly labeled speake
   }
   const review = buildUncastIdentityReview(groups, answers, message)
   assert.ok(review.questions.review_same_g1_g0)
-  assert.deepEqual(resolveUncastVoiceDecisions(groups, voices, answers).map(item => item.voiceId).sort(), ['first', 'second'])
+  assert.deepEqual(resolveUncastVoiceDecisions(groups, voices, answers).map(item => item.voiceId), ['first', 'second'])
   const confirmed = resolveUncastVoiceDecisions(groups, voices, { ...answers, review_same_g1_g0: confidentDecision('same') })
   assert.equal(confirmed[0].voiceId, confirmed[1].voiceId)
   const rejected = resolveUncastVoiceDecisions(groups, voices, { ...answers, review_same_g1_g0: confidentDecision('different_or_unclear') })
-  assert.deepEqual(rejected.map(item => item.voiceId).sort(), ['first', 'second'])
+  assert.deepEqual(rejected.map(item => item.voiceId), ['first', 'second'])
   const weak = resolveUncastVoiceDecisions(groups, voices, { ...answers, review_same_g1_g0: { choice: 'same', probabilities: { same: 0.65, different_or_unclear: 0.35 }, confidence: 0.6 } })
-  assert.deepEqual(weak.map(item => item.voiceId).sort(), ['first', 'second'])
+  assert.deepEqual(weak.map(item => item.voiceId), ['first', 'second'])
   assert.deepEqual(Object.keys(buildUncastIdentityReview(groups, { ...answers, same_g1_g0: confidentDecision('different_or_unclear') }, message).questions), [])
 })
 
