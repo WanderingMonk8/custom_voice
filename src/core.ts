@@ -601,7 +601,7 @@ export function collectUncastVoiceGroups(segments: PlaybackSegment[]): UncastVoi
     const first = Math.min(...group.segmentIndexes)
     const lead = segments[first - 1]
     if (!lead || lead.speakerId !== null) continue
-    const named = lead.text.match(/^([A-Z][a-z]{2,})\s+(?:says|said|murmurs|murmured|whispers|whispered|mutters|muttered|replies|replied|answers|answered|calls|called)\b/u)
+    const named = lead.text.match(/^(\p{Lu}[\p{Ll}\p{M}'’-]{2,})\s+(?:says|said|asks|asked|murmurs|murmured|whispers|whispered|mutters|muttered|replies|replied|answers|answered|calls|called|tells|told|informs|informed|adds|added|continues|continued|shouts|shouted|yells|yelled|remarked|remarks|cries|cried|sighs|sighed|snaps|snapped)\b/u)
     if (named) group.narratedName = named[1].toLowerCase()
   }
   for (const group of groups) {
@@ -1147,6 +1147,12 @@ export function resolveUncastVoiceDecisions(
     let root = group.id
     const occurrenceKey = messageId ? `${messageId}:${hashMessageContent(group.speeches.join('\n'))}` : ''
     const name = revealedUncastName(group, answers, message).toLowerCase()
+    // Narration that explicitly names the speaker ("Voss says…") is
+    // deterministic evidence even when the parser left the quote anonymous
+    // and Jev did not independently resolve the name. Use it only to find an
+    // existing ghost with that exact alias, never to invent a new identity.
+    const narratedName = normalizeSpeakerName(group.narratedName ?? '').toLowerCase()
+    const matchNames = [...new Set([name, narratedName].filter(value => value && !isBroadPersonLabel(value)))]
     const occurrenceIndex = latestGhostOccurrenceIndex(ghosts, occurrenceKey)
     const occurrence = occurrenceIndex >= 0 ? ghosts[occurrenceIndex] : undefined
     const occurrenceReview = occurrenceIndex >= 0 ? answers[`review_occurrence_${group.id}_${occurrenceIndex}`] : undefined
@@ -1189,7 +1195,7 @@ export function resolveUncastVoiceDecisions(
     const confirmedNew = !!occurrence && disposition?.choice === 'different' && strongChoice(disposition)
       && identityAnswer?.choice === 'new_or_unclear' && identityAnswer.confidence >= 0.8 && identityProbability >= 0.8 && identityProbability - identityRunnerUp >= 0.25
     const occurrenceConflict = !!occurrence && !occurrenceConfirmed && !confirmedNew
-    const aliasMatches = name && !isBroadPersonLabel(name) ? ghosts.filter(item => (!confirmedNew || item.id !== occurrence?.id) && ghostCastAliases(item).some(alias => alias.toLowerCase() === name)) : []
+    const aliasMatches = matchNames.length ? ghosts.filter(item => (!confirmedNew || item.id !== occurrence?.id) && ghostCastAliases(item).some(alias => matchNames.includes(alias.toLowerCase()))) : []
     const exact = (occurrenceConfirmed ? occurrence : undefined)
       ?? (group.speakerId !== UNCAST_SPEAKER_ID && !isBroadPersonLabel(name) ? ghosts.find(item => item.speakerId === group.speakerId && (!confirmedNew || item.id !== occurrence?.id)) : undefined)
       ?? (aliasMatches.length === 1 ? aliasMatches[0] : undefined)
@@ -1233,7 +1239,8 @@ export function resolveUncastVoiceDecisions(
     const priorGhost = rankedGhosts[0]?.recent >= 0 && (rankedGhosts.length === 1 || rankedGhosts[0].recent > rankedGhosts[1].recent) ? rankedGhosts[0].item : undefined
     const reviewedGhost = group.speakerId.startsWith('ghost:') ? ghosts.find(item => item.id === group.speakerId.slice('ghost:'.length) && (!confirmedNew || item.id !== occurrence?.id)) : undefined
     let ghost = reviewedGhost ?? (namedGhosts.length === 1 ? namedGhosts[0] : priorGhost ?? exact)
-    let reason = reviewedGhost ? 'speaker relationship review' : ghost === occurrence && ghost ? 'exact message occurrence' : ghost && namedGhosts.includes(ghost) ? 'label or alias match' : ghost ? 'speaker name or alias match' : ''
+    const narratedMatch = !!ghost && ghost === exact && !!narratedName && !name
+    let reason = reviewedGhost ? 'speaker relationship review' : ghost === occurrence && ghost ? 'exact message occurrence' : narratedMatch ? 'narrated name match' : ghost && namedGhosts.includes(ghost) ? 'label or alias match' : ghost ? 'speaker name or alias match' : ''
     if (occurrenceConflict && ghost?.id === occurrence?.id) {
       const alternatives = ghosts.flatMap((candidate, index) => {
         if (candidate.id === occurrence.id) return []

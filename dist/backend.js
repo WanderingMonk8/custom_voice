@@ -539,6 +539,8 @@ function resolveUncastVoiceDecisions(groups, voices, answers, ghosts = [], reser
     let root = group.id;
     const occurrenceKey = messageId ? `${messageId}:${hashMessageContent(group.speeches.join("\n"))}` : "";
     const name = revealedUncastName(group, answers, message).toLowerCase();
+    const narratedName = normalizeSpeakerName(group.narratedName ?? "").toLowerCase();
+    const matchNames = [...new Set([name, narratedName].filter((value) => value && !isBroadPersonLabel(value)))];
     const occurrenceIndex = latestGhostOccurrenceIndex(ghosts, occurrenceKey);
     const occurrence = occurrenceIndex >= 0 ? ghosts[occurrenceIndex] : void 0;
     const occurrenceReview = occurrenceIndex >= 0 ? answers[`review_occurrence_${group.id}_${occurrenceIndex}`] : void 0;
@@ -555,7 +557,7 @@ function resolveUncastVoiceDecisions(groups, voices, answers, ghosts = [], reser
     const identityRunnerUp = identityAnswer ? Math.max(0, ...Object.entries(identityAnswer.probabilities).filter(([key]) => key !== "new_or_unclear").map(([, value]) => value)) : 0;
     const confirmedNew = !!occurrence && disposition?.choice === "different" && strongChoice(disposition) && identityAnswer?.choice === "new_or_unclear" && identityAnswer.confidence >= 0.8 && identityProbability >= 0.8 && identityProbability - identityRunnerUp >= 0.25;
     const occurrenceConflict = !!occurrence && !occurrenceConfirmed && !confirmedNew;
-    const aliasMatches = name && !isBroadPersonLabel(name) ? ghosts.filter((item) => (!confirmedNew || item.id !== occurrence?.id) && ghostCastAliases(item).some((alias) => alias.toLowerCase() === name)) : [];
+    const aliasMatches = matchNames.length ? ghosts.filter((item) => (!confirmedNew || item.id !== occurrence?.id) && ghostCastAliases(item).some((alias) => matchNames.includes(alias.toLowerCase()))) : [];
     const exact = (occurrenceConfirmed ? occurrence : void 0) ?? (group.speakerId !== UNCAST_SPEAKER_ID && !isBroadPersonLabel(name) ? ghosts.find((item) => item.speakerId === group.speakerId && (!confirmedNew || item.id !== occurrence?.id)) : void 0) ?? (aliasMatches.length === 1 ? aliasMatches[0] : void 0) ?? (!confirmedNew ? occurrence : void 0);
     const identity = answers[`identity_${group.id}`];
     const labelAnswer = answers[`label_${group.id}`];
@@ -593,7 +595,8 @@ function resolveUncastVoiceDecisions(groups, voices, answers, ghosts = [], reser
     const priorGhost = rankedGhosts[0]?.recent >= 0 && (rankedGhosts.length === 1 || rankedGhosts[0].recent > rankedGhosts[1].recent) ? rankedGhosts[0].item : void 0;
     const reviewedGhost = group.speakerId.startsWith("ghost:") ? ghosts.find((item) => item.id === group.speakerId.slice("ghost:".length) && (!confirmedNew || item.id !== occurrence?.id)) : void 0;
     let ghost = reviewedGhost ?? (namedGhosts.length === 1 ? namedGhosts[0] : priorGhost ?? exact);
-    let reason = reviewedGhost ? "speaker relationship review" : ghost === occurrence && ghost ? "exact message occurrence" : ghost && namedGhosts.includes(ghost) ? "label or alias match" : ghost ? "speaker name or alias match" : "";
+    const narratedMatch = !!ghost && ghost === exact && !!narratedName && !name;
+    let reason = reviewedGhost ? "speaker relationship review" : ghost === occurrence && ghost ? "exact message occurrence" : narratedMatch ? "narrated name match" : ghost && namedGhosts.includes(ghost) ? "label or alias match" : ghost ? "speaker name or alias match" : "";
     if (occurrenceConflict && ghost?.id === occurrence?.id) {
       const alternatives = ghosts.flatMap((candidate, index) => {
         if (candidate.id === occurrence.id) return [];

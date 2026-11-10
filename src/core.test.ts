@@ -3035,6 +3035,31 @@ test('retains confirmed ghost aliases for matching and promotion', () => {
   assert.deepEqual(ambiguous, [])
 })
 
+test('narration that names an anonymous speaker reuses that ghost instead of creating a new one', () => {
+  const ghost = readGhostVoices([{ id: 'voss-ghost', speakerId: UNCAST_SPEAKER_ID, label: 'voss', voiceId: 'voss-voice', context: 'Voss works the counter.', occurrenceKeys: [], lastSeenMessageId: 'previous' }])[0]
+  const groups = collectUncastVoiceGroups([
+    { text: 'Voss tells her, without looking up from the urn.', speakerId: null },
+    { text: 'Ten-fifty-five.', speakerId: UNCAST_SPEAKER_ID },
+  ] as PlaybackSegment[])
+  assert.equal(groups[0]?.narratedName, 'voss')
+  const assigned = resolveUncastVoiceDecisions(groups, readFavoriteVoices([{ id: 'other-voice' }]), {
+    identity_g0: confidentDecision('new_or_unclear'),
+    voice_g0: confidentDecision('voice_0'),
+  }, [ghost], [], 'current')
+  assert.equal(assigned[0]?.ghostId, 'voss-ghost')
+  assert.equal(assigned[0]?.voiceId, 'voss-voice')
+  assert.match(assigned[0]?.matchReason!, /narrated name match/u)
+
+  // A narrated name that no ghost carries must not steal an unrelated voice.
+  const unrelated = { ...ghost, label: 'ken', aliases: ['ken'] }
+  const fresh = resolveUncastVoiceDecisions(groups, readFavoriteVoices([{ id: 'other-voice' }]), {
+    identity_g0: confidentDecision('new_or_unclear'),
+    voice_g0: confidentDecision('voice_0'),
+  }, [unrelated], [], 'current')
+  assert.match(fresh[0]?.ghostId ?? '', /^pending:/u)
+  assert.equal(fresh[0]?.voiceId, 'other-voice')
+})
+
 test('keeps bounded occurrence provenance while preserving legacy occurrence keys', () => {
   const ghost = readGhostVoices([{ id: 'g', speakerId: UNCAST_SPEAKER_ID, voiceId: 'v', context: '', occurrenceKeys: ['old:legacy'], lastSeenMessageId: 'old' }])[0]
   recordGhostOccurrence(ghost, 'new', 'message-hash', 'speech-hash', 'Jev identity match')
