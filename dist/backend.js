@@ -490,7 +490,7 @@ function buildUncastVoiceDecision(groups, voices, message, ghosts = [], previous
       instructions: `Does character ${group.id} clearly represent the same individual as one prior character? Compare the CURRENT exchange with previousMessages and the prior character's own conversation history. Use topic, activity, actions, objects, physical location, actors, addressees and continuing pair relationships as intra-message and inter-message anchors. Explicit narration that announces another, new, or a second/different voice marks a potentially different participant, not a stylistic quirk; honor that boundary unless the surrounding evidence clearly shows continuity. Activities and conversation topics can evolve over time; use anchors and interactivityTrail as a sequence to trace that evolution rather than requiring identical phrasing or a static topic. Compare who acts with whom, who receives the action, and who addresses whom before and after the target speech. Several agreeing anchors can identify someone when their name is revealed later. A shared object, setting, gender, occupation, topic or voice alone is insufficient; check for multiple people, scene changes, interruptions, and names that identify an addressee or bystander rather than the speaker. Do not confuse the speaker with the person they address. Select new_or_unclear unless identity is clear.`,
       criteria: {
         new_or_unclear: "A new character, or identity cannot be reliably established.",
-        ...Object.fromEntries(ghosts.map((ghost, index) => [`ghost_${index}`, `Previously seen character ${ghostCastAliases(ghost).join(" / ") || ghost.speakerId}; context: ${ghost.context}`])),
+        ...Object.fromEntries(ghosts.map((ghost, index) => [`ghost_${index}`, `Previously seen character ${ghostCastAliases(ghost).join(" / ") || ghost.speakerId}; see state.ghosts[${index}] for its context and history`])),
         ...Object.fromEntries(earlier.map((previous) => [`group_${previous.id}`, `Earlier character ${previous.id}; context: ${previous.context.join(" ").slice(0, 2e3)}`]))
       }
     };
@@ -2327,6 +2327,17 @@ function buildAssistantUserSpeakerReview(plan, answers) {
   }
   return { state: plan.state, questions };
 }
+function measureJevDecisionPayload(state, questions) {
+  const encoder = new TextEncoder();
+  const stateBytes = encoder.encode(JSON.stringify(state) ?? "").byteLength;
+  const questionsBytes = encoder.encode(JSON.stringify(questions) ?? "").byteLength;
+  return {
+    stateBytes,
+    questionsBytes,
+    payloadBytes: stateBytes + questionsBytes,
+    questionCount: Object.keys(questions).length
+  };
+}
 function applyAssistantUserSpeakerReview(plan, answers, reviewed) {
   for (const speech of plan.state.speeches) {
     const result = reviewed[`user_review_${speech.id}`];
@@ -3869,7 +3880,7 @@ function ttsPauseCriteria() {
     [TTS_NO_PAUSE_OPTION, "No inserted pause. Most lines should choose this."]
   ]);
 }
-function buildTtsTagPlan(plan, speechIds, emotionOptions = TTS_AUTO_EMOTION_OPTIONS, style = "gemini", enableModulation = false) {
+function buildTtsTagPlan(plan, speechIds, emotionOptions = TTS_AUTO_EMOTION_OPTIONS, style = "gemini", enableModulation = false, phase = "all", needs = {}) {
   const allowed = speechIds ? new Set(speechIds) : null;
   const speeches = plan.state.speeches.filter((speech) => !allowed || allowed.has(speech.id)).map((speech) => ({
     id: speech.id,
@@ -3888,88 +3899,108 @@ function buildTtsTagPlan(plan, speechIds, emotionOptions = TTS_AUTO_EMOTION_OPTI
   const pausePositions = {};
   const modulationPositions = {};
   for (const speech of speeches) {
+    const includePrimary = phase !== "secondary";
+    const includeSecondary = phase !== "primary";
+    const needsForSpeech = phase === "secondary" ? { emotion2: needs[speech.id]?.emotion2 === true, sound: needs[speech.id]?.sound === true, pause: needs[speech.id]?.pause === true, modulationpos: needs[speech.id]?.modulationpos === true } : { emotion2: phase === "all", sound: phase === "all", pause: phase === "all", modulationpos: phase === "all" };
     if (style !== "gemini38") {
-      questions[`emotion_${speech.id}`] = {
-        type: "choice",
-        instructions: `Which emotion best describes how quotation ${speech.id} is delivered? Use the quotation and its surrounding narration. Every quotation receives exactly one primary emotion; choose calm for neutral delivery.`,
-        criteria: emotionCriteria
-      };
-      questions[`emotion2_${speech.id}`] = {
-        type: "choice",
-        instructions: `Is there a distinct secondary emotion layered into quotation ${speech.id}? Choose no_emotion unless a second emotion is clearly present and compatible with the primary.`,
-        criteria: {
-          ...emotionCriteria,
-          [TTS_NO_EMOTION_OPTION]: "No distinct secondary emotion. Most lines should choose this."
-        }
-      };
+      if (includePrimary) {
+        questions[`emotion_${speech.id}`] = {
+          type: "choice",
+          instructions: `Which emotion best describes how quotation ${speech.id} is delivered? Use the quotation and its surrounding narration. Every quotation receives exactly one primary emotion; choose calm for neutral delivery.`,
+          criteria: emotionCriteria
+        };
+      }
+      if (includeSecondary && needsForSpeech.emotion2) {
+        questions[`emotion2_${speech.id}`] = {
+          type: "choice",
+          instructions: `Is there a distinct secondary emotion layered into quotation ${speech.id}? Choose no_emotion unless a second emotion is clearly present and compatible with the primary.`,
+          criteria: {
+            ...emotionCriteria,
+            [TTS_NO_EMOTION_OPTION]: "No distinct secondary emotion. Most lines should choose this."
+          }
+        };
+      }
     }
     if (style === "fish") {
-      questions[`style_${speech.id}`] = {
-        type: "choice",
-        instructions: `Does quotation ${speech.id} have a sustained voice style that should lead the speech? Choose no_style unless a whisper, soft/loud/low voice, shout, or scream clearly applies to the whole quotation. Do not use this for a momentary sound.`,
-        criteria: {
-          ...styleCriteria,
-          [TTS_NO_STYLE_OPTION]: "No sustained voice style. Most lines should choose this."
-        }
-      };
+      if (includePrimary) {
+        questions[`style_${speech.id}`] = {
+          type: "choice",
+          instructions: `Does quotation ${speech.id} have a sustained voice style that should lead the speech? Choose no_style unless a whisper, soft/loud/low voice, shout, or scream clearly applies to the whole quotation. Do not use this for a momentary sound.`,
+          criteria: {
+            ...styleCriteria,
+            [TTS_NO_STYLE_OPTION]: "No sustained voice style. Most lines should choose this."
+          }
+        };
+      }
       if (enableModulation) {
         const modulationOptions = ttsModulationPositionOptions(speech.text);
         if (modulationOptions.length > 0) {
           modulationPositions[speech.id] = modulationOptions;
-          questions[`modulation_${speech.id}`] = {
-            type: "choice",
-            instructions: `Does quotation ${speech.id} have a clear internal emotional turn that should change delivery before the quotation ends? Choose modulation only when the emotion genuinely shifts and the new delivery should continue to the end. Ignore momentary sounds, ordinary punctuation, and small intensity changes.`,
-            criteria: {
-              modulation: "A clear, sustained emotional turn inside the quotation.",
-              no_modulation: "No clear internal emotional turn. Most lines should choose this."
-            }
-          };
-          questions[`modulationpos_${speech.id}`] = {
-            type: "choice",
-            instructions: `If quotation ${speech.id} receives a modulation, where should the new emotion begin? Choose the boundary closest to the emotional turn.`,
-            criteria: Object.fromEntries(modulationOptions.map((option) => [option.id, option.description]))
-          };
+          if (includePrimary) {
+            questions[`modulation_${speech.id}`] = {
+              type: "choice",
+              instructions: `Does quotation ${speech.id} have a clear internal emotional turn that should change delivery before the quotation ends? Choose modulation only when the emotion genuinely shifts and the new delivery should continue to the end. Ignore momentary sounds, ordinary punctuation, and small intensity changes.`,
+              criteria: {
+                modulation: "A clear, sustained emotional turn inside the quotation.",
+                no_modulation: "No clear internal emotional turn. Most lines should choose this."
+              }
+            };
+          }
+          if (includeSecondary && needsForSpeech.modulationpos) {
+            questions[`modulationpos_${speech.id}`] = {
+              type: "choice",
+              instructions: `If quotation ${speech.id} receives a modulation, where should the new emotion begin? Choose the boundary closest to the emotional turn.`,
+              criteria: Object.fromEntries(modulationOptions.map((option) => [option.id, option.description]))
+            };
+          }
         }
       }
     }
-    questions[`tag_${speech.id}`] = {
-      type: "choice",
-      instructions: `Does quotation ${speech.id} contain one momentary sound effect that should be performed? Use the quotation and its surrounding narration. Most quotations need none; choose no_tag unless the sound is unmistakable. Never use ambient sound, sustained mood, or hesitation.`,
-      criteria: soundCriteria
-    };
-    questions[`tag2_${speech.id}`] = {
-      type: "choice",
-      instructions: `Does quotation ${speech.id} contain a second distinct momentary sound effect? Choose no_tag unless a second sound is clearly present near a different moment.`,
-      criteria: soundCriteria
-    };
+    if (includePrimary) {
+      questions[`tag_${speech.id}`] = {
+        type: "choice",
+        instructions: `Does quotation ${speech.id} contain one momentary sound effect that should be performed? Use the quotation and its surrounding narration. Most quotations need none; choose no_tag unless the sound is unmistakable. Never use ambient sound, sustained mood, or hesitation.`,
+        criteria: soundCriteria
+      };
+    }
     const speechPositions = ttsTagPositionOptions(speech.text);
     positions[speech.id] = speechPositions;
-    questions[`tagpos_${speech.id}`] = {
-      type: "choice",
-      instructions: `If quotation ${speech.id} receives a sound effect, where should it be inserted? Choose the boundary closest to the exact sound.`,
-      criteria: Object.fromEntries(speechPositions.map((option) => [option.id, option.description]))
-    };
-    questions[`pause_${speech.id}`] = {
-      type: "choice",
-      instructions: `Does quotation ${speech.id} need one inserted dramatic pause? Choose no_pause unless a pause clearly improves timing.`,
-      criteria: pauseCriteria
-    };
-    questions[`pause2_${speech.id}`] = {
-      type: "choice",
-      instructions: `Does quotation ${speech.id} need a second distinct pause at another moment? Choose no_pause unless a second pause clearly improves timing.`,
-      criteria: pauseCriteria
-    };
+    if (includeSecondary && needsForSpeech.sound) {
+      questions[`tag2_${speech.id}`] = {
+        type: "choice",
+        instructions: `Does quotation ${speech.id} contain a second distinct momentary sound effect? Choose no_tag unless a second sound is clearly present near a different moment.`,
+        criteria: soundCriteria
+      };
+      questions[`tagpos_${speech.id}`] = {
+        type: "choice",
+        instructions: `If quotation ${speech.id} receives a sound effect, where should it be inserted? Choose the boundary closest to the exact sound.`,
+        criteria: Object.fromEntries(speechPositions.map((option) => [option.id, option.description]))
+      };
+    }
+    if (includePrimary) {
+      questions[`pause_${speech.id}`] = {
+        type: "choice",
+        instructions: `Does quotation ${speech.id} need one inserted dramatic pause? Choose no_pause unless a pause clearly improves timing.`,
+        criteria: pauseCriteria
+      };
+    }
     pausePositions[speech.id] = speechPositions;
-    questions[`pausepos_${speech.id}`] = {
-      type: "choice",
-      instructions: `If quotation ${speech.id} receives a pause, where should it be inserted? Choose the boundary closest to the intended pause.`,
-      criteria: Object.fromEntries(speechPositions.map((option) => [option.id, option.description]))
-    };
+    if (includeSecondary && needsForSpeech.pause) {
+      questions[`pause2_${speech.id}`] = {
+        type: "choice",
+        instructions: `Does quotation ${speech.id} need a second distinct pause at another moment? Choose no_pause unless a second pause clearly improves timing.`,
+        criteria: pauseCriteria
+      };
+      questions[`pausepos_${speech.id}`] = {
+        type: "choice",
+        instructions: `If quotation ${speech.id} receives a pause, where should it be inserted? Choose the boundary closest to the intended pause.`,
+        criteria: Object.fromEntries(speechPositions.map((option) => [option.id, option.description]))
+      };
+    }
   }
   return {
     state: {
       messageRole: plan.state.messageRole,
-      message: plan.state.message,
       speeches
     },
     questions,
@@ -5928,7 +5959,7 @@ function appendSpeakerDebugReason(segments, reason, enabled) {
     debugPath: [...segment.debugPath ?? [], reason]
   }));
 }
-async function evaluateTtsTagSelections(plan, style, userId, enableModulation = false) {
+async function evaluateTtsTagSelections(plan, style, userId, enableModulation = false, debug = false) {
   const selections = /* @__PURE__ */ new Map();
   if (plan.state.speeches.length === 0) return { selections, failed: false };
   const hasCapability = (spindle.host.capabilities["decisions-v1"] ?? 0) >= 1;
@@ -5960,26 +5991,65 @@ async function evaluateTtsTagSelections(plan, style, userId, enableModulation = 
       error: "Decision capability unavailable"
     };
   }
+  const combinedAnswers = (first, second) => ({ ...first, ...second });
   const evaluateIds = async (ids, emotionOptions = TTS_AUTO_EMOTION_OPTIONS) => {
-    const tagPlan = buildTtsTagPlan(plan, ids, emotionOptions, style, enableModulation);
-    const result = await spindle.decisions.evaluate({
-      state: tagPlan.state,
-      questions: tagPlan.questions,
-      ...userId ? { userId } : {}
-    });
-    const answers = {};
-    for (const [questionId, answer] of Object.entries(result.answers)) {
-      if (answer.type !== "choice") continue;
-      answers[questionId] = {
-        choice: answer.choice,
-        probabilities: answer.probabilities,
-        confidence: answer.confidence
+    const evaluatePlan = async (tagPlan) => {
+      const result = await spindle.decisions.evaluate({
+        state: tagPlan.state,
+        questions: tagPlan.questions,
+        ...userId ? { userId } : {}
+      });
+      const answers = {};
+      for (const [questionId, answer] of Object.entries(result.answers)) {
+        if (answer.type !== "choice") continue;
+        answers[questionId] = {
+          choice: answer.choice,
+          probabilities: answer.probabilities,
+          confidence: answer.confidence
+        };
+      }
+      if (Object.keys(answers).length === 0) {
+        throw new Error("Decision returned no choice answers");
+      }
+      return answers;
+    };
+    const primaryPlan = buildTtsTagPlan(plan, ids, emotionOptions, style, enableModulation, "primary");
+    if (debug) {
+      const budget = measureJevDecisionPayload(primaryPlan.state, primaryPlan.questions);
+      spindle.log.info(`[Chat Voice] Jev tag primary budget: speeches=${ids.length}, questions=${budget.questionCount}, state=${budget.stateBytes}B, criteria=${budget.questionsBytes}B`);
+    }
+    const primaryAnswers = await evaluatePlan(primaryPlan);
+    const primarySelections = resolveTtsTagAnswers(primaryPlan, primaryAnswers, style);
+    const needs = {};
+    for (const id of ids) {
+      const emotion = primaryAnswers[`emotion_${id}`];
+      const selection = primarySelections.get(id);
+      const emotionNeedsFollowup = style !== "gemini38" && (!emotion || emotion.choice !== "calm");
+      const need = {
+        ...emotionNeedsFollowup ? { emotion2: true } : {},
+        ...(selection?.sounds.length ?? 0) > 0 ? { sound: true } : {},
+        ...(selection?.pauses.length ?? 0) > 0 ? { pause: true } : {},
+        ...selection?.modulation === true ? { modulationpos: true } : {}
       };
+      if (Object.keys(need).length) needs[id] = need;
     }
-    if (Object.keys(answers).length === 0) {
-      throw new Error("Decision returned no choice answers");
+    let secondaryAnswers = {};
+    const secondaryIds = Object.keys(needs);
+    if (secondaryIds.length) {
+      try {
+        const secondaryPlan = buildTtsTagPlan(plan, secondaryIds, emotionOptions, style, enableModulation, "secondary", needs);
+        if (debug) {
+          const budget = measureJevDecisionPayload(secondaryPlan.state, secondaryPlan.questions);
+          spindle.log.info(`[Chat Voice] Jev tag secondary budget: speeches=${secondaryIds.length}, questions=${budget.questionCount}, state=${budget.stateBytes}B, criteria=${budget.questionsBytes}B`);
+        }
+        secondaryAnswers = await evaluatePlan(secondaryPlan);
+      } catch (secondaryError) {
+        failure = secondaryError instanceof Error ? secondaryError.message : String(secondaryError);
+        spindle.log.warn(`[Chat Voice] Secondary TTS tag refinement failed; retaining the primary result: ${failure}`);
+      }
     }
-    return { tagPlan, answers };
+    const fullPlan = buildTtsTagPlan(plan, ids, emotionOptions, style, enableModulation, "all");
+    return { tagPlan: fullPlan, answers: combinedAnswers(primaryAnswers, secondaryAnswers) };
   };
   const evaluateChunk = async (ids) => {
     try {
@@ -6459,7 +6529,7 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
           }, userId, frontendSessionId);
           return;
         }
-        const tagSelectionsPromise = tagStyle !== "off" ? evaluateTtsTagSelections(decisionPlan, tagStyle, userId, enableModulation) : null;
+        const tagSelectionsPromise = tagStyle !== "off" ? evaluateTtsTagSelections(decisionPlan, tagStyle, userId, enableModulation, payload.debug) : null;
         try {
           const firstPassStartedAt = Date.now();
           const result = await spindle.decisions.evaluate({
@@ -6946,7 +7016,7 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
       }
     }
     const fallbackSegments = appendSpeakerDebugReason(deterministic, decisionFallbackReason, payload.debug);
-    const fallbackTagSelectionsPromise = tagStyle !== "off" && structurePlan ? evaluateTtsTagSelections(structurePlan, tagStyle, userId, enableModulation) : null;
+    const fallbackTagSelectionsPromise = tagStyle !== "off" && structurePlan ? evaluateTtsTagSelections(structurePlan, tagStyle, userId, enableModulation, payload.debug) : null;
     sendSpeakerParse({
       requestId: payload.requestId,
       chatId: chat.id,

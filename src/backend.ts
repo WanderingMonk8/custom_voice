@@ -94,6 +94,7 @@ import {
   TTS_COMPACT_EMOTION_OPTIONS,
   stripTtsModulationMarker,
   validateTtsSpeechPlacement,
+  measureJevDecisionPayload,
   USER_SPEAKER_ID,
   UNCAST_SPEAKER_ID,
   UNRESOLVED_SPEAKER_ID,
@@ -535,6 +536,7 @@ async function evaluateTtsTagSelections(
   style: Exclude<TtsTagStyle, 'off'>,
   userId?: string,
   enableModulation = false,
+  debug = false,
 ): Promise<TtsTagSelectionResult> {
   const selections = new Map<string, TtsTagSelection>()
   if (plan.state.speeches.length === 0) return { selections, failed: false }
@@ -573,29 +575,71 @@ async function evaluateTtsTagSelections(
       error: 'Decision capability unavailable',
     }
   }
+  const combinedAnswers = (
+    first: Record<string, SpeakerDecisionChoice>,
+    second: Record<string, SpeakerDecisionChoice>,
+  ): Record<string, SpeakerDecisionChoice> => ({ ...first, ...second })
+
   const evaluateIds = async (
     ids: string[],
     emotionOptions: readonly TtsTagOption[] = TTS_AUTO_EMOTION_OPTIONS,
   ) => {
-    const tagPlan = buildTtsTagPlan(plan, ids, emotionOptions, style, enableModulation)
-    const result = await spindle.decisions.evaluate({
-      state: tagPlan.state,
-      questions: tagPlan.questions,
-      ...(userId ? { userId } : {}),
-    })
-    const answers: Record<string, SpeakerDecisionChoice> = {}
-    for (const [questionId, answer] of Object.entries(result.answers)) {
-      if (answer.type !== 'choice') continue
-      answers[questionId] = {
-        choice: answer.choice,
-        probabilities: answer.probabilities,
-        confidence: answer.confidence,
+    const evaluatePlan = async (
+      tagPlan: ReturnType<typeof buildTtsTagPlan>,
+    ): Promise<Record<string, SpeakerDecisionChoice>> => {
+      const result = await spindle.decisions.evaluate({
+        state: tagPlan.state,
+        questions: tagPlan.questions,
+        ...(userId ? { userId } : {}),
+      })
+      const answers: Record<string, SpeakerDecisionChoice> = {}
+      for (const [questionId, answer] of Object.entries(result.answers)) {
+        if (answer.type !== 'choice') continue
+        answers[questionId] = {
+          choice: answer.choice,
+          probabilities: answer.probabilities,
+          confidence: answer.confidence,
+        }
+      }
+      if (Object.keys(answers).length === 0) {
+        throw new Error('Decision returned no choice answers')
+      }
+      return answers
+    }
+
+    const primaryPlan = buildTtsTagPlan(plan, ids, emotionOptions, style, enableModulation, 'primary')
+    if (debug) { const budget = measureJevDecisionPayload(primaryPlan.state, primaryPlan.questions); spindle.log.info(`[Chat Voice] Jev tag primary budget: speeches=${ids.length}, questions=${budget.questionCount}, state=${budget.stateBytes}B, criteria=${budget.questionsBytes}B`) }
+    const primaryAnswers = await evaluatePlan(primaryPlan)
+    const primarySelections = resolveTtsTagAnswers(primaryPlan, primaryAnswers, style)
+    const needs: Record<string, import('./core').TtsTagSecondaryNeeds> = {}
+    for (const id of ids) {
+      const emotion = primaryAnswers[`emotion_${id}`]
+      const selection = primarySelections.get(id)
+      const emotionNeedsFollowup = style !== 'gemini38' && (!emotion || emotion.choice !== 'calm')
+      const need = {
+        ...(emotionNeedsFollowup ? { emotion2: true } : {}),
+        ...((selection?.sounds.length ?? 0) > 0 ? { sound: true } : {}),
+        ...((selection?.pauses.length ?? 0) > 0 ? { pause: true } : {}),
+        ...(selection?.modulation === true ? { modulationpos: true } : {}),
+      }
+      if (Object.keys(need).length) needs[id] = need
+    }
+
+    let secondaryAnswers: Record<string, SpeakerDecisionChoice> = {}
+    const secondaryIds = Object.keys(needs)
+    if (secondaryIds.length) {
+      try {
+        const secondaryPlan = buildTtsTagPlan(plan, secondaryIds, emotionOptions, style, enableModulation, 'secondary', needs)
+        if (debug) { const budget = measureJevDecisionPayload(secondaryPlan.state, secondaryPlan.questions); spindle.log.info(`[Chat Voice] Jev tag secondary budget: speeches=${secondaryIds.length}, questions=${budget.questionCount}, state=${budget.stateBytes}B, criteria=${budget.questionsBytes}B`) }
+        secondaryAnswers = await evaluatePlan(secondaryPlan)
+      } catch (secondaryError) {
+        failure = secondaryError instanceof Error ? secondaryError.message : String(secondaryError)
+        spindle.log.warn(`[Chat Voice] Secondary TTS tag refinement failed; retaining the primary result: ${failure}`)
       }
     }
-    if (Object.keys(answers).length === 0) {
-      throw new Error('Decision returned no choice answers')
-    }
-    return { tagPlan, answers }
+
+    const fullPlan = buildTtsTagPlan(plan, ids, emotionOptions, style, enableModulation, 'all')
+    return { tagPlan: fullPlan, answers: combinedAnswers(primaryAnswers, secondaryAnswers) }
   }
   const evaluateChunk = async (ids: string[]) => {
     try {
@@ -1187,7 +1231,7 @@ function queueSpeakerParse(
           return
         }
         const tagSelectionsPromise = tagStyle !== 'off'
-          ? evaluateTtsTagSelections(decisionPlan, tagStyle, userId, enableModulation)
+          ? evaluateTtsTagSelections(decisionPlan, tagStyle, userId, enableModulation, payload.debug)
           : null
         try {
           const firstPassStartedAt = Date.now()
@@ -1666,7 +1710,7 @@ function queueSpeakerParse(
     }
     const fallbackSegments = appendSpeakerDebugReason(deterministic, decisionFallbackReason, payload.debug)
     const fallbackTagSelectionsPromise = tagStyle !== 'off' && structurePlan
-      ? evaluateTtsTagSelections(structurePlan, tagStyle, userId, enableModulation)
+      ? evaluateTtsTagSelections(structurePlan, tagStyle, userId, enableModulation, payload.debug)
       : null
     sendSpeakerParse({
       requestId: payload.requestId,

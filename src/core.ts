@@ -1105,7 +1105,7 @@ export function buildUncastVoiceDecision(groups: UncastVoiceGroup[], voices: Fav
     if (ghosts.length || earlier.length) questions[`identity_${group.id}`] = {
       type: 'choice', instructions: `Does character ${group.id} clearly represent the same individual as one prior character? Compare the CURRENT exchange with previousMessages and the prior character's own conversation history. Use topic, activity, actions, objects, physical location, actors, addressees and continuing pair relationships as intra-message and inter-message anchors. Explicit narration that announces another, new, or a second/different voice marks a potentially different participant, not a stylistic quirk; honor that boundary unless the surrounding evidence clearly shows continuity. Activities and conversation topics can evolve over time; use anchors and interactivityTrail as a sequence to trace that evolution rather than requiring identical phrasing or a static topic. Compare who acts with whom, who receives the action, and who addresses whom before and after the target speech. Several agreeing anchors can identify someone when their name is revealed later. A shared object, setting, gender, occupation, topic or voice alone is insufficient; check for multiple people, scene changes, interruptions, and names that identify an addressee or bystander rather than the speaker. Do not confuse the speaker with the person they address. Select new_or_unclear unless identity is clear.`,
       criteria: { new_or_unclear: 'A new character, or identity cannot be reliably established.',
-        ...Object.fromEntries(ghosts.map((ghost, index) => [`ghost_${index}`, `Previously seen character ${ghostCastAliases(ghost).join(" / ") || ghost.speakerId}; context: ${ghost.context}`])),
+        ...Object.fromEntries(ghosts.map((ghost, index) => [`ghost_${index}`, `Previously seen character ${ghostCastAliases(ghost).join(" / ") || ghost.speakerId}; see state.ghosts[${index}] for its context and history`])),
         ...Object.fromEntries(earlier.map(previous => [`group_${previous.id}`, `Earlier character ${previous.id}; context: ${previous.context.join(' ').slice(0, 2_000)}`])) },
     }
     for (const previous of earlier.slice(-8)) {
@@ -4004,6 +4004,26 @@ export function buildAssistantUserSpeakerReview(plan: SpeakerDecisionPlan, answe
   return { state: plan.state, questions }
 }
 
+export interface JevDecisionPayloadMetrics {
+  stateBytes: number
+  questionsBytes: number
+  payloadBytes: number
+  questionCount: number
+}
+
+/** Byte-size proxy for comparing decision requests across builds and messages. */
+export function measureJevDecisionPayload(state: unknown, questions: Record<string, unknown>): JevDecisionPayloadMetrics {
+  const encoder = new TextEncoder()
+  const stateBytes = encoder.encode(JSON.stringify(state) ?? '').byteLength
+  const questionsBytes = encoder.encode(JSON.stringify(questions) ?? '').byteLength
+  return {
+    stateBytes,
+    questionsBytes,
+    payloadBytes: stateBytes + questionsBytes,
+    questionCount: Object.keys(questions).length,
+  }
+}
+
 /** Only a strong independent review may replace an assistant-message user assignment. */
 export function applyAssistantUserSpeakerReview(plan: SpeakerDecisionPlan, answers: Record<string, SpeakerDecisionChoice>, reviewed: Record<string, SpeakerDecisionChoice>): void {
   for (const speech of plan.state.speeches) {
@@ -5903,7 +5923,6 @@ function ttsModulationPositionOptions(text: string): TtsTagPositionOption[] {
 export interface TtsTagPlan {
   state: {
     messageRole: 'assistant' | 'user'
-    message: string
     speeches: Array<{
       id: string
       paragraphId: string
@@ -5950,11 +5969,17 @@ function ttsPauseCriteria(): Record<string, string> {
   ])
 }
 
+export interface TtsTagSecondaryNeeds {
+  emotion2?: boolean
+  sound?: boolean
+  pause?: boolean
+  modulationpos?: boolean
+}
+
 /**
- * Build the batched tag questions. Every speech gets a mandatory emotion, an
- * optional sound, and an optional pause, plus fallback placement boundaries.
- * Fish S2 with LLM placement also gets an optional mid-speech modulation and
- * its position when the speech is long enough to have a useful remainder.
+ * Build the batched tag questions. `phase: 'primary'` asks only the choices
+ * that decide whether tagging is needed at all; `secondary` emits the likely
+ * no-op follow-ups only for speeches selected by the caller.
  */
 export function buildTtsTagPlan(
   plan: SpeakerDecisionPlan,
@@ -5962,6 +5987,8 @@ export function buildTtsTagPlan(
   emotionOptions: readonly TtsTagOption[] = TTS_AUTO_EMOTION_OPTIONS,
   style: Exclude<TtsTagStyle, 'off'> = 'gemini',
   enableModulation = false,
+  phase: 'all' | 'primary' | 'secondary' = 'all',
+  needs: Readonly<Record<string, Readonly<TtsTagSecondaryNeeds>>> = {},
 ): TtsTagPlan {
   const allowed = speechIds ? new Set(speechIds) : null
   const speeches = plan.state.speeches
@@ -5987,88 +6014,110 @@ export function buildTtsTagPlan(
   const pausePositions: Record<string, TtsTagPositionOption[]> = {}
   const modulationPositions: Record<string, TtsTagPositionOption[]> = {}
   for (const speech of speeches) {
+    const includePrimary = phase !== 'secondary'
+    const includeSecondary = phase !== 'primary'
+    const needsForSpeech = phase === 'secondary'
+      ? { emotion2: needs[speech.id]?.emotion2 === true, sound: needs[speech.id]?.sound === true, pause: needs[speech.id]?.pause === true, modulationpos: needs[speech.id]?.modulationpos === true }
+      : { emotion2: phase === 'all', sound: phase === 'all', pause: phase === 'all', modulationpos: phase === 'all' }
     if (style !== 'gemini38') {
-      questions[`emotion_${speech.id}`] = {
-        type: 'choice',
-        instructions: `Which emotion best describes how quotation ${speech.id} is delivered? Use the quotation and its surrounding narration. Every quotation receives exactly one primary emotion; choose calm for neutral delivery.`,
-        criteria: emotionCriteria,
+      if (includePrimary) {
+        questions[`emotion_${speech.id}`] = {
+          type: 'choice',
+          instructions: `Which emotion best describes how quotation ${speech.id} is delivered? Use the quotation and its surrounding narration. Every quotation receives exactly one primary emotion; choose calm for neutral delivery.`,
+          criteria: emotionCriteria,
+        }
       }
-      questions[`emotion2_${speech.id}`] = {
-        type: 'choice',
-        instructions: `Is there a distinct secondary emotion layered into quotation ${speech.id}? Choose no_emotion unless a second emotion is clearly present and compatible with the primary.`,
-        criteria: {
-          ...emotionCriteria,
-          [TTS_NO_EMOTION_OPTION]: 'No distinct secondary emotion. Most lines should choose this.',
-        },
+      if (includeSecondary && needsForSpeech.emotion2) {
+        questions[`emotion2_${speech.id}`] = {
+          type: 'choice',
+          instructions: `Is there a distinct secondary emotion layered into quotation ${speech.id}? Choose no_emotion unless a second emotion is clearly present and compatible with the primary.`,
+          criteria: {
+            ...emotionCriteria,
+            [TTS_NO_EMOTION_OPTION]: 'No distinct secondary emotion. Most lines should choose this.',
+          },
+        }
       }
     }
     if (style === 'fish') {
-      questions[`style_${speech.id}`] = {
-        type: 'choice',
-        instructions: `Does quotation ${speech.id} have a sustained voice style that should lead the speech? Choose no_style unless a whisper, soft/loud/low voice, shout, or scream clearly applies to the whole quotation. Do not use this for a momentary sound.`,
-        criteria: {
-          ...styleCriteria,
-          [TTS_NO_STYLE_OPTION]: 'No sustained voice style. Most lines should choose this.',
-        },
+      if (includePrimary) {
+        questions[`style_${speech.id}`] = {
+          type: 'choice',
+          instructions: `Does quotation ${speech.id} have a sustained voice style that should lead the speech? Choose no_style unless a whisper, soft/loud/low voice, shout, or scream clearly applies to the whole quotation. Do not use this for a momentary sound.`,
+          criteria: {
+            ...styleCriteria,
+            [TTS_NO_STYLE_OPTION]: 'No sustained voice style. Most lines should choose this.',
+          },
+        }
       }
       if (enableModulation) {
         const modulationOptions = ttsModulationPositionOptions(speech.text)
         if (modulationOptions.length > 0) {
           modulationPositions[speech.id] = modulationOptions
-          questions[`modulation_${speech.id}`] = {
-            type: 'choice',
-            instructions: `Does quotation ${speech.id} have a clear internal emotional turn that should change delivery before the quotation ends? Choose modulation only when the emotion genuinely shifts and the new delivery should continue to the end. Ignore momentary sounds, ordinary punctuation, and small intensity changes.`,
-            criteria: {
-              modulation: 'A clear, sustained emotional turn inside the quotation.',
-              no_modulation: 'No clear internal emotional turn. Most lines should choose this.',
-            },
+          if (includePrimary) {
+            questions[`modulation_${speech.id}`] = {
+              type: 'choice',
+              instructions: `Does quotation ${speech.id} have a clear internal emotional turn that should change delivery before the quotation ends? Choose modulation only when the emotion genuinely shifts and the new delivery should continue to the end. Ignore momentary sounds, ordinary punctuation, and small intensity changes.`,
+              criteria: {
+                modulation: 'A clear, sustained emotional turn inside the quotation.',
+                no_modulation: 'No clear internal emotional turn. Most lines should choose this.',
+              },
+            }
           }
-          questions[`modulationpos_${speech.id}`] = {
-            type: 'choice',
-            instructions: `If quotation ${speech.id} receives a modulation, where should the new emotion begin? Choose the boundary closest to the emotional turn.`,
-            criteria: Object.fromEntries(modulationOptions.map(option => [option.id, option.description])),
+          if (includeSecondary && needsForSpeech.modulationpos) {
+            questions[`modulationpos_${speech.id}`] = {
+              type: 'choice',
+              instructions: `If quotation ${speech.id} receives a modulation, where should the new emotion begin? Choose the boundary closest to the emotional turn.`,
+              criteria: Object.fromEntries(modulationOptions.map(option => [option.id, option.description])),
+            }
           }
         }
       }
     }
-    questions[`tag_${speech.id}`] = {
-      type: 'choice',
-      instructions: `Does quotation ${speech.id} contain one momentary sound effect that should be performed? Use the quotation and its surrounding narration. Most quotations need none; choose no_tag unless the sound is unmistakable. Never use ambient sound, sustained mood, or hesitation.`,
-      criteria: soundCriteria,
-    }
-    questions[`tag2_${speech.id}`] = {
-      type: 'choice',
-      instructions: `Does quotation ${speech.id} contain a second distinct momentary sound effect? Choose no_tag unless a second sound is clearly present near a different moment.`,
-      criteria: soundCriteria,
+    if (includePrimary) {
+      questions[`tag_${speech.id}`] = {
+        type: 'choice',
+        instructions: `Does quotation ${speech.id} contain one momentary sound effect that should be performed? Use the quotation and its surrounding narration. Most quotations need none; choose no_tag unless the sound is unmistakable. Never use ambient sound, sustained mood, or hesitation.`,
+        criteria: soundCriteria,
+      }
     }
     const speechPositions = ttsTagPositionOptions(speech.text)
     positions[speech.id] = speechPositions
-    questions[`tagpos_${speech.id}`] = {
-      type: 'choice',
-      instructions: `If quotation ${speech.id} receives a sound effect, where should it be inserted? Choose the boundary closest to the exact sound.`,
-      criteria: Object.fromEntries(speechPositions.map(option => [option.id, option.description])),
+    if (includeSecondary && needsForSpeech.sound) {
+      questions[`tag2_${speech.id}`] = {
+        type: 'choice',
+        instructions: `Does quotation ${speech.id} contain a second distinct momentary sound effect? Choose no_tag unless a second sound is clearly present near a different moment.`,
+        criteria: soundCriteria,
+      }
+      questions[`tagpos_${speech.id}`] = {
+        type: 'choice',
+        instructions: `If quotation ${speech.id} receives a sound effect, where should it be inserted? Choose the boundary closest to the exact sound.`,
+        criteria: Object.fromEntries(speechPositions.map(option => [option.id, option.description])),
+      }
     }
-    questions[`pause_${speech.id}`] = {
-      type: 'choice',
-      instructions: `Does quotation ${speech.id} need one inserted dramatic pause? Choose no_pause unless a pause clearly improves timing.`,
-      criteria: pauseCriteria,
-    }
-    questions[`pause2_${speech.id}`] = {
-      type: 'choice',
-      instructions: `Does quotation ${speech.id} need a second distinct pause at another moment? Choose no_pause unless a second pause clearly improves timing.`,
-      criteria: pauseCriteria,
+    if (includePrimary) {
+      questions[`pause_${speech.id}`] = {
+        type: 'choice',
+        instructions: `Does quotation ${speech.id} need one inserted dramatic pause? Choose no_pause unless a pause clearly improves timing.`,
+        criteria: pauseCriteria,
+      }
     }
     pausePositions[speech.id] = speechPositions
-    questions[`pausepos_${speech.id}`] = {
-      type: 'choice',
-      instructions: `If quotation ${speech.id} receives a pause, where should it be inserted? Choose the boundary closest to the intended pause.`,
-      criteria: Object.fromEntries(speechPositions.map(option => [option.id, option.description])),
+    if (includeSecondary && needsForSpeech.pause) {
+      questions[`pause2_${speech.id}`] = {
+        type: 'choice',
+        instructions: `Does quotation ${speech.id} need a second distinct pause at another moment? Choose no_pause unless a second pause clearly improves timing.`,
+        criteria: pauseCriteria,
+      }
+      questions[`pausepos_${speech.id}`] = {
+        type: 'choice',
+        instructions: `If quotation ${speech.id} receives a pause, where should it be inserted? Choose the boundary closest to the intended pause.`,
+        criteria: Object.fromEntries(speechPositions.map(option => [option.id, option.description])),
+      }
     }
   }
   return {
     state: {
       messageRole: plan.state.messageRole,
-      message: plan.state.message,
       speeches,
     },
     questions,

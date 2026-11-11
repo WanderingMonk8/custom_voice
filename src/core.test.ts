@@ -78,6 +78,7 @@ import {
   relationshipReviewContext,
   applyAssistantUserSpeakerReview,
   buildTtsTagPlan,
+  measureJevDecisionPayload,
   bufferAwareGenerationConcurrency,
   availableUncastVoices,
   canReserveAutomaticVoice,
@@ -1407,6 +1408,22 @@ test('builds emotion, sound, and pause questions per speech', () => {
   assert.ok(positionQuestion.criteria.b1)
   assert.ok(tagPlan.questions.pausepos_s0?.criteria.b1)
   assert.equal(Object.keys(tagPlan.questions).length, 8)
+  assert.equal('message' in tagPlan.state, false)
+})
+
+test('splits tag decisions into a tiny primary pass and targeted secondary questions', () => {
+  const content = ['Narration.', '', `"I thought you were gone, but you came back."`].join('\n')
+  const plan = buildSpeakerDecisionPlan(content, [{ id: 'alice', name: 'Alice' }], false)
+  const primary = buildTtsTagPlan(plan, undefined, undefined, 'fish', true, 'primary')
+  assert.deepEqual(Object.keys(primary.questions), ['emotion_s0', 'style_s0', 'modulation_s0', 'tag_s0', 'pause_s0'])
+
+  const secondary = buildTtsTagPlan(plan, ['s0'], undefined, 'fish', true, 'secondary', { s0: { emotion2: true, sound: true, pause: true, modulationpos: true } })
+  assert.deepEqual(Object.keys(secondary.questions), ['emotion2_s0', 'modulationpos_s0', 'tag2_s0', 'tagpos_s0', 'pause2_s0', 'pausepos_s0'])
+
+  const budget = measureJevDecisionPayload(primary.state, primary.questions)
+  assert.equal(budget.questionCount, 5)
+  assert.ok(budget.stateBytes > 0)
+  assert.ok(budget.questionsBytes > 0)
 })
 
 test('adds a Fish style question and repeats leading cues per sentence', () => {
