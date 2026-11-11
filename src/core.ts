@@ -146,6 +146,14 @@ export function voiceGender(voice: { category: string; tags?: readonly string[];
   return 'unknown'
 }
 
+/** Make the resolved gender visible as the actual sex tag instead of leaving it only in fields. */
+export function ensureFavoriteGenderTag(voice: FavoriteVoice): FavoriteVoice {
+  const gender = voiceGender(voice)
+  if (gender === 'unknown') return voice
+  const tags = [...new Set((voice.tags ?? []).map(tag => tag.trim().toLowerCase()).filter(tag => tag && tag !== 'male' && tag !== 'female'))]
+  return { ...voice, gender, tags: [gender, ...tags].slice(0, 32) }
+}
+
 /** Age hint for a stored favorite, read from its tags. */
 export function voiceAge(voice: { tags?: readonly string[] }): 'young' | 'middle aged' | 'old' | 'unknown' {
   for (const tag of voice.tags ?? []) {
@@ -173,7 +181,7 @@ export function readFavoriteVoices(value: unknown): FavoriteVoice[] {
     const id = row.id.trim().slice(0, 512)
     if (!id || seen.has(id)) continue
     seen.add(id)
-    result.push({
+    result.push(ensureFavoriteGenderTag({
       id,
       name: typeof row.name === 'string' ? row.name.trim().slice(0, 128) : '',
       category: typeof row.category === 'string' && row.category.trim()
@@ -190,7 +198,7 @@ export function readFavoriteVoices(value: unknown): FavoriteVoice[] {
       ...(Array.isArray(row.languages)
         ? { languages: row.languages.filter((value): value is string => typeof value === 'string').map(value => value.trim().slice(0, 32)).filter(Boolean).slice(0, 8) }
         : {}),
-    })
+    }))
   }
   return result
 }
@@ -322,7 +330,7 @@ export function readCommunityVoicePool(value: unknown): FavoriteVoice[] {
 /** Import a community voice into the user's favorites with its metadata preserved. */
 export function communityVoiceToFavorite(voice: CommunityVoice): FavoriteVoice {
   const gender = ['male', 'female'].find(tag => voice.tags.some(item => item.toLowerCase() === tag)) as 'male' | 'female' | undefined
-  return {
+  return ensureFavoriteGenderTag({
     id: voice.id,
     name: voice.title,
     category: voice.category || (gender ?? 'unspecified'),
@@ -333,7 +341,7 @@ export function communityVoiceToFavorite(voice: CommunityVoice): FavoriteVoice {
     communityLink: voice.communityLink,
     ...(voice.tags.length ? { tags: voice.tags } : {}),
     ...(voice.languages.length ? { languages: voice.languages } : {}),
-  }
+  })
 }
 
 /** Add or update a favorite from the community catalog so imports are idempotent. */
@@ -354,7 +362,7 @@ export function addFavoriteVoice(existing: FavoriteVoice[], voice: FavoriteVoice
   if (!id) throw new Error('Enter a voice ID to add a favorite.')
   if (existing.some(item => item.id === id)) throw new Error('That voice ID is already a favorite.')
   if (existing.length >= 500) throw new Error('The favorites list is limited to 500 voices.')
-  return [...existing, { ...voice, id }]
+  return [...existing, { ...ensureFavoriteGenderTag(voice), id }]
 }
 
 export interface UncastVoiceGroup { id: string; speakerId: string; segmentIndexes: number[]; speeches: string[]; context: string[]; addressee?: string; flankPartners?: string[]; pronounPartners?: string[]; pronounGender?: 'male' | 'female'; narratedName?: string; inferredName?: string }

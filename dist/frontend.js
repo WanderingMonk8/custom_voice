@@ -264,6 +264,12 @@ function voiceGender(voice) {
   }
   return "unknown";
 }
+function ensureFavoriteGenderTag(voice) {
+  const gender = voiceGender(voice);
+  if (gender === "unknown") return voice;
+  const tags = [...new Set((voice.tags ?? []).map((tag) => tag.trim().toLowerCase()).filter((tag) => tag && tag !== "male" && tag !== "female"))];
+  return { ...voice, gender, tags: [gender, ...tags].slice(0, 32) };
+}
 function voiceAge(voice) {
   for (const tag of voice.tags ?? []) {
     const value = tag.trim().toLowerCase();
@@ -282,7 +288,7 @@ function readFavoriteVoices(value) {
     const id = row.id.trim().slice(0, 512);
     if (!id || seen.has(id)) continue;
     seen.add(id);
-    result.push({
+    result.push(ensureFavoriteGenderTag({
       id,
       name: typeof row.name === "string" ? row.name.trim().slice(0, 128) : "",
       category: typeof row.category === "string" && row.category.trim() ? row.category.trim().slice(0, 64) : "unspecified",
@@ -293,7 +299,7 @@ function readFavoriteVoices(value) {
       ...typeof row.communityLink === "string" && row.communityLink.trim() ? { communityLink: row.communityLink.trim().slice(0, 512) } : {},
       ...Array.isArray(row.tags) ? { tags: row.tags.filter((value2) => typeof value2 === "string").map((value2) => value2.trim().slice(0, 64)).filter(Boolean).slice(0, 32) } : {},
       ...Array.isArray(row.languages) ? { languages: row.languages.filter((value2) => typeof value2 === "string").map((value2) => value2.trim().slice(0, 32)).filter(Boolean).slice(0, 8) } : {}
-    });
+    }));
   }
   return result;
 }
@@ -342,7 +348,7 @@ function readCommunityVoicePool(value) {
 }
 function communityVoiceToFavorite(voice) {
   const gender = ["male", "female"].find((tag) => voice.tags.some((item) => item.toLowerCase() === tag));
-  return {
+  return ensureFavoriteGenderTag({
     id: voice.id,
     name: voice.title,
     category: voice.category || (gender ?? "unspecified"),
@@ -353,7 +359,7 @@ function communityVoiceToFavorite(voice) {
     communityLink: voice.communityLink,
     ...voice.tags.length ? { tags: voice.tags } : {},
     ...voice.languages.length ? { languages: voice.languages } : {}
-  };
+  });
 }
 function upsertCommunityFavorite(existing, voice) {
   const favorite = communityVoiceToFavorite(voice);
@@ -370,7 +376,7 @@ function addFavoriteVoice(existing, voice) {
   if (!id) throw new Error("Enter a voice ID to add a favorite.");
   if (existing.some((item) => item.id === id)) throw new Error("That voice ID is already a favorite.");
   if (existing.length >= 500) throw new Error("The favorites list is limited to 500 voices.");
-  return [...existing, { ...voice, id }];
+  return [...existing, { ...ensureFavoriteGenderTag(voice), id }];
 }
 var GHOST_VOICE_LIFETIME_MESSAGES = 10;
 function activeGhostVoices(ghosts, assistantMessageIds, targetId, lifetime = GHOST_VOICE_LIFETIME_MESSAGES) {

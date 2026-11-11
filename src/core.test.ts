@@ -2121,8 +2121,8 @@ test('validates favorite voice IDs and classifications', () => {
     { id: 'voice-1', name: 'Duplicate', category: 'male' },
     { id: ' ' }, null,
   ]), [
-    { id: 'voice-1', name: 'Alice', category: 'female', description: 'warm and gentle' },
-    { id: 'voice-2', name: 'Bob', category: 'male', description: '' },
+    { id: 'voice-1', name: 'Alice', category: 'female', description: 'warm and gentle', gender: 'female', tags: ['female'] },
+    { id: 'voice-2', name: 'Bob', category: 'male', description: '', gender: 'male', tags: ['male'] },
     { id: 'voice-3', name: '', category: 'other', description: '' },
   ])
   // Legacy rows without a recognized category still default to unspecified.
@@ -2133,13 +2133,31 @@ test('validates favorite voice IDs and classifications', () => {
   assert.deepEqual(readFavoriteVoices([{
     id: 'voice-5', name: 'Mother Jinx', category: 'anime character', description: 'commanding',
     author: 'someone', source: 'community', communityLink: 'https://fish.audio/m/voice-5',
-    tags: ['anime', 'female', 'english'],
+    tags: ['female', 'anime', 'english'],
   }]), [{
     id: 'voice-5', name: 'Mother Jinx', category: 'anime character', description: 'commanding',
     author: 'someone', source: 'community', communityLink: 'https://fish.audio/m/voice-5',
-    tags: ['anime', 'female', 'english'],
+    gender: 'female', tags: ['female', 'anime', 'english'],
   }])
   assert.deepEqual(readFavoriteVoices(null), [])
+})
+
+test('favorite gender metadata is normalized into the actual sex tag', () => {
+  const [conflict, inferred, sparse] = readFavoriteVoices([
+    { id: 'conflict', category: 'female', tags: ['male', 'warm'] },
+    { id: 'inferred', category: 'anime character', tags: ['female', 'young'] },
+    { id: 'sparse', category: '', tags: ['warm'] },
+  ])
+  assert.deepEqual([conflict.gender, conflict.tags], ['female', ['female', 'warm']])
+  assert.deepEqual([inferred.gender, inferred.tags], ['female', ['female', 'young']])
+  assert.deepEqual([sparse.gender, sparse.tags], [undefined, ['warm']])
+
+  const favorite = communityVoiceToFavorite({
+    id: 'community', title: 'Grandma', description: 'A warm older voice', category: 'character', tags: ['grandmother', 'female'],
+    languages: [], author: '', likeCount: 0, taskCount: 0, licensed: false, licensedNote: null, communityLink: 'https://fish.audio/m/community',
+  })
+  assert.deepEqual(favorite.tags, ['female', 'grandmother'])
+  assert.equal(favorite.gender, 'female')
 })
 
 test('rejects duplicate favorite voice IDs even if names differ or whitespace is present', () => {
@@ -2231,7 +2249,7 @@ test('communityVoiceToFavorite maps Fish metadata onto expanded favorites', () =
   ])
   const favorite = communityVoiceToFavorite(voice)
   assert.equal(favorite.category, 'anime')
-  assert.deepEqual(favorite.tags, ['anime', 'female', 'english'])
+  assert.deepEqual(favorite.tags, ['female', 'anime', 'english'])
   assert.equal(voiceGender(favorite), 'female')
   assert.equal(readCommunityVoice({ title: 'no id' }), null)
   assert.equal(readCommunityVoice(null), null)
