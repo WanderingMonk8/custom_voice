@@ -564,6 +564,13 @@ export function backwardNarrationPronounGender(segments: PlaybackSegment[], from
   return null
 }
 
+const NEW_UNCAST_VOICE_CUE_PATTERN = /(?:\b(?:a|an|another)\s+(?:new|different|other|second|third|next)\s+(?:voice|speaker)\b|\bthe\s+other\s+(?:voice|speaker)\b|\bsomeone else\s+(?:answers|answer|says|speaks|replies|responds)\b)/iu
+
+/** Explicit announcements that a new or different uncast person started speaking. */
+export function hasNewAnonymousVoiceCue(text: string): boolean {
+  return NEW_UNCAST_VOICE_CUE_PATTERN.test(narrativeOnly(text))
+}
+
 export function collectUncastVoiceGroups(segments: PlaybackSegment[]): UncastVoiceGroup[] {
   const groups: UncastVoiceGroup[] = []
   const named = new Map<string, UncastVoiceGroup>()
@@ -579,6 +586,9 @@ export function collectUncastVoiceGroups(segments: PlaybackSegment[]): UncastVoi
     // A substantial intervening narrative can introduce a different uncast
     // speaker even without an intervening cast quotation. Review each side.
     if (id === UNCAST_SPEAKER_ID && segments[index - 1]?.speakerId === null && segments[index - 1].text.length > 240) anonymous = null
+    // An explicit announcement of a different voice is not just evidence for
+    // attribution; it cannot belong to the same uninterrupted anonymous run.
+    if (id === UNCAST_SPEAKER_ID && segments[index - 1]?.speakerId === null && hasNewAnonymousVoiceCue(segments[index - 1].text)) anonymous = null
     // Named actions and adjacent replies can signal a change of speaker.
     // Split for review; the action alone does not identify the quotation.
     // Dashed appositives (the man — Ellis —) are context candidates for
@@ -1093,7 +1103,7 @@ export function buildUncastVoiceDecision(groups: UncastVoiceGroup[], voices: Fav
     }
     const earlier = groups.slice(0, groups.indexOf(group))
     if (ghosts.length || earlier.length) questions[`identity_${group.id}`] = {
-      type: 'choice', instructions: `Does character ${group.id} clearly represent the same individual as one prior character? Compare the CURRENT exchange with previousMessages and the prior character's own conversation history. Use topic, activity, actions, objects, physical location, actors, addressees and continuing pair relationships as intra-message and inter-message anchors. Activities and conversation topics can evolve over time; use anchors and interactivityTrail as a sequence to trace that evolution rather than requiring identical phrasing or a static topic. Compare who acts with whom, who receives the action, and who addresses whom before and after the target speech. Several agreeing anchors can identify someone when their name is revealed later. A shared object, setting, gender, occupation, topic or voice alone is insufficient; check for multiple people, scene changes, interruptions, and names that identify an addressee or bystander rather than the speaker. Do not confuse the speaker with the person they address. Select new_or_unclear unless identity is clear.`,
+      type: 'choice', instructions: `Does character ${group.id} clearly represent the same individual as one prior character? Compare the CURRENT exchange with previousMessages and the prior character's own conversation history. Use topic, activity, actions, objects, physical location, actors, addressees and continuing pair relationships as intra-message and inter-message anchors. Explicit narration that announces another, new, or a second/different voice marks a potentially different participant, not a stylistic quirk; honor that boundary unless the surrounding evidence clearly shows continuity. Activities and conversation topics can evolve over time; use anchors and interactivityTrail as a sequence to trace that evolution rather than requiring identical phrasing or a static topic. Compare who acts with whom, who receives the action, and who addresses whom before and after the target speech. Several agreeing anchors can identify someone when their name is revealed later. A shared object, setting, gender, occupation, topic or voice alone is insufficient; check for multiple people, scene changes, interruptions, and names that identify an addressee or bystander rather than the speaker. Do not confuse the speaker with the person they address. Select new_or_unclear unless identity is clear.`,
       criteria: { new_or_unclear: 'A new character, or identity cannot be reliably established.',
         ...Object.fromEntries(ghosts.map((ghost, index) => [`ghost_${index}`, `Previously seen character ${ghostCastAliases(ghost).join(" / ") || ghost.speakerId}; context: ${ghost.context}`])),
         ...Object.fromEntries(earlier.map(previous => [`group_${previous.id}`, `Earlier character ${previous.id}; context: ${previous.context.join(' ').slice(0, 2_000)}`])) },

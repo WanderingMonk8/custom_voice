@@ -440,6 +440,10 @@ function backwardNarrationPronounGender(segments, fromIndex) {
   }
   return null;
 }
+var NEW_UNCAST_VOICE_CUE_PATTERN = /(?:\b(?:a|an|another)\s+(?:new|different|other|second|third|next)\s+(?:voice|speaker)\b|\bthe\s+other\s+(?:voice|speaker)\b|\bsomeone else\s+(?:answers|answer|says|speaks|replies|responds)\b)/iu;
+function hasNewAnonymousVoiceCue(text) {
+  return NEW_UNCAST_VOICE_CUE_PATTERN.test(narrativeOnly(text));
+}
 function collectUncastVoiceGroups(segments) {
   const groups = [];
   const named = /* @__PURE__ */ new Map();
@@ -455,6 +459,7 @@ function collectUncastVoiceGroups(segments) {
     }
     if (id !== UNCAST_SPEAKER_ID) anonymous = null;
     if (id === UNCAST_SPEAKER_ID && segments[index - 1]?.speakerId === null && segments[index - 1].text.length > 240) anonymous = null;
+    if (id === UNCAST_SPEAKER_ID && segments[index - 1]?.speakerId === null && hasNewAnonymousVoiceCue(segments[index - 1].text)) anonymous = null;
     if (id === UNCAST_SPEAKER_ID && segments[index - 1]?.speakerId === null && hasStrongNarrativeName(segments[index - 1].text)) anonymous = null;
     if (id === UNCAST_SPEAKER_ID && segments[index - 1]?.speakerId === UNCAST_SPEAKER_ID && segments[index - 2]?.speakerId === null && hasStrongNarrativeName(segments[index - 2].text)) anonymous = null;
     let group = id === UNCAST_SPEAKER_ID ? anonymous : named.get(id);

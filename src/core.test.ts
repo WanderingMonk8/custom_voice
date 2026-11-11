@@ -12,6 +12,7 @@ import {
   mutuallyInvoked,
   narrationFirstPronounClass,
   backwardNarrationPronounGender,
+  hasNewAnonymousVoiceCue,
   narrationBoostsPair,
   vocativeNames,
   type PlaybackSegment,
@@ -2334,6 +2335,19 @@ test('a paragraph opening on "The guy …" anchors male instead of inheriting an
   ]
   assert.equal(backwardNarrationPronounGender(segments, 2), 'male')
   assert.equal(collectUncastVoiceGroups(segments)[0].pronounGender, 'male')
+})
+
+test('explicit different-voice narration splits an otherwise anonymous run', () => {
+  const nar = (text: string) => ({ text, speakerId: null })
+  const speech = (text: string) => ({ text, speakerId: UNCAST_SPEAKER_ID })
+  const segments = [
+    speech('Mom, leave the curtain alone, nobody is out there yet.'),
+    nar('A second voice answers from deeper in the front room, older, papery, sharp:'),
+    speech('Somebody is standing by the hose.'),
+    speech('Nobody is trimming the tree.'),
+  ]
+  assert.equal(hasNewAnonymousVoiceCue(segments[1].text), true)
+  assert.deepEqual(collectUncastVoiceGroups(segments).map(group => group.segmentIndexes), [[0], [2, 3]])
 })
 
 test('a Jev gender that contradicts the narration class falls back to that class instead of dropping the voice', () => {
