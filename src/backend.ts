@@ -112,6 +112,7 @@ import {
   type UncastVoiceGroup,
   type GhostVoice,
 } from './core'
+import { BUILD_VERSION } from './version'
 import { generateUuidV7 } from './uuid'
 
 declare const spindle: import('lumiverse-spindle-types').SpindleAPI
@@ -2109,7 +2110,7 @@ spindle.onFrontendMessage(async (rawPayload: unknown, userId, frontendSessionId)
             const proposed = proposedAssignments.find(item => item.groupId === group.id)
             return `${group.id} segments=${group.segmentIndexes.map(index => index + 1).join(',')} identity=${identity ? `${identity.choice} confidence=${identity.confidence} probabilities=${JSON.stringify(identity.probabilities)}` : 'none'} gender=${gender ? `${gender.choice} confidence=${gender.confidence} probabilities=${JSON.stringify(gender.probabilities)}` : 'none'} label=${label ? `${label.choice} confidence=${label.confidence} probabilities=${JSON.stringify(label.probabilities)}` : 'none'} narrative-name=${narrativeName ? `${narrativeName.choice} (${plan.state.narrativeNames[Number(narrativeName.choice.replace('name_', ''))] ?? 'none'}) confidence=${narrativeName.confidence} probabilities=${JSON.stringify(narrativeName.probabilities)}` : 'none'} comparisons=${comparisons} proposed=${proposed ? `${proposed.ghostId} / ${proposed.voiceId} / ${proposed.gender}` : 'none'} match-reason=${proposed?.matchReason ?? 'none'} voice-choice=${voice ? `${voice.choice} confidence=${voice.confidence} probabilities=${JSON.stringify(voice.probabilities)}` : 'none'} final=${assignment ? `${assignment.label || 'unnamed'} / ${assignment.ghostId} / ${assignment.voiceId}` : 'connection default'}`
           })
-          diagnostics.unshift(`Available favorites=${voices.length}, historical ghosts=${ghosts.length}, current ghosts=${currentGhosts.length}; prior messages=${matchingContext.previousMessages.length}${decisionError ? `; Jev failed: ${decisionError}` : ''}; identity review questions=${Object.keys(review.questions).length}${reviewError ? `; review failed: ${reviewError}` : ''}.`)
+          diagnostics.unshift(`build=${BUILD_VERSION}; Available favorites=${voices.length}, historical ghosts=${ghosts.length}, current ghosts=${currentGhosts.length}; prior messages=${matchingContext.previousMessages.length}${decisionError ? `; Jev failed: ${decisionError}` : ''}; identity review questions=${Object.keys(review.questions).length}${reviewError ? `; review failed: ${reviewError}` : ''}.`)
           diagnostics.splice(1, 0, `Candidate context: ${ghosts.map((ghost, index) => `ghost_${index}=${ghost.id} last=${ghost.lastSeenMessageId || 'none'} history=${(ghost.conversationHistory ?? []).map(entry => `${entry.messageId}(${entry.text.length} chars)`).join(',') || 'none'} context=${ghost.context.length} chars`).join('; ') || 'none'}; prior=${matchingContext.previousMessages.map(item => `${item.role ?? 'unknown'}:${item.id}(${item.text.length} chars)`).join(',') || 'none'}.`)
           sendFrontend({ type: 'chat_voice_uncast_matches', requestId: payload.requestId, assignments, diagnostics }, userId, frontendSessionId)
           if (assignments.length) await sendState(userId, undefined, payload.chatId, frontendSessionId)
