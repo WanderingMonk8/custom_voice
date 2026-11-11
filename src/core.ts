@@ -365,7 +365,7 @@ export function addFavoriteVoice(existing: FavoriteVoice[], voice: FavoriteVoice
   return [...existing, { ...ensureFavoriteGenderTag(voice), id }]
 }
 
-export interface UncastVoiceGroup { id: string; speakerId: string; segmentIndexes: number[]; speeches: string[]; context: string[]; addressee?: string; flankPartners?: string[]; pronounPartners?: string[]; pronounGender?: 'male' | 'female'; narratedName?: string; inferredName?: string }
+export interface UncastVoiceGroup { id: string; speakerId: string; segmentIndexes: number[]; speeches: string[]; context: string[]; addressee?: string; flankPartners?: string[]; pronounPartners?: string[]; pronounGender?: 'male' | 'female'; anchorStrong?: boolean; narratedName?: string; inferredName?: string }
 export interface GhostOccurrenceEvidence { messageId: string; messageHash: string; speechHash: string; version: 'occurrence-1'; reason: string }
 export interface GhostInteractivitySample { [key: string]: string | string[]; messageId: string; anchors: string[] }
 export interface GhostVoice { id: string; speakerId: string; voiceId: string; context: string; occurrenceKeys: string[]; lastSeenMessageId: string; label?: string; createdAtMessageId?: string; lastInvokedAtMessageId?: string; invokedMessageIds?: string[]; aliases?: string[]; conversationHistory?: Array<{ messageId: string; text: string }>; occurrenceEvidence?: GhostOccurrenceEvidence[]; interactivityTrail?: GhostInteractivitySample[] }
@@ -525,7 +525,9 @@ export function narrationFirstPronounClass(text: string): 'male' | 'female' | nu
  * the chain is interrupted by an explicit new character ("another man
  * came…") or a contrary pronoun. Speech does not count.
  */
-export function backwardNarrationPronounGender(segments: PlaybackSegment[], fromIndex: number): 'male' | 'female' | null {
+export interface UncastAnchorGender { gender: 'male' | 'female'; /** True when anchored by an introduction-style noun ("the guy came in…"), not a bare pronoun class. */ strong: boolean }
+
+export function backwardNarrationAnchorGender(segments: PlaybackSegment[], fromIndex: number): UncastAnchorGender | null {
   const castNames = new Set<string>()
   for (const segment of segments) {
     const id = segment.speakerId
@@ -556,7 +558,7 @@ export function backwardNarrationPronounGender(segments: PlaybackSegment[], from
       if (mentionsCastCharacter(text)) continue
       if (/(^|[.!?]\s+)(another|second|third|other)\s+(man|woman|girl|boy|lady|guy)\b/iu.test(text)) return null
       const introduction = text.match(/(?:^|[.!?]\s+)(?:a|an|the|one)\s+(man|woman|girl|boy|lady|guy)(?:\s+\w+){0,2}?\s+(?:came|entered|arrived|appeared|walked in|stepped in|strode in|drew close)\b/iu)
-      if (introduction) return labelGenderHint(`the ${introduction[1]}`)
+      if (introduction) { const gender = labelGenderHint(`the ${introduction[1]}`); if (gender) return { gender, strong: true } }
       // A paragraph that opens on a gendered person ("The guy stops…",
       // "A tall woman turns…") describes that person even though the
       // sentence has no leading pronoun. Without this, the scan skips the
@@ -564,12 +566,16 @@ export function backwardNarrationPronounGender(segments: PlaybackSegment[], from
       // somebody else.
       const lead = text.trimStart().match(/^(?:the|a|an)\s+(?:(?:young|younger|old|older|elderly|middle-aged|tall|short|thin|heavy|bald|bearded|blond|blonde|brunette)\s+)*([a-z-]+)\b/iu)
       const leadHint = lead ? labelGenderHint(lead[1]) : null
-      if (leadHint) return leadHint
+      if (leadHint) return { gender: leadHint, strong: true }
       const klass = narrationFirstPronounClass(text)
-      if (klass) return klass
+      if (klass) return { gender: klass, strong: false }
     }
   }
   return null
+}
+
+export function backwardNarrationPronounGender(segments: PlaybackSegment[], fromIndex: number): 'male' | 'female' | null {
+  return backwardNarrationAnchorGender(segments, fromIndex)?.gender ?? null
 }
 
 const NEW_UNCAST_VOICE_CUE_PATTERN = /(?:\b(?:a|an|another)\s+(?:new|different|other|second|third|next)\s+(?:voice|speaker)\b|\bthe\s+other\s+(?:voice|speaker)\b|\bsomeone else\s+(?:answers|answer|says|speaks|replies|responds)\b)/iu
@@ -669,16 +675,21 @@ export function collectUncastVoiceGroups(segments: PlaybackSegment[]): UncastVoi
     .filter(group => group.speakerId === UNCAST_SPEAKER_ID)
     .sort((a, b) => Math.min(...a.segmentIndexes) - Math.min(...b.segmentIndexes))
   for (const group of unnamedInOrder) {
-    group.pronounGender = backwardNarrationPronounGender(segments, Math.min(...group.segmentIndexes)) ?? undefined
+    const anchor = backwardNarrationAnchorGender(segments, Math.min(...group.segmentIndexes))
+    group.pronounGender = anchor?.gender
+    group.anchorStrong = anchor?.strong
   }
   for (let index = 1; index < unnamedInOrder.length; index += 1) {
     const previous = unnamedInOrder[index - 1]
     const group = unnamedInOrder[index]
     const gender = group.pronounGender
     if (!gender || gender !== previous.pronounGender) {
-      // A fragment that does not join the chain keeps no pronoun credit:
-      // its narration may describe somebody else (e.g. a cast speaker).
-      group.pronounGender = undefined
+      // A fragment whose narration does not inherit the same gendered
+      // chain is not linked, but its own paragraph class is still evidence
+      // the voice-pool decision must weigh (deterministic anchors outvote
+      // a misread chain, or expose the disagreement for Jev to resolve);
+      // clearing it here erased anchors such as "the guy in the
+      // windbreaker says".
       continue
     }
     previous.pronounPartners = [...(previous.pronounPartners ?? []), group.id]
@@ -1523,16 +1534,17 @@ export function resolveUncastVoiceDecisions(
     const labelHint = labelGenderHint(ghost?.label || members.map(group => groupLabels.get(group.id)).find(Boolean) || '')
     const pronounHint = members.find(member => member.pronounGender && member.pronounPartners?.length)?.pronounGender
     let gender: 'male' | 'female' | 'unknown' = jevGender !== 'unknown' ? jevGender : labelHint || pronounHint || 'unknown'
-    // The backward scan may misattribute cast-adjacent narration to this speaker
-    // ("She gets the confession out…" describes the woman, so the uncast man
-    // inherits 'female'). A single uniform narration class may overrule a
-    // disagreeing Jev answer (deterministic introduction grammar); members
-    // that disagree among themselves are noise and defer to Jev's gender.
-    const narrationHints = members.map(member => member.pronounGender)
+    // Intro-grammar anchors ("The guy stops…") carry the speaker's deterministic
+    // sex, so a uniform strong anchor wins over a disagreeing Jev answer. A
+    // soft chain that inherited a cast-adjacent paragraph ("She gets the
+    // confession out…") cannot narrow the pool; mixed strong anchors defer
+    // to Jev too.
+    const strongHints = members
+      .map(member => (member.pronounGender && member.anchorStrong ? member.pronounGender : undefined))
       .filter((hint): hint is 'male' | 'female' => hint === 'male' || hint === 'female')
-    const uniformNarration = narrationHints.length && narrationHints.every(hint => hint === narrationHints[0]) ? narrationHints[0] : undefined
+    const uniformStrong = strongHints.length && strongHints.every(hint => hint === strongHints[0]) ? strongHints[0] : undefined
     // The pool Jev's shortlist and the assignment sex both use.
-    gender = uniformNarration ?? gender
+    gender = uniformStrong ?? gender
     const existingGhost = ghost
     if (existingGhost) {
       const carriedVoice = voices.find(voice => voice.id === existingGhost.voiceId)

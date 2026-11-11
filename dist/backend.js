@@ -838,9 +838,9 @@ function resolveUncastVoiceDecisions(groups, voices, answers, ghosts = [], reser
     const labelHint = labelGenderHint(ghost?.label || members.map((group) => groupLabels.get(group.id)).find(Boolean) || "");
     const pronounHint = members.find((member) => member.pronounGender && member.pronounPartners?.length)?.pronounGender;
     let gender = jevGender !== "unknown" ? jevGender : labelHint || pronounHint || "unknown";
-    const narrationHints = members.map((member) => member.pronounGender).filter((hint) => hint === "male" || hint === "female");
-    const uniformNarration = narrationHints.length && narrationHints.every((hint) => hint === narrationHints[0]) ? narrationHints[0] : void 0;
-    gender = uniformNarration ?? gender;
+    const strongHints = members.map((member) => member.pronounGender && member.anchorStrong ? member.pronounGender : void 0).filter((hint) => hint === "male" || hint === "female");
+    const uniformStrong = strongHints.length && strongHints.every((hint) => hint === strongHints[0]) ? strongHints[0] : void 0;
+    gender = uniformStrong ?? gender;
     const existingGhost = ghost;
     if (existingGhost) {
       const carriedVoice = voices.find((voice) => voice.id === existingGhost.voiceId);

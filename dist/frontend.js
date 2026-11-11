@@ -412,7 +412,7 @@ function narrationFirstPronounClass(text) {
   if (STORY_FEMALE_PRONOUNS.has(head)) return "female";
   return null;
 }
-function backwardNarrationPronounGender(segments, fromIndex) {
+function backwardNarrationAnchorGender(segments, fromIndex) {
   const castNames = /* @__PURE__ */ new Set();
   for (const segment of segments) {
     const id = segment.speakerId;
@@ -436,12 +436,15 @@ function backwardNarrationPronounGender(segments, fromIndex) {
       if (mentionsCastCharacter(text)) continue;
       if (/(^|[.!?]\s+)(another|second|third|other)\s+(man|woman|girl|boy|lady|guy)\b/iu.test(text)) return null;
       const introduction = text.match(/(?:^|[.!?]\s+)(?:a|an|the|one)\s+(man|woman|girl|boy|lady|guy)(?:\s+\w+){0,2}?\s+(?:came|entered|arrived|appeared|walked in|stepped in|strode in|drew close)\b/iu);
-      if (introduction) return labelGenderHint(`the ${introduction[1]}`);
+      if (introduction) {
+        const gender = labelGenderHint(`the ${introduction[1]}`);
+        if (gender) return { gender, strong: true };
+      }
       const lead = text.trimStart().match(/^(?:the|a|an)\s+(?:(?:young|younger|old|older|elderly|middle-aged|tall|short|thin|heavy|bald|bearded|blond|blonde|brunette)\s+)*([a-z-]+)\b/iu);
       const leadHint = lead ? labelGenderHint(lead[1]) : null;
-      if (leadHint) return leadHint;
+      if (leadHint) return { gender: leadHint, strong: true };
       const klass = narrationFirstPronounClass(text);
-      if (klass) return klass;
+      if (klass) return { gender: klass, strong: false };
     }
   }
   return null;
@@ -532,14 +535,15 @@ function collectUncastVoiceGroups(segments) {
   }
   const unnamedInOrder = groups.filter((group) => group.speakerId === UNCAST_SPEAKER_ID).sort((a, b) => Math.min(...a.segmentIndexes) - Math.min(...b.segmentIndexes));
   for (const group of unnamedInOrder) {
-    group.pronounGender = backwardNarrationPronounGender(segments, Math.min(...group.segmentIndexes)) ?? void 0;
+    const anchor = backwardNarrationAnchorGender(segments, Math.min(...group.segmentIndexes));
+    group.pronounGender = anchor?.gender;
+    group.anchorStrong = anchor?.strong;
   }
   for (let index = 1; index < unnamedInOrder.length; index += 1) {
     const previous = unnamedInOrder[index - 1];
     const group = unnamedInOrder[index];
     const gender = group.pronounGender;
     if (!gender || gender !== previous.pronounGender) {
-      group.pronounGender = void 0;
       continue;
     }
     previous.pronounPartners = [...previous.pronounPartners ?? [], group.id];
