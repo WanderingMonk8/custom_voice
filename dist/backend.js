@@ -838,7 +838,9 @@ function resolveUncastVoiceDecisions(groups, voices, answers, ghosts = [], reser
     const labelHint = labelGenderHint(ghost?.label || members.map((group) => groupLabels.get(group.id)).find(Boolean) || "");
     const pronounHint = members.find((member) => member.pronounGender && member.pronounPartners?.length)?.pronounGender;
     let gender = jevGender !== "unknown" ? jevGender : labelHint || pronounHint || "unknown";
-    const rankingHint = members.find((member) => member.pronounGender === "male" || member.pronounGender === "female")?.pronounGender;
+    const narrationHints = members.map((member) => member.pronounGender).filter((hint) => hint === "male" || hint === "female");
+    const uniformNarration = narrationHints.length && narrationHints.every((hint) => hint === narrationHints[0]) ? narrationHints[0] : void 0;
+    gender = uniformNarration ?? gender;
     const existingGhost = ghost;
     if (existingGhost) {
       const carriedVoice = voices.find((voice) => voice.id === existingGhost.voiceId);
@@ -850,13 +852,11 @@ function resolveUncastVoiceDecisions(groups, voices, answers, ghosts = [], reser
     }
     if (!ghost) {
       const matches = members.map((group) => answers[`voice_${group.id}`]).filter((answer) => !!answer);
-      const poolGender = rankingHint ?? gender;
       const candidates = voices.flatMap((voice, index) => {
-        if (used.has(voice.id) || !voiceGenderCompatible(voice, poolGender)) return [];
+        if (used.has(voice.id) || !voiceGenderCompatible(voice, gender)) return [];
         const scores = matches.map((match) => match.probabilities[`voice_${index}`] ?? 0).filter((score) => Number.isFinite(score) && score > 0);
         return [{ voice, score: scores.length ? scores.reduce((sum, score) => sum + score, 0) / scores.length : 0 }];
       });
-      if (poolGender !== gender) gender = poolGender;
       if (!candidates.length || !matches.length) continue;
       if (candidates.length > 1 && matches.every((match) => match.choice === "no_match")) continue;
       const shortlist = shortlistRankedVoices(candidates, (entry) => entry.score);

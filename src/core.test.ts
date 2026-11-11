@@ -2409,6 +2409,56 @@ test('a Jev gender that contradicts the narration class falls back to that class
   assert.deepEqual(result.map(item => [item.voiceId, item.gender]), [['male-2', 'male']])
 })
 
+test('a misattributed "she" from cast narration does not send an explicitly male uncast speaker to a female voice', () => {
+  // Reported case: the uncast "guy in the windbreaker" inherited 'female'
+  // from Wren's paragraph, while the other fragment's narration said 'male'
+  // and Jev's valid vote leaned male. Disagreeing narration hints must defer
+  // to Jev's gender question instead of the misread narration class.
+  const groups = [
+    { id: 'g0', speakerId: UNCAST_SPEAKER_ID, segmentIndexes: [8], speeches: ['Yeah, sure, I got a lab till nine-thirty on Mondays,'], context: ['Wren gets the confession out in a low, strangled rush.'], pronounGender: 'female' as const },
+    { id: 'g1', speakerId: UNCAST_SPEAKER_ID, segmentIndexes: [10], speeches: ['Who\'s the roll for?'], context: ['the guy in the windbreaker says without a blink of curiosity.'], pronounGender: 'male' as const },
+  ]
+  const voices = readFavoriteVoices([
+    { id: 'male-voice', category: 'male' },
+    { id: 'female-voice', category: 'female' },
+  ])
+  const answers = {
+    identity_g0: confidentDecision('new_or_unclear'),
+    identity_g1: confidentDecision('group_g0'),
+    same_g1_g0: confidentDecision('same'),
+    gender_g0: { choice: 'male', confidence: 0.485, probabilities: { male: 0.657, female: 0.210, unknown: 0.133 } },
+    gender_g1: { choice: 'male', confidence: 0.616, probabilities: { male: 0.744, female: 0.069, unknown: 0.186 } },
+    voice_g0: { choice: 'voice_1', confidence: 0.071, probabilities: { voice_1: 0.1 } },
+    voice_g1: { choice: 'voice_0', confidence: 0.422, probabilities: { voice_0: 0.44 } },
+  }
+  const assignments = resolveUncastVoiceDecisions(groups, voices, answers, [], [], 'message', 'the guy in the windbreaker says without a blink of curiosity.', [], () => 0)
+  assert.ok(assignments.length > 0)
+  assert.ok(assignments.every(item => item.voiceId === 'male-voice'))
+  assert.ok(assignments.every(item => item.gender === 'male'))
+})
+
+test('conflicting narration gender classes still yield a voice inside the gender Jev established', () => {
+  const voices = readFavoriteVoices([
+    { id: 'female-1', category: 'female' }, { id: 'female-2', category: 'female' },
+  ])
+  const groups = [
+    { id: 'g0', speakerId: UNCAST_SPEAKER_ID, segmentIndexes: [0], speeches: ['One.'], context: ['She writes.'], pronounGender: 'female' as const },
+    { id: 'g1', speakerId: UNCAST_SPEAKER_ID, segmentIndexes: [2], speeches: ['Two.'], context: ['He counts.'], pronounGender: 'male' as const },
+  ]
+  // Both members valid female votes: Jev says female; hints conflict, so Jev wins.
+  const answers = {
+    identity_g1: confidentDecision('group_g0'),
+    same_g1_g0: confidentDecision('same'),
+    gender_g0: confidentDecision('female'),
+    gender_g1: confidentDecision('female'),
+    voice_g0: { choice: 'voice_0', confidence: 0.9, probabilities: { voice_0: 0.9 } },
+    voice_g1: { choice: 'voice_1', confidence: 0.9, probabilities: { voice_1: 0.9 } },
+  }
+  const assignments = resolveUncastVoiceDecisions(groups, voices, answers, [], [], 'message', 'msg', [], () => 0)
+  assert.ok(assignments.length > 0)
+  assert.ok(assignments.every(item => item.gender === 'female'))
+})
+
 test('a pronoun chain links fragments of one introduced man to a single voice', () => {
   const segments = [
     { text: 'The doors swung and a man came in with a jacket over his arm, tired around the eyes.', speakerId: null },

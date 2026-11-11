@@ -1523,10 +1523,16 @@ export function resolveUncastVoiceDecisions(
     const labelHint = labelGenderHint(ghost?.label || members.map(group => groupLabels.get(group.id)).find(Boolean) || '')
     const pronounHint = members.find(member => member.pronounGender && member.pronounPartners?.length)?.pronounGender
     let gender: 'male' | 'female' | 'unknown' = jevGender !== 'unknown' ? jevGender : labelHint || pronounHint || 'unknown'
-    // The narration's own pronoun class shaped the voice shortlist, so it
-    // defines the compatible pool even when Jev's gender answer disagrees.
-    // A Jev gender only decides the pool when narration left none.
-    const rankingHint = members.find(member => member.pronounGender === 'male' || member.pronounGender === 'female')?.pronounGender
+    // The backward scan may misattribute cast-adjacent narration to this speaker
+    // ("She gets the confession out…" describes the woman, so the uncast man
+    // inherits 'female'). A single uniform narration class may overrule a
+    // disagreeing Jev answer (deterministic introduction grammar); members
+    // that disagree among themselves are noise and defer to Jev's gender.
+    const narrationHints = members.map(member => member.pronounGender)
+      .filter((hint): hint is 'male' | 'female' => hint === 'male' || hint === 'female')
+    const uniformNarration = narrationHints.length && narrationHints.every(hint => hint === narrationHints[0]) ? narrationHints[0] : undefined
+    // The pool Jev's shortlist and the assignment sex both use.
+    gender = uniformNarration ?? gender
     const existingGhost = ghost
     if (existingGhost) {
       const carriedVoice = voices.find(voice => voice.id === existingGhost.voiceId)
@@ -1540,13 +1546,11 @@ export function resolveUncastVoiceDecisions(
     }
     if (!ghost) {
       const matches = members.map(group => answers[`voice_${group.id}`]).filter((answer): answer is SpeakerDecisionChoice => !!answer)
-      const poolGender: 'male' | 'female' | 'unknown' = rankingHint ?? gender
       const candidates = voices.flatMap((voice, index) => {
-        if (used.has(voice.id) || !voiceGenderCompatible(voice, poolGender)) return []
+        if (used.has(voice.id) || !voiceGenderCompatible(voice, gender)) return []
         const scores = matches.map(match => match.probabilities[`voice_${index}`] ?? 0).filter(score => Number.isFinite(score) && score > 0)
         return [{ voice, score: scores.length ? scores.reduce((sum, score) => sum + score, 0) / scores.length : 0 }]
       })
-      if (poolGender !== gender) gender = poolGender
       // Jev ranks the voices from their Fish metadata; randomization happens
       // only inside the shortlist of strong candidates, so quality still
       // leads the choice while new characters stop reusing the same voice.
