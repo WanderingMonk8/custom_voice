@@ -2527,6 +2527,29 @@ test('an established Jev gender outranks a contradictory label hint', () => {
   assert.deepEqual(matches.map(match => [match.voiceId, match.gender]), [['female', 'female']])
 })
 
+test('rejects an established ghost whose stored voice is incompatible with the established gender', () => {
+  const groups = collectUncastVoiceGroups([{ text: 'Next please.', speakerId: UNCAST_SPEAKER_ID }])
+  const voices = readFavoriteVoices([
+    { id: 'female-voice', category: 'female' },
+    { id: 'male-voice', category: 'male' },
+    { id: 'unknown-voice', category: 'unspecified' },
+  ])
+  const female = { id: 'old-ghost', speakerId: UNCAST_SPEAKER_ID, voiceId: 'female-voice', context: 'A previous male voice from an earlier bad match.', occurrenceKeys: [], lastSeenMessageId: 'previous' }
+  const male = resolveUncastVoiceDecisions(groups, voices, {
+    gender_g0: confidentDecision('male'),
+    identity_g0: confidentDecision('ghost_0'),
+    voice_g0: { choice: 'voice_1', probabilities: { voice_0: 0.1, voice_1: 0.85, voice_2: 0.05 }, confidence: 0.8 },
+  }, [female], [], 'current', '', ['previous'], () => 0.99)
+  assert.deepEqual(male.map(match => [match.voiceId, match.gender]), [['male-voice', 'male']])
+
+  const unknown = { id: 'old-ghost', speakerId: UNCAST_SPEAKER_ID, voiceId: 'unknown-voice', context: 'Sparse voice metadata.', occurrenceKeys: [], lastSeenMessageId: 'previous' }
+  const accepted = resolveUncastVoiceDecisions(groups, voices, {
+    gender_g0: confidentDecision('male'),
+    identity_g0: confidentDecision('ghost_0'),
+  }, [unknown], [], 'current', '', ['previous'], () => 0.99)
+  assert.deepEqual(accepted.map(match => match.voiceId), ['unknown-voice'])
+})
+
 test('keeps ghost voices for the configured count of assistant messages and never links weak identities', () => {
   const ids = Array.from({ length: 13 }, (_, index) => `assistant-${index}`)
   const ghost = { id: 'ghost-1', speakerId: UNCAST_SPEAKER_ID, voiceId: 'voice-1', context: 'The clerk spoke.', occurrenceKeys: [], lastSeenMessageId: ids[0] }

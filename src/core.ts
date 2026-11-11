@@ -1527,6 +1527,17 @@ export function resolveUncastVoiceDecisions(
     // defines the compatible pool even when Jev's gender answer disagrees.
     // A Jev gender only decides the pool when narration left none.
     const rankingHint = members.find(member => member.pronounGender === 'male' || member.pronounGender === 'female')?.pronounGender
+    const existingGhost = ghost
+    if (existingGhost) {
+      const carriedVoice = voices.find(voice => voice.id === existingGhost.voiceId)
+      // A stored voice from an earlier generation must not override the now-known
+      // sex of the speaker if metadata identifies it as the wrong sex.
+      if (carriedVoice && !voiceGenderCompatible(carriedVoice, gender)) {
+        ghost = undefined
+        linkedGhosts.delete(root)
+        linkReasons.delete(root)
+      }
+    }
     if (!ghost) {
       const matches = members.map(group => answers[`voice_${group.id}`]).filter((answer): answer is SpeakerDecisionChoice => !!answer)
       const poolGender: 'male' | 'female' | 'unknown' = rankingHint ?? gender
