@@ -60,12 +60,6 @@ function readReductionComponents(value) {
   }
   return next;
 }
-var CRC_TABLE = new Uint32Array(256);
-for (let index = 0; index < 256; index += 1) {
-  let value = index;
-  for (let bit = 0; bit < 8; bit += 1) value = value & 1 ? value >>> 1 ^ 3988292384 : value >>> 1;
-  CRC_TABLE[index] = value >>> 0;
-}
 var UNRESOLVED_SPEAKER_ID = "__chat_voice_unresolved__";
 var DEFAULT_MESSAGE_LIMIT = 20;
 var MIN_MESSAGE_LIMIT = 1;
@@ -6141,7 +6135,7 @@ function applyConfigToMetadata(metadata, config) {
 }
 
 // src/version.ts
-var BUILD_VERSION = "3.31.0";
+var BUILD_VERSION = "3.32.0";
 
 // src/uuid.ts
 var lastTimestamp = 0;
@@ -7769,7 +7763,7 @@ spindle.onFrontendMessage(async (rawPayload, userId, frontendSessionId) => {
           }
           let assignments = resolveUncastVoiceDecisions(groups, voices, answers, ghosts, payload.reserved, payload.messageId, payload.message.slice(0, 3e4), assistantIds.slice(0, Math.max(0, assistantIds.indexOf(anchor))));
           const proposedAssignments = assignments;
-          if (assignments.length && !payload.dryRun) {
+          if (assignments.length) {
             assignments = await saveGhostVoiceAssignments(payload.chatId, payload.messageId, assistantIds, groups, assignments, userId, anchor, payload.reserved, lifetime, payload.message, payload.sourceHash, hashMessageContent(JSON.stringify(savedGhosts)));
           }
           const diagnostics = groups.map((group) => {
@@ -7783,10 +7777,10 @@ spindle.onFrontendMessage(async (rawPayload, userId, frontendSessionId) => {
             const proposed = proposedAssignments.find((item) => item.groupId === group.id);
             return `${group.id} segments=${group.segmentIndexes.map((index) => index + 1).join(",")} identity=${identity ? `${identity.choice} confidence=${identity.confidence} probabilities=${JSON.stringify(identity.probabilities)}` : "none"} gender=${gender ? `${gender.choice} confidence=${gender.confidence} probabilities=${JSON.stringify(gender.probabilities)}` : "none"} label=${label ? `${label.choice} confidence=${label.confidence} probabilities=${JSON.stringify(label.probabilities)}` : "none"} narrative-name=${narrativeName ? `${narrativeName.choice} (${plan.state.narrativeNames[Number(narrativeName.choice.replace("name_", ""))] ?? "none"}) confidence=${narrativeName.confidence} probabilities=${JSON.stringify(narrativeName.probabilities)}` : "none"} comparisons=${comparisons} proposed=${proposed ? `${proposed.ghostId} / ${proposed.voiceId} / ${proposed.gender}` : "none"} match-reason=${proposed?.matchReason ?? "none"} voice-choice=${voice ? `${voice.choice} confidence=${voice.confidence} probabilities=${JSON.stringify(voice.probabilities)}` : "none"} final=${assignment ? `${assignment.label || "unnamed"} / ${assignment.ghostId} / ${assignment.voiceId}` : "connection default"}`;
           });
-          diagnostics.unshift(`build=${BUILD_VERSION}; Available favorites=${voices.length}, historical ghosts=${ghosts.length}, current ghosts=${currentGhosts.length}; prior messages=${matchingContext.previousMessages.length}${decisionError ? `; Jev failed: ${decisionError}` : ""}; identity review questions=${Object.keys(review.questions).length}${reviewError ? `; review failed: ${reviewError}` : ""}${payload.dryRun ? "; dryRun=true (assignments not persisted)" : ""}; reduction=${Object.entries(reduction).filter(([, enabled]) => !enabled).map(([id]) => id).join(",") || "full"}.`);
+          diagnostics.unshift(`build=${BUILD_VERSION}; Available favorites=${voices.length}, historical ghosts=${ghosts.length}, current ghosts=${currentGhosts.length}; prior messages=${matchingContext.previousMessages.length}${decisionError ? `; Jev failed: ${decisionError}` : ""}; identity review questions=${Object.keys(review.questions).length}${reviewError ? `; review failed: ${reviewError}` : ""}; reduction=${Object.entries(reduction).filter(([, enabled]) => !enabled).map(([id]) => id).join(",") || "full"}.`);
           diagnostics.splice(1, 0, `Candidate context: ${ghosts.map((ghost, index) => `ghost_${index}=${ghost.id} last=${ghost.lastSeenMessageId || "none"} history=${(ghost.conversationHistory ?? []).map((entry) => `${entry.messageId}(${entry.text.length} chars)`).join(",") || "none"} context=${ghost.context.length} chars`).join("; ") || "none"}; prior=${matchingContext.previousMessages.map((item) => `${item.role ?? "unknown"}:${item.id}(${item.text.length} chars)`).join(",") || "none"}.`);
           sendFrontend({ type: "chat_voice_uncast_matches", requestId: payload.requestId, assignments, diagnostics }, userId, frontendSessionId);
-          if (assignments.length && !payload.dryRun) await sendState(userId, void 0, payload.chatId, frontendSessionId);
+          if (assignments.length) await sendState(userId, void 0, payload.chatId, frontendSessionId);
         }
       } catch (error) {
         sendFrontend({ type: "chat_voice_uncast_matches", requestId: payload.requestId, assignments: [], error: error instanceof Error ? error.message : "Could not match uncast voices." }, userId, frontendSessionId);

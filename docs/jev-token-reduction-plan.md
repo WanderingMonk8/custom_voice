@@ -586,9 +586,9 @@ The speaker identity pipeline is useful enough already. It should not be distill
 
 ---
 
-## Implementation status (v3.31.0)
+## Implementation status (v3.32.0)
 
-Landed as the **token reduction** implementation. Each plan component below is a global setting, toggleable independently in the Advanced section; turning a component off restores the pre-reduction behavior for that component alone. The comparison mode (also in Advanced) routes audible playback to the configured reduction implementation while running the pre-reduction pipeline silently in parallel; both outputs land in a capped rolling report (20 captures) stored in the global voice settings under `chatVoiceReductionCompareReport` and downloadable as a ZIP via "Download report". The report survives extension updates and reinstalls.
+Landed as the **token reduction** implementation. Each plan component below is a global setting, toggleable independently in the Advanced section; turning a component off restores the pre-reduction behavior for that component alone. The temporary comparison mode and its accumulated report (added in v3.31.0) were retired in v3.32.0 after the 17-capture comparison showed no degradation on the routing/casting/voice axis (see `docs/comparison-reduction-analysis.md`); the per-component rollback toggles remain as the safety net.
 
 | # | Plan item | Component id | Status |
 |---|---|---|---|
@@ -602,4 +602,4 @@ Landed as the **token reduction** implementation. Each plan component below is a
 | 8 | Structural Phase 3 (fold secondary questions) | - | Not implemented; excluded per plan's own risk guidance. |
 | 9 | Prefilter voices by metadata | - | Not implemented; excluded per plan's recommendation. |
 
-Instrumentation (Phase 0) exists through `measureJevDecisionPayload` and the `[Chat Voice] Jev tag budget` log lines; comparison captures additionally record the full reduction and baseline debug reports side by side.
+Instrumentation (Phase 0) exists through `measureJevDecisionPayload` and the `[Chat Voice] Jev tag budget` log lines for the reduction-side cost accounting; the side-by-side comparison instrumentation was retired in v3.32.0 after the measurement campaign.

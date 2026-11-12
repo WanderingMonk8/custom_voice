@@ -172,7 +172,7 @@ type FrontendMessage =
   | { type: 'chat_voice_auto_cast'; requestId: string; chatId: string; voices: FavoriteVoice[]; reserved: string[]; narratorMissing: boolean; userMissing: boolean; ghostLifetime: number }
   | { type: 'chat_voice_ghost_edit'; chatId: string; ghostId: string; voice?: string; promote?: boolean; remove?: boolean }
   | { type: 'chat_voice_get_message'; chatId: string; messageId: string; requestId: string }
-  | { type: 'chat_voice_match_uncast'; requestId: string; chatId: string; messageId: string; message: string; sourceHash: string; groups: UncastVoiceGroup[]; voices: FavoriteVoice[]; reserved: string[]; lifetime: number; speakerLookback?: number; skippedTrackerTags?: string; reduction?: Partial<Record<string, boolean>>; dryRun?: boolean }
+  | { type: 'chat_voice_match_uncast'; requestId: string; chatId: string; messageId: string; message: string; sourceHash: string; groups: UncastVoiceGroup[]; voices: FavoriteVoice[]; reserved: string[]; lifetime: number; speakerLookback?: number; skippedTrackerTags?: string; reduction?: Partial<Record<string, boolean>> }
   | {
       type: 'chat_voice_parse_message'
       chatId: string
@@ -2137,7 +2137,7 @@ spindle.onFrontendMessage(async (rawPayload: unknown, userId, frontendSessionId)
           }
           let assignments = resolveUncastVoiceDecisions(groups, voices, answers, ghosts, payload.reserved, payload.messageId, payload.message.slice(0, 30_000), assistantIds.slice(0, Math.max(0, assistantIds.indexOf(anchor))))
           const proposedAssignments = assignments
-          if (assignments.length && !payload.dryRun) {
+          if (assignments.length) {
             assignments = await saveGhostVoiceAssignments(payload.chatId, payload.messageId, assistantIds, groups, assignments, userId, anchor, payload.reserved, lifetime, payload.message, payload.sourceHash, hashMessageContent(JSON.stringify(savedGhosts)))
           }
           const diagnostics = groups.map(group => {
@@ -2151,10 +2151,10 @@ spindle.onFrontendMessage(async (rawPayload: unknown, userId, frontendSessionId)
             const proposed = proposedAssignments.find(item => item.groupId === group.id)
             return `${group.id} segments=${group.segmentIndexes.map(index => index + 1).join(',')} identity=${identity ? `${identity.choice} confidence=${identity.confidence} probabilities=${JSON.stringify(identity.probabilities)}` : 'none'} gender=${gender ? `${gender.choice} confidence=${gender.confidence} probabilities=${JSON.stringify(gender.probabilities)}` : 'none'} label=${label ? `${label.choice} confidence=${label.confidence} probabilities=${JSON.stringify(label.probabilities)}` : 'none'} narrative-name=${narrativeName ? `${narrativeName.choice} (${plan.state.narrativeNames[Number(narrativeName.choice.replace('name_', ''))] ?? 'none'}) confidence=${narrativeName.confidence} probabilities=${JSON.stringify(narrativeName.probabilities)}` : 'none'} comparisons=${comparisons} proposed=${proposed ? `${proposed.ghostId} / ${proposed.voiceId} / ${proposed.gender}` : 'none'} match-reason=${proposed?.matchReason ?? 'none'} voice-choice=${voice ? `${voice.choice} confidence=${voice.confidence} probabilities=${JSON.stringify(voice.probabilities)}` : 'none'} final=${assignment ? `${assignment.label || 'unnamed'} / ${assignment.ghostId} / ${assignment.voiceId}` : 'connection default'}`
           })
-          diagnostics.unshift(`build=${BUILD_VERSION}; Available favorites=${voices.length}, historical ghosts=${ghosts.length}, current ghosts=${currentGhosts.length}; prior messages=${matchingContext.previousMessages.length}${decisionError ? `; Jev failed: ${decisionError}` : ''}; identity review questions=${Object.keys(review.questions).length}${reviewError ? `; review failed: ${reviewError}` : ''}${payload.dryRun ? '; dryRun=true (assignments not persisted)' : ''}; reduction=${Object.entries(reduction).filter(([, enabled]) => !enabled).map(([id]) => id).join(',') || 'full'}.`)
+          diagnostics.unshift(`build=${BUILD_VERSION}; Available favorites=${voices.length}, historical ghosts=${ghosts.length}, current ghosts=${currentGhosts.length}; prior messages=${matchingContext.previousMessages.length}${decisionError ? `; Jev failed: ${decisionError}` : ''}; identity review questions=${Object.keys(review.questions).length}${reviewError ? `; review failed: ${reviewError}` : ''}; reduction=${Object.entries(reduction).filter(([, enabled]) => !enabled).map(([id]) => id).join(',') || 'full'}.`)
           diagnostics.splice(1, 0, `Candidate context: ${ghosts.map((ghost, index) => `ghost_${index}=${ghost.id} last=${ghost.lastSeenMessageId || 'none'} history=${(ghost.conversationHistory ?? []).map(entry => `${entry.messageId}(${entry.text.length} chars)`).join(',') || 'none'} context=${ghost.context.length} chars`).join('; ') || 'none'}; prior=${matchingContext.previousMessages.map(item => `${item.role ?? 'unknown'}:${item.id}(${item.text.length} chars)`).join(',') || 'none'}.`)
           sendFrontend({ type: 'chat_voice_uncast_matches', requestId: payload.requestId, assignments, diagnostics }, userId, frontendSessionId)
-          if (assignments.length && !payload.dryRun) await sendState(userId, undefined, payload.chatId, frontendSessionId)
+          if (assignments.length) await sendState(userId, undefined, payload.chatId, frontendSessionId)
         }
       } catch (error) {
         sendFrontend({ type: 'chat_voice_uncast_matches', requestId: payload.requestId, assignments: [], error: error instanceof Error ? error.message : 'Could not match uncast voices.' }, userId, frontendSessionId)

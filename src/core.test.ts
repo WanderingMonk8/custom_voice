@@ -79,8 +79,6 @@ import {
   applyAssistantUserSpeakerReview,
   buildTtsTagPlan,
   measureJevDecisionPayload,
-  crc32,
-  buildStoreZip,
   voiceDecisionSummaryTerse,
   readReductionComponents,
   FULL_REDUCTION_COMPONENTS,
@@ -7111,32 +7109,4 @@ test('buildUncastVoiceDecision trimVoiceCriteria caps the shortlist and drops de
   const control = buildUncastVoiceDecision(groups, voices, 'A quiet morning.', [], [], false)
   assert.equal(Object.keys(control.questions.voice_g1!.criteria).length, 32)
   assert.ok(Object.values(control.questions.voice_g1!.criteria).some(value => value.includes('description')))
-})
-
-test('crc32 matches the standard check vector', () => {
-  assert.equal(crc32(new TextEncoder().encode('123456789')), 0xCBF43926)
-  assert.equal(crc32(new Uint8Array(0)), 0)
-})
-
-test('buildStoreZip writes a well-formed archive with local entries and a central directory', () => {
-  const encoder = new TextEncoder()
-  const zip = buildStoreZip([
-    { name: 'manifest.json', data: encoder.encode('{"ok":true}') },
-    { name: 'reports/01-first.md', data: encoder.encode('hello world') },
-  ])
-  assert.equal(zip[0], 0x50)
-  assert.equal(zip[1], 0x4b)
-  assert.equal(zip[2], 0x03)
-  assert.equal(zip[3], 0x04)
-  const signatureAt = (signature: number[]): number => {
-    for (let index = 0; index + 4 <= zip.length; index += 1) {
-      if (signature.every((byte, offset) => zip[index + offset] === byte)) return index
-    }
-    return -1
-  }
-  assert.notEqual(signatureAt([0x50, 0x4b, 0x01, 0x02]), -1)
-  assert.notEqual(signatureAt([0x50, 0x4b, 0x05, 0x06]), -1)
-  const latin1 = Buffer.from(zip).toString('latin1')
-  assert.ok(latin1.includes('manifest.json'))
-  assert.ok(latin1.includes('reports/01-first.md'))
 })
