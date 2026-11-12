@@ -147,6 +147,7 @@ import {
   voiceDecisionSummary,
   interactionAnchorOverlap,
   interactionAnchors,
+  appearanceAnchors,
   voiceDescriptionTagHints,
   voiceGender,
   voiceGenderCompatible,
@@ -2407,6 +2408,35 @@ test('a Jev gender that contradicts the narration class falls back to that class
     voice_g0: confidentDecision('voice_3'),
   })
   assert.deepEqual(result.map(item => [item.voiceId, item.gender]), [['male-2', 'male']])
+})
+
+test('appearanceAnchors extract clothing introduction phrases', () => {
+  const text = 'A girl in a faded grey soccer hoodie walks in with a girl in the denim overalls. A guy in the windbreaker says hello.'
+  const anchors = appearanceAnchors(text)
+  assert.ok(anchors.includes('faded grey soccer hoodie'))
+  assert.ok(anchors.includes('grey soccer hoodie') || anchors.includes('soccer hoodie'))
+  assert.ok(anchors.includes('denim overalls'))
+  assert.ok(anchors.includes('windbreaker'))
+  // No anchors for prose lacking garment descriptors.
+  assert.deepEqual(appearanceAnchors('She smiles at the table and speaks quietly.'), [])
+})
+
+test('appearance anchors ride along in the uncast decision plan for candidate and ghost', () => {
+  const narration = 'A girl in a faded grey soccer hoodie sits down.'
+  const narration2 = 'The girl in the denim overalls asks.'
+  const message = `${narration}  \u201cOh, is this Halvorsen\u2019s petition?\u201d ${narration2}`
+  const groups = collectUncastVoiceGroups([
+    { text: narration, speakerId: null },
+    { speakerId: UNCAST_SPEAKER_ID, text: "Oh, is this Halvorsen's petition?" },
+    { text: narration2, speakerId: null },
+    { speakerId: UNCAST_SPEAKER_ID, text: 'Hmm, I will take one.' },
+  ])
+  const ghost = { id: 'ghost-old', speakerId: UNCAST_SPEAKER_ID, voiceId: 'old', label: 'the windbreaker guy', context: 'The guy in the windbreaker says \u201cyeah, sure.\u201d', occurrenceKeys: [], lastSeenMessageId: 'previous' }
+  const plan = buildUncastVoiceDecision(groups, [], message, [ghost])
+  assert.ok(plan.state.characters[0].appearance?.includes('faded grey soccer hoodie'))
+  assert.ok(plan.state.characters[0].appearance?.includes('denim overalls'))
+  assert.ok(plan.state.ghosts[0].appearance.includes('windbreaker'))
+  assert.match(plan.questions.identity_g0.instructions, /appearance anchors/iu)
 })
 
 test('a misattributed "she" from cast narration does not send an explicitly male uncast speaker to a female voice', () => {

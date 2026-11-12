@@ -447,6 +447,7 @@ function buildUncastVoiceDecision(groups, voices, message, ghosts = [], previous
       speeches: group.speeches,
       context: group.context,
       anchors: interactionAnchors([...group.speeches, ...group.context].join(" ")),
+      appearance: appearanceAnchors([...group.speeches, ...group.context].join(" ")),
       ...group.addressee ? { addressee: group.addressee } : {},
       ...group.flankPartners ? { flankPartners: group.flankPartners } : {},
       ...group.pronounPartners ? { pronounPartners: group.pronounPartners } : {},
@@ -464,6 +465,7 @@ function buildUncastVoiceDecision(groups, voices, message, ghosts = [], previous
         context: ghost.context,
         conversationHistory: ghost.conversationHistory ?? [],
         anchors: interactionAnchors([ghost.context, ...history].join(" ")),
+        appearance: appearanceAnchors([ghost.context, ...history].join(" ")),
         ...ghost.interactivityTrail?.length ? { interactivityTrail: ghost.interactivityTrail.slice(-4) } : {}
       };
     }),
@@ -493,7 +495,7 @@ function buildUncastVoiceDecision(groups, voices, message, ghosts = [], previous
     const earlier = groups.slice(0, groups.indexOf(group));
     if (ghosts.length || earlier.length) questions[`identity_${group.id}`] = {
       type: "choice",
-      instructions: `Does character ${group.id} clearly represent the same individual as one prior character? Compare the CURRENT exchange with previousMessages and the prior character's own conversation history. Use topic, activity, actions, objects, physical location, actors, addressees and continuing pair relationships as intra-message and inter-message anchors. Explicit narration that announces another, new, or a second/different voice marks a potentially different participant, not a stylistic quirk; honor that boundary unless the surrounding evidence clearly shows continuity. Activities and conversation topics can evolve over time; use anchors and interactivityTrail as a sequence to trace that evolution rather than requiring identical phrasing or a static topic. Compare who acts with whom, who receives the action, and who addresses whom before and after the target speech. Several agreeing anchors can identify someone when their name is revealed later. A shared object, setting, gender, occupation, topic or voice alone is insufficient; check for multiple people, scene changes, interruptions, and names that identify an addressee or bystander rather than the speaker. Do not confuse the speaker with the person they address. Select new_or_unclear unless identity is clear.`,
+      instructions: `Does character ${group.id} clearly represent the same individual as one prior character? Compare the CURRENT exchange with previousMessages and the prior character's own conversation history. Use topic, activity, actions, objects, physical location, actors, addressees and continuing pair relationships as intra-message and inter-message anchors. Appearance anchors (state.characters[].appearance and state.ghosts[].appearance) \u2014 e.g. "denim overalls", "faded grey soccer hoodie" \u2014 pin down a specific person; unlike shared nouns such as "the girl" or "the guy", distinct appearance descriptions signal different individuals, and matching appearance anchors support continuity. Explicit narration that announces another, new, or a second/different voice marks a potentially different participant, not a stylistic quirk; honor that boundary unless the surrounding evidence clearly shows continuity. Activities and conversation topics can evolve over time; use anchors and interactivityTrail as a sequence to trace that evolution rather than requiring identical phrasing or a static topic. Compare who acts with whom, who receives the action, and who addresses whom before and after the target speech. Several agreeing anchors can identify someone when their name is revealed later. A shared object, setting, gender, occupation, topic or voice alone is insufficient; check for multiple people, scene changes, interruptions, and names that identify an addressee or bystander rather than the speaker. Do not confuse the speaker with the person they address. Select new_or_unclear unless identity is clear.`,
       criteria: {
         new_or_unclear: "A new character, or identity cannot be reliably established.",
         ...Object.fromEntries(ghosts.map((ghost, index) => [`ghost_${index}`, `Previously seen character ${ghostCastAliases(ghost).join(" / ") || ghost.speakerId}; see state.ghosts[${index}] for its context and history`])),
@@ -570,7 +572,7 @@ function buildUncastIdentityReview(groups, answers, message, ghosts = [], messag
     if (candidate && identity && probability >= 0.6 && identity.confidence >= 0.5 && probability - runnerUp >= 0.2 && (probability < 0.8 || identity.confidence < 0.8 || probability - runnerUp < 0.25)) {
       questions[`review_ghost_${group.id}_${ghostChoice[1]}`] = {
         type: "choice",
-        instructions: `Compare the speaker in current group ${group.id} with the previously seen character ${candidate.label || candidate.speakerId}. Read the prior character's conversation history, interactivityTrail, and the full current scene, including other participants' dialogue, evolving topic, activity, actor/addressee pairs and anchors. Activities and conversation topics can evolve over time, so recognize related shifts instead of demanding identical wording. Confirm only if they are the same person; distinguish callers, people addressed, and people merely mentioned.`,
+        instructions: `Compare the speaker in current group ${group.id} with the previously seen character ${candidate.label || candidate.speakerId}. Read the prior character's conversation history, interactivityTrail, and the full current scene, including other participants' dialogue, evolving topic, activity, actor/addressee pairs and anchors. Appearance anchors (state.characters[].appearance and state.ghosts[].appearance) identify distinct physical forms of the speaker; unmatched appearance anchors are strong evidence of different individuals, even when both share a generic descriptor like "the girl" or "the guy", and matching anchors strongly support continuity. Activities and conversation topics can evolve over time, so recognize related shifts instead of demanding identical wording. Confirm only if they are the same person; distinguish callers, people addressed, and people merely mentioned.`,
         criteria: { same: "The prior character and current speaker are clearly the same person.", different_or_unclear: "They differ or the evidence is insufficient." }
       };
     }
@@ -590,7 +592,7 @@ function buildUncastIdentityReview(groups, answers, message, ghosts = [], messag
         if (interveningUser && linkedToPrior) {
           questions[`review_continuity_${group.id}_${ghostIndex}`] = {
             type: "choice",
-            instructions: `Compare ghost_${ghostIndex}'s actual speech in the immediately preceding assistant message with the intervening user message and current group ${group.id}, now identified as ${revealedName}. The user may address the earlier speaker and the current dialogue may directly answer that user's question: follow the conversation and narrative actions across all three messages. Do not assume every speaker in the earlier message is this ghost, or that the same setting alone proves identity. Is this clearly the same person, clearly a different person, or genuinely uncertain?`,
+            instructions: `Compare ghost_${ghostIndex}'s actual speech in the immediately preceding assistant message with the intervening user message and current group ${group.id}, now identified as ${revealedName}. The user may address the earlier speaker and the current dialogue may directly answer that user's question: follow the conversation and narrative actions across all three messages. Do not assume every speaker in the earlier message is this ghost, or that the same setting alone proves identity. Appearance anchors (state.ghosts[].appearance and state.characters[].appearance) describe each character's physical form; unmatched appearance anchors are strong evidence of different people. Is this clearly the same person, clearly a different person, or genuinely uncertain?`,
             criteria: { same: "The conversation and scene clearly identify the same person.", different: "The evidence clearly establishes different people.", unclear: "There is not enough evidence to decide." }
           };
           if (Object.keys(questions).length >= 16) break;
@@ -604,7 +606,7 @@ function buildUncastIdentityReview(groups, answers, message, ghosts = [], messag
         if (previousMessages.length && ghost.conversationHistory?.length && Object.keys(questions).length < 16) {
           questions[`review_scene_${group.id}_${ghostIndex}`] = {
             type: "choice",
-            instructions: `Re-read previousMessages, ghost_${ghostIndex}'s own saved conversation history, interactivityTrail, and the CURRENT exchange. Has the previously unnamed person who spoke in that history now been identified as ${revealedName}, the actual speaker of ${group.id}? Trace who speaks to whom, the continuing or evolving conversation, topic/activity anchors, objects and workstations and their locations, associated actions, actor/addressee pairings and later naming. Activities and topics can evolve, so use the sequence rather than identical phrasing. Use several agreeing clues together, including intervening user messages. A shared setting, object, profession, gender, topic or voice alone does not prove identity. Consider multiple people, a new arrival or scene change, and whether the name belongs to an addressee or bystander. Select different_or_unclear when these details do not clearly establish the same individual.`,
+            instructions: `Re-read previousMessages, ghost_${ghostIndex}'s own saved conversation history, interactivityTrail, appearance anchors, and the CURRENT exchange. Has the previously unnamed person who spoke in that history now been identified as ${revealedName}, the actual speaker of ${group.id}? Trace who speaks to whom, the continuing or evolving conversation, topic/activity anchors, objects and workstations and their locations, associated actions, actor/addressee pairings and later naming. Activities and topics can evolve, so use the sequence rather than identical phrasing. Use several agreeing clues together, including intervening user messages. A shared setting, object, profession, gender, appearance match, topic or voice alone does not prove identity. Consider multiple people, a new arrival or scene change, and whether the name belongs to an addressee or bystander. Select different_or_unclear when these details do not clearly establish the same individual.`,
             criteria: { same: "The earlier unnamed character and the newly named speaker are clearly the same individual.", different_or_unclear: "Different individuals, or continuity is not clearly established." }
           };
         }
@@ -1659,6 +1661,277 @@ function interactionAnchors(text, limit = 12) {
     if (index < tokens.length - 1) bump(`${tokens[index]} ${tokens[index + 1]}`, 2, index);
   }
   return [...counts.entries()].sort((a, b) => b[1] - a[1] || (first.get(a[0]) ?? 0) - (first.get(b[0]) ?? 0) || a[0].localeCompare(b[0])).slice(0, Math.max(1, Math.round(limit))).map(([anchor]) => anchor);
+}
+var APPEARANCE_MODIFIERS = /* @__PURE__ */ new Set([
+  "faded",
+  "dark",
+  "light",
+  "pale",
+  "bright",
+  "muted",
+  "soft",
+  "washed",
+  "distressed",
+  "ripped",
+  "torn",
+  "tight",
+  "loose",
+  "baggy",
+  "fitted",
+  "cropped",
+  "oversized",
+  "wide",
+  "narrow",
+  "striped",
+  "stripy",
+  "plain",
+  "solid",
+  "floral",
+  "plaid",
+  "patterned",
+  "camouflage",
+  "checkered",
+  "houndstooth",
+  "paisley",
+  "gingham",
+  "polka",
+  "maroon",
+  "crimson",
+  "navy",
+  "teal",
+  "olive",
+  "magenta",
+  "scarlet",
+  "amber",
+  "ochre",
+  "umber",
+  "crimson",
+  "indigo",
+  "violet",
+  "purple",
+  "lavender",
+  "lilac",
+  "azure",
+  "cerulean",
+  "aquamarine",
+  "royal",
+  "grey",
+  "gray",
+  "ashen",
+  "leaden",
+  "silver",
+  "charcoal",
+  "black",
+  "white",
+  "offwhite",
+  "cream",
+  "beige",
+  "tan",
+  "khaki",
+  "brown",
+  "chestnut",
+  "walnut",
+  "auburn",
+  "sepia",
+  "golden",
+  "bronze",
+  "auburn",
+  "rust",
+  "coral",
+  "salmon",
+  "rose",
+  "rosewood",
+  "blue",
+  "red",
+  "green",
+  "yellow",
+  "orange",
+  "pink",
+  "gold",
+  "glows",
+  "glowy",
+  "meringue",
+  "glossy",
+  "matte",
+  "shiny",
+  "silky",
+  "velvet",
+  "denim",
+  "cotton",
+  "wool",
+  "linen",
+  "leather",
+  "suede",
+  "flannel",
+  "fleece",
+  "nylon",
+  "polyester",
+  "spandex",
+  "rayon",
+  "cashmere",
+  "silk",
+  "soccer",
+  "football",
+  "basketball",
+  "track",
+  "running",
+  "cycling",
+  "gym",
+  "sport",
+  "athletic",
+  "tennis",
+  "golf",
+  "motocross",
+  "motorcycle",
+  "leather",
+  "chainmail",
+  "tactical",
+  "military",
+  "work",
+  "school",
+  "uniform",
+  "dress",
+  "formal",
+  "wedding",
+  "party",
+  "church",
+  "casual",
+  "weekend",
+  "evening",
+  "bra",
+  "bralette",
+  "drawstring",
+  "zipper",
+  "zippered",
+  "hooded",
+  "buttoned",
+  "laced",
+  "collared",
+  "cuffed",
+  "furred",
+  "fleece",
+  "ribbed",
+  "slubbed",
+  "textured",
+  "quilted",
+  "pleated",
+  "creased",
+  "rolled"
+]);
+var APPEARANCE_GARMENTS = /* @__PURE__ */ new Set([
+  "hoodie",
+  "sweatshirt",
+  "sweater",
+  "jumper",
+  "t-shirt",
+  "tee",
+  "shirt",
+  "polo",
+  "blouse",
+  "top",
+  "tank",
+  "cami",
+  "camisole",
+  "vest",
+  "waistcoat",
+  "blazer",
+  "jacket",
+  "windbreaker",
+  "coat",
+  "overcoat",
+  "trench",
+  "mackintosh",
+  "parka",
+  "anorak",
+  "cardigan",
+  "dress",
+  "gown",
+  "skirt",
+  "pants",
+  "trousers",
+  "jeans",
+  "shorts",
+  "overalls",
+  "jumpsuit",
+  "romper",
+  "sweatpants",
+  "joggers",
+  "leggings",
+  "tights",
+  "trunks",
+  "briefs",
+  "boxers",
+  "shorts",
+  "underpants",
+  "lingerie",
+  "bra",
+  "panties",
+  "underwear",
+  "thong",
+  "socks",
+  "stockings",
+  "shoes",
+  "sneakers",
+  "boots",
+  "loafers",
+  "heels",
+  "sandals",
+  "sneakers",
+  "cleats",
+  "belt",
+  "scarf",
+  "tie",
+  "bowtie",
+  "bow",
+  "hat",
+  "cap",
+  "beanie",
+  "beret",
+  "visor",
+  "glasses",
+  "sunglasses",
+  "watch",
+  "ring",
+  "bracelet",
+  "earring",
+  "necklace",
+  "gloves",
+  "mittens",
+  "scrubs",
+  "apron",
+  "towel",
+  "bandana",
+  "headband",
+  "bonnet",
+  "veil"
+]);
+function appearanceAnchors(text, limit = 12) {
+  const tokens = text.toLowerCase().match(/[\p{L}\p{M}\p{N}-]+/gu) ?? [];
+  const found = [];
+  const seen = /* @__PURE__ */ new Set();
+  const push = (phrase) => {
+    if (!seen.has(phrase) && phrase.length >= 4) {
+      seen.add(phrase);
+      found.push(phrase);
+    }
+  };
+  for (let index = tokens.length - 1; index >= 0; index -= 1) {
+    const token = tokens[index];
+    if (!APPEARANCE_GARMENTS.has(token) && !APPEARANCE_GARMENTS.has(token.endsWith("s") ? token.slice(0, -1) : token)) continue;
+    const garment = token.endsWith("s") && APPEARANCE_GARMENTS.has(token.slice(0, -1)) ? token.slice(0, -1) : token;
+    let start = index;
+    while (start > 0) {
+      const prev = tokens[start - 1];
+      if (!APPEARANCE_MODIFIERS.has(prev)) break;
+      start -= 1;
+    }
+    const phrase = tokens.slice(start, index + 1).join(" ");
+    push(phrase);
+    for (let cursor = start; cursor < index; cursor += 1) {
+      push(`${tokens[cursor]} ${garment}`);
+    }
+  }
+  return found.slice(0, limit);
 }
 var SPEECH_VERBS = "(?:said|says|asked|asks|replied|replies|whispered|whispers|shouted|shouts|yelled|yells|called|calls|murmured|murmurs|answered|answers|added|adds|continued|continues|remarked|remarks|cried|cries|growled|growls|sighed|sighs)";
 function escapedPattern(value) {
