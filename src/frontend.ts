@@ -19,6 +19,11 @@ import {
   eligibleCardFallbackSpeakerId,
   globalTtsConnectionPreference,
   standardSpeakerReviewPolicy,
+  REDUCTION_COMPONENTS,
+  FULL_REDUCTION_COMPONENTS,
+  DISABLED_REDUCTION_COMPONENTS,
+  readReductionComponents,
+  buildStoreZip,
   autoplayGenerationEvent,
   autoplaySwipeSnapshot,
   autoplaySwipeMatches,
@@ -72,6 +77,7 @@ import {
   type UncastVoiceGroup,
   type UncastVoiceAssignment,
   type SavedAudioRecord,
+  type ReductionComponentMap,
 } from './core'
 
 interface TtsConnection {
@@ -415,6 +421,10 @@ interface PlaybackPreferences {
   communityVoicePoolAt: string
   communityVoiceLanguage: string
   autoVoiceCastingPool: 'favorite' | 'community'
+  /** Compare the configured reduction implementation against the pre-reduction baseline. */
+  reductionCompare: boolean
+  /** Per-component token-reduction toggles; absent entries default to enabled (full reduction). */
+  reductionComponents: ReductionComponentMap
 }
 
 function clampIntegerSetting(value: unknown, fallback: number, maximum: number): number {
@@ -493,6 +503,8 @@ async function loadPlaybackPreferences(): Promise<PlaybackPreferences> {
     communityVoicePoolAt: '',
     communityVoiceLanguage: '',
     autoVoiceCastingPool: 'favorite',
+    reductionCompare: false,
+    reductionComponents: { ...FULL_REDUCTION_COMPONENTS },
   }
   const row = await response.json() as { value?: Record<string, unknown> }
   const speed = typeof row.value?.ttsSpeed === 'number' ? row.value.ttsSpeed : 1
@@ -561,6 +573,8 @@ async function loadPlaybackPreferences(): Promise<PlaybackPreferences> {
       ? row.value.chatVoiceCommunityVoiceLanguage.trim().slice(0, 32).toLowerCase()
       : '',
     autoVoiceCastingPool: row.value?.chatVoiceAutoCastPool === 'community' ? 'community' : 'favorite',
+    reductionCompare: row.value?.chatVoiceReductionCompare === true,
+    reductionComponents: readReductionComponents(row.value?.chatVoiceReductionComponents),
   }
 }
 
@@ -638,6 +652,110 @@ function saveTtsTagPreferences(
   }))
 }
 
+const REDUCTION_COMPARE_REPORT_KEY = 'chatVoiceReductionCompareReport'
+const REDUCTION_COMPARE_REPORT_CAP = 20
+const REDUCTION_COMPARE_TEXT_CAP = 80_000
+
+interface ReductionCompareReportEntry {
+  id: string
+  iso: string
+  chatId: string
+  messageId: string
+  reduction: { text: string; bytes: number }
+  baseline: { text: string; bytes: number }
+}
+
+function utf8ByteLength(text: string): number {
+  return new TextEncoder().encode(text).length
+}
+
+function truncateReportText(text: string): string {
+  if (text.length <= REDUCTION_COMPARE_TEXT_CAP) return text
+  return `${text.slice(0, REDUCTION_COMPARE_TEXT_CAP)}\n[truncated: ${text.length - REDUCTION_COMPARE_TEXT_CAP} characters omitted]`
+}
+
+/** Sanitize the accumulated rolling report stored in global voice settings. */
+function readReductionCompareReports(value: unknown): ReductionCompareReportEntry[] {
+  if (!Array.isArray(value)) return []
+  const entries: ReductionCompareReportEntry[] = []
+  for (const item of value) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) continue
+    const row = item as Record<string, unknown>
+    if (typeof row.id !== 'string' || !row.id.trim() || row.id.length > 128) continue
+    if (typeof row.iso !== 'string' || Number.isNaN(Date.parse(row.iso))) continue
+    if (typeof row.chatId !== 'string' || !row.chatId || typeof row.messageId !== 'string' || !row.messageId) continue
+    const readSide = (side: unknown): { text: string; bytes: number } => {
+      const part = side && typeof side === 'object' && !Array.isArray(side) ? side as Record<string, unknown> : {}
+      const text = typeof part.text === 'string' ? truncateReportText(part.text) : ''
+      const bytes = typeof part.bytes === 'number' && Number.isFinite(part.bytes) && part.bytes >= 0 ? Math.round(part.bytes) : utf8ByteLength(text)
+      return { text, bytes }
+    }
+    entries.push({
+      id: row.id.slice(0, 128),
+      iso: row.iso,
+      chatId: row.chatId.slice(0, 128),
+      messageId: row.messageId.slice(0, 128),
+      reduction: readSide(row.reduction),
+      baseline: readSide(row.baseline),
+    })
+  }
+  return entries.slice(-REDUCTION_COMPARE_REPORT_CAP)
+}
+
+/** Append a capture to the rolling report; returns the number of stored entries. */
+async function appendReductionCompareReport(entry: ReductionCompareReportEntry): Promise<number> {
+  let count = 0
+  await updateVoiceSettings(current => {
+    const existing = readReductionCompareReports(current[REDUCTION_COMPARE_REPORT_KEY])
+    count = Math.min(REDUCTION_COMPARE_REPORT_CAP, existing.length + 1)
+    return { ...current, [REDUCTION_COMPARE_REPORT_KEY]: [...existing, entry].slice(-REDUCTION_COMPARE_REPORT_CAP) }
+  })
+  return count
+}
+
+async function clearReductionCompareReport(): Promise<void> {
+  await updateVoiceSettings(current => ({ ...current, [REDUCTION_COMPARE_REPORT_KEY]: [] }))
+}
+
+async function readReductionCompareReportCount(): Promise<number> {
+  try {
+    const response = await fetch('/api/v1/settings/voiceSettings', {
+      credentials: 'same-origin',
+      headers: { Accept: 'application/json' },
+    })
+    if (!response.ok) return 0
+    const row = await response.json() as { value?: Record<string, unknown> }
+    return readReductionCompareReports(row.value?.[REDUCTION_COMPARE_REPORT_KEY]).length
+  } catch {
+    return 0
+  }
+}
+
+function reductionCompareReportMarkdown(entry: ReductionCompareReportEntry): string {
+  return [
+    '# Chat Voice — reduction comparison report',
+    '',
+    `- Chat: \`${entry.chatId}\``,
+    `- Message: \`${entry.messageId}\``,
+    `- Captured: ${entry.iso}`,
+    `- Reduction payload: ${entry.reduction.bytes} bytes`,
+    `- Baseline payload: ${entry.baseline.bytes} bytes`,
+    '',
+    '## Reduction implementation (audible) — configured reduction components',
+    '',
+    '```',
+    entry.reduction.text || '(no output captured)',
+    '```',
+    '',
+    '## Baseline (silent) — pre-reduction behavior',
+    '',
+    '```',
+    entry.baseline.text || '(no output captured)',
+    '```',
+    '',
+  ].join('\n')
+}
+
 function saveAdvancedPlaybackPreferences(
   bufferSegments: number,
   concurrentGenerations: number,
@@ -650,6 +768,8 @@ function saveAdvancedPlaybackPreferences(
   speakerLookback: number,
   skipNarration: boolean,
   autoVoiceCastingPool: 'favorite' | 'community',
+  reductionCompare: boolean,
+  reductionComponents: ReductionComponentMap,
 ): Promise<void> {
   return updateVoiceSettings(current => ({
     ...current,
@@ -676,6 +796,8 @@ function saveAdvancedPlaybackPreferences(
     chatVoiceAutoCastPool: autoVoiceCastingPool,
     chatVoiceGhostVoiceLifetime: clampIntegerSetting(ghostVoiceLifetime, GHOST_VOICE_LIFETIME_MESSAGES, 1000),
     chatVoiceSpeakerLookback: clampIntegerSetting(speakerLookback, DEFAULT_SPEAKER_LOOKBACK, MAX_SPEAKER_LOOKBACK),
+    chatVoiceReductionCompare: reductionCompare,
+    chatVoiceReductionComponents: { ...readReductionComponents(reductionComponents) },
   }))
 }
 
@@ -1146,6 +1268,8 @@ export function setup(ctx: SpindleFrontendContext) {
     .chat-voice-status[data-state="saved"] { color:var(--lumiverse-success, #65b97a); }
     .chat-voice-status[data-state="error"] { color:var(--lumiverse-danger, #ef6464); }
     .chat-voice-advanced-section { border-top:1px solid var(--lumiverse-border); padding-top:12px; }
+    .chat-voice-reduction-group { display:flex; flex-direction:column; gap:12px; border-top:1px solid var(--lumiverse-border); padding-top:12px; }
+    .chat-voice-reduction-title { font-weight:700; color:var(--lumiverse-text); }
     .chat-voice-advanced-summary {
       display:flex; align-items:center; justify-content:space-between; cursor:pointer;
       font-weight:700; list-style:none; user-select:none;
@@ -1901,6 +2025,88 @@ export function setup(ctx: SpindleFrontendContext) {
   copyReportButton.textContent = 'Copy Report'
   copyReportButton.addEventListener('click', () => { void copyDebugReport() })
   debugActions.append(copyReportButton)
+  // Token-reduction state; declared before the advanced-section UI that binds to these.
+  let reductionCompare = false
+  let reductionComponents: ReductionComponentMap = { ...FULL_REDUCTION_COMPONENTS }
+  /** Toggle elements for the per-component token-reduction switches, populated in the advanced section. */
+  const reductionComponentToggles: Array<{ id: keyof ReductionComponentMap; toggle: HTMLInputElement }> = []
+  let reductionCompareToggle: HTMLInputElement | null = null
+  /** Hint element next to the comparison-report buttons; populated in the advanced section. */
+  let reductionReportHint: HTMLElement | null = null
+  // Token-reduction controls: per-component rollback toggles plus the compare-mode capture UI.
+  const reductionGroup = document.createElement('div')
+  reductionGroup.className = 'chat-voice-reduction-group'
+  const reductionTitle = document.createElement('div')
+  reductionTitle.className = 'chat-voice-reduction-title'
+  reductionTitle.textContent = 'Token reduction (experimental)'
+  reductionGroup.append(reductionTitle)
+  const reductionCompareLabel = document.createElement('label')
+  reductionCompareLabel.className = 'chat-voice-toggle'
+  reductionCompareToggle = document.createElement('input')
+  reductionCompareToggle.type = 'checkbox'
+  reductionCompareToggle.setAttribute('aria-label', 'Compare reduction vs baseline')
+  const reductionCompareCopy = document.createElement('span')
+  reductionCompareCopy.className = 'chat-voice-toggle-copy'
+  const reductionCompareText = document.createElement('span')
+  reductionCompareText.textContent = 'Compare reduction vs baseline'
+  const reductionCompareHint = document.createElement('span')
+  reductionCompareHint.className = 'chat-voice-toggle-hint'
+  reductionCompareHint.textContent = 'Playback audio comes from the configured reduction implementation. A silent copy of the pre-reduction pipeline runs for the same message; nothing it decides affects the audible output, and its debug log is kept in the comparison report instead.'
+  reductionCompareToggle.checked = reductionCompare
+  reductionCompareToggle.addEventListener('change', () => {
+    reductionCompare = reductionCompareToggle?.checked ?? false
+    scheduleAdvancedSettingsSave()
+  })
+  reductionCompareCopy.append(reductionCompareText, reductionCompareHint)
+  reductionCompareLabel.append(reductionCompareToggle, reductionCompareCopy)
+  reductionGroup.append(reductionCompareLabel)
+  for (const component of REDUCTION_COMPONENTS) {
+    const componentLabel = document.createElement('label')
+    componentLabel.className = 'chat-voice-toggle'
+    const componentToggle = document.createElement('input')
+    componentToggle.type = 'checkbox'
+    componentToggle.checked = reductionComponents[component.id]
+    componentToggle.setAttribute('aria-label', component.label)
+    componentToggle.addEventListener('change', () => {
+      reductionComponents = readReductionComponents({ ...reductionComponents, [component.id]: componentToggle.checked })
+      scheduleAdvancedSettingsSave()
+    })
+    const componentCopy = document.createElement('span')
+    componentCopy.className = 'chat-voice-toggle-copy'
+    const componentText = document.createElement('span')
+    componentText.textContent = component.label
+    const componentHint = document.createElement('span')
+    componentHint.className = 'chat-voice-toggle-hint'
+    componentHint.textContent = component.hint
+    componentCopy.append(componentText, componentHint)
+    componentLabel.append(componentToggle, componentCopy)
+    reductionComponentToggles.push({ id: component.id, toggle: componentToggle })
+    reductionGroup.append(componentLabel)
+  }
+  const reductionActions = document.createElement('div')
+  reductionActions.className = 'chat-voice-debug-actions'
+  const downloadReportButton = document.createElement('button')
+  downloadReportButton.type = 'button'
+  downloadReportButton.className = 'chat-voice-copy-report-button'
+  downloadReportButton.textContent = 'Download report'
+  downloadReportButton.addEventListener('click', () => { void downloadReductionCompareReport() })
+  const clearReportButton = document.createElement('button')
+  clearReportButton.type = 'button'
+  clearReportButton.className = 'chat-voice-copy-report-button'
+  clearReportButton.textContent = 'Clear report'
+  clearReportButton.addEventListener('click', () => { void clearReductionCompareReportWithConfirm() })
+  reductionActions.append(downloadReportButton, clearReportButton)
+  reductionReportHint = document.createElement('span')
+  reductionReportHint.className = 'chat-voice-toggle-hint'
+  reductionReportHint.textContent = '0 comparison captures stored'
+  void readReductionCompareReportCount()
+    .then(count => { if (reductionReportHint) reductionReportHint.textContent = `${count} comparison capture${count === 1 ? '' : 's'} stored` })
+    .catch(() => undefined)
+  reductionGroup.append(reductionActions, reductionReportHint)
+  const reductionStoreHint = document.createElement('span')
+  reductionStoreHint.className = 'chat-voice-toggle-hint'
+  reductionStoreHint.textContent = 'The accumulated report (last 20 captures) is stored in the global voice settings shared by the whole app, so it survives extension updates and reinstalls. Each capture stores the reduction and baseline outputs for the same message.'
+  reductionGroup.append(reductionStoreHint)
   const advancedHint = document.createElement('div')
   advancedHint.className = 'chat-voice-hint'
   advancedHint.textContent = 'Concurrency starts at one and adapts up to the selected maximum. Dense short-segment runs stay at one request at a time, while sustained long runs increase gradually. Larger buffers reduce pauses but delay playback. The wait budget controls cumulative rate-limit cooldowns.'
@@ -1922,6 +2128,7 @@ export function setup(ctx: SpindleFrontendContext) {
     speakerDebugLabel,
     debugActions,
     speakerDebugOutput,
+    reductionGroup,
     advancedHint,
   )
 
@@ -2149,7 +2356,13 @@ export function setup(ctx: SpindleFrontendContext) {
   let llmConnectionRequestSequence = 0
   let tagPlacementRequestSequence = 0
 
+  // Compare-mode capture buffers: when the silent baseline pass runs, log lines are routed here instead
+  // of the panel; the reduction (audible) pass also tees its lines into its own buffer for the report.
+  let baselinePassLines: string[] | null = null
+  let reductionPassLines: string[] | null = null
+
   const setStatus = (message: string, state: 'normal' | 'saved' | 'error' = 'normal') => {
+    if (baselinePassLines) return // headless baseline pass: keep the visible status bar untouched
     status.textContent = message
     status.dataset.state = state
   }
@@ -2636,6 +2849,8 @@ export function setup(ctx: SpindleFrontendContext) {
     chatId: string,
     messageId: string,
     preferences: PlaybackPreferences,
+    reductionOverride?: ReductionComponentMap,
+    forceDebug = false,
   ): Promise<SpeakerParseReview> {
     const requestId = `parse-${Date.now().toString(36)}-${++speakerParseRequestSequence}`
     return new Promise((resolve, reject) => {
@@ -2659,8 +2874,9 @@ export function setup(ctx: SpindleFrontendContext) {
         skippedTrackerTags: preferences.skippedTrackerTags,
         ghostVoiceLifetime: preferences.ghostVoiceLifetime,
         speakerLookback: preferences.speakerLookback,
-        debug: preferences.speakerAssignmentDebug,
+        debug: forceDebug || preferences.speakerAssignmentDebug,
         ...standardSpeakerReviewPolicy(),
+        reduction: reductionOverride ?? preferences.reductionComponents,
       })
     })
   }
@@ -2675,7 +2891,7 @@ export function setup(ctx: SpindleFrontendContext) {
     })
   }
 
-  function requestUncastVoiceMatches(chatId: string, messageId: string, message: string, sourceHash: string, groups: UncastVoiceGroup[], voices: FavoriteVoice[], reserved: string[], lifetime: number, speakerLookback: number, skippedTrackerTags: string): Promise<UncastVoiceAssignment[]> {
+  function requestUncastVoiceMatches(chatId: string, messageId: string, message: string, sourceHash: string, groups: UncastVoiceGroup[], voices: FavoriteVoice[], reserved: string[], lifetime: number, speakerLookback: number, skippedTrackerTags: string, reductionOverride?: ReductionComponentMap, dryRun = false): Promise<UncastVoiceAssignment[]> {
     const requestId = `uncast-${Date.now().toString(36)}-${++uncastRequestSequence}`
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -2683,7 +2899,7 @@ export function setup(ctx: SpindleFrontendContext) {
         reject(new Error('Uncast voice matching timed out.'))
       }, 35_000)
       pendingUncastRequests.set(requestId, { resolve, reject, timer })
-      ctx.sendToBackend({ type: 'chat_voice_match_uncast', requestId, chatId, messageId, message, sourceHash, groups, voices, reserved, lifetime, speakerLookback, skippedTrackerTags })
+      ctx.sendToBackend({ type: 'chat_voice_match_uncast', requestId, chatId, messageId, message, sourceHash, groups, voices, reserved, lifetime, speakerLookback, skippedTrackerTags, reduction: reductionOverride, dryRun })
     })
   }
 
@@ -2916,7 +3132,8 @@ export function setup(ctx: SpindleFrontendContext) {
     parsingMode: PlaybackPreferences['speakerParsingMode'],
     review: SpeakerParseReview,
   ): void {
-    if (!speakerAssignmentDebug) return
+    const capturing = baselinePassLines !== null || reductionPassLines !== null
+    if (!speakerAssignmentDebug && !capturing) return
     const lines = [
       `Message ${messageId} (${isUserMessage ? 'user' : 'assistant'})`,
       `Parsing mode: ${parsingMode === 'off' ? 'local parser only' : 'Jev with local fallback'}`,
@@ -2982,12 +3199,23 @@ export function setup(ctx: SpindleFrontendContext) {
       'Legend: jev-* first pass · jev-turn-* and chain-* turn matrix · jev-discourse-* and discourse-* cross-paragraph review · resolution:* deterministic policy · voice-route:* final routing',
     )
     const log = lines.join('\n')
+    if (baselinePassLines) {
+      baselinePassLines.push(log)
+      return
+    }
+    reductionPassLines?.push(log)
     speakerDebugOutput.value = log
     console.debug('[Chat Voice] Speaker assignment trace\n' + log)
   }
 
   function appendSpeakerDebugLog(line: string): void {
-    if (!speakerAssignmentDebug) return
+    if (baselinePassLines) {
+      baselinePassLines.push(line)
+      console.debug(`[Chat Voice] ${line}`)
+      return
+    }
+    reductionPassLines?.push(line)
+    if (!speakerAssignmentDebug && !reductionPassLines) return
     speakerDebugOutput.value += `${speakerDebugOutput.value ? '\n' : ''}${line}`
     console.debug(`[Chat Voice] ${line}`)
   }
@@ -3079,6 +3307,77 @@ export function setup(ctx: SpindleFrontendContext) {
       speakerDebugOutput.focus()
       speakerDebugOutput.select()
       setStatus('Clipboard copy failed; the debug log text is selected for manual copying.', 'error')
+    }
+  }
+
+  async function downloadReductionCompareReport(): Promise<void> {
+    let entries: ReductionCompareReportEntry[] = []
+    try {
+      const response = await fetch('/api/v1/settings/voiceSettings', {
+        credentials: 'same-origin',
+        headers: { Accept: 'application/json' },
+      })
+      if (!response.ok) throw new Error(`Could not load global voice settings (${response.status}).`)
+      const row = await response.json() as { value?: Record<string, unknown> }
+      entries = readReductionCompareReports(row.value?.[REDUCTION_COMPARE_REPORT_KEY])
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : 'Could not load the reduction comparison report.', 'error')
+      return
+    }
+    if (entries.length === 0) {
+      setStatus('The reduction comparison report is empty. Enable "Compare reduction vs baseline" in Advanced settings and replay a message first.', 'error')
+      return
+    }
+    const encoder = new TextEncoder()
+    const files: Array<{ name: string; data: Uint8Array }> = [
+      {
+        name: 'manifest.json',
+        data: encoder.encode(JSON.stringify({
+          kind: 'chat-voice/reduction-compare-report',
+          format: 1,
+          app: 'Chat Voice',
+          exportedAt: new Date().toISOString(),
+          reportCount: entries.length,
+          retention: `Rolling buffer of the last ${REDUCTION_COMPARE_REPORT_CAP} captures, stored in global voice settings under \`${REDUCTION_COMPARE_REPORT_KEY}\`; it survives extension updates and reinstalls.`,
+          components: REDUCTION_COMPONENTS.map(component => ({ id: component.id, phase: component.phase, label: component.label })),
+        }, null, 2)),
+      },
+    ]
+    for (const [index, entry] of entries.entries()) {
+      const stamp = entry.iso.replace(/[:.]/gu, '-')
+      files.push({
+        name: `reports/${String(index + 1).padStart(2, '0')}-${stamp}-${entry.id}.md`,
+        data: encoder.encode(reductionCompareReportMarkdown(entry)),
+      })
+    }
+    const zip = buildStoreZip(files)
+    const blob = new Blob([zip as unknown as BlobPart], { type: 'application/zip' })
+    const url = URL.createObjectURL(blob)
+    const anchor = document.createElement('a')
+    anchor.href = url
+    anchor.download = `chat-voice-reduction-compare-report-${new Date().toISOString().slice(0, 10)}.zip`
+    document.body.appendChild(anchor)
+    anchor.click()
+    anchor.remove()
+    URL.revokeObjectURL(url)
+    setStatus(`Downloaded ${entries.length} comparison capture(s) as a zip.`, 'saved')
+  }
+
+  async function clearReductionCompareReportWithConfirm(): Promise<void> {
+    const { confirmed } = await ctx.ui.showConfirm({
+      title: 'Clear comparison report?',
+      message: 'This deletes every stored reduction comparison capture. This cannot be undone.',
+      confirmLabel: 'Clear',
+      cancelLabel: 'Keep',
+      variant: 'warning',
+    })
+    if (!confirmed) return
+    try {
+      await clearReductionCompareReport()
+      if (reductionReportHint) reductionReportHint.textContent = '0 comparison captures stored'
+      setStatus('Reduction comparison report cleared.', 'saved')
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : 'Could not clear the reduction comparison report.', 'error')
     }
   }
 
@@ -3348,8 +3647,12 @@ export function setup(ctx: SpindleFrontendContext) {
     })
   }
 
-  async function playMessage(messageId: string, nativeRegenerationAction = false, automatic = false, expectedSwipe?: AutoplaySwipeSnapshot): Promise<void> {
-    if (activePlayback?.messageId === messageId) {
+  async function playMessage(messageId: string, nativeRegenerationAction = false, automatic = false, expectedSwipe?: AutoplaySwipeSnapshot, compareBaseline = false): Promise<void> {
+    if (!compareBaseline) {
+      baselinePassLines = null
+      reductionPassLines = null
+    }
+    if (!compareBaseline && activePlayback?.messageId === messageId) {
       if (automatic) return
       playbackStartup.cancel()
       const finishingSave = stopPlayback()
@@ -3362,13 +3665,14 @@ export function setup(ctx: SpindleFrontendContext) {
       setStatus('Open a chat before starting voice playback.', 'error')
       return
     }
-    const startupToken = playbackStartup.begin(requestedChatId, messageId, automatic)
-    if (startupToken === null) {
+    const startupToken = compareBaseline ? null : playbackStartup.begin(requestedChatId, messageId, automatic)
+    if (!compareBaseline && startupToken === null) {
       if (!automatic) setStatus('Playback stopped.')
       return
     }
-    const ownsStartup = () => playbackStartup.owns(startupToken) && !autoPlaybackDisposed
-      && ctx.getActiveChat().chatId === requestedChatId && (!automatic || autoPlayback)
+    const ownsStartup = () => compareBaseline
+      || (playbackStartup.owns(startupToken as number) && !autoPlaybackDisposed
+        && ctx.getActiveChat().chatId === requestedChatId && (!automatic || autoPlayback))
     try {
     let message: PlaybackMessage
     try {
@@ -3385,7 +3689,7 @@ export function setup(ctx: SpindleFrontendContext) {
       return
     }
 
-    const regeneratingSavedAudio = !message.is_user
+    const regeneratingSavedAudio = !compareBaseline && !message.is_user
       && (nativeRegenerationAction || (!automatic && hasSavedAudioForCurrentSwipe(message)))
     if (regeneratingSavedAudio) {
       const { confirmed } = await ctx.ui.showConfirm({
@@ -3416,6 +3720,8 @@ export function setup(ctx: SpindleFrontendContext) {
     const config = collectConfig()
     const connectionVersionAtLoad = globalConnectionVersion
     const preferences = await loadPlaybackPreferences()
+    if (compareBaseline) baselinePassLines = []
+    else if (preferences.reductionCompare) reductionPassLines = []
     if (!ownsStartup()) return
     if (llmSettingsSaveTimer || savingLlmSettings) {
       preferences.speakerParsingMode = speakerParsingMode
@@ -3434,12 +3740,16 @@ export function setup(ctx: SpindleFrontendContext) {
       preferences.autoPlayback = autoPlayback
       preferences.speakerAssignmentDebug = speakerAssignmentDebug
       preferences.skipNarration = skipNarration
+      preferences.reductionCompare = reductionCompare
+      preferences.reductionComponents = { ...reductionComponents }
     } else {
       playbackBufferSegments = preferences.playbackBufferSegments
       concurrentGenerationLimit = preferences.concurrentGenerations
       rateLimitWaitSeconds = preferences.rateLimitWaitSeconds
       speakerAssignmentDebug = preferences.speakerAssignmentDebug
       skipNarration = preferences.skipNarration
+      reductionCompare = preferences.reductionCompare
+      reductionComponents = { ...preferences.reductionComponents }
     }
     const connectionId = savingGlobalConnection || connectionVersionAtLoad !== globalConnectionVersion
       ? lumiverseConnectionId
@@ -3456,7 +3766,7 @@ export function setup(ctx: SpindleFrontendContext) {
       connections.find(connection => connection.id === connectionId)?.voice ?? ''
     ).trim()
     let autoCastDiagnostics: string[] = []
-    if (preferences.autoVoiceCasting && poolVoicesForAutoCast().length && (!config.narratorVoice || !config.userVoice || playbackChat.characters.some(character => !config.characterVoices[character.id]))) {
+    if (!compareBaseline && preferences.autoVoiceCasting && poolVoicesForAutoCast().length && (!config.narratorVoice || !config.userVoice || playbackChat.characters.some(character => !config.characterVoices[character.id]))) {
       flushSave()
       const autoResult = await requestAutoCast(playbackChat.id, poolVoicesForAutoCast(), [connectionProfileVoice, config.narratorVoice, config.userVoice, ...Object.values(config.characterVoices)].filter(Boolean), !config.narratorVoice, !config.userVoice)
       if (!ownsStartup()) return
@@ -3477,56 +3787,86 @@ export function setup(ctx: SpindleFrontendContext) {
           + `userVoice=${JSON.stringify(config.userVoice || '<none>')}`,
       )
     }
-    const contextClass = window.AudioContext
-      ?? (window as typeof window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext
-    if (!contextClass) {
-      setStatus('Web Audio is unavailable in this browser.', 'error')
-      return
+    let playback: {
+      messageId: string
+      controller: AbortController
+      synthesisController: AbortController | null
+      context: AudioContext
+      source: AudioBufferSourceNode | null
+      persistenceState: 'disabled' | 'not-started' | 'pending' | 'saved' | 'failed'
+      persistenceError: string | null
+      playbackStopped: boolean
+      playbackFinished: boolean
+      audibleDone: Promise<void>
+      finishAudible: () => void
     }
-    const audioContext = new contextClass()
-    if (automatic) {
-      let timer: ReturnType<typeof setTimeout> | undefined
-      try {
-        await Promise.race([
-          audioContext.resume(),
-          new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error('Automatic playback needs a browser interaction. Click a play button to enable audio.')), 2000) }),
-        ])
-      } catch (error) {
-        void audioContext.close().catch(() => undefined)
-        if (ownsStartup()) setStatus(error instanceof Error ? error.message : 'Automatic playback could not start.', 'error')
-        return
-      } finally { if (timer) clearTimeout(timer) }
+    if (compareBaseline) {
+      // Headless baseline pass: no AudioContext and no registered playback, just the decision pipeline.
+      playback = {
+        messageId,
+        controller: new AbortController(),
+        synthesisController: null,
+        context: null as unknown as AudioContext,
+        source: null,
+        persistenceState: 'disabled',
+        persistenceError: null,
+        playbackStopped: true,
+        playbackFinished: true,
+        audibleDone: Promise.resolve(),
+        finishAudible: () => undefined,
+      }
     } else {
-      try { await audioContext.resume() } catch (error) { void audioContext.close().catch(() => undefined); throw error }
+      const contextClass = window.AudioContext
+        ?? (window as typeof window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext
+      if (!contextClass) {
+        setStatus('Web Audio is unavailable in this browser.', 'error')
+        return
+      }
+      const audioContext = new contextClass()
+      if (automatic) {
+        let timer: ReturnType<typeof setTimeout> | undefined
+        try {
+          await Promise.race([
+            audioContext.resume(),
+            new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error('Automatic playback needs a browser interaction. Click a play button to enable audio.')), 2000) }),
+          ])
+        } catch (error) {
+          void audioContext.close().catch(() => undefined)
+          if (ownsStartup()) setStatus(error instanceof Error ? error.message : 'Automatic playback could not start.', 'error')
+          return
+        } finally { if (timer) clearTimeout(timer) }
+      } else {
+        try { await audioContext.resume() } catch (error) { void audioContext.close().catch(() => undefined); throw error }
+      }
+      if (!ownsStartup()) { void audioContext.close().catch(() => undefined); return }
+      let audibleFinished = false
+      let resolveAudibleDone: (() => void) | null = null
+      const audibleDone = new Promise<void>((resolve) => {
+        resolveAudibleDone = resolve
+      })
+      playback = {
+        messageId,
+        controller: new AbortController(),
+        synthesisController: null as AbortController | null,
+        context: audioContext,
+        source: null as AudioBufferSourceNode | null,
+        persistenceState: 'not-started' as const as 'disabled' | 'not-started' | 'pending' | 'saved' | 'failed',
+        persistenceError: null as string | null,
+        playbackStopped: false,
+        playbackFinished: false,
+        audibleDone,
+        finishAudible: () => {
+          if (audibleFinished) return
+          audibleFinished = true
+          resolveAudibleDone?.()
+        },
+      }
+      // A different request may have started while this one was awaiting setup.
+      if (activePlayback) stopPlayback()
+      activePlayback = playback
+      if (startupToken !== null) playbackStartup.finish(startupToken)
+      updatePlaybackButtons()
     }
-    if (!ownsStartup()) { void audioContext.close().catch(() => undefined); return }
-    let audibleFinished = false
-    let resolveAudibleDone: (() => void) | null = null
-    const audibleDone = new Promise<void>((resolve) => {
-      resolveAudibleDone = resolve
-    })
-    const playback = {
-      messageId,
-      controller: new AbortController(),
-      synthesisController: null as AbortController | null,
-      context: audioContext,
-      source: null as AudioBufferSourceNode | null,
-      persistenceState: 'not-started' as const as 'disabled' | 'not-started' | 'pending' | 'saved' | 'failed',
-      persistenceError: null as string | null,
-      playbackStopped: false,
-      playbackFinished: false,
-      audibleDone,
-      finishAudible: () => {
-        if (audibleFinished) return
-        audibleFinished = true
-        resolveAudibleDone?.()
-      },
-    }
-    // A different request may have started while this one was awaiting setup.
-    if (activePlayback) stopPlayback()
-    activePlayback = playback
-    playbackStartup.finish(startupToken)
-    updatePlaybackButtons()
     const playbackSetupFinishedAt = Date.now()
 
     try {
@@ -3561,7 +3901,13 @@ export function setup(ctx: SpindleFrontendContext) {
         )
       }
       try {
-        review = await requestSpeakerReviewedSegments(playbackChat.id, messageId, preferences)
+        review = await requestSpeakerReviewedSegments(
+          playbackChat.id,
+          messageId,
+          preferences,
+          compareBaseline ? DISABLED_REDUCTION_COMPONENTS : undefined,
+          compareBaseline || preferences.reductionCompare,
+        )
       } catch (error) {
         if (playback.controller.signal.aborted) throw new DOMException('Playback stopped.', 'AbortError')
         if (error instanceof Error && error.message.includes('changed during speaker review')) throw error
@@ -3605,6 +3951,8 @@ export function setup(ctx: SpindleFrontendContext) {
         ? requestUncastVoiceMatches(
             playbackChat.id, messageId, preparePlaybackContent(message.content, preferences.skippedTrackerTags), hashMessageContent(message.content),
             uncastGroups, uncastVoices, reservedVoices, preferences.ghostVoiceLifetime, preferences.speakerLookback, preferences.skippedTrackerTags,
+            compareBaseline ? DISABLED_REDUCTION_COMPONENTS : undefined,
+            compareBaseline,
           ).catch(error => {
             appendSpeakerDebugLog(`Uncast voice matching failed; using connection default: ${error instanceof Error ? error.message : String(error)}`)
             return [] as UncastVoiceAssignment[]
@@ -3758,7 +4106,16 @@ export function setup(ctx: SpindleFrontendContext) {
         }
       }
       if (
-        preferences.ttsTagStyle !== 'off'
+        compareBaseline && preferences.ttsTagPlacement === 'llm' && tagSources.size > 0
+      ) {
+        appendSpeakerDebugLog(
+          `TTS tag placement: skipped in the baseline capture `
+            + `(${tagSources.size} speeches would be placed by the LLM; deterministic Jev placement applies instead).`,
+        )
+      }
+      if (
+        !compareBaseline
+        && preferences.ttsTagStyle !== 'off'
         && preferences.ttsTagPlacement === 'llm'
         && tagSources.size > 0
       ) {
@@ -3919,7 +4276,7 @@ export function setup(ctx: SpindleFrontendContext) {
           })()
         }
       }
-      if (uncastGroups.length) setStatus('Matching uncast characters to favorite voices…')
+      if (uncastGroups.length && !compareBaseline) setStatus('Matching uncast characters to favorite voices…')
       const uncastMatches = await uncastMatchPromise
       if (playback.controller.signal.aborted) throw new DOMException('Playback stopped.', 'AbortError')
       for (const match of uncastMatches) {
@@ -3929,6 +4286,39 @@ export function setup(ctx: SpindleFrontendContext) {
           for (const index of segmentPlanIndexes[segmentIndex] ?? []) plan[index] = { ...plan[index], voice: match.voiceId }
         }
         appendSpeakerDebugLog(`Uncast voice ${group.id}: gender=${match.gender}, ghost=${match.ghostId ?? 'none'}, voice=${JSON.stringify(match.voiceId)}.`)
+      }
+      if (compareBaseline) {
+        appendSpeakerDebugLog('\nBaseline capture complete: synthesis and saved audio were intentionally skipped.')
+        return
+      }
+      if (preferences.reductionCompare) {
+        const reductionText = (reductionPassLines ?? []).join('\n')
+        reductionPassLines = null
+        try {
+          setStatus('Saving baseline comparison…')
+          // The baseline pass recomputes the full pipeline against the pre-reduction
+          // component map in a headless run; no synthesis, no saved audio, no ghost writes.
+          await playMessage(messageId, false, false, undefined, true)
+        } catch (error) {
+          console.warn('[Chat Voice] Baseline comparison capture failed.', error)
+          appendSpeakerDebugLog(`Baseline comparison capture failed: ${error instanceof Error ? error.message : String(error)}`)
+        }
+        const baselineText = (baselinePassLines ?? []).join('\n')
+        baselinePassLines = null
+        try {
+          const count = await appendReductionCompareReport({
+            id: `cmp-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+            iso: new Date().toISOString(),
+            chatId: playbackChat.id,
+            messageId,
+            reduction: { text: truncateReportText(reductionText), bytes: utf8ByteLength(reductionText) },
+            baseline: { text: truncateReportText(baselineText), bytes: utf8ByteLength(baselineText) },
+          })
+          if (reductionReportHint) reductionReportHint.textContent = `${count} comparison capture${count === 1 ? '' : 's'} stored`
+          setStatus(`Baseline comparison captured. The report now holds ${count} capture${count === 1 ? '' : 's'}.`, 'saved')
+        } catch (error) {
+          setStatus(error instanceof Error ? error.message : 'Could not save the comparison report.', 'error')
+        }
       }
       synthesisPlanFrozen = true
       const splitPlan = splitLargeVoicePlanSegments(plan)
@@ -4122,7 +4512,8 @@ export function setup(ctx: SpindleFrontendContext) {
         adaptiveSynthesisLimits.delete(adaptiveLimitToken)
         drainSynthesisQueue()
       })
-      const normalizationContext = new contextClass()
+      const normalizationContext = new (window.AudioContext
+        ?? (window as typeof window & { webkitAudioContext: typeof AudioContext }).webkitAudioContext)()
       const voiceLoudnessProfiles = new Map<string, number>()
       let normalizationChain: Promise<void> = Promise.resolve()
       const processed = prepared.map((pending, index) => {
@@ -4165,7 +4556,8 @@ export function setup(ctx: SpindleFrontendContext) {
             messageId,
             message.swipe_id,
             captured,
-            contextClass,
+            window.AudioContext
+              ?? (window as typeof window & { webkitAudioContext: typeof AudioContext }).webkitAudioContext,
             synthesisController.signal,
             () => playback.audibleDone,
             (normalized) => {
@@ -4315,7 +4707,7 @@ export function setup(ctx: SpindleFrontendContext) {
       }
     }
     } finally {
-      playbackStartup.finish(startupToken)
+      if (startupToken !== null) playbackStartup.finish(startupToken)
     }
   }
 
@@ -5746,6 +6138,10 @@ export function setup(ctx: SpindleFrontendContext) {
         skipNarration = preferences.skipNarration
         skipNarrationToggle.checked = skipNarration
         speakerDebugOutput.hidden = !speakerAssignmentDebug
+        reductionCompare = preferences.reductionCompare
+        reductionComponents = { ...preferences.reductionComponents }
+        if (reductionCompareToggle) reductionCompareToggle.checked = reductionCompare
+        for (const entry of reductionComponentToggles) entry.toggle.checked = reductionComponents[entry.id]
       }
       if (!savingGlobalConnection && connectionVersionAtLoad === globalConnectionVersion) lumiverseConnectionId = resolveGlobalTtsConnection(preferences.connectionId, connections)
       const selectedConnectionId = lumiverseConnectionId
@@ -5902,6 +6298,8 @@ export function setup(ctx: SpindleFrontendContext) {
         speakerLookback,
         skipNarration,
         autoVoiceCastingPool,
+        reductionCompare,
+        reductionComponents,
       )
       setStatus('Advanced playback settings saved globally.', 'saved')
     } catch (error) {
@@ -6530,6 +6928,8 @@ export function setup(ctx: SpindleFrontendContext) {
         speakerLookback,
         skipNarration,
         autoVoiceCastingPool,
+        reductionCompare,
+        reductionComponents,
       )
     }
     skippedTrackerTagsInput.destroy()
