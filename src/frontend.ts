@@ -2033,6 +2033,8 @@ export function setup(ctx: SpindleFrontendContext) {
   let reductionCompareToggle: HTMLInputElement | null = null
   /** Hint element next to the comparison-report buttons; populated in the advanced section. */
   let reductionReportHint: HTMLElement | null = null
+  /** True while a silent baseline capture runs in the background; prevents overlapping captures from mixing line buffers. */
+  let reductionCompareRunning = false
   // Token-reduction controls: per-component rollback toggles plus the compare-mode capture UI.
   const reductionGroup = document.createElement('div')
   reductionGroup.className = 'chat-voice-reduction-group'
@@ -3702,7 +3704,7 @@ export function setup(ctx: SpindleFrontendContext) {
       if (!confirmed || !ownsStartup()) return
     }
 
-    if (activePlayback) {
+    if (!compareBaseline && activePlayback) {
       stopPlayback()
     }
     const localChatId = ctx.getActiveChat().chatId
@@ -4294,30 +4296,40 @@ export function setup(ctx: SpindleFrontendContext) {
       if (preferences.reductionCompare) {
         const reductionText = (reductionPassLines ?? []).join('\n')
         reductionPassLines = null
-        try {
-          setStatus('Saving baseline comparison…')
-          // The baseline pass recomputes the full pipeline against the pre-reduction
-          // component map in a headless run; no synthesis, no saved audio, no ghost writes.
-          await playMessage(messageId, false, false, undefined, true)
-        } catch (error) {
-          console.warn('[Chat Voice] Baseline comparison capture failed.', error)
-          appendSpeakerDebugLog(`Baseline comparison capture failed: ${error instanceof Error ? error.message : String(error)}`)
-        }
-        const baselineText = (baselinePassLines ?? []).join('\n')
-        baselinePassLines = null
-        try {
-          const count = await appendReductionCompareReport({
-            id: `cmp-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
-            iso: new Date().toISOString(),
-            chatId: playbackChat.id,
-            messageId,
-            reduction: { text: truncateReportText(reductionText), bytes: utf8ByteLength(reductionText) },
-            baseline: { text: truncateReportText(baselineText), bytes: utf8ByteLength(baselineText) },
-          })
-          if (reductionReportHint) reductionReportHint.textContent = `${count} comparison capture${count === 1 ? '' : 's'} stored`
-          setStatus(`Baseline comparison captured. The report now holds ${count} capture${count === 1 ? '' : 's'}.`, 'saved')
-        } catch (error) {
-          setStatus(error instanceof Error ? error.message : 'Could not save the comparison report.', 'error')
+        if (reductionCompareRunning) {
+          appendSpeakerDebugLog('\nReduction baseline comparison skipped: another capture is already running.')
+        } else {
+          reductionCompareRunning = true
+          // The baseline runs in the background while audio playback proceeds; the report lands when it finishes.
+          void (async () => {
+            try {
+              // The baseline pass recomputes the full pipeline against the pre-reduction
+              // component map in a headless run; no synthesis, no saved audio, no ghost writes.
+              await playMessage(messageId, false, false, undefined, true)
+              const baselineText = (baselinePassLines ?? []).join('\n')
+              baselinePassLines = null
+              try {
+                const count = await appendReductionCompareReport({
+                  id: `cmp-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+                  iso: new Date().toISOString(),
+                  chatId: playbackChat.id,
+                  messageId,
+                  reduction: { text: truncateReportText(reductionText), bytes: utf8ByteLength(reductionText) },
+                  baseline: { text: truncateReportText(baselineText), bytes: utf8ByteLength(baselineText) },
+                })
+                if (reductionReportHint) reductionReportHint.textContent = `${count} comparison capture${count === 1 ? '' : 's'} stored`
+                setStatus(`Baseline comparison captured. The report now holds ${count} capture${count === 1 ? '' : 's'}.`, 'saved')
+              } catch (error) {
+                setStatus(error instanceof Error ? error.message : 'Could not save the comparison report.', 'error')
+              }
+            } catch (error) {
+              console.warn('[Chat Voice] Baseline comparison capture failed.', error)
+              appendSpeakerDebugLog(`Baseline comparison capture failed: ${error instanceof Error ? error.message : String(error)}`)
+              baselinePassLines = null
+            } finally {
+              reductionCompareRunning = false
+            }
+          })()
         }
       }
       synthesisPlanFrozen = true
