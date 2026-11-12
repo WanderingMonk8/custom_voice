@@ -2,70 +2,6 @@
 var CONFIG_KEY = "chat_voice";
 var USER_SPEAKER_ID = "__chat_voice_user__";
 var UNCAST_SPEAKER_ID = "__chat_voice_uncast__";
-var REDUCTION_COMPONENTS = [
-  {
-    id: "scopedTtsState",
-    phase: "Phase 1",
-    label: "Scope TTS tag state to the target speech",
-    hint: "Send only the target quotation and its local neighbours to Jev for tag selection, not the full message.",
-    defaultValue: true
-  },
-  {
-    id: "twoPhaseTagReview",
-    phase: "Phase 1",
-    label: "Two-phase (primary/secondary) tag questions",
-    hint: "Primary pass asks primary questions first; secondary questions are asked only when the first pass establishes a need for them.",
-    defaultValue: true
-  },
-  {
-    id: "dedupTagCriteria",
-    phase: "Phase 1",
-    label: "Deduplicate tag criteria",
-    hint: "Share terse criteria blocks across emotion/style/sound/pause questions instead of expanding full descriptions per question.",
-    defaultValue: true
-  },
-  {
-    id: "gatedAuxReviews",
-    phase: "Phase 2",
-    label: "Gate auxiliary speaker reviews on triggers",
-    hint: "Best-available guess, self-introduction, speaker-switch and focused opening reviews run only when a trigger is present, not always.",
-    defaultValue: true
-  },
-  {
-    id: "deferRelationshipReview",
-    phase: "Phase 2",
-    label: "Defer the global relationship review until a trigger fires",
-    hint: "Skip the whole relationship review when no known trigger is established (no unresolved turn, no boundary, no alternate speaker switch); otherwise it runs as today.",
-    defaultValue: true
-  },
-  {
-    id: "trimVoiceCriteria",
-    phase: "Phase 2",
-    label: "Condense uncast voice ranking criteria",
-    hint: "Drop the description fields from the voice ranking criteria (use name, category, languages and tags only) and keep the shortlist small.",
-    defaultValue: true
-  }
-];
-var REDUCTION_COMPONENT_IDS = REDUCTION_COMPONENTS.map((component) => component.id);
-var FULL_REDUCTION_COMPONENTS = Object.fromEntries(REDUCTION_COMPONENTS.map((component) => [component.id, component.defaultValue]));
-var DISABLED_REDUCTION_COMPONENTS = Object.fromEntries(REDUCTION_COMPONENTS.map((component) => [component.id, false]));
-function readReductionComponents(value) {
-  const full = FULL_REDUCTION_COMPONENTS;
-  if (!value || typeof value !== "object" || Array.isArray(value)) return { ...full };
-  const row = value;
-  const next = { ...full };
-  for (const component of REDUCTION_COMPONENTS) {
-    const raw = row[component.id];
-    if (typeof raw === "boolean") next[component.id] = raw;
-  }
-  return next;
-}
-var CRC_TABLE = new Uint32Array(256);
-for (let index = 0; index < 256; index += 1) {
-  let value = index;
-  for (let bit = 0; bit < 8; bit += 1) value = value & 1 ? value >>> 1 ^ 3988292384 : value >>> 1;
-  CRC_TABLE[index] = value >>> 0;
-}
 var UNRESOLVED_SPEAKER_ID = "__chat_voice_unresolved__";
 var DEFAULT_MESSAGE_LIMIT = 20;
 var MIN_MESSAGE_LIMIT = 1;
@@ -498,15 +434,7 @@ function voiceDecisionSummary(voice) {
   if (description) parts.push(`description: ${description}`);
   return parts.join("; ") || "No details provided.";
 }
-function voiceDecisionSummaryTerse(voice) {
-  const tags = [...new Set((voice.tags ?? []).map((tag) => tag.trim().toLowerCase()).filter(Boolean))];
-  const languages = [...new Set((voice.languages ?? []).map((code) => code.trim().toLowerCase()).filter(Boolean))];
-  const parts = [voice.name, voice.category].map((part) => (part ?? "").replace(/\s+/gu, " ").trim()).filter(Boolean);
-  if (languages.length) parts.push(`languages: ${languages.join(", ")}`);
-  if (tags.length) parts.push(`tags: ${tags.join(", ")}`);
-  return parts.join("; ") || "No details provided.";
-}
-function buildUncastVoiceDecision(groups, voices, message, ghosts = [], previousMessages = [], trimCriteria = false) {
+function buildUncastVoiceDecision(groups, voices, message, ghosts = [], previousMessages = []) {
   const labels = uncastIdentityLabels(message, ghosts);
   const narrativeNames = uncastNarrativeNameCandidates(message);
   const state = {
@@ -543,10 +471,9 @@ function buildUncastVoiceDecision(groups, voices, message, ghosts = [], previous
     }),
     voices: voices.map((voice, index) => ({ option: `voice_${index}`, name: voice.name }))
   };
-  const voiceSummary = trimCriteria ? voiceDecisionSummaryTerse : voiceDecisionSummary;
   const voiceOptionsFor = (group) => {
     const hint = group.pronounGender && (group.pronounGender === "male" || group.pronounGender === "female") ? group.pronounGender : "unknown";
-    return voices.map((voice, index) => ({ index, voice })).filter(({ voice }) => hint === "unknown" || voiceGenderCompatible(voice, hint)).slice(0, trimCriteria ? 16 : 32);
+    return voices.map((voice, index) => ({ index, voice })).filter(({ voice }) => hint === "unknown" || voiceGenderCompatible(voice, hint)).slice(0, 32);
   };
   const questions = {};
   for (const group of groups) {
@@ -584,11 +511,10 @@ function buildUncastVoiceDecision(groups, voices, message, ghosts = [], previous
     }
     if (!voices.length) continue;
     const options = voiceOptionsFor(group);
-    const rankingInstructions = trimCriteria ? `Rank the available voices for the person who actually speaks the quoted dialogue in ${group.id}. Narration-only bystanders and people merely addressed are not speakers. Use the full scene as context, including other character groups only when clearly the same speaker. Score voices by metadata cues, not prose length: name is weak context, category and languages contribute one compatibility cue in aggregate, and each explicit tag is one cue. Missing fields are not a reason to rank a voice lower. Select the best available voice.` : `Rank the available voices for the person who actually speaks the quoted dialogue in ${group.id}. Narration-only bystanders and people merely addressed are not speakers. Use the full scene as context, including other character groups only when clearly the same speaker. Score voices by metadata cues, not prose length: name is weak context, category and languages contribute one compatibility cue in aggregate, each explicit tag is one cue, and each tag listed in "description supports" is one cue. The description is evidence for those tags, not an extra vote, and support for an explicit tag counts once rather than twice. Balance tags against that description evidence instead of letting a long description outweigh otherwise better matches. Missing fields are not a reason to rank a voice lower. Select the best available voice.`;
     questions[`voice_${group.id}`] = {
       type: "choice",
-      instructions: rankingInstructions,
-      criteria: { ...Object.fromEntries(options.map(({ index, voice }) => [`voice_${index}`, voiceSummary(voice)])), ...options.length === 1 ? { no_match: "No suitable voice is available." } : {} }
+      instructions: `Rank the available voices for the person who actually speaks the quoted dialogue in ${group.id}. Narration-only bystanders and people merely addressed are not speakers. Use the full scene as context, including other character groups only when clearly the same speaker. Score voices by metadata cues, not prose length: name is weak context, category and languages contribute one compatibility cue in aggregate, each explicit tag is one cue, and each tag listed in "description supports" is one cue. The description is evidence for those tags, not an extra vote, and support for an explicit tag counts once rather than twice. Balance tags against that description evidence instead of letting a long description outweigh otherwise better matches. Missing fields are not a reason to rank a voice lower. Select the best available voice.`,
+      criteria: { ...Object.fromEntries(options.map(({ index, voice }) => [`voice_${index}`, voiceDecisionSummary(voice)])), ...options.length === 1 ? { no_match: "No suitable voice is available." } : {} }
     };
   }
   return { state, questions };
@@ -4242,33 +4168,20 @@ function ttsPauseCriteria() {
     [TTS_NO_PAUSE_OPTION, "No inserted pause. Most lines should choose this."]
   ]);
 }
-function ttsTersePhrase(description) {
-  const sentence = description.split(". ")[0] ?? description;
-  return sentence.replace(/\.+$/u, "").trim();
-}
-function ttsTerseCriteria(criteria) {
-  const next = {};
-  for (const [key, value] of Object.entries(criteria)) next[key] = ttsTersePhrase(value);
-  return next;
-}
-var TTS_NARRATION_WINDOW = 320;
-function buildTtsTagPlan(plan, speechIds, emotionOptions = TTS_AUTO_EMOTION_OPTIONS, style = "gemini", enableModulation = false, phase = "all", needs = {}, tagStateOptions) {
+function buildTtsTagPlan(plan, speechIds, emotionOptions = TTS_AUTO_EMOTION_OPTIONS, style = "gemini", enableModulation = false, phase = "all", needs = {}) {
   const allowed = speechIds ? new Set(speechIds) : null;
-  const scoped = tagStateOptions?.scoped === true;
   const speeches = plan.state.speeches.filter((speech) => !allowed || allowed.has(speech.id)).map((speech) => ({
     id: speech.id,
     paragraphId: speech.paragraphId,
     text: speech.text,
-    narrativeBefore: scoped ? speech.narrativeBefore.slice(-TTS_NARRATION_WINDOW) : speech.narrativeBefore,
-    narrativeAfter: scoped ? speech.narrativeAfter.slice(0, TTS_NARRATION_WINDOW) : speech.narrativeAfter
+    narrativeBefore: speech.narrativeBefore,
+    narrativeAfter: speech.narrativeAfter
   }));
-  const terseCriteria = tagStateOptions?.terse === true ? ttsTerseCriteria : (criteria) => criteria;
-  const phrase = tagStateOptions?.terse === true ? ttsTersePhrase : (description) => description;
-  const emotionCriteria = terseCriteria(ttsEmotionCriteria(emotionOptions));
+  const emotionCriteria = ttsEmotionCriteria(emotionOptions);
   const soundOptions = style === "fish" ? TTS_FISH_SOUND_OPTIONS : style === "gemini38" ? TTS_GEMINI38_SOUND_OPTIONS : TTS_TAG_OPTIONS;
-  const soundCriteria = terseCriteria(ttsSoundCriteria(soundOptions));
-  const styleCriteria = terseCriteria(ttsStyleCriteria());
-  const pauseCriteria = terseCriteria(ttsPauseCriteria());
+  const soundCriteria = ttsSoundCriteria(soundOptions);
+  const styleCriteria = ttsStyleCriteria();
+  const pauseCriteria = ttsPauseCriteria();
   const questions = {};
   const positions = {};
   const pausePositions = {};
@@ -4291,7 +4204,7 @@ function buildTtsTagPlan(plan, speechIds, emotionOptions = TTS_AUTO_EMOTION_OPTI
           instructions: `Is there a distinct secondary emotion layered into quotation ${speech.id}? Choose no_emotion unless a second emotion is clearly present and compatible with the primary.`,
           criteria: {
             ...emotionCriteria,
-            [TTS_NO_EMOTION_OPTION]: phrase("No distinct secondary emotion. Most lines should choose this.")
+            [TTS_NO_EMOTION_OPTION]: "No distinct secondary emotion. Most lines should choose this."
           }
         };
       }
@@ -4303,7 +4216,7 @@ function buildTtsTagPlan(plan, speechIds, emotionOptions = TTS_AUTO_EMOTION_OPTI
           instructions: `Does quotation ${speech.id} have a sustained voice style that should lead the speech? Choose no_style unless a whisper, soft/loud/low voice, shout, or scream clearly applies to the whole quotation. Do not use this for a momentary sound.`,
           criteria: {
             ...styleCriteria,
-            [TTS_NO_STYLE_OPTION]: phrase("No sustained voice style. Most lines should choose this.")
+            [TTS_NO_STYLE_OPTION]: "No sustained voice style. Most lines should choose this."
           }
         };
       }
@@ -4316,8 +4229,8 @@ function buildTtsTagPlan(plan, speechIds, emotionOptions = TTS_AUTO_EMOTION_OPTI
               type: "choice",
               instructions: `Does quotation ${speech.id} have a clear internal emotional turn that should change delivery before the quotation ends? Choose modulation only when the emotion genuinely shifts and the new delivery should continue to the end. Ignore momentary sounds, ordinary punctuation, and small intensity changes.`,
               criteria: {
-                modulation: phrase("A clear, sustained emotional turn inside the quotation."),
-                no_modulation: phrase("No clear internal emotional turn. Most lines should choose this.")
+                modulation: "A clear, sustained emotional turn inside the quotation.",
+                no_modulation: "No clear internal emotional turn. Most lines should choose this."
               }
             };
           }
@@ -4325,7 +4238,7 @@ function buildTtsTagPlan(plan, speechIds, emotionOptions = TTS_AUTO_EMOTION_OPTI
             questions[`modulationpos_${speech.id}`] = {
               type: "choice",
               instructions: `If quotation ${speech.id} receives a modulation, where should the new emotion begin? Choose the boundary closest to the emotional turn.`,
-              criteria: terseCriteria(Object.fromEntries(modulationOptions.map((option) => [option.id, option.description])))
+              criteria: Object.fromEntries(modulationOptions.map((option) => [option.id, option.description]))
             };
           }
         }
@@ -4349,7 +4262,7 @@ function buildTtsTagPlan(plan, speechIds, emotionOptions = TTS_AUTO_EMOTION_OPTI
       questions[`tagpos_${speech.id}`] = {
         type: "choice",
         instructions: `If quotation ${speech.id} receives a sound effect, where should it be inserted? Choose the boundary closest to the exact sound.`,
-        criteria: terseCriteria(Object.fromEntries(speechPositions.map((option) => [option.id, option.description])))
+        criteria: Object.fromEntries(speechPositions.map((option) => [option.id, option.description]))
       };
     }
     if (includePrimary) {
@@ -4369,7 +4282,7 @@ function buildTtsTagPlan(plan, speechIds, emotionOptions = TTS_AUTO_EMOTION_OPTI
       questions[`pausepos_${speech.id}`] = {
         type: "choice",
         instructions: `If quotation ${speech.id} receives a pause, where should it be inserted? Choose the boundary closest to the intended pause.`,
-        criteria: terseCriteria(Object.fromEntries(speechPositions.map((option) => [option.id, option.description])))
+        criteria: Object.fromEntries(speechPositions.map((option) => [option.id, option.description]))
       };
     }
   }
@@ -5301,16 +5214,6 @@ function assessSpeakerDiscourseEscalation(plan, answers, options = {}) {
     runs
   };
 }
-function hasUncertainFirstPass(plan, answers) {
-  const assessment = assessSpeakerDiscourseEscalation(plan, answers);
-  if (assessment.runs.some((run) => run.triggers.length > 0)) return true;
-  for (const speech of plan.state.speeches) {
-    const evaluation = evaluateSpeakerDecisionAnswer(answers[`speech_${speech.id}`], plan.optionSpeakerIds, SPEAKER_DECISION_THRESHOLDS.local);
-    if (!evaluation.resolved) return true;
-    if (evaluation.leadingMargin < SPEAKER_DECISION_THRESHOLDS.local.margin) return true;
-  }
-  return false;
-}
 function resolveSpeakerDiscourseAnswers(discourse, answers) {
   const outcomes = /* @__PURE__ */ new Map();
   const evidenceById = new Map(discourse.state.firstPass.map((entry) => [entry.speechId, entry]));
@@ -6141,7 +6044,7 @@ function applyConfigToMetadata(metadata, config) {
 }
 
 // src/version.ts
-var BUILD_VERSION = "3.31.0";
+var BUILD_VERSION = "3.30.7";
 
 // src/uuid.ts
 var lastTimestamp = 0;
@@ -6347,7 +6250,7 @@ function appendSpeakerDebugReason(segments, reason, enabled) {
     debugPath: [...segment.debugPath ?? [], reason]
   }));
 }
-async function evaluateTtsTagSelections(plan, style, userId, enableModulation = false, debug = false, reduction = FULL_REDUCTION_COMPONENTS) {
+async function evaluateTtsTagSelections(plan, style, userId, enableModulation = false, debug = false) {
   const selections = /* @__PURE__ */ new Map();
   if (plan.state.speeches.length === 0) return { selections, failed: false };
   const hasCapability = (spindle.host.capabilities["decisions-v1"] ?? 0) >= 1;
@@ -6358,7 +6261,6 @@ async function evaluateTtsTagSelections(plan, style, userId, enableModulation = 
   }
   let failed = false;
   let failure = "";
-  const tagStateOptions = { scoped: reduction.scopedTtsState, terse: reduction.dedupTagCriteria };
   const resolveChunk = (tagPlan, answers) => {
     const resolved = resolveTtsTagAnswers(tagPlan, answers, style);
     for (const [id, selection] of resolved) {
@@ -6371,7 +6273,7 @@ async function evaluateTtsTagSelections(plan, style, userId, enableModulation = 
   };
   if (!hasCapability) {
     markFallback(resolveChunk(
-      buildTtsTagPlan(plan, void 0, TTS_AUTO_EMOTION_OPTIONS, style, enableModulation, "all", {}, tagStateOptions),
+      buildTtsTagPlan(plan, void 0, TTS_AUTO_EMOTION_OPTIONS, style, enableModulation),
       {}
     ));
     return {
@@ -6402,16 +6304,7 @@ async function evaluateTtsTagSelections(plan, style, userId, enableModulation = 
       }
       return answers;
     };
-    if (!reduction.twoPhaseTagReview) {
-      const singlePlan = buildTtsTagPlan(plan, ids, emotionOptions, style, enableModulation, "all", {}, tagStateOptions);
-      if (debug) {
-        const budget = measureJevDecisionPayload(singlePlan.state, singlePlan.questions);
-        spindle.log.info(`[Chat Voice] Jev tag single-pass budget: speeches=${ids.length}, questions=${budget.questionCount}, state=${budget.stateBytes}B, criteria=${budget.questionsBytes}B`);
-      }
-      const singleAnswers = await evaluatePlan(singlePlan);
-      return { tagPlan: singlePlan, answers: singleAnswers };
-    }
-    const primaryPlan = buildTtsTagPlan(plan, ids, emotionOptions, style, enableModulation, "primary", {}, tagStateOptions);
+    const primaryPlan = buildTtsTagPlan(plan, ids, emotionOptions, style, enableModulation, "primary");
     if (debug) {
       const budget = measureJevDecisionPayload(primaryPlan.state, primaryPlan.questions);
       spindle.log.info(`[Chat Voice] Jev tag primary budget: speeches=${ids.length}, questions=${budget.questionCount}, state=${budget.stateBytes}B, criteria=${budget.questionsBytes}B`);
@@ -6435,7 +6328,7 @@ async function evaluateTtsTagSelections(plan, style, userId, enableModulation = 
     const secondaryIds = Object.keys(needs);
     if (secondaryIds.length) {
       try {
-        const secondaryPlan = buildTtsTagPlan(plan, secondaryIds, emotionOptions, style, enableModulation, "secondary", needs, tagStateOptions);
+        const secondaryPlan = buildTtsTagPlan(plan, secondaryIds, emotionOptions, style, enableModulation, "secondary", needs);
         if (debug) {
           const budget = measureJevDecisionPayload(secondaryPlan.state, secondaryPlan.questions);
           spindle.log.info(`[Chat Voice] Jev tag secondary budget: speeches=${secondaryIds.length}, questions=${budget.questionCount}, state=${budget.stateBytes}B, criteria=${budget.questionsBytes}B`);
@@ -6446,7 +6339,7 @@ async function evaluateTtsTagSelections(plan, style, userId, enableModulation = 
         spindle.log.warn(`[Chat Voice] Secondary TTS tag refinement failed; retaining the primary result: ${failure}`);
       }
     }
-    const fullPlan = buildTtsTagPlan(plan, ids, emotionOptions, style, enableModulation, "all", {}, tagStateOptions);
+    const fullPlan = buildTtsTagPlan(plan, ids, emotionOptions, style, enableModulation, "all");
     return { tagPlan: fullPlan, answers: combinedAnswers(primaryAnswers, secondaryAnswers) };
   };
   const evaluateChunk = async (ids) => {
@@ -6465,7 +6358,7 @@ async function evaluateTtsTagSelections(plan, style, userId, enableModulation = 
         } catch (compactError) {
           failure = compactError instanceof Error ? compactError.message : String(compactError);
           markFallback(resolveChunk(
-            buildTtsTagPlan(plan, ids, TTS_COMPACT_EMOTION_OPTIONS, style, enableModulation, "all", {}, tagStateOptions),
+            buildTtsTagPlan(plan, ids, TTS_COMPACT_EMOTION_OPTIONS, style, enableModulation),
             {}
           ));
           return false;
@@ -6484,7 +6377,7 @@ async function evaluateTtsTagSelections(plan, style, userId, enableModulation = 
           } catch (compactError) {
             failure = compactError instanceof Error ? compactError.message : String(compactError);
             markFallback(resolveChunk(
-              buildTtsTagPlan(plan, [id], TTS_COMPACT_EMOTION_OPTIONS, style, enableModulation, "all", {}, tagStateOptions),
+              buildTtsTagPlan(plan, [id], TTS_COMPACT_EMOTION_OPTIONS, style, enableModulation),
               {}
             ));
             return false;
@@ -6840,7 +6733,6 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
       userAliases.join(" / ") || "User"
     );
     const skippedTrackerTags = payload.skippedTrackerTags.slice(0, 4e3);
-    const reduction = readReductionComponents(payload.reduction);
     const assistantIds = messages.filter((item) => !item.is_user).map((item) => item.id);
     const anchor = message.is_user ? messages.slice(0, messageIndex).filter((item) => !item.is_user).at(-1)?.id ?? "" : message.id;
     const lifetime = Number.isFinite(payload.ghostVoiceLifetime) ? Math.min(1e3, Math.max(1, Math.round(payload.ghostVoiceLifetime))) : 10;
@@ -6915,7 +6807,6 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
           cardSpeakerId: titleMatchedCardSpeakerId,
           historicalSpeakerId,
           relationshipReview: { version: "cross-message-run-22", context: relationshipContext, speakerLookback, strategy: payload.runReview !== false ? "run" : "scene", focusedOpeningFallback: payload.focusedOpeningFallback === true, bestAvailableSpeaker: payload.bestAvailableSpeaker !== false },
-          reduction,
           skippedTrackerTags
         }));
         const cached = config.parsedMessages[payload.messageId];
@@ -6929,7 +6820,7 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
           }, userId, frontendSessionId);
           return;
         }
-        const tagSelectionsPromise = tagStyle !== "off" ? evaluateTtsTagSelections(decisionPlan, tagStyle, userId, enableModulation, payload.debug, reduction) : null;
+        const tagSelectionsPromise = tagStyle !== "off" ? evaluateTtsTagSelections(decisionPlan, tagStyle, userId, enableModulation, payload.debug) : null;
         try {
           const firstPassStartedAt = Date.now();
           const result = await spindle.decisions.evaluate({
@@ -6949,15 +6840,9 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
           }
           if (payload.debug) snapshotSpeakerFirstPass(decisionPlan, answers);
           suppressUngroundedSpeakerChoices(decisionPlan, answers, relationshipContext, titleMatchedCardSpeakerId);
-          const reductionGates = [];
-          const uncertainFirstPass = hasUncertainFirstPass(decisionPlan, answers);
-          const auxReviewsEnabled = !reduction.gatedAuxReviews || uncertainFirstPass;
-          const relationshipReviewDeferred = reduction.deferRelationshipReview && !uncertainFirstPass;
-          if (reduction.gatedAuxReviews && !auxReviewsEnabled) reductionGates.push("auxiliary-reviews=deferred (clear first pass)");
-          if (relationshipReviewDeferred) reductionGates.push("relationship-review=deferred (clear first pass)");
-          const userReview = auxReviewsEnabled ? buildAssistantUserSpeakerReview(decisionPlan, answers) : null;
+          const userReview = buildAssistantUserSpeakerReview(decisionPlan, answers);
           let userReviewFailed = false;
-          if (userReview && Object.keys(userReview.questions).length) {
+          if (Object.keys(userReview.questions).length) {
             try {
               const reviewResult = await spindle.decisions.evaluate({ state: userReview.state, questions: userReview.questions, ...userId ? { userId } : {} });
               const reviewed = {};
@@ -6971,7 +6856,7 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
             }
           }
           const discourseAssessment = assessSpeakerDiscourseEscalation(decisionPlan, answers);
-          const relationshipReview = relationshipReviewDeferred ? null : buildRelationshipSpeakerReview(decisionPlan, answers, relationshipContext, null, {
+          const relationshipReview = buildRelationshipSpeakerReview(decisionPlan, answers, relationshipContext, null, {
             cardSpeakerId: titleMatchedCardSpeakerId,
             targets: [...new Set(discourseAssessment.runs.flatMap((run) => run.targets))],
             strategy: payload.runReview !== false ? "run" : "scene"
@@ -6998,10 +6883,8 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
           let bestAvailableRetry = false;
           let selfIntroductionRetry = false;
           let speakerSwitchRetry = false;
-          const relationshipReviewQuestionCount = relationshipReview ? Object.keys(relationshipReview.questions).length : 0;
-          const relationshipReviewCandidates = relationshipReview ? Object.entries(relationshipReview.ghostOptions).map(([option, id]) => `${option}=${id}`).join(",") : "";
-          let relationshipSceneDiagnostic = `strategy=${payload.runReview !== false ? "run" : "scene"}; global-context=${relationshipContext.previousMessages.length} messages, ${relationshipContext.previousMessages.reduce((sum, item) => sum + item.text.length, 0)} characters; target=${decisionPlan.state.message.length} characters; first-pass=${decisionQuestionCount} questions/${firstPassDuration}ms; review=${relationshipReviewQuestionCount} questions; candidates=${relationshipReviewCandidates || "none"}${reductionGates.length ? `; ${reductionGates.join("; ")}` : ""}`;
-          if (relationshipReview && Object.keys(relationshipReview.questions).length) {
+          let relationshipSceneDiagnostic = `strategy=${payload.runReview !== false ? "run" : "scene"}; global-context=${relationshipContext.previousMessages.length} messages, ${relationshipContext.previousMessages.reduce((sum, item) => sum + item.text.length, 0)} characters; target=${decisionPlan.state.message.length} characters; first-pass=${decisionQuestionCount} questions/${firstPassDuration}ms; review=${Object.keys(relationshipReview.questions).length} questions; candidates=${Object.entries(relationshipReview.ghostOptions).map(([option, id]) => `${option}=${id}`).join(",") || "none"}`;
+          if (Object.keys(relationshipReview.questions).length) {
             const reviewStartedAt = Date.now();
             try {
               const relationshipResult = await spindle.decisions.evaluate({ state: relationshipReview.state, questions: relationshipReview.questions, ...userId ? { userId } : {} });
@@ -7031,8 +6914,8 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
               spindle.log.warn(`[Chat Voice] Relationship speaker review failed; preserving validated assignments and marking uncertain targets: ${error instanceof Error ? error.message : String(error)}`);
             }
           }
-          const personaReview = auxReviewsEnabled ? buildContextualUserReconciliation(decisionPlan, answers, relationshipContext) : null;
-          if (personaReview && Object.keys(personaReview.questions).length) {
+          const personaReview = buildContextualUserReconciliation(decisionPlan, answers, relationshipContext);
+          if (Object.keys(personaReview.questions).length) {
             const startedAt = Date.now();
             const reviewed = {};
             try {
@@ -7054,7 +6937,7 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
           }
           answers.persona_phase_complete = { choice: "complete", probabilities: {}, confidence: 0 };
           applyExplicitPostQuoteVoiceAttributions(decisionPlan, answers);
-          const openingReview = !relationshipReviewFailed && auxReviewsEnabled ? buildOpeningSpeakerReview(decisionPlan, answers, relationshipContext, titleMatchedCardSpeakerId) : null;
+          const openingReview = !relationshipReviewFailed ? buildOpeningSpeakerReview(decisionPlan, answers, relationshipContext, titleMatchedCardSpeakerId) : null;
           if (openingReview) {
             if (payload.debug) relationshipSceneDiagnostic += `; opening-scope=${JSON.stringify({ previous: openingReview.state.previousMessages.map((item) => ({ id: item.id, role: item.role, chars: item.text.length })), speeches: openingReview.state.speeches.map((item) => ({ id: item.id, paragraphId: item.paragraphId, text: item.text.slice(0, 160) })), boundary: openingReview.state.boundaryEvidence ? { role: openingReview.state.boundaryEvidence.role, lead: openingReview.state.boundaryEvidence.lead.slice(-240), quotation: openingReview.state.boundaryEvidence.quotation.slice(-240) } : null })}`;
             const startedAt = Date.now();
@@ -7105,7 +6988,7 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
               }
             }
           }
-          const backlinkReview = !relationshipReviewFailed && auxReviewsEnabled ? buildOpeningBacklinkReview(decisionPlan, answers, relationshipContext, titleMatchedCardSpeakerId) : null;
+          const backlinkReview = !relationshipReviewFailed ? buildOpeningBacklinkReview(decisionPlan, answers, relationshipContext, titleMatchedCardSpeakerId) : null;
           if (backlinkReview) {
             const startedAt = Date.now();
             const contrastive = payload.shadowEvaluation && payload.debug || payload.focusedOpeningFallback ? buildContrastiveOpeningLinkReview(backlinkReview) : null;
@@ -7178,7 +7061,7 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
               }
             }
           }
-          if (!relationshipReviewFailed && !userReviewFailed && auxReviewsEnabled) {
+          if (!relationshipReviewFailed && !userReviewFailed) {
             const introReview = buildSelfIntroductionReview(decisionPlan, relationshipContext);
             if (Object.keys(introReview.questions).length) {
               let timer;
@@ -7208,7 +7091,7 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
               }
             }
           }
-          if (!relationshipReviewFailed && !userReviewFailed && auxReviewsEnabled) {
+          if (!relationshipReviewFailed && !userReviewFailed) {
             const switchReview = buildSpeakerSwitchContradictionReview(decisionPlan, answers, relationshipContext, titleMatchedCardSpeakerId);
             if (Object.keys(switchReview.questions).length) {
               let timer;
@@ -7247,7 +7130,7 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
               }
             }
           }
-          if (payload.bestAvailableSpeaker !== false && !relationshipReviewFailed && !userReviewFailed && auxReviewsEnabled) {
+          if (payload.bestAvailableSpeaker !== false && !relationshipReviewFailed && !userReviewFailed) {
             const bestReview = buildBestAvailableSpeakerReview(decisionPlan, answers, relationshipContext, titleMatchedCardSpeakerId);
             if (Object.keys(bestReview.questions).length) {
               let timer;
@@ -7279,8 +7162,8 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
           }
           const discourse = {
             answers: null,
-            status: relationshipReviewDeferred ? "relationship review deferred; clear first pass; reviews skipped" : relationshipReviewFailed ? "global-context review failed; no forced inheritance" : "handled by targeted global-context review",
-            outcome: relationshipReviewDeferred ? "deferred" : relationshipReviewFailed ? "failed" : relationshipReviewQuestionCount ? "completed" : "not-escalated"
+            status: relationshipReviewFailed ? "global-context review failed; no forced inheritance" : "handled by targeted global-context review",
+            outcome: relationshipReviewFailed ? "failed" : Object.keys(relationshipReview.questions).length ? "completed" : "not-escalated"
           };
           const segments = resolveSpeakerDecisionSegments(
             message.content ?? "",
@@ -7335,7 +7218,7 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
             }
           }
           relationshipSceneDiagnostic += `; speaker-review-total=${Date.now() - firstPassStartedAt}ms (includes optional shadow wait; excludes later tag placement)`;
-          const relationshipStatus = relationshipReviewFailed ? `failed; validated assignments retained, uncertain targets protected; ${relationshipSceneDiagnostic}` : `${relationshipReviewQuestionCount} question(s) reviewed; ${relationshipSceneDiagnostic}`;
+          const relationshipStatus = relationshipReviewFailed ? `failed; validated assignments retained, uncertain targets protected; ${relationshipSceneDiagnostic}` : `${Object.keys(relationshipReview.questions).length} question(s) reviewed; ${relationshipSceneDiagnostic}`;
           const reviewedSegments = payload.debug ? segments.map((segment) => segment.debugPath ? {
             ...segment,
             debugPath: [...segment.debugPath, `relationship-review-status:${relationshipStatus}`]
@@ -7424,7 +7307,7 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
       }
     }
     const fallbackSegments = appendSpeakerDebugReason(deterministic, decisionFallbackReason, payload.debug);
-    const fallbackTagSelectionsPromise = tagStyle !== "off" && structurePlan ? evaluateTtsTagSelections(structurePlan, tagStyle, userId, enableModulation, payload.debug, reduction) : null;
+    const fallbackTagSelectionsPromise = tagStyle !== "off" && structurePlan ? evaluateTtsTagSelections(structurePlan, tagStyle, userId, enableModulation, payload.debug) : null;
     sendSpeakerParse({
       requestId: payload.requestId,
       chatId: chat.id,
@@ -7719,14 +7602,13 @@ spindle.onFrontendMessage(async (rawPayload, userId, frontendSessionId) => {
           if (!safe) return [];
           return [{ ...ghost, speakerId: safe.aliases.length ? ghost.speakerId : UNCAST_SPEAKER_ID, label: safe.label, aliases: safe.aliases, context: safe.context, conversationHistory: safe.conversationHistory }];
         });
-        const reduction = readReductionComponents(payload.reduction);
         const currentGhosts = activeGhostVoices(savedGhosts, assistantIds, assistantIds.at(-1) ?? anchor, lifetime);
         const config = readConfig(chat.metadata ?? {}, chatMemberIds(chat));
         const voices = availableUncastVoices(readFavoriteVoices(payload.voices), [...payload.reserved, config.narratorVoice, config.userVoice, ...Object.values(config.characterVoices), ...ghosts.map((ghost) => ghost.voiceId), ...currentGhosts.map((ghost) => ghost.voiceId)]).slice(0, 254);
         if (!groups.length || !voices.length && !ghosts.length) {
           sendFrontend({ type: "chat_voice_uncast_matches", requestId: payload.requestId, assignments: [], diagnostics: [`No matching request: groups=${groups.length}, availableFavorites=${voices.length}, historicalGhosts=${ghosts.length}, currentGhosts=${currentGhosts.length}.`] }, userId, frontendSessionId);
         } else {
-          const plan = buildUncastVoiceDecision(groups, voices, payload.message.slice(0, 3e4), ghosts, matchingContext.previousMessages, reduction.trimVoiceCriteria);
+          const plan = buildUncastVoiceDecision(groups, voices, payload.message.slice(0, 3e4), ghosts, matchingContext.previousMessages);
           const answers = {};
           let decisionError = "";
           const captureAnswers = (result) => {
@@ -7769,7 +7651,7 @@ spindle.onFrontendMessage(async (rawPayload, userId, frontendSessionId) => {
           }
           let assignments = resolveUncastVoiceDecisions(groups, voices, answers, ghosts, payload.reserved, payload.messageId, payload.message.slice(0, 3e4), assistantIds.slice(0, Math.max(0, assistantIds.indexOf(anchor))));
           const proposedAssignments = assignments;
-          if (assignments.length && !payload.dryRun) {
+          if (assignments.length) {
             assignments = await saveGhostVoiceAssignments(payload.chatId, payload.messageId, assistantIds, groups, assignments, userId, anchor, payload.reserved, lifetime, payload.message, payload.sourceHash, hashMessageContent(JSON.stringify(savedGhosts)));
           }
           const diagnostics = groups.map((group) => {
@@ -7783,10 +7665,10 @@ spindle.onFrontendMessage(async (rawPayload, userId, frontendSessionId) => {
             const proposed = proposedAssignments.find((item) => item.groupId === group.id);
             return `${group.id} segments=${group.segmentIndexes.map((index) => index + 1).join(",")} identity=${identity ? `${identity.choice} confidence=${identity.confidence} probabilities=${JSON.stringify(identity.probabilities)}` : "none"} gender=${gender ? `${gender.choice} confidence=${gender.confidence} probabilities=${JSON.stringify(gender.probabilities)}` : "none"} label=${label ? `${label.choice} confidence=${label.confidence} probabilities=${JSON.stringify(label.probabilities)}` : "none"} narrative-name=${narrativeName ? `${narrativeName.choice} (${plan.state.narrativeNames[Number(narrativeName.choice.replace("name_", ""))] ?? "none"}) confidence=${narrativeName.confidence} probabilities=${JSON.stringify(narrativeName.probabilities)}` : "none"} comparisons=${comparisons} proposed=${proposed ? `${proposed.ghostId} / ${proposed.voiceId} / ${proposed.gender}` : "none"} match-reason=${proposed?.matchReason ?? "none"} voice-choice=${voice ? `${voice.choice} confidence=${voice.confidence} probabilities=${JSON.stringify(voice.probabilities)}` : "none"} final=${assignment ? `${assignment.label || "unnamed"} / ${assignment.ghostId} / ${assignment.voiceId}` : "connection default"}`;
           });
-          diagnostics.unshift(`build=${BUILD_VERSION}; Available favorites=${voices.length}, historical ghosts=${ghosts.length}, current ghosts=${currentGhosts.length}; prior messages=${matchingContext.previousMessages.length}${decisionError ? `; Jev failed: ${decisionError}` : ""}; identity review questions=${Object.keys(review.questions).length}${reviewError ? `; review failed: ${reviewError}` : ""}${payload.dryRun ? "; dryRun=true (assignments not persisted)" : ""}; reduction=${Object.entries(reduction).filter(([, enabled]) => !enabled).map(([id]) => id).join(",") || "full"}.`);
+          diagnostics.unshift(`build=${BUILD_VERSION}; Available favorites=${voices.length}, historical ghosts=${ghosts.length}, current ghosts=${currentGhosts.length}; prior messages=${matchingContext.previousMessages.length}${decisionError ? `; Jev failed: ${decisionError}` : ""}; identity review questions=${Object.keys(review.questions).length}${reviewError ? `; review failed: ${reviewError}` : ""}.`);
           diagnostics.splice(1, 0, `Candidate context: ${ghosts.map((ghost, index) => `ghost_${index}=${ghost.id} last=${ghost.lastSeenMessageId || "none"} history=${(ghost.conversationHistory ?? []).map((entry) => `${entry.messageId}(${entry.text.length} chars)`).join(",") || "none"} context=${ghost.context.length} chars`).join("; ") || "none"}; prior=${matchingContext.previousMessages.map((item) => `${item.role ?? "unknown"}:${item.id}(${item.text.length} chars)`).join(",") || "none"}.`);
           sendFrontend({ type: "chat_voice_uncast_matches", requestId: payload.requestId, assignments, diagnostics }, userId, frontendSessionId);
-          if (assignments.length && !payload.dryRun) await sendState(userId, void 0, payload.chatId, frontendSessionId);
+          if (assignments.length) await sendState(userId, void 0, payload.chatId, frontendSessionId);
         }
       } catch (error) {
         sendFrontend({ type: "chat_voice_uncast_matches", requestId: payload.requestId, assignments: [], error: error instanceof Error ? error.message : "Could not match uncast voices." }, userId, frontendSessionId);

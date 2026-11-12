@@ -177,156 +177,6 @@ var UNCAST_SPEAKER_ID = "__chat_voice_uncast__";
 function standardSpeakerReviewPolicy() {
   return { runReview: true, bestAvailableSpeaker: true, shadowEvaluation: false, focusedOpeningFallback: false };
 }
-var REDUCTION_COMPONENTS = [
-  {
-    id: "scopedTtsState",
-    phase: "Phase 1",
-    label: "Scope TTS tag state to the target speech",
-    hint: "Send only the target quotation and its local neighbours to Jev for tag selection, not the full message.",
-    defaultValue: true
-  },
-  {
-    id: "twoPhaseTagReview",
-    phase: "Phase 1",
-    label: "Two-phase (primary/secondary) tag questions",
-    hint: "Primary pass asks primary questions first; secondary questions are asked only when the first pass establishes a need for them.",
-    defaultValue: true
-  },
-  {
-    id: "dedupTagCriteria",
-    phase: "Phase 1",
-    label: "Deduplicate tag criteria",
-    hint: "Share terse criteria blocks across emotion/style/sound/pause questions instead of expanding full descriptions per question.",
-    defaultValue: true
-  },
-  {
-    id: "gatedAuxReviews",
-    phase: "Phase 2",
-    label: "Gate auxiliary speaker reviews on triggers",
-    hint: "Best-available guess, self-introduction, speaker-switch and focused opening reviews run only when a trigger is present, not always.",
-    defaultValue: true
-  },
-  {
-    id: "deferRelationshipReview",
-    phase: "Phase 2",
-    label: "Defer the global relationship review until a trigger fires",
-    hint: "Skip the whole relationship review when no known trigger is established (no unresolved turn, no boundary, no alternate speaker switch); otherwise it runs as today.",
-    defaultValue: true
-  },
-  {
-    id: "trimVoiceCriteria",
-    phase: "Phase 2",
-    label: "Condense uncast voice ranking criteria",
-    hint: "Drop the description fields from the voice ranking criteria (use name, category, languages and tags only) and keep the shortlist small.",
-    defaultValue: true
-  }
-];
-var REDUCTION_COMPONENT_IDS = REDUCTION_COMPONENTS.map((component) => component.id);
-var FULL_REDUCTION_COMPONENTS = Object.fromEntries(REDUCTION_COMPONENTS.map((component) => [component.id, component.defaultValue]));
-var DISABLED_REDUCTION_COMPONENTS = Object.fromEntries(REDUCTION_COMPONENTS.map((component) => [component.id, false]));
-function readReductionComponents(value) {
-  const full = FULL_REDUCTION_COMPONENTS;
-  if (!value || typeof value !== "object" || Array.isArray(value)) return { ...full };
-  const row = value;
-  const next = { ...full };
-  for (const component of REDUCTION_COMPONENTS) {
-    const raw = row[component.id];
-    if (typeof raw === "boolean") next[component.id] = raw;
-  }
-  return next;
-}
-var CRC_TABLE = new Uint32Array(256);
-for (let index = 0; index < 256; index += 1) {
-  let value = index;
-  for (let bit = 0; bit < 8; bit += 1) value = value & 1 ? value >>> 1 ^ 3988292384 : value >>> 1;
-  CRC_TABLE[index] = value >>> 0;
-}
-function crc32(data) {
-  let crc = 4294967295;
-  for (const byte of data) crc = crc >>> 8 ^ CRC_TABLE[(crc ^ byte) & 255];
-  return (crc ^ 4294967295) >>> 0;
-}
-function dosDateTime(now) {
-  const time = (now.getHours() & 31) << 11 | (now.getMinutes() & 63) << 5 | Math.floor(now.getSeconds() / 2) & 31;
-  return {
-    time,
-    date: (now.getFullYear() - 1980 & 127) << 9 | (now.getMonth() + 1 & 15) << 5 | now.getDate() & 31
-  };
-}
-function buildStoreZip(files) {
-  const encoder = new TextEncoder();
-  const chunks = [];
-  const central = [];
-  let offset = 0;
-  const { time, date } = dosDateTime(/* @__PURE__ */ new Date());
-  for (const file of files) {
-    const nameBytes = encoder.encode(file.name);
-    const crc = crc32(file.data);
-    const local = new Uint8Array(30 + nameBytes.length);
-    const view = new DataView(local.buffer);
-    view.setUint32(0, 67324752, true);
-    view.setUint16(4, 20, true);
-    view.setUint16(6, 2048, true);
-    view.setUint16(8, 0, true);
-    view.setUint16(10, time, true);
-    view.setUint16(12, date, true);
-    view.setUint32(14, crc, true);
-    view.setUint32(18, file.data.length, true);
-    view.setUint32(22, file.data.length, true);
-    view.setUint16(26, nameBytes.length, true);
-    view.setUint16(28, 0, true);
-    local.set(nameBytes, 30);
-    chunks.push(local, file.data);
-    const entry = new Uint8Array(46 + nameBytes.length);
-    const centralView = new DataView(entry.buffer);
-    centralView.setUint32(0, 33639248, true);
-    centralView.setUint16(4, 20, true);
-    centralView.setUint16(6, 20, true);
-    centralView.setUint16(8, 2048, true);
-    centralView.setUint16(10, 0, true);
-    centralView.setUint16(12, time, true);
-    centralView.setUint16(14, date, true);
-    centralView.setUint32(16, crc, true);
-    centralView.setUint32(20, file.data.length, true);
-    centralView.setUint32(24, file.data.length, true);
-    centralView.setUint16(28, nameBytes.length, true);
-    centralView.setUint16(30, 0, true);
-    centralView.setUint16(32, 0, true);
-    centralView.setUint16(34, 0, true);
-    centralView.setUint16(36, 0, true);
-    centralView.setUint32(38, 0, true);
-    centralView.setUint32(42, offset, true);
-    entry.set(nameBytes, 46);
-    central.push(entry);
-    offset += local.length + file.data.length;
-  }
-  const centralOffset = offset;
-  let centralSize = 0;
-  for (const entry of central) {
-    chunks.push(entry);
-    centralSize += entry.length;
-    offset += entry.length;
-  }
-  const eocd = new Uint8Array(22);
-  const eocdView = new DataView(eocd.buffer);
-  eocdView.setUint32(0, 101010256, true);
-  eocdView.setUint16(4, 0, true);
-  eocdView.setUint16(6, 0, true);
-  eocdView.setUint16(8, files.length, true);
-  eocdView.setUint16(10, files.length, true);
-  eocdView.setUint32(12, centralSize, true);
-  eocdView.setUint32(16, centralOffset, true);
-  eocdView.setUint16(20, 0, true);
-  chunks.push(eocd);
-  const total = offset + eocd.length;
-  const output = new Uint8Array(total);
-  let cursor = 0;
-  for (const chunk of chunks) {
-    output.set(chunk, cursor);
-    cursor += chunk.length;
-  }
-  return output;
-}
 function autoplayGenerationEvent(value, activeChatId) {
   if (!value || typeof value !== "object" || Array.isArray(value) || !activeChatId) return null;
   const event = value;
@@ -2431,9 +2281,7 @@ async function loadPlaybackPreferences() {
     communityVoicePool: [],
     communityVoicePoolAt: "",
     communityVoiceLanguage: "",
-    autoVoiceCastingPool: "favorite",
-    reductionCompare: false,
-    reductionComponents: { ...FULL_REDUCTION_COMPONENTS }
+    autoVoiceCastingPool: "favorite"
   };
   const row = await response.json();
   const speed = typeof row.value?.ttsSpeed === "number" ? row.value.ttsSpeed : 1;
@@ -2481,9 +2329,7 @@ async function loadPlaybackPreferences() {
     communityVoicePool: readFavoriteVoices(row.value?.chatVoiceCommunityVoicePool),
     communityVoicePoolAt: typeof row.value?.chatVoiceCommunityVoicePoolAt === "string" ? row.value.chatVoiceCommunityVoicePoolAt.slice(0, 32) : "",
     communityVoiceLanguage: typeof row.value?.chatVoiceCommunityVoiceLanguage === "string" ? row.value.chatVoiceCommunityVoiceLanguage.trim().slice(0, 32).toLowerCase() : "",
-    autoVoiceCastingPool: row.value?.chatVoiceAutoCastPool === "community" ? "community" : "favorite",
-    reductionCompare: row.value?.chatVoiceReductionCompare === true,
-    reductionComponents: readReductionComponents(row.value?.chatVoiceReductionComponents)
+    autoVoiceCastingPool: row.value?.chatVoiceAutoCastPool === "community" ? "community" : "favorite"
   };
 }
 var voiceSettingsWriteQueue = Promise.resolve();
@@ -2543,93 +2389,7 @@ function saveTtsTagPreferences(style, placement, connectionId, model) {
     chatVoiceTagLlmModel: model.trim().slice(0, 256)
   }));
 }
-var REDUCTION_COMPARE_REPORT_KEY = "chatVoiceReductionCompareReport";
-var REDUCTION_COMPARE_REPORT_CAP = 20;
-var REDUCTION_COMPARE_TEXT_CAP = 8e4;
-function utf8ByteLength(text) {
-  return new TextEncoder().encode(text).length;
-}
-function truncateReportText(text) {
-  if (text.length <= REDUCTION_COMPARE_TEXT_CAP) return text;
-  return `${text.slice(0, REDUCTION_COMPARE_TEXT_CAP)}
-[truncated: ${text.length - REDUCTION_COMPARE_TEXT_CAP} characters omitted]`;
-}
-function readReductionCompareReports(value) {
-  if (!Array.isArray(value)) return [];
-  const entries = [];
-  for (const item of value) {
-    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
-    const row = item;
-    if (typeof row.id !== "string" || !row.id.trim() || row.id.length > 128) continue;
-    if (typeof row.iso !== "string" || Number.isNaN(Date.parse(row.iso))) continue;
-    if (typeof row.chatId !== "string" || !row.chatId || typeof row.messageId !== "string" || !row.messageId) continue;
-    const readSide = (side) => {
-      const part = side && typeof side === "object" && !Array.isArray(side) ? side : {};
-      const text = typeof part.text === "string" ? truncateReportText(part.text) : "";
-      const bytes = typeof part.bytes === "number" && Number.isFinite(part.bytes) && part.bytes >= 0 ? Math.round(part.bytes) : utf8ByteLength(text);
-      return { text, bytes };
-    };
-    entries.push({
-      id: row.id.slice(0, 128),
-      iso: row.iso,
-      chatId: row.chatId.slice(0, 128),
-      messageId: row.messageId.slice(0, 128),
-      reduction: readSide(row.reduction),
-      baseline: readSide(row.baseline)
-    });
-  }
-  return entries.slice(-REDUCTION_COMPARE_REPORT_CAP);
-}
-async function appendReductionCompareReport(entry) {
-  let count = 0;
-  await updateVoiceSettings((current) => {
-    const existing = readReductionCompareReports(current[REDUCTION_COMPARE_REPORT_KEY]);
-    count = Math.min(REDUCTION_COMPARE_REPORT_CAP, existing.length + 1);
-    return { ...current, [REDUCTION_COMPARE_REPORT_KEY]: [...existing, entry].slice(-REDUCTION_COMPARE_REPORT_CAP) };
-  });
-  return count;
-}
-async function clearReductionCompareReport() {
-  await updateVoiceSettings((current) => ({ ...current, [REDUCTION_COMPARE_REPORT_KEY]: [] }));
-}
-async function readReductionCompareReportCount() {
-  try {
-    const response = await fetch("/api/v1/settings/voiceSettings", {
-      credentials: "same-origin",
-      headers: { Accept: "application/json" }
-    });
-    if (!response.ok) return 0;
-    const row = await response.json();
-    return readReductionCompareReports(row.value?.[REDUCTION_COMPARE_REPORT_KEY]).length;
-  } catch {
-    return 0;
-  }
-}
-function reductionCompareReportMarkdown(entry) {
-  return [
-    "# Chat Voice \u2014 reduction comparison report",
-    "",
-    `- Chat: \`${entry.chatId}\``,
-    `- Message: \`${entry.messageId}\``,
-    `- Captured: ${entry.iso}`,
-    `- Reduction payload: ${entry.reduction.bytes} bytes`,
-    `- Baseline payload: ${entry.baseline.bytes} bytes`,
-    "",
-    "## Reduction implementation (audible) \u2014 configured reduction components",
-    "",
-    "```",
-    entry.reduction.text || "(no output captured)",
-    "```",
-    "",
-    "## Baseline (silent) \u2014 pre-reduction behavior",
-    "",
-    "```",
-    entry.baseline.text || "(no output captured)",
-    "```",
-    ""
-  ].join("\n");
-}
-function saveAdvancedPlaybackPreferences(bufferSegments, concurrentGenerations, rateLimitWaitSeconds, speakerAssignmentDebug, ghostVoiceLifetime, autoVoiceCasting, autoPlayback, autoPlaybackDelaySeconds, speakerLookback, skipNarration, autoVoiceCastingPool, reductionCompare, reductionComponents) {
+function saveAdvancedPlaybackPreferences(bufferSegments, concurrentGenerations, rateLimitWaitSeconds, speakerAssignmentDebug, ghostVoiceLifetime, autoVoiceCasting, autoPlayback, autoPlaybackDelaySeconds, speakerLookback, skipNarration, autoVoiceCastingPool) {
   return updateVoiceSettings((current) => ({
     ...current,
     chatVoicePlaybackBufferSegments: clampIntegerSetting(
@@ -2654,9 +2414,7 @@ function saveAdvancedPlaybackPreferences(bufferSegments, concurrentGenerations, 
     chatVoiceAutoPlaybackDelaySeconds: readAutoplayDelaySeconds(autoPlaybackDelaySeconds),
     chatVoiceAutoCastPool: autoVoiceCastingPool,
     chatVoiceGhostVoiceLifetime: clampIntegerSetting(ghostVoiceLifetime, GHOST_VOICE_LIFETIME_MESSAGES, 1e3),
-    chatVoiceSpeakerLookback: clampIntegerSetting(speakerLookback, DEFAULT_SPEAKER_LOOKBACK, MAX_SPEAKER_LOOKBACK),
-    chatVoiceReductionCompare: reductionCompare,
-    chatVoiceReductionComponents: { ...readReductionComponents(reductionComponents) }
+    chatVoiceSpeakerLookback: clampIntegerSetting(speakerLookback, DEFAULT_SPEAKER_LOOKBACK, MAX_SPEAKER_LOOKBACK)
   }));
 }
 function saveDefaultRoleVoice(role, voice) {
@@ -3079,8 +2837,6 @@ function setup(ctx) {
     .chat-voice-status[data-state="saved"] { color:var(--lumiverse-success, #65b97a); }
     .chat-voice-status[data-state="error"] { color:var(--lumiverse-danger, #ef6464); }
     .chat-voice-advanced-section { border-top:1px solid var(--lumiverse-border); padding-top:12px; }
-    .chat-voice-reduction-group { display:flex; flex-direction:column; gap:12px; border-top:1px solid var(--lumiverse-border); padding-top:12px; }
-    .chat-voice-reduction-title { font-weight:700; color:var(--lumiverse-text); }
     .chat-voice-advanced-summary {
       display:flex; align-items:center; justify-content:space-between; cursor:pointer;
       font-weight:700; list-style:none; user-select:none;
@@ -3866,88 +3622,6 @@ function setup(ctx) {
     void copyDebugReport();
   });
   debugActions.append(copyReportButton);
-  let reductionCompare = false;
-  let reductionComponents = { ...FULL_REDUCTION_COMPONENTS };
-  const reductionComponentToggles = [];
-  let reductionCompareToggle = null;
-  let reductionReportHint = null;
-  const reductionGroup = document.createElement("div");
-  reductionGroup.className = "chat-voice-reduction-group";
-  const reductionTitle = document.createElement("div");
-  reductionTitle.className = "chat-voice-reduction-title";
-  reductionTitle.textContent = "Token reduction (experimental)";
-  reductionGroup.append(reductionTitle);
-  const reductionCompareLabel = document.createElement("label");
-  reductionCompareLabel.className = "chat-voice-toggle";
-  reductionCompareToggle = document.createElement("input");
-  reductionCompareToggle.type = "checkbox";
-  reductionCompareToggle.setAttribute("aria-label", "Compare reduction vs baseline");
-  const reductionCompareCopy = document.createElement("span");
-  reductionCompareCopy.className = "chat-voice-toggle-copy";
-  const reductionCompareText = document.createElement("span");
-  reductionCompareText.textContent = "Compare reduction vs baseline";
-  const reductionCompareHint = document.createElement("span");
-  reductionCompareHint.className = "chat-voice-toggle-hint";
-  reductionCompareHint.textContent = "Playback audio comes from the configured reduction implementation. A silent copy of the pre-reduction pipeline runs for the same message; nothing it decides affects the audible output, and its debug log is kept in the comparison report instead.";
-  reductionCompareToggle.checked = reductionCompare;
-  reductionCompareToggle.addEventListener("change", () => {
-    reductionCompare = reductionCompareToggle?.checked ?? false;
-    scheduleAdvancedSettingsSave();
-  });
-  reductionCompareCopy.append(reductionCompareText, reductionCompareHint);
-  reductionCompareLabel.append(reductionCompareToggle, reductionCompareCopy);
-  reductionGroup.append(reductionCompareLabel);
-  for (const component of REDUCTION_COMPONENTS) {
-    const componentLabel = document.createElement("label");
-    componentLabel.className = "chat-voice-toggle";
-    const componentToggle = document.createElement("input");
-    componentToggle.type = "checkbox";
-    componentToggle.checked = reductionComponents[component.id];
-    componentToggle.setAttribute("aria-label", component.label);
-    componentToggle.addEventListener("change", () => {
-      reductionComponents = readReductionComponents({ ...reductionComponents, [component.id]: componentToggle.checked });
-      scheduleAdvancedSettingsSave();
-    });
-    const componentCopy = document.createElement("span");
-    componentCopy.className = "chat-voice-toggle-copy";
-    const componentText = document.createElement("span");
-    componentText.textContent = component.label;
-    const componentHint = document.createElement("span");
-    componentHint.className = "chat-voice-toggle-hint";
-    componentHint.textContent = component.hint;
-    componentCopy.append(componentText, componentHint);
-    componentLabel.append(componentToggle, componentCopy);
-    reductionComponentToggles.push({ id: component.id, toggle: componentToggle });
-    reductionGroup.append(componentLabel);
-  }
-  const reductionActions = document.createElement("div");
-  reductionActions.className = "chat-voice-debug-actions";
-  const downloadReportButton = document.createElement("button");
-  downloadReportButton.type = "button";
-  downloadReportButton.className = "chat-voice-copy-report-button";
-  downloadReportButton.textContent = "Download report";
-  downloadReportButton.addEventListener("click", () => {
-    void downloadReductionCompareReport();
-  });
-  const clearReportButton = document.createElement("button");
-  clearReportButton.type = "button";
-  clearReportButton.className = "chat-voice-copy-report-button";
-  clearReportButton.textContent = "Clear report";
-  clearReportButton.addEventListener("click", () => {
-    void clearReductionCompareReportWithConfirm();
-  });
-  reductionActions.append(downloadReportButton, clearReportButton);
-  reductionReportHint = document.createElement("span");
-  reductionReportHint.className = "chat-voice-toggle-hint";
-  reductionReportHint.textContent = "0 comparison captures stored";
-  void readReductionCompareReportCount().then((count) => {
-    if (reductionReportHint) reductionReportHint.textContent = `${count} comparison capture${count === 1 ? "" : "s"} stored`;
-  }).catch(() => void 0);
-  reductionGroup.append(reductionActions, reductionReportHint);
-  const reductionStoreHint = document.createElement("span");
-  reductionStoreHint.className = "chat-voice-toggle-hint";
-  reductionStoreHint.textContent = "The accumulated report (last 20 captures) is stored in the global voice settings shared by the whole app, so it survives extension updates and reinstalls. Each capture stores the reduction and baseline outputs for the same message.";
-  reductionGroup.append(reductionStoreHint);
   const advancedHint = document.createElement("div");
   advancedHint.className = "chat-voice-hint";
   advancedHint.textContent = "Concurrency starts at one and adapts up to the selected maximum. Dense short-segment runs stay at one request at a time, while sustained long runs increase gradually. Larger buffers reduce pauses but delay playback. The wait budget controls cumulative rate-limit cooldowns.";
@@ -3969,7 +3643,6 @@ function setup(ctx) {
     speakerDebugLabel,
     debugActions,
     speakerDebugOutput,
-    reductionGroup,
     advancedHint
   );
   let applyingState = false;
@@ -4137,10 +3810,7 @@ function setup(ctx) {
   let decisionStatusRequestSequence = 0;
   let llmConnectionRequestSequence = 0;
   let tagPlacementRequestSequence = 0;
-  let baselinePassLines = null;
-  let reductionPassLines = null;
   const setStatus = (message, state = "normal") => {
-    if (baselinePassLines) return;
     status.textContent = message;
     status.dataset.state = state;
   };
@@ -4615,7 +4285,7 @@ function setup(ctx) {
       ctx.sendToBackend({ type: "chat_voice_get_message", chatId, messageId, requestId });
     });
   }
-  function requestSpeakerReviewedSegments(chatId, messageId, preferences, reductionOverride, forceDebug = false) {
+  function requestSpeakerReviewedSegments(chatId, messageId, preferences) {
     const requestId = `parse-${Date.now().toString(36)}-${++speakerParseRequestSequence}`;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -4636,9 +4306,8 @@ function setup(ctx) {
         skippedTrackerTags: preferences.skippedTrackerTags,
         ghostVoiceLifetime: preferences.ghostVoiceLifetime,
         speakerLookback: preferences.speakerLookback,
-        debug: forceDebug || preferences.speakerAssignmentDebug,
-        ...standardSpeakerReviewPolicy(),
-        reduction: reductionOverride ?? preferences.reductionComponents
+        debug: preferences.speakerAssignmentDebug,
+        ...standardSpeakerReviewPolicy()
       });
     });
   }
@@ -4654,7 +4323,7 @@ function setup(ctx) {
       ctx.sendToBackend({ type: "chat_voice_auto_cast", requestId, chatId, voices, reserved, narratorMissing, userMissing, ghostLifetime: ghostVoiceLifetime });
     });
   }
-  function requestUncastVoiceMatches(chatId, messageId, message, sourceHash, groups, voices, reserved, lifetime, speakerLookback2, skippedTrackerTags2, reductionOverride, dryRun = false) {
+  function requestUncastVoiceMatches(chatId, messageId, message, sourceHash, groups, voices, reserved, lifetime, speakerLookback2, skippedTrackerTags2) {
     const requestId = `uncast-${Date.now().toString(36)}-${++uncastRequestSequence}`;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -4662,7 +4331,7 @@ function setup(ctx) {
         reject(new Error("Uncast voice matching timed out."));
       }, 35e3);
       pendingUncastRequests.set(requestId, { resolve, reject, timer });
-      ctx.sendToBackend({ type: "chat_voice_match_uncast", requestId, chatId, messageId, message, sourceHash, groups, voices, reserved, lifetime, speakerLookback: speakerLookback2, skippedTrackerTags: skippedTrackerTags2, reduction: reductionOverride, dryRun });
+      ctx.sendToBackend({ type: "chat_voice_match_uncast", requestId, chatId, messageId, message, sourceHash, groups, voices, reserved, lifetime, speakerLookback: speakerLookback2, skippedTrackerTags: skippedTrackerTags2 });
     });
   }
   const pendingCommunityRequests = /* @__PURE__ */ new Map();
@@ -4813,8 +4482,7 @@ function setup(ctx) {
     return lines;
   }
   function updateSpeakerDebugLog(messageId, isUserMessage, defaultSpeakerId, parserSpeakers, configuredSpeakers, localSegments, finalSegments, aliases, config, parsingMode, review) {
-    const capturing = baselinePassLines !== null || reductionPassLines !== null;
-    if (!speakerAssignmentDebug && !capturing) return;
+    if (!speakerAssignmentDebug) return;
     const lines = [
       `Message ${messageId} (${isUserMessage ? "user" : "assistant"})`,
       `Parsing mode: ${parsingMode === "off" ? "local parser only" : "Jev with local fallback"}`,
@@ -4866,22 +4534,11 @@ function setup(ctx) {
       "Legend: jev-* first pass \xB7 jev-turn-* and chain-* turn matrix \xB7 jev-discourse-* and discourse-* cross-paragraph review \xB7 resolution:* deterministic policy \xB7 voice-route:* final routing"
     );
     const log = lines.join("\n");
-    if (baselinePassLines) {
-      baselinePassLines.push(log);
-      return;
-    }
-    reductionPassLines?.push(log);
     speakerDebugOutput.value = log;
     console.debug("[Chat Voice] Speaker assignment trace\n" + log);
   }
   function appendSpeakerDebugLog(line) {
-    if (baselinePassLines) {
-      baselinePassLines.push(line);
-      console.debug(`[Chat Voice] ${line}`);
-      return;
-    }
-    reductionPassLines?.push(line);
-    if (!speakerAssignmentDebug && !reductionPassLines) return;
+    if (!speakerAssignmentDebug) return;
     speakerDebugOutput.value += `${speakerDebugOutput.value ? "\n" : ""}${line}`;
     console.debug(`[Chat Voice] ${line}`);
   }
@@ -4956,75 +4613,6 @@ function setup(ctx) {
       speakerDebugOutput.focus();
       speakerDebugOutput.select();
       setStatus("Clipboard copy failed; the debug log text is selected for manual copying.", "error");
-    }
-  }
-  async function downloadReductionCompareReport() {
-    let entries = [];
-    try {
-      const response = await fetch("/api/v1/settings/voiceSettings", {
-        credentials: "same-origin",
-        headers: { Accept: "application/json" }
-      });
-      if (!response.ok) throw new Error(`Could not load global voice settings (${response.status}).`);
-      const row = await response.json();
-      entries = readReductionCompareReports(row.value?.[REDUCTION_COMPARE_REPORT_KEY]);
-    } catch (error) {
-      setStatus(error instanceof Error ? error.message : "Could not load the reduction comparison report.", "error");
-      return;
-    }
-    if (entries.length === 0) {
-      setStatus('The reduction comparison report is empty. Enable "Compare reduction vs baseline" in Advanced settings and replay a message first.', "error");
-      return;
-    }
-    const encoder = new TextEncoder();
-    const files = [
-      {
-        name: "manifest.json",
-        data: encoder.encode(JSON.stringify({
-          kind: "chat-voice/reduction-compare-report",
-          format: 1,
-          app: "Chat Voice",
-          exportedAt: (/* @__PURE__ */ new Date()).toISOString(),
-          reportCount: entries.length,
-          retention: `Rolling buffer of the last ${REDUCTION_COMPARE_REPORT_CAP} captures, stored in global voice settings under \`${REDUCTION_COMPARE_REPORT_KEY}\`; it survives extension updates and reinstalls.`,
-          components: REDUCTION_COMPONENTS.map((component) => ({ id: component.id, phase: component.phase, label: component.label }))
-        }, null, 2))
-      }
-    ];
-    for (const [index, entry] of entries.entries()) {
-      const stamp = entry.iso.replace(/[:.]/gu, "-");
-      files.push({
-        name: `reports/${String(index + 1).padStart(2, "0")}-${stamp}-${entry.id}.md`,
-        data: encoder.encode(reductionCompareReportMarkdown(entry))
-      });
-    }
-    const zip = buildStoreZip(files);
-    const blob = new Blob([zip], { type: "application/zip" });
-    const url = URL.createObjectURL(blob);
-    const anchor = document.createElement("a");
-    anchor.href = url;
-    anchor.download = `chat-voice-reduction-compare-report-${(/* @__PURE__ */ new Date()).toISOString().slice(0, 10)}.zip`;
-    document.body.appendChild(anchor);
-    anchor.click();
-    anchor.remove();
-    URL.revokeObjectURL(url);
-    setStatus(`Downloaded ${entries.length} comparison capture(s) as a zip.`, "saved");
-  }
-  async function clearReductionCompareReportWithConfirm() {
-    const { confirmed } = await ctx.ui.showConfirm({
-      title: "Clear comparison report?",
-      message: "This deletes every stored reduction comparison capture. This cannot be undone.",
-      confirmLabel: "Clear",
-      cancelLabel: "Keep",
-      variant: "warning"
-    });
-    if (!confirmed) return;
-    try {
-      await clearReductionCompareReport();
-      if (reductionReportHint) reductionReportHint.textContent = "0 comparison captures stored";
-      setStatus("Reduction comparison report cleared.", "saved");
-    } catch (error) {
-      setStatus(error instanceof Error ? error.message : "Could not clear the reduction comparison report.", "error");
     }
   }
   function requestTagPlacements(message, style, connectionId, model, items) {
@@ -5236,12 +4824,8 @@ function setup(ctx) {
       return attachment.type === "audio" && (attachment.swipe_id === void 0 || attachment.swipe_id === message.swipe_id);
     });
   }
-  async function playMessage(messageId, nativeRegenerationAction = false, automatic = false, expectedSwipe, compareBaseline = false) {
-    if (!compareBaseline) {
-      baselinePassLines = null;
-      reductionPassLines = null;
-    }
-    if (!compareBaseline && activePlayback?.messageId === messageId) {
+  async function playMessage(messageId, nativeRegenerationAction = false, automatic = false, expectedSwipe) {
+    if (activePlayback?.messageId === messageId) {
       if (automatic) return;
       playbackStartup.cancel();
       const finishingSave = stopPlayback();
@@ -5253,12 +4837,12 @@ function setup(ctx) {
       setStatus("Open a chat before starting voice playback.", "error");
       return;
     }
-    const startupToken = compareBaseline ? null : playbackStartup.begin(requestedChatId, messageId, automatic);
-    if (!compareBaseline && startupToken === null) {
+    const startupToken = playbackStartup.begin(requestedChatId, messageId, automatic);
+    if (startupToken === null) {
       if (!automatic) setStatus("Playback stopped.");
       return;
     }
-    const ownsStartup = () => compareBaseline || playbackStartup.owns(startupToken) && !autoPlaybackDisposed && ctx.getActiveChat().chatId === requestedChatId && (!automatic || autoPlayback);
+    const ownsStartup = () => playbackStartup.owns(startupToken) && !autoPlaybackDisposed && ctx.getActiveChat().chatId === requestedChatId && (!automatic || autoPlayback);
     try {
       let message;
       try {
@@ -5277,7 +4861,7 @@ function setup(ctx) {
         appendSpeakerDebugLog(`Autoplay skipped: message ${messageId} changed swipe or content after generation (expected swipe ${expectedSwipe?.swipeId ?? "unknown"}, active swipe ${message.swipe_id ?? 0}).`);
         return;
       }
-      const regeneratingSavedAudio = !compareBaseline && !message.is_user && (nativeRegenerationAction || !automatic && hasSavedAudioForCurrentSwipe(message));
+      const regeneratingSavedAudio = !message.is_user && (nativeRegenerationAction || !automatic && hasSavedAudioForCurrentSwipe(message));
       if (regeneratingSavedAudio) {
         const { confirmed } = await ctx.ui.showConfirm({
           title: "Regenerate TTS audio?",
@@ -5306,8 +4890,6 @@ function setup(ctx) {
       const config = collectConfig();
       const connectionVersionAtLoad = globalConnectionVersion;
       const preferences = await loadPlaybackPreferences();
-      if (compareBaseline) baselinePassLines = [];
-      else if (preferences.reductionCompare) reductionPassLines = [];
       if (!ownsStartup()) return;
       if (llmSettingsSaveTimer || savingLlmSettings) {
         preferences.speakerParsingMode = speakerParsingMode;
@@ -5326,16 +4908,12 @@ function setup(ctx) {
         preferences.autoPlayback = autoPlayback;
         preferences.speakerAssignmentDebug = speakerAssignmentDebug;
         preferences.skipNarration = skipNarration;
-        preferences.reductionCompare = reductionCompare;
-        preferences.reductionComponents = { ...reductionComponents };
       } else {
         playbackBufferSegments = preferences.playbackBufferSegments;
         concurrentGenerationLimit = preferences.concurrentGenerations;
         rateLimitWaitSeconds = preferences.rateLimitWaitSeconds;
         speakerAssignmentDebug = preferences.speakerAssignmentDebug;
         skipNarration = preferences.skipNarration;
-        reductionCompare = preferences.reductionCompare;
-        reductionComponents = { ...preferences.reductionComponents };
       }
       const connectionId = savingGlobalConnection || connectionVersionAtLoad !== globalConnectionVersion ? lumiverseConnectionId : resolveGlobalTtsConnection(preferences.connectionId, connections);
       if (!connectionId) {
@@ -5344,7 +4922,7 @@ function setup(ctx) {
       }
       const connectionProfileVoice = (connections.find((connection) => connection.id === connectionId)?.voice ?? "").trim();
       let autoCastDiagnostics = [];
-      if (!compareBaseline && preferences.autoVoiceCasting && poolVoicesForAutoCast().length && (!config.narratorVoice || !config.userVoice || playbackChat.characters.some((character) => !config.characterVoices[character.id]))) {
+      if (preferences.autoVoiceCasting && poolVoicesForAutoCast().length && (!config.narratorVoice || !config.userVoice || playbackChat.characters.some((character) => !config.characterVoices[character.id]))) {
         flushSave();
         const autoResult = await requestAutoCast(playbackChat.id, poolVoicesForAutoCast(), [connectionProfileVoice, config.narratorVoice, config.userVoice, ...Object.values(config.characterVoices)].filter(Boolean), !config.narratorVoice, !config.userVoice);
         if (!ownsStartup()) return;
@@ -5360,83 +4938,66 @@ function setup(ctx) {
           `TTS connection profile: id=${JSON.stringify(connectionId)}, provider=${JSON.stringify(profile?.provider ?? "")}, model=${JSON.stringify(profile?.model ?? "")}, defaultVoice=${JSON.stringify(profile?.voice ?? "")}, narratorVoice=${JSON.stringify(config.narratorVoice || "<connection default>")}, userVoice=${JSON.stringify(config.userVoice || "<none>")}`
         );
       }
-      let playback;
-      if (compareBaseline) {
-        playback = {
-          messageId,
-          controller: new AbortController(),
-          synthesisController: null,
-          context: null,
-          source: null,
-          persistenceState: "disabled",
-          persistenceError: null,
-          playbackStopped: true,
-          playbackFinished: true,
-          audibleDone: Promise.resolve(),
-          finishAudible: () => void 0
-        };
-      } else {
-        const contextClass = window.AudioContext ?? window.webkitAudioContext;
-        if (!contextClass) {
-          setStatus("Web Audio is unavailable in this browser.", "error");
-          return;
-        }
-        const audioContext = new contextClass();
-        if (automatic) {
-          let timer;
-          try {
-            await Promise.race([
-              audioContext.resume(),
-              new Promise((_, reject) => {
-                timer = setTimeout(() => reject(new Error("Automatic playback needs a browser interaction. Click a play button to enable audio.")), 2e3);
-              })
-            ]);
-          } catch (error) {
-            void audioContext.close().catch(() => void 0);
-            if (ownsStartup()) setStatus(error instanceof Error ? error.message : "Automatic playback could not start.", "error");
-            return;
-          } finally {
-            if (timer) clearTimeout(timer);
-          }
-        } else {
-          try {
-            await audioContext.resume();
-          } catch (error) {
-            void audioContext.close().catch(() => void 0);
-            throw error;
-          }
-        }
-        if (!ownsStartup()) {
-          void audioContext.close().catch(() => void 0);
-          return;
-        }
-        let audibleFinished = false;
-        let resolveAudibleDone = null;
-        const audibleDone = new Promise((resolve) => {
-          resolveAudibleDone = resolve;
-        });
-        playback = {
-          messageId,
-          controller: new AbortController(),
-          synthesisController: null,
-          context: audioContext,
-          source: null,
-          persistenceState: "not-started",
-          persistenceError: null,
-          playbackStopped: false,
-          playbackFinished: false,
-          audibleDone,
-          finishAudible: () => {
-            if (audibleFinished) return;
-            audibleFinished = true;
-            resolveAudibleDone?.();
-          }
-        };
-        if (activePlayback) stopPlayback();
-        activePlayback = playback;
-        if (startupToken !== null) playbackStartup.finish(startupToken);
-        updatePlaybackButtons();
+      const contextClass = window.AudioContext ?? window.webkitAudioContext;
+      if (!contextClass) {
+        setStatus("Web Audio is unavailable in this browser.", "error");
+        return;
       }
+      const audioContext = new contextClass();
+      if (automatic) {
+        let timer;
+        try {
+          await Promise.race([
+            audioContext.resume(),
+            new Promise((_, reject) => {
+              timer = setTimeout(() => reject(new Error("Automatic playback needs a browser interaction. Click a play button to enable audio.")), 2e3);
+            })
+          ]);
+        } catch (error) {
+          void audioContext.close().catch(() => void 0);
+          if (ownsStartup()) setStatus(error instanceof Error ? error.message : "Automatic playback could not start.", "error");
+          return;
+        } finally {
+          if (timer) clearTimeout(timer);
+        }
+      } else {
+        try {
+          await audioContext.resume();
+        } catch (error) {
+          void audioContext.close().catch(() => void 0);
+          throw error;
+        }
+      }
+      if (!ownsStartup()) {
+        void audioContext.close().catch(() => void 0);
+        return;
+      }
+      let audibleFinished = false;
+      let resolveAudibleDone = null;
+      const audibleDone = new Promise((resolve) => {
+        resolveAudibleDone = resolve;
+      });
+      const playback = {
+        messageId,
+        controller: new AbortController(),
+        synthesisController: null,
+        context: audioContext,
+        source: null,
+        persistenceState: "not-started",
+        persistenceError: null,
+        playbackStopped: false,
+        playbackFinished: false,
+        audibleDone,
+        finishAudible: () => {
+          if (audibleFinished) return;
+          audibleFinished = true;
+          resolveAudibleDone?.();
+        }
+      };
+      if (activePlayback) stopPlayback();
+      activePlayback = playback;
+      playbackStartup.finish(startupToken);
+      updatePlaybackButtons();
       const playbackSetupFinishedAt = Date.now();
       try {
         if (playback.controller.signal.aborted) throw new DOMException("Playback stopped.", "AbortError");
@@ -5466,13 +5027,7 @@ function setup(ctx) {
           );
         }
         try {
-          review = await requestSpeakerReviewedSegments(
-            playbackChat.id,
-            messageId,
-            preferences,
-            compareBaseline ? DISABLED_REDUCTION_COMPONENTS : void 0,
-            compareBaseline || preferences.reductionCompare
-          );
+          review = await requestSpeakerReviewedSegments(playbackChat.id, messageId, preferences);
         } catch (error) {
           if (playback.controller.signal.aborted) throw new DOMException("Playback stopped.", "AbortError");
           if (error instanceof Error && error.message.includes("changed during speaker review")) throw error;
@@ -5525,9 +5080,7 @@ function setup(ctx) {
           reservedVoices,
           preferences.ghostVoiceLifetime,
           preferences.speakerLookback,
-          preferences.skippedTrackerTags,
-          compareBaseline ? DISABLED_REDUCTION_COMPONENTS : void 0,
-          compareBaseline
+          preferences.skippedTrackerTags
         ).catch((error) => {
           appendSpeakerDebugLog(`Uncast voice matching failed; using connection default: ${error instanceof Error ? error.message : String(error)}`);
           return [];
@@ -5615,12 +5168,7 @@ function setup(ctx) {
             );
           }
         };
-        if (compareBaseline && preferences.ttsTagPlacement === "llm" && tagSources.size > 0) {
-          appendSpeakerDebugLog(
-            `TTS tag placement: skipped in the baseline capture (${tagSources.size} speeches would be placed by the LLM; deterministic Jev placement applies instead).`
-          );
-        }
-        if (!compareBaseline && preferences.ttsTagStyle !== "off" && preferences.ttsTagPlacement === "llm" && tagSources.size > 0) {
+        if (preferences.ttsTagStyle !== "off" && preferences.ttsTagPlacement === "llm" && tagSources.size > 0) {
           const placementStyle = preferences.ttsTagStyle;
           appendSpeakerDebugLog(
             `
@@ -5729,7 +5277,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
             })();
           }
         }
-        if (uncastGroups.length && !compareBaseline) setStatus("Matching uncast characters to favorite voices\u2026");
+        if (uncastGroups.length) setStatus("Matching uncast characters to favorite voices\u2026");
         const uncastMatches = await uncastMatchPromise;
         if (playback.controller.signal.aborted) throw new DOMException("Playback stopped.", "AbortError");
         for (const match of uncastMatches) {
@@ -5739,37 +5287,6 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
             for (const index of segmentPlanIndexes[segmentIndex] ?? []) plan[index] = { ...plan[index], voice: match.voiceId };
           }
           appendSpeakerDebugLog(`Uncast voice ${group.id}: gender=${match.gender}, ghost=${match.ghostId ?? "none"}, voice=${JSON.stringify(match.voiceId)}.`);
-        }
-        if (compareBaseline) {
-          appendSpeakerDebugLog("\nBaseline capture complete: synthesis and saved audio were intentionally skipped.");
-          return;
-        }
-        if (preferences.reductionCompare) {
-          const reductionText = (reductionPassLines ?? []).join("\n");
-          reductionPassLines = null;
-          try {
-            setStatus("Saving baseline comparison\u2026");
-            await playMessage(messageId, false, false, void 0, true);
-          } catch (error) {
-            console.warn("[Chat Voice] Baseline comparison capture failed.", error);
-            appendSpeakerDebugLog(`Baseline comparison capture failed: ${error instanceof Error ? error.message : String(error)}`);
-          }
-          const baselineText = (baselinePassLines ?? []).join("\n");
-          baselinePassLines = null;
-          try {
-            const count = await appendReductionCompareReport({
-              id: `cmp-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
-              iso: (/* @__PURE__ */ new Date()).toISOString(),
-              chatId: playbackChat.id,
-              messageId,
-              reduction: { text: truncateReportText(reductionText), bytes: utf8ByteLength(reductionText) },
-              baseline: { text: truncateReportText(baselineText), bytes: utf8ByteLength(baselineText) }
-            });
-            if (reductionReportHint) reductionReportHint.textContent = `${count} comparison capture${count === 1 ? "" : "s"} stored`;
-            setStatus(`Baseline comparison captured. The report now holds ${count} capture${count === 1 ? "" : "s"}.`, "saved");
-          } catch (error) {
-            setStatus(error instanceof Error ? error.message : "Could not save the comparison report.", "error");
-          }
         }
         synthesisPlanFrozen = true;
         const splitPlan = splitLargeVoicePlanSegments(plan);
@@ -5945,7 +5462,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
           adaptiveSynthesisLimits.delete(adaptiveLimitToken);
           drainSynthesisQueue();
         });
-        const normalizationContext = new (window.AudioContext ?? window.webkitAudioContext)();
+        const normalizationContext = new contextClass();
         const voiceLoudnessProfiles = /* @__PURE__ */ new Map();
         let normalizationChain = Promise.resolve();
         const processed = prepared.map((pending, index) => {
@@ -5986,7 +5503,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
               messageId,
               message.swipe_id,
               captured,
-              window.AudioContext ?? window.webkitAudioContext,
+              contextClass,
               synthesisController.signal,
               () => playback.audibleDone,
               (normalized) => {
@@ -6120,7 +5637,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
         }
       }
     } finally {
-      if (startupToken !== null) playbackStartup.finish(startupToken);
+      playbackStartup.finish(startupToken);
     }
   }
   function scanMessages() {
@@ -7550,10 +7067,6 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
         skipNarration = preferences.skipNarration;
         skipNarrationToggle.checked = skipNarration;
         speakerDebugOutput.hidden = !speakerAssignmentDebug;
-        reductionCompare = preferences.reductionCompare;
-        reductionComponents = { ...preferences.reductionComponents };
-        if (reductionCompareToggle) reductionCompareToggle.checked = reductionCompare;
-        for (const entry of reductionComponentToggles) entry.toggle.checked = reductionComponents[entry.id];
       }
       if (!savingGlobalConnection && connectionVersionAtLoad === globalConnectionVersion) lumiverseConnectionId = resolveGlobalTtsConnection(preferences.connectionId, connections);
       const selectedConnectionId = lumiverseConnectionId;
@@ -7693,9 +7206,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
         autoPlaybackDelaySeconds,
         speakerLookback,
         skipNarration,
-        autoVoiceCastingPool,
-        reductionCompare,
-        reductionComponents
+        autoVoiceCastingPool
       );
       setStatus("Advanced playback settings saved globally.", "saved");
     } catch (error) {
@@ -8300,9 +7811,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
         autoPlaybackDelaySeconds,
         speakerLookback,
         skipNarration,
-        autoVoiceCastingPool,
-        reductionCompare,
-        reductionComponents
+        autoVoiceCastingPool
       );
     }
     skippedTrackerTagsInput.destroy();

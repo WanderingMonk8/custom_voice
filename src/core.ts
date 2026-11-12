@@ -6,180 +6,6 @@ export function standardSpeakerReviewPolicy() {
   return { runReview: true, bestAvailableSpeaker: true, shadowEvaluation: false, focusedOpeningFallback: false } as const
 }
 
-/** Every component of the token-reduction implementation that can be toggled independently. */
-export const REDUCTION_COMPONENTS = [
-  {
-    id: 'scopedTtsState',
-    phase: 'Phase 1',
-    label: 'Scope TTS tag state to the target speech',
-    hint: 'Send only the target quotation and its local neighbours to Jev for tag selection, not the full message.',
-    defaultValue: true,
-  },
-  {
-    id: 'twoPhaseTagReview',
-    phase: 'Phase 1',
-    label: 'Two-phase (primary/secondary) tag questions',
-    hint: 'Primary pass asks primary questions first; secondary questions are asked only when the first pass establishes a need for them.',
-    defaultValue: true,
-  },
-  {
-    id: 'dedupTagCriteria',
-    phase: 'Phase 1',
-    label: 'Deduplicate tag criteria',
-    hint: 'Share terse criteria blocks across emotion/style/sound/pause questions instead of expanding full descriptions per question.',
-    defaultValue: true,
-  },
-  {
-    id: 'gatedAuxReviews',
-    phase: 'Phase 2',
-    label: 'Gate auxiliary speaker reviews on triggers',
-    hint: 'Best-available guess, self-introduction, speaker-switch and focused opening reviews run only when a trigger is present, not always.',
-    defaultValue: true,
-  },
-  {
-    id: 'deferRelationshipReview',
-    phase: 'Phase 2',
-    label: 'Defer the global relationship review until a trigger fires',
-    hint: 'Skip the whole relationship review when no known trigger is established (no unresolved turn, no boundary, no alternate speaker switch); otherwise it runs as today.',
-    defaultValue: true,
-  },
-  {
-    id: 'trimVoiceCriteria',
-    phase: 'Phase 2',
-    label: 'Condense uncast voice ranking criteria',
-    hint: 'Drop the description fields from the voice ranking criteria (use name, category, languages and tags only) and keep the shortlist small.',
-    defaultValue: true,
-  },
-] as const
-export type ReductionComponentId = typeof REDUCTION_COMPONENTS[number]['id']
-export type ReductionComponentMap = Record<ReductionComponentId, boolean>
-export const REDUCTION_COMPONENT_IDS: readonly ReductionComponentId[] = REDUCTION_COMPONENTS.map(component => component.id)
-export const FULL_REDUCTION_COMPONENTS: ReductionComponentMap = Object.fromEntries(REDUCTION_COMPONENTS.map(component => [component.id, component.defaultValue])) as ReductionComponentMap
-export const DISABLED_REDUCTION_COMPONENTS: ReductionComponentMap = Object.fromEntries(REDUCTION_COMPONENTS.map(component => [component.id, false])) as ReductionComponentMap
-/** Parse raw settings JSON into a full, valid component map. Missing or unknown ids default to the full-reduction value. */
-export function readReductionComponents(value: unknown): ReductionComponentMap {
-  const full = FULL_REDUCTION_COMPONENTS
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return { ...full }
-  const row = value as Record<string, unknown>
-  const next = { ...full } as ReductionComponentMap
-  for (const component of REDUCTION_COMPONENTS) {
-    const raw = row[component.id]
-    if (typeof raw === 'boolean') next[component.id] = raw
-  }
-  return next
-}
-
-// ---------------------------------------------------------------------------
-// Minimal store-mode ZIP writer for the reduction-compare report download.
-// Kept dependency-free so the extension never needs an archive library.
-// ---------------------------------------------------------------------------
-
-const CRC_TABLE = new Uint32Array(256)
-for (let index = 0; index < 256; index += 1) {
-  let value = index
-  for (let bit = 0; bit < 8; bit += 1) value = (value & 1) ? (value >>> 1) ^ 0xedb88320 : value >>> 1
-  CRC_TABLE[index] = value >>> 0
-}
-
-export function crc32(data: Uint8Array): number {
-  let crc = 0xffffffff
-  for (const byte of data) crc = (crc >>> 8) ^ CRC_TABLE[(crc ^ byte) & 0xff]!
-  return (crc ^ 0xffffffff) >>> 0
-}
-
-export interface ZipStoredFile {
-  name: string
-  data: Uint8Array
-}
-
-function dosDateTime(now: Date): { time: number; date: number } {
-  const time = ((now.getHours() & 0x1f) << 11)
-    | ((now.getMinutes() & 0x3f) << 5)
-    | Math.floor(now.getSeconds() / 2) & 0x1f
-  return {
-    time,
-    date: (((now.getFullYear() - 1980) & 0x7f) << 9)
-      | (((now.getMonth() + 1) & 0x0f) << 5)
-      | (now.getDate() & 0x1f),
-  }
-}
-
-/** Build a ZIP archive (store method, no compression) from the given files. */
-export function buildStoreZip(files: ReadonlyArray<ZipStoredFile>): Uint8Array {
-  const encoder = new TextEncoder()
-  const chunks: Uint8Array[] = []
-  const central: Uint8Array[] = []
-  let offset = 0
-  const { time, date } = dosDateTime(new Date())
-  for (const file of files) {
-    const nameBytes = encoder.encode(file.name)
-    const crc = crc32(file.data)
-    const local = new Uint8Array(30 + nameBytes.length)
-    const view = new DataView(local.buffer)
-    view.setUint32(0, 0x04034b50, true)
-    view.setUint16(4, 20, true) // version needed
-    view.setUint16(6, 0x0800, true) // UTF-8 flag
-    view.setUint16(8, 0, true) // store
-    view.setUint16(10, time, true)
-    view.setUint16(12, date, true)
-    view.setUint32(14, crc, true)
-    view.setUint32(18, file.data.length, true)
-    view.setUint32(22, file.data.length, true)
-    view.setUint16(26, nameBytes.length, true)
-    view.setUint16(28, 0, true) // no extra field
-    local.set(nameBytes, 30)
-    chunks.push(local, file.data)
-    const entry = new Uint8Array(46 + nameBytes.length)
-    const centralView = new DataView(entry.buffer)
-    centralView.setUint32(0, 0x02014b50, true)
-    centralView.setUint16(4, 20, true) // version made by
-    centralView.setUint16(6, 20, true) // version needed
-    centralView.setUint16(8, 0x0800, true) // UTF-8 flag
-    centralView.setUint16(10, 0, true) // store
-    centralView.setUint16(12, time, true)
-    centralView.setUint16(14, date, true)
-    centralView.setUint32(16, crc, true)
-    centralView.setUint32(20, file.data.length, true)
-    centralView.setUint32(24, file.data.length, true)
-    centralView.setUint16(28, nameBytes.length, true)
-    centralView.setUint16(30, 0, true) // extra
-    centralView.setUint16(32, 0, true) // comment
-    centralView.setUint16(34, 0, true) // disk
-    centralView.setUint16(36, 0, true) // internal attrs
-    centralView.setUint32(38, 0, true) // external attrs
-    centralView.setUint32(42, offset, true) // local header offset
-    entry.set(nameBytes, 46)
-    central.push(entry)
-    offset += local.length + file.data.length
-  }
-  const centralOffset = offset
-  let centralSize = 0
-  for (const entry of central) {
-    chunks.push(entry)
-    centralSize += entry.length
-    offset += entry.length
-  }
-  const eocd = new Uint8Array(22)
-  const eocdView = new DataView(eocd.buffer)
-  eocdView.setUint32(0, 0x06054b50, true)
-  eocdView.setUint16(4, 0, true) // disk
-  eocdView.setUint16(6, 0, true) // central directory disk
-  eocdView.setUint16(8, files.length, true)
-  eocdView.setUint16(10, files.length, true)
-  eocdView.setUint32(12, centralSize, true)
-  eocdView.setUint32(16, centralOffset, true)
-  eocdView.setUint16(20, 0, true) // comment length
-  chunks.push(eocd)
-  const total = offset + eocd.length
-  const output = new Uint8Array(total)
-  let cursor = 0
-  for (const chunk of chunks) {
-    output.set(chunk, cursor)
-    cursor += chunk.length
-  }
-  return output
-}
-
 export interface AutoplayGeneration { chatId: string; messageId: string; generationId: string; reroll?: boolean; content?: string }
 
 /** Accept successful foreground new messages and rerolls in the active chat. */
@@ -1230,19 +1056,8 @@ export function voiceDecisionSummary(voice: FavoriteVoice): string {
   return parts.join('; ') || 'No details provided.'
 }
 
-/** Terse variant used by the token-reduction "trimVoiceCriteria" component: drops the description
- * and its tag-support hints entirely (sparse metadata must not count against a voice). */
-export function voiceDecisionSummaryTerse(voice: FavoriteVoice): string {
-  const tags = [...new Set((voice.tags ?? []).map(tag => tag.trim().toLowerCase()).filter(Boolean))]
-  const languages = [...new Set((voice.languages ?? []).map(code => code.trim().toLowerCase()).filter(Boolean))]
-  const parts = [voice.name, voice.category].map(part => (part ?? '').replace(/\s+/gu, ' ').trim()).filter(Boolean)
-  if (languages.length) parts.push(`languages: ${languages.join(', ')}`)
-  if (tags.length) parts.push(`tags: ${tags.join(', ')}`)
-  return parts.join('; ') || 'No details provided.'
-}
-
 /** One decision call classifies each uncast group and ranks the available voice descriptions. */
-export function buildUncastVoiceDecision(groups: UncastVoiceGroup[], voices: FavoriteVoice[], message: string, ghosts: GhostVoice[] = [], previousMessages: RelationshipReviewContext['previousMessages'] = [], trimCriteria = false) {
+export function buildUncastVoiceDecision(groups: UncastVoiceGroup[], voices: FavoriteVoice[], message: string, ghosts: GhostVoice[] = [], previousMessages: RelationshipReviewContext['previousMessages'] = []) {
   const labels = uncastIdentityLabels(message, ghosts)
   const narrativeNames = uncastNarrativeNameCandidates(message)
   const state = {
@@ -1284,13 +1099,12 @@ export function buildUncastVoiceDecision(groups: UncastVoiceGroup[], voices: Fav
   // are the strongest candidates. The shortlist keeps each ranking
   // question small enough for the decision gateway while preserving the
   // original voice indexes for probability lookup.
-  const voiceSummary = trimCriteria ? voiceDecisionSummaryTerse : voiceDecisionSummary
   const voiceOptionsFor = (group: UncastVoiceGroup): Array<{ index: number; voice: FavoriteVoice }> => {
     const hint = group.pronounGender && (group.pronounGender === 'male' || group.pronounGender === 'female') ? group.pronounGender : 'unknown'
     return voices
       .map((voice, index) => ({ index, voice }))
       .filter(({ voice }) => hint === 'unknown' || voiceGenderCompatible(voice, hint))
-      .slice(0, trimCriteria ? 16 : 32)
+      .slice(0, 32)
   }
   const questions: Record<string, { type: 'choice'; instructions: string; criteria: Record<string, string> }> = {}
   for (const group of groups) {
@@ -1324,12 +1138,9 @@ export function buildUncastVoiceDecision(groups: UncastVoiceGroup[], voices: Fav
     }
     if (!voices.length) continue
     const options = voiceOptionsFor(group)
-    const rankingInstructions = trimCriteria
-      ? `Rank the available voices for the person who actually speaks the quoted dialogue in ${group.id}. Narration-only bystanders and people merely addressed are not speakers. Use the full scene as context, including other character groups only when clearly the same speaker. Score voices by metadata cues, not prose length: name is weak context, category and languages contribute one compatibility cue in aggregate, and each explicit tag is one cue. Missing fields are not a reason to rank a voice lower. Select the best available voice.`
-      : `Rank the available voices for the person who actually speaks the quoted dialogue in ${group.id}. Narration-only bystanders and people merely addressed are not speakers. Use the full scene as context, including other character groups only when clearly the same speaker. Score voices by metadata cues, not prose length: name is weak context, category and languages contribute one compatibility cue in aggregate, each explicit tag is one cue, and each tag listed in "description supports" is one cue. The description is evidence for those tags, not an extra vote, and support for an explicit tag counts once rather than twice. Balance tags against that description evidence instead of letting a long description outweigh otherwise better matches. Missing fields are not a reason to rank a voice lower. Select the best available voice.`
     questions[`voice_${group.id}`] = {
-      type: 'choice', instructions: rankingInstructions,
-      criteria: { ...Object.fromEntries(options.map(({ index, voice }) => [`voice_${index}`, voiceSummary(voice)])), ...(options.length === 1 ? { no_match: 'No suitable voice is available.' } : {}) },
+      type: 'choice', instructions: `Rank the available voices for the person who actually speaks the quoted dialogue in ${group.id}. Narration-only bystanders and people merely addressed are not speakers. Use the full scene as context, including other character groups only when clearly the same speaker. Score voices by metadata cues, not prose length: name is weak context, category and languages contribute one compatibility cue in aggregate, each explicit tag is one cue, and each tag listed in "description supports" is one cue. The description is evidence for those tags, not an extra vote, and support for an explicit tag counts once rather than twice. Balance tags against that description evidence instead of letting a long description outweigh otherwise better matches. Missing fields are not a reason to rank a voice lower. Select the best available voice.`,
+      criteria: { ...Object.fromEntries(options.map(({ index, voice }) => [`voice_${index}`, voiceDecisionSummary(voice)])), ...(options.length === 1 ? { no_match: 'No suitable voice is available.' } : {}) },
     }
   }
   return { state, questions }
@@ -1829,7 +1640,7 @@ export interface CachedMessageParse {
   segments: PlaybackSegment[]
   /** Escalated dialogue runs and their triggers, retained for diagnostics. */
   discourse?: {
-    status: 'not-escalated' | 'completed' | 'failed' | 'deferred'
+    status: 'not-escalated' | 'completed' | 'failed'
     /** Whether the first pass issued turn-relation questions. */
     turns?: 'issued' | 'omitted'
     runs: Array<{ id: string; targets: string[]; triggers: string[] }>
@@ -6246,29 +6057,6 @@ function ttsPauseCriteria(): Record<string, string> {
   ])
 }
 
-/** Options for the token-reduction implementation's tag-state shaping. */
-export interface TtsTagStateOptions {
-  /** Slice narration to the quotation-local window instead of the full paragraph span. */
-  scoped?: boolean
-  /** Replace each criteria string with its first sentence to shrink the per-question payload. */
-  terse?: boolean
-}
-
-/** Keep only the first sentence of a criterion; the safety clauses are already in `instructions`. */
-function ttsTersePhrase(description: string): string {
-  const sentence = description.split('. ')[0] ?? description
-  return sentence.replace(/\.+$/u, '').trim()
-}
-
-function ttsTerseCriteria(criteria: Record<string, string>): Record<string, string> {
-  const next: Record<string, string> = {}
-  for (const [key, value] of Object.entries(criteria)) next[key] = ttsTersePhrase(value)
-  return next
-}
-
-/** How many characters of narration flanking a quotation are sent to Jev in scoped mode. */
-export const TTS_NARRATION_WINDOW = 320
-
 export interface TtsTagSecondaryNeeds {
   emotion2?: boolean
   sound?: boolean
@@ -6279,10 +6067,7 @@ export interface TtsTagSecondaryNeeds {
 /**
  * Build the batched tag questions. `phase: 'primary'` asks only the choices
  * that decide whether tagging is needed at all; `secondary` emits the likely
- * no-op follow-ups only for speeches selected by the caller. The final
- * options object enables the token-reduction components: `scoped` narrows the
- * narration sent to Jev to the quotation-local window, and `terse` keeps only
- * the first sentence of every criterion string.
+ * no-op follow-ups only for speeches selected by the caller.
  */
 export function buildTtsTagPlan(
   plan: SpeakerDecisionPlan,
@@ -6292,30 +6077,26 @@ export function buildTtsTagPlan(
   enableModulation = false,
   phase: 'all' | 'primary' | 'secondary' = 'all',
   needs: Readonly<Record<string, Readonly<TtsTagSecondaryNeeds>>> = {},
-  tagStateOptions?: TtsTagStateOptions,
 ): TtsTagPlan {
   const allowed = speechIds ? new Set(speechIds) : null
-  const scoped = tagStateOptions?.scoped === true
   const speeches = plan.state.speeches
     .filter(speech => !allowed || allowed.has(speech.id))
     .map(speech => ({
       id: speech.id,
       paragraphId: speech.paragraphId,
       text: speech.text,
-      narrativeBefore: scoped ? speech.narrativeBefore.slice(-TTS_NARRATION_WINDOW) : speech.narrativeBefore,
-      narrativeAfter: scoped ? speech.narrativeAfter.slice(0, TTS_NARRATION_WINDOW) : speech.narrativeAfter,
+      narrativeBefore: speech.narrativeBefore,
+      narrativeAfter: speech.narrativeAfter,
     }))
-  const terseCriteria = tagStateOptions?.terse === true ? ttsTerseCriteria : (criteria: Record<string, string>) => criteria
-  const phrase = tagStateOptions?.terse === true ? ttsTersePhrase : (description: string) => description
-  const emotionCriteria = terseCriteria(ttsEmotionCriteria(emotionOptions))
+  const emotionCriteria = ttsEmotionCriteria(emotionOptions)
   const soundOptions = style === 'fish'
     ? TTS_FISH_SOUND_OPTIONS
     : style === 'gemini38'
       ? TTS_GEMINI38_SOUND_OPTIONS
       : TTS_TAG_OPTIONS
-  const soundCriteria = terseCriteria(ttsSoundCriteria(soundOptions))
-  const styleCriteria = terseCriteria(ttsStyleCriteria())
-  const pauseCriteria = terseCriteria(ttsPauseCriteria())
+  const soundCriteria = ttsSoundCriteria(soundOptions)
+  const styleCriteria = ttsStyleCriteria()
+  const pauseCriteria = ttsPauseCriteria()
   const questions: SpeakerDecisionPlan['questions'] = {}
   const positions: Record<string, TtsTagPositionOption[]> = {}
   const pausePositions: Record<string, TtsTagPositionOption[]> = {}
@@ -6340,7 +6121,7 @@ export function buildTtsTagPlan(
           instructions: `Is there a distinct secondary emotion layered into quotation ${speech.id}? Choose no_emotion unless a second emotion is clearly present and compatible with the primary.`,
           criteria: {
             ...emotionCriteria,
-            [TTS_NO_EMOTION_OPTION]: phrase('No distinct secondary emotion. Most lines should choose this.'),
+            [TTS_NO_EMOTION_OPTION]: 'No distinct secondary emotion. Most lines should choose this.',
           },
         }
       }
@@ -6352,7 +6133,7 @@ export function buildTtsTagPlan(
           instructions: `Does quotation ${speech.id} have a sustained voice style that should lead the speech? Choose no_style unless a whisper, soft/loud/low voice, shout, or scream clearly applies to the whole quotation. Do not use this for a momentary sound.`,
           criteria: {
             ...styleCriteria,
-            [TTS_NO_STYLE_OPTION]: phrase('No sustained voice style. Most lines should choose this.'),
+            [TTS_NO_STYLE_OPTION]: 'No sustained voice style. Most lines should choose this.',
           },
         }
       }
@@ -6365,8 +6146,8 @@ export function buildTtsTagPlan(
               type: 'choice',
               instructions: `Does quotation ${speech.id} have a clear internal emotional turn that should change delivery before the quotation ends? Choose modulation only when the emotion genuinely shifts and the new delivery should continue to the end. Ignore momentary sounds, ordinary punctuation, and small intensity changes.`,
               criteria: {
-                modulation: phrase('A clear, sustained emotional turn inside the quotation.'),
-                no_modulation: phrase('No clear internal emotional turn. Most lines should choose this.'),
+                modulation: 'A clear, sustained emotional turn inside the quotation.',
+                no_modulation: 'No clear internal emotional turn. Most lines should choose this.',
               },
             }
           }
@@ -6374,7 +6155,7 @@ export function buildTtsTagPlan(
             questions[`modulationpos_${speech.id}`] = {
               type: 'choice',
               instructions: `If quotation ${speech.id} receives a modulation, where should the new emotion begin? Choose the boundary closest to the emotional turn.`,
-              criteria: terseCriteria(Object.fromEntries(modulationOptions.map(option => [option.id, option.description]))),
+              criteria: Object.fromEntries(modulationOptions.map(option => [option.id, option.description])),
             }
           }
         }
@@ -6398,7 +6179,7 @@ export function buildTtsTagPlan(
       questions[`tagpos_${speech.id}`] = {
         type: 'choice',
         instructions: `If quotation ${speech.id} receives a sound effect, where should it be inserted? Choose the boundary closest to the exact sound.`,
-        criteria: terseCriteria(Object.fromEntries(speechPositions.map(option => [option.id, option.description]))),
+        criteria: Object.fromEntries(speechPositions.map(option => [option.id, option.description])),
       }
     }
     if (includePrimary) {
@@ -6418,7 +6199,7 @@ export function buildTtsTagPlan(
       questions[`pausepos_${speech.id}`] = {
         type: 'choice',
         instructions: `If quotation ${speech.id} receives a pause, where should it be inserted? Choose the boundary closest to the intended pause.`,
-        criteria: terseCriteria(Object.fromEntries(speechPositions.map(option => [option.id, option.description]))),
+        criteria: Object.fromEntries(speechPositions.map(option => [option.id, option.description])),
       }
     }
   }
@@ -7935,25 +7716,6 @@ export function assessSpeakerDiscourseEscalation(
     },
     runs,
   }
-}
-
-/**
- * A scene is clear when no run has an escalation trigger and every quotation
- * resolved to a single confident first-pass answer. Used to skip auxiliary
- * reviews (phase 2) when they are unlikely to change anything.
- */
-export function hasUncertainFirstPass(
-  plan: SpeakerDecisionPlan,
-  answers: Record<string, SpeakerDecisionChoice>,
-): boolean {
-  const assessment = assessSpeakerDiscourseEscalation(plan, answers)
-  if (assessment.runs.some(run => run.triggers.length > 0)) return true
-  for (const speech of plan.state.speeches) {
-    const evaluation = evaluateSpeakerDecisionAnswer(answers[`speech_${speech.id}`], plan.optionSpeakerIds, SPEAKER_DECISION_THRESHOLDS.local)
-    if (!evaluation.resolved) return true
-    if (evaluation.leadingMargin < SPEAKER_DECISION_THRESHOLDS.local.margin) return true
-  }
-  return false
 }
 
 export type SpeakerDiscourseOutcomeReason =
