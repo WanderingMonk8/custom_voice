@@ -2639,6 +2639,25 @@ test('reuses a ghost voice for a weak identity only when the follow-up review co
   assert.equal(unconfirmed.some(assignment => assignment.ghostId === 'ghost-girl'), false)
 })
 
+test('never proposes the voice of an active ghost for a brand-new character', () => {
+  const ghost = { id: 'ghost-girl', speakerId: UNCAST_SPEAKER_ID, voiceId: 'reserved-voice', context: 'The girl ordered coffee.', occurrenceKeys: [], lastSeenMessageId: 'assistant-0' }
+  const groups = collectUncastVoiceGroups([{ speakerId: UNCAST_SPEAKER_ID, text: 'Yeah, I know that place.' }, { speakerId: null, text: 'She tiptoes forward.' }, { speakerId: UNCAST_SPEAKER_ID, text: 'Also fancy.' }])
+  const voices = readFavoriteVoices([
+    { id: 'reserved-voice', category: 'female', description: 'jaded contralto' },
+    { id: 'fresh-voice', category: 'female', description: 'bright alto' },
+  ])
+  // The active ghost holds 'voice_0'; Jev heavily favors voice_0 anyway. The
+  // resolver must not pick it: the voices held by the current ghosts stay
+  // reserved for their owners.
+  const answers = {
+    gender_g0: confidentDecision('female'),
+    voice_g0: { choice: 'voice_0', confidence: 0.999, probabilities: { voice_0: 0.999, voice_1: 0.001 } },
+  }
+  const matches = resolveUncastVoiceDecisions(groups, voices, answers, [ghost], [], 'current', 'The girl ordered coffee.')
+  assert.ok(matches.length)
+  assert.equal(matches[0]?.voiceId, 'fresh-voice')
+})
+
 test('treats a repeated specific unnamed label as a voice match and ignores broad person labels', () => {
   const girl = { id: 'ghost-girl', speakerId: UNCAST_SPEAKER_ID, voiceId: 'voice-girl', label: 'the girl', context: 'A girl orders coffee.', occurrenceKeys: [], lastSeenMessageId: 'assistant-0' }
   const groups = collectUncastVoiceGroups([{ text: 'Thanks for pulling out.', speakerId: UNCAST_SPEAKER_ID }])

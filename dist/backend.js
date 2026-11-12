@@ -664,7 +664,7 @@ function narrationBoostsPair(group, partner) {
   return !!group.narratedName && group.flankPartners?.includes(partner.id) === true && partner.addressee === group.narratedName;
 }
 function resolveUncastVoiceDecisions(groups, voices, answers, ghosts = [], reserved = [], messageId = "", message = "", previousMessageIds = [], random = Math.random) {
-  const used = new Set(reserved.filter(Boolean));
+  const used = /* @__PURE__ */ new Set([...reserved.filter(Boolean), ...ghosts.map((it) => it.voiceId).filter(Boolean)]);
   const assignments = [];
   const roots = /* @__PURE__ */ new Map();
   const linkedGhosts = /* @__PURE__ */ new Map();

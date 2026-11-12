@@ -1330,7 +1330,10 @@ export function resolveUncastVoiceDecisions(
   ghosts: GhostVoice[] = [], reserved: readonly string[] = [], messageId = '', message = '', previousMessageIds: readonly string[] = [],
   random: () => number = Math.random,
 ): UncastVoiceAssignment[] {
-  const used = new Set<string>(reserved.filter(Boolean))
+  // Voices held by live ghosts stay reserved for their owners; Jev's shortlist
+  // must not reassign one to a new character (the reservation recheck would
+  // then silently drop the assignment and fall back to the default voice).
+  const used = new Set<string>([...reserved.filter(Boolean), ...ghosts.map(it => it.voiceId).filter(Boolean)])
   const assignments: UncastVoiceAssignment[] = []
   const roots = new Map<string, string>()
   const linkedGhosts = new Map<string, GhostVoice>()
