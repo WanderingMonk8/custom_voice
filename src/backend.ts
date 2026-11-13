@@ -95,12 +95,16 @@ import {
   stripTtsModulationMarker,
   validateTtsSpeechPlacement,
   measureJevDecisionPayload,
+  readReductionComponents,
+  FULL_REDUCTION_COMPONENTS,
+  hasUncertainFirstPass,
   USER_SPEAKER_ID,
   UNCAST_SPEAKER_ID,
   UNRESOLVED_SPEAKER_ID,
   type CharacterLike,
   type ChatVoiceConfig,
   type PlaybackSegment,
+  type ReductionComponentMap,
   type SpeakerDecisionChoice,
   type SpeakerDecisionPlan,
   type SpeakerDiscourseAssessment,
@@ -168,7 +172,7 @@ type FrontendMessage =
   | { type: 'chat_voice_auto_cast'; requestId: string; chatId: string; voices: FavoriteVoice[]; reserved: string[]; narratorMissing: boolean; userMissing: boolean; ghostLifetime: number }
   | { type: 'chat_voice_ghost_edit'; chatId: string; ghostId: string; voice?: string; promote?: boolean; remove?: boolean }
   | { type: 'chat_voice_get_message'; chatId: string; messageId: string; requestId: string }
-  | { type: 'chat_voice_match_uncast'; requestId: string; chatId: string; messageId: string; message: string; sourceHash: string; groups: UncastVoiceGroup[]; voices: FavoriteVoice[]; reserved: string[]; lifetime: number; speakerLookback?: number; skippedTrackerTags?: string }
+  | { type: 'chat_voice_match_uncast'; requestId: string; chatId: string; messageId: string; message: string; sourceHash: string; groups: UncastVoiceGroup[]; voices: FavoriteVoice[]; reserved: string[]; lifetime: number; speakerLookback?: number; skippedTrackerTags?: string; reduction?: Partial<Record<string, boolean>> }
   | {
       type: 'chat_voice_parse_message'
       chatId: string
@@ -187,6 +191,8 @@ type FrontendMessage =
       focusedOpeningFallback?: boolean
       bestAvailableSpeaker?: boolean
       runReview?: boolean
+      /** Per-component token-reduction toggles from the frontend. */
+      reduction?: Partial<Record<string, boolean>>
     }
   | {
       type: 'chat_voice_place_tags'
@@ -464,7 +470,7 @@ interface DiscourseEvaluation {
   /** Diagnostics description of the second-pass request. */
   status: string
   /** Compact outcome recorded with the cached assignment. */
-  outcome: 'not-escalated' | 'completed' | 'failed'
+  outcome: 'not-escalated' | 'completed' | 'failed' | 'deferred'
 }
 
 /**
@@ -538,6 +544,7 @@ async function evaluateTtsTagSelections(
   userId?: string,
   enableModulation = false,
   debug = false,
+  reduction: ReductionComponentMap = FULL_REDUCTION_COMPONENTS,
 ): Promise<TtsTagSelectionResult> {
   const selections = new Map<string, TtsTagSelection>()
   if (plan.state.speeches.length === 0) return { selections, failed: false }
@@ -552,6 +559,7 @@ async function evaluateTtsTagSelections(
   }
   let failed = false
   let failure = ''
+  const tagStateOptions = { scoped: reduction.scopedTtsState, terse: reduction.dedupTagCriteria }
   const resolveChunk = (
     tagPlan: ReturnType<typeof buildTtsTagPlan>,
     answers: Record<string, SpeakerDecisionChoice>,
@@ -567,7 +575,7 @@ async function evaluateTtsTagSelections(
   }
   if (!hasCapability) {
     markFallback(resolveChunk(
-      buildTtsTagPlan(plan, undefined, TTS_AUTO_EMOTION_OPTIONS, style, enableModulation),
+      buildTtsTagPlan(plan, undefined, TTS_AUTO_EMOTION_OPTIONS, style, enableModulation, 'all', {}, tagStateOptions),
       {},
     ))
     return {
@@ -608,7 +616,15 @@ async function evaluateTtsTagSelections(
       return answers
     }
 
-    const primaryPlan = buildTtsTagPlan(plan, ids, emotionOptions, style, enableModulation, 'primary')
+    if (!reduction.twoPhaseTagReview) {
+      // Component disabled: pre-reduction single-pass evaluation instead of the primary/secondary split.
+      const singlePlan = buildTtsTagPlan(plan, ids, emotionOptions, style, enableModulation, 'all', {}, tagStateOptions)
+      if (debug) { const budget = measureJevDecisionPayload(singlePlan.state, singlePlan.questions); spindle.log.info(`[Chat Voice] Jev tag single-pass budget: speeches=${ids.length}, questions=${budget.questionCount}, state=${budget.stateBytes}B, criteria=${budget.questionsBytes}B`) }
+      const singleAnswers = await evaluatePlan(singlePlan)
+      return { tagPlan: singlePlan, answers: singleAnswers }
+    }
+
+    const primaryPlan = buildTtsTagPlan(plan, ids, emotionOptions, style, enableModulation, 'primary', {}, tagStateOptions)
     if (debug) { const budget = measureJevDecisionPayload(primaryPlan.state, primaryPlan.questions); spindle.log.info(`[Chat Voice] Jev tag primary budget: speeches=${ids.length}, questions=${budget.questionCount}, state=${budget.stateBytes}B, criteria=${budget.questionsBytes}B`) }
     const primaryAnswers = await evaluatePlan(primaryPlan)
     const primarySelections = resolveTtsTagAnswers(primaryPlan, primaryAnswers, style)
@@ -630,7 +646,7 @@ async function evaluateTtsTagSelections(
     const secondaryIds = Object.keys(needs)
     if (secondaryIds.length) {
       try {
-        const secondaryPlan = buildTtsTagPlan(plan, secondaryIds, emotionOptions, style, enableModulation, 'secondary', needs)
+        const secondaryPlan = buildTtsTagPlan(plan, secondaryIds, emotionOptions, style, enableModulation, 'secondary', needs, tagStateOptions)
         if (debug) { const budget = measureJevDecisionPayload(secondaryPlan.state, secondaryPlan.questions); spindle.log.info(`[Chat Voice] Jev tag secondary budget: speeches=${secondaryIds.length}, questions=${budget.questionCount}, state=${budget.stateBytes}B, criteria=${budget.questionsBytes}B`) }
         secondaryAnswers = await evaluatePlan(secondaryPlan)
       } catch (secondaryError) {
@@ -639,7 +655,7 @@ async function evaluateTtsTagSelections(
       }
     }
 
-    const fullPlan = buildTtsTagPlan(plan, ids, emotionOptions, style, enableModulation, 'all')
+    const fullPlan = buildTtsTagPlan(plan, ids, emotionOptions, style, enableModulation, 'all', {}, tagStateOptions)
     return { tagPlan: fullPlan, answers: combinedAnswers(primaryAnswers, secondaryAnswers) }
   }
   const evaluateChunk = async (ids: string[]) => {
@@ -658,7 +674,7 @@ async function evaluateTtsTagSelections(
         } catch (compactError) {
           failure = compactError instanceof Error ? compactError.message : String(compactError)
           markFallback(resolveChunk(
-            buildTtsTagPlan(plan, ids, TTS_COMPACT_EMOTION_OPTIONS, style, enableModulation),
+            buildTtsTagPlan(plan, ids, TTS_COMPACT_EMOTION_OPTIONS, style, enableModulation, 'all', {}, tagStateOptions),
             {},
           ))
           return false
@@ -677,7 +693,7 @@ async function evaluateTtsTagSelections(
           } catch (compactError) {
             failure = compactError instanceof Error ? compactError.message : String(compactError)
             markFallback(resolveChunk(
-              buildTtsTagPlan(plan, [id], TTS_COMPACT_EMOTION_OPTIONS, style, enableModulation),
+              buildTtsTagPlan(plan, [id], TTS_COMPACT_EMOTION_OPTIONS, style, enableModulation, 'all', {}, tagStateOptions),
               {},
             ))
             return false
@@ -1123,6 +1139,7 @@ function queueSpeakerParse(
       userAliases.join(' / ') || 'User',
     )
     const skippedTrackerTags = payload.skippedTrackerTags.slice(0, 4_000)
+    const reduction = readReductionComponents(payload.reduction)
     const assistantIds = messages.filter(item => !item.is_user).map(item => item.id)
     const anchor = message.is_user
       ? messages.slice(0, messageIndex).filter(item => !item.is_user).at(-1)?.id ?? ''
@@ -1218,6 +1235,7 @@ function queueSpeakerParse(
           cardSpeakerId: titleMatchedCardSpeakerId,
           historicalSpeakerId,
           relationshipReview: { version: 'cross-message-run-22', context: relationshipContext, speakerLookback, strategy: payload.runReview !== false ? 'run' : 'scene', focusedOpeningFallback: payload.focusedOpeningFallback === true, bestAvailableSpeaker: payload.bestAvailableSpeaker !== false },
+          reduction,
           skippedTrackerTags,
         }))
         const cached = config.parsedMessages[payload.messageId]
@@ -1232,7 +1250,7 @@ function queueSpeakerParse(
           return
         }
         const tagSelectionsPromise = tagStyle !== 'off'
-          ? evaluateTtsTagSelections(decisionPlan, tagStyle, userId, enableModulation, payload.debug)
+          ? evaluateTtsTagSelections(decisionPlan, tagStyle, userId, enableModulation, payload.debug, reduction)
           : null
         try {
           const firstPassStartedAt = Date.now()
@@ -1253,9 +1271,19 @@ function queueSpeakerParse(
           }
           if (payload.debug) snapshotSpeakerFirstPass(decisionPlan, answers)
           suppressUngroundedSpeakerChoices(decisionPlan, answers, relationshipContext, titleMatchedCardSpeakerId)
-          const userReview = buildAssistantUserSpeakerReview(decisionPlan, answers)
+          // Token-reduction components: both the auxiliary-review gate and the
+          // deferred relationship review look at the same first-pass signal.
+          const reductionGates: string[] = []
+          const uncertainFirstPass = hasUncertainFirstPass(decisionPlan, answers)
+          const auxReviewsEnabled = !reduction.gatedAuxReviews || uncertainFirstPass
+          const relationshipReviewDeferred = reduction.deferRelationshipReview && !uncertainFirstPass
+          if (reduction.gatedAuxReviews && !auxReviewsEnabled) reductionGates.push('auxiliary-reviews=deferred (clear first pass)')
+          if (relationshipReviewDeferred) reductionGates.push('relationship-review=deferred (clear first pass)')
+          const userReview = auxReviewsEnabled
+            ? buildAssistantUserSpeakerReview(decisionPlan, answers)
+            : null
           let userReviewFailed = false
-          if (Object.keys(userReview.questions).length) {
+          if (userReview && Object.keys(userReview.questions).length) {
             try {
               const reviewResult = await spindle.decisions.evaluate({ state: userReview.state, questions: userReview.questions, ...(userId ? { userId } : {}) })
               const reviewed: Record<string, SpeakerDecisionChoice> = {}
@@ -1269,11 +1297,13 @@ function queueSpeakerParse(
             }
           }
           const discourseAssessment = assessSpeakerDiscourseEscalation(decisionPlan, answers)
-          const relationshipReview = buildRelationshipSpeakerReview(decisionPlan, answers, relationshipContext, null, {
-            cardSpeakerId: titleMatchedCardSpeakerId,
-            targets: [...new Set(discourseAssessment.runs.flatMap(run => run.targets))],
-            strategy: payload.runReview !== false ? 'run' : 'scene',
-          })
+          const relationshipReview = relationshipReviewDeferred
+            ? null
+            : buildRelationshipSpeakerReview(decisionPlan, answers, relationshipContext, null, {
+              cardSpeakerId: titleMatchedCardSpeakerId,
+              targets: [...new Set(discourseAssessment.runs.flatMap(run => run.targets))],
+              strategy: payload.runReview !== false ? 'run' : 'scene',
+            })
           // The experimental review owns its answers and option map. It must never
           // affect the live plan, cache, cast, or ghost assignment pipeline.
           const shadowPlan = { ...decisionPlan, optionSpeakerIds: { ...decisionPlan.optionSpeakerIds } }
@@ -1296,8 +1326,12 @@ function queueSpeakerParse(
           let bestAvailableRetry = false
           let selfIntroductionRetry = false
           let speakerSwitchRetry = false
-          let relationshipSceneDiagnostic = `strategy=${payload.runReview !== false ? 'run' : 'scene'}; global-context=${relationshipContext.previousMessages.length} messages, ${relationshipContext.previousMessages.reduce((sum, item) => sum + item.text.length, 0)} characters; target=${decisionPlan.state.message.length} characters; first-pass=${decisionQuestionCount} questions/${firstPassDuration}ms; review=${Object.keys(relationshipReview.questions).length} questions; candidates=${Object.entries(relationshipReview.ghostOptions).map(([option, id]) => `${option}=${id}`).join(',') || 'none'}`
-          if (Object.keys(relationshipReview.questions).length) {
+          const relationshipReviewQuestionCount = relationshipReview ? Object.keys(relationshipReview.questions).length : 0
+          const relationshipReviewCandidates = relationshipReview
+            ? Object.entries(relationshipReview.ghostOptions).map(([option, id]) => `${option}=${id}`).join(',')
+            : ''
+          let relationshipSceneDiagnostic = `strategy=${payload.runReview !== false ? 'run' : 'scene'}; global-context=${relationshipContext.previousMessages.length} messages, ${relationshipContext.previousMessages.reduce((sum, item) => sum + item.text.length, 0)} characters; target=${decisionPlan.state.message.length} characters; first-pass=${decisionQuestionCount} questions/${firstPassDuration}ms; review=${relationshipReviewQuestionCount} questions; candidates=${relationshipReviewCandidates || 'none'}${reductionGates.length ? `; ${reductionGates.join('; ')}` : ''}`
+          if (relationshipReview && Object.keys(relationshipReview.questions).length) {
             const reviewStartedAt = Date.now()
             try {
               const relationshipResult = await spindle.decisions.evaluate({ state: relationshipReview.state, questions: relationshipReview.questions, ...(userId ? { userId } : {}) })
@@ -1331,8 +1365,10 @@ function queueSpeakerParse(
           }
           // Reconcile persona assignments after contextual review as well as
           // first pass, including assignments introduced by that review.
-          const personaReview = buildContextualUserReconciliation(decisionPlan, answers, relationshipContext)
-          if (Object.keys(personaReview.questions).length) {
+          const personaReview = auxReviewsEnabled
+            ? buildContextualUserReconciliation(decisionPlan, answers, relationshipContext)
+            : null
+          if (personaReview && Object.keys(personaReview.questions).length) {
             const startedAt = Date.now()
             const reviewed: Record<string, SpeakerDecisionChoice> = {}
             try {
@@ -1356,7 +1392,7 @@ function queueSpeakerParse(
           applyExplicitPostQuoteVoiceAttributions(decisionPlan, answers)
           // Re-read only unresolved opening quotations with the nearest exchange.
           // This is a fresh bounded decision, never an unconditional inheritance.
-          const openingReview = !relationshipReviewFailed ? buildOpeningSpeakerReview(decisionPlan, answers, relationshipContext, titleMatchedCardSpeakerId) : null
+          const openingReview = !relationshipReviewFailed && auxReviewsEnabled ? buildOpeningSpeakerReview(decisionPlan, answers, relationshipContext, titleMatchedCardSpeakerId) : null
           if (openingReview) {
             if (payload.debug) relationshipSceneDiagnostic += `; opening-scope=${JSON.stringify({ previous: openingReview.state.previousMessages.map(item => ({ id: item.id, role: item.role, chars: item.text.length })), speeches: openingReview.state.speeches.map(item => ({ id: item.id, paragraphId: item.paragraphId, text: item.text.slice(0, 160) })), boundary: openingReview.state.boundaryEvidence ? { role: openingReview.state.boundaryEvidence.role, lead: openingReview.state.boundaryEvidence.lead.slice(-240), quotation: openingReview.state.boundaryEvidence.quotation.slice(-240) } : null })}`
             const startedAt = Date.now()
@@ -1405,7 +1441,7 @@ function queueSpeakerParse(
               }
             }
           }
-          const backlinkReview = !relationshipReviewFailed ? buildOpeningBacklinkReview(decisionPlan, answers, relationshipContext, titleMatchedCardSpeakerId) : null
+          const backlinkReview = !relationshipReviewFailed && auxReviewsEnabled ? buildOpeningBacklinkReview(decisionPlan, answers, relationshipContext, titleMatchedCardSpeakerId) : null
           if (backlinkReview) {
             const startedAt = Date.now()
             // Diagnostics or the separate opt-in fallback can request this review.
@@ -1479,7 +1515,7 @@ function queueSpeakerParse(
               }
             }
           }
-          if (!relationshipReviewFailed && !userReviewFailed) {
+          if (!relationshipReviewFailed && !userReviewFailed && auxReviewsEnabled) {
             const introReview = buildSelfIntroductionReview(decisionPlan, relationshipContext)
             if (Object.keys(introReview.questions).length) {
               let timer: ReturnType<typeof setTimeout> | undefined
@@ -1503,7 +1539,7 @@ function queueSpeakerParse(
               } finally { if (timer) clearTimeout(timer) }
             }
           }
-          if (!relationshipReviewFailed && !userReviewFailed) {
+          if (!relationshipReviewFailed && !userReviewFailed && auxReviewsEnabled) {
             const switchReview = buildSpeakerSwitchContradictionReview(decisionPlan, answers, relationshipContext, titleMatchedCardSpeakerId)
             if (Object.keys(switchReview.questions).length) {
               let timer: ReturnType<typeof setTimeout> | undefined
@@ -1536,7 +1572,7 @@ function queueSpeakerParse(
               } finally { if (timer) clearTimeout(timer) }
             }
           }
-          if (payload.bestAvailableSpeaker !== false && !relationshipReviewFailed && !userReviewFailed) {
+          if (payload.bestAvailableSpeaker !== false && !relationshipReviewFailed && !userReviewFailed && auxReviewsEnabled) {
             const bestReview = buildBestAvailableSpeakerReview(decisionPlan, answers, relationshipContext, titleMatchedCardSpeakerId)
             if (Object.keys(bestReview.questions).length) {
               let timer: ReturnType<typeof setTimeout> | undefined
@@ -1562,8 +1598,12 @@ function queueSpeakerParse(
           }
           const discourse: DiscourseEvaluation = {
             answers: null,
-            status: relationshipReviewFailed ? 'global-context review failed; no forced inheritance' : 'handled by targeted global-context review',
-            outcome: relationshipReviewFailed ? 'failed' : Object.keys(relationshipReview.questions).length ? 'completed' : 'not-escalated',
+            status: relationshipReviewDeferred
+              ? 'relationship review deferred; clear first pass; reviews skipped'
+              : relationshipReviewFailed ? 'global-context review failed; no forced inheritance' : 'handled by targeted global-context review',
+            outcome: relationshipReviewDeferred
+              ? 'deferred'
+              : relationshipReviewFailed ? 'failed' : relationshipReviewQuestionCount ? 'completed' : 'not-escalated',
           }
           const segments = resolveSpeakerDecisionSegments(
             message.content ?? '',
@@ -1616,7 +1656,7 @@ function queueSpeakerParse(
           }
           relationshipSceneDiagnostic += `; speaker-review-total=${Date.now() - firstPassStartedAt}ms (includes optional shadow wait; excludes later tag placement)`
           const relationshipStatus = relationshipReviewFailed ? `failed; validated assignments retained, uncertain targets protected; ${relationshipSceneDiagnostic}`
-            : `${Object.keys(relationshipReview.questions).length} question(s) reviewed; ${relationshipSceneDiagnostic}`
+            : `${relationshipReviewQuestionCount} question(s) reviewed; ${relationshipSceneDiagnostic}`
           const reviewedSegments = payload.debug ? segments.map(segment => segment.debugPath ? {
             ...segment, debugPath: [...segment.debugPath, `relationship-review-status:${relationshipStatus}`],
           } : segment) : segments
@@ -1711,7 +1751,7 @@ function queueSpeakerParse(
     }
     const fallbackSegments = appendSpeakerDebugReason(deterministic, decisionFallbackReason, payload.debug)
     const fallbackTagSelectionsPromise = tagStyle !== 'off' && structurePlan
-      ? evaluateTtsTagSelections(structurePlan, tagStyle, userId, enableModulation, payload.debug)
+      ? evaluateTtsTagSelections(structurePlan, tagStyle, userId, enableModulation, payload.debug, reduction)
       : null
     sendSpeakerParse({
       requestId: payload.requestId,
@@ -2041,13 +2081,14 @@ spindle.onFrontendMessage(async (rawPayload: unknown, userId, frontendSessionId)
         // Match with the same current reservations that the serialized save
         // checks, even when regenerating an older message. Historical ghosts
         // remain available for identity matching, not as new voice choices.
+        const reduction = readReductionComponents(payload.reduction)
         const currentGhosts = activeGhostVoices(savedGhosts, assistantIds, assistantIds.at(-1) ?? anchor, lifetime)
         const config = readConfig(chat.metadata ?? {}, chatMemberIds(chat))
         const voices = availableUncastVoices(readFavoriteVoices(payload.voices), [...payload.reserved, config.narratorVoice, config.userVoice, ...Object.values(config.characterVoices), ...ghosts.map(ghost => ghost.voiceId), ...currentGhosts.map(ghost => ghost.voiceId)]).slice(0, 254)
         if (!groups.length || (!voices.length && !ghosts.length)) {
           sendFrontend({ type: 'chat_voice_uncast_matches', requestId: payload.requestId, assignments: [], diagnostics: [`No matching request: groups=${groups.length}, availableFavorites=${voices.length}, historicalGhosts=${ghosts.length}, currentGhosts=${currentGhosts.length}.`] }, userId, frontendSessionId)
         } else {
-          const plan = buildUncastVoiceDecision(groups, voices, payload.message.slice(0, 30_000), ghosts, matchingContext.previousMessages)
+          const plan = buildUncastVoiceDecision(groups, voices, payload.message.slice(0, 30_000), ghosts, matchingContext.previousMessages, reduction.trimVoiceCriteria)
           const answers: Record<string, SpeakerDecisionChoice> = {}
           let decisionError = ''
           const captureAnswers = (result: { answers: Record<string, unknown> }): void => {
@@ -2110,7 +2151,7 @@ spindle.onFrontendMessage(async (rawPayload: unknown, userId, frontendSessionId)
             const proposed = proposedAssignments.find(item => item.groupId === group.id)
             return `${group.id} segments=${group.segmentIndexes.map(index => index + 1).join(',')} identity=${identity ? `${identity.choice} confidence=${identity.confidence} probabilities=${JSON.stringify(identity.probabilities)}` : 'none'} gender=${gender ? `${gender.choice} confidence=${gender.confidence} probabilities=${JSON.stringify(gender.probabilities)}` : 'none'} label=${label ? `${label.choice} confidence=${label.confidence} probabilities=${JSON.stringify(label.probabilities)}` : 'none'} narrative-name=${narrativeName ? `${narrativeName.choice} (${plan.state.narrativeNames[Number(narrativeName.choice.replace('name_', ''))] ?? 'none'}) confidence=${narrativeName.confidence} probabilities=${JSON.stringify(narrativeName.probabilities)}` : 'none'} comparisons=${comparisons} proposed=${proposed ? `${proposed.ghostId} / ${proposed.voiceId} / ${proposed.gender}` : 'none'} match-reason=${proposed?.matchReason ?? 'none'} voice-choice=${voice ? `${voice.choice} confidence=${voice.confidence} probabilities=${JSON.stringify(voice.probabilities)}` : 'none'} final=${assignment ? `${assignment.label || 'unnamed'} / ${assignment.ghostId} / ${assignment.voiceId}` : 'connection default'}`
           })
-          diagnostics.unshift(`build=${BUILD_VERSION}; Available favorites=${voices.length}, historical ghosts=${ghosts.length}, current ghosts=${currentGhosts.length}; prior messages=${matchingContext.previousMessages.length}${decisionError ? `; Jev failed: ${decisionError}` : ''}; identity review questions=${Object.keys(review.questions).length}${reviewError ? `; review failed: ${reviewError}` : ''}.`)
+          diagnostics.unshift(`build=${BUILD_VERSION}; Available favorites=${voices.length}, historical ghosts=${ghosts.length}, current ghosts=${currentGhosts.length}; prior messages=${matchingContext.previousMessages.length}${decisionError ? `; Jev failed: ${decisionError}` : ''}; identity review questions=${Object.keys(review.questions).length}${reviewError ? `; review failed: ${reviewError}` : ''}; reduction=${Object.entries(reduction).filter(([, enabled]) => !enabled).map(([id]) => id).join(',') || 'full'}.`)
           diagnostics.splice(1, 0, `Candidate context: ${ghosts.map((ghost, index) => `ghost_${index}=${ghost.id} last=${ghost.lastSeenMessageId || 'none'} history=${(ghost.conversationHistory ?? []).map(entry => `${entry.messageId}(${entry.text.length} chars)`).join(',') || 'none'} context=${ghost.context.length} chars`).join('; ') || 'none'}; prior=${matchingContext.previousMessages.map(item => `${item.role ?? 'unknown'}:${item.id}(${item.text.length} chars)`).join(',') || 'none'}.`)
           sendFrontend({ type: 'chat_voice_uncast_matches', requestId: payload.requestId, assignments, diagnostics }, userId, frontendSessionId)
           if (assignments.length) await sendState(userId, undefined, payload.chatId, frontendSessionId)

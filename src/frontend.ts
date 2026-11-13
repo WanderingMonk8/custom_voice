@@ -19,6 +19,9 @@ import {
   eligibleCardFallbackSpeakerId,
   globalTtsConnectionPreference,
   standardSpeakerReviewPolicy,
+  REDUCTION_COMPONENTS,
+  FULL_REDUCTION_COMPONENTS,
+  readReductionComponents,
   autoplayGenerationEvent,
   autoplaySwipeSnapshot,
   autoplaySwipeMatches,
@@ -72,6 +75,7 @@ import {
   type UncastVoiceGroup,
   type UncastVoiceAssignment,
   type SavedAudioRecord,
+  type ReductionComponentMap,
 } from './core'
 
 interface TtsConnection {
@@ -415,6 +419,8 @@ interface PlaybackPreferences {
   communityVoicePoolAt: string
   communityVoiceLanguage: string
   autoVoiceCastingPool: 'favorite' | 'community'
+  /** Per-component token-reduction toggles; absent entries default to enabled (full reduction). */
+  reductionComponents: ReductionComponentMap
 }
 
 function clampIntegerSetting(value: unknown, fallback: number, maximum: number): number {
@@ -493,6 +499,7 @@ async function loadPlaybackPreferences(): Promise<PlaybackPreferences> {
     communityVoicePoolAt: '',
     communityVoiceLanguage: '',
     autoVoiceCastingPool: 'favorite',
+    reductionComponents: { ...FULL_REDUCTION_COMPONENTS },
   }
   const row = await response.json() as { value?: Record<string, unknown> }
   const speed = typeof row.value?.ttsSpeed === 'number' ? row.value.ttsSpeed : 1
@@ -561,6 +568,7 @@ async function loadPlaybackPreferences(): Promise<PlaybackPreferences> {
       ? row.value.chatVoiceCommunityVoiceLanguage.trim().slice(0, 32).toLowerCase()
       : '',
     autoVoiceCastingPool: row.value?.chatVoiceAutoCastPool === 'community' ? 'community' : 'favorite',
+    reductionComponents: readReductionComponents(row.value?.chatVoiceReductionComponents),
   }
 }
 
@@ -650,6 +658,7 @@ function saveAdvancedPlaybackPreferences(
   speakerLookback: number,
   skipNarration: boolean,
   autoVoiceCastingPool: 'favorite' | 'community',
+  reductionComponents: ReductionComponentMap,
 ): Promise<void> {
   return updateVoiceSettings(current => ({
     ...current,
@@ -676,6 +685,7 @@ function saveAdvancedPlaybackPreferences(
     chatVoiceAutoCastPool: autoVoiceCastingPool,
     chatVoiceGhostVoiceLifetime: clampIntegerSetting(ghostVoiceLifetime, GHOST_VOICE_LIFETIME_MESSAGES, 1000),
     chatVoiceSpeakerLookback: clampIntegerSetting(speakerLookback, DEFAULT_SPEAKER_LOOKBACK, MAX_SPEAKER_LOOKBACK),
+    chatVoiceReductionComponents: { ...readReductionComponents(reductionComponents) },
   }))
 }
 
@@ -1146,6 +1156,8 @@ export function setup(ctx: SpindleFrontendContext) {
     .chat-voice-status[data-state="saved"] { color:var(--lumiverse-success, #65b97a); }
     .chat-voice-status[data-state="error"] { color:var(--lumiverse-danger, #ef6464); }
     .chat-voice-advanced-section { border-top:1px solid var(--lumiverse-border); padding-top:12px; }
+    .chat-voice-reduction-group { display:flex; flex-direction:column; gap:12px; border-top:1px solid var(--lumiverse-border); padding-top:12px; }
+    .chat-voice-reduction-title { font-weight:700; color:var(--lumiverse-text); }
     .chat-voice-advanced-summary {
       display:flex; align-items:center; justify-content:space-between; cursor:pointer;
       font-weight:700; list-style:none; user-select:none;
@@ -1901,6 +1913,41 @@ export function setup(ctx: SpindleFrontendContext) {
   copyReportButton.textContent = 'Copy Report'
   copyReportButton.addEventListener('click', () => { void copyDebugReport() })
   debugActions.append(copyReportButton)
+  // Token-reduction controls: per-component rollback toggles. Disabling every
+  // component restores the pre-reduction behavior; the comparison/report tooling
+  // has been retired now that the implementation is settled.
+  let reductionComponents: ReductionComponentMap = { ...FULL_REDUCTION_COMPONENTS }
+  /** Toggle elements for the per-component token-reduction switches, populated in the advanced section. */
+  const reductionComponentToggles: Array<{ id: keyof ReductionComponentMap; toggle: HTMLInputElement }> = []
+  const reductionGroup = document.createElement('div')
+  reductionGroup.className = 'chat-voice-reduction-group'
+  const reductionTitle = document.createElement('div')
+  reductionTitle.className = 'chat-voice-reduction-title'
+  reductionTitle.textContent = 'Token reduction'
+  reductionGroup.append(reductionTitle)
+  for (const component of REDUCTION_COMPONENTS) {
+    const componentLabel = document.createElement('label')
+    componentLabel.className = 'chat-voice-toggle'
+    const componentToggle = document.createElement('input')
+    componentToggle.type = 'checkbox'
+    componentToggle.checked = reductionComponents[component.id]
+    componentToggle.setAttribute('aria-label', component.label)
+    componentToggle.addEventListener('change', () => {
+      reductionComponents = readReductionComponents({ ...reductionComponents, [component.id]: componentToggle.checked })
+      scheduleAdvancedSettingsSave()
+    })
+    const componentCopy = document.createElement('span')
+    componentCopy.className = 'chat-voice-toggle-copy'
+    const componentText = document.createElement('span')
+    componentText.textContent = component.label
+    const componentHint = document.createElement('span')
+    componentHint.className = 'chat-voice-toggle-hint'
+    componentHint.textContent = component.hint
+    componentCopy.append(componentText, componentHint)
+    componentLabel.append(componentToggle, componentCopy)
+    reductionComponentToggles.push({ id: component.id, toggle: componentToggle })
+    reductionGroup.append(componentLabel)
+  }
   const advancedHint = document.createElement('div')
   advancedHint.className = 'chat-voice-hint'
   advancedHint.textContent = 'Concurrency starts at one and adapts up to the selected maximum. Dense short-segment runs stay at one request at a time, while sustained long runs increase gradually. Larger buffers reduce pauses but delay playback. The wait budget controls cumulative rate-limit cooldowns.'
@@ -1922,6 +1969,7 @@ export function setup(ctx: SpindleFrontendContext) {
     speakerDebugLabel,
     debugActions,
     speakerDebugOutput,
+    reductionGroup,
     advancedHint,
   )
 
@@ -2661,6 +2709,7 @@ export function setup(ctx: SpindleFrontendContext) {
         speakerLookback: preferences.speakerLookback,
         debug: preferences.speakerAssignmentDebug,
         ...standardSpeakerReviewPolicy(),
+        reduction: preferences.reductionComponents,
       })
     })
   }
@@ -2675,7 +2724,7 @@ export function setup(ctx: SpindleFrontendContext) {
     })
   }
 
-  function requestUncastVoiceMatches(chatId: string, messageId: string, message: string, sourceHash: string, groups: UncastVoiceGroup[], voices: FavoriteVoice[], reserved: string[], lifetime: number, speakerLookback: number, skippedTrackerTags: string): Promise<UncastVoiceAssignment[]> {
+  function requestUncastVoiceMatches(chatId: string, messageId: string, message: string, sourceHash: string, groups: UncastVoiceGroup[], voices: FavoriteVoice[], reserved: string[], lifetime: number, speakerLookback: number, skippedTrackerTags: string, reduction: ReductionComponentMap): Promise<UncastVoiceAssignment[]> {
     const requestId = `uncast-${Date.now().toString(36)}-${++uncastRequestSequence}`
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -2683,7 +2732,7 @@ export function setup(ctx: SpindleFrontendContext) {
         reject(new Error('Uncast voice matching timed out.'))
       }, 35_000)
       pendingUncastRequests.set(requestId, { resolve, reject, timer })
-      ctx.sendToBackend({ type: 'chat_voice_match_uncast', requestId, chatId, messageId, message, sourceHash, groups, voices, reserved, lifetime, speakerLookback, skippedTrackerTags })
+      ctx.sendToBackend({ type: 'chat_voice_match_uncast', requestId, chatId, messageId, message, sourceHash, groups, voices, reserved, lifetime, speakerLookback, skippedTrackerTags, reduction })
     })
   }
 
@@ -3434,12 +3483,14 @@ export function setup(ctx: SpindleFrontendContext) {
       preferences.autoPlayback = autoPlayback
       preferences.speakerAssignmentDebug = speakerAssignmentDebug
       preferences.skipNarration = skipNarration
+      preferences.reductionComponents = { ...reductionComponents }
     } else {
       playbackBufferSegments = preferences.playbackBufferSegments
       concurrentGenerationLimit = preferences.concurrentGenerations
       rateLimitWaitSeconds = preferences.rateLimitWaitSeconds
       speakerAssignmentDebug = preferences.speakerAssignmentDebug
       skipNarration = preferences.skipNarration
+      reductionComponents = { ...preferences.reductionComponents }
     }
     const connectionId = savingGlobalConnection || connectionVersionAtLoad !== globalConnectionVersion
       ? lumiverseConnectionId
@@ -3506,20 +3557,20 @@ export function setup(ctx: SpindleFrontendContext) {
       resolveAudibleDone = resolve
     })
     const playback = {
-      messageId,
-      controller: new AbortController(),
-      synthesisController: null as AbortController | null,
-      context: audioContext,
-      source: null as AudioBufferSourceNode | null,
-      persistenceState: 'not-started' as const as 'disabled' | 'not-started' | 'pending' | 'saved' | 'failed',
-      persistenceError: null as string | null,
-      playbackStopped: false,
-      playbackFinished: false,
-      audibleDone,
-      finishAudible: () => {
-        if (audibleFinished) return
-        audibleFinished = true
-        resolveAudibleDone?.()
+        messageId,
+        controller: new AbortController(),
+        synthesisController: null as AbortController | null,
+        context: audioContext,
+        source: null as AudioBufferSourceNode | null,
+        persistenceState: 'not-started' as const as 'disabled' | 'not-started' | 'pending' | 'saved' | 'failed',
+        persistenceError: null as string | null,
+        playbackStopped: false,
+        playbackFinished: false,
+        audibleDone,
+        finishAudible: () => {
+          if (audibleFinished) return
+          audibleFinished = true
+          resolveAudibleDone?.()
       },
     }
     // A different request may have started while this one was awaiting setup.
@@ -3561,7 +3612,11 @@ export function setup(ctx: SpindleFrontendContext) {
         )
       }
       try {
-        review = await requestSpeakerReviewedSegments(playbackChat.id, messageId, preferences)
+        review = await requestSpeakerReviewedSegments(
+          playbackChat.id,
+          messageId,
+          preferences,
+        )
       } catch (error) {
         if (playback.controller.signal.aborted) throw new DOMException('Playback stopped.', 'AbortError')
         if (error instanceof Error && error.message.includes('changed during speaker review')) throw error
@@ -3605,6 +3660,7 @@ export function setup(ctx: SpindleFrontendContext) {
         ? requestUncastVoiceMatches(
             playbackChat.id, messageId, preparePlaybackContent(message.content, preferences.skippedTrackerTags), hashMessageContent(message.content),
             uncastGroups, uncastVoices, reservedVoices, preferences.ghostVoiceLifetime, preferences.speakerLookback, preferences.skippedTrackerTags,
+            preferences.reductionComponents,
           ).catch(error => {
             appendSpeakerDebugLog(`Uncast voice matching failed; using connection default: ${error instanceof Error ? error.message : String(error)}`)
             return [] as UncastVoiceAssignment[]
@@ -4122,7 +4178,8 @@ export function setup(ctx: SpindleFrontendContext) {
         adaptiveSynthesisLimits.delete(adaptiveLimitToken)
         drainSynthesisQueue()
       })
-      const normalizationContext = new contextClass()
+      const normalizationContext = new (window.AudioContext
+        ?? (window as typeof window & { webkitAudioContext: typeof AudioContext }).webkitAudioContext)()
       const voiceLoudnessProfiles = new Map<string, number>()
       let normalizationChain: Promise<void> = Promise.resolve()
       const processed = prepared.map((pending, index) => {
@@ -4165,7 +4222,8 @@ export function setup(ctx: SpindleFrontendContext) {
             messageId,
             message.swipe_id,
             captured,
-            contextClass,
+            window.AudioContext
+              ?? (window as typeof window & { webkitAudioContext: typeof AudioContext }).webkitAudioContext,
             synthesisController.signal,
             () => playback.audibleDone,
             (normalized) => {
@@ -4315,7 +4373,7 @@ export function setup(ctx: SpindleFrontendContext) {
       }
     }
     } finally {
-      playbackStartup.finish(startupToken)
+      if (startupToken !== null) playbackStartup.finish(startupToken)
     }
   }
 
@@ -5746,6 +5804,8 @@ export function setup(ctx: SpindleFrontendContext) {
         skipNarration = preferences.skipNarration
         skipNarrationToggle.checked = skipNarration
         speakerDebugOutput.hidden = !speakerAssignmentDebug
+        reductionComponents = { ...preferences.reductionComponents }
+        for (const entry of reductionComponentToggles) entry.toggle.checked = reductionComponents[entry.id]
       }
       if (!savingGlobalConnection && connectionVersionAtLoad === globalConnectionVersion) lumiverseConnectionId = resolveGlobalTtsConnection(preferences.connectionId, connections)
       const selectedConnectionId = lumiverseConnectionId
@@ -5902,6 +5962,7 @@ export function setup(ctx: SpindleFrontendContext) {
         speakerLookback,
         skipNarration,
         autoVoiceCastingPool,
+        reductionComponents,
       )
       setStatus('Advanced playback settings saved globally.', 'saved')
     } catch (error) {
@@ -6530,6 +6591,7 @@ export function setup(ctx: SpindleFrontendContext) {
         speakerLookback,
         skipNarration,
         autoVoiceCastingPool,
+        reductionComponents,
       )
     }
     skippedTrackerTagsInput.destroy()

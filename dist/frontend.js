@@ -177,6 +177,64 @@ var UNCAST_SPEAKER_ID = "__chat_voice_uncast__";
 function standardSpeakerReviewPolicy() {
   return { runReview: true, bestAvailableSpeaker: true, shadowEvaluation: false, focusedOpeningFallback: false };
 }
+var REDUCTION_COMPONENTS = [
+  {
+    id: "scopedTtsState",
+    phase: "Phase 1",
+    label: "Scope TTS tag state to the target speech",
+    hint: "Send only the target quotation and its local neighbours to Jev for tag selection, not the full message.",
+    defaultValue: true
+  },
+  {
+    id: "twoPhaseTagReview",
+    phase: "Phase 1",
+    label: "Two-phase (primary/secondary) tag questions",
+    hint: "Primary pass asks primary questions first; secondary questions are asked only when the first pass establishes a need for them.",
+    defaultValue: true
+  },
+  {
+    id: "dedupTagCriteria",
+    phase: "Phase 1",
+    label: "Deduplicate tag criteria",
+    hint: "Share terse criteria blocks across emotion/style/sound/pause questions instead of expanding full descriptions per question.",
+    defaultValue: true
+  },
+  {
+    id: "gatedAuxReviews",
+    phase: "Phase 2",
+    label: "Gate auxiliary speaker reviews on triggers",
+    hint: "Best-available guess, self-introduction, speaker-switch and focused opening reviews run only when a trigger is present, not always.",
+    defaultValue: true
+  },
+  {
+    id: "deferRelationshipReview",
+    phase: "Phase 2",
+    label: "Defer the global relationship review until a trigger fires",
+    hint: "Skip the whole relationship review when no known trigger is established (no unresolved turn, no boundary, no alternate speaker switch); otherwise it runs as today.",
+    defaultValue: true
+  },
+  {
+    id: "trimVoiceCriteria",
+    phase: "Phase 2",
+    label: "Condense uncast voice ranking criteria",
+    hint: "Drop the description fields from the voice ranking criteria (use name, category, languages and tags only) and keep the shortlist small.",
+    defaultValue: true
+  }
+];
+var REDUCTION_COMPONENT_IDS = REDUCTION_COMPONENTS.map((component) => component.id);
+var FULL_REDUCTION_COMPONENTS = Object.fromEntries(REDUCTION_COMPONENTS.map((component) => [component.id, component.defaultValue]));
+var DISABLED_REDUCTION_COMPONENTS = Object.fromEntries(REDUCTION_COMPONENTS.map((component) => [component.id, false]));
+function readReductionComponents(value) {
+  const full = FULL_REDUCTION_COMPONENTS;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return { ...full };
+  const row = value;
+  const next = { ...full };
+  for (const component of REDUCTION_COMPONENTS) {
+    const raw = row[component.id];
+    if (typeof raw === "boolean") next[component.id] = raw;
+  }
+  return next;
+}
 function autoplayGenerationEvent(value, activeChatId) {
   if (!value || typeof value !== "object" || Array.isArray(value) || !activeChatId) return null;
   const event = value;
@@ -2281,7 +2339,8 @@ async function loadPlaybackPreferences() {
     communityVoicePool: [],
     communityVoicePoolAt: "",
     communityVoiceLanguage: "",
-    autoVoiceCastingPool: "favorite"
+    autoVoiceCastingPool: "favorite",
+    reductionComponents: { ...FULL_REDUCTION_COMPONENTS }
   };
   const row = await response.json();
   const speed = typeof row.value?.ttsSpeed === "number" ? row.value.ttsSpeed : 1;
@@ -2329,7 +2388,8 @@ async function loadPlaybackPreferences() {
     communityVoicePool: readFavoriteVoices(row.value?.chatVoiceCommunityVoicePool),
     communityVoicePoolAt: typeof row.value?.chatVoiceCommunityVoicePoolAt === "string" ? row.value.chatVoiceCommunityVoicePoolAt.slice(0, 32) : "",
     communityVoiceLanguage: typeof row.value?.chatVoiceCommunityVoiceLanguage === "string" ? row.value.chatVoiceCommunityVoiceLanguage.trim().slice(0, 32).toLowerCase() : "",
-    autoVoiceCastingPool: row.value?.chatVoiceAutoCastPool === "community" ? "community" : "favorite"
+    autoVoiceCastingPool: row.value?.chatVoiceAutoCastPool === "community" ? "community" : "favorite",
+    reductionComponents: readReductionComponents(row.value?.chatVoiceReductionComponents)
   };
 }
 var voiceSettingsWriteQueue = Promise.resolve();
@@ -2389,7 +2449,7 @@ function saveTtsTagPreferences(style, placement, connectionId, model) {
     chatVoiceTagLlmModel: model.trim().slice(0, 256)
   }));
 }
-function saveAdvancedPlaybackPreferences(bufferSegments, concurrentGenerations, rateLimitWaitSeconds, speakerAssignmentDebug, ghostVoiceLifetime, autoVoiceCasting, autoPlayback, autoPlaybackDelaySeconds, speakerLookback, skipNarration, autoVoiceCastingPool) {
+function saveAdvancedPlaybackPreferences(bufferSegments, concurrentGenerations, rateLimitWaitSeconds, speakerAssignmentDebug, ghostVoiceLifetime, autoVoiceCasting, autoPlayback, autoPlaybackDelaySeconds, speakerLookback, skipNarration, autoVoiceCastingPool, reductionComponents) {
   return updateVoiceSettings((current) => ({
     ...current,
     chatVoicePlaybackBufferSegments: clampIntegerSetting(
@@ -2414,7 +2474,8 @@ function saveAdvancedPlaybackPreferences(bufferSegments, concurrentGenerations, 
     chatVoiceAutoPlaybackDelaySeconds: readAutoplayDelaySeconds(autoPlaybackDelaySeconds),
     chatVoiceAutoCastPool: autoVoiceCastingPool,
     chatVoiceGhostVoiceLifetime: clampIntegerSetting(ghostVoiceLifetime, GHOST_VOICE_LIFETIME_MESSAGES, 1e3),
-    chatVoiceSpeakerLookback: clampIntegerSetting(speakerLookback, DEFAULT_SPEAKER_LOOKBACK, MAX_SPEAKER_LOOKBACK)
+    chatVoiceSpeakerLookback: clampIntegerSetting(speakerLookback, DEFAULT_SPEAKER_LOOKBACK, MAX_SPEAKER_LOOKBACK),
+    chatVoiceReductionComponents: { ...readReductionComponents(reductionComponents) }
   }));
 }
 function saveDefaultRoleVoice(role, voice) {
@@ -2837,6 +2898,8 @@ function setup(ctx) {
     .chat-voice-status[data-state="saved"] { color:var(--lumiverse-success, #65b97a); }
     .chat-voice-status[data-state="error"] { color:var(--lumiverse-danger, #ef6464); }
     .chat-voice-advanced-section { border-top:1px solid var(--lumiverse-border); padding-top:12px; }
+    .chat-voice-reduction-group { display:flex; flex-direction:column; gap:12px; border-top:1px solid var(--lumiverse-border); padding-top:12px; }
+    .chat-voice-reduction-title { font-weight:700; color:var(--lumiverse-text); }
     .chat-voice-advanced-summary {
       display:flex; align-items:center; justify-content:space-between; cursor:pointer;
       font-weight:700; list-style:none; user-select:none;
@@ -3622,6 +3685,37 @@ function setup(ctx) {
     void copyDebugReport();
   });
   debugActions.append(copyReportButton);
+  let reductionComponents = { ...FULL_REDUCTION_COMPONENTS };
+  const reductionComponentToggles = [];
+  const reductionGroup = document.createElement("div");
+  reductionGroup.className = "chat-voice-reduction-group";
+  const reductionTitle = document.createElement("div");
+  reductionTitle.className = "chat-voice-reduction-title";
+  reductionTitle.textContent = "Token reduction";
+  reductionGroup.append(reductionTitle);
+  for (const component of REDUCTION_COMPONENTS) {
+    const componentLabel = document.createElement("label");
+    componentLabel.className = "chat-voice-toggle";
+    const componentToggle = document.createElement("input");
+    componentToggle.type = "checkbox";
+    componentToggle.checked = reductionComponents[component.id];
+    componentToggle.setAttribute("aria-label", component.label);
+    componentToggle.addEventListener("change", () => {
+      reductionComponents = readReductionComponents({ ...reductionComponents, [component.id]: componentToggle.checked });
+      scheduleAdvancedSettingsSave();
+    });
+    const componentCopy = document.createElement("span");
+    componentCopy.className = "chat-voice-toggle-copy";
+    const componentText = document.createElement("span");
+    componentText.textContent = component.label;
+    const componentHint = document.createElement("span");
+    componentHint.className = "chat-voice-toggle-hint";
+    componentHint.textContent = component.hint;
+    componentCopy.append(componentText, componentHint);
+    componentLabel.append(componentToggle, componentCopy);
+    reductionComponentToggles.push({ id: component.id, toggle: componentToggle });
+    reductionGroup.append(componentLabel);
+  }
   const advancedHint = document.createElement("div");
   advancedHint.className = "chat-voice-hint";
   advancedHint.textContent = "Concurrency starts at one and adapts up to the selected maximum. Dense short-segment runs stay at one request at a time, while sustained long runs increase gradually. Larger buffers reduce pauses but delay playback. The wait budget controls cumulative rate-limit cooldowns.";
@@ -3643,6 +3737,7 @@ function setup(ctx) {
     speakerDebugLabel,
     debugActions,
     speakerDebugOutput,
+    reductionGroup,
     advancedHint
   );
   let applyingState = false;
@@ -4307,7 +4402,8 @@ function setup(ctx) {
         ghostVoiceLifetime: preferences.ghostVoiceLifetime,
         speakerLookback: preferences.speakerLookback,
         debug: preferences.speakerAssignmentDebug,
-        ...standardSpeakerReviewPolicy()
+        ...standardSpeakerReviewPolicy(),
+        reduction: preferences.reductionComponents
       });
     });
   }
@@ -4323,7 +4419,7 @@ function setup(ctx) {
       ctx.sendToBackend({ type: "chat_voice_auto_cast", requestId, chatId, voices, reserved, narratorMissing, userMissing, ghostLifetime: ghostVoiceLifetime });
     });
   }
-  function requestUncastVoiceMatches(chatId, messageId, message, sourceHash, groups, voices, reserved, lifetime, speakerLookback2, skippedTrackerTags2) {
+  function requestUncastVoiceMatches(chatId, messageId, message, sourceHash, groups, voices, reserved, lifetime, speakerLookback2, skippedTrackerTags2, reduction) {
     const requestId = `uncast-${Date.now().toString(36)}-${++uncastRequestSequence}`;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -4331,7 +4427,7 @@ function setup(ctx) {
         reject(new Error("Uncast voice matching timed out."));
       }, 35e3);
       pendingUncastRequests.set(requestId, { resolve, reject, timer });
-      ctx.sendToBackend({ type: "chat_voice_match_uncast", requestId, chatId, messageId, message, sourceHash, groups, voices, reserved, lifetime, speakerLookback: speakerLookback2, skippedTrackerTags: skippedTrackerTags2 });
+      ctx.sendToBackend({ type: "chat_voice_match_uncast", requestId, chatId, messageId, message, sourceHash, groups, voices, reserved, lifetime, speakerLookback: speakerLookback2, skippedTrackerTags: skippedTrackerTags2, reduction });
     });
   }
   const pendingCommunityRequests = /* @__PURE__ */ new Map();
@@ -4908,12 +5004,14 @@ function setup(ctx) {
         preferences.autoPlayback = autoPlayback;
         preferences.speakerAssignmentDebug = speakerAssignmentDebug;
         preferences.skipNarration = skipNarration;
+        preferences.reductionComponents = { ...reductionComponents };
       } else {
         playbackBufferSegments = preferences.playbackBufferSegments;
         concurrentGenerationLimit = preferences.concurrentGenerations;
         rateLimitWaitSeconds = preferences.rateLimitWaitSeconds;
         speakerAssignmentDebug = preferences.speakerAssignmentDebug;
         skipNarration = preferences.skipNarration;
+        reductionComponents = { ...preferences.reductionComponents };
       }
       const connectionId = savingGlobalConnection || connectionVersionAtLoad !== globalConnectionVersion ? lumiverseConnectionId : resolveGlobalTtsConnection(preferences.connectionId, connections);
       if (!connectionId) {
@@ -5027,7 +5125,11 @@ function setup(ctx) {
           );
         }
         try {
-          review = await requestSpeakerReviewedSegments(playbackChat.id, messageId, preferences);
+          review = await requestSpeakerReviewedSegments(
+            playbackChat.id,
+            messageId,
+            preferences
+          );
         } catch (error) {
           if (playback.controller.signal.aborted) throw new DOMException("Playback stopped.", "AbortError");
           if (error instanceof Error && error.message.includes("changed during speaker review")) throw error;
@@ -5080,7 +5182,8 @@ function setup(ctx) {
           reservedVoices,
           preferences.ghostVoiceLifetime,
           preferences.speakerLookback,
-          preferences.skippedTrackerTags
+          preferences.skippedTrackerTags,
+          preferences.reductionComponents
         ).catch((error) => {
           appendSpeakerDebugLog(`Uncast voice matching failed; using connection default: ${error instanceof Error ? error.message : String(error)}`);
           return [];
@@ -5462,7 +5565,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
           adaptiveSynthesisLimits.delete(adaptiveLimitToken);
           drainSynthesisQueue();
         });
-        const normalizationContext = new contextClass();
+        const normalizationContext = new (window.AudioContext ?? window.webkitAudioContext)();
         const voiceLoudnessProfiles = /* @__PURE__ */ new Map();
         let normalizationChain = Promise.resolve();
         const processed = prepared.map((pending, index) => {
@@ -5503,7 +5606,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
               messageId,
               message.swipe_id,
               captured,
-              contextClass,
+              window.AudioContext ?? window.webkitAudioContext,
               synthesisController.signal,
               () => playback.audibleDone,
               (normalized) => {
@@ -5637,7 +5740,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
         }
       }
     } finally {
-      playbackStartup.finish(startupToken);
+      if (startupToken !== null) playbackStartup.finish(startupToken);
     }
   }
   function scanMessages() {
@@ -7067,6 +7170,8 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
         skipNarration = preferences.skipNarration;
         skipNarrationToggle.checked = skipNarration;
         speakerDebugOutput.hidden = !speakerAssignmentDebug;
+        reductionComponents = { ...preferences.reductionComponents };
+        for (const entry of reductionComponentToggles) entry.toggle.checked = reductionComponents[entry.id];
       }
       if (!savingGlobalConnection && connectionVersionAtLoad === globalConnectionVersion) lumiverseConnectionId = resolveGlobalTtsConnection(preferences.connectionId, connections);
       const selectedConnectionId = lumiverseConnectionId;
@@ -7206,7 +7311,8 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
         autoPlaybackDelaySeconds,
         speakerLookback,
         skipNarration,
-        autoVoiceCastingPool
+        autoVoiceCastingPool,
+        reductionComponents
       );
       setStatus("Advanced playback settings saved globally.", "saved");
     } catch (error) {
@@ -7811,7 +7917,8 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
         autoPlaybackDelaySeconds,
         speakerLookback,
         skipNarration,
-        autoVoiceCastingPool
+        autoVoiceCastingPool,
+        reductionComponents
       );
     }
     skippedTrackerTagsInput.destroy();

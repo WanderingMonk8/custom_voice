@@ -583,3 +583,23 @@ The pipeline is spending disproportionate Jev budget re-reading text for short, 
 **Scope state → evaluate secondary choices only when needed → deduplicate criteria → gate only genuinely avoidable reviews.**
 
 The speaker identity pipeline is useful enough already. It should not be distilled into a cheaper set of questions that lose voice attribution across messages to save a few percent of prompt tokens.
+
+---
+
+## Implementation status (v3.32.0)
+
+Landed as the **token reduction** implementation. Each plan component below is a global setting, toggleable independently in the Advanced section; turning a component off restores the pre-reduction behavior for that component alone. The temporary comparison mode and its accumulated report (added in v3.31.0) were retired in v3.32.0 after the 17-capture comparison showed no degradation on the routing/casting/voice axis (see `docs/comparison-reduction-analysis.md`); the per-component rollback toggles remain as the safety net.
+
+| # | Plan item | Component id | Status |
+|---|---|---|---|
+| 1 | Scope TTS tag state to the target speech | `scopedTtsState` | Implemented: narration sent to Jev is sliced to a 320-character quotation-local window (`TTS_NARRATION_WINDOW`), newest-first. |
+| 2 | Conditional secondary questions | `twoPhaseTagReview` | Implemented (6e54127); off reverts to the single-pass `all` plan. |
+| 3 | Deduplicate tag criteria | `dedupTagCriteria` | Implemented: shared terse criteria (first sentence only) are sent for emotion, sound, style, pause and boundary questions. |
+| 5 | Gate auxiliary speaker reviews | `gatedAuxReviews` | Implemented: auxiliary reviews (user-review, contextual reconciliation, opening re-read, opening backlink, self-introduction, speaker-switch, best-available) are skipped on a clear first pass (`hasUncertainFirstPass`) and run on any escalation trigger. |
+| 6 | Reduce uncast voice shortlist / criteria | `trimVoiceCriteria` | Implemented: voice ranking criteria drop `description` and `description supports`, the shortlist is capped at 16, and the ranking instructions match the trimmed criteria. |
+| 7 | Defer relationship review globally | `deferRelationshipReview` | Implemented: the relationship review is skipped when no escalation trigger exists; first-pass answers remain authoritative and the decision is logged as `relationship-review=deferred (clear first pass)`. |
+| 4 | Fish tag LLM placement as a separate failure mode | - | Not applicable to Jev cost; unchanged. |
+| 8 | Structural Phase 3 (fold secondary questions) | - | Not implemented; excluded per plan's own risk guidance. |
+| 9 | Prefilter voices by metadata | - | Not implemented; excluded per plan's recommendation. |
+
+Instrumentation (Phase 0) exists through `measureJevDecisionPayload` and the `[Chat Voice] Jev tag budget` log lines for the reduction-side cost accounting; the side-by-side comparison instrumentation was retired in v3.32.0 after the measurement campaign.
