@@ -12,6 +12,7 @@ import {
   mutuallyInvoked,
   narrationFirstPronounClass,
   backwardNarrationPronounGender,
+  hasNewAnonymousVoiceCue,
   narrationBoostsPair,
   vocativeNames,
   type PlaybackSegment,
@@ -77,6 +78,14 @@ import {
   relationshipReviewContext,
   applyAssistantUserSpeakerReview,
   buildTtsTagPlan,
+  measureJevDecisionPayload,
+  voiceDecisionSummaryTerse,
+  readReductionComponents,
+  FULL_REDUCTION_COMPONENTS,
+  DISABLED_REDUCTION_COMPONENTS,
+  REDUCTION_COMPONENTS,
+  hasUncertainFirstPass,
+  TTS_NARRATION_WINDOW,
   bufferAwareGenerationConcurrency,
   availableUncastVoices,
   canReserveAutomaticVoice,
@@ -90,6 +99,7 @@ import {
   uncastNarrativeNameCandidates,
   ghostCastAliases,
   updateGhostConversationHistory,
+  updateGhostInteractivityTrail,
   uncastIdentityLabels,
   mergeGhostAliases,
   readGhostVoices,
@@ -142,6 +152,9 @@ import {
   voiceAge,
   voiceCategoryGender,
   voiceDecisionSummary,
+  interactionAnchorOverlap,
+  interactionAnchors,
+  appearanceAnchors,
   voiceDescriptionTagHints,
   voiceGender,
   voiceGenderCompatible,
@@ -1403,6 +1416,22 @@ test('builds emotion, sound, and pause questions per speech', () => {
   assert.ok(positionQuestion.criteria.b1)
   assert.ok(tagPlan.questions.pausepos_s0?.criteria.b1)
   assert.equal(Object.keys(tagPlan.questions).length, 8)
+  assert.equal('message' in tagPlan.state, false)
+})
+
+test('splits tag decisions into a tiny primary pass and targeted secondary questions', () => {
+  const content = ['Narration.', '', `"I thought you were gone, but you came back."`].join('\n')
+  const plan = buildSpeakerDecisionPlan(content, [{ id: 'alice', name: 'Alice' }], false)
+  const primary = buildTtsTagPlan(plan, undefined, undefined, 'fish', true, 'primary')
+  assert.deepEqual(Object.keys(primary.questions), ['emotion_s0', 'style_s0', 'modulation_s0', 'tag_s0', 'pause_s0'])
+
+  const secondary = buildTtsTagPlan(plan, ['s0'], undefined, 'fish', true, 'secondary', { s0: { emotion2: true, sound: true, pause: true, modulationpos: true } })
+  assert.deepEqual(Object.keys(secondary.questions), ['emotion2_s0', 'modulationpos_s0', 'tag2_s0', 'tagpos_s0', 'pause2_s0', 'pausepos_s0'])
+
+  const budget = measureJevDecisionPayload(primary.state, primary.questions)
+  assert.equal(budget.questionCount, 5)
+  assert.ok(budget.stateBytes > 0)
+  assert.ok(budget.questionsBytes > 0)
 })
 
 test('adds a Fish style question and repeats leading cues per sentence', () => {
@@ -2100,8 +2129,8 @@ test('validates favorite voice IDs and classifications', () => {
     { id: 'voice-1', name: 'Duplicate', category: 'male' },
     { id: ' ' }, null,
   ]), [
-    { id: 'voice-1', name: 'Alice', category: 'female', description: 'warm and gentle' },
-    { id: 'voice-2', name: 'Bob', category: 'male', description: '' },
+    { id: 'voice-1', name: 'Alice', category: 'female', description: 'warm and gentle', gender: 'female', tags: ['female'] },
+    { id: 'voice-2', name: 'Bob', category: 'male', description: '', gender: 'male', tags: ['male'] },
     { id: 'voice-3', name: '', category: 'other', description: '' },
   ])
   // Legacy rows without a recognized category still default to unspecified.
@@ -2112,13 +2141,31 @@ test('validates favorite voice IDs and classifications', () => {
   assert.deepEqual(readFavoriteVoices([{
     id: 'voice-5', name: 'Mother Jinx', category: 'anime character', description: 'commanding',
     author: 'someone', source: 'community', communityLink: 'https://fish.audio/m/voice-5',
-    tags: ['anime', 'female', 'english'],
+    tags: ['female', 'anime', 'english'],
   }]), [{
     id: 'voice-5', name: 'Mother Jinx', category: 'anime character', description: 'commanding',
     author: 'someone', source: 'community', communityLink: 'https://fish.audio/m/voice-5',
-    tags: ['anime', 'female', 'english'],
+    gender: 'female', tags: ['female', 'anime', 'english'],
   }])
   assert.deepEqual(readFavoriteVoices(null), [])
+})
+
+test('favorite gender metadata is normalized into the actual sex tag', () => {
+  const [conflict, inferred, sparse] = readFavoriteVoices([
+    { id: 'conflict', category: 'female', tags: ['male', 'warm'] },
+    { id: 'inferred', category: 'anime character', tags: ['female', 'young'] },
+    { id: 'sparse', category: '', tags: ['warm'] },
+  ])
+  assert.deepEqual([conflict.gender, conflict.tags], ['female', ['female', 'warm']])
+  assert.deepEqual([inferred.gender, inferred.tags], ['female', ['female', 'young']])
+  assert.deepEqual([sparse.gender, sparse.tags], [undefined, ['warm']])
+
+  const favorite = communityVoiceToFavorite({
+    id: 'community', title: 'Grandma', description: 'A warm older voice', category: 'character', tags: ['grandmother', 'female'],
+    languages: [], author: '', likeCount: 0, taskCount: 0, licensed: false, licensedNote: null, communityLink: 'https://fish.audio/m/community',
+  })
+  assert.deepEqual(favorite.tags, ['female', 'grandmother'])
+  assert.equal(favorite.gender, 'female')
 })
 
 test('rejects duplicate favorite voice IDs even if names differ or whitespace is present', () => {
@@ -2184,6 +2231,14 @@ test('voiceDescriptionTagHints scores descriptions across Fish quality tags', ()
   assert.deepEqual(voiceDescriptionTagHints('English narrator for tutorials.'), ['narration', 'educational'])
 })
 
+test('interaction anchors expose repeated activity and actor-addressee pairs without overfitting', () => {
+  const anchors = interactionAnchors('Ash kneels on the gravel. Rose tells Ash to kneel again. They continue the mouth work, maintaining the same pair interaction.')
+  assert.ok(anchors.includes('gravel') || anchors.includes('mouth work'))
+  assert.ok(anchors.includes('ash') || anchors.includes('rose'))
+  assert.ok(interactionAnchorOverlap(anchors, interactionAnchors('The mouth work continues. Ash and Rose remain paired in the activity.')).length >= 3)
+  assert.deepEqual(interactionAnchors('one one two three'), [])
+})
+
 test('communityVoiceToFavorite maps Fish metadata onto expanded favorites', () => {
   const voice = readCommunityVoice({
     _id: 'model-1',
@@ -2202,7 +2257,7 @@ test('communityVoiceToFavorite maps Fish metadata onto expanded favorites', () =
   ])
   const favorite = communityVoiceToFavorite(voice)
   assert.equal(favorite.category, 'anime')
-  assert.deepEqual(favorite.tags, ['anime', 'female', 'english'])
+  assert.deepEqual(favorite.tags, ['female', 'anime', 'english'])
   assert.equal(voiceGender(favorite), 'female')
   assert.equal(readCommunityVoice({ title: 'no id' }), null)
   assert.equal(readCommunityVoice(null), null)
@@ -2325,6 +2380,19 @@ test('a paragraph opening on "The guy …" anchors male instead of inheriting an
   assert.equal(collectUncastVoiceGroups(segments)[0].pronounGender, 'male')
 })
 
+test('explicit different-voice narration splits an otherwise anonymous run', () => {
+  const nar = (text: string) => ({ text, speakerId: null })
+  const speech = (text: string) => ({ text, speakerId: UNCAST_SPEAKER_ID })
+  const segments = [
+    speech('Mom, leave the curtain alone, nobody is out there yet.'),
+    nar('A second voice answers from deeper in the front room, older, papery, sharp:'),
+    speech('Somebody is standing by the hose.'),
+    speech('Nobody is trimming the tree.'),
+  ]
+  assert.equal(hasNewAnonymousVoiceCue(segments[1].text), true)
+  assert.deepEqual(collectUncastVoiceGroups(segments).map(group => group.segmentIndexes), [[0], [2, 3]])
+})
+
 test('a Jev gender that contradicts the narration class falls back to that class instead of dropping the voice', () => {
   const segments = [
     { text: 'She leans down over her knees, hair falling forward across her cheek.', speakerId: null },
@@ -2347,6 +2415,85 @@ test('a Jev gender that contradicts the narration class falls back to that class
     voice_g0: confidentDecision('voice_3'),
   })
   assert.deepEqual(result.map(item => [item.voiceId, item.gender]), [['male-2', 'male']])
+})
+
+test('appearanceAnchors extract clothing introduction phrases', () => {
+  const text = 'A girl in a faded grey soccer hoodie walks in with a girl in the denim overalls. A guy in the windbreaker says hello.'
+  const anchors = appearanceAnchors(text)
+  assert.ok(anchors.includes('faded grey soccer hoodie'))
+  assert.ok(anchors.includes('grey soccer hoodie') || anchors.includes('soccer hoodie'))
+  assert.ok(anchors.includes('denim overalls'))
+  assert.ok(anchors.includes('windbreaker'))
+  // No anchors for prose lacking garment descriptors.
+  assert.deepEqual(appearanceAnchors('She smiles at the table and speaks quietly.'), [])
+})
+
+test('appearance anchors ride along in the uncast decision plan for candidate and ghost', () => {
+  const narration = 'A girl in a faded grey soccer hoodie sits down.'
+  const narration2 = 'The girl in the denim overalls asks.'
+  const message = `${narration}  \u201cOh, is this Halvorsen\u2019s petition?\u201d ${narration2}`
+  const groups = collectUncastVoiceGroups([
+    { text: narration, speakerId: null },
+    { speakerId: UNCAST_SPEAKER_ID, text: "Oh, is this Halvorsen's petition?" },
+    { text: narration2, speakerId: null },
+    { speakerId: UNCAST_SPEAKER_ID, text: 'Hmm, I will take one.' },
+  ])
+  const ghost = { id: 'ghost-old', speakerId: UNCAST_SPEAKER_ID, voiceId: 'old', label: 'the windbreaker guy', context: 'The guy in the windbreaker says \u201cyeah, sure.\u201d', occurrenceKeys: [], lastSeenMessageId: 'previous' }
+  const plan = buildUncastVoiceDecision(groups, [], message, [ghost])
+  assert.ok(plan.state.characters[0].appearance?.includes('faded grey soccer hoodie'))
+  assert.ok(plan.state.characters[0].appearance?.includes('denim overalls'))
+  assert.ok(plan.state.ghosts[0].appearance.includes('windbreaker'))
+  assert.match(plan.questions.identity_g0.instructions, /appearance anchors/iu)
+})
+
+test('a misattributed "she" from cast narration does not send an explicitly male uncast speaker to a female voice', () => {
+  // Reported case: the uncast "guy in the windbreaker" inherited 'female'
+  // from Wren's paragraph, while the other fragment's narration said 'male'
+  // and Jev's valid vote leaned male. Disagreeing narration hints must defer
+  // to Jev's gender question instead of the misread narration class.
+  const groups = [
+    { id: 'g0', speakerId: UNCAST_SPEAKER_ID, segmentIndexes: [8], speeches: ['Yeah, sure, I got a lab till nine-thirty on Mondays,'], context: ['Wren gets the confession out in a low, strangled rush.'], pronounGender: 'female' as const },
+    { id: 'g1', speakerId: UNCAST_SPEAKER_ID, segmentIndexes: [10], speeches: ['Who\'s the roll for?'], context: ['the guy in the windbreaker says without a blink of curiosity.'], pronounGender: 'male' as const },
+  ]
+  const voices = readFavoriteVoices([
+    { id: 'male-voice', category: 'male' },
+    { id: 'female-voice', category: 'female' },
+  ])
+  const answers = {
+    identity_g0: confidentDecision('new_or_unclear'),
+    identity_g1: confidentDecision('group_g0'),
+    same_g1_g0: confidentDecision('same'),
+    gender_g0: { choice: 'male', confidence: 0.485, probabilities: { male: 0.657, female: 0.210, unknown: 0.133 } },
+    gender_g1: { choice: 'male', confidence: 0.616, probabilities: { male: 0.744, female: 0.069, unknown: 0.186 } },
+    voice_g0: { choice: 'voice_1', confidence: 0.071, probabilities: { voice_1: 0.1 } },
+    voice_g1: { choice: 'voice_0', confidence: 0.422, probabilities: { voice_0: 0.44 } },
+  }
+  const assignments = resolveUncastVoiceDecisions(groups, voices, answers, [], [], 'message', 'the guy in the windbreaker says without a blink of curiosity.', [], () => 0)
+  assert.ok(assignments.length > 0)
+  assert.ok(assignments.every(item => item.voiceId === 'male-voice'))
+  assert.ok(assignments.every(item => item.gender === 'male'))
+})
+
+test('conflicting narration gender classes still yield a voice inside the gender Jev established', () => {
+  const voices = readFavoriteVoices([
+    { id: 'female-1', category: 'female' }, { id: 'female-2', category: 'female' },
+  ])
+  const groups = [
+    { id: 'g0', speakerId: UNCAST_SPEAKER_ID, segmentIndexes: [0], speeches: ['One.'], context: ['She writes.'], pronounGender: 'female' as const },
+    { id: 'g1', speakerId: UNCAST_SPEAKER_ID, segmentIndexes: [2], speeches: ['Two.'], context: ['He counts.'], pronounGender: 'male' as const },
+  ]
+  // Both members valid female votes: Jev says female; hints conflict, so Jev wins.
+  const answers = {
+    identity_g1: confidentDecision('group_g0'),
+    same_g1_g0: confidentDecision('same'),
+    gender_g0: confidentDecision('female'),
+    gender_g1: confidentDecision('female'),
+    voice_g0: { choice: 'voice_0', confidence: 0.9, probabilities: { voice_0: 0.9 } },
+    voice_g1: { choice: 'voice_1', confidence: 0.9, probabilities: { voice_1: 0.9 } },
+  }
+  const assignments = resolveUncastVoiceDecisions(groups, voices, answers, [], [], 'message', 'msg', [], () => 0)
+  assert.ok(assignments.length > 0)
+  assert.ok(assignments.every(item => item.gender === 'female'))
 })
 
 test('a pronoun chain links fragments of one introduced man to a single voice', () => {
@@ -2467,6 +2614,29 @@ test('an established Jev gender outranks a contradictory label hint', () => {
   assert.deepEqual(matches.map(match => [match.voiceId, match.gender]), [['female', 'female']])
 })
 
+test('rejects an established ghost whose stored voice is incompatible with the established gender', () => {
+  const groups = collectUncastVoiceGroups([{ text: 'Next please.', speakerId: UNCAST_SPEAKER_ID }])
+  const voices = readFavoriteVoices([
+    { id: 'female-voice', category: 'female' },
+    { id: 'male-voice', category: 'male' },
+    { id: 'unknown-voice', category: 'unspecified' },
+  ])
+  const female = { id: 'old-ghost', speakerId: UNCAST_SPEAKER_ID, voiceId: 'female-voice', context: 'A previous male voice from an earlier bad match.', occurrenceKeys: [], lastSeenMessageId: 'previous' }
+  const male = resolveUncastVoiceDecisions(groups, voices, {
+    gender_g0: confidentDecision('male'),
+    identity_g0: confidentDecision('ghost_0'),
+    voice_g0: { choice: 'voice_1', probabilities: { voice_0: 0.1, voice_1: 0.85, voice_2: 0.05 }, confidence: 0.8 },
+  }, [female], [], 'current', '', ['previous'], () => 0.99)
+  assert.deepEqual(male.map(match => [match.voiceId, match.gender]), [['male-voice', 'male']])
+
+  const unknown = { id: 'old-ghost', speakerId: UNCAST_SPEAKER_ID, voiceId: 'unknown-voice', context: 'Sparse voice metadata.', occurrenceKeys: [], lastSeenMessageId: 'previous' }
+  const accepted = resolveUncastVoiceDecisions(groups, voices, {
+    gender_g0: confidentDecision('male'),
+    identity_g0: confidentDecision('ghost_0'),
+  }, [unknown], [], 'current', '', ['previous'], () => 0.99)
+  assert.deepEqual(accepted.map(match => match.voiceId), ['unknown-voice'])
+})
+
 test('keeps ghost voices for the configured count of assistant messages and never links weak identities', () => {
   const ids = Array.from({ length: 13 }, (_, index) => `assistant-${index}`)
   const ghost = { id: 'ghost-1', speakerId: UNCAST_SPEAKER_ID, voiceId: 'voice-1', context: 'The clerk spoke.', occurrenceKeys: [], lastSeenMessageId: ids[0] }
@@ -2504,6 +2674,25 @@ test('reuses a ghost voice for a weak identity only when the follow-up review co
     review_ghost_g0_0: { choice: 'different_or_unclear', probabilities: { same: 0.3, different_or_unclear: 0.7 }, confidence: 0.7 },
   }, [ghost])
   assert.equal(unconfirmed.some(assignment => assignment.ghostId === 'ghost-girl'), false)
+})
+
+test('never proposes the voice of an active ghost for a brand-new character', () => {
+  const ghost = { id: 'ghost-girl', speakerId: UNCAST_SPEAKER_ID, voiceId: 'reserved-voice', context: 'The girl ordered coffee.', occurrenceKeys: [], lastSeenMessageId: 'assistant-0' }
+  const groups = collectUncastVoiceGroups([{ speakerId: UNCAST_SPEAKER_ID, text: 'Yeah, I know that place.' }, { speakerId: null, text: 'She tiptoes forward.' }, { speakerId: UNCAST_SPEAKER_ID, text: 'Also fancy.' }])
+  const voices = readFavoriteVoices([
+    { id: 'reserved-voice', category: 'female', description: 'jaded contralto' },
+    { id: 'fresh-voice', category: 'female', description: 'bright alto' },
+  ])
+  // The active ghost holds 'voice_0'; Jev heavily favors voice_0 anyway. The
+  // resolver must not pick it: the voices held by the current ghosts stay
+  // reserved for their owners.
+  const answers = {
+    gender_g0: confidentDecision('female'),
+    voice_g0: { choice: 'voice_0', confidence: 0.999, probabilities: { voice_0: 0.999, voice_1: 0.001 } },
+  }
+  const matches = resolveUncastVoiceDecisions(groups, voices, answers, [ghost], [], 'current', 'The girl ordered coffee.')
+  assert.ok(matches.length)
+  assert.equal(matches[0]?.voiceId, 'fresh-voice')
 })
 
 test('treats a repeated specific unnamed label as a voice match and ignores broad person labels', () => {
@@ -3529,29 +3718,38 @@ test('reviews a name introduced in narration for an otherwise uncast speaker', (
 
 test('retains conversation exchanges and relationship labels for later ghost identity review', () => {
   const ids = ['one', 'two', 'three', 'four']
-  const ghost = { id: 'mother', speakerId: UNCAST_SPEAKER_ID, voiceId: 'voice', context: '', occurrenceKeys: [], lastSeenMessageId: 'one', conversationHistory: [] as Array<{ messageId: string; text: string }> }
+  const ghost: Parameters<typeof updateGhostInteractivityTrail>[0] = { id: 'mother', speakerId: UNCAST_SPEAKER_ID, voiceId: 'voice', context: '', occurrenceKeys: [], lastSeenMessageId: 'one', conversationHistory: [] as Array<{ messageId: string; text: string }> }
   const first = `"Nine-fifteen, Tessa." Tessa holds the phone. "Mom, I heard you."`
   const second = `Tessa listens to the phone. "Mom, I said I'm coming." "I'm on Maple, Tessa."`
   const third = `Marisol arrives. Her daughter Tessa sees her. "Seven minutes."`
   updateGhostConversationHistory(ghost, 'one', first, ids)
   updateGhostConversationHistory(ghost, 'two', second, ids)
-  assert.deepEqual(ghost.conversationHistory.map(item => item.messageId), ['one', 'two'])
-  assert.match(ghost.conversationHistory[0].text, /Mom, I heard you/u)
+  updateGhostInteractivityTrail(ghost, 'one', 'They discuss the phone conversation about Maple and Tessa coming later.', ids)
+  updateGhostInteractivityTrail(ghost, 'two', 'The same phone conversation continues with Maple, Tessa and coming over.', ids)
+  updateGhostInteractivityTrail(ghost, 'three', 'The activity shifts from the phone call to walking toward the visit.', ids)
+  assert.deepEqual(ghost.interactivityTrail?.map(item => item.messageId), ['one', 'two', 'three'])
+  assert.ok(ghost.interactivityTrail?.every(item => item.anchors.length > 0))
+  assert.deepEqual(ghost.conversationHistory!.map(item => item.messageId), ['one', 'two'])
+  assert.match(ghost.conversationHistory![0].text, /Mom, I heard you/u)
   const labels = uncastIdentityLabels(first, [])
   assert.ok(labels.includes("tessa's mom"))
   const groups = collectUncastVoiceGroups([{ speakerId: 'unconfigured:marisol', text: 'Seven minutes.' }])
   const plan = buildUncastVoiceDecision(groups, [], third, [ghost])
   assert.match(plan.questions.identity_g0.instructions, /person they address/u)
-  assert.equal(plan.state.ghosts[0].conversationHistory[1].text, second)
+  assert.equal(plan.state.ghosts[0].conversationHistory![1].text, second)
   const assignment = resolveUncastVoiceDecisions(groups, [], { identity_g0: confidentDecision('ghost_0') }, [ghost], [], 'three', third, ids.slice(0, 2))
   assert.equal(assignment[0]?.voiceId, 'voice')
   assert.deepEqual(assignment[0]?.aliases, ['marisol'])
   updateGhostConversationHistory(ghost, 'three', third, ids)
   updateGhostConversationHistory(ghost, 'four', 'A later conversation.', ids)
   updateGhostConversationHistory(ghost, 'one', first, ids)
-  assert.deepEqual(ghost.conversationHistory.map(item => item.messageId), ['two', 'three', 'four'])
+  updateGhostInteractivityTrail(ghost, 'four', 'A later conversation about a visit and a train.', ids)
+  updateGhostInteractivityTrail(ghost, 'one', 'They discuss the phone conversation about Maple and Tessa coming later.', ids)
+  assert.deepEqual(ghost.conversationHistory!.map(item => item.messageId), ['two', 'three', 'four'])
+  assert.deepEqual(ghost.interactivityTrail?.map(item => item.messageId), ['one', 'two', 'three', 'four'])
   const reloaded = readGhostVoices([ghost])[0]
   assert.equal(reloaded.conversationHistory?.length, 3)
+  assert.equal(reloaded.interactivityTrail?.length, 4)
 })
 
 test('relationship review preserves caller identity, excludes future context, and routes to the existing ghost', () => {
@@ -3564,6 +3762,8 @@ test('relationship review preserves caller identity, excludes future context, an
   const context = relationshipReviewContext(messages, 'current', [ghost], 'tracker')
   assert.doesNotMatch(JSON.stringify(context), /secret prior|Marisol/u)
   assert.match(context.ghosts[0].conversationHistory[0].text, /Mom, are you there/u)
+  assert.deepEqual(context.previousMessages.map(item => item.role), ['assistant'])
+  assert.ok(context.previousMessages.every(item => item.anchors?.length))
   const speakers = [{ id: 'npc:tessa', name: 'Tessa' }, { id: USER_SPEAKER_ID, name: 'Ken' }]
   const plan = buildSpeakerDecisionPlan(messages[1].content, speakers, false)
   const answers = { speech_s0: confidentDecision('known_0'), speech_s1: confidentDecision('uncast_character') }
@@ -6797,4 +6997,116 @@ test('uses group message character IDs before ambiguous display names', () => {
     { id: 'second', name: 'Shared Name' },
   ], 20, null)
   assert.deepEqual(detected, [{ id: 'second', name: 'Shared Name', messageCount: 1 }])
+})
+
+test('REDUCTION_COMPONENTS registry: unique ids and mirrored full/disabled maps', () => {
+  const ids = REDUCTION_COMPONENTS.map(component => component.id)
+  assert.equal(new Set(ids).size, ids.length)
+  assert.deepEqual(FULL_REDUCTION_COMPONENTS, Object.fromEntries(REDUCTION_COMPONENTS.map(component => [component.id, true])))
+  assert.deepEqual(DISABLED_REDUCTION_COMPONENTS, Object.fromEntries(REDUCTION_COMPONENTS.map(component => [component.id, false])))
+  for (const component of REDUCTION_COMPONENTS) assert.equal(component.defaultValue, true)
+})
+
+test('readReductionComponents defaults to the full reduction and parses partial maps', () => {
+  assert.deepEqual(readReductionComponents(undefined), FULL_REDUCTION_COMPONENTS)
+  assert.deepEqual(readReductionComponents(null), FULL_REDUCTION_COMPONENTS)
+  assert.deepEqual(readReductionComponents('reduction'), FULL_REDUCTION_COMPONENTS)
+  assert.deepEqual(readReductionComponents([true]), FULL_REDUCTION_COMPONENTS)
+  assert.deepEqual(readReductionComponents({ scopedTtsState: false }), { ...FULL_REDUCTION_COMPONENTS, scopedTtsState: false })
+  assert.deepEqual(readReductionComponents({ scopedTtsState: 'yes', unknownComponent: true }), FULL_REDUCTION_COMPONENTS)
+  assert.deepEqual(readReductionComponents({ deferRelationshipReview: false, trimVoiceCriteria: true }), { ...FULL_REDUCTION_COMPONENTS, deferRelationshipReview: false, trimVoiceCriteria: true })
+})
+
+test('hasUncertainFirstPass is false for a clear single-speaker message', () => {
+  const content = 'Ruby closes the door. "I am staying."'
+  const speakers = [{ id: 'ruby', name: 'Ruby' }]
+  const plan = buildSpeakerDecisionPlan(content, speakers, false)
+  const ruby = decisionOption(plan, 'ruby')
+  assert.equal(hasUncertainFirstPass(plan, {
+    paragraph_p0: confidentDecision(ruby),
+    speech_s0: confidentDecision(ruby),
+  }), false)
+})
+
+test('hasUncertainFirstPass is true when a quotation is unresolved or a run escalates', () => {
+  const content = 'Ruby closes the door. "I am staying."'
+  const speakers = [{ id: 'ruby', name: 'Ruby' }]
+  const plan = buildSpeakerDecisionPlan(content, speakers, false)
+  const ruby = decisionOption(plan, 'ruby')
+  assert.equal(hasUncertainFirstPass(plan, {
+    paragraph_p0: confidentDecision(ruby),
+    speech_s0: confidentDecision('no_clear_identity'),
+  }), true)
+
+  const escalated = buildSpeakerDecisionPlan(CALL_AND_RESPONSE, CALL_AND_RESPONSE_SPEAKERS, false)
+  assert.equal(hasUncertainFirstPass(escalated, callAndResponseAnswers(escalated)), true)
+})
+
+test('hasUncertainFirstPass is false when there is nothing to review', () => {
+  const plan = buildSpeakerDecisionPlan('Only narration, no quotations.', [{ id: 'ruby', name: 'Ruby' }], false)
+  assert.equal(hasUncertainFirstPass(plan, {}), false)
+})
+
+test('buildTtsTagPlan scoped option bounds the narration sent to Jev', () => {
+  const longNarration = 'The loading dock groaned under the morning freight. '.repeat(30)
+  const content = `${longNarration}"Mind the crate," Halloran said.`
+  const speakers = [{ id: 'halloran', name: 'Halloran' }]
+  const plan = buildSpeakerDecisionPlan(content, speakers, false)
+  const scoped = buildTtsTagPlan(plan, undefined, undefined, 'gemini', false, 'all', {}, { scoped: true })
+  const unscoped = buildTtsTagPlan(plan, undefined, undefined, 'gemini', false, 'all', {}, { scoped: false })
+  const scopedSpeech = scoped.state.speeches[0]!
+  const unscopedSpeech = unscoped.state.speeches[0]!
+  assert.ok(unscopedSpeech.narrativeBefore.length > TTS_NARRATION_WINDOW)
+  assert.equal(scopedSpeech.narrativeBefore.length, TTS_NARRATION_WINDOW)
+  assert.ok(unscopedSpeech.narrativeBefore.endsWith(scopedSpeech.narrativeBefore))
+  assert.equal(scopedSpeech.narrativeAfter, unscopedSpeech.narrativeAfter)
+  assert.ok(measureJevDecisionPayload(scoped.state, scoped.questions).stateBytes
+    < measureJevDecisionPayload(unscoped.state, unscoped.questions).stateBytes)
+})
+
+test('buildTtsTagPlan terse option keeps criteria keys and shrinks the payload', () => {
+  const plan = buildSpeakerDecisionPlan(CALL_AND_RESPONSE, CALL_AND_RESPONSE_SPEAKERS, false)
+  const terse = buildTtsTagPlan(plan, undefined, undefined, 'fish', true, 'all', {}, { terse: true })
+  const full = buildTtsTagPlan(plan, undefined, undefined, 'fish', true, 'all')
+  assert.deepEqual(Object.keys(terse.questions), Object.keys(full.questions))
+  for (const [id, question] of Object.entries(terse.questions)) {
+    assert.deepEqual(Object.keys(question.criteria), Object.keys(full.questions[id]!.criteria), id)
+  }
+  const criteriaBytes = (questions: typeof terse.questions) =>
+    Object.values(questions).reduce((sum, question) => sum + JSON.stringify(question.criteria).length, 0)
+  const terseBytes = criteriaBytes(terse.questions)
+  const fullBytes = criteriaBytes(full.questions)
+  assert.ok(terseBytes < fullBytes, `terse criteria should serialize smaller: ${terseBytes} >= ${fullBytes}`)
+})
+
+test('voiceDecisionSummaryTerse drops descriptions and their tag-support hints', () => {
+  const summary = voiceDecisionSummaryTerse({ id: 'v1', name: 'Nova', category: 'character', description: 'Warm and bright', tags: ['Young', 'warm'], languages: ['en'] })
+  assert.equal(summary, 'Nova; character; languages: en; tags: young, warm')
+  assert.ok(!summary.includes('description'))
+  assert.equal(voiceDecisionSummaryTerse({ id: 'v2', name: '', category: '', description: 'Only description' }), 'No details provided.')
+})
+
+test('buildUncastVoiceDecision trimVoiceCriteria caps the shortlist and drops descriptions', () => {
+  const groups = [{
+    id: 'g1',
+    speakerId: UNCAST_SPEAKER_ID,
+    speeches: ['"A quiet morning."'],
+    segmentIndexes: [0],
+    context: [],
+  }]
+  const voices = Array.from({ length: 40 }, (_, index) => ({
+    id: `voice-${index}`,
+    name: `Voice ${index}`,
+    category: 'character',
+    description: `Warm and bright voice ${index}`,
+    tags: ['warm'],
+    languages: ['en'],
+  }))
+  const trimmed = buildUncastVoiceDecision(groups, voices, 'A quiet morning.', [], [], true)
+  assert.equal(Object.keys(trimmed.questions.voice_g1!.criteria).length, 16)
+  assert.ok(Object.values(trimmed.questions.voice_g1!.criteria).every(value => !value.includes('description')))
+  assert.ok(!trimmed.questions.voice_g1!.instructions.includes('description supports'))
+  const control = buildUncastVoiceDecision(groups, voices, 'A quiet morning.', [], [], false)
+  assert.equal(Object.keys(control.questions.voice_g1!.criteria).length, 32)
+  assert.ok(Object.values(control.questions.voice_g1!.criteria).some(value => value.includes('description')))
 })

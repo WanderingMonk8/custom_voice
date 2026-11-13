@@ -6,6 +6,69 @@ export function standardSpeakerReviewPolicy() {
   return { runReview: true, bestAvailableSpeaker: true, shadowEvaluation: false, focusedOpeningFallback: false } as const
 }
 
+/** Every component of the token-reduction implementation that can be toggled independently. */
+export const REDUCTION_COMPONENTS = [
+  {
+    id: 'scopedTtsState',
+    phase: 'Phase 1',
+    label: 'Scope TTS tag state to the target speech',
+    hint: 'Send only the target quotation and its local neighbours to Jev for tag selection, not the full message.',
+    defaultValue: true,
+  },
+  {
+    id: 'twoPhaseTagReview',
+    phase: 'Phase 1',
+    label: 'Two-phase (primary/secondary) tag questions',
+    hint: 'Primary pass asks primary questions first; secondary questions are asked only when the first pass establishes a need for them.',
+    defaultValue: true,
+  },
+  {
+    id: 'dedupTagCriteria',
+    phase: 'Phase 1',
+    label: 'Deduplicate tag criteria',
+    hint: 'Share terse criteria blocks across emotion/style/sound/pause questions instead of expanding full descriptions per question.',
+    defaultValue: true,
+  },
+  {
+    id: 'gatedAuxReviews',
+    phase: 'Phase 2',
+    label: 'Gate auxiliary speaker reviews on triggers',
+    hint: 'Best-available guess, self-introduction, speaker-switch and focused opening reviews run only when a trigger is present, not always.',
+    defaultValue: true,
+  },
+  {
+    id: 'deferRelationshipReview',
+    phase: 'Phase 2',
+    label: 'Defer the global relationship review until a trigger fires',
+    hint: 'Skip the whole relationship review when no known trigger is established (no unresolved turn, no boundary, no alternate speaker switch); otherwise it runs as today.',
+    defaultValue: true,
+  },
+  {
+    id: 'trimVoiceCriteria',
+    phase: 'Phase 2',
+    label: 'Condense uncast voice ranking criteria',
+    hint: 'Drop the description fields from the voice ranking criteria (use name, category, languages and tags only) and keep the shortlist small.',
+    defaultValue: true,
+  },
+] as const
+export type ReductionComponentId = typeof REDUCTION_COMPONENTS[number]['id']
+export type ReductionComponentMap = Record<ReductionComponentId, boolean>
+export const REDUCTION_COMPONENT_IDS: readonly ReductionComponentId[] = REDUCTION_COMPONENTS.map(component => component.id)
+export const FULL_REDUCTION_COMPONENTS: ReductionComponentMap = Object.fromEntries(REDUCTION_COMPONENTS.map(component => [component.id, component.defaultValue])) as ReductionComponentMap
+export const DISABLED_REDUCTION_COMPONENTS: ReductionComponentMap = Object.fromEntries(REDUCTION_COMPONENTS.map(component => [component.id, false])) as ReductionComponentMap
+/** Parse raw settings JSON into a full, valid component map. Missing or unknown ids default to the full-reduction value. */
+export function readReductionComponents(value: unknown): ReductionComponentMap {
+  const full = FULL_REDUCTION_COMPONENTS
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return { ...full }
+  const row = value as Record<string, unknown>
+  const next = { ...full } as ReductionComponentMap
+  for (const component of REDUCTION_COMPONENTS) {
+    const raw = row[component.id]
+    if (typeof raw === 'boolean') next[component.id] = raw
+  }
+  return next
+}
+
 export interface AutoplayGeneration { chatId: string; messageId: string; generationId: string; reroll?: boolean; content?: string }
 
 /** Accept successful foreground new messages and rerolls in the active chat. */
@@ -146,6 +209,14 @@ export function voiceGender(voice: { category: string; tags?: readonly string[];
   return 'unknown'
 }
 
+/** Make the resolved gender visible as the actual sex tag instead of leaving it only in fields. */
+export function ensureFavoriteGenderTag(voice: FavoriteVoice): FavoriteVoice {
+  const gender = voiceGender(voice)
+  if (gender === 'unknown') return voice
+  const tags = [...new Set((voice.tags ?? []).map(tag => tag.trim().toLowerCase()).filter(tag => tag && tag !== 'male' && tag !== 'female'))]
+  return { ...voice, gender, tags: [gender, ...tags].slice(0, 32) }
+}
+
 /** Age hint for a stored favorite, read from its tags. */
 export function voiceAge(voice: { tags?: readonly string[] }): 'young' | 'middle aged' | 'old' | 'unknown' {
   for (const tag of voice.tags ?? []) {
@@ -173,7 +244,7 @@ export function readFavoriteVoices(value: unknown): FavoriteVoice[] {
     const id = row.id.trim().slice(0, 512)
     if (!id || seen.has(id)) continue
     seen.add(id)
-    result.push({
+    result.push(ensureFavoriteGenderTag({
       id,
       name: typeof row.name === 'string' ? row.name.trim().slice(0, 128) : '',
       category: typeof row.category === 'string' && row.category.trim()
@@ -190,7 +261,7 @@ export function readFavoriteVoices(value: unknown): FavoriteVoice[] {
       ...(Array.isArray(row.languages)
         ? { languages: row.languages.filter((value): value is string => typeof value === 'string').map(value => value.trim().slice(0, 32)).filter(Boolean).slice(0, 8) }
         : {}),
-    })
+    }))
   }
   return result
 }
@@ -322,7 +393,7 @@ export function readCommunityVoicePool(value: unknown): FavoriteVoice[] {
 /** Import a community voice into the user's favorites with its metadata preserved. */
 export function communityVoiceToFavorite(voice: CommunityVoice): FavoriteVoice {
   const gender = ['male', 'female'].find(tag => voice.tags.some(item => item.toLowerCase() === tag)) as 'male' | 'female' | undefined
-  return {
+  return ensureFavoriteGenderTag({
     id: voice.id,
     name: voice.title,
     category: voice.category || (gender ?? 'unspecified'),
@@ -333,7 +404,7 @@ export function communityVoiceToFavorite(voice: CommunityVoice): FavoriteVoice {
     communityLink: voice.communityLink,
     ...(voice.tags.length ? { tags: voice.tags } : {}),
     ...(voice.languages.length ? { languages: voice.languages } : {}),
-  }
+  })
 }
 
 /** Add or update a favorite from the community catalog so imports are idempotent. */
@@ -354,12 +425,13 @@ export function addFavoriteVoice(existing: FavoriteVoice[], voice: FavoriteVoice
   if (!id) throw new Error('Enter a voice ID to add a favorite.')
   if (existing.some(item => item.id === id)) throw new Error('That voice ID is already a favorite.')
   if (existing.length >= 500) throw new Error('The favorites list is limited to 500 voices.')
-  return [...existing, { ...voice, id }]
+  return [...existing, { ...ensureFavoriteGenderTag(voice), id }]
 }
 
-export interface UncastVoiceGroup { id: string; speakerId: string; segmentIndexes: number[]; speeches: string[]; context: string[]; addressee?: string; flankPartners?: string[]; pronounPartners?: string[]; pronounGender?: 'male' | 'female'; narratedName?: string; inferredName?: string }
+export interface UncastVoiceGroup { id: string; speakerId: string; segmentIndexes: number[]; speeches: string[]; context: string[]; addressee?: string; flankPartners?: string[]; pronounPartners?: string[]; pronounGender?: 'male' | 'female'; anchorStrong?: boolean; narratedName?: string; inferredName?: string }
 export interface GhostOccurrenceEvidence { messageId: string; messageHash: string; speechHash: string; version: 'occurrence-1'; reason: string }
-export interface GhostVoice { id: string; speakerId: string; voiceId: string; context: string; occurrenceKeys: string[]; lastSeenMessageId: string; label?: string; createdAtMessageId?: string; lastInvokedAtMessageId?: string; invokedMessageIds?: string[]; aliases?: string[]; conversationHistory?: Array<{ messageId: string; text: string }>; occurrenceEvidence?: GhostOccurrenceEvidence[] }
+export interface GhostInteractivitySample { [key: string]: string | string[]; messageId: string; anchors: string[] }
+export interface GhostVoice { id: string; speakerId: string; voiceId: string; context: string; occurrenceKeys: string[]; lastSeenMessageId: string; label?: string; createdAtMessageId?: string; lastInvokedAtMessageId?: string; invokedMessageIds?: string[]; aliases?: string[]; conversationHistory?: Array<{ messageId: string; text: string }>; occurrenceEvidence?: GhostOccurrenceEvidence[]; interactivityTrail?: GhostInteractivitySample[] }
 export const GHOST_VOICE_LIFETIME_MESSAGES = 10
 
 export function readGhostVoices(value: unknown): GhostVoice[] {
@@ -387,6 +459,14 @@ export function readGhostVoices(value: unknown): GhostVoice[] {
         return typeof item.messageId === 'string' && typeof item.text === 'string' && item.messageId && item.text
           ? [{ messageId: item.messageId.slice(0, 256), text: item.text.slice(0, 6_000) }] : []
       }).slice(-3) : [],
+      interactivityTrail: Array.isArray(row.interactivityTrail) ? row.interactivityTrail.flatMap(entry => {
+        if (!entry || typeof entry !== 'object') return []
+        const item = entry as Record<string, unknown>
+        const anchors = Array.isArray(item.anchors)
+          ? [...new Set(item.anchors.filter((anchor): anchor is string => typeof anchor === 'string').map(anchor => anchor.trim().toLowerCase().slice(0, 128)).filter(Boolean))].slice(0, 12)
+          : []
+        return typeof item.messageId === 'string' && item.messageId && anchors.length ? [{ messageId: item.messageId.slice(0, 256), anchors }] : []
+      }).slice(-12) : [],
       ...(typeof row.createdAtMessageId === 'string' && row.createdAtMessageId ? { createdAtMessageId: row.createdAtMessageId } : {}),
       ...(typeof row.lastInvokedAtMessageId === 'string' && row.lastInvokedAtMessageId ? { lastInvokedAtMessageId: row.lastInvokedAtMessageId } : {}) }]
   })
@@ -408,6 +488,16 @@ export function updateGhostConversationHistory(ghost: GhostVoice, messageId: str
   entries.push({ messageId, text })
   entries.sort((a, b) => assistantMessageIds.indexOf(a.messageId) - assistantMessageIds.indexOf(b.messageId))
   ghost.conversationHistory = entries.slice(-3)
+}
+
+/** Keep a bounded trajectory of evolving activity/topic anchors for the ghost. */
+export function updateGhostInteractivityTrail(ghost: GhostVoice, messageId: string, message: string, assistantMessageIds: readonly string[]): void {
+  const anchors = interactionAnchors(message, 12)
+  if (!messageId || !anchors.length) return
+  const entries = (ghost.interactivityTrail ?? []).filter(item => item.messageId !== messageId)
+  entries.push({ messageId: messageId.slice(0, 256), anchors })
+  entries.sort((a, b) => assistantMessageIds.indexOf(a.messageId) - assistantMessageIds.indexOf(b.messageId))
+  ghost.interactivityTrail = entries.slice(-12)
 }
 
 /** Keep only unique, complete aliases within the regular cast name limit. */
@@ -498,7 +588,9 @@ export function narrationFirstPronounClass(text: string): 'male' | 'female' | nu
  * the chain is interrupted by an explicit new character ("another man
  * came…") or a contrary pronoun. Speech does not count.
  */
-export function backwardNarrationPronounGender(segments: PlaybackSegment[], fromIndex: number): 'male' | 'female' | null {
+export interface UncastAnchorGender { gender: 'male' | 'female'; /** True when anchored by an introduction-style noun ("the guy came in…"), not a bare pronoun class. */ strong: boolean }
+
+export function backwardNarrationAnchorGender(segments: PlaybackSegment[], fromIndex: number): UncastAnchorGender | null {
   const castNames = new Set<string>()
   for (const segment of segments) {
     const id = segment.speakerId
@@ -529,7 +621,7 @@ export function backwardNarrationPronounGender(segments: PlaybackSegment[], from
       if (mentionsCastCharacter(text)) continue
       if (/(^|[.!?]\s+)(another|second|third|other)\s+(man|woman|girl|boy|lady|guy)\b/iu.test(text)) return null
       const introduction = text.match(/(?:^|[.!?]\s+)(?:a|an|the|one)\s+(man|woman|girl|boy|lady|guy)(?:\s+\w+){0,2}?\s+(?:came|entered|arrived|appeared|walked in|stepped in|strode in|drew close)\b/iu)
-      if (introduction) return labelGenderHint(`the ${introduction[1]}`)
+      if (introduction) { const gender = labelGenderHint(`the ${introduction[1]}`); if (gender) return { gender, strong: true } }
       // A paragraph that opens on a gendered person ("The guy stops…",
       // "A tall woman turns…") describes that person even though the
       // sentence has no leading pronoun. Without this, the scan skips the
@@ -537,12 +629,23 @@ export function backwardNarrationPronounGender(segments: PlaybackSegment[], from
       // somebody else.
       const lead = text.trimStart().match(/^(?:the|a|an)\s+(?:(?:young|younger|old|older|elderly|middle-aged|tall|short|thin|heavy|bald|bearded|blond|blonde|brunette)\s+)*([a-z-]+)\b/iu)
       const leadHint = lead ? labelGenderHint(lead[1]) : null
-      if (leadHint) return leadHint
+      if (leadHint) return { gender: leadHint, strong: true }
       const klass = narrationFirstPronounClass(text)
-      if (klass) return klass
+      if (klass) return { gender: klass, strong: false }
     }
   }
   return null
+}
+
+export function backwardNarrationPronounGender(segments: PlaybackSegment[], fromIndex: number): 'male' | 'female' | null {
+  return backwardNarrationAnchorGender(segments, fromIndex)?.gender ?? null
+}
+
+const NEW_UNCAST_VOICE_CUE_PATTERN = /(?:\b(?:a|an|another)\s+(?:new|different|other|second|third|next)\s+(?:voice|speaker)\b|\bthe\s+other\s+(?:voice|speaker)\b|\bsomeone else\s+(?:answers|answer|says|speaks|replies|responds)\b)/iu
+
+/** Explicit announcements that a new or different uncast person started speaking. */
+export function hasNewAnonymousVoiceCue(text: string): boolean {
+  return NEW_UNCAST_VOICE_CUE_PATTERN.test(narrativeOnly(text))
 }
 
 export function collectUncastVoiceGroups(segments: PlaybackSegment[]): UncastVoiceGroup[] {
@@ -560,6 +663,9 @@ export function collectUncastVoiceGroups(segments: PlaybackSegment[]): UncastVoi
     // A substantial intervening narrative can introduce a different uncast
     // speaker even without an intervening cast quotation. Review each side.
     if (id === UNCAST_SPEAKER_ID && segments[index - 1]?.speakerId === null && segments[index - 1].text.length > 240) anonymous = null
+    // An explicit announcement of a different voice is not just evidence for
+    // attribution; it cannot belong to the same uninterrupted anonymous run.
+    if (id === UNCAST_SPEAKER_ID && segments[index - 1]?.speakerId === null && hasNewAnonymousVoiceCue(segments[index - 1].text)) anonymous = null
     // Named actions and adjacent replies can signal a change of speaker.
     // Split for review; the action alone does not identify the quotation.
     // Dashed appositives (the man — Ellis —) are context candidates for
@@ -632,16 +738,21 @@ export function collectUncastVoiceGroups(segments: PlaybackSegment[]): UncastVoi
     .filter(group => group.speakerId === UNCAST_SPEAKER_ID)
     .sort((a, b) => Math.min(...a.segmentIndexes) - Math.min(...b.segmentIndexes))
   for (const group of unnamedInOrder) {
-    group.pronounGender = backwardNarrationPronounGender(segments, Math.min(...group.segmentIndexes)) ?? undefined
+    const anchor = backwardNarrationAnchorGender(segments, Math.min(...group.segmentIndexes))
+    group.pronounGender = anchor?.gender
+    group.anchorStrong = anchor?.strong
   }
   for (let index = 1; index < unnamedInOrder.length; index += 1) {
     const previous = unnamedInOrder[index - 1]
     const group = unnamedInOrder[index]
     const gender = group.pronounGender
     if (!gender || gender !== previous.pronounGender) {
-      // A fragment that does not join the chain keeps no pronoun credit:
-      // its narration may describe somebody else (e.g. a cast speaker).
-      group.pronounGender = undefined
+      // A fragment whose narration does not inherit the same gendered
+      // chain is not linked, but its own paragraph class is still evidence
+      // the voice-pool decision must weigh (deterministic anchors outvote
+      // a misread chain, or expose the disagreement for Jev to resolve);
+      // clearing it here erased anchors such as "the guy in the
+      // windbreaker says".
       continue
     }
     previous.pronounPartners = [...(previous.pronounPartners ?? []), group.id]
@@ -1008,16 +1119,53 @@ export function voiceDecisionSummary(voice: FavoriteVoice): string {
   return parts.join('; ') || 'No details provided.'
 }
 
+/** Terse variant used by the token-reduction "trimVoiceCriteria" component: drops the description
+ * and its tag-support hints entirely (sparse metadata must not count against a voice). */
+export function voiceDecisionSummaryTerse(voice: FavoriteVoice): string {
+  const tags = [...new Set((voice.tags ?? []).map(tag => tag.trim().toLowerCase()).filter(Boolean))]
+  const languages = [...new Set((voice.languages ?? []).map(code => code.trim().toLowerCase()).filter(Boolean))]
+  const parts = [voice.name, voice.category].map(part => (part ?? '').replace(/\s+/gu, ' ').trim()).filter(Boolean)
+  if (languages.length) parts.push(`languages: ${languages.join(', ')}`)
+  if (tags.length) parts.push(`tags: ${tags.join(', ')}`)
+  return parts.join('; ') || 'No details provided.'
+}
+
 /** One decision call classifies each uncast group and ranks the available voice descriptions. */
-export function buildUncastVoiceDecision(groups: UncastVoiceGroup[], voices: FavoriteVoice[], message: string, ghosts: GhostVoice[] = [], previousMessages: RelationshipReviewContext['previousMessages'] = []) {
+export function buildUncastVoiceDecision(groups: UncastVoiceGroup[], voices: FavoriteVoice[], message: string, ghosts: GhostVoice[] = [], previousMessages: RelationshipReviewContext['previousMessages'] = [], trimCriteria = false) {
   const labels = uncastIdentityLabels(message, ghosts)
   const narrativeNames = uncastNarrativeNameCandidates(message)
   const state = {
     message,
     previousMessages,
     narrativeNames,
-    characters: groups.map(group => ({ id: group.id, identity: group.speakerId, speeches: group.speeches, context: group.context })),
-    ghosts: ghosts.map((ghost, index) => ({ option: `ghost_${index}`, identity: ghost.speakerId, label: ghost.label || null, aliases: ghostCastAliases(ghost), priorMessageIds: ghostPriorMessageIds(ghost, previousMessages), context: ghost.context, conversationHistory: ghost.conversationHistory ?? [] })),
+    characters: groups.map(group => ({
+      id: group.id,
+      identity: group.speakerId,
+      speeches: group.speeches,
+      context: group.context,
+      anchors: interactionAnchors([...group.speeches, ...group.context].join(' ')),
+      appearance: appearanceAnchors([...group.speeches, ...group.context].join(' ')),
+      ...(group.addressee ? { addressee: group.addressee } : {}),
+      ...(group.flankPartners ? { flankPartners: group.flankPartners } : {}),
+      ...(group.pronounPartners ? { pronounPartners: group.pronounPartners } : {}),
+      ...(group.pronounGender ? { pronounGender: group.pronounGender } : {}),
+      ...(group.inferredName ? { inferredName: group.inferredName } : {}),
+    })),
+    ghosts: ghosts.map((ghost, index) => {
+      const history = ghost.conversationHistory?.flatMap(entry => [entry.text]) ?? []
+      return {
+        option: `ghost_${index}`,
+        identity: ghost.speakerId,
+        label: ghost.label || null,
+        aliases: ghostCastAliases(ghost),
+        priorMessageIds: ghostPriorMessageIds(ghost, previousMessages),
+        context: ghost.context,
+        conversationHistory: ghost.conversationHistory ?? [],
+        anchors: interactionAnchors([ghost.context, ...history].join(' ')),
+        appearance: appearanceAnchors([ghost.context, ...history].join(' ')),
+        ...(ghost.interactivityTrail?.length ? { interactivityTrail: ghost.interactivityTrail.slice(-4) } : {}),
+      }
+    }),
     voices: voices.map((voice, index) => ({ option: `voice_${index}`, name: voice.name })),
   }
   // Deterministic gender hints prefer what the narration says about the
@@ -1025,12 +1173,13 @@ export function buildUncastVoiceDecision(groups: UncastVoiceGroup[], voices: Fav
   // are the strongest candidates. The shortlist keeps each ranking
   // question small enough for the decision gateway while preserving the
   // original voice indexes for probability lookup.
+  const voiceSummary = trimCriteria ? voiceDecisionSummaryTerse : voiceDecisionSummary
   const voiceOptionsFor = (group: UncastVoiceGroup): Array<{ index: number; voice: FavoriteVoice }> => {
     const hint = group.pronounGender && (group.pronounGender === 'male' || group.pronounGender === 'female') ? group.pronounGender : 'unknown'
     return voices
       .map((voice, index) => ({ index, voice }))
       .filter(({ voice }) => hint === 'unknown' || voiceGenderCompatible(voice, hint))
-      .slice(0, 32)
+      .slice(0, trimCriteria ? 16 : 32)
   }
   const questions: Record<string, { type: 'choice'; instructions: string; criteria: Record<string, string> }> = {}
   for (const group of groups) {
@@ -1050,9 +1199,9 @@ export function buildUncastVoiceDecision(groups: UncastVoiceGroup[], voices: Fav
     }
     const earlier = groups.slice(0, groups.indexOf(group))
     if (ghosts.length || earlier.length) questions[`identity_${group.id}`] = {
-      type: 'choice', instructions: `Does character ${group.id} clearly represent the same individual as one prior character? Compare the current exchange with previousMessages and the prior character's own conversation history. Trace distinctive objects or workstations, physical location, actions, conversation topic, who addresses whom, and continuing relationships, including across user messages. Several agreeing details can identify someone when their name is revealed later. A shared object, setting, gender, occupation, or voice alone is insufficient; check for multiple people, scene changes, interruptions, and names that identify an addressee or bystander rather than the speaker. Do not confuse the speaker with the person they address. Select new_or_unclear unless identity is clear.`,
+      type: 'choice', instructions: `Does character ${group.id} clearly represent the same individual as one prior character? Compare the CURRENT exchange with previousMessages and the prior character's own conversation history. Use topic, activity, actions, objects, physical location, actors, addressees and continuing pair relationships as intra-message and inter-message anchors. Appearance anchors (state.characters[].appearance and state.ghosts[].appearance) — e.g. "denim overalls", "faded grey soccer hoodie" — pin down a specific person; unlike shared nouns such as "the girl" or "the guy", distinct appearance descriptions signal different individuals, and matching appearance anchors support continuity. Explicit narration that announces another, new, or a second/different voice marks a potentially different participant, not a stylistic quirk; honor that boundary unless the surrounding evidence clearly shows continuity. Activities and conversation topics can evolve over time; use anchors and interactivityTrail as a sequence to trace that evolution rather than requiring identical phrasing or a static topic. Compare who acts with whom, who receives the action, and who addresses whom before and after the target speech. Several agreeing anchors can identify someone when their name is revealed later. A shared object, setting, gender, occupation, topic or voice alone is insufficient; check for multiple people, scene changes, interruptions, and names that identify an addressee or bystander rather than the speaker. Do not confuse the speaker with the person they address. Select new_or_unclear unless identity is clear.`,
       criteria: { new_or_unclear: 'A new character, or identity cannot be reliably established.',
-        ...Object.fromEntries(ghosts.map((ghost, index) => [`ghost_${index}`, `Previously seen character ${ghostCastAliases(ghost).join(" / ") || ghost.speakerId}; context: ${ghost.context}`])),
+        ...Object.fromEntries(ghosts.map((ghost, index) => [`ghost_${index}`, `Previously seen character ${ghostCastAliases(ghost).join(" / ") || ghost.speakerId}; see state.ghosts[${index}] for its context and history`])),
         ...Object.fromEntries(earlier.map(previous => [`group_${previous.id}`, `Earlier character ${previous.id}; context: ${previous.context.join(' ').slice(0, 2_000)}`])) },
     }
     for (const previous of earlier.slice(-8)) {
@@ -1064,9 +1213,12 @@ export function buildUncastVoiceDecision(groups: UncastVoiceGroup[], voices: Fav
     }
     if (!voices.length) continue
     const options = voiceOptionsFor(group)
+    const rankingInstructions = trimCriteria
+      ? `Rank the available voices for the person who actually speaks the quoted dialogue in ${group.id}. Narration-only bystanders and people merely addressed are not speakers. Use the full scene as context, including other character groups only when clearly the same speaker. Score voices by metadata cues, not prose length: name is weak context, category and languages contribute one compatibility cue in aggregate, and each explicit tag is one cue. Missing fields are not a reason to rank a voice lower. Select the best available voice.`
+      : `Rank the available voices for the person who actually speaks the quoted dialogue in ${group.id}. Narration-only bystanders and people merely addressed are not speakers. Use the full scene as context, including other character groups only when clearly the same speaker. Score voices by metadata cues, not prose length: name is weak context, category and languages contribute one compatibility cue in aggregate, each explicit tag is one cue, and each tag listed in "description supports" is one cue. The description is evidence for those tags, not an extra vote, and support for an explicit tag counts once rather than twice. Balance tags against that description evidence instead of letting a long description outweigh otherwise better matches. Missing fields are not a reason to rank a voice lower. Select the best available voice.`
     questions[`voice_${group.id}`] = {
-      type: 'choice', instructions: `Rank the available voices for the person who actually speaks the quoted dialogue in ${group.id}. Narration-only bystanders and people merely addressed are not speakers. Use the full scene as context, including other character groups only when clearly the same speaker. Score voices by metadata cues, not prose length: name is weak context, category and languages contribute one compatibility cue in aggregate, each explicit tag is one cue, and each tag listed in "description supports" is one cue. The description is evidence for those tags, not an extra vote, and support for an explicit tag counts once rather than twice. Balance tags against that description evidence instead of letting a long description outweigh otherwise better matches. Missing fields are not a reason to rank a voice lower. Select the best available voice.`,
-      criteria: { ...Object.fromEntries(options.map(({ index, voice }) => [`voice_${index}`, voiceDecisionSummary(voice)])), ...(options.length === 1 ? { no_match: 'No suitable voice is available.' } : {}) },
+      type: 'choice', instructions: rankingInstructions,
+      criteria: { ...Object.fromEntries(options.map(({ index, voice }) => [`voice_${index}`, voiceSummary(voice)])), ...(options.length === 1 ? { no_match: 'No suitable voice is available.' } : {}) },
     }
   }
   return { state, questions }
@@ -1132,7 +1284,7 @@ export function buildUncastIdentityReview(groups: UncastVoiceGroup[], answers: R
       && (probability < 0.8 || identity.confidence < 0.8 || probability - runnerUp < 0.25)) {
       questions[`review_ghost_${group.id}_${ghostChoice![1]}`] = {
         type: 'choice',
-        instructions: `Compare the speaker in current group ${group.id} with the previously seen character ${candidate.label || candidate.speakerId}. Read the prior character's conversation history and the full current scene, including other participants? dialogue, relationship clues, and continuity from phone to in-person. Confirm only if they are the same person; distinguish callers, people addressed, and people merely mentioned.`,
+        instructions: `Compare the speaker in current group ${group.id} with the previously seen character ${candidate.label || candidate.speakerId}. Read the prior character's conversation history, interactivityTrail, and the full current scene, including other participants' dialogue, evolving topic, activity, actor/addressee pairs and anchors. Appearance anchors (state.characters[].appearance and state.ghosts[].appearance) identify distinct physical forms of the speaker; unmatched appearance anchors are strong evidence of different individuals, even when both share a generic descriptor like "the girl" or "the guy", and matching anchors strongly support continuity. Activities and conversation topics can evolve over time, so recognize related shifts instead of demanding identical wording. Confirm only if they are the same person; distinguish callers, people addressed, and people merely mentioned.`,
         criteria: { same: 'The prior character and current speaker are clearly the same person.', different_or_unclear: 'They differ or the evidence is insufficient.' },
       }
     }
@@ -1155,7 +1307,7 @@ export function buildUncastIdentityReview(groups: UncastVoiceGroup[], answers: R
         if (interveningUser && linkedToPrior) {
           questions[`review_continuity_${group.id}_${ghostIndex}`] = {
             type: 'choice',
-            instructions: `Compare ghost_${ghostIndex}'s actual speech in the immediately preceding assistant message with the intervening user message and current group ${group.id}, now identified as ${revealedName}. The user may address the earlier speaker and the current dialogue may directly answer that user's question: follow the conversation and narrative actions across all three messages. Do not assume every speaker in the earlier message is this ghost, or that the same setting alone proves identity. Is this clearly the same person, clearly a different person, or genuinely uncertain?`,
+            instructions: `Compare ghost_${ghostIndex}'s actual speech in the immediately preceding assistant message with the intervening user message and current group ${group.id}, now identified as ${revealedName}. The user may address the earlier speaker and the current dialogue may directly answer that user's question: follow the conversation and narrative actions across all three messages. Do not assume every speaker in the earlier message is this ghost, or that the same setting alone proves identity. Appearance anchors (state.ghosts[].appearance and state.characters[].appearance) describe each character's physical form; unmatched appearance anchors are strong evidence of different people. Is this clearly the same person, clearly a different person, or genuinely uncertain?`,
             criteria: { same: 'The conversation and scene clearly identify the same person.', different: 'The evidence clearly establishes different people.', unclear: 'There is not enough evidence to decide.' },
           }
           if (Object.keys(questions).length >= 16) break
@@ -1169,7 +1321,7 @@ export function buildUncastIdentityReview(groups: UncastVoiceGroup[], answers: R
         if (previousMessages.length && ghost.conversationHistory?.length && Object.keys(questions).length < 16) {
           questions[`review_scene_${group.id}_${ghostIndex}`] = {
             type: 'choice',
-            instructions: `Re-read previousMessages, ghost_${ghostIndex}'s own saved conversation history, and the CURRENT exchange. Has the previously unnamed person who spoke in that history now been identified as ${revealedName}, the actual speaker of ${group.id}? Trace who speaks to whom, a continuing conversation, distinctive objects or workstations and their location, associated actions and later naming. Use several agreeing clues together, including intervening user messages. A shared setting, object, profession, or gender alone does not prove identity. Consider multiple people, a new arrival or scene change, and whether the name belongs to an addressee or bystander. Select different_or_unclear when these details do not clearly establish the same individual.`,
+            instructions: `Re-read previousMessages, ghost_${ghostIndex}'s own saved conversation history, interactivityTrail, appearance anchors, and the CURRENT exchange. Has the previously unnamed person who spoke in that history now been identified as ${revealedName}, the actual speaker of ${group.id}? Trace who speaks to whom, the continuing or evolving conversation, topic/activity anchors, objects and workstations and their locations, associated actions, actor/addressee pairings and later naming. Activities and topics can evolve, so use the sequence rather than identical phrasing. Use several agreeing clues together, including intervening user messages. A shared setting, object, profession, gender, appearance match, topic or voice alone does not prove identity. Consider multiple people, a new arrival or scene change, and whether the name belongs to an addressee or bystander. Select different_or_unclear when these details do not clearly establish the same individual.`,
             criteria: { same: 'The earlier unnamed character and the newly named speaker are clearly the same individual.', different_or_unclear: 'Different individuals, or continuity is not clearly established.' },
           }
         }
@@ -1258,7 +1410,10 @@ export function resolveUncastVoiceDecisions(
   ghosts: GhostVoice[] = [], reserved: readonly string[] = [], messageId = '', message = '', previousMessageIds: readonly string[] = [],
   random: () => number = Math.random,
 ): UncastVoiceAssignment[] {
-  const used = new Set<string>(reserved.filter(Boolean))
+  // Voices held by live ghosts stay reserved for their owners; Jev's shortlist
+  // must not reassign one to a new character (the reservation recheck would
+  // then silently drop the assignment and fall back to the default voice).
+  const used = new Set<string>([...reserved.filter(Boolean), ...ghosts.map(it => it.voiceId).filter(Boolean)])
   const assignments: UncastVoiceAssignment[] = []
   const roots = new Map<string, string>()
   const linkedGhosts = new Map<string, GhostVoice>()
@@ -1462,19 +1617,35 @@ export function resolveUncastVoiceDecisions(
     const labelHint = labelGenderHint(ghost?.label || members.map(group => groupLabels.get(group.id)).find(Boolean) || '')
     const pronounHint = members.find(member => member.pronounGender && member.pronounPartners?.length)?.pronounGender
     let gender: 'male' | 'female' | 'unknown' = jevGender !== 'unknown' ? jevGender : labelHint || pronounHint || 'unknown'
-    // The narration's own pronoun class shaped the voice shortlist, so it
-    // defines the compatible pool even when Jev's gender answer disagrees.
-    // A Jev gender only decides the pool when narration left none.
-    const rankingHint = members.find(member => member.pronounGender === 'male' || member.pronounGender === 'female')?.pronounGender
+    // Intro-grammar anchors ("The guy stops…") carry the speaker's deterministic
+    // sex, so a uniform strong anchor wins over a disagreeing Jev answer. A
+    // soft chain that inherited a cast-adjacent paragraph ("She gets the
+    // confession out…") cannot narrow the pool; mixed strong anchors defer
+    // to Jev too.
+    const strongHints = members
+      .map(member => (member.pronounGender && member.anchorStrong ? member.pronounGender : undefined))
+      .filter((hint): hint is 'male' | 'female' => hint === 'male' || hint === 'female')
+    const uniformStrong = strongHints.length && strongHints.every(hint => hint === strongHints[0]) ? strongHints[0] : undefined
+    // The pool Jev's shortlist and the assignment sex both use.
+    gender = uniformStrong ?? gender
+    const existingGhost = ghost
+    if (existingGhost) {
+      const carriedVoice = voices.find(voice => voice.id === existingGhost.voiceId)
+      // A stored voice from an earlier generation must not override the now-known
+      // sex of the speaker if metadata identifies it as the wrong sex.
+      if (carriedVoice && !voiceGenderCompatible(carriedVoice, gender)) {
+        ghost = undefined
+        linkedGhosts.delete(root)
+        linkReasons.delete(root)
+      }
+    }
     if (!ghost) {
       const matches = members.map(group => answers[`voice_${group.id}`]).filter((answer): answer is SpeakerDecisionChoice => !!answer)
-      const poolGender: 'male' | 'female' | 'unknown' = rankingHint ?? gender
       const candidates = voices.flatMap((voice, index) => {
-        if (used.has(voice.id) || !voiceGenderCompatible(voice, poolGender)) return []
+        if (used.has(voice.id) || !voiceGenderCompatible(voice, gender)) return []
         const scores = matches.map(match => match.probabilities[`voice_${index}`] ?? 0).filter(score => Number.isFinite(score) && score > 0)
         return [{ voice, score: scores.length ? scores.reduce((sum, score) => sum + score, 0) / scores.length : 0 }]
       })
-      if (poolGender !== gender) gender = poolGender
       // Jev ranks the voices from their Fish metadata; randomization happens
       // only inside the shortlist of strong candidates, so quality still
       // leads the choice while new characters stop reusing the same voice.
@@ -1547,7 +1718,7 @@ export interface CachedMessageParse {
   segments: PlaybackSegment[]
   /** Escalated dialogue runs and their triggers, retained for diagnostics. */
   discourse?: {
-    status: 'not-escalated' | 'completed' | 'failed'
+    status: 'not-escalated' | 'completed' | 'failed' | 'deferred'
     /** Whether the first pass issued turn-relation questions. */
     turns?: 'issued' | 'omitted'
     runs: Array<{ id: string; targets: string[]; triggers: string[] }>
@@ -2897,6 +3068,99 @@ function cleanPlaybackText(value: string): string {
     .trim()
 }
 
+const INTERACTION_STOPWORDS = new Set([
+  'a', 'an', 'and', 'are', 'as', 'at', 'be', 'been', 'but', 'by', 'can', 'could', 'did', 'do', 'does', 'doing', 'for', 'from', 'had', 'has', 'have', 'he', 'her', 'here', 'hers', 'him', 'his', 'i', 'if', 'in', 'into', 'is', 'it', 'its', 'just', 'me', 'my', 'of', 'on', 'or', 'our', 'out', 'said', 'says', 'she', 'so', 'than', 'that', 'the', 'their', 'them', 'then', 'there', 'these', 'they', 'this', 'those', 'to', 'up', 'upon', 'us', 'very', 'was', 'we', 'were', 'what', 'when', 'which', 'who', 'will', 'with', 'you', 'your',
+  'about', 'after', 'again', 'also', 'another', 'because', 'before', 'being', 'but', 'each', 'every', 'first', 'get', 'gets', 'got', 'had', 'has', 'have', 'having', 'here', 'how', 'into', 'itself', 'like', 'made', 'make', 'many', 'more', 'most', 'much', 'now', 'off', 'only', 'other', 'over', 'same', 'some', 'such', 'take', 'than', 'then', 'through', 'too', 'under', 'where', 'while', 'would', 'their', 'there', 'these', 'those', 'one', 'two', 'three', 'well', 'okay', 'said',
+])
+
+const INTERACTION_TOKEN_PATTERN = /[\p{L}\p{M}\p{N}]+/gu
+
+const stemInteractionToken = (token: string): string => {
+  if (token.length > 5 && token.endsWith('ing')) {
+    const stem = token.slice(0, -3)
+    return stem.endsWith('e') ? stem.slice(0, -1) : stem
+  }
+  if (token.length > 4 && token.endsWith('ies')) return `${token.slice(0, -3)}y`
+  if (token.length > 5 && /(?:shes|ches|xes|zes|sses)$/u.test(token)) return token.slice(0, -2)
+  if (token.length > 4 && token.endsWith('s')) return token.slice(0, -1)
+  return token
+}
+
+/** Distinctive content words that help a model see continuing behavior. */
+export function interactionAnchors(text: string, limit = 12): string[] {
+  const tokens = (text.toLowerCase().match(INTERACTION_TOKEN_PATTERN) ?? [])
+    .map(stemInteractionToken)
+    .filter(token => token.length >= 3 && !INTERACTION_STOPWORDS.has(token) && !/^\d+$/u.test(token))
+  const counts = new Map<string, number>()
+  const first = new Map<string, number>()
+  const bump = (value: string, weight: number, index: number) => {
+    counts.set(value, (counts.get(value) ?? 0) + weight)
+    if (!first.has(value)) first.set(value, index)
+  }
+  for (let index = 0; index < tokens.length; index += 1) {
+    bump(tokens[index], 3, index)
+    if (index < tokens.length - 1) bump(`${tokens[index]} ${tokens[index + 1]}`, 2, index)
+  }
+  return [...counts.entries()]
+    .sort((a, b) => b[1] - a[1] || (first.get(a[0]) ?? 0) - (first.get(b[0]) ?? 0) || a[0].localeCompare(b[0]))
+    .slice(0, Math.max(1, Math.round(limit)))
+    .map(([anchor]) => anchor)
+}
+
+/** Shared continuity anchors, preserving current scene order. */
+export function interactionAnchorOverlap(left: readonly string[], right: readonly string[]): string[] {
+  const rightSet = new Set(right.map(anchor => anchor.toLowerCase()))
+  return [...new Set(left.map(anchor => anchor.toLowerCase()).filter(anchor => rightSet.has(anchor)))]
+}
+
+/**
+ * Appearance anchors: descriptor phrases that pin down a temporary speaker's
+ * look ("faded grey soccer hoodie", "denim overalls", "loose drawstring
+ * sweatpants"). Introductions built on these phrases identify a person, and
+ * two different phrases naming two different-looking people refer to two
+ * different individuals even when they interchange generic descriptors like
+ * "the girl" or "the guy".
+ */
+const APPEARANCE_MODIFIERS = new Set([
+  'faded', 'dark', 'light', 'pale', 'bright', 'muted', 'soft', 'washed', 'distressed', 'ripped', 'torn', 'tight', 'loose', 'baggy', 'fitted', 'cropped', 'oversized', 'wide', 'narrow', 'striped', 'stripy', 'plain', 'solid', 'floral', 'plaid', 'patterned', 'camouflage', 'checkered', 'houndstooth', 'paisley', 'gingham', 'polka', 'maroon', 'crimson', 'navy', 'teal', 'olive', 'magenta', 'scarlet', 'amber', 'ochre', 'umber', 'crimson', 'indigo', 'violet', 'purple', 'lavender', 'lilac', 'azure', 'cerulean', 'aquamarine', 'royal', 'grey', 'gray', 'ashen', 'leaden', 'silver', 'charcoal', 'black', 'white', 'offwhite', 'cream', 'beige', 'tan', 'khaki', 'brown', 'chestnut', 'walnut', 'auburn', 'sepia', 'golden', 'bronze', 'auburn', 'rust', 'coral', 'salmon', 'rose', 'rosewood', 'blue', 'red', 'green', 'yellow', 'orange', 'pink', 'gold', 'glows', 'glowy', 'meringue', 'glossy', 'matte', 'shiny', 'silky', 'velvet',
+  'denim', 'cotton', 'wool', 'linen', 'leather', 'suede', 'flannel', 'fleece', 'nylon', 'polyester', 'spandex', 'rayon', 'cashmere', 'silk',
+  'soccer', 'football', 'basketball', 'track', 'running', 'cycling', 'gym', 'sport', 'athletic', 'tennis', 'golf', 'motocross', 'motorcycle', 'leather', 'chainmail', 'tactical', 'military', 'work', 'school', 'uniform', 'dress', 'formal', 'wedding', 'party', 'church', 'casual', 'weekend', 'evening', 'bra', 'bralette',
+  'drawstring', 'zipper', 'zippered', 'hooded', 'buttoned', 'laced', 'collared', 'cuffed', 'furred', 'fleece', 'ribbed', 'slubbed', 'textured', 'quilted', 'pleated', 'creased', 'rolled',
+])
+const APPEARANCE_GARMENTS = new Set([
+  'hoodie', 'sweatshirt', 'sweater', 'jumper', 't-shirt', 'tee', 'shirt', 'polo', 'blouse', 'top', 'tank', 'cami', 'camisole', 'vest', 'waistcoat', 'blazer', 'jacket', 'windbreaker', 'coat', 'overcoat', 'trench', 'mackintosh', 'parka', 'anorak', 'cardigan', 'dress', 'gown', 'skirt', 'pants', 'trousers', 'jeans', 'shorts', 'overalls', 'jumpsuit', 'romper', 'sweatpants', 'joggers', 'leggings', 'tights', 'trunks', 'briefs', 'boxers', 'shorts', 'underpants', 'lingerie', 'bra', 'panties', 'underwear', 'thong', 'socks', 'stockings', 'shoes', 'sneakers', 'boots', 'loafers', 'heels', 'sandals', 'sneakers', 'cleats', 'belt', 'scarf', 'tie', 'bowtie', 'bow', 'hat', 'cap', 'beanie', 'beret', 'visor', 'glasses', 'sunglasses', 'watch', 'ring', 'bracelet', 'earring', 'necklace', 'gloves', 'mittens', 'scrubs', 'apron', 'towel', 'bandana', 'headband', 'bonnet', 'veil',
+])
+const APPEARANCE_POSTURE_OR_ACTION = new Set([
+  'crossed', 'folded', 'tucked', 'rolled', 'pushed', 'shoved', 'pulled', 'gripped', 'leaned', 'flopped', 'slung', 'hooked', 'strung', 'held', 'worn', 'dressed', 'clad', 'draped', 'hitched', 'snagged', 'gripped',
+])
+export function appearanceAnchors(text: string, limit = 12): string[] {
+  const tokens = (text.toLowerCase().match(/[\p{L}\p{M}\p{N}-]+/gu) ?? [])
+  const found: string[] = []
+  const seen = new Set<string>()
+  const push = (phrase: string) => {
+    if (!seen.has(phrase) && phrase.length >= 4) { seen.add(phrase); found.push(phrase) }
+  }
+  for (let index = tokens.length - 1; index >= 0; index -= 1) {
+    const token = tokens[index]
+    if (!APPEARANCE_GARMENTS.has(token) && !APPEARANCE_GARMENTS.has(token.endsWith('s') ? token.slice(0, -1) : token)) continue
+    const garment = token.endsWith('s') && APPEARANCE_GARMENTS.has(token.slice(0, -1)) ? token.slice(0, -1) : token
+    // walk back through modifiers: collect contiguous appearance descriptors
+    let start = index
+    while (start > 0) {
+      const prev = tokens[start - 1]
+      if (!APPEARANCE_MODIFIERS.has(prev)) break
+      start -= 1
+    }
+    const phrase = tokens.slice(start, index + 1).join(' ')
+    push(phrase)
+    // also emit each consecutive appearance modifier+garment pair so partial matches bridge
+    for (let cursor = start; cursor < index; cursor += 1) {
+      push(`${tokens[cursor]} ${garment}`)
+    }
+  }
+  return found.slice(0, limit)
+}
+
 function appendGenericSegments(result: PlaybackSegment[], text: string, defaultSpeakerId: string | null): void {
   const quotePattern = /["“]([\s\S]*?)["”]/g
   let cursor = 0
@@ -3906,6 +4170,26 @@ export function buildAssistantUserSpeakerReview(plan: SpeakerDecisionPlan, answe
   return { state: plan.state, questions }
 }
 
+export interface JevDecisionPayloadMetrics {
+  stateBytes: number
+  questionsBytes: number
+  payloadBytes: number
+  questionCount: number
+}
+
+/** Byte-size proxy for comparing decision requests across builds and messages. */
+export function measureJevDecisionPayload(state: unknown, questions: Record<string, unknown>): JevDecisionPayloadMetrics {
+  const encoder = new TextEncoder()
+  const stateBytes = encoder.encode(JSON.stringify(state) ?? '').byteLength
+  const questionsBytes = encoder.encode(JSON.stringify(questions) ?? '').byteLength
+  return {
+    stateBytes,
+    questionsBytes,
+    payloadBytes: stateBytes + questionsBytes,
+    questionCount: Object.keys(questions).length,
+  }
+}
+
 /** Only a strong independent review may replace an assistant-message user assignment. */
 export function applyAssistantUserSpeakerReview(plan: SpeakerDecisionPlan, answers: Record<string, SpeakerDecisionChoice>, reviewed: Record<string, SpeakerDecisionChoice>): void {
   for (const speech of plan.state.speeches) {
@@ -3923,8 +4207,8 @@ export function applyAssistantUserSpeakerReview(plan: SpeakerDecisionPlan, answe
 }
 
 export interface RelationshipReviewContext {
-  previousMessages: Array<{ id: string; text: string; role?: 'user' | 'assistant' }>
-  ghosts: Array<{ id: string; label: string; aliases: string[]; context: string; conversationHistory: Array<{ messageId: string; text: string }> }>
+  previousMessages: Array<{ id: string; text: string; role?: 'user' | 'assistant'; anchors?: string[] }>
+  ghosts: Array<{ id: string; label: string; aliases: string[]; context: string; conversationHistory: Array<{ messageId: string; text: string }>; interactivityTrail?: GhostInteractivitySample[] }>
 }
 
 /** Recheck user-voice assignments made by any stage, with prior conversation. */
@@ -4162,7 +4446,7 @@ export function relationshipReviewContext(messages: Array<{ id: string; is_user:
     if (remaining <= 0) return []
     const text = preparePlaybackContent(message.content ?? '', skippedTags).slice(-Math.min(4_000, remaining))
     remaining -= text.length
-    return text ? [{ id: message.id, role: message.is_user ? 'user' as const : 'assistant' as const, text }] : []
+    return text ? [{ id: message.id, role: message.is_user ? 'user' as const : 'assistant' as const, text, anchors: interactionAnchors(text, 8) }] : []
   }).reverse()
   let ghostBudget = 12_000
   const takeGhostText = (text: string, limit: number): string => {
@@ -4183,7 +4467,8 @@ export function relationshipReviewContext(messages: Array<{ id: string; is_user:
   const safeGhosts = candidates.map(({ ghost, index, safeCurrent, historical }) => {
     const context = safeCurrent ? takeGhostText(ghost.context, 1_200) : ''
     const conversationHistory = historical.slice(-3).reverse().map(entry => ({ messageId: entry.messageId, text: takeGhostText(entry.text, 1_200) })).filter(entry => entry.text).reverse()
-    return { index, value: { id: ghost.id, label: safeCurrent ? ghost.label ?? '' : '', aliases: safeCurrent ? ghostCastAliases(ghost) : [], context, conversationHistory } }
+    const interactivityTrail = (ghost.interactivityTrail ?? []).slice(-4)
+    return { index, value: { id: ghost.id, label: safeCurrent ? ghost.label ?? '' : '', aliases: safeCurrent ? ghostCastAliases(ghost) : [], context, conversationHistory, ...(interactivityTrail.length ? { interactivityTrail } : {}) } }
   }).sort((a, b) => a.index - b.index).map(item => item.value)
   return { previousMessages, ghosts: safeGhosts }
 }
@@ -4254,7 +4539,7 @@ export function buildRelationshipSpeakerReview(plan: SpeakerDecisionPlan, answer
       if (local.identity && local.identity !== UNCAST_SPEAKER_ID && !conflict && !phoneExchange && !globalOptions?.targets.includes(speech.id) && !openingTargets.has(speech.id)) continue
       questions[`relationship_${speech.id}`] = {
         type: 'choice',
-        instructions: `Who actually speaks quotation ${speech.id}? Read its entire dialogue run together, including later quotations and narration in the current message. Compare the topic and wording with the preceding role-labeled exchange, including user messages: identify who spoke, whom they addressed, and whether this quote responds or continues. For an opening reply, consider the recipient of the preceding relevant utterance as a candidate, and trace distinctive objects, actions and pronouns into the current scene. A user message may contain several utterances or descriptions: identify the relevant exchange, not just its last name or the message author. Weigh semantic continuity and the whole run, but do not assume the addressee responds or that all quotes share a speaker. Connect people across messages using names, aliases, actions, pronouns and carried objects. A person who merely observes, is addressed, or passes by is not automatically speaking. Distinguish in-person dialogue from a caller or text sender. Pronouns are evidence, not proof of gender or identity. Prefer explicit attribution and select no_clear_identity when evidence is insufficient.`,
+        instructions: `Who actually speaks quotation ${speech.id}? Read its entire dialogue run together, including later quotations and narration in the current message. Treat actors, addressees, participants and the continuing activity as anchors within and across messages: same pair, same topic, same ongoing activity and role are strong continuity clues, while a new addressee, changed activity or changed scene can break them. Compare the topic and wording with the preceding role-labeled exchange, including user messages: identify who spoke, whom they addressed, and whether this quote responds or continues. For an opening reply, consider the recipient of the preceding relevant utterance as a candidate, and trace distinctive objects, actions and pronouns into the current scene. A user message may contain several utterances or descriptions: identify the relevant exchange, not just its last name or the message author. Weigh semantic continuity and the whole run, but do not assume the addressee responds or that all quotes share a speaker. Connect people across messages using names, aliases, actions, pronouns and carried objects. A person who merely observes, is addressed, or passes by is not automatically speaking. Distinguish in-person dialogue from a caller or text sender. Pronouns are evidence, not proof of gender or identity. Prefer explicit attribution and select no_clear_identity when evidence is insufficient.`,
         criteria,
       }
       if (globalOptions && globalOptions.strategy !== 'run') {
@@ -5804,7 +6089,6 @@ function ttsModulationPositionOptions(text: string): TtsTagPositionOption[] {
 export interface TtsTagPlan {
   state: {
     messageRole: 'assistant' | 'user'
-    message: string
     speeches: Array<{
       id: string
       paragraphId: string
@@ -5851,11 +6135,43 @@ function ttsPauseCriteria(): Record<string, string> {
   ])
 }
 
+/** Options for the token-reduction implementation's tag-state shaping. */
+export interface TtsTagStateOptions {
+  /** Slice narration to the quotation-local window instead of the full paragraph span. */
+  scoped?: boolean
+  /** Replace each criteria string with its first sentence to shrink the per-question payload. */
+  terse?: boolean
+}
+
+/** Keep only the first sentence of a criterion; the safety clauses are already in `instructions`. */
+function ttsTersePhrase(description: string): string {
+  const sentence = description.split('. ')[0] ?? description
+  return sentence.replace(/\.+$/u, '').trim()
+}
+
+function ttsTerseCriteria(criteria: Record<string, string>): Record<string, string> {
+  const next: Record<string, string> = {}
+  for (const [key, value] of Object.entries(criteria)) next[key] = ttsTersePhrase(value)
+  return next
+}
+
+/** How many characters of narration flanking a quotation are sent to Jev in scoped mode. */
+export const TTS_NARRATION_WINDOW = 320
+
+export interface TtsTagSecondaryNeeds {
+  emotion2?: boolean
+  sound?: boolean
+  pause?: boolean
+  modulationpos?: boolean
+}
+
 /**
- * Build the batched tag questions. Every speech gets a mandatory emotion, an
- * optional sound, and an optional pause, plus fallback placement boundaries.
- * Fish S2 with LLM placement also gets an optional mid-speech modulation and
- * its position when the speech is long enough to have a useful remainder.
+ * Build the batched tag questions. `phase: 'primary'` asks only the choices
+ * that decide whether tagging is needed at all; `secondary` emits the likely
+ * no-op follow-ups only for speeches selected by the caller. The final
+ * options object enables the token-reduction components: `scoped` narrows the
+ * narration sent to Jev to the quotation-local window, and `terse` keeps only
+ * the first sentence of every criterion string.
  */
 export function buildTtsTagPlan(
   plan: SpeakerDecisionPlan,
@@ -5863,113 +6179,141 @@ export function buildTtsTagPlan(
   emotionOptions: readonly TtsTagOption[] = TTS_AUTO_EMOTION_OPTIONS,
   style: Exclude<TtsTagStyle, 'off'> = 'gemini',
   enableModulation = false,
+  phase: 'all' | 'primary' | 'secondary' = 'all',
+  needs: Readonly<Record<string, Readonly<TtsTagSecondaryNeeds>>> = {},
+  tagStateOptions?: TtsTagStateOptions,
 ): TtsTagPlan {
   const allowed = speechIds ? new Set(speechIds) : null
+  const scoped = tagStateOptions?.scoped === true
   const speeches = plan.state.speeches
     .filter(speech => !allowed || allowed.has(speech.id))
     .map(speech => ({
       id: speech.id,
       paragraphId: speech.paragraphId,
       text: speech.text,
-      narrativeBefore: speech.narrativeBefore,
-      narrativeAfter: speech.narrativeAfter,
+      narrativeBefore: scoped ? speech.narrativeBefore.slice(-TTS_NARRATION_WINDOW) : speech.narrativeBefore,
+      narrativeAfter: scoped ? speech.narrativeAfter.slice(0, TTS_NARRATION_WINDOW) : speech.narrativeAfter,
     }))
-  const emotionCriteria = ttsEmotionCriteria(emotionOptions)
+  const terseCriteria = tagStateOptions?.terse === true ? ttsTerseCriteria : (criteria: Record<string, string>) => criteria
+  const phrase = tagStateOptions?.terse === true ? ttsTersePhrase : (description: string) => description
+  const emotionCriteria = terseCriteria(ttsEmotionCriteria(emotionOptions))
   const soundOptions = style === 'fish'
     ? TTS_FISH_SOUND_OPTIONS
     : style === 'gemini38'
       ? TTS_GEMINI38_SOUND_OPTIONS
       : TTS_TAG_OPTIONS
-  const soundCriteria = ttsSoundCriteria(soundOptions)
-  const styleCriteria = ttsStyleCriteria()
-  const pauseCriteria = ttsPauseCriteria()
+  const soundCriteria = terseCriteria(ttsSoundCriteria(soundOptions))
+  const styleCriteria = terseCriteria(ttsStyleCriteria())
+  const pauseCriteria = terseCriteria(ttsPauseCriteria())
   const questions: SpeakerDecisionPlan['questions'] = {}
   const positions: Record<string, TtsTagPositionOption[]> = {}
   const pausePositions: Record<string, TtsTagPositionOption[]> = {}
   const modulationPositions: Record<string, TtsTagPositionOption[]> = {}
   for (const speech of speeches) {
+    const includePrimary = phase !== 'secondary'
+    const includeSecondary = phase !== 'primary'
+    const needsForSpeech = phase === 'secondary'
+      ? { emotion2: needs[speech.id]?.emotion2 === true, sound: needs[speech.id]?.sound === true, pause: needs[speech.id]?.pause === true, modulationpos: needs[speech.id]?.modulationpos === true }
+      : { emotion2: phase === 'all', sound: phase === 'all', pause: phase === 'all', modulationpos: phase === 'all' }
     if (style !== 'gemini38') {
-      questions[`emotion_${speech.id}`] = {
-        type: 'choice',
-        instructions: `Which emotion best describes how quotation ${speech.id} is delivered? Use the quotation and its surrounding narration. Every quotation receives exactly one primary emotion; choose calm for neutral delivery.`,
-        criteria: emotionCriteria,
+      if (includePrimary) {
+        questions[`emotion_${speech.id}`] = {
+          type: 'choice',
+          instructions: `Which emotion best describes how quotation ${speech.id} is delivered? Use the quotation and its surrounding narration. Every quotation receives exactly one primary emotion; choose calm for neutral delivery.`,
+          criteria: emotionCriteria,
+        }
       }
-      questions[`emotion2_${speech.id}`] = {
-        type: 'choice',
-        instructions: `Is there a distinct secondary emotion layered into quotation ${speech.id}? Choose no_emotion unless a second emotion is clearly present and compatible with the primary.`,
-        criteria: {
-          ...emotionCriteria,
-          [TTS_NO_EMOTION_OPTION]: 'No distinct secondary emotion. Most lines should choose this.',
-        },
+      if (includeSecondary && needsForSpeech.emotion2) {
+        questions[`emotion2_${speech.id}`] = {
+          type: 'choice',
+          instructions: `Is there a distinct secondary emotion layered into quotation ${speech.id}? Choose no_emotion unless a second emotion is clearly present and compatible with the primary.`,
+          criteria: {
+            ...emotionCriteria,
+            [TTS_NO_EMOTION_OPTION]: phrase('No distinct secondary emotion. Most lines should choose this.'),
+          },
+        }
       }
     }
     if (style === 'fish') {
-      questions[`style_${speech.id}`] = {
-        type: 'choice',
-        instructions: `Does quotation ${speech.id} have a sustained voice style that should lead the speech? Choose no_style unless a whisper, soft/loud/low voice, shout, or scream clearly applies to the whole quotation. Do not use this for a momentary sound.`,
-        criteria: {
-          ...styleCriteria,
-          [TTS_NO_STYLE_OPTION]: 'No sustained voice style. Most lines should choose this.',
-        },
+      if (includePrimary) {
+        questions[`style_${speech.id}`] = {
+          type: 'choice',
+          instructions: `Does quotation ${speech.id} have a sustained voice style that should lead the speech? Choose no_style unless a whisper, soft/loud/low voice, shout, or scream clearly applies to the whole quotation. Do not use this for a momentary sound.`,
+          criteria: {
+            ...styleCriteria,
+            [TTS_NO_STYLE_OPTION]: phrase('No sustained voice style. Most lines should choose this.'),
+          },
+        }
       }
       if (enableModulation) {
         const modulationOptions = ttsModulationPositionOptions(speech.text)
         if (modulationOptions.length > 0) {
           modulationPositions[speech.id] = modulationOptions
-          questions[`modulation_${speech.id}`] = {
-            type: 'choice',
-            instructions: `Does quotation ${speech.id} have a clear internal emotional turn that should change delivery before the quotation ends? Choose modulation only when the emotion genuinely shifts and the new delivery should continue to the end. Ignore momentary sounds, ordinary punctuation, and small intensity changes.`,
-            criteria: {
-              modulation: 'A clear, sustained emotional turn inside the quotation.',
-              no_modulation: 'No clear internal emotional turn. Most lines should choose this.',
-            },
+          if (includePrimary) {
+            questions[`modulation_${speech.id}`] = {
+              type: 'choice',
+              instructions: `Does quotation ${speech.id} have a clear internal emotional turn that should change delivery before the quotation ends? Choose modulation only when the emotion genuinely shifts and the new delivery should continue to the end. Ignore momentary sounds, ordinary punctuation, and small intensity changes.`,
+              criteria: {
+                modulation: phrase('A clear, sustained emotional turn inside the quotation.'),
+                no_modulation: phrase('No clear internal emotional turn. Most lines should choose this.'),
+              },
+            }
           }
-          questions[`modulationpos_${speech.id}`] = {
-            type: 'choice',
-            instructions: `If quotation ${speech.id} receives a modulation, where should the new emotion begin? Choose the boundary closest to the emotional turn.`,
-            criteria: Object.fromEntries(modulationOptions.map(option => [option.id, option.description])),
+          if (includeSecondary && needsForSpeech.modulationpos) {
+            questions[`modulationpos_${speech.id}`] = {
+              type: 'choice',
+              instructions: `If quotation ${speech.id} receives a modulation, where should the new emotion begin? Choose the boundary closest to the emotional turn.`,
+              criteria: terseCriteria(Object.fromEntries(modulationOptions.map(option => [option.id, option.description]))),
+            }
           }
         }
       }
     }
-    questions[`tag_${speech.id}`] = {
-      type: 'choice',
-      instructions: `Does quotation ${speech.id} contain one momentary sound effect that should be performed? Use the quotation and its surrounding narration. Most quotations need none; choose no_tag unless the sound is unmistakable. Never use ambient sound, sustained mood, or hesitation.`,
-      criteria: soundCriteria,
-    }
-    questions[`tag2_${speech.id}`] = {
-      type: 'choice',
-      instructions: `Does quotation ${speech.id} contain a second distinct momentary sound effect? Choose no_tag unless a second sound is clearly present near a different moment.`,
-      criteria: soundCriteria,
+    if (includePrimary) {
+      questions[`tag_${speech.id}`] = {
+        type: 'choice',
+        instructions: `Does quotation ${speech.id} contain one momentary sound effect that should be performed? Use the quotation and its surrounding narration. Most quotations need none; choose no_tag unless the sound is unmistakable. Never use ambient sound, sustained mood, or hesitation.`,
+        criteria: soundCriteria,
+      }
     }
     const speechPositions = ttsTagPositionOptions(speech.text)
     positions[speech.id] = speechPositions
-    questions[`tagpos_${speech.id}`] = {
-      type: 'choice',
-      instructions: `If quotation ${speech.id} receives a sound effect, where should it be inserted? Choose the boundary closest to the exact sound.`,
-      criteria: Object.fromEntries(speechPositions.map(option => [option.id, option.description])),
+    if (includeSecondary && needsForSpeech.sound) {
+      questions[`tag2_${speech.id}`] = {
+        type: 'choice',
+        instructions: `Does quotation ${speech.id} contain a second distinct momentary sound effect? Choose no_tag unless a second sound is clearly present near a different moment.`,
+        criteria: soundCriteria,
+      }
+      questions[`tagpos_${speech.id}`] = {
+        type: 'choice',
+        instructions: `If quotation ${speech.id} receives a sound effect, where should it be inserted? Choose the boundary closest to the exact sound.`,
+        criteria: terseCriteria(Object.fromEntries(speechPositions.map(option => [option.id, option.description]))),
+      }
     }
-    questions[`pause_${speech.id}`] = {
-      type: 'choice',
-      instructions: `Does quotation ${speech.id} need one inserted dramatic pause? Choose no_pause unless a pause clearly improves timing.`,
-      criteria: pauseCriteria,
-    }
-    questions[`pause2_${speech.id}`] = {
-      type: 'choice',
-      instructions: `Does quotation ${speech.id} need a second distinct pause at another moment? Choose no_pause unless a second pause clearly improves timing.`,
-      criteria: pauseCriteria,
+    if (includePrimary) {
+      questions[`pause_${speech.id}`] = {
+        type: 'choice',
+        instructions: `Does quotation ${speech.id} need one inserted dramatic pause? Choose no_pause unless a pause clearly improves timing.`,
+        criteria: pauseCriteria,
+      }
     }
     pausePositions[speech.id] = speechPositions
-    questions[`pausepos_${speech.id}`] = {
-      type: 'choice',
-      instructions: `If quotation ${speech.id} receives a pause, where should it be inserted? Choose the boundary closest to the intended pause.`,
-      criteria: Object.fromEntries(speechPositions.map(option => [option.id, option.description])),
+    if (includeSecondary && needsForSpeech.pause) {
+      questions[`pause2_${speech.id}`] = {
+        type: 'choice',
+        instructions: `Does quotation ${speech.id} need a second distinct pause at another moment? Choose no_pause unless a second pause clearly improves timing.`,
+        criteria: pauseCriteria,
+      }
+      questions[`pausepos_${speech.id}`] = {
+        type: 'choice',
+        instructions: `If quotation ${speech.id} receives a pause, where should it be inserted? Choose the boundary closest to the intended pause.`,
+        criteria: terseCriteria(Object.fromEntries(speechPositions.map(option => [option.id, option.description]))),
+      }
     }
   }
   return {
     state: {
       messageRole: plan.state.messageRole,
-      message: plan.state.message,
       speeches,
     },
     questions,
@@ -7480,6 +7824,25 @@ export function assessSpeakerDiscourseEscalation(
     },
     runs,
   }
+}
+
+/**
+ * A scene is clear when no run has an escalation trigger and every quotation
+ * resolved to a single confident first-pass answer. Used to skip auxiliary
+ * reviews (phase 2) when they are unlikely to change anything.
+ */
+export function hasUncertainFirstPass(
+  plan: SpeakerDecisionPlan,
+  answers: Record<string, SpeakerDecisionChoice>,
+): boolean {
+  const assessment = assessSpeakerDiscourseEscalation(plan, answers)
+  if (assessment.runs.some(run => run.triggers.length > 0)) return true
+  for (const speech of plan.state.speeches) {
+    const evaluation = evaluateSpeakerDecisionAnswer(answers[`speech_${speech.id}`], plan.optionSpeakerIds, SPEAKER_DECISION_THRESHOLDS.local)
+    if (!evaluation.resolved) return true
+    if (evaluation.leadingMargin < SPEAKER_DECISION_THRESHOLDS.local.margin) return true
+  }
+  return false
 }
 
 export type SpeakerDiscourseOutcomeReason =

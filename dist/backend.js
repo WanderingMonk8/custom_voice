@@ -2,6 +2,64 @@
 var CONFIG_KEY = "chat_voice";
 var USER_SPEAKER_ID = "__chat_voice_user__";
 var UNCAST_SPEAKER_ID = "__chat_voice_uncast__";
+var REDUCTION_COMPONENTS = [
+  {
+    id: "scopedTtsState",
+    phase: "Phase 1",
+    label: "Scope TTS tag state to the target speech",
+    hint: "Send only the target quotation and its local neighbours to Jev for tag selection, not the full message.",
+    defaultValue: true
+  },
+  {
+    id: "twoPhaseTagReview",
+    phase: "Phase 1",
+    label: "Two-phase (primary/secondary) tag questions",
+    hint: "Primary pass asks primary questions first; secondary questions are asked only when the first pass establishes a need for them.",
+    defaultValue: true
+  },
+  {
+    id: "dedupTagCriteria",
+    phase: "Phase 1",
+    label: "Deduplicate tag criteria",
+    hint: "Share terse criteria blocks across emotion/style/sound/pause questions instead of expanding full descriptions per question.",
+    defaultValue: true
+  },
+  {
+    id: "gatedAuxReviews",
+    phase: "Phase 2",
+    label: "Gate auxiliary speaker reviews on triggers",
+    hint: "Best-available guess, self-introduction, speaker-switch and focused opening reviews run only when a trigger is present, not always.",
+    defaultValue: true
+  },
+  {
+    id: "deferRelationshipReview",
+    phase: "Phase 2",
+    label: "Defer the global relationship review until a trigger fires",
+    hint: "Skip the whole relationship review when no known trigger is established (no unresolved turn, no boundary, no alternate speaker switch); otherwise it runs as today.",
+    defaultValue: true
+  },
+  {
+    id: "trimVoiceCriteria",
+    phase: "Phase 2",
+    label: "Condense uncast voice ranking criteria",
+    hint: "Drop the description fields from the voice ranking criteria (use name, category, languages and tags only) and keep the shortlist small.",
+    defaultValue: true
+  }
+];
+var REDUCTION_COMPONENT_IDS = REDUCTION_COMPONENTS.map((component) => component.id);
+var FULL_REDUCTION_COMPONENTS = Object.fromEntries(REDUCTION_COMPONENTS.map((component) => [component.id, component.defaultValue]));
+var DISABLED_REDUCTION_COMPONENTS = Object.fromEntries(REDUCTION_COMPONENTS.map((component) => [component.id, false]));
+function readReductionComponents(value) {
+  const full = FULL_REDUCTION_COMPONENTS;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return { ...full };
+  const row = value;
+  const next = { ...full };
+  for (const component of REDUCTION_COMPONENTS) {
+    const raw = row[component.id];
+    if (typeof raw === "boolean") next[component.id] = raw;
+  }
+  return next;
+}
 var UNRESOLVED_SPEAKER_ID = "__chat_voice_unresolved__";
 var DEFAULT_MESSAGE_LIMIT = 20;
 var MIN_MESSAGE_LIMIT = 1;
@@ -23,6 +81,12 @@ function voiceGender(voice) {
   }
   return "unknown";
 }
+function ensureFavoriteGenderTag(voice) {
+  const gender = voiceGender(voice);
+  if (gender === "unknown") return voice;
+  const tags = [...new Set((voice.tags ?? []).map((tag) => tag.trim().toLowerCase()).filter((tag) => tag && tag !== "male" && tag !== "female"))];
+  return { ...voice, gender, tags: [gender, ...tags].slice(0, 32) };
+}
 function voiceGenderCompatible(voice, gender) {
   const hint = voiceGender(voice);
   return gender === "unknown" || hint === "unknown" || hint === gender;
@@ -38,7 +102,7 @@ function readFavoriteVoices(value) {
     const id = row.id.trim().slice(0, 512);
     if (!id || seen.has(id)) continue;
     seen.add(id);
-    result.push({
+    result.push(ensureFavoriteGenderTag({
       id,
       name: typeof row.name === "string" ? row.name.trim().slice(0, 128) : "",
       category: typeof row.category === "string" && row.category.trim() ? row.category.trim().slice(0, 64) : "unspecified",
@@ -49,7 +113,7 @@ function readFavoriteVoices(value) {
       ...typeof row.communityLink === "string" && row.communityLink.trim() ? { communityLink: row.communityLink.trim().slice(0, 512) } : {},
       ...Array.isArray(row.tags) ? { tags: row.tags.filter((value2) => typeof value2 === "string").map((value2) => value2.trim().slice(0, 64)).filter(Boolean).slice(0, 32) } : {},
       ...Array.isArray(row.languages) ? { languages: row.languages.filter((value2) => typeof value2 === "string").map((value2) => value2.trim().slice(0, 32)).filter(Boolean).slice(0, 8) } : {}
-    });
+    }));
   }
   return result;
 }
@@ -127,7 +191,7 @@ function communityPayloadShape(payload) {
 }
 function communityVoiceToFavorite(voice) {
   const gender = ["male", "female"].find((tag) => voice.tags.some((item) => item.toLowerCase() === tag));
-  return {
+  return ensureFavoriteGenderTag({
     id: voice.id,
     name: voice.title,
     category: voice.category || (gender ?? "unspecified"),
@@ -138,7 +202,7 @@ function communityVoiceToFavorite(voice) {
     communityLink: voice.communityLink,
     ...voice.tags.length ? { tags: voice.tags } : {},
     ...voice.languages.length ? { languages: voice.languages } : {}
-  };
+  });
 }
 var GHOST_VOICE_LIFETIME_MESSAGES = 10;
 function readGhostVoices(value) {
@@ -168,6 +232,12 @@ function readGhostVoices(value) {
         const item2 = entry;
         return typeof item2.messageId === "string" && typeof item2.text === "string" && item2.messageId && item2.text ? [{ messageId: item2.messageId.slice(0, 256), text: item2.text.slice(0, 6e3) }] : [];
       }).slice(-3) : [],
+      interactivityTrail: Array.isArray(row.interactivityTrail) ? row.interactivityTrail.flatMap((entry) => {
+        if (!entry || typeof entry !== "object") return [];
+        const item2 = entry;
+        const anchors = Array.isArray(item2.anchors) ? [...new Set(item2.anchors.filter((anchor) => typeof anchor === "string").map((anchor) => anchor.trim().toLowerCase().slice(0, 128)).filter(Boolean))].slice(0, 12) : [];
+        return typeof item2.messageId === "string" && item2.messageId && anchors.length ? [{ messageId: item2.messageId.slice(0, 256), anchors }] : [];
+      }).slice(-12) : [],
       ...typeof row.createdAtMessageId === "string" && row.createdAtMessageId ? { createdAtMessageId: row.createdAtMessageId } : {},
       ...typeof row.lastInvokedAtMessageId === "string" && row.lastInvokedAtMessageId ? { lastInvokedAtMessageId: row.lastInvokedAtMessageId } : {}
     }];
@@ -186,6 +256,14 @@ function updateGhostConversationHistory(ghost, messageId, message, assistantMess
   entries.push({ messageId, text });
   entries.sort((a, b) => assistantMessageIds.indexOf(a.messageId) - assistantMessageIds.indexOf(b.messageId));
   ghost.conversationHistory = entries.slice(-3);
+}
+function updateGhostInteractivityTrail(ghost, messageId, message, assistantMessageIds) {
+  const anchors = interactionAnchors(message, 12);
+  if (!messageId || !anchors.length) return;
+  const entries = (ghost.interactivityTrail ?? []).filter((item) => item.messageId !== messageId);
+  entries.push({ messageId: messageId.slice(0, 256), anchors });
+  entries.sort((a, b) => assistantMessageIds.indexOf(a.messageId) - assistantMessageIds.indexOf(b.messageId));
+  ghost.interactivityTrail = entries.slice(-12);
 }
 function mergeGhostAliases(...sources) {
   const aliases = [];
@@ -414,20 +492,55 @@ function voiceDecisionSummary(voice) {
   if (description) parts.push(`description: ${description}`);
   return parts.join("; ") || "No details provided.";
 }
-function buildUncastVoiceDecision(groups, voices, message, ghosts = [], previousMessages = []) {
+function voiceDecisionSummaryTerse(voice) {
+  const tags = [...new Set((voice.tags ?? []).map((tag) => tag.trim().toLowerCase()).filter(Boolean))];
+  const languages = [...new Set((voice.languages ?? []).map((code) => code.trim().toLowerCase()).filter(Boolean))];
+  const parts = [voice.name, voice.category].map((part) => (part ?? "").replace(/\s+/gu, " ").trim()).filter(Boolean);
+  if (languages.length) parts.push(`languages: ${languages.join(", ")}`);
+  if (tags.length) parts.push(`tags: ${tags.join(", ")}`);
+  return parts.join("; ") || "No details provided.";
+}
+function buildUncastVoiceDecision(groups, voices, message, ghosts = [], previousMessages = [], trimCriteria = false) {
   const labels = uncastIdentityLabels(message, ghosts);
   const narrativeNames = uncastNarrativeNameCandidates(message);
   const state = {
     message,
     previousMessages,
     narrativeNames,
-    characters: groups.map((group) => ({ id: group.id, identity: group.speakerId, speeches: group.speeches, context: group.context })),
-    ghosts: ghosts.map((ghost, index) => ({ option: `ghost_${index}`, identity: ghost.speakerId, label: ghost.label || null, aliases: ghostCastAliases(ghost), priorMessageIds: ghostPriorMessageIds(ghost, previousMessages), context: ghost.context, conversationHistory: ghost.conversationHistory ?? [] })),
+    characters: groups.map((group) => ({
+      id: group.id,
+      identity: group.speakerId,
+      speeches: group.speeches,
+      context: group.context,
+      anchors: interactionAnchors([...group.speeches, ...group.context].join(" ")),
+      appearance: appearanceAnchors([...group.speeches, ...group.context].join(" ")),
+      ...group.addressee ? { addressee: group.addressee } : {},
+      ...group.flankPartners ? { flankPartners: group.flankPartners } : {},
+      ...group.pronounPartners ? { pronounPartners: group.pronounPartners } : {},
+      ...group.pronounGender ? { pronounGender: group.pronounGender } : {},
+      ...group.inferredName ? { inferredName: group.inferredName } : {}
+    })),
+    ghosts: ghosts.map((ghost, index) => {
+      const history = ghost.conversationHistory?.flatMap((entry) => [entry.text]) ?? [];
+      return {
+        option: `ghost_${index}`,
+        identity: ghost.speakerId,
+        label: ghost.label || null,
+        aliases: ghostCastAliases(ghost),
+        priorMessageIds: ghostPriorMessageIds(ghost, previousMessages),
+        context: ghost.context,
+        conversationHistory: ghost.conversationHistory ?? [],
+        anchors: interactionAnchors([ghost.context, ...history].join(" ")),
+        appearance: appearanceAnchors([ghost.context, ...history].join(" ")),
+        ...ghost.interactivityTrail?.length ? { interactivityTrail: ghost.interactivityTrail.slice(-4) } : {}
+      };
+    }),
     voices: voices.map((voice, index) => ({ option: `voice_${index}`, name: voice.name }))
   };
+  const voiceSummary = trimCriteria ? voiceDecisionSummaryTerse : voiceDecisionSummary;
   const voiceOptionsFor = (group) => {
     const hint = group.pronounGender && (group.pronounGender === "male" || group.pronounGender === "female") ? group.pronounGender : "unknown";
-    return voices.map((voice, index) => ({ index, voice })).filter(({ voice }) => hint === "unknown" || voiceGenderCompatible(voice, hint)).slice(0, 32);
+    return voices.map((voice, index) => ({ index, voice })).filter(({ voice }) => hint === "unknown" || voiceGenderCompatible(voice, hint)).slice(0, trimCriteria ? 16 : 32);
   };
   const questions = {};
   for (const group of groups) {
@@ -449,10 +562,10 @@ function buildUncastVoiceDecision(groups, voices, message, ghosts = [], previous
     const earlier = groups.slice(0, groups.indexOf(group));
     if (ghosts.length || earlier.length) questions[`identity_${group.id}`] = {
       type: "choice",
-      instructions: `Does character ${group.id} clearly represent the same individual as one prior character? Compare the current exchange with previousMessages and the prior character's own conversation history. Trace distinctive objects or workstations, physical location, actions, conversation topic, who addresses whom, and continuing relationships, including across user messages. Several agreeing details can identify someone when their name is revealed later. A shared object, setting, gender, occupation, or voice alone is insufficient; check for multiple people, scene changes, interruptions, and names that identify an addressee or bystander rather than the speaker. Do not confuse the speaker with the person they address. Select new_or_unclear unless identity is clear.`,
+      instructions: `Does character ${group.id} clearly represent the same individual as one prior character? Compare the CURRENT exchange with previousMessages and the prior character's own conversation history. Use topic, activity, actions, objects, physical location, actors, addressees and continuing pair relationships as intra-message and inter-message anchors. Appearance anchors (state.characters[].appearance and state.ghosts[].appearance) \u2014 e.g. "denim overalls", "faded grey soccer hoodie" \u2014 pin down a specific person; unlike shared nouns such as "the girl" or "the guy", distinct appearance descriptions signal different individuals, and matching appearance anchors support continuity. Explicit narration that announces another, new, or a second/different voice marks a potentially different participant, not a stylistic quirk; honor that boundary unless the surrounding evidence clearly shows continuity. Activities and conversation topics can evolve over time; use anchors and interactivityTrail as a sequence to trace that evolution rather than requiring identical phrasing or a static topic. Compare who acts with whom, who receives the action, and who addresses whom before and after the target speech. Several agreeing anchors can identify someone when their name is revealed later. A shared object, setting, gender, occupation, topic or voice alone is insufficient; check for multiple people, scene changes, interruptions, and names that identify an addressee or bystander rather than the speaker. Do not confuse the speaker with the person they address. Select new_or_unclear unless identity is clear.`,
       criteria: {
         new_or_unclear: "A new character, or identity cannot be reliably established.",
-        ...Object.fromEntries(ghosts.map((ghost, index) => [`ghost_${index}`, `Previously seen character ${ghostCastAliases(ghost).join(" / ") || ghost.speakerId}; context: ${ghost.context}`])),
+        ...Object.fromEntries(ghosts.map((ghost, index) => [`ghost_${index}`, `Previously seen character ${ghostCastAliases(ghost).join(" / ") || ghost.speakerId}; see state.ghosts[${index}] for its context and history`])),
         ...Object.fromEntries(earlier.map((previous) => [`group_${previous.id}`, `Earlier character ${previous.id}; context: ${previous.context.join(" ").slice(0, 2e3)}`]))
       }
     };
@@ -465,10 +578,11 @@ function buildUncastVoiceDecision(groups, voices, message, ghosts = [], previous
     }
     if (!voices.length) continue;
     const options = voiceOptionsFor(group);
+    const rankingInstructions = trimCriteria ? `Rank the available voices for the person who actually speaks the quoted dialogue in ${group.id}. Narration-only bystanders and people merely addressed are not speakers. Use the full scene as context, including other character groups only when clearly the same speaker. Score voices by metadata cues, not prose length: name is weak context, category and languages contribute one compatibility cue in aggregate, and each explicit tag is one cue. Missing fields are not a reason to rank a voice lower. Select the best available voice.` : `Rank the available voices for the person who actually speaks the quoted dialogue in ${group.id}. Narration-only bystanders and people merely addressed are not speakers. Use the full scene as context, including other character groups only when clearly the same speaker. Score voices by metadata cues, not prose length: name is weak context, category and languages contribute one compatibility cue in aggregate, each explicit tag is one cue, and each tag listed in "description supports" is one cue. The description is evidence for those tags, not an extra vote, and support for an explicit tag counts once rather than twice. Balance tags against that description evidence instead of letting a long description outweigh otherwise better matches. Missing fields are not a reason to rank a voice lower. Select the best available voice.`;
     questions[`voice_${group.id}`] = {
       type: "choice",
-      instructions: `Rank the available voices for the person who actually speaks the quoted dialogue in ${group.id}. Narration-only bystanders and people merely addressed are not speakers. Use the full scene as context, including other character groups only when clearly the same speaker. Score voices by metadata cues, not prose length: name is weak context, category and languages contribute one compatibility cue in aggregate, each explicit tag is one cue, and each tag listed in "description supports" is one cue. The description is evidence for those tags, not an extra vote, and support for an explicit tag counts once rather than twice. Balance tags against that description evidence instead of letting a long description outweigh otherwise better matches. Missing fields are not a reason to rank a voice lower. Select the best available voice.`,
-      criteria: { ...Object.fromEntries(options.map(({ index, voice }) => [`voice_${index}`, voiceDecisionSummary(voice)])), ...options.length === 1 ? { no_match: "No suitable voice is available." } : {} }
+      instructions: rankingInstructions,
+      criteria: { ...Object.fromEntries(options.map(({ index, voice }) => [`voice_${index}`, voiceSummary(voice)])), ...options.length === 1 ? { no_match: "No suitable voice is available." } : {} }
     };
   }
   return { state, questions };
@@ -526,7 +640,7 @@ function buildUncastIdentityReview(groups, answers, message, ghosts = [], messag
     if (candidate && identity && probability >= 0.6 && identity.confidence >= 0.5 && probability - runnerUp >= 0.2 && (probability < 0.8 || identity.confidence < 0.8 || probability - runnerUp < 0.25)) {
       questions[`review_ghost_${group.id}_${ghostChoice[1]}`] = {
         type: "choice",
-        instructions: `Compare the speaker in current group ${group.id} with the previously seen character ${candidate.label || candidate.speakerId}. Read the prior character's conversation history and the full current scene, including other participants? dialogue, relationship clues, and continuity from phone to in-person. Confirm only if they are the same person; distinguish callers, people addressed, and people merely mentioned.`,
+        instructions: `Compare the speaker in current group ${group.id} with the previously seen character ${candidate.label || candidate.speakerId}. Read the prior character's conversation history, interactivityTrail, and the full current scene, including other participants' dialogue, evolving topic, activity, actor/addressee pairs and anchors. Appearance anchors (state.characters[].appearance and state.ghosts[].appearance) identify distinct physical forms of the speaker; unmatched appearance anchors are strong evidence of different individuals, even when both share a generic descriptor like "the girl" or "the guy", and matching anchors strongly support continuity. Activities and conversation topics can evolve over time, so recognize related shifts instead of demanding identical wording. Confirm only if they are the same person; distinguish callers, people addressed, and people merely mentioned.`,
         criteria: { same: "The prior character and current speaker are clearly the same person.", different_or_unclear: "They differ or the evidence is insufficient." }
       };
     }
@@ -546,7 +660,7 @@ function buildUncastIdentityReview(groups, answers, message, ghosts = [], messag
         if (interveningUser && linkedToPrior) {
           questions[`review_continuity_${group.id}_${ghostIndex}`] = {
             type: "choice",
-            instructions: `Compare ghost_${ghostIndex}'s actual speech in the immediately preceding assistant message with the intervening user message and current group ${group.id}, now identified as ${revealedName}. The user may address the earlier speaker and the current dialogue may directly answer that user's question: follow the conversation and narrative actions across all three messages. Do not assume every speaker in the earlier message is this ghost, or that the same setting alone proves identity. Is this clearly the same person, clearly a different person, or genuinely uncertain?`,
+            instructions: `Compare ghost_${ghostIndex}'s actual speech in the immediately preceding assistant message with the intervening user message and current group ${group.id}, now identified as ${revealedName}. The user may address the earlier speaker and the current dialogue may directly answer that user's question: follow the conversation and narrative actions across all three messages. Do not assume every speaker in the earlier message is this ghost, or that the same setting alone proves identity. Appearance anchors (state.ghosts[].appearance and state.characters[].appearance) describe each character's physical form; unmatched appearance anchors are strong evidence of different people. Is this clearly the same person, clearly a different person, or genuinely uncertain?`,
             criteria: { same: "The conversation and scene clearly identify the same person.", different: "The evidence clearly establishes different people.", unclear: "There is not enough evidence to decide." }
           };
           if (Object.keys(questions).length >= 16) break;
@@ -560,7 +674,7 @@ function buildUncastIdentityReview(groups, answers, message, ghosts = [], messag
         if (previousMessages.length && ghost.conversationHistory?.length && Object.keys(questions).length < 16) {
           questions[`review_scene_${group.id}_${ghostIndex}`] = {
             type: "choice",
-            instructions: `Re-read previousMessages, ghost_${ghostIndex}'s own saved conversation history, and the CURRENT exchange. Has the previously unnamed person who spoke in that history now been identified as ${revealedName}, the actual speaker of ${group.id}? Trace who speaks to whom, a continuing conversation, distinctive objects or workstations and their location, associated actions and later naming. Use several agreeing clues together, including intervening user messages. A shared setting, object, profession, or gender alone does not prove identity. Consider multiple people, a new arrival or scene change, and whether the name belongs to an addressee or bystander. Select different_or_unclear when these details do not clearly establish the same individual.`,
+            instructions: `Re-read previousMessages, ghost_${ghostIndex}'s own saved conversation history, interactivityTrail, appearance anchors, and the CURRENT exchange. Has the previously unnamed person who spoke in that history now been identified as ${revealedName}, the actual speaker of ${group.id}? Trace who speaks to whom, the continuing or evolving conversation, topic/activity anchors, objects and workstations and their locations, associated actions, actor/addressee pairings and later naming. Activities and topics can evolve, so use the sequence rather than identical phrasing. Use several agreeing clues together, including intervening user messages. A shared setting, object, profession, gender, appearance match, topic or voice alone does not prove identity. Consider multiple people, a new arrival or scene change, and whether the name belongs to an addressee or bystander. Select different_or_unclear when these details do not clearly establish the same individual.`,
             criteria: { same: "The earlier unnamed character and the newly named speaker are clearly the same individual.", different_or_unclear: "Different individuals, or continuity is not clearly established." }
           };
         }
@@ -620,7 +734,7 @@ function narrationBoostsPair(group, partner) {
   return !!group.narratedName && group.flankPartners?.includes(partner.id) === true && partner.addressee === group.narratedName;
 }
 function resolveUncastVoiceDecisions(groups, voices, answers, ghosts = [], reserved = [], messageId = "", message = "", previousMessageIds = [], random = Math.random) {
-  const used = new Set(reserved.filter(Boolean));
+  const used = /* @__PURE__ */ new Set([...reserved.filter(Boolean), ...ghosts.map((it) => it.voiceId).filter(Boolean)]);
   const assignments = [];
   const roots = /* @__PURE__ */ new Map();
   const linkedGhosts = /* @__PURE__ */ new Map();
@@ -794,16 +908,25 @@ function resolveUncastVoiceDecisions(groups, voices, answers, ghosts = [], reser
     const labelHint = labelGenderHint(ghost?.label || members.map((group) => groupLabels.get(group.id)).find(Boolean) || "");
     const pronounHint = members.find((member) => member.pronounGender && member.pronounPartners?.length)?.pronounGender;
     let gender = jevGender !== "unknown" ? jevGender : labelHint || pronounHint || "unknown";
-    const rankingHint = members.find((member) => member.pronounGender === "male" || member.pronounGender === "female")?.pronounGender;
+    const strongHints = members.map((member) => member.pronounGender && member.anchorStrong ? member.pronounGender : void 0).filter((hint) => hint === "male" || hint === "female");
+    const uniformStrong = strongHints.length && strongHints.every((hint) => hint === strongHints[0]) ? strongHints[0] : void 0;
+    gender = uniformStrong ?? gender;
+    const existingGhost = ghost;
+    if (existingGhost) {
+      const carriedVoice = voices.find((voice) => voice.id === existingGhost.voiceId);
+      if (carriedVoice && !voiceGenderCompatible(carriedVoice, gender)) {
+        ghost = void 0;
+        linkedGhosts.delete(root);
+        linkReasons.delete(root);
+      }
+    }
     if (!ghost) {
       const matches = members.map((group) => answers[`voice_${group.id}`]).filter((answer) => !!answer);
-      const poolGender = rankingHint ?? gender;
       const candidates = voices.flatMap((voice, index) => {
-        if (used.has(voice.id) || !voiceGenderCompatible(voice, poolGender)) return [];
+        if (used.has(voice.id) || !voiceGenderCompatible(voice, gender)) return [];
         const scores = matches.map((match) => match.probabilities[`voice_${index}`] ?? 0).filter((score) => Number.isFinite(score) && score > 0);
         return [{ voice, score: scores.length ? scores.reduce((sum, score) => sum + score, 0) / scores.length : 0 }];
       });
-      if (poolGender !== gender) gender = poolGender;
       if (!candidates.length || !matches.length) continue;
       if (candidates.length > 1 && matches.every((match) => match.choice === "no_match")) continue;
       const shortlist = shortlistRankedVoices(candidates, (entry) => entry.score);
@@ -1449,6 +1572,434 @@ function preparePlaybackContent(content, skippedTrackerTagPairs = "") {
 }
 function cleanPlaybackText(value) {
   return decodePlaybackEntities(stripPlaybackMarkup(value)).replace(/```[\s\S]*?```/g, " ").replace(/`[^`\n]*`/g, " ").replace(/\r\n?/g, "\n").replace(/[^\S\n]+/g, " ").replace(/ *\n */g, "\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+var INTERACTION_STOPWORDS = /* @__PURE__ */ new Set([
+  "a",
+  "an",
+  "and",
+  "are",
+  "as",
+  "at",
+  "be",
+  "been",
+  "but",
+  "by",
+  "can",
+  "could",
+  "did",
+  "do",
+  "does",
+  "doing",
+  "for",
+  "from",
+  "had",
+  "has",
+  "have",
+  "he",
+  "her",
+  "here",
+  "hers",
+  "him",
+  "his",
+  "i",
+  "if",
+  "in",
+  "into",
+  "is",
+  "it",
+  "its",
+  "just",
+  "me",
+  "my",
+  "of",
+  "on",
+  "or",
+  "our",
+  "out",
+  "said",
+  "says",
+  "she",
+  "so",
+  "than",
+  "that",
+  "the",
+  "their",
+  "them",
+  "then",
+  "there",
+  "these",
+  "they",
+  "this",
+  "those",
+  "to",
+  "up",
+  "upon",
+  "us",
+  "very",
+  "was",
+  "we",
+  "were",
+  "what",
+  "when",
+  "which",
+  "who",
+  "will",
+  "with",
+  "you",
+  "your",
+  "about",
+  "after",
+  "again",
+  "also",
+  "another",
+  "because",
+  "before",
+  "being",
+  "but",
+  "each",
+  "every",
+  "first",
+  "get",
+  "gets",
+  "got",
+  "had",
+  "has",
+  "have",
+  "having",
+  "here",
+  "how",
+  "into",
+  "itself",
+  "like",
+  "made",
+  "make",
+  "many",
+  "more",
+  "most",
+  "much",
+  "now",
+  "off",
+  "only",
+  "other",
+  "over",
+  "same",
+  "some",
+  "such",
+  "take",
+  "than",
+  "then",
+  "through",
+  "too",
+  "under",
+  "where",
+  "while",
+  "would",
+  "their",
+  "there",
+  "these",
+  "those",
+  "one",
+  "two",
+  "three",
+  "well",
+  "okay",
+  "said"
+]);
+var INTERACTION_TOKEN_PATTERN = /[\p{L}\p{M}\p{N}]+/gu;
+var stemInteractionToken = (token) => {
+  if (token.length > 5 && token.endsWith("ing")) {
+    const stem = token.slice(0, -3);
+    return stem.endsWith("e") ? stem.slice(0, -1) : stem;
+  }
+  if (token.length > 4 && token.endsWith("ies")) return `${token.slice(0, -3)}y`;
+  if (token.length > 5 && /(?:shes|ches|xes|zes|sses)$/u.test(token)) return token.slice(0, -2);
+  if (token.length > 4 && token.endsWith("s")) return token.slice(0, -1);
+  return token;
+};
+function interactionAnchors(text, limit = 12) {
+  const tokens = (text.toLowerCase().match(INTERACTION_TOKEN_PATTERN) ?? []).map(stemInteractionToken).filter((token) => token.length >= 3 && !INTERACTION_STOPWORDS.has(token) && !/^\d+$/u.test(token));
+  const counts = /* @__PURE__ */ new Map();
+  const first = /* @__PURE__ */ new Map();
+  const bump = (value, weight, index) => {
+    counts.set(value, (counts.get(value) ?? 0) + weight);
+    if (!first.has(value)) first.set(value, index);
+  };
+  for (let index = 0; index < tokens.length; index += 1) {
+    bump(tokens[index], 3, index);
+    if (index < tokens.length - 1) bump(`${tokens[index]} ${tokens[index + 1]}`, 2, index);
+  }
+  return [...counts.entries()].sort((a, b) => b[1] - a[1] || (first.get(a[0]) ?? 0) - (first.get(b[0]) ?? 0) || a[0].localeCompare(b[0])).slice(0, Math.max(1, Math.round(limit))).map(([anchor]) => anchor);
+}
+var APPEARANCE_MODIFIERS = /* @__PURE__ */ new Set([
+  "faded",
+  "dark",
+  "light",
+  "pale",
+  "bright",
+  "muted",
+  "soft",
+  "washed",
+  "distressed",
+  "ripped",
+  "torn",
+  "tight",
+  "loose",
+  "baggy",
+  "fitted",
+  "cropped",
+  "oversized",
+  "wide",
+  "narrow",
+  "striped",
+  "stripy",
+  "plain",
+  "solid",
+  "floral",
+  "plaid",
+  "patterned",
+  "camouflage",
+  "checkered",
+  "houndstooth",
+  "paisley",
+  "gingham",
+  "polka",
+  "maroon",
+  "crimson",
+  "navy",
+  "teal",
+  "olive",
+  "magenta",
+  "scarlet",
+  "amber",
+  "ochre",
+  "umber",
+  "crimson",
+  "indigo",
+  "violet",
+  "purple",
+  "lavender",
+  "lilac",
+  "azure",
+  "cerulean",
+  "aquamarine",
+  "royal",
+  "grey",
+  "gray",
+  "ashen",
+  "leaden",
+  "silver",
+  "charcoal",
+  "black",
+  "white",
+  "offwhite",
+  "cream",
+  "beige",
+  "tan",
+  "khaki",
+  "brown",
+  "chestnut",
+  "walnut",
+  "auburn",
+  "sepia",
+  "golden",
+  "bronze",
+  "auburn",
+  "rust",
+  "coral",
+  "salmon",
+  "rose",
+  "rosewood",
+  "blue",
+  "red",
+  "green",
+  "yellow",
+  "orange",
+  "pink",
+  "gold",
+  "glows",
+  "glowy",
+  "meringue",
+  "glossy",
+  "matte",
+  "shiny",
+  "silky",
+  "velvet",
+  "denim",
+  "cotton",
+  "wool",
+  "linen",
+  "leather",
+  "suede",
+  "flannel",
+  "fleece",
+  "nylon",
+  "polyester",
+  "spandex",
+  "rayon",
+  "cashmere",
+  "silk",
+  "soccer",
+  "football",
+  "basketball",
+  "track",
+  "running",
+  "cycling",
+  "gym",
+  "sport",
+  "athletic",
+  "tennis",
+  "golf",
+  "motocross",
+  "motorcycle",
+  "leather",
+  "chainmail",
+  "tactical",
+  "military",
+  "work",
+  "school",
+  "uniform",
+  "dress",
+  "formal",
+  "wedding",
+  "party",
+  "church",
+  "casual",
+  "weekend",
+  "evening",
+  "bra",
+  "bralette",
+  "drawstring",
+  "zipper",
+  "zippered",
+  "hooded",
+  "buttoned",
+  "laced",
+  "collared",
+  "cuffed",
+  "furred",
+  "fleece",
+  "ribbed",
+  "slubbed",
+  "textured",
+  "quilted",
+  "pleated",
+  "creased",
+  "rolled"
+]);
+var APPEARANCE_GARMENTS = /* @__PURE__ */ new Set([
+  "hoodie",
+  "sweatshirt",
+  "sweater",
+  "jumper",
+  "t-shirt",
+  "tee",
+  "shirt",
+  "polo",
+  "blouse",
+  "top",
+  "tank",
+  "cami",
+  "camisole",
+  "vest",
+  "waistcoat",
+  "blazer",
+  "jacket",
+  "windbreaker",
+  "coat",
+  "overcoat",
+  "trench",
+  "mackintosh",
+  "parka",
+  "anorak",
+  "cardigan",
+  "dress",
+  "gown",
+  "skirt",
+  "pants",
+  "trousers",
+  "jeans",
+  "shorts",
+  "overalls",
+  "jumpsuit",
+  "romper",
+  "sweatpants",
+  "joggers",
+  "leggings",
+  "tights",
+  "trunks",
+  "briefs",
+  "boxers",
+  "shorts",
+  "underpants",
+  "lingerie",
+  "bra",
+  "panties",
+  "underwear",
+  "thong",
+  "socks",
+  "stockings",
+  "shoes",
+  "sneakers",
+  "boots",
+  "loafers",
+  "heels",
+  "sandals",
+  "sneakers",
+  "cleats",
+  "belt",
+  "scarf",
+  "tie",
+  "bowtie",
+  "bow",
+  "hat",
+  "cap",
+  "beanie",
+  "beret",
+  "visor",
+  "glasses",
+  "sunglasses",
+  "watch",
+  "ring",
+  "bracelet",
+  "earring",
+  "necklace",
+  "gloves",
+  "mittens",
+  "scrubs",
+  "apron",
+  "towel",
+  "bandana",
+  "headband",
+  "bonnet",
+  "veil"
+]);
+function appearanceAnchors(text, limit = 12) {
+  const tokens = text.toLowerCase().match(/[\p{L}\p{M}\p{N}-]+/gu) ?? [];
+  const found = [];
+  const seen = /* @__PURE__ */ new Set();
+  const push = (phrase) => {
+    if (!seen.has(phrase) && phrase.length >= 4) {
+      seen.add(phrase);
+      found.push(phrase);
+    }
+  };
+  for (let index = tokens.length - 1; index >= 0; index -= 1) {
+    const token = tokens[index];
+    if (!APPEARANCE_GARMENTS.has(token) && !APPEARANCE_GARMENTS.has(token.endsWith("s") ? token.slice(0, -1) : token)) continue;
+    const garment = token.endsWith("s") && APPEARANCE_GARMENTS.has(token.slice(0, -1)) ? token.slice(0, -1) : token;
+    let start = index;
+    while (start > 0) {
+      const prev = tokens[start - 1];
+      if (!APPEARANCE_MODIFIERS.has(prev)) break;
+      start -= 1;
+    }
+    const phrase = tokens.slice(start, index + 1).join(" ");
+    push(phrase);
+    for (let cursor = start; cursor < index; cursor += 1) {
+      push(`${tokens[cursor]} ${garment}`);
+    }
+  }
+  return found.slice(0, limit);
 }
 var SPEECH_VERBS = "(?:said|says|asked|asks|replied|replies|whispered|whispers|shouted|shouts|yelled|yells|called|calls|murmured|murmurs|answered|answers|added|adds|continued|continues|remarked|remarks|cried|cries|growled|growls|sighed|sighs)";
 function escapedPattern(value) {
@@ -2132,6 +2683,17 @@ function buildAssistantUserSpeakerReview(plan, answers) {
   }
   return { state: plan.state, questions };
 }
+function measureJevDecisionPayload(state, questions) {
+  const encoder = new TextEncoder();
+  const stateBytes = encoder.encode(JSON.stringify(state) ?? "").byteLength;
+  const questionsBytes = encoder.encode(JSON.stringify(questions) ?? "").byteLength;
+  return {
+    stateBytes,
+    questionsBytes,
+    payloadBytes: stateBytes + questionsBytes,
+    questionCount: Object.keys(questions).length
+  };
+}
 function applyAssistantUserSpeakerReview(plan, answers, reviewed) {
   for (const speech of plan.state.speeches) {
     const result = reviewed[`user_review_${speech.id}`];
@@ -2210,7 +2772,7 @@ function relationshipReviewContext(messages, targetId, ghosts, skippedTags = "",
     if (remaining <= 0) return [];
     const text = preparePlaybackContent(message.content ?? "", skippedTags).slice(-Math.min(4e3, remaining));
     remaining -= text.length;
-    return text ? [{ id: message.id, role: message.is_user ? "user" : "assistant", text }] : [];
+    return text ? [{ id: message.id, role: message.is_user ? "user" : "assistant", text, anchors: interactionAnchors(text, 8) }] : [];
   }).reverse();
   let ghostBudget = 12e3;
   const takeGhostText = (text, limit2) => {
@@ -2229,7 +2791,8 @@ function relationshipReviewContext(messages, targetId, ghosts, skippedTags = "",
   const safeGhosts = candidates.map(({ ghost, index, safeCurrent, historical }) => {
     const context = safeCurrent ? takeGhostText(ghost.context, 1200) : "";
     const conversationHistory = historical.slice(-3).reverse().map((entry) => ({ messageId: entry.messageId, text: takeGhostText(entry.text, 1200) })).filter((entry) => entry.text).reverse();
-    return { index, value: { id: ghost.id, label: safeCurrent ? ghost.label ?? "" : "", aliases: safeCurrent ? ghostCastAliases(ghost) : [], context, conversationHistory } };
+    const interactivityTrail = (ghost.interactivityTrail ?? []).slice(-4);
+    return { index, value: { id: ghost.id, label: safeCurrent ? ghost.label ?? "" : "", aliases: safeCurrent ? ghostCastAliases(ghost) : [], context, conversationHistory, ...interactivityTrail.length ? { interactivityTrail } : {} } };
   }).sort((a, b) => a.index - b.index).map((item) => item.value);
   return { previousMessages, ghosts: safeGhosts };
 }
@@ -2297,7 +2860,7 @@ function buildRelationshipSpeakerReview(plan, answers, context, continuitySpeake
       if (local.identity && local.identity !== UNCAST_SPEAKER_ID && !conflict && !phoneExchange && !globalOptions?.targets.includes(speech.id) && !openingTargets.has(speech.id)) continue;
       questions[`relationship_${speech.id}`] = {
         type: "choice",
-        instructions: `Who actually speaks quotation ${speech.id}? Read its entire dialogue run together, including later quotations and narration in the current message. Compare the topic and wording with the preceding role-labeled exchange, including user messages: identify who spoke, whom they addressed, and whether this quote responds or continues. For an opening reply, consider the recipient of the preceding relevant utterance as a candidate, and trace distinctive objects, actions and pronouns into the current scene. A user message may contain several utterances or descriptions: identify the relevant exchange, not just its last name or the message author. Weigh semantic continuity and the whole run, but do not assume the addressee responds or that all quotes share a speaker. Connect people across messages using names, aliases, actions, pronouns and carried objects. A person who merely observes, is addressed, or passes by is not automatically speaking. Distinguish in-person dialogue from a caller or text sender. Pronouns are evidence, not proof of gender or identity. Prefer explicit attribution and select no_clear_identity when evidence is insufficient.`,
+        instructions: `Who actually speaks quotation ${speech.id}? Read its entire dialogue run together, including later quotations and narration in the current message. Treat actors, addressees, participants and the continuing activity as anchors within and across messages: same pair, same topic, same ongoing activity and role are strong continuity clues, while a new addressee, changed activity or changed scene can break them. Compare the topic and wording with the preceding role-labeled exchange, including user messages: identify who spoke, whom they addressed, and whether this quote responds or continues. For an opening reply, consider the recipient of the preceding relevant utterance as a candidate, and trace distinctive objects, actions and pronouns into the current scene. A user message may contain several utterances or descriptions: identify the relevant exchange, not just its last name or the message author. Weigh semantic continuity and the whole run, but do not assume the addressee responds or that all quotes share a speaker. Connect people across messages using names, aliases, actions, pronouns and carried objects. A person who merely observes, is addressed, or passes by is not automatically speaking. Distinguish in-person dialogue from a caller or text sender. Pronouns are evidence, not proof of gender or identity. Prefer explicit attribution and select no_clear_identity when evidence is insufficient.`,
         criteria
       };
       if (globalOptions && globalOptions.strategy !== "run") {
@@ -3673,107 +4236,140 @@ function ttsPauseCriteria() {
     [TTS_NO_PAUSE_OPTION, "No inserted pause. Most lines should choose this."]
   ]);
 }
-function buildTtsTagPlan(plan, speechIds, emotionOptions = TTS_AUTO_EMOTION_OPTIONS, style = "gemini", enableModulation = false) {
+function ttsTersePhrase(description) {
+  const sentence = description.split(". ")[0] ?? description;
+  return sentence.replace(/\.+$/u, "").trim();
+}
+function ttsTerseCriteria(criteria) {
+  const next = {};
+  for (const [key, value] of Object.entries(criteria)) next[key] = ttsTersePhrase(value);
+  return next;
+}
+var TTS_NARRATION_WINDOW = 320;
+function buildTtsTagPlan(plan, speechIds, emotionOptions = TTS_AUTO_EMOTION_OPTIONS, style = "gemini", enableModulation = false, phase = "all", needs = {}, tagStateOptions) {
   const allowed = speechIds ? new Set(speechIds) : null;
+  const scoped = tagStateOptions?.scoped === true;
   const speeches = plan.state.speeches.filter((speech) => !allowed || allowed.has(speech.id)).map((speech) => ({
     id: speech.id,
     paragraphId: speech.paragraphId,
     text: speech.text,
-    narrativeBefore: speech.narrativeBefore,
-    narrativeAfter: speech.narrativeAfter
+    narrativeBefore: scoped ? speech.narrativeBefore.slice(-TTS_NARRATION_WINDOW) : speech.narrativeBefore,
+    narrativeAfter: scoped ? speech.narrativeAfter.slice(0, TTS_NARRATION_WINDOW) : speech.narrativeAfter
   }));
-  const emotionCriteria = ttsEmotionCriteria(emotionOptions);
+  const terseCriteria = tagStateOptions?.terse === true ? ttsTerseCriteria : (criteria) => criteria;
+  const phrase = tagStateOptions?.terse === true ? ttsTersePhrase : (description) => description;
+  const emotionCriteria = terseCriteria(ttsEmotionCriteria(emotionOptions));
   const soundOptions = style === "fish" ? TTS_FISH_SOUND_OPTIONS : style === "gemini38" ? TTS_GEMINI38_SOUND_OPTIONS : TTS_TAG_OPTIONS;
-  const soundCriteria = ttsSoundCriteria(soundOptions);
-  const styleCriteria = ttsStyleCriteria();
-  const pauseCriteria = ttsPauseCriteria();
+  const soundCriteria = terseCriteria(ttsSoundCriteria(soundOptions));
+  const styleCriteria = terseCriteria(ttsStyleCriteria());
+  const pauseCriteria = terseCriteria(ttsPauseCriteria());
   const questions = {};
   const positions = {};
   const pausePositions = {};
   const modulationPositions = {};
   for (const speech of speeches) {
+    const includePrimary = phase !== "secondary";
+    const includeSecondary = phase !== "primary";
+    const needsForSpeech = phase === "secondary" ? { emotion2: needs[speech.id]?.emotion2 === true, sound: needs[speech.id]?.sound === true, pause: needs[speech.id]?.pause === true, modulationpos: needs[speech.id]?.modulationpos === true } : { emotion2: phase === "all", sound: phase === "all", pause: phase === "all", modulationpos: phase === "all" };
     if (style !== "gemini38") {
-      questions[`emotion_${speech.id}`] = {
-        type: "choice",
-        instructions: `Which emotion best describes how quotation ${speech.id} is delivered? Use the quotation and its surrounding narration. Every quotation receives exactly one primary emotion; choose calm for neutral delivery.`,
-        criteria: emotionCriteria
-      };
-      questions[`emotion2_${speech.id}`] = {
-        type: "choice",
-        instructions: `Is there a distinct secondary emotion layered into quotation ${speech.id}? Choose no_emotion unless a second emotion is clearly present and compatible with the primary.`,
-        criteria: {
-          ...emotionCriteria,
-          [TTS_NO_EMOTION_OPTION]: "No distinct secondary emotion. Most lines should choose this."
-        }
-      };
+      if (includePrimary) {
+        questions[`emotion_${speech.id}`] = {
+          type: "choice",
+          instructions: `Which emotion best describes how quotation ${speech.id} is delivered? Use the quotation and its surrounding narration. Every quotation receives exactly one primary emotion; choose calm for neutral delivery.`,
+          criteria: emotionCriteria
+        };
+      }
+      if (includeSecondary && needsForSpeech.emotion2) {
+        questions[`emotion2_${speech.id}`] = {
+          type: "choice",
+          instructions: `Is there a distinct secondary emotion layered into quotation ${speech.id}? Choose no_emotion unless a second emotion is clearly present and compatible with the primary.`,
+          criteria: {
+            ...emotionCriteria,
+            [TTS_NO_EMOTION_OPTION]: phrase("No distinct secondary emotion. Most lines should choose this.")
+          }
+        };
+      }
     }
     if (style === "fish") {
-      questions[`style_${speech.id}`] = {
-        type: "choice",
-        instructions: `Does quotation ${speech.id} have a sustained voice style that should lead the speech? Choose no_style unless a whisper, soft/loud/low voice, shout, or scream clearly applies to the whole quotation. Do not use this for a momentary sound.`,
-        criteria: {
-          ...styleCriteria,
-          [TTS_NO_STYLE_OPTION]: "No sustained voice style. Most lines should choose this."
-        }
-      };
+      if (includePrimary) {
+        questions[`style_${speech.id}`] = {
+          type: "choice",
+          instructions: `Does quotation ${speech.id} have a sustained voice style that should lead the speech? Choose no_style unless a whisper, soft/loud/low voice, shout, or scream clearly applies to the whole quotation. Do not use this for a momentary sound.`,
+          criteria: {
+            ...styleCriteria,
+            [TTS_NO_STYLE_OPTION]: phrase("No sustained voice style. Most lines should choose this.")
+          }
+        };
+      }
       if (enableModulation) {
         const modulationOptions = ttsModulationPositionOptions(speech.text);
         if (modulationOptions.length > 0) {
           modulationPositions[speech.id] = modulationOptions;
-          questions[`modulation_${speech.id}`] = {
-            type: "choice",
-            instructions: `Does quotation ${speech.id} have a clear internal emotional turn that should change delivery before the quotation ends? Choose modulation only when the emotion genuinely shifts and the new delivery should continue to the end. Ignore momentary sounds, ordinary punctuation, and small intensity changes.`,
-            criteria: {
-              modulation: "A clear, sustained emotional turn inside the quotation.",
-              no_modulation: "No clear internal emotional turn. Most lines should choose this."
-            }
-          };
-          questions[`modulationpos_${speech.id}`] = {
-            type: "choice",
-            instructions: `If quotation ${speech.id} receives a modulation, where should the new emotion begin? Choose the boundary closest to the emotional turn.`,
-            criteria: Object.fromEntries(modulationOptions.map((option) => [option.id, option.description]))
-          };
+          if (includePrimary) {
+            questions[`modulation_${speech.id}`] = {
+              type: "choice",
+              instructions: `Does quotation ${speech.id} have a clear internal emotional turn that should change delivery before the quotation ends? Choose modulation only when the emotion genuinely shifts and the new delivery should continue to the end. Ignore momentary sounds, ordinary punctuation, and small intensity changes.`,
+              criteria: {
+                modulation: phrase("A clear, sustained emotional turn inside the quotation."),
+                no_modulation: phrase("No clear internal emotional turn. Most lines should choose this.")
+              }
+            };
+          }
+          if (includeSecondary && needsForSpeech.modulationpos) {
+            questions[`modulationpos_${speech.id}`] = {
+              type: "choice",
+              instructions: `If quotation ${speech.id} receives a modulation, where should the new emotion begin? Choose the boundary closest to the emotional turn.`,
+              criteria: terseCriteria(Object.fromEntries(modulationOptions.map((option) => [option.id, option.description])))
+            };
+          }
         }
       }
     }
-    questions[`tag_${speech.id}`] = {
-      type: "choice",
-      instructions: `Does quotation ${speech.id} contain one momentary sound effect that should be performed? Use the quotation and its surrounding narration. Most quotations need none; choose no_tag unless the sound is unmistakable. Never use ambient sound, sustained mood, or hesitation.`,
-      criteria: soundCriteria
-    };
-    questions[`tag2_${speech.id}`] = {
-      type: "choice",
-      instructions: `Does quotation ${speech.id} contain a second distinct momentary sound effect? Choose no_tag unless a second sound is clearly present near a different moment.`,
-      criteria: soundCriteria
-    };
+    if (includePrimary) {
+      questions[`tag_${speech.id}`] = {
+        type: "choice",
+        instructions: `Does quotation ${speech.id} contain one momentary sound effect that should be performed? Use the quotation and its surrounding narration. Most quotations need none; choose no_tag unless the sound is unmistakable. Never use ambient sound, sustained mood, or hesitation.`,
+        criteria: soundCriteria
+      };
+    }
     const speechPositions = ttsTagPositionOptions(speech.text);
     positions[speech.id] = speechPositions;
-    questions[`tagpos_${speech.id}`] = {
-      type: "choice",
-      instructions: `If quotation ${speech.id} receives a sound effect, where should it be inserted? Choose the boundary closest to the exact sound.`,
-      criteria: Object.fromEntries(speechPositions.map((option) => [option.id, option.description]))
-    };
-    questions[`pause_${speech.id}`] = {
-      type: "choice",
-      instructions: `Does quotation ${speech.id} need one inserted dramatic pause? Choose no_pause unless a pause clearly improves timing.`,
-      criteria: pauseCriteria
-    };
-    questions[`pause2_${speech.id}`] = {
-      type: "choice",
-      instructions: `Does quotation ${speech.id} need a second distinct pause at another moment? Choose no_pause unless a second pause clearly improves timing.`,
-      criteria: pauseCriteria
-    };
+    if (includeSecondary && needsForSpeech.sound) {
+      questions[`tag2_${speech.id}`] = {
+        type: "choice",
+        instructions: `Does quotation ${speech.id} contain a second distinct momentary sound effect? Choose no_tag unless a second sound is clearly present near a different moment.`,
+        criteria: soundCriteria
+      };
+      questions[`tagpos_${speech.id}`] = {
+        type: "choice",
+        instructions: `If quotation ${speech.id} receives a sound effect, where should it be inserted? Choose the boundary closest to the exact sound.`,
+        criteria: terseCriteria(Object.fromEntries(speechPositions.map((option) => [option.id, option.description])))
+      };
+    }
+    if (includePrimary) {
+      questions[`pause_${speech.id}`] = {
+        type: "choice",
+        instructions: `Does quotation ${speech.id} need one inserted dramatic pause? Choose no_pause unless a pause clearly improves timing.`,
+        criteria: pauseCriteria
+      };
+    }
     pausePositions[speech.id] = speechPositions;
-    questions[`pausepos_${speech.id}`] = {
-      type: "choice",
-      instructions: `If quotation ${speech.id} receives a pause, where should it be inserted? Choose the boundary closest to the intended pause.`,
-      criteria: Object.fromEntries(speechPositions.map((option) => [option.id, option.description]))
-    };
+    if (includeSecondary && needsForSpeech.pause) {
+      questions[`pause2_${speech.id}`] = {
+        type: "choice",
+        instructions: `Does quotation ${speech.id} need a second distinct pause at another moment? Choose no_pause unless a second pause clearly improves timing.`,
+        criteria: pauseCriteria
+      };
+      questions[`pausepos_${speech.id}`] = {
+        type: "choice",
+        instructions: `If quotation ${speech.id} receives a pause, where should it be inserted? Choose the boundary closest to the intended pause.`,
+        criteria: terseCriteria(Object.fromEntries(speechPositions.map((option) => [option.id, option.description])))
+      };
+    }
   }
   return {
     state: {
       messageRole: plan.state.messageRole,
-      message: plan.state.message,
       speeches
     },
     questions,
@@ -4699,6 +5295,16 @@ function assessSpeakerDiscourseEscalation(plan, answers, options = {}) {
     runs
   };
 }
+function hasUncertainFirstPass(plan, answers) {
+  const assessment = assessSpeakerDiscourseEscalation(plan, answers);
+  if (assessment.runs.some((run) => run.triggers.length > 0)) return true;
+  for (const speech of plan.state.speeches) {
+    const evaluation = evaluateSpeakerDecisionAnswer(answers[`speech_${speech.id}`], plan.optionSpeakerIds, SPEAKER_DECISION_THRESHOLDS.local);
+    if (!evaluation.resolved) return true;
+    if (evaluation.leadingMargin < SPEAKER_DECISION_THRESHOLDS.local.margin) return true;
+  }
+  return false;
+}
 function resolveSpeakerDiscourseAnswers(discourse, answers) {
   const outcomes = /* @__PURE__ */ new Map();
   const evidenceById = new Map(discourse.state.firstPass.map((entry) => [entry.speechId, entry]));
@@ -5528,6 +6134,9 @@ function applyConfigToMetadata(metadata, config) {
   return result;
 }
 
+// src/version.ts
+var BUILD_VERSION = "3.33.0";
+
 // src/uuid.ts
 var lastTimestamp = 0;
 var counter = 0;
@@ -5732,7 +6341,7 @@ function appendSpeakerDebugReason(segments, reason, enabled) {
     debugPath: [...segment.debugPath ?? [], reason]
   }));
 }
-async function evaluateTtsTagSelections(plan, style, userId, enableModulation = false) {
+async function evaluateTtsTagSelections(plan, style, userId, enableModulation = false, debug = false, reduction = FULL_REDUCTION_COMPONENTS) {
   const selections = /* @__PURE__ */ new Map();
   if (plan.state.speeches.length === 0) return { selections, failed: false };
   const hasCapability = (spindle.host.capabilities["decisions-v1"] ?? 0) >= 1;
@@ -5743,6 +6352,7 @@ async function evaluateTtsTagSelections(plan, style, userId, enableModulation = 
   }
   let failed = false;
   let failure = "";
+  const tagStateOptions = { scoped: reduction.scopedTtsState, terse: reduction.dedupTagCriteria };
   const resolveChunk = (tagPlan, answers) => {
     const resolved = resolveTtsTagAnswers(tagPlan, answers, style);
     for (const [id, selection] of resolved) {
@@ -5755,7 +6365,7 @@ async function evaluateTtsTagSelections(plan, style, userId, enableModulation = 
   };
   if (!hasCapability) {
     markFallback(resolveChunk(
-      buildTtsTagPlan(plan, void 0, TTS_AUTO_EMOTION_OPTIONS, style, enableModulation),
+      buildTtsTagPlan(plan, void 0, TTS_AUTO_EMOTION_OPTIONS, style, enableModulation, "all", {}, tagStateOptions),
       {}
     ));
     return {
@@ -5764,26 +6374,74 @@ async function evaluateTtsTagSelections(plan, style, userId, enableModulation = 
       error: "Decision capability unavailable"
     };
   }
+  const combinedAnswers = (first, second) => ({ ...first, ...second });
   const evaluateIds = async (ids, emotionOptions = TTS_AUTO_EMOTION_OPTIONS) => {
-    const tagPlan = buildTtsTagPlan(plan, ids, emotionOptions, style, enableModulation);
-    const result = await spindle.decisions.evaluate({
-      state: tagPlan.state,
-      questions: tagPlan.questions,
-      ...userId ? { userId } : {}
-    });
-    const answers = {};
-    for (const [questionId, answer] of Object.entries(result.answers)) {
-      if (answer.type !== "choice") continue;
-      answers[questionId] = {
-        choice: answer.choice,
-        probabilities: answer.probabilities,
-        confidence: answer.confidence
+    const evaluatePlan = async (tagPlan) => {
+      const result = await spindle.decisions.evaluate({
+        state: tagPlan.state,
+        questions: tagPlan.questions,
+        ...userId ? { userId } : {}
+      });
+      const answers = {};
+      for (const [questionId, answer] of Object.entries(result.answers)) {
+        if (answer.type !== "choice") continue;
+        answers[questionId] = {
+          choice: answer.choice,
+          probabilities: answer.probabilities,
+          confidence: answer.confidence
+        };
+      }
+      if (Object.keys(answers).length === 0) {
+        throw new Error("Decision returned no choice answers");
+      }
+      return answers;
+    };
+    if (!reduction.twoPhaseTagReview) {
+      const singlePlan = buildTtsTagPlan(plan, ids, emotionOptions, style, enableModulation, "all", {}, tagStateOptions);
+      if (debug) {
+        const budget = measureJevDecisionPayload(singlePlan.state, singlePlan.questions);
+        spindle.log.info(`[Chat Voice] Jev tag single-pass budget: speeches=${ids.length}, questions=${budget.questionCount}, state=${budget.stateBytes}B, criteria=${budget.questionsBytes}B`);
+      }
+      const singleAnswers = await evaluatePlan(singlePlan);
+      return { tagPlan: singlePlan, answers: singleAnswers };
+    }
+    const primaryPlan = buildTtsTagPlan(plan, ids, emotionOptions, style, enableModulation, "primary", {}, tagStateOptions);
+    if (debug) {
+      const budget = measureJevDecisionPayload(primaryPlan.state, primaryPlan.questions);
+      spindle.log.info(`[Chat Voice] Jev tag primary budget: speeches=${ids.length}, questions=${budget.questionCount}, state=${budget.stateBytes}B, criteria=${budget.questionsBytes}B`);
+    }
+    const primaryAnswers = await evaluatePlan(primaryPlan);
+    const primarySelections = resolveTtsTagAnswers(primaryPlan, primaryAnswers, style);
+    const needs = {};
+    for (const id of ids) {
+      const emotion = primaryAnswers[`emotion_${id}`];
+      const selection = primarySelections.get(id);
+      const emotionNeedsFollowup = style !== "gemini38" && (!emotion || emotion.choice !== "calm");
+      const need = {
+        ...emotionNeedsFollowup ? { emotion2: true } : {},
+        ...(selection?.sounds.length ?? 0) > 0 ? { sound: true } : {},
+        ...(selection?.pauses.length ?? 0) > 0 ? { pause: true } : {},
+        ...selection?.modulation === true ? { modulationpos: true } : {}
       };
+      if (Object.keys(need).length) needs[id] = need;
     }
-    if (Object.keys(answers).length === 0) {
-      throw new Error("Decision returned no choice answers");
+    let secondaryAnswers = {};
+    const secondaryIds = Object.keys(needs);
+    if (secondaryIds.length) {
+      try {
+        const secondaryPlan = buildTtsTagPlan(plan, secondaryIds, emotionOptions, style, enableModulation, "secondary", needs, tagStateOptions);
+        if (debug) {
+          const budget = measureJevDecisionPayload(secondaryPlan.state, secondaryPlan.questions);
+          spindle.log.info(`[Chat Voice] Jev tag secondary budget: speeches=${secondaryIds.length}, questions=${budget.questionCount}, state=${budget.stateBytes}B, criteria=${budget.questionsBytes}B`);
+        }
+        secondaryAnswers = await evaluatePlan(secondaryPlan);
+      } catch (secondaryError) {
+        failure = secondaryError instanceof Error ? secondaryError.message : String(secondaryError);
+        spindle.log.warn(`[Chat Voice] Secondary TTS tag refinement failed; retaining the primary result: ${failure}`);
+      }
     }
-    return { tagPlan, answers };
+    const fullPlan = buildTtsTagPlan(plan, ids, emotionOptions, style, enableModulation, "all", {}, tagStateOptions);
+    return { tagPlan: fullPlan, answers: combinedAnswers(primaryAnswers, secondaryAnswers) };
   };
   const evaluateChunk = async (ids) => {
     try {
@@ -5801,7 +6459,7 @@ async function evaluateTtsTagSelections(plan, style, userId, enableModulation = 
         } catch (compactError) {
           failure = compactError instanceof Error ? compactError.message : String(compactError);
           markFallback(resolveChunk(
-            buildTtsTagPlan(plan, ids, TTS_COMPACT_EMOTION_OPTIONS, style, enableModulation),
+            buildTtsTagPlan(plan, ids, TTS_COMPACT_EMOTION_OPTIONS, style, enableModulation, "all", {}, tagStateOptions),
             {}
           ));
           return false;
@@ -5820,7 +6478,7 @@ async function evaluateTtsTagSelections(plan, style, userId, enableModulation = 
           } catch (compactError) {
             failure = compactError instanceof Error ? compactError.message : String(compactError);
             markFallback(resolveChunk(
-              buildTtsTagPlan(plan, [id], TTS_COMPACT_EMOTION_OPTIONS, style, enableModulation),
+              buildTtsTagPlan(plan, [id], TTS_COMPACT_EMOTION_OPTIONS, style, enableModulation, "all", {}, tagStateOptions),
               {}
             ));
             return false;
@@ -6108,6 +6766,7 @@ async function saveGhostVoiceAssignments(chatId, messageId, assistantIds, groups
       if (revealedName && (!ghost.label || isDescriptiveGhostLabel(ghost.label))) ghost.label = revealedName;
       else if (!ghost.label && assignment.label) ghost.label = assignment.label;
       updateGhostConversationHistory(ghost, messageId, conversation, currentAssistantIds);
+      updateGhostInteractivityTrail(ghost, messageId, conversation, currentAssistantIds);
       const occurrence = `${messageId}:${hashMessageContent(group.speeches.join("\n"))}`;
       if (!ghost.occurrenceKeys.includes(occurrence)) ghost.occurrenceKeys = [...ghost.occurrenceKeys, occurrence].slice(-100);
       recordGhostOccurrence(ghost, messageId, sourceHash, hashMessageContent(group.speeches.join("\n")), assignment.matchReason ?? "unspecified");
@@ -6175,6 +6834,7 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
       userAliases.join(" / ") || "User"
     );
     const skippedTrackerTags = payload.skippedTrackerTags.slice(0, 4e3);
+    const reduction = readReductionComponents(payload.reduction);
     const assistantIds = messages.filter((item) => !item.is_user).map((item) => item.id);
     const anchor = message.is_user ? messages.slice(0, messageIndex).filter((item) => !item.is_user).at(-1)?.id ?? "" : message.id;
     const lifetime = Number.isFinite(payload.ghostVoiceLifetime) ? Math.min(1e3, Math.max(1, Math.round(payload.ghostVoiceLifetime))) : 10;
@@ -6249,6 +6909,7 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
           cardSpeakerId: titleMatchedCardSpeakerId,
           historicalSpeakerId,
           relationshipReview: { version: "cross-message-run-22", context: relationshipContext, speakerLookback, strategy: payload.runReview !== false ? "run" : "scene", focusedOpeningFallback: payload.focusedOpeningFallback === true, bestAvailableSpeaker: payload.bestAvailableSpeaker !== false },
+          reduction,
           skippedTrackerTags
         }));
         const cached = config.parsedMessages[payload.messageId];
@@ -6262,7 +6923,7 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
           }, userId, frontendSessionId);
           return;
         }
-        const tagSelectionsPromise = tagStyle !== "off" ? evaluateTtsTagSelections(decisionPlan, tagStyle, userId, enableModulation) : null;
+        const tagSelectionsPromise = tagStyle !== "off" ? evaluateTtsTagSelections(decisionPlan, tagStyle, userId, enableModulation, payload.debug, reduction) : null;
         try {
           const firstPassStartedAt = Date.now();
           const result = await spindle.decisions.evaluate({
@@ -6282,9 +6943,15 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
           }
           if (payload.debug) snapshotSpeakerFirstPass(decisionPlan, answers);
           suppressUngroundedSpeakerChoices(decisionPlan, answers, relationshipContext, titleMatchedCardSpeakerId);
-          const userReview = buildAssistantUserSpeakerReview(decisionPlan, answers);
+          const reductionGates = [];
+          const uncertainFirstPass = hasUncertainFirstPass(decisionPlan, answers);
+          const auxReviewsEnabled = !reduction.gatedAuxReviews || uncertainFirstPass;
+          const relationshipReviewDeferred = reduction.deferRelationshipReview && !uncertainFirstPass;
+          if (reduction.gatedAuxReviews && !auxReviewsEnabled) reductionGates.push("auxiliary-reviews=deferred (clear first pass)");
+          if (relationshipReviewDeferred) reductionGates.push("relationship-review=deferred (clear first pass)");
+          const userReview = auxReviewsEnabled ? buildAssistantUserSpeakerReview(decisionPlan, answers) : null;
           let userReviewFailed = false;
-          if (Object.keys(userReview.questions).length) {
+          if (userReview && Object.keys(userReview.questions).length) {
             try {
               const reviewResult = await spindle.decisions.evaluate({ state: userReview.state, questions: userReview.questions, ...userId ? { userId } : {} });
               const reviewed = {};
@@ -6298,7 +6965,7 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
             }
           }
           const discourseAssessment = assessSpeakerDiscourseEscalation(decisionPlan, answers);
-          const relationshipReview = buildRelationshipSpeakerReview(decisionPlan, answers, relationshipContext, null, {
+          const relationshipReview = relationshipReviewDeferred ? null : buildRelationshipSpeakerReview(decisionPlan, answers, relationshipContext, null, {
             cardSpeakerId: titleMatchedCardSpeakerId,
             targets: [...new Set(discourseAssessment.runs.flatMap((run) => run.targets))],
             strategy: payload.runReview !== false ? "run" : "scene"
@@ -6325,8 +6992,10 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
           let bestAvailableRetry = false;
           let selfIntroductionRetry = false;
           let speakerSwitchRetry = false;
-          let relationshipSceneDiagnostic = `strategy=${payload.runReview !== false ? "run" : "scene"}; global-context=${relationshipContext.previousMessages.length} messages, ${relationshipContext.previousMessages.reduce((sum, item) => sum + item.text.length, 0)} characters; target=${decisionPlan.state.message.length} characters; first-pass=${decisionQuestionCount} questions/${firstPassDuration}ms; review=${Object.keys(relationshipReview.questions).length} questions; candidates=${Object.entries(relationshipReview.ghostOptions).map(([option, id]) => `${option}=${id}`).join(",") || "none"}`;
-          if (Object.keys(relationshipReview.questions).length) {
+          const relationshipReviewQuestionCount = relationshipReview ? Object.keys(relationshipReview.questions).length : 0;
+          const relationshipReviewCandidates = relationshipReview ? Object.entries(relationshipReview.ghostOptions).map(([option, id]) => `${option}=${id}`).join(",") : "";
+          let relationshipSceneDiagnostic = `strategy=${payload.runReview !== false ? "run" : "scene"}; global-context=${relationshipContext.previousMessages.length} messages, ${relationshipContext.previousMessages.reduce((sum, item) => sum + item.text.length, 0)} characters; target=${decisionPlan.state.message.length} characters; first-pass=${decisionQuestionCount} questions/${firstPassDuration}ms; review=${relationshipReviewQuestionCount} questions; candidates=${relationshipReviewCandidates || "none"}${reductionGates.length ? `; ${reductionGates.join("; ")}` : ""}`;
+          if (relationshipReview && Object.keys(relationshipReview.questions).length) {
             const reviewStartedAt = Date.now();
             try {
               const relationshipResult = await spindle.decisions.evaluate({ state: relationshipReview.state, questions: relationshipReview.questions, ...userId ? { userId } : {} });
@@ -6356,8 +7025,8 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
               spindle.log.warn(`[Chat Voice] Relationship speaker review failed; preserving validated assignments and marking uncertain targets: ${error instanceof Error ? error.message : String(error)}`);
             }
           }
-          const personaReview = buildContextualUserReconciliation(decisionPlan, answers, relationshipContext);
-          if (Object.keys(personaReview.questions).length) {
+          const personaReview = auxReviewsEnabled ? buildContextualUserReconciliation(decisionPlan, answers, relationshipContext) : null;
+          if (personaReview && Object.keys(personaReview.questions).length) {
             const startedAt = Date.now();
             const reviewed = {};
             try {
@@ -6379,7 +7048,7 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
           }
           answers.persona_phase_complete = { choice: "complete", probabilities: {}, confidence: 0 };
           applyExplicitPostQuoteVoiceAttributions(decisionPlan, answers);
-          const openingReview = !relationshipReviewFailed ? buildOpeningSpeakerReview(decisionPlan, answers, relationshipContext, titleMatchedCardSpeakerId) : null;
+          const openingReview = !relationshipReviewFailed && auxReviewsEnabled ? buildOpeningSpeakerReview(decisionPlan, answers, relationshipContext, titleMatchedCardSpeakerId) : null;
           if (openingReview) {
             if (payload.debug) relationshipSceneDiagnostic += `; opening-scope=${JSON.stringify({ previous: openingReview.state.previousMessages.map((item) => ({ id: item.id, role: item.role, chars: item.text.length })), speeches: openingReview.state.speeches.map((item) => ({ id: item.id, paragraphId: item.paragraphId, text: item.text.slice(0, 160) })), boundary: openingReview.state.boundaryEvidence ? { role: openingReview.state.boundaryEvidence.role, lead: openingReview.state.boundaryEvidence.lead.slice(-240), quotation: openingReview.state.boundaryEvidence.quotation.slice(-240) } : null })}`;
             const startedAt = Date.now();
@@ -6430,7 +7099,7 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
               }
             }
           }
-          const backlinkReview = !relationshipReviewFailed ? buildOpeningBacklinkReview(decisionPlan, answers, relationshipContext, titleMatchedCardSpeakerId) : null;
+          const backlinkReview = !relationshipReviewFailed && auxReviewsEnabled ? buildOpeningBacklinkReview(decisionPlan, answers, relationshipContext, titleMatchedCardSpeakerId) : null;
           if (backlinkReview) {
             const startedAt = Date.now();
             const contrastive = payload.shadowEvaluation && payload.debug || payload.focusedOpeningFallback ? buildContrastiveOpeningLinkReview(backlinkReview) : null;
@@ -6503,7 +7172,7 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
               }
             }
           }
-          if (!relationshipReviewFailed && !userReviewFailed) {
+          if (!relationshipReviewFailed && !userReviewFailed && auxReviewsEnabled) {
             const introReview = buildSelfIntroductionReview(decisionPlan, relationshipContext);
             if (Object.keys(introReview.questions).length) {
               let timer;
@@ -6533,7 +7202,7 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
               }
             }
           }
-          if (!relationshipReviewFailed && !userReviewFailed) {
+          if (!relationshipReviewFailed && !userReviewFailed && auxReviewsEnabled) {
             const switchReview = buildSpeakerSwitchContradictionReview(decisionPlan, answers, relationshipContext, titleMatchedCardSpeakerId);
             if (Object.keys(switchReview.questions).length) {
               let timer;
@@ -6572,7 +7241,7 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
               }
             }
           }
-          if (payload.bestAvailableSpeaker !== false && !relationshipReviewFailed && !userReviewFailed) {
+          if (payload.bestAvailableSpeaker !== false && !relationshipReviewFailed && !userReviewFailed && auxReviewsEnabled) {
             const bestReview = buildBestAvailableSpeakerReview(decisionPlan, answers, relationshipContext, titleMatchedCardSpeakerId);
             if (Object.keys(bestReview.questions).length) {
               let timer;
@@ -6604,8 +7273,8 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
           }
           const discourse = {
             answers: null,
-            status: relationshipReviewFailed ? "global-context review failed; no forced inheritance" : "handled by targeted global-context review",
-            outcome: relationshipReviewFailed ? "failed" : Object.keys(relationshipReview.questions).length ? "completed" : "not-escalated"
+            status: relationshipReviewDeferred ? "relationship review deferred; clear first pass; reviews skipped" : relationshipReviewFailed ? "global-context review failed; no forced inheritance" : "handled by targeted global-context review",
+            outcome: relationshipReviewDeferred ? "deferred" : relationshipReviewFailed ? "failed" : relationshipReviewQuestionCount ? "completed" : "not-escalated"
           };
           const segments = resolveSpeakerDecisionSegments(
             message.content ?? "",
@@ -6660,7 +7329,7 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
             }
           }
           relationshipSceneDiagnostic += `; speaker-review-total=${Date.now() - firstPassStartedAt}ms (includes optional shadow wait; excludes later tag placement)`;
-          const relationshipStatus = relationshipReviewFailed ? `failed; validated assignments retained, uncertain targets protected; ${relationshipSceneDiagnostic}` : `${Object.keys(relationshipReview.questions).length} question(s) reviewed; ${relationshipSceneDiagnostic}`;
+          const relationshipStatus = relationshipReviewFailed ? `failed; validated assignments retained, uncertain targets protected; ${relationshipSceneDiagnostic}` : `${relationshipReviewQuestionCount} question(s) reviewed; ${relationshipSceneDiagnostic}`;
           const reviewedSegments = payload.debug ? segments.map((segment) => segment.debugPath ? {
             ...segment,
             debugPath: [...segment.debugPath, `relationship-review-status:${relationshipStatus}`]
@@ -6749,7 +7418,7 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
       }
     }
     const fallbackSegments = appendSpeakerDebugReason(deterministic, decisionFallbackReason, payload.debug);
-    const fallbackTagSelectionsPromise = tagStyle !== "off" && structurePlan ? evaluateTtsTagSelections(structurePlan, tagStyle, userId, enableModulation) : null;
+    const fallbackTagSelectionsPromise = tagStyle !== "off" && structurePlan ? evaluateTtsTagSelections(structurePlan, tagStyle, userId, enableModulation, payload.debug, reduction) : null;
     sendSpeakerParse({
       requestId: payload.requestId,
       chatId: chat.id,
@@ -7044,13 +7713,14 @@ spindle.onFrontendMessage(async (rawPayload, userId, frontendSessionId) => {
           if (!safe) return [];
           return [{ ...ghost, speakerId: safe.aliases.length ? ghost.speakerId : UNCAST_SPEAKER_ID, label: safe.label, aliases: safe.aliases, context: safe.context, conversationHistory: safe.conversationHistory }];
         });
+        const reduction = readReductionComponents(payload.reduction);
         const currentGhosts = activeGhostVoices(savedGhosts, assistantIds, assistantIds.at(-1) ?? anchor, lifetime);
         const config = readConfig(chat.metadata ?? {}, chatMemberIds(chat));
         const voices = availableUncastVoices(readFavoriteVoices(payload.voices), [...payload.reserved, config.narratorVoice, config.userVoice, ...Object.values(config.characterVoices), ...ghosts.map((ghost) => ghost.voiceId), ...currentGhosts.map((ghost) => ghost.voiceId)]).slice(0, 254);
         if (!groups.length || !voices.length && !ghosts.length) {
           sendFrontend({ type: "chat_voice_uncast_matches", requestId: payload.requestId, assignments: [], diagnostics: [`No matching request: groups=${groups.length}, availableFavorites=${voices.length}, historicalGhosts=${ghosts.length}, currentGhosts=${currentGhosts.length}.`] }, userId, frontendSessionId);
         } else {
-          const plan = buildUncastVoiceDecision(groups, voices, payload.message.slice(0, 3e4), ghosts, matchingContext.previousMessages);
+          const plan = buildUncastVoiceDecision(groups, voices, payload.message.slice(0, 3e4), ghosts, matchingContext.previousMessages, reduction.trimVoiceCriteria);
           const answers = {};
           let decisionError = "";
           const captureAnswers = (result) => {
@@ -7107,7 +7777,7 @@ spindle.onFrontendMessage(async (rawPayload, userId, frontendSessionId) => {
             const proposed = proposedAssignments.find((item) => item.groupId === group.id);
             return `${group.id} segments=${group.segmentIndexes.map((index) => index + 1).join(",")} identity=${identity ? `${identity.choice} confidence=${identity.confidence} probabilities=${JSON.stringify(identity.probabilities)}` : "none"} gender=${gender ? `${gender.choice} confidence=${gender.confidence} probabilities=${JSON.stringify(gender.probabilities)}` : "none"} label=${label ? `${label.choice} confidence=${label.confidence} probabilities=${JSON.stringify(label.probabilities)}` : "none"} narrative-name=${narrativeName ? `${narrativeName.choice} (${plan.state.narrativeNames[Number(narrativeName.choice.replace("name_", ""))] ?? "none"}) confidence=${narrativeName.confidence} probabilities=${JSON.stringify(narrativeName.probabilities)}` : "none"} comparisons=${comparisons} proposed=${proposed ? `${proposed.ghostId} / ${proposed.voiceId} / ${proposed.gender}` : "none"} match-reason=${proposed?.matchReason ?? "none"} voice-choice=${voice ? `${voice.choice} confidence=${voice.confidence} probabilities=${JSON.stringify(voice.probabilities)}` : "none"} final=${assignment ? `${assignment.label || "unnamed"} / ${assignment.ghostId} / ${assignment.voiceId}` : "connection default"}`;
           });
-          diagnostics.unshift(`Available favorites=${voices.length}, historical ghosts=${ghosts.length}, current ghosts=${currentGhosts.length}; prior messages=${matchingContext.previousMessages.length}${decisionError ? `; Jev failed: ${decisionError}` : ""}; identity review questions=${Object.keys(review.questions).length}${reviewError ? `; review failed: ${reviewError}` : ""}.`);
+          diagnostics.unshift(`build=${BUILD_VERSION}; Available favorites=${voices.length}, historical ghosts=${ghosts.length}, current ghosts=${currentGhosts.length}; prior messages=${matchingContext.previousMessages.length}${decisionError ? `; Jev failed: ${decisionError}` : ""}; identity review questions=${Object.keys(review.questions).length}${reviewError ? `; review failed: ${reviewError}` : ""}; reduction=${Object.entries(reduction).filter(([, enabled]) => !enabled).map(([id]) => id).join(",") || "full"}.`);
           diagnostics.splice(1, 0, `Candidate context: ${ghosts.map((ghost, index) => `ghost_${index}=${ghost.id} last=${ghost.lastSeenMessageId || "none"} history=${(ghost.conversationHistory ?? []).map((entry) => `${entry.messageId}(${entry.text.length} chars)`).join(",") || "none"} context=${ghost.context.length} chars`).join("; ") || "none"}; prior=${matchingContext.previousMessages.map((item) => `${item.role ?? "unknown"}:${item.id}(${item.text.length} chars)`).join(",") || "none"}.`);
           sendFrontend({ type: "chat_voice_uncast_matches", requestId: payload.requestId, assignments, diagnostics }, userId, frontendSessionId);
           if (assignments.length) await sendState(userId, void 0, payload.chatId, frontendSessionId);
