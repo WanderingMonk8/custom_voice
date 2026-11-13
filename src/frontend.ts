@@ -19,7 +19,6 @@ import {
   eligibleCardFallbackSpeakerId,
   globalTtsConnectionPreference,
   standardSpeakerReviewPolicy,
-  REDUCTION_COMPONENTS,
   FULL_REDUCTION_COMPONENTS,
   readReductionComponents,
   autoplayGenerationEvent,
@@ -1156,8 +1155,6 @@ export function setup(ctx: SpindleFrontendContext) {
     .chat-voice-status[data-state="saved"] { color:var(--lumiverse-success, #65b97a); }
     .chat-voice-status[data-state="error"] { color:var(--lumiverse-danger, #ef6464); }
     .chat-voice-advanced-section { border-top:1px solid var(--lumiverse-border); padding-top:12px; }
-    .chat-voice-reduction-group { display:flex; flex-direction:column; gap:12px; border-top:1px solid var(--lumiverse-border); padding-top:12px; }
-    .chat-voice-reduction-title { font-weight:700; color:var(--lumiverse-text); }
     .chat-voice-advanced-summary {
       display:flex; align-items:center; justify-content:space-between; cursor:pointer;
       font-weight:700; list-style:none; user-select:none;
@@ -1913,41 +1910,9 @@ export function setup(ctx: SpindleFrontendContext) {
   copyReportButton.textContent = 'Copy Report'
   copyReportButton.addEventListener('click', () => { void copyDebugReport() })
   debugActions.append(copyReportButton)
-  // Token-reduction controls: per-component rollback toggles. Disabling every
-  // component restores the pre-reduction behavior; the comparison/report tooling
-  // has been retired now that the implementation is settled.
+  // Reduction components stay conditional in the backend (global voice settings honor
+  // chatVoiceReductionComponents); no toggle UI is exposed to end users.
   let reductionComponents: ReductionComponentMap = { ...FULL_REDUCTION_COMPONENTS }
-  /** Toggle elements for the per-component token-reduction switches, populated in the advanced section. */
-  const reductionComponentToggles: Array<{ id: keyof ReductionComponentMap; toggle: HTMLInputElement }> = []
-  const reductionGroup = document.createElement('div')
-  reductionGroup.className = 'chat-voice-reduction-group'
-  const reductionTitle = document.createElement('div')
-  reductionTitle.className = 'chat-voice-reduction-title'
-  reductionTitle.textContent = 'Token reduction'
-  reductionGroup.append(reductionTitle)
-  for (const component of REDUCTION_COMPONENTS) {
-    const componentLabel = document.createElement('label')
-    componentLabel.className = 'chat-voice-toggle'
-    const componentToggle = document.createElement('input')
-    componentToggle.type = 'checkbox'
-    componentToggle.checked = reductionComponents[component.id]
-    componentToggle.setAttribute('aria-label', component.label)
-    componentToggle.addEventListener('change', () => {
-      reductionComponents = readReductionComponents({ ...reductionComponents, [component.id]: componentToggle.checked })
-      scheduleAdvancedSettingsSave()
-    })
-    const componentCopy = document.createElement('span')
-    componentCopy.className = 'chat-voice-toggle-copy'
-    const componentText = document.createElement('span')
-    componentText.textContent = component.label
-    const componentHint = document.createElement('span')
-    componentHint.className = 'chat-voice-toggle-hint'
-    componentHint.textContent = component.hint
-    componentCopy.append(componentText, componentHint)
-    componentLabel.append(componentToggle, componentCopy)
-    reductionComponentToggles.push({ id: component.id, toggle: componentToggle })
-    reductionGroup.append(componentLabel)
-  }
   const advancedHint = document.createElement('div')
   advancedHint.className = 'chat-voice-hint'
   advancedHint.textContent = 'Concurrency starts at one and adapts up to the selected maximum. Dense short-segment runs stay at one request at a time, while sustained long runs increase gradually. Larger buffers reduce pauses but delay playback. The wait budget controls cumulative rate-limit cooldowns.'
@@ -1969,7 +1934,6 @@ export function setup(ctx: SpindleFrontendContext) {
     speakerDebugLabel,
     debugActions,
     speakerDebugOutput,
-    reductionGroup,
     advancedHint,
   )
 
@@ -5805,7 +5769,6 @@ export function setup(ctx: SpindleFrontendContext) {
         skipNarrationToggle.checked = skipNarration
         speakerDebugOutput.hidden = !speakerAssignmentDebug
         reductionComponents = { ...preferences.reductionComponents }
-        for (const entry of reductionComponentToggles) entry.toggle.checked = reductionComponents[entry.id]
       }
       if (!savingGlobalConnection && connectionVersionAtLoad === globalConnectionVersion) lumiverseConnectionId = resolveGlobalTtsConnection(preferences.connectionId, connections)
       const selectedConnectionId = lumiverseConnectionId
