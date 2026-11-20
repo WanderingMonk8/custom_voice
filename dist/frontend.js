@@ -470,6 +470,48 @@ function narrationFirstPronounClass(text) {
   if (STORY_FEMALE_PRONOUNS.has(head)) return "female";
   return null;
 }
+var POSSESSIVE_SUFFIX = /['’]s$/u;
+var PERSON_ARTICLES = /* @__PURE__ */ new Set(["the", "a", "an"]);
+function paragraphGenderedNouns(narrative) {
+  const scan = (text) => {
+    const tokens = text.toLowerCase().replace(/[^a-z'’-]+/gu, " ").split(/\s+/u).filter(Boolean);
+    const found = /* @__PURE__ */ new Set();
+    for (let index = 0; index < tokens.length; index += 1) {
+      const token = tokens[index];
+      if (!token) continue;
+      const possessive = POSSESSIVE_SUFFIX.test(token);
+      const bare = possessive ? token.replace(POSSESSIVE_SUFFIX, "") : token;
+      if (!possessive && !PERSON_ARTICLES.has(tokens[index - 1] ?? "")) continue;
+      const gender = LABEL_GENDER_TOKENS.get(bare);
+      if (gender) found.add(gender);
+    }
+    return found;
+  };
+  const firstSentence = narrative.split(/[.!?]\s/u)[0] ?? narrative;
+  const leadingSet = scan(firstSentence);
+  const genders = scan(narrative);
+  const leading = leadingSet.size === 1 ? [...leadingSet][0] : null;
+  return { genders, leading };
+}
+var speechTagLeadPattern = null;
+function isQuotationSpeechTag(text) {
+  if (/["“”„«»]/u.test(text)) return false;
+  const narrative = cleanPlaybackText(narrativeOnly(text));
+  if (!narrative) return false;
+  speechTagLeadPattern ??= new RegExp(
+    `^\\s*(?:[,;:.\u2014-]+\\s*)?(?:he|she|they|\\p{Lu}[\\p{Ll}\\p{M}'\u2019-]{1,39}|the\\s+[\\p{L}-]+)\\s+${SPEECH_VERBS}\\b`,
+    "iu"
+  );
+  return speechTagLeadPattern.test(narrative) || hasPronounSpeechAttribution(narrative);
+}
+function previousQuotationIsKnown(segments, narrationIndex) {
+  for (let index = narrationIndex - 1; index >= 0; index -= 1) {
+    const id = segments[index]?.speakerId;
+    if (id === null) continue;
+    return id !== UNCAST_SPEAKER_ID && id !== UNRESOLVED_SPEAKER_ID;
+  }
+  return false;
+}
 function backwardNarrationAnchorGender(segments, fromIndex) {
   const castNames = /* @__PURE__ */ new Set();
   for (const segment of segments) {
@@ -488,9 +530,11 @@ function backwardNarrationAnchorGender(segments, fromIndex) {
   for (let index = fromIndex - 1; index >= 0; index -= 1) {
     const segment = segments[index];
     if (!segment || segment.speakerId !== null) continue;
+    const describesPreviousUncastRun = segments[index - 1]?.speakerId === UNCAST_SPEAKER_ID || segments[index - 1]?.speakerId === UNRESOLVED_SPEAKER_ID;
     const paragraphs = segment.text.split(/\n\s*\n/u).filter((paragraph) => paragraph.trim());
     for (let paragraphIndex = paragraphs.length - 1; paragraphIndex >= 0; paragraphIndex -= 1) {
       const text = paragraphs[paragraphIndex];
+      if (describesPreviousUncastRun) continue;
       if (mentionsCastCharacter(text)) continue;
       if (/(^|[.!?]\s+)(another|second|third|other)\s+(man|woman|girl|boy|lady|guy)\b/iu.test(text)) return null;
       const introduction = text.match(/(?:^|[.!?]\s+)(?:a|an|the|one)\s+(man|woman|girl|boy|lady|guy)(?:\s+\w+){0,2}?\s+(?:came|entered|arrived|appeared|walked in|stepped in|strode in|drew close)\b/iu);
@@ -501,8 +545,18 @@ function backwardNarrationAnchorGender(segments, fromIndex) {
       const lead = text.trimStart().match(/^(?:the|a|an)\s+(?:(?:young|younger|old|older|elderly|middle-aged|tall|short|thin|heavy|bald|bearded|blond|blonde|brunette)\s+)*([a-z-]+)\b/iu);
       const leadHint = lead ? labelGenderHint(lead[1]) : null;
       if (leadHint) return { gender: leadHint, strong: true };
-      const klass = narrationFirstPronounClass(text);
-      if (klass) return { gender: klass, strong: false };
+      const tagOnly = isQuotationSpeechTag(text) && previousQuotationIsKnown(segments, index);
+      if (!tagOnly) {
+        const nouns = paragraphGenderedNouns(narrativeOnly(text));
+        if (nouns.genders.size === 1) {
+          const [gender] = [...nouns.genders];
+          return { gender, strong: nouns.leading !== null };
+        }
+      }
+      if (!tagOnly) {
+        const klass = narrationFirstPronounClass(text);
+        if (klass) return { gender: klass, strong: false };
+      }
     }
   }
   return null;

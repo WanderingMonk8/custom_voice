@@ -12,6 +12,7 @@ import {
   mutuallyInvoked,
   narrationFirstPronounClass,
   backwardNarrationPronounGender,
+  backwardNarrationAnchorGender,
   hasNewAnonymousVoiceCue,
   narrationBoostsPair,
   vocativeNames,
@@ -2391,6 +2392,81 @@ test('explicit different-voice narration splits an otherwise anonymous run', () 
   ]
   assert.equal(hasNewAnonymousVoiceCue(segments[1].text), true)
   assert.deepEqual(collectUncastVoiceGroups(segments).map(group => group.segmentIndexes), [[0], [2, 3]])
+})
+
+test('a possessive person noun anchors gender even mid-paragraph ("The boy\u2019s head snaps upright")', () => {
+  const nar = (text: string) => ({ text, speakerId: null })
+  const speech = (text: string) => ({ text, speakerId: UNCAST_SPEAKER_ID })
+  // The paragraph never opens on the person and only names them by a
+  // belonging, so neither the leading-noun rule nor the first-pronoun rule
+  // fires; the possessive "\u2019s" is the only gender evidence.
+  const segments = [
+    nar('Up in the fork of the oak the coat jerks hard. The boy\u2019s head snaps upright, pale and wide-eyed under a wool cap.'),
+    speech('Aunt Elena?'),
+  ]
+  assert.deepEqual(backwardNarrationAnchorGender(segments, 1), { gender: 'male', strong: false })
+  assert.equal(collectUncastVoiceGroups(segments)[0].pronounGender, 'male')
+
+  const girl = [nar('The lantern gutters once. the girl\u2019s voice cracks high in the cold air.'), speech('I am here.')]
+  assert.deepEqual(backwardNarrationAnchorGender(girl, 1), { gender: 'female', strong: false })
+})
+
+test('a possessive in the opening sentence is a strong anchor', () => {
+  const nar = (text: string) => ({ text, speakerId: null })
+  const speech = (text: string) => ({ text, speakerId: UNCAST_SPEAKER_ID })
+  const segments = [nar("The boy's voice cracks high in the cold air, then drops hastily."), speech('Aunt Elena?')]
+  assert.deepEqual(backwardNarrationAnchorGender(segments, 1), { gender: 'male', strong: true })
+})
+
+test('possessive gender anchors stay ambiguous when the paragraph names two people', () => {
+  const nar = (text: string) => ({ text, speakerId: null })
+  const speech = (text: string) => ({ text, speakerId: UNCAST_SPEAKER_ID })
+  const segments = [nar("Two coats hang by the door — the boy's and the girl's, both soaked through."), speech('Who is there?')]
+  assert.equal(backwardNarrationPronounGender(segments, 1), null)
+})
+
+test('a pronoun that belongs to a named character in the same paragraph does not anchor gender', () => {
+  const nar = (text: string) => ({ text, speakerId: null })
+  const speech = (text: string) => ({ text, speakerId: UNCAST_SPEAKER_ID })
+  const segments = [nar('Wren stared at her own hands and said nothing more.'), speech('Good luck with it.')]
+  assert.equal(backwardNarrationPronounGender(segments, 1), null)
+})
+
+test('a speech tag for a known speaker does not lend its pronoun class to the next uncast speaker', () => {
+  // Reported case: the unnamed boy inherited 'female' from Elena's own speech
+  // tag ("she says, her voice dropping…") because nothing later in the scan
+  // was recognised as describing him.
+  const nar = (text: string) => ({ text, speakerId: null })
+  const known = (text: string) => ({ text, speakerId: 'npc:elena' })
+  const speech = (text: string) => ({ text, speakerId: UNCAST_SPEAKER_ID })
+  const tagOnly = [
+    nar('Elena gives one short, sharp nod.'),
+    known('Good,'),
+    nar('she says, her voice dropping back into its flat plains cadence as she rolls her shoulders inside the stiff canvas jacket.'),
+    speech('Who is up there?'),
+  ]
+  assert.equal(backwardNarrationPronounGender(tagOnly, 3), null)
+  // A tag that follows an unresolved quotation is skipped as that run's own
+  // narration instead, so it never leaks onto the next uncast speaker either.
+  const uncastTag = [speech('Good,'), nar('she says, her voice dropping into its flat plains cadence.'), speech('Who is up there?')]
+  assert.equal(backwardNarrationPronounGender(uncastTag, 2), null)
+})
+
+test('narration after an unresolved quotation does not anchor the next uncast group', () => {
+  const nar = (text: string) => ({ text, speakerId: null })
+  const speech = (text: string) => ({ text, speakerId: UNCAST_SPEAKER_ID })
+  const segments = [
+    nar('The clerk arrives.'),
+    speech('Hello.'),
+    nar('She waits.'),
+    speech('Come in.'),
+    { text: 'Thanks.', speakerId: 'mira' },
+    speech('Next.'),
+  ]
+  const groups = collectUncastVoiceGroups(segments)
+  assert.deepEqual(groups.map(group => group.segmentIndexes), [[1, 3], [5]])
+  assert.equal(groups[0].pronounGender, undefined)
+  assert.equal(groups[1].pronounGender, undefined)
 })
 
 test('a Jev gender that contradicts the narration class falls back to that class instead of dropping the voice', () => {
