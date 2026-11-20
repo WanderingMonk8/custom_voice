@@ -2469,6 +2469,47 @@ test('narration after an unresolved quotation does not anchor the next uncast gr
   assert.equal(groups[1].pronounGender, undefined)
 })
 
+test('a cast name in the same paragraph does not hide an explicit introduction', () => {
+  // Reported case: the store manager is introduced mid-paragraph as
+  // "a middle-aged man … —steps behind the counter", but the same paragraph
+  // also names Aiko, so the whole paragraph used to be discarded as cast
+  // narration and the manager inherited Aiko's female delivery description.
+  const nar = (text: string) => ({ text, speakerId: null })
+  const segments = [
+    { text: 'Aiko sets the tray down.', speakerId: 'npc:aiko' },
+    nar('The store manager—a middle-aged man in a pressed windbreaker carrying a clipboard—steps behind the counter without a word of greeting. Aiko steps aside while he runs the tally.'),
+    { text: 'Balanced,', speakerId: UNCAST_SPEAKER_ID },
+  ]
+  assert.deepEqual(backwardNarrationAnchorGender(segments, 2), { gender: 'male', strong: true })
+})
+
+test('a delivery description after a known quotation does not anchor the next speaker', () => {
+  const segments = [
+    { text: 'Four hundred eighty yen.', speakerId: 'npc:aiko' },
+    { text: 'Her voice is flat, sanded down to its exact retail register.', speakerId: null },
+    { text: 'Balanced,', speakerId: UNCAST_SPEAKER_ID },
+  ]
+  assert.equal(backwardNarrationPronounGender(segments, 2), null)
+  // The same description anchors when no established speaker precedes it.
+  assert.equal(backwardNarrationPronounGender(segments.slice(1), 1), 'female')
+})
+
+test('pronouns are never read as article-led nouns', () => {
+  // "her" is in the gender lexicon, so a nearby article ("the register, her
+  // mask") must not turn it into a noun phrase.
+  const segments = [
+    { text: 'Aiko is standing upright behind the register, her mask pulled up over her nose and mouth.', speakerId: null },
+    { text: 'Soft pack.', speakerId: UNCAST_SPEAKER_ID },
+  ]
+  assert.equal(backwardNarrationPronounGender(segments, 1), null)
+  // A paragraph that leads with a name owns its pronouns even without a cast id.
+  const named = [
+    { text: 'Wren folded her arms and waited.', speakerId: null },
+    { text: 'Soft pack.', speakerId: UNCAST_SPEAKER_ID },
+  ]
+  assert.equal(backwardNarrationPronounGender(named, 1), null)
+})
+
 test('a Jev gender that contradicts the narration class falls back to that class instead of dropping the voice', () => {
   const segments = [
     { text: 'She leans down over her knees, hair falling forward across her cheek.', speakerId: null },

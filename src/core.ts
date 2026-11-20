@@ -584,39 +584,74 @@ export function narrationFirstPronounClass(text: string): 'male' | 'female' | nu
 
 const POSSESSIVE_SUFFIX = /['’]s$/u
 const PERSON_ARTICLES = new Set(['the', 'a', 'an'])
+/** Words that start a paragraph without naming a person, so a leading pronoun still describes the subject. */
+const PARAGRAPH_NAME_LEADS = new Set(['then', 'so', 'and', 'but', 'still', 'yet', 'meanwhile', 'now', 'anyway', 'he', 'she', 'they', 'him', 'her', 'them', 'his', 'hers', 'their', 'theirs', 'it', 'its', 'there', 'this', 'that', 'these', 'those', 'a', 'an', 'the', 'when', 'while', 'after', 'before', 'as', 'at', 'in', 'on', 'outside', 'inside', 'above', 'below', 'behind', 'beside', 'across', 'down', 'up', 'over', 'under', 'through', 'from', 'by', 'with', 'without', 'only', 'even', 'once', 'twice', 'no', 'not', 'nothing', 'nobody', 'someone', 'somebody', 'everyone'])
 
 /**
- * Gendered people a paragraph names as nouns: article-led nouns ("the boy")
- * and possessives ("the boy's voice", "the girl's hand"). Narration usually
- * names a person's body part, voice or belonging instead of the person
- * themselves, so possessive forms must count. Bare pronouns are deliberately
- * excluded: their antecedent can be a named character in the same paragraph
- * ("Wren stared at her own hands"), which is the first-sentence pronoun
- * layer's job. Returns the classes named and whether one was named in the
- * paragraph's opening sentence.
+ * Every gendered mention a narration paragraph makes, as gender classes.
+ *
+ * Narration refers to people in several forms, and all of them count:
+ * - article-led nouns with stacked modifiers ("a middle-aged man",
+ *   "the tall blond boy"),
+ * - possessives ("the boy's head", "the girl's voice") — narration names a
+ *   body part or belonging more often than the person,
+ * - the leading pronoun subject ("She waits.", "Then he looked up.").
+ *
+ * Pronouns are unreliable when the paragraph names someone else, since their
+ * antecedent can be a named or cast character ("Wren stared at her own
+ * hands", "…Aiko steps aside… while he runs the tally"), so callers pass
+ * `ignorePronouns` in that case. The classes are returned as a set: a
+ * paragraph that mentions both genders describes more than one person and
+ * must not anchor anybody, which the caller enforces by requiring size 1.
  */
-function paragraphGenderedNouns(narrative: string): { genders: Set<'male' | 'female'>; leading: 'male' | 'female' | null } {
+function paragraphGenderedMentions(narrative: string, ignorePronouns: boolean): {
+  genders: Set<'male' | 'female'>
+  /** Class named in the paragraph's opening sentence, whose subject it is. */
+  leading: 'male' | 'female' | null
+  /** True when an article-led or possessive noun names a person explicitly. */
+  hasNounMention: boolean
+} {
   const scan = (text: string): Set<'male' | 'female'> => {
     const tokens = text.toLowerCase().replace(/[^a-z'’-]+/gu, ' ').split(/\s+/u).filter(Boolean)
     const found = new Set<'male' | 'female'>()
-    for (let index = 0; index < tokens.length; index += 1) {
-      const token = tokens[index]
+    // An article may be separated from its noun by modifiers ("a middle-aged
+    // man", "the tall blond boy"); treat that as one noun phrase instead of
+    // losing the gender to the adjective.
+    let sinceArticle = 99
+    for (const token of tokens) {
       if (!token) continue
+      if (PERSON_ARTICLES.has(token)) { sinceArticle = 0; continue }
       const possessive = POSSESSIVE_SUFFIX.test(token)
       const bare = possessive ? token.replace(POSSESSIVE_SUFFIX, '') : token
-      // A bare noun names a person only behind an article; otherwise it is an
-      // address ("Boy, get down") or an unrelated word.
-      if (!possessive && !PERSON_ARTICLES.has(tokens[index - 1] ?? '')) continue
-      const gender = LABEL_GENDER_TOKENS.get(bare)
-      if (gender) found.add(gender)
+      // Pronouns share the gender lexicon with nouns ("her"), so they must
+      // never be read as an article-led noun ("the register, her mask").
+      if (STORY_MALE_PRONOUNS.has(bare) || STORY_FEMALE_PRONOUNS.has(bare)) {
+        sinceArticle += 1
+        continue
+      }
+      if (possessive || sinceArticle <= 3) {
+        const gender = LABEL_GENDER_TOKENS.get(bare)
+        if (gender) found.add(gender)
+      }
+      sinceArticle += 1
     }
     return found
   }
-  const firstSentence = narrative.split(/[.!?]\s/u)[0] ?? narrative
-  const leadingSet = scan(firstSentence)
-  const genders = scan(narrative)
+  const nounGenders = scan(narrative)
+  const leadingSet = scan(narrative.split(/[.!?]\s/u)[0] ?? narrative)
   const leading = leadingSet.size === 1 ? [...leadingSet][0] : null
-  return { genders, leading }
+  const genders = new Set(nounGenders)
+  if (!ignorePronouns) {
+    const pronoun = narrationFirstPronounClass(narrative)
+    if (pronoun) genders.add(pronoun)
+  }
+  return { genders, leading, hasNounMention: nounGenders.size > 0 }
+}
+
+/** True when the paragraph opens on a proper name, so later pronouns are that person's. */
+function paragraphLeadsWithName(text: string): boolean {
+  const first = text.trimStart().match(/^([\p{Lu}][\p{Ll}\p{M}'’-]{1,39})\b/u)?.[1]
+  return !!first && !PARAGRAPH_NAME_LEADS.has(first.toLowerCase())
 }
 
 /**
@@ -646,14 +681,22 @@ function previousQuotationIsKnown(segments: PlaybackSegment[], narrationIndex: n
   }
   return false
 }
+
 /**
- * The gendered pronoun class a group's first speech inherits from the
- * narration before it: the nearest class-bearing paragraph ("…then he
- * walked…"), a character introduction ("a man came in…"), or nothing when
- * the chain is interrupted by an explicit new character ("another man
- * came…") or a contrary pronoun. Speech does not count.
+ * The gender an uncast group's first speech inherits from the narration before
+ * it. The nearest paragraph that is about exactly one person decides, however
+ * that person is referred to: by an article-led or possessive noun ("a
+ * middle-aged man", "the boy's head"), or by the leading pronoun of a
+ * paragraph that names nobody else ("Then he walked…", "She waits.").
+ *
+ * Narration that is about somebody else never anchors: a paragraph describing
+ * an established speaker's delivery after their quotation, narration that
+ * follows an unresolved quotation (it belongs to that run), pronouns whose
+ * owner is named or cast in the same paragraph, paragraphs mixing genders, and
+ * explicit "another/second man" switches all yield no evidence — the caller
+ * then falls back to Jev's own gender answer.
  */
-export interface UncastAnchorGender { gender: 'male' | 'female'; /** True when anchored by an introduction-style noun ("the guy came in…"), not a bare pronoun class. */ strong: boolean }
+export interface UncastAnchorGender { gender: 'male' | 'female'; /** True when the paragraph's opening sentence names the person as a noun ("the guy stops…", "a middle-aged man…"), not only by a pronoun. */ strong: boolean }
 
 export function backwardNarrationAnchorGender(segments: PlaybackSegment[], fromIndex: number): UncastAnchorGender | null {
   const castNames = new Set<string>()
@@ -670,8 +713,8 @@ export function backwardNarrationAnchorGender(segments: PlaybackSegment[], fromI
     for (const name of castNames) if (words.has(name)) return true
     return false
   }
-  // Walk narration the same way a reader would: the paragraph nearest to
-  // the speech decides its pronoun gender. One multi-paragraph narration
+  // Walk narration the same way a reader would: the paragraph nearest to the
+  // speech decides who the narration is about. One multi-paragraph narration
   // segment can introduce a man and later describe a cast speaker, so
   // classify paragraph by paragraph rather than segment by segment.
   for (let index = fromIndex - 1; index >= 0; index -= 1) {
@@ -679,50 +722,36 @@ export function backwardNarrationAnchorGender(segments: PlaybackSegment[], fromI
     if (!segment || segment.speakerId !== null) continue
     // Narration that directly follows an unresolved quotation describes the
     // run that already spoke ("Hello." → "She waits."), not whoever speaks
-    // next; adopting it lent "She waits." to the following uncast group and
-    // misgendered it. Keep scanning for narration that frames a new speaker.
+    // next. Keep scanning for narration that frames a new speaker.
     const describesPreviousUncastRun = segments[index - 1]?.speakerId === UNCAST_SPEAKER_ID
       || segments[index - 1]?.speakerId === UNRESOLVED_SPEAKER_ID
     const paragraphs = segment.text.split(/\n\s*\n/u).filter(paragraph => paragraph.trim())
     for (let paragraphIndex = paragraphs.length - 1; paragraphIndex >= 0; paragraphIndex -= 1) {
       const text = paragraphs[paragraphIndex]
       if (describesPreviousUncastRun) continue
-      // A paragraph that names a cast character describes that character,
-      // not an emerging uncast chain; other paragraphs in the same segment
-      // can still anchor the uncast chain.
-      if (mentionsCastCharacter(text)) continue
+      // An explicit "another/second/other man" says the next speaker is not
+      // the person described so far; neither side can be assumed.
       if (/(^|[.!?]\s+)(another|second|third|other)\s+(man|woman|girl|boy|lady|guy)\b/iu.test(text)) return null
-      const introduction = text.match(/(?:^|[.!?]\s+)(?:a|an|the|one)\s+(man|woman|girl|boy|lady|guy)(?:\s+\w+){0,2}?\s+(?:came|entered|arrived|appeared|walked in|stepped in|strode in|drew close)\b/iu)
-      if (introduction) { const gender = labelGenderHint(`the ${introduction[1]}`); if (gender) return { gender, strong: true } }
-      // A paragraph that opens on a gendered person ("The guy stops…",
-      // "A tall woman turns…") describes that person even though the
-      // sentence has no leading pronoun. Without this, the scan skips the
-      // introduction and inherits a gender from an earlier paragraph about
-      // somebody else.
-      const lead = text.trimStart().match(/^(?:the|a|an)\s+(?:(?:young|younger|old|older|elderly|middle-aged|tall|short|thin|heavy|bald|bearded|blond|blonde|brunette)\s+)*([a-z-]+)\b/iu)
-      const leadHint = lead ? labelGenderHint(lead[1]) : null
-      if (leadHint) return { gender: leadHint, strong: true }
-      // A paragraph that only tags a known speaker's quotation ("she says,
-      // her voice dropping…") describes that established speaker's delivery
-      // and says nothing about who speaks the next unresolved quotation.
-      // Adopting its pronoun class gave a girl's voice to an unnamed boy.
-      const tagOnly = isQuotationSpeechTag(text) && previousQuotationIsKnown(segments, index)
-      // Narration most often names a person by a belonging rather than the
-      // person ("The boy's head snaps upright", "the girl's voice cracks").
-      // Possessives therefore count like pronouns and article-led nouns, but
-      // only when the paragraph mentions a single gender class; a mixed
-      // paragraph describes more than one person and carries no anchor.
-      if (!tagOnly) {
-        const nouns = paragraphGenderedNouns(narrativeOnly(text))
-        if (nouns.genders.size === 1) {
-          const [gender] = [...nouns.genders]
-          return { gender, strong: nouns.leading !== null }
-        }
-      }
-      if (!tagOnly) {
-        const klass = narrationFirstPronounClass(text)
-        if (klass) return { gender: klass, strong: false }
-      }
+      const narrative = narrativeOnly(text)
+      // Pronouns can belong to a named or cast character mentioned in the same
+      // paragraph ("Wren stared at her own hands", "…Aiko steps aside… while
+      // he runs the tally"); explicit nouns still describe whoever they name.
+      const pronounOwnerPresent = mentionsCastCharacter(text) || paragraphLeadsWithName(text)
+      const mentions = paragraphGenderedMentions(narrative, pronounOwnerPresent)
+      // A paragraph that directly follows a known speaker's quotation and never
+      // names someone new only describes that speaker — their delivery
+      // ("Her voice is flat, sanded down to its retail register") or a speech
+      // tag ("she says, her voice dropping…"). A paragraph that does name a
+      // person anchors that person.
+      const describesPreviousSpeaker = segments[index - 1]?.speakerId != null
+        && previousQuotationIsKnown(segments, index)
+        && (!mentions.hasNounMention || isQuotationSpeechTag(text))
+      if (describesPreviousSpeaker) continue
+      // One gender class means one person: anchor. Several means the paragraph
+      // describes more than one, so it carries no evidence either way.
+      if (mentions.genders.size !== 1) continue
+      const [gender] = [...mentions.genders]
+      return { gender, strong: mentions.leading !== null }
     }
   }
   return null
