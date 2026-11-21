@@ -4951,6 +4951,44 @@ test('best-available guesses use scene candidates and never become validated anc
   assert.equal(ghostReview.options.best_ghost_0, 'ghost:mira')
 })
 
+test('an uncast guess never invents a speaker the narration does not describe', () => {
+  // Reported case: a single-character card, one named speaker on the page, no
+  // unnamed person anywhere. Two quotes were tracked as "uncast", which handed
+  // them the connection-default voice and put a third voice in a two-person scene.
+  const speakers = [{ id: 'npc:jayden', name: 'Jayden' }, { id: USER_SPEAKER_ID, name: 'User' }]
+  const content = [
+    '"No."',
+    "It comes out before she's decided to say it, and her hand is already flat on the page as if he's about to take something away from her.",
+    '"No, that\'s — the folds are the inside."',
+    'She hears herself. Her mouth closes.',
+    '"And the jelly — okay, fine, the jelly is a room."',
+  ].join('\n\n')
+  const plan = buildSpeakerDecisionPlan(content, speakers, false)
+  const known = decisionOption(plan, 'npc:jayden')
+  const makeAnswers = () => ({
+    speech_s0: confidentDecision(known),
+    speech_s1: { choice: known, probabilities: { [known]: 0.53, no_clear_identity: 0.28, uncast_character: 0.18 }, confidence: 0.41 },
+    speech_s2: confidentDecision(known),
+    turn_s1: confidentDecision('continues_previous_turn'),
+    turn_s2: confidentDecision('continues_previous_turn'),
+    global_uncertain_s1: confidentDecision('uncast_character'),
+  } as Record<string, SpeakerDecisionChoice>)
+  const uncastGuess = { best_guess_s1: { choice: 'uncast_character', probabilities: { uncast_character: 0.49, no_clear_identity: 0.34, [known]: 0.15 }, confidence: 0.32 } }
+  const context = { previousMessages: [{ id: 'prior', role: 'assistant' as const, text: 'Jayden sighs and turns the page.' }], ghosts: [] }
+  const answers = makeAnswers()
+  applyBestAvailableSpeakerReview(plan, answers, buildBestAvailableSpeakerReview(plan, answers, context), uncastGuess)
+  const segments = resolveSpeakerDecisionSegments(content, plan, answers, speakers, { isUserMessage: false, cardSpeakerId: null, historicalSpeakerId: null, evidenceOnly: true, includeDebug: true })
+  const questioned = segments.filter(segment => segment.speakerId !== null)[1]
+  assert.equal(questioned.speakerId, 'npc:jayden')
+  assert.ok(questioned.debugPath?.some(step => step.includes('uncast guess overruled')))
+  // The same guess still stands when the message does introduce someone unnamed.
+  const strangerPlan = buildSpeakerDecisionPlan(`${content}\n\nA woman in a grey coat waits by the door.`, speakers, false)
+  const strangerAnswers = makeAnswers()
+  applyBestAvailableSpeakerReview(strangerPlan, strangerAnswers, buildBestAvailableSpeakerReview(strangerPlan, strangerAnswers, context), uncastGuess)
+  const strangerSegments = resolveSpeakerDecisionSegments(strangerPlan.state.message, strangerPlan, strangerAnswers, speakers, { isUserMessage: false, cardSpeakerId: null, historicalSpeakerId: null, evidenceOnly: true })
+  assert.equal(strangerSegments.filter(segment => segment.speakerId !== null)[1].speakerId, UNCAST_SPEAKER_ID)
+})
+
 test('focused shadow compares the earlier unnamed reply to a validated later anchor', () => {
   const speakers = [{ id: 'npc:tessa', name: 'Tessa' }, { id: USER_SPEAKER_ID, name: 'Ken' }]
   const plan = buildSpeakerDecisionPlan('"Bishop. Third floor."\n\nShe balances her tray. "It is noisy."\n\n"Tessa. Tessa Doyle." She sits down.', speakers, false)

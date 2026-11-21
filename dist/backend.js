@@ -5639,6 +5639,11 @@ function hasExplicitUncastCue(content, skippedTrackerTagPairs = "") {
   const narration = cleanPlaybackText(narrativeOnly(playbackContent));
   return ANONYMOUS_ROLE_IDENTITY_PATTERN.test(narration) || hasAnonymousHumanSubject(narration) || SPEAKER_TURN_SWITCH_PATTERN.test(narration);
 }
+function messageDescribesUnnamedPerson(content) {
+  if (hasExplicitUncastCue(content)) return true;
+  const narration = cleanPlaybackText(narrativeOnly(preparePlaybackContent(content)));
+  return ANONYMOUS_HUMAN_IDENTITY_PATTERN.test(narration);
+}
 function hasFirstPersonPronoun(text) {
   return /\b(?:i|me|my|mine|myself)(?:'(?:m|ve|ll|d|re))?\b/iu.test(text);
 }
@@ -5706,6 +5711,13 @@ function resolveSpeakerDecisionSegments(content, plan, answers, speakers, option
     if (options.evidenceOnly && answers[`global_uncertain_${speech.id}`]) {
       const guessed = answers[`best_guess_${speech.id}`];
       const guessedIdentity = guessed ? plan.optionSpeakerIds[guessed.choice] : null;
+      if (guessedIdentity === UNCAST_SPEAKER_ID) {
+        const chainIdentity = chain.get(speech.id)?.identity ?? null;
+        if (chainIdentity && chainIdentity !== UNCAST_SPEAKER_ID && !messageDescribesUnnamedPerson(plan.state.message)) {
+          chainPathBySpeechIndex.set(index, "resolution:chain-identity (uncast guess overruled; narration describes no unnamed person)");
+          return chainIdentity;
+        }
+      }
       if (guessedIdentity) {
         discoursePathBySpeechIndex.set(index, "resolution:best-available speaker (low-confidence guess; not an anchor)");
         return guessedIdentity;

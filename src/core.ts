@@ -8386,6 +8386,18 @@ function hasExplicitUncastCue(content: string, skippedTrackerTagPairs = ''): boo
 }
 
 /**
+ * Whether the message describes a person it does not name, even mid-sentence
+ * ("the store manager—a middle-aged man … steps behind the counter"). An
+ * uncast speaker is a claim that such a person exists, so a guess may only
+ * introduce one when the text does.
+ */
+function messageDescribesUnnamedPerson(content: string): boolean {
+  if (hasExplicitUncastCue(content)) return true
+  const narration = cleanPlaybackText(narrativeOnly(preparePlaybackContent(content)))
+  return ANONYMOUS_HUMAN_IDENTITY_PATTERN.test(narration)
+}
+
+/**
  * Whether a span is written in the first person. In a user message that
  * first-person voice is the user persona; in narration it is the persona
  * narrating their own actions.
@@ -8507,6 +8519,17 @@ export function resolveSpeakerDecisionSegments(
     if (options.evidenceOnly && answers[`global_uncertain_${speech.id}`]) {
       const guessed = answers[`best_guess_${speech.id}`]
       const guessedIdentity = guessed ? plan.optionSpeakerIds[guessed.choice] : null
+      if (guessedIdentity === UNCAST_SPEAKER_ID) {
+        // An uncast identity asserts a person the text never introduced. When
+        // the message describes nobody unnamed and the turn chain already
+        // decoded a known speaker for this quote, the guess would hand the line
+        // to a fabricated new character with its own voice: keep the chain.
+        const chainIdentity = chain.get(speech.id)?.identity ?? null
+        if (chainIdentity && chainIdentity !== UNCAST_SPEAKER_ID && !messageDescribesUnnamedPerson(plan.state.message)) {
+          chainPathBySpeechIndex.set(index, 'resolution:chain-identity (uncast guess overruled; narration describes no unnamed person)')
+          return chainIdentity
+        }
+      }
       if (guessedIdentity) {
         discoursePathBySpeechIndex.set(index, 'resolution:best-available speaker (low-confidence guess; not an anchor)')
         return guessedIdentity
