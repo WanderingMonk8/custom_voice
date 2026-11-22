@@ -6147,7 +6147,7 @@ function applyConfigToMetadata(metadata, config) {
 }
 
 // src/version.ts
-var BUILD_VERSION = "3.34.0";
+var BUILD_VERSION = "3.34.1";
 
 // src/uuid.ts
 var lastTimestamp = 0;
