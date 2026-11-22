@@ -12,6 +12,7 @@ import {
   mutuallyInvoked,
   narrationFirstPronounClass,
   backwardNarrationPronounGender,
+  backwardNarrationAnchorGender,
   hasNewAnonymousVoiceCue,
   narrationBoostsPair,
   vocativeNames,
@@ -2391,6 +2392,122 @@ test('explicit different-voice narration splits an otherwise anonymous run', () 
   ]
   assert.equal(hasNewAnonymousVoiceCue(segments[1].text), true)
   assert.deepEqual(collectUncastVoiceGroups(segments).map(group => group.segmentIndexes), [[0], [2, 3]])
+})
+
+test('a possessive person noun anchors gender even mid-paragraph ("The boy\u2019s head snaps upright")', () => {
+  const nar = (text: string) => ({ text, speakerId: null })
+  const speech = (text: string) => ({ text, speakerId: UNCAST_SPEAKER_ID })
+  // The paragraph never opens on the person and only names them by a
+  // belonging, so neither the leading-noun rule nor the first-pronoun rule
+  // fires; the possessive "\u2019s" is the only gender evidence.
+  const segments = [
+    nar('Up in the fork of the oak the coat jerks hard. The boy\u2019s head snaps upright, pale and wide-eyed under a wool cap.'),
+    speech('Aunt Elena?'),
+  ]
+  assert.deepEqual(backwardNarrationAnchorGender(segments, 1), { gender: 'male', strong: false })
+  assert.equal(collectUncastVoiceGroups(segments)[0].pronounGender, 'male')
+
+  const girl = [nar('The lantern gutters once. the girl\u2019s voice cracks high in the cold air.'), speech('I am here.')]
+  assert.deepEqual(backwardNarrationAnchorGender(girl, 1), { gender: 'female', strong: false })
+})
+
+test('a possessive in the opening sentence is a strong anchor', () => {
+  const nar = (text: string) => ({ text, speakerId: null })
+  const speech = (text: string) => ({ text, speakerId: UNCAST_SPEAKER_ID })
+  const segments = [nar("The boy's voice cracks high in the cold air, then drops hastily."), speech('Aunt Elena?')]
+  assert.deepEqual(backwardNarrationAnchorGender(segments, 1), { gender: 'male', strong: true })
+})
+
+test('possessive gender anchors stay ambiguous when the paragraph names two people', () => {
+  const nar = (text: string) => ({ text, speakerId: null })
+  const speech = (text: string) => ({ text, speakerId: UNCAST_SPEAKER_ID })
+  const segments = [nar("Two coats hang by the door — the boy's and the girl's, both soaked through."), speech('Who is there?')]
+  assert.equal(backwardNarrationPronounGender(segments, 1), null)
+})
+
+test('a pronoun that belongs to a named character in the same paragraph does not anchor gender', () => {
+  const nar = (text: string) => ({ text, speakerId: null })
+  const speech = (text: string) => ({ text, speakerId: UNCAST_SPEAKER_ID })
+  const segments = [nar('Wren stared at her own hands and said nothing more.'), speech('Good luck with it.')]
+  assert.equal(backwardNarrationPronounGender(segments, 1), null)
+})
+
+test('a speech tag for a known speaker does not lend its pronoun class to the next uncast speaker', () => {
+  // Reported case: the unnamed boy inherited 'female' from Elena's own speech
+  // tag ("she says, her voice dropping…") because nothing later in the scan
+  // was recognised as describing him.
+  const nar = (text: string) => ({ text, speakerId: null })
+  const known = (text: string) => ({ text, speakerId: 'npc:elena' })
+  const speech = (text: string) => ({ text, speakerId: UNCAST_SPEAKER_ID })
+  const tagOnly = [
+    nar('Elena gives one short, sharp nod.'),
+    known('Good,'),
+    nar('she says, her voice dropping back into its flat plains cadence as she rolls her shoulders inside the stiff canvas jacket.'),
+    speech('Who is up there?'),
+  ]
+  assert.equal(backwardNarrationPronounGender(tagOnly, 3), null)
+  // A tag that follows an unresolved quotation is skipped as that run's own
+  // narration instead, so it never leaks onto the next uncast speaker either.
+  const uncastTag = [speech('Good,'), nar('she says, her voice dropping into its flat plains cadence.'), speech('Who is up there?')]
+  assert.equal(backwardNarrationPronounGender(uncastTag, 2), null)
+})
+
+test('narration after an unresolved quotation does not anchor the next uncast group', () => {
+  const nar = (text: string) => ({ text, speakerId: null })
+  const speech = (text: string) => ({ text, speakerId: UNCAST_SPEAKER_ID })
+  const segments = [
+    nar('The clerk arrives.'),
+    speech('Hello.'),
+    nar('She waits.'),
+    speech('Come in.'),
+    { text: 'Thanks.', speakerId: 'mira' },
+    speech('Next.'),
+  ]
+  const groups = collectUncastVoiceGroups(segments)
+  assert.deepEqual(groups.map(group => group.segmentIndexes), [[1, 3], [5]])
+  assert.equal(groups[0].pronounGender, undefined)
+  assert.equal(groups[1].pronounGender, undefined)
+})
+
+test('a cast name in the same paragraph does not hide an explicit introduction', () => {
+  // Reported case: the store manager is introduced mid-paragraph as
+  // "a middle-aged man … —steps behind the counter", but the same paragraph
+  // also names Aiko, so the whole paragraph used to be discarded as cast
+  // narration and the manager inherited Aiko's female delivery description.
+  const nar = (text: string) => ({ text, speakerId: null })
+  const segments = [
+    { text: 'Aiko sets the tray down.', speakerId: 'npc:aiko' },
+    nar('The store manager—a middle-aged man in a pressed windbreaker carrying a clipboard—steps behind the counter without a word of greeting. Aiko steps aside while he runs the tally.'),
+    { text: 'Balanced,', speakerId: UNCAST_SPEAKER_ID },
+  ]
+  assert.deepEqual(backwardNarrationAnchorGender(segments, 2), { gender: 'male', strong: true })
+})
+
+test('a delivery description after a known quotation does not anchor the next speaker', () => {
+  const segments = [
+    { text: 'Four hundred eighty yen.', speakerId: 'npc:aiko' },
+    { text: 'Her voice is flat, sanded down to its exact retail register.', speakerId: null },
+    { text: 'Balanced,', speakerId: UNCAST_SPEAKER_ID },
+  ]
+  assert.equal(backwardNarrationPronounGender(segments, 2), null)
+  // The same description anchors when no established speaker precedes it.
+  assert.equal(backwardNarrationPronounGender(segments.slice(1), 1), 'female')
+})
+
+test('pronouns are never read as article-led nouns', () => {
+  // "her" is in the gender lexicon, so a nearby article ("the register, her
+  // mask") must not turn it into a noun phrase.
+  const segments = [
+    { text: 'Aiko is standing upright behind the register, her mask pulled up over her nose and mouth.', speakerId: null },
+    { text: 'Soft pack.', speakerId: UNCAST_SPEAKER_ID },
+  ]
+  assert.equal(backwardNarrationPronounGender(segments, 1), null)
+  // A paragraph that leads with a name owns its pronouns even without a cast id.
+  const named = [
+    { text: 'Wren folded her arms and waited.', speakerId: null },
+    { text: 'Soft pack.', speakerId: UNCAST_SPEAKER_ID },
+  ]
+  assert.equal(backwardNarrationPronounGender(named, 1), null)
 })
 
 test('a Jev gender that contradicts the narration class falls back to that class instead of dropping the voice', () => {
@@ -4832,6 +4949,44 @@ test('best-available guesses use scene candidates and never become validated anc
   assert.equal(unknownAnswers.best_guess_s0, undefined)
   const ghostReview = buildBestAvailableSpeakerReview(plan, unknownAnswers, { previousMessages: [{ id: 'prior', role: 'user', text: 'Mira returns to the table.' }], ghosts: [{ id: 'mira', label: 'Mira', aliases: ['Mira'], context: 'Friend at the table', conversationHistory: [] }] })
   assert.equal(ghostReview.options.best_ghost_0, 'ghost:mira')
+})
+
+test('an uncast guess never invents a speaker the narration does not describe', () => {
+  // Reported case: a single-character card, one named speaker on the page, no
+  // unnamed person anywhere. Two quotes were tracked as "uncast", which handed
+  // them the connection-default voice and put a third voice in a two-person scene.
+  const speakers = [{ id: 'npc:jayden', name: 'Jayden' }, { id: USER_SPEAKER_ID, name: 'User' }]
+  const content = [
+    '"No."',
+    "It comes out before she's decided to say it, and her hand is already flat on the page as if he's about to take something away from her.",
+    '"No, that\'s — the folds are the inside."',
+    'She hears herself. Her mouth closes.',
+    '"And the jelly — okay, fine, the jelly is a room."',
+  ].join('\n\n')
+  const plan = buildSpeakerDecisionPlan(content, speakers, false)
+  const known = decisionOption(plan, 'npc:jayden')
+  const makeAnswers = () => ({
+    speech_s0: confidentDecision(known),
+    speech_s1: { choice: known, probabilities: { [known]: 0.53, no_clear_identity: 0.28, uncast_character: 0.18 }, confidence: 0.41 },
+    speech_s2: confidentDecision(known),
+    turn_s1: confidentDecision('continues_previous_turn'),
+    turn_s2: confidentDecision('continues_previous_turn'),
+    global_uncertain_s1: confidentDecision('uncast_character'),
+  } as Record<string, SpeakerDecisionChoice>)
+  const uncastGuess = { best_guess_s1: { choice: 'uncast_character', probabilities: { uncast_character: 0.49, no_clear_identity: 0.34, [known]: 0.15 }, confidence: 0.32 } }
+  const context = { previousMessages: [{ id: 'prior', role: 'assistant' as const, text: 'Jayden sighs and turns the page.' }], ghosts: [] }
+  const answers = makeAnswers()
+  applyBestAvailableSpeakerReview(plan, answers, buildBestAvailableSpeakerReview(plan, answers, context), uncastGuess)
+  const segments = resolveSpeakerDecisionSegments(content, plan, answers, speakers, { isUserMessage: false, cardSpeakerId: null, historicalSpeakerId: null, evidenceOnly: true, includeDebug: true })
+  const questioned = segments.filter(segment => segment.speakerId !== null)[1]
+  assert.equal(questioned.speakerId, 'npc:jayden')
+  assert.ok(questioned.debugPath?.some(step => step.includes('uncast guess overruled')))
+  // The same guess still stands when the message does introduce someone unnamed.
+  const strangerPlan = buildSpeakerDecisionPlan(`${content}\n\nA woman in a grey coat waits by the door.`, speakers, false)
+  const strangerAnswers = makeAnswers()
+  applyBestAvailableSpeakerReview(strangerPlan, strangerAnswers, buildBestAvailableSpeakerReview(strangerPlan, strangerAnswers, context), uncastGuess)
+  const strangerSegments = resolveSpeakerDecisionSegments(strangerPlan.state.message, strangerPlan, strangerAnswers, speakers, { isUserMessage: false, cardSpeakerId: null, historicalSpeakerId: null, evidenceOnly: true })
+  assert.equal(strangerSegments.filter(segment => segment.speakerId !== null)[1].speakerId, UNCAST_SPEAKER_ID)
 })
 
 test('focused shadow compares the earlier unnamed reply to a validated later anchor', () => {

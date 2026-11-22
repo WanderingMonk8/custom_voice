@@ -470,6 +470,67 @@ function narrationFirstPronounClass(text) {
   if (STORY_FEMALE_PRONOUNS.has(head)) return "female";
   return null;
 }
+var POSSESSIVE_SUFFIX = /['’]s$/u;
+var PERSON_ARTICLES = /* @__PURE__ */ new Set(["the", "a", "an"]);
+var PARAGRAPH_NAME_LEADS = /* @__PURE__ */ new Set(["then", "so", "and", "but", "still", "yet", "meanwhile", "now", "anyway", "he", "she", "they", "him", "her", "them", "his", "hers", "their", "theirs", "it", "its", "there", "this", "that", "these", "those", "a", "an", "the", "when", "while", "after", "before", "as", "at", "in", "on", "outside", "inside", "above", "below", "behind", "beside", "across", "down", "up", "over", "under", "through", "from", "by", "with", "without", "only", "even", "once", "twice", "no", "not", "nothing", "nobody", "someone", "somebody", "everyone"]);
+function paragraphGenderedMentions(narrative, ignorePronouns) {
+  const scan = (text) => {
+    const tokens = text.toLowerCase().replace(/[^a-z'’-]+/gu, " ").split(/\s+/u).filter(Boolean);
+    const found = /* @__PURE__ */ new Set();
+    let sinceArticle = 99;
+    for (const token of tokens) {
+      if (!token) continue;
+      if (PERSON_ARTICLES.has(token)) {
+        sinceArticle = 0;
+        continue;
+      }
+      const possessive = POSSESSIVE_SUFFIX.test(token);
+      const bare = possessive ? token.replace(POSSESSIVE_SUFFIX, "") : token;
+      if (STORY_MALE_PRONOUNS.has(bare) || STORY_FEMALE_PRONOUNS.has(bare)) {
+        sinceArticle += 1;
+        continue;
+      }
+      if (possessive || sinceArticle <= 3) {
+        const gender = LABEL_GENDER_TOKENS.get(bare);
+        if (gender) found.add(gender);
+      }
+      sinceArticle += 1;
+    }
+    return found;
+  };
+  const nounGenders = scan(narrative);
+  const leadingSet = scan(narrative.split(/[.!?]\s/u)[0] ?? narrative);
+  const leading = leadingSet.size === 1 ? [...leadingSet][0] : null;
+  const genders = new Set(nounGenders);
+  if (!ignorePronouns) {
+    const pronoun = narrationFirstPronounClass(narrative);
+    if (pronoun) genders.add(pronoun);
+  }
+  return { genders, leading, hasNounMention: nounGenders.size > 0 };
+}
+function paragraphLeadsWithName(text) {
+  const first = text.trimStart().match(/^([\p{Lu}][\p{Ll}\p{M}'’-]{1,39})\b/u)?.[1];
+  return !!first && !PARAGRAPH_NAME_LEADS.has(first.toLowerCase());
+}
+var speechTagLeadPattern = null;
+function isQuotationSpeechTag(text) {
+  if (/["“”„«»]/u.test(text)) return false;
+  const narrative = cleanPlaybackText(narrativeOnly(text));
+  if (!narrative) return false;
+  speechTagLeadPattern ??= new RegExp(
+    `^\\s*(?:[,;:.\u2014-]+\\s*)?(?:he|she|they|\\p{Lu}[\\p{Ll}\\p{M}'\u2019-]{1,39}|the\\s+[\\p{L}-]+)\\s+${SPEECH_VERBS}\\b`,
+    "iu"
+  );
+  return speechTagLeadPattern.test(narrative) || hasPronounSpeechAttribution(narrative);
+}
+function previousQuotationIsKnown(segments, narrationIndex) {
+  for (let index = narrationIndex - 1; index >= 0; index -= 1) {
+    const id = segments[index]?.speakerId;
+    if (id === null) continue;
+    return id !== UNCAST_SPEAKER_ID && id !== UNRESOLVED_SPEAKER_ID;
+  }
+  return false;
+}
 function backwardNarrationAnchorGender(segments, fromIndex) {
   const castNames = /* @__PURE__ */ new Set();
   for (const segment of segments) {
@@ -488,21 +549,20 @@ function backwardNarrationAnchorGender(segments, fromIndex) {
   for (let index = fromIndex - 1; index >= 0; index -= 1) {
     const segment = segments[index];
     if (!segment || segment.speakerId !== null) continue;
+    const describesPreviousUncastRun = segments[index - 1]?.speakerId === UNCAST_SPEAKER_ID || segments[index - 1]?.speakerId === UNRESOLVED_SPEAKER_ID;
     const paragraphs = segment.text.split(/\n\s*\n/u).filter((paragraph) => paragraph.trim());
     for (let paragraphIndex = paragraphs.length - 1; paragraphIndex >= 0; paragraphIndex -= 1) {
       const text = paragraphs[paragraphIndex];
-      if (mentionsCastCharacter(text)) continue;
+      if (describesPreviousUncastRun) continue;
       if (/(^|[.!?]\s+)(another|second|third|other)\s+(man|woman|girl|boy|lady|guy)\b/iu.test(text)) return null;
-      const introduction = text.match(/(?:^|[.!?]\s+)(?:a|an|the|one)\s+(man|woman|girl|boy|lady|guy)(?:\s+\w+){0,2}?\s+(?:came|entered|arrived|appeared|walked in|stepped in|strode in|drew close)\b/iu);
-      if (introduction) {
-        const gender = labelGenderHint(`the ${introduction[1]}`);
-        if (gender) return { gender, strong: true };
-      }
-      const lead = text.trimStart().match(/^(?:the|a|an)\s+(?:(?:young|younger|old|older|elderly|middle-aged|tall|short|thin|heavy|bald|bearded|blond|blonde|brunette)\s+)*([a-z-]+)\b/iu);
-      const leadHint = lead ? labelGenderHint(lead[1]) : null;
-      if (leadHint) return { gender: leadHint, strong: true };
-      const klass = narrationFirstPronounClass(text);
-      if (klass) return { gender: klass, strong: false };
+      const narrative = narrativeOnly(text);
+      const pronounOwnerPresent = mentionsCastCharacter(text) || paragraphLeadsWithName(text);
+      const mentions = paragraphGenderedMentions(narrative, pronounOwnerPresent);
+      const describesPreviousSpeaker = segments[index - 1]?.speakerId != null && previousQuotationIsKnown(segments, index) && (!mentions.hasNounMention || isQuotationSpeechTag(text));
+      if (describesPreviousSpeaker) continue;
+      if (mentions.genders.size !== 1) continue;
+      const [gender] = [...mentions.genders];
+      return { gender, strong: mentions.leading !== null };
     }
   }
   return null;
@@ -731,18 +791,6 @@ var LABEL_GENDER_TOKENS = new Map(
     ...["boy", "boys", "man", "men", "gentleman", "gentlemen", "male", "males", "father", "fathers", "dad", "dads", "brother", "brothers", "husband", "husbands", "son", "sons", "uncle", "uncles", "nephew", "nephews", "grandfather", "grandfathers", "grandpa", "grandpas", "groom", "grooms", "prince", "princes", "monk", "monks", "guy", "guys", "mr", "sir", "he", "him", "his", "himself"].map((token) => [token, "male"])
   ]
 );
-function labelGenderHint(label) {
-  const genders = /* @__PURE__ */ new Set();
-  for (const token of label.toLowerCase().replace(/[^a-z]+/gu, " ").split(/\s+/u)) {
-    if (!token) continue;
-    const gender = LABEL_GENDER_TOKENS.get(token);
-    if (gender) {
-      genders.add(gender);
-      if (genders.size > 1) return null;
-    }
-  }
-  return genders.size === 1 ? [...genders][0] : null;
-}
 function speakersForMessageRole(speakers, _isUserMessage, userName = "User") {
   const nonUserSpeakers = speakers.filter((speaker) => speaker.id !== USER_SPEAKER_ID);
   return [
