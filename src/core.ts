@@ -3052,9 +3052,16 @@ function decodePlaybackEntities(value: string): string {
 export interface SkippedTrackerTagPair {
   open: string
   close: string
+  /**
+   * True when the pair is marker text matched literally, such as the HTML
+   * comments `<!-- GFX_START -->` / `<!-- GFX_END -->`, instead of an
+   * XML-style tag name.
+   */
+  marker?: boolean
 }
 
 const TRACKER_TAG_NAME_RE = /^[a-z][a-z0-9:._-]*$/u
+const TRACKER_COMMENT_RE = /<!--[\s\S]*?-->/gu
 
 function normalizeTrackerTagName(value: string): string | null {
   const tag = value.trim().toLowerCase()
@@ -3066,7 +3073,9 @@ function normalizeTrackerTagName(value: string): string | null {
  * - a tag name (`tracker`), treated as a symmetric pair;
  * - a single full tag (`<tracker>`), treated as a symmetric pair;
  * - a full pair (`<o_ledger></o_l>`), which may open and close with different
- *   names.
+ *   names;
+ * - a pair of comment markers (`<!-- GFX_START --><!-- GFX_END -->`) or one
+ *   marker on its own (`<!-- GFX_START -->`), matched literally.
  *
  * Attributes and surrounding whitespace are ignored; only the tag names are
  * retained so the same entry matches tags with attributes in the message.
@@ -3075,18 +3084,47 @@ export function parseSkippedTrackerTagPairs(value: string): SkippedTrackerTagPai
   const decoded = decodePlaybackEntities(value)
   const pairs: SkippedTrackerTagPair[] = []
   const seen = new Set<string>()
-  const addPair = (open: string | null, close: string | null) => {
+  const addPair = (open: string | null, close: string | null, marker = false) => {
     if (!open || !close) return
-    const key = `${open}\u0000${close}`
+    const key = `${open.toLowerCase()}\u0000${close.toLowerCase()}`
     if (seen.has(key)) return
     seen.add(key)
-    pairs.push({ open, close })
+    pairs.push(marker ? { open, close, marker: true } : { open, close })
   }
-  const addSymmetric = (name: string | null) => addPair(name, name)
+  const addSymmetric = (name: string | null, marker = false) => addPair(name, name, marker)
+  const full = () => pairs.length >= 100
 
-  for (const entry of decoded.split(',')) {
+  // Markers use comment syntax, which has no tag name, and a marker may itself
+  // contain commas ("<!-- GFX: state, scene -->"). Pair them before the comma
+  // split, then drop the matched spans so the remaining entries parse as tags.
+  const comments = [...decoded.matchAll(TRACKER_COMMENT_RE)]
+  const consumed: Array<{ start: number; end: number }> = []
+  for (let index = 0; index + 1 < comments.length && !full(); index += 1) {
+    const left = comments[index]
+    const right = comments[index + 1]
+    if (left.index === undefined || right.index === undefined) continue
+    const leftEnd = left.index + left[0].length
+    if (!/^\s*,?\s*$/u.test(decoded.slice(leftEnd, right.index))) continue
+    addPair(left[0].trim(), right[0].trim(), true)
+    consumed.push({ start: left.index, end: right.index + right[0].length })
+    index += 1
+  }
+  let entries = decoded
+  for (let index = consumed.length - 1; index >= 0; index -= 1) {
+    entries = `${entries.slice(0, consumed[index].start)}${entries.slice(consumed[index].end)}`
+  }
+
+  for (const entry of entries.split(',')) {
     const trimmed = entry.trim()
     if (!trimmed) continue
+    // A lone comment marker excludes everything up to the next occurrence of
+    // the same marker, the way a symmetric tag name does.
+    const loneMarker = trimmed.match(/^<!--[\s\S]*?-->$/u)
+    if (loneMarker) {
+      addSymmetric(loneMarker[0], true)
+      if (full()) return pairs
+      continue
+    }
     const pairMatch = trimmed.match(
       /^\\?<\s*([a-z][a-z0-9:._-]*)(?=\s|>)[^>]*>\s*\\?<\s*\/\s*([a-z][a-z0-9:._-]*)(?=\s|>)[^>]*>$/iu,
     )
@@ -3095,17 +3133,17 @@ export function parseSkippedTrackerTagPairs(value: string): SkippedTrackerTagPai
         normalizeTrackerTagName(pairMatch[1] ?? ''),
         normalizeTrackerTagName(pairMatch[2] ?? ''),
       )
-      if (pairs.length >= 100) return pairs
+      if (full()) return pairs
       continue
     }
     const tagMatch = trimmed.match(/^\\?<\s*([a-z][a-z0-9:._-]*)(?=\s|>)[^>]*>$/iu)
     if (tagMatch) {
       addSymmetric(normalizeTrackerTagName(tagMatch[1] ?? ''))
-      if (pairs.length >= 100) return pairs
+      if (full()) return pairs
       continue
     }
     addSymmetric(normalizeTrackerTagName(trimmed))
-    if (pairs.length >= 100) return pairs
+    if (full()) return pairs
   }
   // Keep previously saved paired-tag settings working after the simpler
   // name-only format was introduced. This also accepts an entry that embeds
@@ -3113,7 +3151,7 @@ export function parseSkippedTrackerTagPairs(value: string): SkippedTrackerTagPai
   const legacyPattern = /\\?<\s*([a-z][a-z0-9:._-]*)(?=\s|>)[^>]*>[\s\S]*?\\?<\s*\/\s*\1\s*>/giu
   for (const match of decoded.matchAll(legacyPattern)) {
     addSymmetric(normalizeTrackerTagName(match[1] ?? ''))
-    if (pairs.length >= 100) break
+    if (full()) break
   }
   return pairs
 }
@@ -3123,13 +3161,16 @@ export function parseSkippedTrackerTags(value: string): string[] {
   return [...new Set(parseSkippedTrackerTagPairs(value).map(pair => pair.open))].slice(0, 100)
 }
 
-function stripTagBlock(value: string, openTag: string, closeTag: string): string {
-  const open = escapedPattern(openTag)
-  const close = escapedPattern(closeTag)
-  const tokenPattern = new RegExp(
-    `(\\\\?<\\s*${open}(?=\\s|>)[^>]*>)|(\\\\?<\\s*\\/\\s*${close}(?=\\s|>)[^>]*>)`,
-    'giu',
-  )
+function applyStripRanges(value: string, ranges: Array<{ start: number; end: number }>): string {
+  if (ranges.length === 0) return value
+  let result = value
+  for (let index = ranges.length - 1; index >= 0; index--) {
+    result = `${result.slice(0, ranges[index].start)} ${result.slice(ranges[index].end)}`
+  }
+  return result
+}
+
+function stripDelimitedBlock(value: string, tokenPattern: RegExp): string {
   const ranges: Array<{ start: number; end: number }> = []
   let depth = 0
   let blockStart = -1
@@ -3149,23 +3190,57 @@ function stripTagBlock(value: string, openTag: string, closeTag: string): string
       }
     }
   }
-  if (ranges.length === 0) return value
-  let result = value
-  for (let index = ranges.length - 1; index >= 0; index--) {
-    result = `${result.slice(0, ranges[index].start)} ${result.slice(ranges[index].end)}`
+  return applyStripRanges(value, ranges)
+}
+
+function stripTagBlock(value: string, openTag: string, closeTag: string): string {
+  const open = escapedPattern(openTag)
+  const close = escapedPattern(closeTag)
+  return stripDelimitedBlock(value, new RegExp(
+    `(\\\\?<\\s*${open}(?=\\s|>)[^>]*>)|(\\\\?<\\s*\\/\\s*${close}(?=\\s|>)[^>]*>)`,
+    'giu',
+  ))
+}
+
+/** Remove everything between two literal markers, such as HTML comments. */
+function stripMarkerBlock(value: string, openMarker: string, closeMarker: string): string {
+  if (openMarker.toLowerCase() === closeMarker.toLowerCase()) {
+    // One marker used for both ends: alternate open/close so a single marker is
+    // not counted as its own closer.
+    const ranges: Array<{ start: number; end: number }> = []
+    let openAt = -1
+    for (const match of value.matchAll(new RegExp(escapedPattern(openMarker), 'giu'))) {
+      if (match.index === undefined) continue
+      if (openAt < 0) {
+        openAt = match.index
+      } else {
+        ranges.push({ start: openAt, end: match.index + match[0].length })
+        openAt = -1
+      }
+    }
+    return applyStripRanges(value, ranges)
   }
-  return result
+  return stripDelimitedBlock(value, new RegExp(
+    `(${escapedPattern(openMarker)})|(${escapedPattern(closeMarker)})`,
+    'giu',
+  ))
 }
 
 export function stripSkippedTrackerBlocks(content: string, tagPairs: string): string {
   let result = content
     .replace(/&lt;|&#60;|&#x3c;/gi, '<')
     .replace(/&gt;|&#62;|&#x3e;/gi, '>')
-    .replace(/<!--[\s\S]*?-->/g, ' ')
-  for (const pair of parseSkippedTrackerTagPairs(tagPairs)) {
-    result = stripTagBlock(result, pair.open, pair.close)
+  const pairs = parseSkippedTrackerTagPairs(tagPairs)
+  // Marker pairs run first: their markers are HTML comments, and the generic
+  // comment pass below would remove those before the enclosed block could be
+  // read, leaving the tracker text behind.
+  for (const pair of pairs) {
+    if (pair.marker) result = stripMarkerBlock(result, pair.open, pair.close)
   }
-  return result
+  for (const pair of pairs) {
+    if (!pair.marker) result = stripTagBlock(result, pair.open, pair.close)
+  }
+  return result.replace(/<!--[\s\S]*?-->/g, ' ')
 }
 
 export function preparePlaybackContent(content: string, skippedTrackerTagPairs = ''): string {

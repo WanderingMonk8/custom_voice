@@ -2091,6 +2091,60 @@ test('skips quotations inside asymmetric tracker blocks during playback', () => 
   )
 })
 
+test('skips everything between configured comment markers', () => {
+  // Reported case: the card wraps its tracker output in `<!-- GFX_START -->`
+  // comments. Comment syntax has no tag name, so the entry used to parse to
+  // nothing and the enclosed tracker text reached the speaker pipeline.
+  const setting = '<!-- GFX_START --><!-- GFX_END -->'
+  assert.deepEqual(parseSkippedTrackerTagPairs(setting), [
+    { open: '<!-- GFX_START -->', close: '<!-- GFX_END -->', marker: true },
+  ])
+  const content = [
+    '"Keep this line."',
+    '',
+    '<!-- GFX_START -->',
+    '<o_ledger>Date: 1/2/2026</o_l>',
+    '<tracker>HP 40, state, scene</tracker>',
+    '<!-- GFX_END -->',
+    '',
+    'Narration remains.',
+  ].join('\n')
+  assert.deepEqual(
+    parseRosterVoiceSegments(content, 'alice', [{ id: 'alice', name: 'Alice' }], setting),
+    [
+      { text: 'Keep this line.', speakerId: 'alice' },
+      { text: 'Narration remains.', speakerId: null },
+    ],
+  )
+  // Escaped markers, markers containing commas, and marker pairs mixed with
+  // ordinary tag entries all work from the same setting.
+  assert.equal(
+    stripSkippedTrackerBlocks(
+      'A &lt;!-- GFX_START --&gt;hidden&lt;!-- GFX_END --&gt; B',
+      '&lt;!-- GFX_START --&gt;&lt;!-- GFX_END --&gt;',
+    ),
+    'A   B',
+  )
+  assert.equal(
+    stripSkippedTrackerBlocks('A <!-- GFX: state, scene -->hidden<!-- GTFO --> B', '<!-- GFX: state, scene --><!-- GTFO -->'),
+    'A   B',
+  )
+  assert.equal(
+    stripSkippedTrackerBlocks('A <tracker>t</tracker> B <!-- X -->m<!-- Y --> C', 'tracker, <!-- X --><!-- Y -->'),
+    'A   B   C',
+  )
+  // One marker on its own excludes the text between alternating occurrences.
+  assert.equal(
+    stripSkippedTrackerBlocks('A <!-- HIDDEN -->secret<!-- HIDDEN --> B', '<!-- HIDDEN -->'),
+    'A   B',
+  )
+  // An unclosed marker leaves the text alone rather than swallowing the rest.
+  assert.equal(
+    stripSkippedTrackerBlocks('A <!-- GFX_START -->hidden tail', setting),
+    'A  hidden tail',
+  )
+})
+
 test('automatically removes raw and escaped HTML comments before playback', () => {
   const content = [
     'Spoken before.',
