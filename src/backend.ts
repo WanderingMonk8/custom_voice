@@ -2,6 +2,8 @@ import {
   addScannedFirstNameAliases,
   addUnconfiguredDialogueSpeakers,
   activeGhostVoices,
+  cardRelationshipAliases,
+  withRelationshipAliases,
   isDescriptiveGhostLabel,
   purgeExpiredGhostContexts,
   markGhostVoiceInvoked,
@@ -326,6 +328,13 @@ async function buildState(chat: ChatLike, userId?: string) {
       ? [{ ...character, name: savedName || character.name, messageCount }]
       : savedName ? [{ id, name: savedName, messageCount }] : []
   })
+  // Relationship aliases ("Mother", "Mom") come from the card text, so narration
+  // and dialogue that address a character by family role still resolve to them.
+  // Applying it here also covers chats scanned before the aliases existed.
+  const relationshipAliases = cardRelationshipAliases(candidates.map(card => ({
+    id: card.id, name: card.name, description: card.description, personality: card.personality,
+    scenario: card.scenario, creatorNotes: card.creator_notes, firstMes: card.first_mes,
+  })))
 
   const messages = await spindle.chat.getMessages(chat.id) as Array<{ id: string; is_user: boolean }>
   return {
@@ -343,6 +352,7 @@ async function buildState(chat: ChatLike, userId?: string) {
     cardCharacterIds: candidates.map(character => character.id),
     characters: detected.map((character) => ({
       ...character,
+      name: withRelationshipAliases(character.name, relationshipAliases.get(character.id) ?? []),
       voice: config.characterVoices[character.id] ?? '',
     })),
   }
@@ -1136,8 +1146,23 @@ function queueSpeakerParse(
     }
     const scannedScenarioIds = Array.isArray(chat.metadata?.chat_voice_non_speaker_cards) ? chat.metadata.chat_voice_non_speaker_cards.filter((id): id is string => typeof id === 'string') : []
     const scenarioCardIds = new Set([...scannedScenarioIds, ...cards.filter(card => isScenarioCardTitle(card.name)).map(card => card.id)])
+    // The parser roster answers to a character's family role as well as their
+    // name, so "his mother answers" or "Mom." can reach the card that claims it.
+    const relationshipAliases = cardRelationshipAliases(cards.map(card => ({
+      id: card.id, name: card.name, description: card.description, personality: card.personality,
+      scenario: card.scenario, creatorNotes: card.creator_notes, firstMes: card.first_mes,
+    })))
+    const cardNamesById = new Map(cards.map(card => [card.id, card.name] as const))
     const configuredSpeakers = speakersForMessageRole(
-      config.detectedCharacters.filter(character => !scenarioCardIds.has(character.id)),
+      config.detectedCharacters
+        .filter(character => !scenarioCardIds.has(character.id))
+        .map(character => ({
+          ...character,
+          name: withRelationshipAliases(
+            character.name || cardNamesById.get(character.id) || (character.id.startsWith('npc:') ? character.id.slice(4) : ''),
+            relationshipAliases.get(character.id) ?? [],
+          ),
+        })),
       message.is_user,
       userAliases.join(' / ') || 'User',
     )

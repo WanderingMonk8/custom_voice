@@ -165,6 +165,9 @@ import {
   resolveSpeakerDiscourseAnswers,
   resolveTtsTagAnswers,
   speakerAliases,
+  cardRelationshipRoles,
+  cardRelationshipAliases,
+  withRelationshipAliases,
   speakerAliasIdLookup,
   speakerIdMatchingCardTitle,
   speakerReviewQuoteIndexes,
@@ -4505,8 +4508,43 @@ test('keeps a fast exchange alternating and follows a self-quotation', () => {
   assert.equal(confident[1], 'aiko')
 })
 
-test('confirms a POV persona that clearly speaks and never strands a rejected user line', () => {
-  const speakers = [{ id: 'aiko', name: 'Aiko' }, { id: 'npc:nao', name: 'nao' }, { id: USER_SPEAKER_ID, name: 'Ken' }]
+test('reads a character card as answering to its family role', () => {
+  // Reported case: the card never said "Aiko" in narration, only "his mother",
+  // so the line fell to a new voice until the role was added by hand.
+  assert.deepEqual(cardRelationshipRoles("Aiko is Ken and Nao's mother.", ['Aiko Takayama', 'Aiko']), ['mother'])
+  assert.deepEqual(cardRelationshipRoles('Aiko, Ken\u2019s mother, keeps the kitchen.', ['Aiko']), ['mother'])
+  assert.deepEqual(cardRelationshipRoles('{{char}} is the mother of Ken.', ['Aiko']), ['mother'])
+  assert.deepEqual(cardRelationshipRoles("I'm Ken's mom.", ['Aiko']), ['mother'])
+  assert.deepEqual(cardRelationshipRoles('She is Nao\u2019s older sister.', ['Aiko']), ['sister'])
+  assert.deepEqual(cardRelationshipRoles("Ken's mother is Aiko.", ['Aiko']), ['mother'])
+  // A card that only describes someone else's relative claims nothing.
+  assert.deepEqual(cardRelationshipRoles("Aiko works with Ken's mother at the shop.", ['Aiko']), [])
+  assert.deepEqual(cardRelationshipRoles('She is a firefighter.', ['Aiko']), [])
+  const aliases = cardRelationshipAliases([
+    { id: 'aiko', name: 'Aiko', description: "Aiko is Ken and Nao's mother.", personality: '', scenario: '' },
+    { id: 'nao', name: 'nao', description: "Nao is Ken's sister.", personality: '', scenario: '' },
+    { id: 'ken', name: 'Ken', description: 'Ken is the youngest.', personality: '', scenario: '' },
+  ])
+  assert.deepEqual(aliases.get('aiko'), ['Mother', 'Mom'])
+  assert.deepEqual(aliases.get('nao'), ['Sister'])
+  assert.equal(aliases.get('ken'), undefined)
+  // Creator notes and first messages often state the relationship too.
+  assert.deepEqual(cardRelationshipAliases([{ id: 'aiko', name: 'Aiko', creatorNotes: "Aiko is Ken's mother." }]).get('aiko'), ['Mother', 'Mom'])
+  // Two cards claiming the same role leave it ambiguous.
+  const ambiguous = cardRelationshipAliases([
+    { id: 'a', name: 'Aiko', description: "Aiko is Ken's mother." },
+    { id: 'b', name: 'Yumi', description: "Yumi is Nao's mother." },
+  ])
+  assert.equal(ambiguous.get('a'), undefined)
+  assert.equal(ambiguous.get('b'), undefined)
+  assert.equal(withRelationshipAliases('Aiko', ['Mother', 'Mom']), 'Aiko / Mother / Mom')
+  assert.equal(withRelationshipAliases('Aiko / Mother', ['Mother', 'Mom']), 'Aiko / Mother / Mom')
+  assert.equal(withRelationshipAliases('', ['Mother']), '')
+  assert.equal(withRelationshipAliases('Aiko', []), 'Aiko')
+  assert.deepEqual(speakerAliases(withRelationshipAliases('Aiko Takayama / Aiko', ['Mother', 'Mom'])), ['Aiko Takayama', 'Aiko', 'Mother', 'Mom'])
+})
+
+test('confirms a POV persona that clearly speaks and never strands a rejected user line', () => {  const speakers = [{ id: 'aiko', name: 'Aiko' }, { id: 'npc:nao', name: 'nao' }, { id: USER_SPEAKER_ID, name: 'Ken' }]
   const plan = buildSpeakerDecisionPlan('"It was dead quiet up there."', speakers, false)
   const firstPass: SpeakerDecisionChoice = {
     choice: 'known_2',

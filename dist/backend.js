@@ -621,6 +621,97 @@ function revealedUncastName(group, answers = {}, message = "") {
   if (jev) return jev;
   return group.inferredName && !isBroadPersonLabel(group.inferredName) ? group.inferredName.toLowerCase() : "";
 }
+var RELATIONSHIP_ROLE_WORDS = new Map([
+  ...["mother", "mom", "mommy", "mum", "mummy", "mama"].map((word) => [word, "mother"]),
+  ...["father", "dad", "daddy", "papa"].map((word) => [word, "father"]),
+  ...["sister", "brother", "daughter", "son", "wife", "husband", "niece", "nephew", "cousin", "girlfriend", "boyfriend", "roommate", "fiance", "fiancee"].map((word) => [word, word]),
+  ...["aunt", "auntie"].map((word) => [word, "aunt"]),
+  ...["uncle"].map((word) => [word, "uncle"]),
+  ...["grandmother", "grandma", "granny", "nana"].map((word) => [word, "grandmother"]),
+  ...["grandfather", "grandpa"].map((word) => [word, "grandfather"]),
+  ...["stepmother", "stepfather", "stepsister", "stepbrother"].map((word) => [word, word])
+]);
+var RELATIONSHIP_ROLE_ALIAS_WORDS = {
+  mother: ["Mother", "Mom"],
+  father: ["Father", "Dad"],
+  sister: ["Sister"],
+  brother: ["Brother"],
+  daughter: ["Daughter"],
+  son: ["Son"],
+  wife: ["Wife"],
+  husband: ["Husband"],
+  aunt: ["Aunt", "Auntie"],
+  uncle: ["Uncle"],
+  grandmother: ["Grandmother", "Grandma"],
+  grandfather: ["Grandfather", "Grandpa"],
+  niece: ["Niece"],
+  nephew: ["Nephew"],
+  cousin: ["Cousin"],
+  girlfriend: ["Girlfriend"],
+  boyfriend: ["Boyfriend"],
+  roommate: ["Roommate"],
+  fiance: ["Fiance"],
+  fiancee: ["Fiancee"],
+  stepmother: ["Stepmother"],
+  stepfather: ["Stepfather"],
+  stepsister: ["Stepsister"],
+  stepbrother: ["Stepbrother"]
+};
+function cardRelationshipRoles(text, aliases) {
+  const names = [...new Set(aliases.map((alias) => alias.trim()).filter(Boolean))].sort((left, right) => right.length - left.length);
+  if (!names.length || !text.trim()) return [];
+  const source = text.replace(/[\u2019]/gu, "'").replace(/\{\{\s*char\s*\}\}/giu, names[0]);
+  const escape = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const namePattern = names.map(escape).join("|");
+  const namedPossessive = "[A-Z][\\p{L}'-]*(?:\\s*(?:,|and|&|\\+)\\s*[A-Z][\\p{L}'-]*)*'s";
+  const possessive = `(?:${namedPossessive}\\s+|his\\s+|her\\s+|their\\s+|its\\s+)?`;
+  const roleWords = [...RELATIONSHIP_ROLE_WORDS.keys()].sort((left, right) => right.length - left.length).map(escape).join("|");
+  const modifiers = "(?:[\\p{Ll}'-]+\\s+){0,2}";
+  const patterns = [
+    // "Aiko is Ken's mother", "Aiko is a mother"
+    new RegExp(`\\b(?:${namePattern})\\s+(?:is|was|serves as|acts as)\\s+(?:the\\s+|a\\s+|an\\s+)?${possessive}${modifiers}(${roleWords})\\b`, "giu"),
+    // "Aiko, Ken's mother, …", "Aiko — the mother — …"
+    new RegExp(`\\b(?:${namePattern})\\s*[,\u2014\u2013-]\\s*(?:the\\s+)?${possessive}${modifiers}(${roleWords})\\b`, "giu"),
+    // "She is Ken's mother", "He acts as their father"
+    new RegExp(`\\b(?:he|she|they)\\s+(?:is|was|serves as|acts as)\\s+(?:the\\s+|a\\s+|an\\s+)?${possessive}${modifiers}(${roleWords})\\b`, "giu"),
+    // First and second person cards: "I am Ken's mother", "You are the mother."
+    new RegExp(`\\b(?:i(?:'m| am)|you(?:'re| are))\\s+(?:the\\s+|a\\s+|an\\s+)?${possessive}${modifiers}(${roleWords})\\b`, "giu"),
+    // "Ken's mother is Aiko"
+    new RegExp(`\\b${namedPossessive}\\s+${modifiers}(${roleWords})\\s+(?:is|was)\\s+(?:${namePattern})\\b`, "gu")
+  ];
+  const roles = [];
+  for (const pattern of patterns) {
+    for (const match of source.matchAll(pattern)) {
+      const role = RELATIONSHIP_ROLE_WORDS.get(match[1].toLowerCase());
+      if (role && !roles.includes(role)) roles.push(role);
+    }
+  }
+  return roles;
+}
+function cardRelationshipAliases(cards) {
+  const claims = /* @__PURE__ */ new Map();
+  const rolesByCard = /* @__PURE__ */ new Map();
+  for (const card of cards) {
+    const text = [card.description, card.personality, card.scenario, card.creatorNotes, card.firstMes].filter((part) => typeof part === "string" && part.trim().length > 0).join("\n").slice(0, 6e3);
+    const roles = cardRelationshipRoles(text, speakerAliases(card.name));
+    rolesByCard.set(card.id, roles);
+    for (const role of roles) claims.set(role, [...claims.get(role) ?? [], card.id]);
+  }
+  const result = /* @__PURE__ */ new Map();
+  for (const [id, roles] of rolesByCard) {
+    const words = roles.filter((role) => (claims.get(role) ?? []).length === 1).flatMap((role) => RELATIONSHIP_ROLE_ALIAS_WORDS[role] ?? []);
+    if (words.length) result.set(id, words.slice(0, 2));
+  }
+  return result;
+}
+function withRelationshipAliases(name, aliases) {
+  const base = name.trim();
+  if (!base) return name;
+  const existing = new Set(speakerAliases(name).map((alias) => alias.toLowerCase()));
+  const additions = [...new Set(aliases.filter((alias) => alias.trim() && !existing.has(alias.trim().toLowerCase())))];
+  if (!additions.length) return name;
+  return [base, ...additions].join(" / ").slice(0, 4096);
+}
 function latestGhostOccurrenceIndex(ghosts, key) {
   let found = -1;
   if (key) {
@@ -6596,6 +6687,15 @@ async function buildState(chat, userId) {
     const savedName = name || (id.startsWith("npc:") ? id.slice(4) : "");
     return character ? [{ ...character, name: savedName || character.name, messageCount }] : savedName ? [{ id, name: savedName, messageCount }] : [];
   });
+  const relationshipAliases = cardRelationshipAliases(candidates.map((card) => ({
+    id: card.id,
+    name: card.name,
+    description: card.description,
+    personality: card.personality,
+    scenario: card.scenario,
+    creatorNotes: card.creator_notes,
+    firstMes: card.first_mes
+  })));
   const messages = await spindle.chat.getMessages(chat.id);
   return {
     id: chat.id,
@@ -6612,6 +6712,7 @@ async function buildState(chat, userId) {
     cardCharacterIds: candidates.map((character) => character.id),
     characters: detected.map((character) => ({
       ...character,
+      name: withRelationshipAliases(character.name, relationshipAliases.get(character.id) ?? []),
       voice: config.characterVoices[character.id] ?? ""
     }))
   };
@@ -7179,8 +7280,24 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
     }
     const scannedScenarioIds = Array.isArray(chat.metadata?.chat_voice_non_speaker_cards) ? chat.metadata.chat_voice_non_speaker_cards.filter((id) => typeof id === "string") : [];
     const scenarioCardIds = /* @__PURE__ */ new Set([...scannedScenarioIds, ...cards.filter((card) => isScenarioCardTitle(card.name)).map((card) => card.id)]);
+    const relationshipAliases = cardRelationshipAliases(cards.map((card) => ({
+      id: card.id,
+      name: card.name,
+      description: card.description,
+      personality: card.personality,
+      scenario: card.scenario,
+      creatorNotes: card.creator_notes,
+      firstMes: card.first_mes
+    })));
+    const cardNamesById = new Map(cards.map((card) => [card.id, card.name]));
     const configuredSpeakers = speakersForMessageRole(
-      config.detectedCharacters.filter((character) => !scenarioCardIds.has(character.id)),
+      config.detectedCharacters.filter((character) => !scenarioCardIds.has(character.id)).map((character) => ({
+        ...character,
+        name: withRelationshipAliases(
+          character.name || cardNamesById.get(character.id) || (character.id.startsWith("npc:") ? character.id.slice(4) : ""),
+          relationshipAliases.get(character.id) ?? []
+        )
+      })),
       message.is_user,
       userAliases.join(" / ") || "User"
     );

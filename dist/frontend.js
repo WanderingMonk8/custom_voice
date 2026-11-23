@@ -791,6 +791,16 @@ function uncastNarrativeNameCandidates(message) {
   }
   return [...names.values()];
 }
+var RELATIONSHIP_ROLE_WORDS = new Map([
+  ...["mother", "mom", "mommy", "mum", "mummy", "mama"].map((word) => [word, "mother"]),
+  ...["father", "dad", "daddy", "papa"].map((word) => [word, "father"]),
+  ...["sister", "brother", "daughter", "son", "wife", "husband", "niece", "nephew", "cousin", "girlfriend", "boyfriend", "roommate", "fiance", "fiancee"].map((word) => [word, word]),
+  ...["aunt", "auntie"].map((word) => [word, "aunt"]),
+  ...["uncle"].map((word) => [word, "uncle"]),
+  ...["grandmother", "grandma", "granny", "nana"].map((word) => [word, "grandmother"]),
+  ...["grandfather", "grandpa"].map((word) => [word, "grandfather"]),
+  ...["stepmother", "stepfather", "stepsister", "stepbrother"].map((word) => [word, word])
+]);
 var NARRATED_ROLE_ALIASES = new Map([
   ...["mother", "mom", "mommy", "mum", "mummy", "mama"].map((word) => [word, "mother"]),
   ...["father", "dad", "daddy", "papa"].map((word) => [word, "father"]),

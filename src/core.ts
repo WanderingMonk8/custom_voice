@@ -1383,6 +1383,142 @@ function revealedUncastName(group: UncastVoiceGroup, answers: Record<string, Spe
   return group.inferredName && !isBroadPersonLabel(group.inferredName) ? group.inferredName.toLowerCase() : ''
 }
 
+/**
+ * Relationship words a card can establish about its own character: "Aiko is
+ * Ken's mother". They become speaker aliases, because narration and dialogue
+ * address the character by the role ("his mother answers", "Mom.") rather than
+ * by name.
+ */
+const RELATIONSHIP_ROLE_WORDS: ReadonlyMap<string, string> = new Map([
+  ...['mother', 'mom', 'mommy', 'mum', 'mummy', 'mama'].map(word => [word, 'mother'] as const),
+  ...['father', 'dad', 'daddy', 'papa'].map(word => [word, 'father'] as const),
+  ...['sister', 'brother', 'daughter', 'son', 'wife', 'husband', 'niece', 'nephew', 'cousin', 'girlfriend', 'boyfriend', 'roommate', 'fiance', 'fiancee'].map(word => [word, word] as const),
+  ...['aunt', 'auntie'].map(word => [word, 'aunt'] as const),
+  ...['uncle'].map(word => [word, 'uncle'] as const),
+  ...['grandmother', 'grandma', 'granny', 'nana'].map(word => [word, 'grandmother'] as const),
+  ...['grandfather', 'grandpa'].map(word => [word, 'grandfather'] as const),
+  ...['stepmother', 'stepfather', 'stepsister', 'stepbrother'].map(word => [word, word] as const),
+])
+
+/** Words to add to the roster for each claimed role, most natural first. */
+const RELATIONSHIP_ROLE_ALIAS_WORDS: Readonly<Record<string, readonly string[]>> = {
+  mother: ['Mother', 'Mom'],
+  father: ['Father', 'Dad'],
+  sister: ['Sister'],
+  brother: ['Brother'],
+  daughter: ['Daughter'],
+  son: ['Son'],
+  wife: ['Wife'],
+  husband: ['Husband'],
+  aunt: ['Aunt', 'Auntie'],
+  uncle: ['Uncle'],
+  grandmother: ['Grandmother', 'Grandma'],
+  grandfather: ['Grandfather', 'Grandpa'],
+  niece: ['Niece'],
+  nephew: ['Nephew'],
+  cousin: ['Cousin'],
+  girlfriend: ['Girlfriend'],
+  boyfriend: ['Boyfriend'],
+  roommate: ['Roommate'],
+  fiance: ['Fiance'],
+  fiancee: ['Fiancee'],
+  stepmother: ['Stepmother'],
+  stepfather: ['Stepfather'],
+  stepsister: ['Stepsister'],
+  stepbrother: ['Stepbrother'],
+}
+
+/**
+ * Roles a character card claims for its own character. Only claims attached to
+ * the card's own name (or to the card speaking in first or second person) count,
+ * so a card that merely describes someone else's mother claims nothing.
+ */
+export function cardRelationshipRoles(text: string, aliases: readonly string[]): string[] {
+  const names = [...new Set(aliases.map(alias => alias.trim()).filter(Boolean))].sort((left, right) => right.length - left.length)
+  if (!names.length || !text.trim()) return []
+  const source = text
+    .replace(/[\u2019]/gu, "'")
+    .replace(/\{\{\s*char\s*\}\}/giu, names[0]!)
+  const escape = (value: string): string => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const namePattern = names.map(escape).join('|')
+  // "Ken's", "Ken and Nao's" — the person the role belongs to. A lowercase
+  // pronoun ("his mother") is only honored for a named subject, because the
+  // pronoun may point at another character.
+  const namedPossessive = "[A-Z][\\p{L}'-]*(?:\\s*(?:,|and|&|\\+)\\s*[A-Z][\\p{L}'-]*)*'s"
+  const possessive = `(?:${namedPossessive}\\s+|his\\s+|her\\s+|their\\s+|its\\s+)?`
+  const roleWords = [...RELATIONSHIP_ROLE_WORDS.keys()].sort((left, right) => right.length - left.length).map(escape).join('|')
+  // "Nao's older sister", "the younger brother" — a couple of modifiers may sit
+  // between the relationship and the role noun.
+  const modifiers = "(?:[\\p{Ll}'-]+\\s+){0,2}"
+  const patterns = [
+    // "Aiko is Ken's mother", "Aiko is a mother"
+    new RegExp(`\\b(?:${namePattern})\\s+(?:is|was|serves as|acts as)\\s+(?:the\\s+|a\\s+|an\\s+)?${possessive}${modifiers}(${roleWords})\\b`, 'giu'),
+    // "Aiko, Ken's mother, …", "Aiko — the mother — …"
+    new RegExp(`\\b(?:${namePattern})\\s*[,—–-]\\s*(?:the\\s+)?${possessive}${modifiers}(${roleWords})\\b`, 'giu'),
+    // "She is Ken's mother", "He acts as their father"
+    new RegExp(`\\b(?:he|she|they)\\s+(?:is|was|serves as|acts as)\\s+(?:the\\s+|a\\s+|an\\s+)?${possessive}${modifiers}(${roleWords})\\b`, 'giu'),
+    // First and second person cards: "I am Ken's mother", "You are the mother."
+    new RegExp(`\\b(?:i(?:'m| am)|you(?:'re| are))\\s+(?:the\\s+|a\\s+|an\\s+)?${possessive}${modifiers}(${roleWords})\\b`, 'giu'),
+    // "Ken's mother is Aiko"
+    new RegExp(`\\b${namedPossessive}\\s+${modifiers}(${roleWords})\\s+(?:is|was)\\s+(?:${namePattern})\\b`, 'gu'),
+  ]
+  const roles: string[] = []
+  for (const pattern of patterns) {
+    for (const match of source.matchAll(pattern)) {
+      const role = RELATIONSHIP_ROLE_WORDS.get(match[1].toLowerCase())
+      if (role && !roles.includes(role)) roles.push(role)
+    }
+  }
+  return roles
+}
+
+/**
+ * Relationship aliases for every card in the chat. A role claimed by more than
+ * one card is ambiguous and stays out of the roster, so two cards mentioning
+ * "mother" cannot both answer to "Mom".
+ */
+export function cardRelationshipAliases(
+  cards: ReadonlyArray<{
+    id: string
+    name: string
+    description?: string
+    personality?: string
+    scenario?: string
+    creatorNotes?: string
+    firstMes?: string
+  }>,
+): Map<string, string[]> {
+  const claims = new Map<string, string[]>()
+  const rolesByCard = new Map<string, string[]>()
+  for (const card of cards) {
+    const text = [card.description, card.personality, card.scenario, card.creatorNotes, card.firstMes]
+      .filter((part): part is string => typeof part === 'string' && part.trim().length > 0)
+      .join('\n')
+      .slice(0, 6_000)
+    const roles = cardRelationshipRoles(text, speakerAliases(card.name))
+    rolesByCard.set(card.id, roles)
+    for (const role of roles) claims.set(role, [...(claims.get(role) ?? []), card.id])
+  }
+  const result = new Map<string, string[]>()
+  for (const [id, roles] of rolesByCard) {
+    const words = roles
+      .filter(role => (claims.get(role) ?? []).length === 1)
+      .flatMap(role => RELATIONSHIP_ROLE_ALIAS_WORDS[role] ?? [])
+    if (words.length) result.set(id, words.slice(0, 2))
+  }
+  return result
+}
+
+/** Append relationship aliases to a roster name unless it already answers to them. */
+export function withRelationshipAliases(name: string, aliases: readonly string[]): string {
+  const base = name.trim()
+  if (!base) return name
+  const existing = new Set(speakerAliases(name).map(alias => alias.toLowerCase()))
+  const additions = [...new Set(aliases.filter(alias => alias.trim() && !existing.has(alias.trim().toLowerCase())))]
+  if (!additions.length) return name
+  return [base, ...additions].join(' / ').slice(0, 4_096)
+}
+
 /** Prefer the most recently recorded claim if a rejected old occurrence was superseded. */
 function latestGhostOccurrenceIndex(ghosts: GhostVoice[], key: string): number {
   let found = -1
