@@ -1275,7 +1275,7 @@ export function buildUncastVoiceDecision(groups: UncastVoiceGroup[], voices: Fav
     message,
     previousMessages,
     narrativeNames,
-    ...(cast.length ? { cast: cast.map(member => ({ id: member.id, name: member.name })) } : {}),
+    ...(cast.length ? { cast: cast.map(member => ({ id: member.id, name: member.name, ...(member.description ? { description: member.description } : {}) })) } : {}),
     characters: groups.map(group => ({
       id: group.id,
       identity: group.speakerId,
@@ -1337,10 +1337,10 @@ export function buildUncastVoiceDecision(groups: UncastVoiceGroup[], voices: Fav
     }
     if (cast.length) questions[`cast_${group.id}`] = {
       type: 'choice',
-      instructions: `Is the person who speaks the quoted dialogue in ${group.id} one of the established cast characters listed in state.cast? Established cast members already have their own voice, so an unlisted voice is only for someone new. Trace the current exchange and previousMessages: who is present, who acts, who is addressed, and who a name or relationship refers to. A person mentioned in narration, addressed by the speaker, or merely present is not the speaker. Choose none unless the evidence clearly identifies which established cast member speaks these quotations.`,
+      instructions: `Is the person who speaks the quoted dialogue in ${group.id} one of the established cast characters listed in state.cast? Established cast members already have their own voice, so an unlisted voice is only for someone new. When the scene refers to the speaker by family role or relationship ("his mother answers", "the sister calls"), a cast member whose description matches that role is the speaker. Trace the current exchange and previousMessages: who is present, who acts, who is addressed, and who a name or relationship refers to. A person mentioned in narration, addressed by the speaker, or merely present is not the speaker. Choose none only when no cast member plausibly fits.`,
       criteria: {
         none: 'The speaker is a new, unnamed, or unlisted character.',
-        ...Object.fromEntries(cast.map((member, index) => [`cast_${index}`, `${member.name} (${member.id})`])),
+        ...Object.fromEntries(cast.map((member, index) => [`cast_${index}`, member.description ? `${member.name} (${member.id}) — ${member.description}` : `${member.name} (${member.id})`])),
       },
     }
     const earlier = groups.slice(0, groups.indexOf(group))
@@ -1497,10 +1497,48 @@ export function buildUncastIdentityReview(groups: UncastVoiceGroup[], answers: R
   return { state: { message, previousMessages, characters: groups.map(group => ({ id: group.id, identity: group.speakerId, speeches: group.speeches, context: group.context })), ghosts: ghosts.map((ghost, index) => ({ option: `ghost_${index}`, identity: ghost.speakerId, aliases: ghostCastAliases(ghost), priorMessageIds: ghostPriorMessageIds(ghost, previousMessages), context: ghost.context, conversationHistory: ghost.conversationHistory ?? [] })) }, questions }
 }
 
+/** Family and relationship words used both in narration and in character descriptions. */
+const NARRATED_ROLE_ALIASES: ReadonlyMap<string, string> = new Map([
+  ...['mother', 'mom', 'mommy', 'mum', 'mummy', 'mama'].map(word => [word, 'mother'] as const),
+  ...['father', 'dad', 'daddy', 'papa'].map(word => [word, 'father'] as const),
+  ...['sister', 'sis'].map(word => [word, 'sister'] as const),
+  ...['brother', 'bro'].map(word => [word, 'brother'] as const),
+  ...['daughter', 'son', 'wife', 'husband', 'aunt', 'uncle', 'niece', 'nephew', 'cousin', 'girlfriend', 'boyfriend', 'fiance', 'fiancee', 'friend', 'boss', 'teacher', 'landlady', 'landlord', 'neighbor', 'roommate', 'partner'].map(word => [word, word] as const),
+  ...['grandmother', 'grandma', 'granny', 'nana'].map(word => [word, 'grandmother'] as const),
+  ...['grandfather', 'grandpa'].map(word => [word, 'grandfather'] as const),
+])
+
+/**
+ * Roles narration attributes to the speaker right where it introduces them:
+ * "his mother answers", "the landlord replies". Only speech attributions
+ * count, so a merely present relative ("her brother sets the tray down") is
+ * not mistaken for the speaker.
+ */
+export function narratedSpeakerRoles(context: string): string[] {
+  const text = context.replace(/[\u2019]/gu, "'")
+  const roles: string[] = []
+  const pattern = /(?:\b(?:his|her|their|my|your|His|Her|Their|My|Your)\s+|\bthe\s+|\b[\p{Lu}][\p{L}'’-]{1,30}'s\s+)([\p{Ll}]{3,})\s+(?:answers?|answered|repl(?:y|ies|ied)|says?|said|asks?|asked|calls?|called|whispers?|whispered|murmurs?|murmured|adds?|added|continues?|continued|snaps?|snapped|sighs?|sighed|laughs?|laughed|shouts?|shouted|tells?|told|begins?|began|returns?|returned|agrees?|agreed)\b/gu
+  for (const match of text.matchAll(pattern)) {
+    const role = NARRATED_ROLE_ALIASES.get(match[1].toLowerCase())
+    if (role && !roles.includes(role)) roles.push(role)
+  }
+  return roles
+}
+
+/** Roles a character card claims for itself ("Aiko is Ken's mother"). */
+function castDescriptionRoles(description: string): string[] {
+  const roles: string[] = []
+  for (const token of description.toLowerCase().replace(/[^\p{L}']+/gu, ' ').split(/\s+/u)) {
+    const role = NARRATED_ROLE_ALIASES.get(token.replace(/'s$/u, ''))
+    if (role && !roles.includes(role)) roles.push(role)
+  }
+  return roles
+}
+
 export interface UncastVoiceAssignment { groupId: string; voiceId: string; gender: string; ghostId?: string; label?: string; aliases?: string[]; matchReason?: string; castSpeakerId?: string }
 
 /** A chat character that already owns a configured voice. */
-export interface CastSpeaker { id: string; name: string; voiceId: string }
+export interface CastSpeaker { id: string; name: string; voiceId: string; description?: string }
 
 /** Broad descriptions are useful context, but do not uniquely identify a person. */
 export function isBroadPersonLabel(label: string): boolean {
@@ -1583,6 +1621,13 @@ export function resolveUncastVoiceDecisions(
   // unidentified fragment instead reuses the first pending voice of a
   // compatible sex.
   const pendingUnnamedVoices: Array<{ ghost: GhostVoice; voice: FavoriteVoice }> = []
+  // A cast member identified within this message also owns the message's
+  // remaining unidentified lines when the exchange has only that one unnamed
+  // participant: the mother answering off-screen and then "Mm." are the same
+  // person, so "Mm." must not mint a separate favorite either.
+  const pendingCastVoices: CastSpeaker[] = []
+  const hasNewVoiceEvidence = (members: UncastVoiceGroup[]): boolean =>
+    members.some(group => group.context.some(context => hasNewAnonymousVoiceCue(context) || hasStrongNarrativeName(context)))
   const groupShowsNamedIdentity = (group: UncastVoiceGroup): boolean => {
     if (revealedUncastName(group, answers, message)) return true
     if (normalizeSpeakerName(group.narratedName ?? '')) return true
@@ -1596,19 +1641,35 @@ export function resolveUncastVoiceDecisions(
     const runnerUp = Math.max(0, ...Object.entries(answer.probabilities).filter(([key]) => key !== answer.choice).map(([, p]) => p))
     return answer.confidence >= 0.8 && probability >= 0.8 && probability - runnerUp >= 0.25
   }
-  // A group Jev confidently places among the established cast characters must
-  // keep that character's configured voice instead of minting a new favorite.
-  // A root is one person, so conflicting or weak picks do not count.
+  // A group Jev places among the established cast characters must keep that
+  // character's configured voice instead of minting a new favorite, so the bar
+  // is a clear lead rather than Jev's strict "strong" verdict: the cast list is
+  // small and carries each member's description, and a random voice for an
+  // off-screen cast member is the worse error. A root is one person, so
+  // conflicting picks do not count.
+  const castChoice = (answer: SpeakerDecisionChoice | undefined): boolean => {
+    if (!answer || !answer.choice.startsWith('cast_') || !answer.probabilities) return false
+    const probability = answer.probabilities[answer.choice] ?? 0
+    const runnerUp = Math.max(0, ...Object.entries(answer.probabilities).filter(([key]) => key !== answer.choice).map(([, p]) => p))
+    return Number.isFinite(answer.confidence) && answer.confidence >= 0.6 && probability >= 0.7 && probability - runnerUp >= 0.25
+  }
   const castSpeakerFor = (members: UncastVoiceGroup[]): CastSpeaker | undefined => {
     const picks = members.flatMap(group => {
       const answer = answers[`cast_${group.id}`]
-      if (!answer || !strongChoice(answer)) return []
-      const match = answer.choice.match(/^cast_(\d+)$/u)
+      if (!castChoice(answer)) return []
+      const match = answer!.choice.match(/^cast_(\d+)$/u)
       const member = match ? cast[Number(match[1])] : undefined
       return member ? [member] : []
     })
-    if (!picks.length) return undefined
-    return picks.every(member => member.id === picks[0].id) ? picks[0] : undefined
+    if (picks.length) return picks.every(member => member.id === picks[0].id) ? picks[0] : undefined
+    // Deterministic backstop when Jev leaves the group unidentified: narration
+    // that attributes the speech to a role ("his mother answers") names the
+    // speaker's relation, and exactly one cast member whose card claims that
+    // relation must be that person.
+    const roles = [...new Set(members.flatMap(group => narratedSpeakerRoles(group.context.join(' '))))]
+    if (!roles.length) return undefined
+    const matching = cast.filter(member => member.description && roles.every(role => castDescriptionRoles(member.description!).includes(role)))
+    return matching.length === 1 ? matching[0] : undefined
   }
   // Resolve identity links before choosing voices, so later evidence can help
   // the whole character even when the first group has no suitable match.
@@ -1824,6 +1885,7 @@ export function resolveUncastVoiceDecisions(
     const castMember = ghost || !cast.length ? undefined : castSpeakerFor(members)
     if (castMember && members.every(group => !groupShowsNamedIdentity(group))) {
       used.add(castMember.voiceId)
+      if (!pendingCastVoices.some(member => member.id === castMember.id)) pendingCastVoices.push(castMember)
       for (const group of members) {
         assignments.push({
           groupId: group.id, voiceId: castMember.voiceId, gender,
@@ -1846,6 +1908,21 @@ export function resolveUncastVoiceDecisions(
       // An unknown-gender fragment is compatible with every voice, so it
       // cannot be shown to belong to the same person; it keeps its own voice.
       const definiteGender = gender === 'male' || gender === 'female'
+      // A cast member identified earlier in this same message owns the rest of
+      // the exchange's unnamed lines unless they introduce someone new. The
+      // gender stays definite: an unknown-gender fragment proves nothing.
+      const sharedCast = unidentified && unnamedMembers && definiteGender && pendingCastVoices.length === 1 && !hasNewVoiceEvidence(members)
+        ? pendingCastVoices[0]
+        : undefined
+      if (sharedCast) {
+        for (const group of members) {
+          assignments.push({
+            groupId: group.id, voiceId: sharedCast.voiceId, gender, castSpeakerId: sharedCast.id,
+            matchReason: `same exchange as cast member: ${sharedCast.name} (${sharedCast.id})`,
+          })
+        }
+        continue
+      }
       const shared = unidentified && unnamedMembers && definiteGender
         ? pendingUnnamedVoices.find(entry => voiceGenderCompatible(entry.voice, gender))
         : undefined

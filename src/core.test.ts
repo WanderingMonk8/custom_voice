@@ -170,6 +170,7 @@ import {
   shouldPersistMessageAudio,
   splitLargeVoicePlanSegments,
   rollingRequestWindowDelay,
+  narratedSpeakerRoles,
   SPEAKER_DECISION_THRESHOLDS,
   TTS_MODULATION_MARKER,
   stripSkippedTrackerBlocks,
@@ -3294,11 +3295,11 @@ test('checks an unidentified group against the existing cast before adding a voi
   ])
   assert.equal(groups.length, 1)
   const voices = readFavoriteVoices([{ id: 'voice-1', category: 'female' }])
-  const cast = [{ id: 'aiko', name: 'Aiko', voiceId: 'cast-voice' }]
-  const plan = buildUncastVoiceDecision(groups, voices, 'Aiko answers from the kitchen.', [], [], false, cast)
+  const cast = [{ id: 'aiko', name: 'Aiko', voiceId: 'cast-voice', description: "Aiko is Ken and Nao's mother." }]
+  const plan = buildUncastVoiceDecision(groups, voices, 'His mother answers from the kitchen.', [], [], false, cast)
   assert.ok(plan.questions.cast_g0)
-  assert.ok(Object.values(plan.questions.cast_g0.criteria).includes('Aiko (aiko)'))
-  assert.deepEqual(plan.state.cast, [{ id: 'aiko', name: 'Aiko' }])
+  assert.ok(Object.values(plan.questions.cast_g0.criteria).includes("Aiko (aiko) \u2014 Aiko is Ken and Nao's mother."))
+  assert.deepEqual(plan.state.cast, [{ id: 'aiko', name: 'Aiko', description: "Aiko is Ken and Nao's mother." }])
   assert.equal(buildUncastVoiceDecision(groups, voices, 'Aiko answers.').questions.cast_g0, undefined)
   const resolved = resolveUncastVoiceDecisions(groups, voices, {
     cast_g0: confidentDecision('cast_0'),
@@ -3308,6 +3309,13 @@ test('checks an unidentified group against the existing cast before adding a voi
   assert.deepEqual(resolved.map(item => item.voiceId), ['cast-voice'])
   assert.equal(resolved[0]?.castSpeakerId, 'aiko')
   assert.equal(resolved[0]?.ghostId, undefined)
+  // A clear lead is enough even below Jev's strict "strong" verdict.
+  const leading = resolveUncastVoiceDecisions(groups, voices, {
+    cast_g0: { choice: 'cast_0', probabilities: { cast_0: 0.74, none: 0.26 }, confidence: 0.61 },
+    gender_g0: confidentDecision('female'),
+    voice_g0: confidentDecision('voice_0'),
+  }, [], [], 'current', 'Aiko answers from the kitchen.', [], () => 0, cast)
+  assert.deepEqual(leading.map(item => item.voiceId), ['cast-voice'])
   // A weak pick is not evidence: the group keeps its own new voice.
   const weak = resolveUncastVoiceDecisions(groups, voices, {
     cast_g0: { choice: 'cast_0', probabilities: { cast_0: 0.45, none: 0.55 }, confidence: 0.2 },
@@ -3316,6 +3324,62 @@ test('checks an unidentified group against the existing cast before adding a voi
   }, [], [], 'current', 'Aiko answers from the kitchen.', [], () => 0, cast)
   assert.deepEqual(weak.map(item => item.voiceId), ['voice-1'])
   assert.equal(weak[0]?.castSpeakerId, undefined)
+})
+
+test('matches a narrator-attributed role to the cast member whose card claims it', () => {
+  // Reported scene: the mother answers off-screen, the cast already holds her
+  // with her own configured voice, but Jev sees no name and leaves the group
+  // unidentified. Narration states the role, so the cast member who claims
+  // that role speaks it instead of a fresh favorite.
+  const groups = collectUncastVoiceGroups([
+    { speakerId: null, text: "Through the floor it's mush. Her voice comes up thin and low.\n\nHis mother answers. That's the same. A murmur, warm, moving." },
+    { speakerId: UNCAST_SPEAKER_ID, text: "...cold out? Take your coat off, you're dripping on-" },
+  ])
+  assert.deepEqual(narratedSpeakerRoles(groups[0].context.join(' ')), ['mother'])
+  // A relative who merely acts is not attributed a speech.
+  assert.deepEqual(narratedSpeakerRoles('Her brother sets the tray down and leaves.'), [])
+  const voices = readFavoriteVoices([{ id: 'voice-1', category: 'female' }])
+  const answers = { gender_g0: confidentDecision('female'), voice_g0: confidentDecision('voice_0') }
+  const aiko = [{ id: 'aiko', name: 'Aiko', voiceId: 'cast-voice', description: "Aiko is Ken and Nao's mother." }]
+  const assigned = resolveUncastVoiceDecisions(groups, voices, answers, [], [], 'current', '', [], () => 0, aiko)
+  assert.deepEqual(assigned.map(item => item.voiceId), ['cast-voice'])
+  assert.equal(assigned[0]?.castSpeakerId, 'aiko')
+  // A card that does not claim the role is no evidence.
+  const other = [{ id: 'aiko', name: 'Aiko', voiceId: 'cast-voice', description: 'Aiko runs the tea shop on the corner.' }]
+  const unrelated = resolveUncastVoiceDecisions(groups, voices, answers, [], [], 'current', '', [], () => 0, other)
+  assert.deepEqual(unrelated.map(item => item.voiceId), ['voice-1'])
+  assert.equal(unrelated[0]?.castSpeakerId, undefined)
+})
+
+test('keeps the rest of an off-screen exchange on the cast voice the narration identified', () => {
+  // Reported scene: the mother answers off-screen between her daughter's
+  // lines. Narration names her role, so she is cast, and the replies that
+  // follow belong to the same person rather than to new arrivals.
+  const groups = collectUncastVoiceGroups([
+    { speakerId: null, text: "Through the floor it's mush. Her voice comes up thin and low.\n\nHis mother answers. That's the same. A murmur, warm, moving." },
+    { speakerId: UNCAST_SPEAKER_ID, text: "...cold out? Take your coat off, you're dripping on-" },
+    { speakerId: 'npc:nao', text: "I'm not dripping." },
+    { speakerId: UNCAST_SPEAKER_ID, text: "Then what's that, exactly." },
+    { speakerId: 'npc:nao', text: "Rain. It's raining out there." },
+    { speakerId: UNCAST_SPEAKER_ID, text: "Go and hang the coat up, then, before it drips." },
+    { speakerId: null, text: 'A clatter. Something set down hard.\n\nThen, quieter. Not muffled. Clear as if said on the stairs.' },
+    { speakerId: UNCAST_SPEAKER_ID, text: 'It is not rain, it is the gutter overflowing.' },
+  ])
+  assert.deepEqual(narratedSpeakerRoles(groups[0].context.join(' ')), ['mother'])
+  const voices = readFavoriteVoices([
+    { id: 'voice-1', category: 'female' },
+    { id: 'voice-2', category: 'female' },
+  ])
+  const answers = Object.fromEntries(groups.flatMap((group, index) => [
+    [`gender_${group.id}`, confidentDecision('female')],
+    [`voice_${group.id}`, confidentDecision(index === 0 ? 'voice_0' : 'voice_1')],
+  ]))
+  const cast = [{ id: 'aiko', name: 'Aiko', voiceId: 'cast-voice', description: "Aiko is Ken and Nao's mother." }]
+  const assigned = resolveUncastVoiceDecisions(groups, voices, answers, [], [], 'current', '', [], () => 0, cast)
+  assert.equal(assigned.length, groups.length)
+  assert.ok(assigned.every(item => item.voiceId === 'cast-voice'), JSON.stringify(assigned))
+  assert.ok(assigned.every(item => item.castSpeakerId === 'aiko'), JSON.stringify(assigned))
+  assert.ok(assigned.every(item => !item.ghostId), JSON.stringify(assigned))
 })
 
 test('strong pairwise identity links override conflicting cached turn voices', () => {

@@ -316,6 +316,18 @@ function purgeExpiredGhostContexts(ghosts, assistantMessageIds, lifetime) {
   }
   return changed;
 }
+function hasStrongNarrativeName(text) {
+  const narrative = narrativeOnly(text);
+  for (const match of narrative.matchAll(/\b([\p{Lu}][\p{Ll}\p{M}'’-]{1,39})\s+(?:is|was|has|had|stands|stood|sits|sat|turns|turned|looks|looked|says|said|asks|asked|answers|answered|replies|replied|huffs|huffed|slaps|slapped|calls|called|shouts|shouted|speaks|spoke|mutters|muttered|laughs|laughed|glances|glanced|walks|walked|moves|moved|steps|stepped|nods|nodded)\b/gu)) {
+    const name = normalizeSpeakerName(match[1]);
+    if (name && !NON_NAME_PARAGRAPH_LEADS.has(name.toLowerCase())) return true;
+  }
+  return false;
+}
+var NEW_UNCAST_VOICE_CUE_PATTERN = /(?:\b(?:a|an|another)\s+(?:new|different|other|second|third|next)\s+(?:voice|speaker)\b|\bthe\s+other\s+(?:voice|speaker)\b|\bsomeone else\s+(?:answers|answer|says|speaks|replies|responds)\b)/iu;
+function hasNewAnonymousVoiceCue(text) {
+  return NEW_UNCAST_VOICE_CUE_PATTERN.test(narrativeOnly(text));
+}
 function canReserveAutomaticVoice(voiceId, reserved, ghosts, existingGhostId = "") {
   return !!voiceId && !reserved.has(voiceId) && !ghosts.some((ghost) => ghost.voiceId === voiceId && ghost.id !== existingGhostId);
 }
@@ -508,7 +520,7 @@ function buildUncastVoiceDecision(groups, voices, message, ghosts = [], previous
     message,
     previousMessages,
     narrativeNames,
-    ...cast.length ? { cast: cast.map((member) => ({ id: member.id, name: member.name })) } : {},
+    ...cast.length ? { cast: cast.map((member) => ({ id: member.id, name: member.name, ...member.description ? { description: member.description } : {} })) } : {},
     characters: groups.map((group) => ({
       id: group.id,
       identity: group.speakerId,
@@ -563,10 +575,10 @@ function buildUncastVoiceDecision(groups, voices, message, ghosts = [], previous
     };
     if (cast.length) questions[`cast_${group.id}`] = {
       type: "choice",
-      instructions: `Is the person who speaks the quoted dialogue in ${group.id} one of the established cast characters listed in state.cast? Established cast members already have their own voice, so an unlisted voice is only for someone new. Trace the current exchange and previousMessages: who is present, who acts, who is addressed, and who a name or relationship refers to. A person mentioned in narration, addressed by the speaker, or merely present is not the speaker. Choose none unless the evidence clearly identifies which established cast member speaks these quotations.`,
+      instructions: `Is the person who speaks the quoted dialogue in ${group.id} one of the established cast characters listed in state.cast? Established cast members already have their own voice, so an unlisted voice is only for someone new. When the scene refers to the speaker by family role or relationship ("his mother answers", "the sister calls"), a cast member whose description matches that role is the speaker. Trace the current exchange and previousMessages: who is present, who acts, who is addressed, and who a name or relationship refers to. A person mentioned in narration, addressed by the speaker, or merely present is not the speaker. Choose none only when no cast member plausibly fits.`,
       criteria: {
         none: "The speaker is a new, unnamed, or unlisted character.",
-        ...Object.fromEntries(cast.map((member, index) => [`cast_${index}`, `${member.name} (${member.id})`]))
+        ...Object.fromEntries(cast.map((member, index) => [`cast_${index}`, member.description ? `${member.name} (${member.id}) \u2014 ${member.description}` : `${member.name} (${member.id})`]))
       }
     };
     const earlier = groups.slice(0, groups.indexOf(group));
@@ -713,6 +725,33 @@ function buildUncastIdentityReview(groups, answers, message, ghosts = [], messag
   }
   return { state: { message, previousMessages, characters: groups.map((group) => ({ id: group.id, identity: group.speakerId, speeches: group.speeches, context: group.context })), ghosts: ghosts.map((ghost, index) => ({ option: `ghost_${index}`, identity: ghost.speakerId, aliases: ghostCastAliases(ghost), priorMessageIds: ghostPriorMessageIds(ghost, previousMessages), context: ghost.context, conversationHistory: ghost.conversationHistory ?? [] })) }, questions };
 }
+var NARRATED_ROLE_ALIASES = new Map([
+  ...["mother", "mom", "mommy", "mum", "mummy", "mama"].map((word) => [word, "mother"]),
+  ...["father", "dad", "daddy", "papa"].map((word) => [word, "father"]),
+  ...["sister", "sis"].map((word) => [word, "sister"]),
+  ...["brother", "bro"].map((word) => [word, "brother"]),
+  ...["daughter", "son", "wife", "husband", "aunt", "uncle", "niece", "nephew", "cousin", "girlfriend", "boyfriend", "fiance", "fiancee", "friend", "boss", "teacher", "landlady", "landlord", "neighbor", "roommate", "partner"].map((word) => [word, word]),
+  ...["grandmother", "grandma", "granny", "nana"].map((word) => [word, "grandmother"]),
+  ...["grandfather", "grandpa"].map((word) => [word, "grandfather"])
+]);
+function narratedSpeakerRoles(context) {
+  const text = context.replace(/[\u2019]/gu, "'");
+  const roles = [];
+  const pattern = /(?:\b(?:his|her|their|my|your|His|Her|Their|My|Your)\s+|\bthe\s+|\b[\p{Lu}][\p{L}'’-]{1,30}'s\s+)([\p{Ll}]{3,})\s+(?:answers?|answered|repl(?:y|ies|ied)|says?|said|asks?|asked|calls?|called|whispers?|whispered|murmurs?|murmured|adds?|added|continues?|continued|snaps?|snapped|sighs?|sighed|laughs?|laughed|shouts?|shouted|tells?|told|begins?|began|returns?|returned|agrees?|agreed)\b/gu;
+  for (const match of text.matchAll(pattern)) {
+    const role = NARRATED_ROLE_ALIASES.get(match[1].toLowerCase());
+    if (role && !roles.includes(role)) roles.push(role);
+  }
+  return roles;
+}
+function castDescriptionRoles(description) {
+  const roles = [];
+  for (const token of description.toLowerCase().replace(/[^\p{L}']+/gu, " ").split(/\s+/u)) {
+    const role = NARRATED_ROLE_ALIASES.get(token.replace(/'s$/u, ""));
+    if (role && !roles.includes(role)) roles.push(role);
+  }
+  return roles;
+}
 function isBroadPersonLabel(label) {
   return /^(?:(?:the|a|an)\s+)?(?:(?:young|younger|old|older|elderly|middle-aged|tall|short)\s+)*(?:woman|man|person|girl|boy|guy|lady|stranger|someone|somebody)$/iu.test(label.trim());
 }
@@ -757,6 +796,8 @@ function resolveUncastVoiceDecisions(groups, voices, answers, ghosts = [], reser
   const rootByLabel = /* @__PURE__ */ new Map();
   const rootByRevealedName = /* @__PURE__ */ new Map();
   const pendingUnnamedVoices = [];
+  const pendingCastVoices = [];
+  const hasNewVoiceEvidence = (members) => members.some((group) => group.context.some((context) => hasNewAnonymousVoiceCue(context) || hasStrongNarrativeName(context)));
   const groupShowsNamedIdentity = (group) => {
     if (revealedUncastName(group, answers, message)) return true;
     if (normalizeSpeakerName(group.narratedName ?? "")) return true;
@@ -770,16 +811,25 @@ function resolveUncastVoiceDecisions(groups, voices, answers, ghosts = [], reser
     const runnerUp = Math.max(0, ...Object.entries(answer.probabilities).filter(([key]) => key !== answer.choice).map(([, p]) => p));
     return answer.confidence >= 0.8 && probability >= 0.8 && probability - runnerUp >= 0.25;
   };
+  const castChoice = (answer) => {
+    if (!answer || !answer.choice.startsWith("cast_") || !answer.probabilities) return false;
+    const probability = answer.probabilities[answer.choice] ?? 0;
+    const runnerUp = Math.max(0, ...Object.entries(answer.probabilities).filter(([key]) => key !== answer.choice).map(([, p]) => p));
+    return Number.isFinite(answer.confidence) && answer.confidence >= 0.6 && probability >= 0.7 && probability - runnerUp >= 0.25;
+  };
   const castSpeakerFor = (members) => {
     const picks = members.flatMap((group) => {
       const answer = answers[`cast_${group.id}`];
-      if (!answer || !strongChoice(answer)) return [];
+      if (!castChoice(answer)) return [];
       const match = answer.choice.match(/^cast_(\d+)$/u);
       const member = match ? cast[Number(match[1])] : void 0;
       return member ? [member] : [];
     });
-    if (!picks.length) return void 0;
-    return picks.every((member) => member.id === picks[0].id) ? picks[0] : void 0;
+    if (picks.length) return picks.every((member) => member.id === picks[0].id) ? picks[0] : void 0;
+    const roles = [...new Set(members.flatMap((group) => narratedSpeakerRoles(group.context.join(" "))))];
+    if (!roles.length) return void 0;
+    const matching = cast.filter((member) => member.description && roles.every((role) => castDescriptionRoles(member.description).includes(role)));
+    return matching.length === 1 ? matching[0] : void 0;
   };
   for (const group of groups) {
     let root = group.id;
@@ -951,6 +1001,7 @@ function resolveUncastVoiceDecisions(groups, voices, answers, ghosts = [], reser
     const castMember = ghost || !cast.length ? void 0 : castSpeakerFor(members);
     if (castMember && members.every((group) => !groupShowsNamedIdentity(group))) {
       used.add(castMember.voiceId);
+      if (!pendingCastVoices.some((member) => member.id === castMember.id)) pendingCastVoices.push(castMember);
       for (const group of members) {
         assignments.push({
           groupId: group.id,
@@ -966,6 +1017,19 @@ function resolveUncastVoiceDecisions(groups, voices, answers, ghosts = [], reser
       const unidentified = members.every((group) => !strongChoice(answers[`identity_${group.id}`]));
       const unnamedMembers = members.every((group) => group.speakerId === UNCAST_SPEAKER_ID && !groupShowsNamedIdentity(group));
       const definiteGender = gender === "male" || gender === "female";
+      const sharedCast = unidentified && unnamedMembers && definiteGender && pendingCastVoices.length === 1 && !hasNewVoiceEvidence(members) ? pendingCastVoices[0] : void 0;
+      if (sharedCast) {
+        for (const group of members) {
+          assignments.push({
+            groupId: group.id,
+            voiceId: sharedCast.voiceId,
+            gender,
+            castSpeakerId: sharedCast.id,
+            matchReason: `same exchange as cast member: ${sharedCast.name} (${sharedCast.id})`
+          });
+        }
+        continue;
+      }
       const shared = unidentified && unnamedMembers && definiteGender ? pendingUnnamedVoices.find((entry) => voiceGenderCompatible(entry.voice, gender)) : void 0;
       if (shared) {
         ghost = shared.ghost;
@@ -7916,15 +7980,18 @@ spindle.onFrontendMessage(async (rawPayload, userId, frontendSessionId) => {
           ...group.narratedName ? { narratedName: group.narratedName } : {},
           ...group.inferredName ? { inferredName: group.inferredName } : {}
         }));
+        const chat = await spindle.chats.get(payload.chatId, userId);
+        if (!chat) throw new Error("The chat is no longer available.");
+        const castCards = payload.cast?.length ? await loadCharacters(chat, userId).catch(() => []) : [];
         const cast = (payload.cast ?? []).slice(0, 32).flatMap((member) => {
           if (!member || typeof member.id !== "string" || typeof member.name !== "string" || typeof member.voiceId !== "string") return [];
           const id = member.id.trim().slice(0, 200);
           const voiceId = member.voiceId.trim().slice(0, 512);
           const name = member.name.trim().slice(0, 200) || id;
-          return id && voiceId ? [{ id, name, voiceId }] : [];
+          const card = castCards.find((item) => item.id === id);
+          const description = (card?.description ?? "").replace(/\s+/gu, " ").trim().slice(0, 300);
+          return id && voiceId ? [{ id, name, voiceId, ...description ? { description } : {} }] : [];
         });
-        const chat = await spindle.chats.get(payload.chatId, userId);
-        if (!chat) throw new Error("The chat is no longer available.");
         const messages = await spindle.chat.getMessages(payload.chatId);
         const targetIndex = messages.findIndex((message) => message.id === payload.messageId);
         if (targetIndex < 0) throw new Error("The message is no longer available.");
@@ -8001,11 +8068,12 @@ spindle.onFrontendMessage(async (rawPayload, userId, frontendSessionId) => {
             const voice = answers[`voice_${group.id}`];
             const comparisons = Object.entries(answers).filter(([key]) => key.startsWith(`same_${group.id}_`) || key.startsWith(`review_same_${group.id}_`) || key.startsWith(`review_ghost_${group.id}_`) || key.startsWith(`review_occurrence_${group.id}_`) || key.startsWith(`review_occurrence_disposition_${group.id}_`) || key.startsWith(`review_reveal_${group.id}_`) || key.startsWith(`review_scene_${group.id}_`) || key.startsWith(`review_continuity_${group.id}_`)).map(([key, answer]) => `${key}=${answer.choice} confidence=${answer.confidence} probabilities=${JSON.stringify(answer.probabilities)}`).join(";") || "none";
             const narrativeName = answers[`narrative_name_${group.id}`];
+            const castAnswer = answers[`cast_${group.id}`];
             const assignment = assignments.find((item) => item.groupId === group.id);
             const proposed = proposedAssignments.find((item) => item.groupId === group.id);
-            return `${group.id} segments=${group.segmentIndexes.map((index) => index + 1).join(",")} identity=${identity ? `${identity.choice} confidence=${identity.confidence} probabilities=${JSON.stringify(identity.probabilities)}` : "none"} gender=${gender ? `${gender.choice} confidence=${gender.confidence} probabilities=${JSON.stringify(gender.probabilities)}` : "none"} label=${label ? `${label.choice} confidence=${label.confidence} probabilities=${JSON.stringify(label.probabilities)}` : "none"} narrative-name=${narrativeName ? `${narrativeName.choice} (${plan.state.narrativeNames[Number(narrativeName.choice.replace("name_", ""))] ?? "none"}) confidence=${narrativeName.confidence} probabilities=${JSON.stringify(narrativeName.probabilities)}` : "none"} comparisons=${comparisons} proposed=${proposed ? `${proposed.ghostId} / ${proposed.voiceId} / ${proposed.gender}` : "none"} match-reason=${proposed?.matchReason ?? "none"} voice-choice=${voice ? `${voice.choice} confidence=${voice.confidence} probabilities=${JSON.stringify(voice.probabilities)}` : "none"} final=${assignment ? `${assignment.label || "unnamed"} / ${assignment.ghostId} / ${assignment.voiceId}` : "connection default"}`;
+            return `${group.id} segments=${group.segmentIndexes.map((index) => index + 1).join(",")} identity=${identity ? `${identity.choice} confidence=${identity.confidence} probabilities=${JSON.stringify(identity.probabilities)}` : "none"} cast=${castAnswer ? `${castAnswer.choice} confidence=${castAnswer.confidence} probabilities=${JSON.stringify(castAnswer.probabilities)}` : "none"} gender=${gender ? `${gender.choice} confidence=${gender.confidence} probabilities=${JSON.stringify(gender.probabilities)}` : "none"} label=${label ? `${label.choice} confidence=${label.confidence} probabilities=${JSON.stringify(label.probabilities)}` : "none"} narrative-name=${narrativeName ? `${narrativeName.choice} (${plan.state.narrativeNames[Number(narrativeName.choice.replace("name_", ""))] ?? "none"}) confidence=${narrativeName.confidence} probabilities=${JSON.stringify(narrativeName.probabilities)}` : "none"} comparisons=${comparisons} proposed=${proposed ? `${proposed.castSpeakerId ? `cast:${proposed.castSpeakerId} ` : ""}${proposed.ghostId ?? "none"} / ${proposed.voiceId} / ${proposed.gender}` : "none"} match-reason=${proposed?.matchReason ?? "none"} voice-choice=${voice ? `${voice.choice} confidence=${voice.confidence} probabilities=${JSON.stringify(voice.probabilities)}` : "none"} final=${assignment ? `${assignment.castSpeakerId ? `${assignment.castSpeakerId} (configured)` : assignment.label || "unnamed"} / ${assignment.ghostId ?? "none"} / ${assignment.voiceId}` : "connection default"}`;
           });
-          diagnostics.unshift(`build=${BUILD_VERSION}; Available favorites=${voices.length}, cast=${cast.length}, historical ghosts=${ghosts.length}, current ghosts=${currentGhosts.length}; prior messages=${matchingContext.previousMessages.length}${decisionError ? `; Jev failed: ${decisionError}` : ""}; identity review questions=${Object.keys(review.questions).length}${reviewError ? `; review failed: ${reviewError}` : ""}; reduction=${Object.entries(reduction).filter(([, enabled]) => !enabled).map(([id]) => id).join(",") || "full"}.`);
+          diagnostics.unshift(`build=${BUILD_VERSION}; Available favorites=${voices.length}, cast=${cast.length} (${cast.map((member) => `${member.name}${member.description ? "*" : ""}`).join(", ") || "none"}); historical ghosts=${ghosts.length}, current ghosts=${currentGhosts.length}; prior messages=${matchingContext.previousMessages.length}${decisionError ? `; Jev failed: ${decisionError}` : ""}; identity review questions=${Object.keys(review.questions).length}${reviewError ? `; review failed: ${reviewError}` : ""}; reduction=${Object.entries(reduction).filter(([, enabled]) => !enabled).map(([id]) => id).join(",") || "full"}.`);
           diagnostics.splice(1, 0, `Candidate context: ${ghosts.map((ghost, index) => `ghost_${index}=${ghost.id} last=${ghost.lastSeenMessageId || "none"} history=${(ghost.conversationHistory ?? []).map((entry) => `${entry.messageId}(${entry.text.length} chars)`).join(",") || "none"} context=${ghost.context.length} chars`).join("; ") || "none"}; prior=${matchingContext.previousMessages.map((item) => `${item.role ?? "unknown"}:${item.id}(${item.text.length} chars)`).join(",") || "none"}.`);
           sendFrontend({ type: "chat_voice_uncast_matches", requestId: payload.requestId, assignments, diagnostics }, userId, frontendSessionId);
           if (assignments.length) await sendState(userId, void 0, payload.chatId, frontendSessionId);

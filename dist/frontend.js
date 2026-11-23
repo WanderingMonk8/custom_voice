@@ -791,6 +791,15 @@ function uncastNarrativeNameCandidates(message) {
   }
   return [...names.values()];
 }
+var NARRATED_ROLE_ALIASES = new Map([
+  ...["mother", "mom", "mommy", "mum", "mummy", "mama"].map((word) => [word, "mother"]),
+  ...["father", "dad", "daddy", "papa"].map((word) => [word, "father"]),
+  ...["sister", "sis"].map((word) => [word, "sister"]),
+  ...["brother", "bro"].map((word) => [word, "brother"]),
+  ...["daughter", "son", "wife", "husband", "aunt", "uncle", "niece", "nephew", "cousin", "girlfriend", "boyfriend", "fiance", "fiancee", "friend", "boss", "teacher", "landlady", "landlord", "neighbor", "roommate", "partner"].map((word) => [word, word]),
+  ...["grandmother", "grandma", "granny", "nana"].map((word) => [word, "grandmother"]),
+  ...["grandfather", "grandpa"].map((word) => [word, "grandfather"])
+]);
 function isBroadPersonLabel(label) {
   return /^(?:(?:the|a|an)\s+)?(?:(?:young|younger|old|older|elderly|middle-aged|tall|short)\s+)*(?:woman|man|person|girl|boy|guy|lady|stranger|someone|somebody)$/iu.test(label.trim());
 }
