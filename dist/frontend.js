@@ -1184,6 +1184,93 @@ var PREPOSITION_BEFORE_NAME_PATTERN = new RegExp(
   `\\b(?:${PREPOSITION_WORDS.join("|")})\\s*$`,
   "iu"
 );
+var NON_NAME_WORDS = /* @__PURE__ */ new Set([
+  ...NON_NAME_PARAGRAPH_LEADS,
+  "all",
+  "almost",
+  "already",
+  "also",
+  "always",
+  "another",
+  "any",
+  "anything",
+  "anywhere",
+  "both",
+  "each",
+  "either",
+  "even",
+  "eventually",
+  "every",
+  "everybody",
+  "everything",
+  "everywhere",
+  "finally",
+  "fine",
+  "first",
+  "good",
+  "half",
+  "hey",
+  "hi",
+  "however",
+  "instead",
+  "just",
+  "last",
+  "later",
+  "many",
+  "maybe",
+  "meanwhile",
+  "most",
+  "much",
+  "neither",
+  "never",
+  "next",
+  "no",
+  "nobody",
+  "noone",
+  "none",
+  "not",
+  "nothing",
+  "nowhere",
+  "now",
+  "oh",
+  "ok",
+  "okay",
+  "once",
+  "only",
+  "other",
+  "otherwise",
+  "perhaps",
+  "probably",
+  "quite",
+  "rather",
+  "really",
+  "right",
+  "second",
+  "simply",
+  "since",
+  "soon",
+  "still",
+  "such",
+  "sure",
+  "suddenly",
+  "third",
+  "too",
+  "twice",
+  "very",
+  "well",
+  "whatever",
+  "whenever",
+  "wherever",
+  "why",
+  "yes",
+  "yet"
+]);
+function isPlausiblePersonName(name, narration, aliases) {
+  const first = aliases[0]?.split(/\s+/u)[0]?.toLowerCase() ?? "";
+  if (!first || NON_NAME_WORDS.has(first)) return false;
+  if (aliases.some((alias) => NON_NAME_WORDS.has(alias.toLowerCase()))) return false;
+  return !new RegExp(`\\b${escapedPattern(name.toLowerCase())}\\b`, "u").test(narration);
+}
 var INTRODUCTORY_PREPOSITIONAL_PHRASE_PATTERN = new RegExp(
   `^\\s*(?:${PREPOSITION_WORDS.join("|")})\\b(?:\\s+[\\p{L}\\p{M}'\u2019-]+){1,7}\\s*,?\\s*$`,
   "iu"
@@ -1195,11 +1282,13 @@ function addUnconfiguredDialogueSpeakers(content, speakers, skippedTrackerTagPai
   const preparedContent = preparePlaybackContent(content, skippedTrackerTagPairs);
   const result = [...speakers];
   const knownAliases = new Set(result.flatMap((speaker) => speakerAliases(speaker.name).map((alias) => alias.toLowerCase())));
+  const narrationForNames = narrativeOnly(preparedContent);
   const addCandidate = (rawName, explicitlyAttributed = false) => {
     const name = normalizeSpeakerName(rawName.replace(/['’]s$/u, ""));
     const aliases = speakerAliases(name);
     const first = aliases[0]?.split(/\s+/u)[0]?.toLowerCase() ?? "";
-    if (!name || !first || NON_NAME_PARAGRAPH_LEADS.has(first)) return;
+    if (!name || !first) return;
+    if (!isPlausiblePersonName(name, narrationForNames, aliases)) return;
     if (aliases.some((alias) => knownAliases.has(alias.toLowerCase()))) return;
     if (!explicitlyAttributed) {
       const occurrences = [...preparedContent.matchAll(
@@ -1215,7 +1304,7 @@ function addUnconfiguredDialogueSpeakers(content, speakers, skippedTrackerTagPai
     result.push({ id, name });
     for (const alias of aliases) knownAliases.add(alias.toLowerCase());
   };
-  const narrative = narrativeOnly(preparedContent);
+  const narrative = narrationForNames;
   for (const match of narrative.matchAll(/\b([\p{Lu}][\p{L}\p{M}-]{1,63})['\u2019]s\s+[\p{L}\p{M}-]+/gu)) addCandidate(match[1]);
   for (const match of narrative.matchAll(/\b(?:and|but|then)\s+([\p{Lu}][\p{L}\p{M}-]{1,63})\s+[\p{Ll}][\p{L}\p{M}-]+/gu)) addCandidate(match[1]);
   for (const quote of playbackQuotes(preparedContent)) {

@@ -440,6 +440,10 @@ export function readGhostVoices(value: unknown): GhostVoice[] {
     if (!item || typeof item !== 'object') return []
     const row = item as Record<string, unknown>
     if (typeof row.id !== 'string' || typeof row.speakerId !== 'string' || typeof row.voiceId !== 'string' || !row.id || !row.voiceId) return []
+    // Names inferred from prose used to include ordinary capitalized words
+    // ("Not", "Nothing"). A saved voice for one of those would keep being offered
+    // as a cast member, so drop it instead of reviving it.
+    if (isNonNameSpeakerId(row.speakerId)) return []
     return [{ id: row.id.slice(0, 128), speakerId: row.speakerId.slice(0, 256), voiceId: row.voiceId.slice(0, 512),
       label: typeof row.label === 'string' ? row.label.trim().slice(0, 100) : '',
       aliases: mergeGhostAliases(Array.isArray(row.aliases) ? row.aliases.filter((value): value is string => typeof value === 'string') : []),
@@ -2752,6 +2756,51 @@ const PREPOSITION_BEFORE_NAME_PATTERN = new RegExp(
   'iu',
 )
 
+/**
+ * Whether a saved speaker id was built from a word that cannot be a name, such
+ * as `unconfigured:not`. Used to retire voices created before name inference
+ * rejected ordinary capitalized words.
+ */
+function isNonNameSpeakerId(speakerId: string): boolean {
+  const name = speakerId.startsWith('unconfigured:') ? speakerId.slice('unconfigured:'.length) : ''
+  if (!name) return false
+  const aliases = speakerAliases(name)
+  const first = aliases[0]?.split(/\s+/u)[0]?.toLowerCase() ?? ''
+  return !first || NON_NAME_WORDS.has(first) || aliases.some(alias => NON_NAME_WORDS.has(alias.toLowerCase()))
+}
+
+/**
+ * Words that must never be read as a person's name. Name inference runs on
+ * capitalized words at the start of a paragraph or sentence, where ordinary
+ * English is capitalized too ("Not that it matters.", "Nothing moves."). A
+ * repeated one used to become a roster candidate with its own voice.
+ */
+const NON_NAME_WORDS = new Set<string>([
+  ...NON_NAME_PARAGRAPH_LEADS,
+  'all', 'almost', 'already', 'also', 'always', 'another', 'any', 'anything', 'anywhere',
+  'both', 'each', 'either', 'even', 'eventually', 'every', 'everybody', 'everything',
+  'everywhere', 'finally', 'fine', 'first', 'good', 'half', 'hey', 'hi', 'however',
+  'instead', 'just', 'last', 'later', 'many', 'maybe', 'meanwhile', 'most', 'much', 'neither',
+  'never', 'next', 'no', 'nobody', 'noone', 'none', 'not', 'nothing', 'nowhere', 'now',
+  'oh', 'ok', 'okay', 'once', 'only', 'other', 'otherwise', 'perhaps', 'probably', 'quite',
+  'rather', 'really', 'right', 'second', 'simply', 'since', 'soon', 'still', 'such', 'sure',
+  'suddenly', 'third', 'too', 'twice', 'very', 'well', 'whatever', 'whenever', 'wherever',
+  'why', 'yes', 'yet',
+])
+
+/**
+ * Whether a capitalized word plausibly names a person. A proper name keeps its
+ * capital wherever it appears, so a word that also occurs in lower case in the
+ * narration ("Not that it matters" beside "not words so much as shape") is
+ * ordinary prose rather than somebody new.
+ */
+function isPlausiblePersonName(name: string, narration: string, aliases: readonly string[]): boolean {
+  const first = aliases[0]?.split(/\s+/u)[0]?.toLowerCase() ?? ''
+  if (!first || NON_NAME_WORDS.has(first)) return false
+  if (aliases.some(alias => NON_NAME_WORDS.has(alias.toLowerCase()))) return false
+  return !new RegExp(`\\b${escapedPattern(name.toLowerCase())}\\b`, 'u').test(narration)
+}
+
 const INTRODUCTORY_PREPOSITIONAL_PHRASE_PATTERN = new RegExp(
   `^\\s*(?:${PREPOSITION_WORDS.join('|')})\\b(?:\\s+[\\p{L}\\p{M}'’-]+){1,7}\\s*,?\\s*$`,
   'iu',
@@ -2776,11 +2825,13 @@ export function addUnconfiguredDialogueSpeakers(
   const knownAliases = new Set(result.flatMap(speaker => (
     speakerAliases(speaker.name).map(alias => alias.toLowerCase())
   )))
+  const narrationForNames = narrativeOnly(preparedContent)
   const addCandidate = (rawName: string, explicitlyAttributed = false) => {
     const name = normalizeSpeakerName(rawName.replace(/['’]s$/u, ''))
     const aliases = speakerAliases(name)
     const first = aliases[0]?.split(/\s+/u)[0]?.toLowerCase() ?? ''
-    if (!name || !first || NON_NAME_PARAGRAPH_LEADS.has(first)) return
+    if (!name || !first) return
+    if (!isPlausiblePersonName(name, narrationForNames, aliases)) return
     if (aliases.some(alias => knownAliases.has(alias.toLowerCase()))) return
     if (!explicitlyAttributed) {
       const occurrences = [...preparedContent.matchAll(
@@ -2799,7 +2850,7 @@ export function addUnconfiguredDialogueSpeakers(
 
   // Possessive subjects can establish an unconfigured person even when the
   // name follows another sentence, as in a phone conversation's action beat.
-  const narrative = narrativeOnly(preparedContent)
+  const narrative = narrationForNames
   for (const match of narrative.matchAll(/\b([\p{Lu}][\p{L}\p{M}-]{1,63})['\u2019]s\s+[\p{L}\p{M}-]+/gu)) addCandidate(match[1])
   // Collect repeated proper-name subjects within a sentence, not just at a
   // paragraph's beginning. These are candidates; Jev still attributes speech.

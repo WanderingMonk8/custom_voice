@@ -5569,6 +5569,69 @@ test('rejects common prepositional paragraph leads as inferred character names',
   }
 })
 
+test('rejects sentence-leading function words as inferred character names', () => {
+  // Reported case: a roster listed a fourth "character" named "Not", because a
+  // capitalized sentence lead before dialogue repeated ("Not that it matters.").
+  // Such a word then had its own voice available for any quotation.
+  const joiner = [
+    'Not that it matters.',
+    '',
+    'Not that he cares.',
+    '',
+    '"I\u2019m home."',
+  ].join('\n')
+  assert.deepEqual(
+    addUnconfiguredDialogueSpeakers(joiner, [{ id: 'aiko', name: 'Aiko' }]).map(speaker => speaker.id),
+    ['aiko'],
+  )
+  const nothing = [
+    'Nothing moves. Even the cat is still.',
+    '',
+    'Nothing but the pipes.',
+    '',
+    '"I\u2019m home."',
+  ].join('\n')
+  assert.deepEqual(
+    addUnconfiguredDialogueSpeakers(nothing, [{ id: 'aiko', name: 'Aiko' }]).map(speaker => speaker.id),
+    ['aiko'],
+  )
+  // A repeated capital that also occurs in lower case is ordinary prose.
+  const lowerCase = [
+    'Quiet holds the hall. Quiet again.',
+    '',
+    'It stays quiet for a long minute.',
+    '',
+    '"I\u2019m home."',
+  ].join('\n')
+  assert.deepEqual(
+    addUnconfiguredDialogueSpeakers(lowerCase, [{ id: 'aiko', name: 'Aiko' }]).map(speaker => speaker.id),
+    ['aiko'],
+  )
+  // A real name repeating at sentence starts is still inferred.
+  const named = [
+    'Kaito drops his bag. The hall stays dark.',
+    '',
+    'Kaito does not knock.',
+    '',
+    '"I\u2019m home."',
+  ].join('\n')
+  assert.deepEqual(
+    addUnconfiguredDialogueSpeakers(named, [{ id: 'aiko', name: 'Aiko' }]).map(speaker => speaker.id),
+    ['aiko', unconfiguredSpeakerId('Kaito')],
+  )
+})
+
+test('retires saved voices for speakers named after ordinary words', () => {
+  const base = { context: '', occurrenceKeys: [], lastSeenMessageId: '', voiceId: 'voice-1' }
+  const ghosts = readGhostVoices([
+    { ...base, id: 'g1', speakerId: unconfiguredSpeakerId('Not'), label: 'Not' },
+    { ...base, id: 'g2', speakerId: unconfiguredSpeakerId('Nothing') },
+    { ...base, id: 'g3', speakerId: unconfiguredSpeakerId('Kaito'), label: 'Kaito' },
+    { ...base, id: 'g4', speakerId: 'npc:nao', label: 'nao' },
+  ])
+  assert.deepEqual(ghosts.map(ghost => ghost.id), ['g3', 'g4'])
+})
+
 test('does not treat a configured name after a preposition as a speaker without attribution', () => {
   const speakers = [
     { id: 'mira', name: 'Mira' },
