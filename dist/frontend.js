@@ -461,11 +461,16 @@ function hasStrongNarrativeName(text) {
 var STORY_NARRATION_SKIP_STARTERS = /* @__PURE__ */ new Set(["then", "so", "and", "but", "still", "yet", "meanwhile", "now", "anyway"]);
 var STORY_MALE_PRONOUNS = /* @__PURE__ */ new Set(["he", "him", "hisself", "himself", "his"]);
 var STORY_FEMALE_PRONOUNS = /* @__PURE__ */ new Set(["she", "her", "herself", "hers"]);
+var POSSESSIVE_DETERMINERS = /* @__PURE__ */ new Set(["his", "her", "my", "your", "their", "our", "its"]);
 function narrationFirstPronounClass(text) {
   const tokens = text.toLowerCase().replace(/[^a-z'-]+/gu, " ").split(/\s+/u).filter(Boolean);
   let head = tokens[0];
   if (!head) return null;
   if (STORY_NARRATION_SKIP_STARTERS.has(head)) head = tokens[1] ?? "";
+  if (POSSESSIVE_DETERMINERS.has(head)) {
+    const owned = (tokens[1] ?? "").replace(POSSESSIVE_SUFFIX, "");
+    if (LABEL_GENDER_TOKENS.has(owned)) return null;
+  }
   if (STORY_MALE_PRONOUNS.has(head)) return "male";
   if (STORY_FEMALE_PRONOUNS.has(head)) return "female";
   return null;
@@ -486,6 +491,10 @@ function paragraphGenderedMentions(narrative, ignorePronouns) {
       }
       const possessive = POSSESSIVE_SUFFIX.test(token);
       const bare = possessive ? token.replace(POSSESSIVE_SUFFIX, "") : token;
+      if (POSSESSIVE_DETERMINERS.has(token)) {
+        sinceArticle = 0;
+        continue;
+      }
       if (STORY_MALE_PRONOUNS.has(bare) || STORY_FEMALE_PRONOUNS.has(bare)) {
         sinceArticle += 1;
         continue;

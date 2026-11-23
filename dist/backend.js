@@ -747,6 +747,13 @@ function resolveUncastVoiceDecisions(groups, voices, answers, ghosts = [], reser
   const groupLabels = /* @__PURE__ */ new Map();
   const rootByLabel = /* @__PURE__ */ new Map();
   const rootByRevealedName = /* @__PURE__ */ new Map();
+  const pendingUnnamedVoices = [];
+  const groupShowsNamedIdentity = (group) => {
+    if (revealedUncastName(group, answers, message)) return true;
+    if (normalizeSpeakerName(group.narratedName ?? "")) return true;
+    const label = groupLabels.get(group.id);
+    return !!label && !isBroadPersonLabel(label);
+  };
   const strongChoice = (answer) => {
     if (!answer || answer.choice === "new_or_unclear") return false;
     if (!Number.isFinite(answer.confidence) || answer.confidence < 0 || answer.confidence > 1 || !answer.probabilities || Object.values(answer.probabilities).some((value) => !Number.isFinite(value) || value < 0 || value > 1)) return false;
@@ -922,6 +929,16 @@ function resolveUncastVoiceDecisions(groups, voices, answers, ghosts = [], reser
       }
     }
     if (!ghost) {
+      const explicitlyUnclear = members.every((group) => answers[`identity_${group.id}`]?.choice === "new_or_unclear");
+      const unnamedMembers = members.every((group) => group.speakerId === UNCAST_SPEAKER_ID && !groupShowsNamedIdentity(group));
+      const shared = explicitlyUnclear && unnamedMembers ? pendingUnnamedVoices.find((entry) => voiceGenderCompatible(entry.voice, gender)) : void 0;
+      if (shared) {
+        ghost = shared.ghost;
+        ghost.context = [ghost.context, ...members.flatMap((group) => group.context)].filter(Boolean).join(" ").slice(0, 2e3);
+        linkReasons.set(root, "reuses the exchange's unidentified voice");
+      }
+    }
+    if (!ghost) {
       const matches = members.map((group) => answers[`voice_${group.id}`]).filter((answer) => !!answer);
       const candidates = voices.flatMap((voice, index) => {
         if (used.has(voice.id) || !voiceGenderCompatible(voice, gender)) return [];
@@ -933,6 +950,9 @@ function resolveUncastVoiceDecisions(groups, voices, answers, ghosts = [], reser
       const shortlist = shortlistRankedVoices(candidates, (entry) => entry.score);
       const chosen = shortlist[Math.min(shortlist.length - 1, Math.floor(random() * shortlist.length))].voice;
       ghost = { id: `pending:${root}`, speakerId: members[0].speakerId, voiceId: chosen.id, context: members.flatMap((group) => group.context).join(" ").slice(0, 2e3), occurrenceKeys: [], lastSeenMessageId: messageId };
+      if (members.every((group) => group.speakerId === UNCAST_SPEAKER_ID && !groupShowsNamedIdentity(group))) {
+        pendingUnnamedVoices.push({ ghost, voice: chosen });
+      }
       linkReasons.set(root, "new voice selected from favorites");
     }
     used.add(ghost.voiceId);

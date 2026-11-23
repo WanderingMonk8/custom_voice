@@ -575,12 +575,21 @@ function hasStrongNarrativeName(text: string): boolean {
 const STORY_NARRATION_SKIP_STARTERS = new Set(['then', 'so', 'and', 'but', 'still', 'yet', 'meanwhile', 'now', 'anyway'])
 const STORY_MALE_PRONOUNS = new Set(['he', 'him', 'hisself', 'himself', 'his'])
 const STORY_FEMALE_PRONOUNS = new Set(['she', 'her', 'herself', 'hers'])
+/** Determiners that own the noun after them ("his mother", "her brother"), not the paragraph's subject. */
+const POSSESSIVE_DETERMINERS = new Set(['his', 'her', 'my', 'your', 'their', 'our', 'its'])
 /** Gender of a narration paragraph's first-subject pronoun; named or neutral starts carry none. */
 export function narrationFirstPronounClass(text: string): 'male' | 'female' | null {
   const tokens = text.toLowerCase().replace(/[^a-z'-]+/gu, ' ').split(/\s+/u).filter(Boolean)
   let head = tokens[0]
   if (!head) return null
   if (STORY_NARRATION_SKIP_STARTERS.has(head)) head = tokens[1] ?? ''
+  // "His mother answers" is about the mother. A possessive determiner in front
+  // of a person noun surfaces that noun's own gender (the noun scan reads it),
+  // so the narrator's or another character's sex never leaks onto the speaker.
+  if (POSSESSIVE_DETERMINERS.has(head)) {
+    const owned = (tokens[1] ?? '').replace(POSSESSIVE_SUFFIX, '')
+    if (LABEL_GENDER_TOKENS.has(owned)) return null
+  }
   if (STORY_MALE_PRONOUNS.has(head)) return 'male'
   if (STORY_FEMALE_PRONOUNS.has(head)) return 'female'
   return null
@@ -627,6 +636,10 @@ function paragraphGenderedMentions(narrative: string, ignorePronouns: boolean): 
       if (PERSON_ARTICLES.has(token)) { sinceArticle = 0; continue }
       const possessive = POSSESSIVE_SUFFIX.test(token)
       const bare = possessive ? token.replace(POSSESSIVE_SUFFIX, '') : token
+      // A possessive determiner owns the noun after it ("his mother", "her
+      // brother"), so that noun is a person mention even though no article
+      // precedes it, and its own gender is the evidence.
+      if (POSSESSIVE_DETERMINERS.has(token)) { sinceArticle = 0; continue }
       // Pronouns share the gender lexicon with nouns ("her"), so they must
       // never be read as an article-led noun ("the register, her mask").
       if (STORY_MALE_PRONOUNS.has(bare) || STORY_FEMALE_PRONOUNS.has(bare)) {
@@ -1549,6 +1562,20 @@ export function resolveUncastVoiceDecisions(
   const groupLabels = new Map<string, string>()
   const rootByLabel = new Map<string, string>()
   const rootByRevealedName = new Map<string, string>()
+  // One exchange can split a single unidentified participant into several
+  // groups: a cast character answers between their lines, or narration breaks
+  // the quote run. Jev then reports each fragment as "new or unclear" because
+  // nothing in the text distinguishes them, and minting a favorite per
+  // fragment produced four or five voices for one off-screen speaker. An
+  // unidentified fragment instead reuses the first pending voice of a
+  // compatible sex.
+  const pendingUnnamedVoices: Array<{ ghost: GhostVoice; voice: FavoriteVoice }> = []
+  const groupShowsNamedIdentity = (group: UncastVoiceGroup): boolean => {
+    if (revealedUncastName(group, answers, message)) return true
+    if (normalizeSpeakerName(group.narratedName ?? '')) return true
+    const label = groupLabels.get(group.id)
+    return !!label && !isBroadPersonLabel(label)
+  }
   const strongChoice = (answer: SpeakerDecisionChoice | undefined): boolean => {
     if (!answer || answer.choice === 'new_or_unclear') return false
     if (!Number.isFinite(answer.confidence) || answer.confidence < 0 || answer.confidence > 1 || !answer.probabilities || Object.values(answer.probabilities).some(value => !Number.isFinite(value) || value < 0 || value > 1)) return false
@@ -1763,6 +1790,23 @@ export function resolveUncastVoiceDecisions(
         linkReasons.delete(root)
       }
     }
+    // A fragment Jev explicitly leaves unidentified is not evidence of a
+    // second unnamed person. Reuse the first pending voice of a compatible
+    // sex so one off-screen participant keeps one voice across the exchange.
+    // Named and specifically labelled fragments never take this path, so
+    // mutually named uncast speakers still keep separate voices.
+    if (!ghost) {
+      const explicitlyUnclear = members.every(group => answers[`identity_${group.id}`]?.choice === 'new_or_unclear')
+      const unnamedMembers = members.every(group => group.speakerId === UNCAST_SPEAKER_ID && !groupShowsNamedIdentity(group))
+      const shared = explicitlyUnclear && unnamedMembers
+        ? pendingUnnamedVoices.find(entry => voiceGenderCompatible(entry.voice, gender))
+        : undefined
+      if (shared) {
+        ghost = shared.ghost
+        ghost.context = [ghost.context, ...members.flatMap(group => group.context)].filter(Boolean).join(' ').slice(0, 2_000)
+        linkReasons.set(root, "reuses the exchange's unidentified voice")
+      }
+    }
     if (!ghost) {
       const matches = members.map(group => answers[`voice_${group.id}`]).filter((answer): answer is SpeakerDecisionChoice => !!answer)
       const candidates = voices.flatMap((voice, index) => {
@@ -1781,6 +1825,11 @@ export function resolveUncastVoiceDecisions(
       const shortlist = shortlistRankedVoices(candidates, entry => entry.score)
       const chosen = shortlist[Math.min(shortlist.length - 1, Math.floor(random() * shortlist.length))].voice
       ghost = { id: `pending:${root}`, speakerId: members[0].speakerId, voiceId: chosen.id, context: members.flatMap(group => group.context).join(' ').slice(0, 2_000), occurrenceKeys: [], lastSeenMessageId: messageId }
+      // Only an unnamed, unlabelled root becomes the reusable baseline; a
+      // labelled or named newcomer is a distinct person by construction.
+      if (members.every(group => group.speakerId === UNCAST_SPEAKER_ID && !groupShowsNamedIdentity(group))) {
+        pendingUnnamedVoices.push({ ghost, voice: chosen })
+      }
       linkReasons.set(root, 'new voice selected from favorites')
     }
     used.add(ghost.voiceId)

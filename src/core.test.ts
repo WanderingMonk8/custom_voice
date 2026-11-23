@@ -2465,6 +2465,17 @@ test('a possessive person noun anchors gender even mid-paragraph ("The boy\u2019
   assert.deepEqual(backwardNarrationAnchorGender(girl, 1), { gender: 'female', strong: false })
 })
 
+test('a possessive determiner surfaces the owned person noun, not the owner', () => {
+  const nar = (text: string) => ({ text, speakerId: null })
+  const speech = (text: string) => ({ text, speakerId: UNCAST_SPEAKER_ID })
+  // "His mother answers" is about the mother; the brother's "his" must not
+  // send the next unnamed speaker to a male voice, and vice versa.
+  assert.equal(narrationFirstPronounClass('His mother answers from the kitchen.'), null)
+  assert.equal(narrationFirstPronounClass('Her brother sets the tray down.'), null)
+  assert.equal(backwardNarrationPronounGender([nar('His mother answers from the kitchen.'), speech('Out back.')], 1), 'female')
+  assert.equal(backwardNarrationPronounGender([nar('Her brother sets the tray down.'), speech('Out back.')], 1), 'male')
+})
+
 test('a possessive in the opening sentence is a strong anchor', () => {
   const nar = (text: string) => ({ text, speakerId: null })
   const speech = (text: string) => ({ text, speakerId: UNCAST_SPEAKER_ID })
@@ -3208,6 +3219,40 @@ test('combines interrupted uncast groups before selecting their voice', () => {
     voice_g1: confidentDecision('voice_0'),
   })
   assert.deepEqual(weak.map(match => match.groupId), ['g1'])
+})
+
+test('reuses one pending voice when an exchange splits one unidentified participant into fragments', () => {
+  // Reported case: a three-character scene (cast mother and sister, silent
+  // POV) had one off-screen speaker quoted between cast lines. Jev called
+  // every fragment "new or unclear", so each one minted another favorite and
+  // the scene played four or five voices for one person. Fragments that stay
+  // unidentified belong to the exchange's one unnamed voice.
+  const groups = collectUncastVoiceGroups([
+    { speakerId: 'npc:nao', text: 'Where is she?' },
+    { speakerId: UNCAST_SPEAKER_ID, text: 'Out back.' },
+    { speakerId: 'npc:nao', text: 'Still?' },
+    { speakerId: UNCAST_SPEAKER_ID, text: 'Since noon.' },
+    { speakerId: 'npc:nao', text: 'Did she eat?' },
+    { speakerId: UNCAST_SPEAKER_ID, text: 'She had tea.' },
+  ])
+  assert.equal(groups.length, 3)
+  const voices = readFavoriteVoices([
+    { id: 'voice-1', category: 'female' },
+    { id: 'voice-2', category: 'female' },
+    { id: 'voice-3', category: 'female' },
+  ])
+  const assigned = resolveUncastVoiceDecisions(groups, voices, {
+    identity_g1: confidentDecision('new_or_unclear'),
+    identity_g2: confidentDecision('new_or_unclear'),
+    gender_g0: confidentDecision('female'),
+    gender_g1: confidentDecision('female'),
+    gender_g2: confidentDecision('female'),
+    voice_g0: confidentDecision('voice_0'),
+    voice_g1: confidentDecision('voice_1'),
+    voice_g2: confidentDecision('voice_2'),
+  })
+  assert.deepEqual(assigned.map(item => item.voiceId), ['voice-1', 'voice-1', 'voice-1'])
+  assert.equal(new Set(assigned.map(item => item.ghostId)).size, 1)
 })
 
 test('strong pairwise identity links override conflicting cached turn voices', () => {
