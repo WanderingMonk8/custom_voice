@@ -3255,6 +3255,69 @@ test('reuses one pending voice when an exchange splits one unidentified particip
   assert.equal(new Set(assigned.map(item => item.ghostId)).size, 1)
 })
 
+test('treats a weak identity lean as unresolved instead of evidence of a second person', () => {
+  // Reported scene: the same off-screen speaker was split into five groups and
+  // Jev answered "group_g2" at 0.14 confidence for the last one. A weak lean is
+  // noise, not a second participant, so it must not mint another favorite.
+  const groups = collectUncastVoiceGroups([
+    { speakerId: UNCAST_SPEAKER_ID, text: 'Out back.' },
+    { speakerId: 'npc:nao', text: 'Still?' },
+    { speakerId: UNCAST_SPEAKER_ID, text: 'Since noon.' },
+    { speakerId: 'npc:nao', text: 'Did she eat?' },
+    { speakerId: UNCAST_SPEAKER_ID, text: 'She had tea.' },
+  ])
+  assert.equal(groups.length, 3)
+  const voices = readFavoriteVoices([
+    { id: 'voice-1', category: 'female' },
+    { id: 'voice-2', category: 'female' },
+  ])
+  const assigned = resolveUncastVoiceDecisions(groups, voices, {
+    identity_g1: confidentDecision('new_or_unclear'),
+    identity_g2: { choice: 'group_g0', probabilities: { group_g0: 0.315, new_or_unclear: 0.311, group_g1: 0.044 }, confidence: 0.144 },
+    gender_g0: confidentDecision('female'),
+    gender_g1: confidentDecision('female'),
+    gender_g2: confidentDecision('female'),
+    voice_g0: confidentDecision('voice_0'),
+    voice_g1: confidentDecision('voice_1'),
+    voice_g2: confidentDecision('voice_1'),
+  })
+  assert.deepEqual(assigned.map(item => item.voiceId), ['voice-1', 'voice-1', 'voice-1'])
+  assert.equal(new Set(assigned.map(item => item.ghostId)).size, 1)
+})
+
+test('checks an unidentified group against the existing cast before adding a voice', () => {
+  // Cast members already own a configured voice, so an off-screen cast member
+  // must not be given a second, random favorite.
+  const groups = collectUncastVoiceGroups([
+    { speakerId: 'npc:nao', text: 'Where is she?' },
+    { speakerId: UNCAST_SPEAKER_ID, text: 'Out back.' },
+  ])
+  assert.equal(groups.length, 1)
+  const voices = readFavoriteVoices([{ id: 'voice-1', category: 'female' }])
+  const cast = [{ id: 'aiko', name: 'Aiko', voiceId: 'cast-voice' }]
+  const plan = buildUncastVoiceDecision(groups, voices, 'Aiko answers from the kitchen.', [], [], false, cast)
+  assert.ok(plan.questions.cast_g0)
+  assert.ok(Object.values(plan.questions.cast_g0.criteria).includes('Aiko (aiko)'))
+  assert.deepEqual(plan.state.cast, [{ id: 'aiko', name: 'Aiko' }])
+  assert.equal(buildUncastVoiceDecision(groups, voices, 'Aiko answers.').questions.cast_g0, undefined)
+  const resolved = resolveUncastVoiceDecisions(groups, voices, {
+    cast_g0: confidentDecision('cast_0'),
+    gender_g0: confidentDecision('female'),
+    voice_g0: confidentDecision('voice_0'),
+  }, [], [], 'current', 'Aiko answers from the kitchen.', [], undefined, cast)
+  assert.deepEqual(resolved.map(item => item.voiceId), ['cast-voice'])
+  assert.equal(resolved[0]?.castSpeakerId, 'aiko')
+  assert.equal(resolved[0]?.ghostId, undefined)
+  // A weak pick is not evidence: the group keeps its own new voice.
+  const weak = resolveUncastVoiceDecisions(groups, voices, {
+    cast_g0: { choice: 'cast_0', probabilities: { cast_0: 0.45, none: 0.55 }, confidence: 0.2 },
+    gender_g0: confidentDecision('female'),
+    voice_g0: confidentDecision('voice_0'),
+  }, [], [], 'current', 'Aiko answers from the kitchen.', [], () => 0, cast)
+  assert.deepEqual(weak.map(item => item.voiceId), ['voice-1'])
+  assert.equal(weak[0]?.castSpeakerId, undefined)
+})
+
 test('strong pairwise identity links override conflicting cached turn voices', () => {
   const groups = collectUncastVoiceGroups([
     { speakerId: UNCAST_SPEAKER_ID, text: 'First.' },

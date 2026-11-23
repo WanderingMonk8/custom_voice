@@ -4585,7 +4585,7 @@ function setup(ctx) {
       ctx.sendToBackend({ type: "chat_voice_auto_cast", requestId, chatId, voices, reserved, narratorMissing, userMissing, ghostLifetime: ghostVoiceLifetime });
     });
   }
-  function requestUncastVoiceMatches(chatId, messageId, message, sourceHash, groups, voices, reserved, lifetime, speakerLookback2, skippedTrackerTags2, reduction) {
+  function requestUncastVoiceMatches(chatId, messageId, message, sourceHash, groups, voices, reserved, lifetime, speakerLookback2, skippedTrackerTags2, reduction, cast) {
     const requestId = `uncast-${Date.now().toString(36)}-${++uncastRequestSequence}`;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -4593,7 +4593,7 @@ function setup(ctx) {
         reject(new Error("Uncast voice matching timed out."));
       }, 35e3);
       pendingUncastRequests.set(requestId, { resolve, reject, timer });
-      ctx.sendToBackend({ type: "chat_voice_match_uncast", requestId, chatId, messageId, message, sourceHash, groups, voices, reserved, lifetime, speakerLookback: speakerLookback2, skippedTrackerTags: skippedTrackerTags2, reduction });
+      ctx.sendToBackend({ type: "chat_voice_match_uncast", requestId, chatId, messageId, message, sourceHash, groups, voices, reserved, lifetime, speakerLookback: speakerLookback2, skippedTrackerTags: skippedTrackerTags2, reduction, cast });
     });
   }
   const pendingCommunityRequests = /* @__PURE__ */ new Map();
@@ -5338,6 +5338,10 @@ function setup(ctx) {
         const poolVoices = poolVoicesForAutoCast();
         if (preferences.autoVoiceCasting && speakerAssignmentDebug) appendSpeakerDebugLog(`Voice pool: ${autoVoiceCastingPool === "community" && communityIsAvailable() ? `community (${communityVoices.length} snapshot voices)` : "favorites"}.`);
         const uncastVoices = availableUncastVoices(poolVoices, reservedVoices);
+        const castSpeakers = [...new Map(playbackSpeakers.filter((speaker) => speaker.id !== USER_SPEAKER_ID && speaker.id !== UNCAST_SPEAKER_ID && speaker.id !== UNRESOLVED_SPEAKER_ID).flatMap((speaker) => {
+          const voiceId = config.characterVoices[speaker.id] ?? "";
+          return voiceId ? [[speaker.id, { id: speaker.id, name: speaker.name, voiceId }]] : [];
+        })).values()];
         const uncastMatchPromise = preferences.autoVoiceCasting && uncastGroups.length ? requestUncastVoiceMatches(
           playbackChat.id,
           messageId,
@@ -5349,7 +5353,8 @@ function setup(ctx) {
           preferences.ghostVoiceLifetime,
           preferences.speakerLookback,
           preferences.skippedTrackerTags,
-          preferences.reductionComponents
+          preferences.reductionComponents,
+          castSpeakers
         ).catch((error) => {
           appendSpeakerDebugLog(`Uncast voice matching failed; using connection default: ${error instanceof Error ? error.message : String(error)}`);
           return [];
@@ -5551,11 +5556,12 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
         if (playback.controller.signal.aborted) throw new DOMException("Playback stopped.", "AbortError");
         for (const match of uncastMatches) {
           const group = uncastGroups.find((item) => item.id === match.groupId);
-          if (!group || reservedVoices.includes(match.voiceId)) continue;
+          if (!group) continue;
+          if (!match.castSpeakerId && reservedVoices.includes(match.voiceId)) continue;
           for (const segmentIndex of group.segmentIndexes) {
             for (const index of segmentPlanIndexes[segmentIndex] ?? []) plan[index] = { ...plan[index], voice: match.voiceId };
           }
-          appendSpeakerDebugLog(`Uncast voice ${group.id}: gender=${match.gender}, ghost=${match.ghostId ?? "none"}, voice=${JSON.stringify(match.voiceId)}.`);
+          appendSpeakerDebugLog(`Uncast voice ${group.id}: gender=${match.gender}, ghost=${match.ghostId ?? "none"}, cast=${match.castSpeakerId ?? "none"}, voice=${JSON.stringify(match.voiceId)}.`);
         }
         synthesisPlanFrozen = true;
         const splitPlan = splitLargeVoicePlanSegments(plan);

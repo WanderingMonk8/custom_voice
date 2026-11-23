@@ -73,6 +73,7 @@ import {
   type AutoplaySwipeSnapshot,
   type UncastVoiceGroup,
   type UncastVoiceAssignment,
+  type CastSpeaker,
   type SavedAudioRecord,
   type ReductionComponentMap,
 } from './core'
@@ -2688,7 +2689,7 @@ export function setup(ctx: SpindleFrontendContext) {
     })
   }
 
-  function requestUncastVoiceMatches(chatId: string, messageId: string, message: string, sourceHash: string, groups: UncastVoiceGroup[], voices: FavoriteVoice[], reserved: string[], lifetime: number, speakerLookback: number, skippedTrackerTags: string, reduction: ReductionComponentMap): Promise<UncastVoiceAssignment[]> {
+  function requestUncastVoiceMatches(chatId: string, messageId: string, message: string, sourceHash: string, groups: UncastVoiceGroup[], voices: FavoriteVoice[], reserved: string[], lifetime: number, speakerLookback: number, skippedTrackerTags: string, reduction: ReductionComponentMap, cast: CastSpeaker[]): Promise<UncastVoiceAssignment[]> {
     const requestId = `uncast-${Date.now().toString(36)}-${++uncastRequestSequence}`
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -2696,7 +2697,7 @@ export function setup(ctx: SpindleFrontendContext) {
         reject(new Error('Uncast voice matching timed out.'))
       }, 35_000)
       pendingUncastRequests.set(requestId, { resolve, reject, timer })
-      ctx.sendToBackend({ type: 'chat_voice_match_uncast', requestId, chatId, messageId, message, sourceHash, groups, voices, reserved, lifetime, speakerLookback, skippedTrackerTags, reduction })
+      ctx.sendToBackend({ type: 'chat_voice_match_uncast', requestId, chatId, messageId, message, sourceHash, groups, voices, reserved, lifetime, speakerLookback, skippedTrackerTags, reduction, cast })
     })
   }
 
@@ -3620,11 +3621,20 @@ export function setup(ctx: SpindleFrontendContext) {
       const poolVoices = poolVoicesForAutoCast()
       if (preferences.autoVoiceCasting && speakerAssignmentDebug) appendSpeakerDebugLog(`Voice pool: ${autoVoiceCastingPool === 'community' && communityIsAvailable() ? `community (${communityVoices.length} snapshot voices)` : 'favorites'}.`)
       const uncastVoices = availableUncastVoices(poolVoices, reservedVoices)
+      // The parser roster plus each character's configured voice. Uncast
+      // matching checks these before it invents a voice, so an off-screen cast
+      // member is not given a second, random voice.
+      const castSpeakers: CastSpeaker[] = [...new Map(playbackSpeakers
+        .filter(speaker => speaker.id !== USER_SPEAKER_ID && speaker.id !== UNCAST_SPEAKER_ID && speaker.id !== UNRESOLVED_SPEAKER_ID)
+        .flatMap(speaker => {
+          const voiceId = config.characterVoices[speaker.id] ?? ''
+          return voiceId ? [[speaker.id, { id: speaker.id, name: speaker.name, voiceId }] as const] : []
+        })).values()]
       const uncastMatchPromise = preferences.autoVoiceCasting && uncastGroups.length
         ? requestUncastVoiceMatches(
             playbackChat.id, messageId, preparePlaybackContent(message.content, preferences.skippedTrackerTags), hashMessageContent(message.content),
             uncastGroups, uncastVoices, reservedVoices, preferences.ghostVoiceLifetime, preferences.speakerLookback, preferences.skippedTrackerTags,
-            preferences.reductionComponents,
+            preferences.reductionComponents, castSpeakers,
           ).catch(error => {
             appendSpeakerDebugLog(`Uncast voice matching failed; using connection default: ${error instanceof Error ? error.message : String(error)}`)
             return [] as UncastVoiceAssignment[]
@@ -3944,11 +3954,14 @@ export function setup(ctx: SpindleFrontendContext) {
       if (playback.controller.signal.aborted) throw new DOMException('Playback stopped.', 'AbortError')
       for (const match of uncastMatches) {
         const group = uncastGroups.find(item => item.id === match.groupId)
-        if (!group || reservedVoices.includes(match.voiceId)) continue
+        if (!group) continue
+        // A cast member keeps their configured voice, which is in the reserved
+        // set; only new-voice assignments must avoid the reserved voices.
+        if (!match.castSpeakerId && reservedVoices.includes(match.voiceId)) continue
         for (const segmentIndex of group.segmentIndexes) {
           for (const index of segmentPlanIndexes[segmentIndex] ?? []) plan[index] = { ...plan[index], voice: match.voiceId }
         }
-        appendSpeakerDebugLog(`Uncast voice ${group.id}: gender=${match.gender}, ghost=${match.ghostId ?? 'none'}, voice=${JSON.stringify(match.voiceId)}.`)
+        appendSpeakerDebugLog(`Uncast voice ${group.id}: gender=${match.gender}, ghost=${match.ghostId ?? 'none'}, cast=${match.castSpeakerId ?? 'none'}, voice=${JSON.stringify(match.voiceId)}.`)
       }
       synthesisPlanFrozen = true
       const splitPlan = splitLargeVoicePlanSegments(plan)

@@ -501,13 +501,14 @@ function voiceDecisionSummaryTerse(voice) {
   if (tags.length) parts.push(`tags: ${tags.join(", ")}`);
   return parts.join("; ") || "No details provided.";
 }
-function buildUncastVoiceDecision(groups, voices, message, ghosts = [], previousMessages = [], trimCriteria = false) {
+function buildUncastVoiceDecision(groups, voices, message, ghosts = [], previousMessages = [], trimCriteria = false, cast = []) {
   const labels = uncastIdentityLabels(message, ghosts);
   const narrativeNames = uncastNarrativeNameCandidates(message);
   const state = {
     message,
     previousMessages,
     narrativeNames,
+    ...cast.length ? { cast: cast.map((member) => ({ id: member.id, name: member.name })) } : {},
     characters: groups.map((group) => ({
       id: group.id,
       identity: group.speakerId,
@@ -559,6 +560,14 @@ function buildUncastVoiceDecision(groups, voices, message, ghosts = [], previous
       type: "choice",
       instructions: `Does a person explicitly named in CURRENT narration actually speak the quotations in ${group.id}? Trace nearby pronouns, actions, dialogue and previousMessages. Names of addressees, bystanders, narrators, and people merely discussed are not speaker identities. Choose none unless the evidence clearly identifies the speaker.`,
       criteria: { none: "No named person is clearly identified as this speaker.", ...Object.fromEntries(narrativeNames.map((name, index) => [`name_${index}`, name])) }
+    };
+    if (cast.length) questions[`cast_${group.id}`] = {
+      type: "choice",
+      instructions: `Is the person who speaks the quoted dialogue in ${group.id} one of the established cast characters listed in state.cast? Established cast members already have their own voice, so an unlisted voice is only for someone new. Trace the current exchange and previousMessages: who is present, who acts, who is addressed, and who a name or relationship refers to. A person mentioned in narration, addressed by the speaker, or merely present is not the speaker. Choose none unless the evidence clearly identifies which established cast member speaks these quotations.`,
+      criteria: {
+        none: "The speaker is a new, unnamed, or unlisted character.",
+        ...Object.fromEntries(cast.map((member, index) => [`cast_${index}`, `${member.name} (${member.id})`]))
+      }
     };
     const earlier = groups.slice(0, groups.indexOf(group));
     if (ghosts.length || earlier.length) questions[`identity_${group.id}`] = {
@@ -734,7 +743,7 @@ function labelGenderHint(label) {
 function narrationBoostsPair(group, partner) {
   return !!group.narratedName && group.flankPartners?.includes(partner.id) === true && partner.addressee === group.narratedName;
 }
-function resolveUncastVoiceDecisions(groups, voices, answers, ghosts = [], reserved = [], messageId = "", message = "", previousMessageIds = [], random = Math.random) {
+function resolveUncastVoiceDecisions(groups, voices, answers, ghosts = [], reserved = [], messageId = "", message = "", previousMessageIds = [], random = Math.random, cast = []) {
   const used = /* @__PURE__ */ new Set([...reserved.filter(Boolean), ...ghosts.map((it) => it.voiceId).filter(Boolean)]);
   const assignments = [];
   const roots = /* @__PURE__ */ new Map();
@@ -760,6 +769,17 @@ function resolveUncastVoiceDecisions(groups, voices, answers, ghosts = [], reser
     const probability = answer.probabilities[answer.choice] ?? 0;
     const runnerUp = Math.max(0, ...Object.entries(answer.probabilities).filter(([key]) => key !== answer.choice).map(([, p]) => p));
     return answer.confidence >= 0.8 && probability >= 0.8 && probability - runnerUp >= 0.25;
+  };
+  const castSpeakerFor = (members) => {
+    const picks = members.flatMap((group) => {
+      const answer = answers[`cast_${group.id}`];
+      if (!answer || !strongChoice(answer)) return [];
+      const match = answer.choice.match(/^cast_(\d+)$/u);
+      const member = match ? cast[Number(match[1])] : void 0;
+      return member ? [member] : [];
+    });
+    if (!picks.length) return void 0;
+    return picks.every((member) => member.id === picks[0].id) ? picks[0] : void 0;
   };
   for (const group of groups) {
     let root = group.id;
@@ -928,10 +948,25 @@ function resolveUncastVoiceDecisions(groups, voices, answers, ghosts = [], reser
         linkReasons.delete(root);
       }
     }
+    const castMember = ghost || !cast.length ? void 0 : castSpeakerFor(members);
+    if (castMember && members.every((group) => !groupShowsNamedIdentity(group))) {
+      used.add(castMember.voiceId);
+      for (const group of members) {
+        assignments.push({
+          groupId: group.id,
+          voiceId: castMember.voiceId,
+          gender,
+          castSpeakerId: castMember.id,
+          matchReason: `existing cast member: ${castMember.name} (${castMember.id})`
+        });
+      }
+      continue;
+    }
     if (!ghost) {
-      const explicitlyUnclear = members.every((group) => answers[`identity_${group.id}`]?.choice === "new_or_unclear");
+      const unidentified = members.every((group) => !strongChoice(answers[`identity_${group.id}`]));
       const unnamedMembers = members.every((group) => group.speakerId === UNCAST_SPEAKER_ID && !groupShowsNamedIdentity(group));
-      const shared = explicitlyUnclear && unnamedMembers ? pendingUnnamedVoices.find((entry) => voiceGenderCompatible(entry.voice, gender)) : void 0;
+      const definiteGender = gender === "male" || gender === "female";
+      const shared = unidentified && unnamedMembers && definiteGender ? pendingUnnamedVoices.find((entry) => voiceGenderCompatible(entry.voice, gender)) : void 0;
       if (shared) {
         ghost = shared.ghost;
         ghost.context = [ghost.context, ...members.flatMap((group) => group.context)].filter(Boolean).join(" ").slice(0, 2e3);
@@ -6920,6 +6955,10 @@ async function saveGhostVoiceAssignments(chatId, messageId, assistantIds, groups
     const accepted = [];
     const pendingIds = /* @__PURE__ */ new Map();
     for (const assignment of assignments) {
+      if (assignment.castSpeakerId) {
+        accepted.push(assignment);
+        continue;
+      }
       const group = groups.find((item) => item.id === assignment.groupId);
       if (!group) continue;
       let ghostId = assignment.ghostId ?? "";
@@ -6966,7 +7005,7 @@ async function saveGhostVoiceAssignments(chatId, messageId, assistantIds, groups
       const covered = groups.reduce((sum, group) => sum + group.speeches.length, 0);
       const previousRecords = metadata.chat_voice_speaker_continuity;
       const records = previousRecords && typeof previousRecords === "object" && !Array.isArray(previousRecords) ? { ...previousRecords } : {};
-      if (source && !source.is_user && expected > 0 && covered === expected && accepted.length === groups.length && matchingIds.size === 1) {
+      if (source && !source.is_user && expected > 0 && covered === expected && accepted.length === groups.length && accepted.every((item) => !!item.ghostId) && matchingIds.size === 1) {
         records[messageId] = { contentHash: hashMessageContent(source.content ?? ""), speakerId: `ghost:${accepted[0].ghostId}` };
       }
       await spindle.chats.update(chatId, { metadata: { ...metadata, chat_voice_ghost_cast: ghosts.slice(-200), chat_voice_speaker_continuity: records } }, userId);
@@ -7877,6 +7916,13 @@ spindle.onFrontendMessage(async (rawPayload, userId, frontendSessionId) => {
           ...group.narratedName ? { narratedName: group.narratedName } : {},
           ...group.inferredName ? { inferredName: group.inferredName } : {}
         }));
+        const cast = (payload.cast ?? []).slice(0, 32).flatMap((member) => {
+          if (!member || typeof member.id !== "string" || typeof member.name !== "string" || typeof member.voiceId !== "string") return [];
+          const id = member.id.trim().slice(0, 200);
+          const voiceId = member.voiceId.trim().slice(0, 512);
+          const name = member.name.trim().slice(0, 200) || id;
+          return id && voiceId ? [{ id, name, voiceId }] : [];
+        });
         const chat = await spindle.chats.get(payload.chatId, userId);
         if (!chat) throw new Error("The chat is no longer available.");
         const messages = await spindle.chat.getMessages(payload.chatId);
@@ -7902,7 +7948,7 @@ spindle.onFrontendMessage(async (rawPayload, userId, frontendSessionId) => {
         if (!groups.length || !voices.length && !ghosts.length) {
           sendFrontend({ type: "chat_voice_uncast_matches", requestId: payload.requestId, assignments: [], diagnostics: [`No matching request: groups=${groups.length}, availableFavorites=${voices.length}, historicalGhosts=${ghosts.length}, currentGhosts=${currentGhosts.length}.`] }, userId, frontendSessionId);
         } else {
-          const plan = buildUncastVoiceDecision(groups, voices, payload.message.slice(0, 3e4), ghosts, matchingContext.previousMessages, reduction.trimVoiceCriteria);
+          const plan = buildUncastVoiceDecision(groups, voices, payload.message.slice(0, 3e4), ghosts, matchingContext.previousMessages, reduction.trimVoiceCriteria, cast);
           const answers = {};
           let decisionError = "";
           const captureAnswers = (result) => {
@@ -7943,7 +7989,7 @@ spindle.onFrontendMessage(async (rawPayload, userId, frontendSessionId) => {
               spindle.log.warn(`[Chat Voice] Uncast identity review failed: ${reviewError}`);
             }
           }
-          let assignments = resolveUncastVoiceDecisions(groups, voices, answers, ghosts, payload.reserved, payload.messageId, payload.message.slice(0, 3e4), assistantIds.slice(0, Math.max(0, assistantIds.indexOf(anchor))));
+          let assignments = resolveUncastVoiceDecisions(groups, voices, answers, ghosts, payload.reserved, payload.messageId, payload.message.slice(0, 3e4), assistantIds.slice(0, Math.max(0, assistantIds.indexOf(anchor))), void 0, cast);
           const proposedAssignments = assignments;
           if (assignments.length) {
             assignments = await saveGhostVoiceAssignments(payload.chatId, payload.messageId, assistantIds, groups, assignments, userId, anchor, payload.reserved, lifetime, payload.message, payload.sourceHash, hashMessageContent(JSON.stringify(savedGhosts)));
@@ -7959,7 +8005,7 @@ spindle.onFrontendMessage(async (rawPayload, userId, frontendSessionId) => {
             const proposed = proposedAssignments.find((item) => item.groupId === group.id);
             return `${group.id} segments=${group.segmentIndexes.map((index) => index + 1).join(",")} identity=${identity ? `${identity.choice} confidence=${identity.confidence} probabilities=${JSON.stringify(identity.probabilities)}` : "none"} gender=${gender ? `${gender.choice} confidence=${gender.confidence} probabilities=${JSON.stringify(gender.probabilities)}` : "none"} label=${label ? `${label.choice} confidence=${label.confidence} probabilities=${JSON.stringify(label.probabilities)}` : "none"} narrative-name=${narrativeName ? `${narrativeName.choice} (${plan.state.narrativeNames[Number(narrativeName.choice.replace("name_", ""))] ?? "none"}) confidence=${narrativeName.confidence} probabilities=${JSON.stringify(narrativeName.probabilities)}` : "none"} comparisons=${comparisons} proposed=${proposed ? `${proposed.ghostId} / ${proposed.voiceId} / ${proposed.gender}` : "none"} match-reason=${proposed?.matchReason ?? "none"} voice-choice=${voice ? `${voice.choice} confidence=${voice.confidence} probabilities=${JSON.stringify(voice.probabilities)}` : "none"} final=${assignment ? `${assignment.label || "unnamed"} / ${assignment.ghostId} / ${assignment.voiceId}` : "connection default"}`;
           });
-          diagnostics.unshift(`build=${BUILD_VERSION}; Available favorites=${voices.length}, historical ghosts=${ghosts.length}, current ghosts=${currentGhosts.length}; prior messages=${matchingContext.previousMessages.length}${decisionError ? `; Jev failed: ${decisionError}` : ""}; identity review questions=${Object.keys(review.questions).length}${reviewError ? `; review failed: ${reviewError}` : ""}; reduction=${Object.entries(reduction).filter(([, enabled]) => !enabled).map(([id]) => id).join(",") || "full"}.`);
+          diagnostics.unshift(`build=${BUILD_VERSION}; Available favorites=${voices.length}, cast=${cast.length}, historical ghosts=${ghosts.length}, current ghosts=${currentGhosts.length}; prior messages=${matchingContext.previousMessages.length}${decisionError ? `; Jev failed: ${decisionError}` : ""}; identity review questions=${Object.keys(review.questions).length}${reviewError ? `; review failed: ${reviewError}` : ""}; reduction=${Object.entries(reduction).filter(([, enabled]) => !enabled).map(([id]) => id).join(",") || "full"}.`);
           diagnostics.splice(1, 0, `Candidate context: ${ghosts.map((ghost, index) => `ghost_${index}=${ghost.id} last=${ghost.lastSeenMessageId || "none"} history=${(ghost.conversationHistory ?? []).map((entry) => `${entry.messageId}(${entry.text.length} chars)`).join(",") || "none"} context=${ghost.context.length} chars`).join("; ") || "none"}; prior=${matchingContext.previousMessages.map((item) => `${item.role ?? "unknown"}:${item.id}(${item.text.length} chars)`).join(",") || "none"}.`);
           sendFrontend({ type: "chat_voice_uncast_matches", requestId: payload.requestId, assignments, diagnostics }, userId, frontendSessionId);
           if (assignments.length) await sendState(userId, void 0, payload.chatId, frontendSessionId);
