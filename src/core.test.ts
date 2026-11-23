@@ -88,6 +88,7 @@ import {
   hasUncertainFirstPass,
   TTS_NARRATION_WINDOW,
   bufferAwareGenerationConcurrency,
+  planNeedsVoiceSerialization,
   availableUncastVoices,
   canReserveAutomaticVoice,
   selectAutomaticVoice,
@@ -1241,10 +1242,16 @@ test('applies per-segment gain while assembling PCM WAV audio', () => {
   assert.equal(view.getInt16(46, true), -8192)
 })
 
-test('forces fragmented generation windows to one despite long outliers', () => {
+test('keeps at least two requests in flight for fragmented short windows', () => {
+  // Short, densely alternating lines are the case that drains the playback
+  // buffer fastest, so they must not be serialized to a single request.
   assert.deepEqual(
     adaptiveGenerationConcurrency(3, 3, [80, 90, 500, 100, 450, 110]),
-    { concurrency: 1, shortCooldown: 6, longWindowStreak: 0 },
+    { concurrency: 3, shortCooldown: 6, longWindowStreak: 0 },
+  )
+  assert.deepEqual(
+    adaptiveGenerationConcurrency(1, 3, [80, 90, 500, 100, 450, 110]),
+    { concurrency: 2, shortCooldown: 6, longWindowStreak: 0 },
   )
 })
 
@@ -1267,24 +1274,28 @@ test('requires sustained long windows before raising concurrency to its configur
   )
 })
 
-test('holds concurrency at one during the short-segment cooldown', () => {
+test('holds the dense-line floor during the short-segment cooldown', () => {
   assert.deepEqual(
     adaptiveGenerationConcurrency(1, 4, [250, 260, 270], 6, 0),
+    { concurrency: 2, shortCooldown: 5, longWindowStreak: 0 },
+  )
+  assert.deepEqual(
+    adaptiveGenerationConcurrency(1, 1, [250, 260, 270], 6, 0),
     { concurrency: 1, shortCooldown: 5, longWindowStreak: 0 },
   )
 })
 
-test('keeps mixed long and short synthesis windows at one request', () => {
+test('keeps mixed long and short synthesis windows above one request', () => {
   assert.deepEqual(
     adaptiveGenerationConcurrency(4, 4, [520, 190, 610, 205, 480, 175]),
-    { concurrency: 1, shortCooldown: 6, longWindowStreak: 0 },
+    { concurrency: 4, shortCooldown: 6, longWindowStreak: 0 },
   )
 })
 
-test('keeps frequently switching voice windows at one request', () => {
+test('keeps frequently switching voice windows above one request', () => {
   assert.deepEqual(
     adaptiveGenerationConcurrency(3, 4, [420, 460, 500, 440, 480, 520], 0, 0, 10, 4),
-    { concurrency: 1, shortCooldown: 6, longWindowStreak: 0 },
+    { concurrency: 3, shortCooldown: 6, longWindowStreak: 0 },
   )
 })
 
@@ -1294,10 +1305,22 @@ test('raises synthesis concurrency while the playback buffer is under target', (
   assert.equal(bufferAwareGenerationConcurrency(3, 4, 0, 2, 1), 4)
 })
 
-test('returns to the adaptive baseline when buffered and serializes after rate limiting', () => {
-  assert.equal(bufferAwareGenerationConcurrency(3, 4, 2, 2, 1), 1)
+test('holds concurrency while buffered and decays only when comfortably ahead', () => {
+  // Snap-back to the baseline as soon as the buffer was satisfied made the
+  // pipeline oscillate between starved and idle, so a healthy buffer now holds.
+  assert.equal(bufferAwareGenerationConcurrency(3, 4, 2, 2, 1), 3)
+  assert.equal(bufferAwareGenerationConcurrency(4, 4, 3, 2, 2), 4)
+  assert.equal(bufferAwareGenerationConcurrency(4, 4, 4, 2, 2), 3)
+  assert.equal(bufferAwareGenerationConcurrency(2, 4, 8, 2, 2), 2)
   assert.equal(bufferAwareGenerationConcurrency(3, 4, 0, 2, 3, true), 1)
   assert.equal(bufferAwareGenerationConcurrency(1, 1, 0, 2, 1), 1)
+})
+
+test('serializes voices only when a clip leans on the connection default voice', () => {
+  assert.equal(planNeedsVoiceSerialization([{ voice: 'aiko' }, { voice: 'nao' }]), false)
+  assert.equal(planNeedsVoiceSerialization([{ voice: 'aiko' }, { voice: '' }]), true)
+  assert.equal(planNeedsVoiceSerialization([{ voice: '   ' }]), true)
+  assert.equal(planNeedsVoiceSerialization([]), false)
 })
 
 test('paces synthesis starts inside a rolling request window', () => {

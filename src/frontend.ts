@@ -60,6 +60,7 @@ import {
   speakerAliasIdLookup,
   speakersForMessageRole,
   splitLargeVoicePlanSegments,
+  planNeedsVoiceSerialization,
   shouldPersistMessageAudio,
   UNCAST_SPEAKER_ID,
   UNRESOLVED_SPEAKER_ID,
@@ -889,7 +890,7 @@ async function synthesizeVoiceSegment(
   signal: AbortSignal,
   pacer: SynthesisPacer,
   rateLimitBudget: RateLimitBudget,
-  voiceGate: ConnectionVoiceGate,
+  voiceGate: ConnectionVoiceGate | null,
   onRateLimit: (delayMs: number, cumulativeWaitMs: number) => void,
 ): Promise<SynthesizedVoiceSegment> {
   while (true) {
@@ -898,7 +899,7 @@ async function synthesizeVoiceSegment(
     let response: Response
     let audioData: ArrayBuffer | null = null
     try {
-      releaseVoice = await voiceGate.acquire(voice, signal)
+      releaseVoice = voiceGate ? await voiceGate.acquire(voice, signal) : null
       await waitForSynthesisSlot(pacer, signal)
       response = await fetch('/api/v1/tts/synthesize', {
         method: 'POST',
@@ -4007,6 +4008,22 @@ export function setup(ctx: SpindleFrontendContext) {
       let shortConcurrencyCooldown = 0
       let longWindowStreak = 0
       let rateLimitedForRemainder = false
+      // Requests that carry an explicit voice identify their own voice, so they
+      // may overlap another voice on the connection. Only a clip that leans on
+      // the connection's mutable "current voice" has to stay exclusive.
+      const serializeVoices = planNeedsVoiceSerialization(plan)
+      const playbackVoiceGate = serializeVoices
+        ? connectionVoiceGates.get(connectionId) ?? (() => {
+            const gate = new ConnectionVoiceGate()
+            connectionVoiceGates.set(connectionId, gate)
+            return gate
+          })()
+        : null
+      appendSpeakerDebugLog(
+        `Voice serialization: ${serializeVoices
+          ? 'on (a clip uses the connection default voice)'
+          : 'off (every clip carries an explicit voice)'}.`,
+      )
       const prepare = async (index: number): Promise<PreparedSegment> => {
         try {
           appendSpeakerDebugLog(
@@ -4027,11 +4044,7 @@ export function setup(ctx: SpindleFrontendContext) {
               synthesisController.signal,
               sharedSynthesisPacer,
               rateLimitBudget,
-              connectionVoiceGates.get(connectionId) ?? (() => {
-                const gate = new ConnectionVoiceGate()
-                connectionVoiceGates.set(connectionId, gate)
-                return gate
-              })(),
+              playbackVoiceGate,
               (delayMs, cumulativeWaitMs) => {
                 rateLimitedForRemainder = true
                 adaptiveConcurrency = 1
@@ -4579,8 +4592,9 @@ export function setup(ctx: SpindleFrontendContext) {
       blockedUntil: 0, cumulativeWaitMs: 0, consecutiveResponses: 0,
       maximumWaitMs: rateLimitWaitSeconds * 1_000, recovering: false, recoveryTail: Promise.resolve(),
     }
-    const gate = connectionVoiceGates.get(connectionId) ?? new ConnectionVoiceGate()
-    connectionVoiceGates.set(connectionId, gate)
+    // A preview always names its voice, so it only has to join a queue that a
+    // serializing playback already opened for this connection.
+    const gate = connectionVoiceGates.get(connectionId) ?? null
     try {
       const segment = await runSynthesisTask(() => synthesizeVoiceSegment(
         connectionId, 'Hello. This is a preview of my voice.', voiceId, 1,

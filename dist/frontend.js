@@ -885,11 +885,12 @@ function adaptiveGenerationConcurrency(current, configuredMaximum, segmentLength
   const lowerQuartileLength = sorted[Math.floor((sorted.length - 1) * 0.25)] ?? 0;
   const shortCount = lengths.filter((length) => length < 160).length;
   const mixedDenseWindow = lengths.length >= 4 && lowerQuartileLength < 220;
+  const denseFloor = Math.min(safeConfiguredMaximum, 2);
   if (shortCount >= 3 || medianLength < 200 || mixedDenseWindow || voiceChanges >= 3) {
-    return { concurrency: 1, shortCooldown: 6, longWindowStreak: 0 };
+    return { concurrency: Math.max(denseFloor, safeCurrent), shortCooldown: 6, longWindowStreak: 0 };
   }
   if (safeCooldown > 0) {
-    return { concurrency: 1, shortCooldown: safeCooldown - 1, longWindowStreak: 0 };
+    return { concurrency: denseFloor, shortCooldown: safeCooldown - 1, longWindowStreak: 0 };
   }
   const uniformlyLongWindow = lengths.length >= 3 && Math.min(...lengths) >= 300 && lowerQuartileLength > 320 && medianLength > 420;
   if (uniformlyLongWindow) {
@@ -915,8 +916,13 @@ function bufferAwareGenerationConcurrency(current, configuredMaximum, readyAhead
   const safeBaseline = Math.min(ceiling, Math.max(1, Math.round(adaptiveBaseline)));
   const ready = Math.max(0, Math.round(readyAhead));
   const target = Math.max(1, Math.round(targetBuffer));
-  if (ready >= target || ceiling === 1) return safeBaseline;
-  return Math.min(ceiling, Math.max(2, safeCurrent + 1));
+  if (ceiling === 1) return 1;
+  if (ready < target) return Math.min(ceiling, Math.max(2, safeCurrent + 1));
+  if (ready >= target * 2) return Math.min(ceiling, Math.max(safeBaseline, safeCurrent - 1));
+  return Math.min(ceiling, Math.max(safeBaseline, safeCurrent));
+}
+function planNeedsVoiceSerialization(segments) {
+  return segments.some((segment) => !segment.voice.trim());
 }
 function encodeConcatenatedWav(segments) {
   const usable = segments.filter((segment) => Number.isFinite(segment.sampleRate) && segment.sampleRate > 0 && segment.channels.length > 0 && segment.channels.some((channel) => channel.length > 0));
@@ -2858,7 +2864,7 @@ async function synthesizeVoiceSegment(connectionId, text, voice, speed, signal, 
     let response;
     let audioData = null;
     try {
-      releaseVoice = await voiceGate.acquire(voice, signal);
+      releaseVoice = voiceGate ? await voiceGate.acquire(voice, signal) : null;
       await waitForSynthesisSlot(pacer, signal);
       response = await fetch("/api/v1/tts/synthesize", {
         method: "POST",
@@ -5611,6 +5617,15 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
         let shortConcurrencyCooldown = 0;
         let longWindowStreak = 0;
         let rateLimitedForRemainder = false;
+        const serializeVoices = planNeedsVoiceSerialization(plan);
+        const playbackVoiceGate = serializeVoices ? connectionVoiceGates.get(connectionId) ?? (() => {
+          const gate = new ConnectionVoiceGate();
+          connectionVoiceGates.set(connectionId, gate);
+          return gate;
+        })() : null;
+        appendSpeakerDebugLog(
+          `Voice serialization: ${serializeVoices ? "on (a clip uses the connection default voice)" : "off (every clip carries an explicit voice)"}.`
+        );
         const prepare = async (index) => {
           try {
             appendSpeakerDebugLog(
@@ -5630,11 +5645,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
                 synthesisController.signal,
                 sharedSynthesisPacer,
                 rateLimitBudget,
-                connectionVoiceGates.get(connectionId) ?? (() => {
-                  const gate = new ConnectionVoiceGate();
-                  connectionVoiceGates.set(connectionId, gate);
-                  return gate;
-                })(),
+                playbackVoiceGate,
                 (delayMs, cumulativeWaitMs) => {
                   rateLimitedForRemainder = true;
                   adaptiveConcurrency = 1;
@@ -6139,8 +6150,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
       recovering: false,
       recoveryTail: Promise.resolve()
     };
-    const gate = connectionVoiceGates.get(connectionId) ?? new ConnectionVoiceGate();
-    connectionVoiceGates.set(connectionId, gate);
+    const gate = connectionVoiceGates.get(connectionId) ?? null;
     try {
       const segment = await runSynthesisTask(() => synthesizeVoiceSegment(
         connectionId,

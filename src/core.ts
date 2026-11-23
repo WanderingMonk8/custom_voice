@@ -2258,11 +2258,16 @@ export function adaptiveGenerationConcurrency(
   const lowerQuartileLength = sorted[Math.floor((sorted.length - 1) * 0.25)] ?? 0
   const shortCount = lengths.filter(length => length < 160).length
   const mixedDenseWindow = lengths.length >= 4 && lowerQuartileLength < 220
+  // Dense, short, frequently alternating lines are the case that drains the
+  // playback buffer fastest: each clip holds a second or two of audio, so a
+  // single in-flight request cannot keep up with playback. Keep at least two
+  // requests in flight instead of serializing the whole scene.
+  const denseFloor = Math.min(safeConfiguredMaximum, 2)
   if (shortCount >= 3 || medianLength < 200 || mixedDenseWindow || voiceChanges >= 3) {
-    return { concurrency: 1, shortCooldown: 6, longWindowStreak: 0 }
+    return { concurrency: Math.max(denseFloor, safeCurrent), shortCooldown: 6, longWindowStreak: 0 }
   }
   if (safeCooldown > 0) {
-    return { concurrency: 1, shortCooldown: safeCooldown - 1, longWindowStreak: 0 }
+    return { concurrency: denseFloor, shortCooldown: safeCooldown - 1, longWindowStreak: 0 }
   }
   const uniformlyLongWindow = lengths.length >= 3
     && Math.min(...lengths) >= 300
@@ -2283,9 +2288,12 @@ export function adaptiveGenerationConcurrency(
 }
 
 /**
- * Raise synthesis concurrency only while playback is at risk of exhausting its
- * ready-audio buffer. The ordinary adaptive result remains authoritative once
- * enough segments are available, and rate limiting always forces serialization.
+ * Keep synthesis concurrency high enough to feed playback, and hold it there
+ * instead of snapping back to the content-aware baseline the moment the buffer
+ * is satisfied. Returning to the baseline as soon as a few clips are ready made
+ * the pipeline oscillate between starved and idle, so the buffer drained again
+ * before the next request landed. Concurrency now decays one step only once the
+ * buffer is comfortably ahead, and rate limiting still forces serialization.
  */
 export function bufferAwareGenerationConcurrency(
   current: number,
@@ -2305,8 +2313,20 @@ export function bufferAwareGenerationConcurrency(
   const safeBaseline = Math.min(ceiling, Math.max(1, Math.round(adaptiveBaseline)))
   const ready = Math.max(0, Math.round(readyAhead))
   const target = Math.max(1, Math.round(targetBuffer))
-  if (ready >= target || ceiling === 1) return safeBaseline
-  return Math.min(ceiling, Math.max(2, safeCurrent + 1))
+  if (ceiling === 1) return 1
+  if (ready < target) return Math.min(ceiling, Math.max(2, safeCurrent + 1))
+  if (ready >= target * 2) return Math.min(ceiling, Math.max(safeBaseline, safeCurrent - 1))
+  return Math.min(ceiling, Math.max(safeBaseline, safeCurrent))
+}
+
+/**
+ * Some TTS providers apply a request's voice through mutable connection state,
+ * so a clip that falls back to the connection's own voice must not overlap a
+ * different voice on the same connection. A clip that carries an explicit voice
+ * identifies its own voice, so its requests may overlap freely.
+ */
+export function planNeedsVoiceSerialization(segments: ReadonlyArray<{ voice: string }>): boolean {
+  return segments.some(segment => !segment.voice.trim())
 }
 
 /** Combine decoded audio into one PCM WAV so the host does not need FFmpeg to save it. */
