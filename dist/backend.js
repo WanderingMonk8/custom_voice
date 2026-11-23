@@ -2993,16 +2993,20 @@ function buildContextualUserReconciliation(plan, answers, context) {
 }
 function applyContextualUserReconciliation(plan, answers, reviewed, questions) {
   const speakers = plan.state.speakers.map((speaker) => ({ id: speaker.id, name: speaker.name }));
+  const userOption = plan.state.speakers.find((speaker) => speaker.id === USER_SPEAKER_ID)?.option;
   for (const speech of plan.state.speeches) {
     const key = `persona_check_${speech.id}`;
     if (!questions[key]) continue;
     const result = reviewed[key];
     answers[`persona_check_${speech.id}`] = result ?? { choice: "no_clear_identity", probabilities: {}, confidence: 0 };
     const checked = evaluateSpeakerDecisionAnswer(result, { user: USER_SPEAKER_ID, other: "other" }, { probability: 0.8, confidence: 0.75, margin: 0.25 });
+    const leaned = evaluateSpeakerDecisionAnswer(result, { user: USER_SPEAKER_ID, other: "other" }, { probability: 0.6, confidence: 0.45, margin: 0.2 });
+    const identityLeanedUser = Boolean(userOption) && [answers[`speech_${speech.id}`], answers[`relationship_review_${speech.id}`]].some((answer) => Boolean(answer) && answer.choice === userOption && (answer.probabilities[userOption] ?? 0) >= 0.6);
+    const personaConfirmed = checked.identity === USER_SPEAKER_ID || leaned.identity === USER_SPEAKER_ID && identityLeanedUser;
     const explicit = narrativeAttributionSpeaker(`${speech.narrativeBefore} ${speech.narrativeAfter}`, speakers);
     const candidate = answers[`relationship_review_${speech.id}`];
     const candidateIdentity = evaluateSpeakerDecisionAnswer(candidate, plan.optionSpeakerIds).identity;
-    if (checked.identity === USER_SPEAKER_ID && (!explicit || explicit === USER_SPEAKER_ID) || explicit === USER_SPEAKER_ID) {
+    if (personaConfirmed && (!explicit || explicit === USER_SPEAKER_ID) || explicit === USER_SPEAKER_ID) {
       const currentIdentity = evaluateSpeakerDecisionAnswer(answers[`speech_${speech.id}`], plan.optionSpeakerIds).identity;
       if (currentIdentity !== USER_SPEAKER_ID && candidateIdentity === USER_SPEAKER_ID) {
         answers[`relationship_original_${speech.id}`] = answers[`speech_${speech.id}`];
@@ -3018,7 +3022,7 @@ function applyContextualUserReconciliation(plan, answers, reviewed, questions) {
         answers[`persona_original_${speech.id}`] = answers[`speech_${speech.id}`];
         const before = answers[`relationship_original_${speech.id}`];
         const beforeIdentity = evaluateSpeakerDecisionAnswer(before, plan.optionSpeakerIds).identity;
-        answers[`speech_${speech.id}`] = before && beforeIdentity !== USER_SPEAKER_ID ? before : { choice: "no_clear_identity", probabilities: {}, confidence: 0 };
+        answers[`speech_${speech.id}`] = before && beforeIdentity !== USER_SPEAKER_ID ? before : withoutUserCandidate(answers[`speech_${speech.id}`], userOption);
         delete answers[`relationship_confirmed_${speech.id}`];
         delete answers[`relationship_applied_${speech.id}`];
         delete answers[`relationship_global_${speech.id}`];
@@ -3027,6 +3031,66 @@ function applyContextualUserReconciliation(plan, answers, reviewed, questions) {
       answers[`global_uncertain_${speech.id}`] = result ?? { choice: "no_clear_identity", probabilities: {}, confidence: 0 };
     }
   }
+}
+function withoutUserCandidate(answer, userOption) {
+  const cleared = { choice: "no_clear_identity", probabilities: {}, confidence: 0 };
+  if (!answer || !userOption) return cleared;
+  const remaining = Object.entries(answer.probabilities).filter(([option]) => option !== userOption);
+  const total = remaining.reduce((sum, [, probability]) => sum + probability, 0);
+  if (!(total > 0)) return cleared;
+  const probabilities = Object.fromEntries(remaining.map(([option, probability]) => [option, probability / total]));
+  const [best] = Object.entries(probabilities).sort((left, right) => right[1] - left[1]);
+  if (!best || best[0] === DECISION_UNCLEAR_OPTION) return cleared;
+  return { choice: best[0], probabilities, confidence: answer.confidence };
+}
+function applyConversationFlow(plan, answers, identities, paths) {
+  const optionIds = plan.optionSpeakerIds;
+  const optionById = new Map(Object.entries(optionIds).map(([option, id]) => [id, option]));
+  const castIds = new Set(plan.state.speakers.map((speaker) => speaker.id).filter((id) => id !== USER_SPEAKER_ID && id !== UNCAST_SPEAKER_ID && id !== UNRESOLVED_SPEAKER_ID));
+  const locked = (speechId) => Boolean(
+    answers[`relationship_confirmed_${speechId}`] || answers[`relationship_continuity_${speechId}`] || answers[`persona_confirmed_${speechId}`] || answers[`switch_reconciled_${speechId}`]
+  );
+  for (let index = 1; index < plan.state.speeches.length; index += 1) {
+    const speech = plan.state.speeches[index];
+    const current = identities[index];
+    const previous = identities[index - 1];
+    if (!current || !previous || current !== previous) continue;
+    if (!castIds.has(current)) continue;
+    const turn = answers[`turn_${speech.id}`];
+    const responds = turn?.probabilities?.[TURN_RESPOND_OPTION] ?? 0;
+    if (turn?.choice !== TURN_RESPOND_OPTION || responds < 0.55 || turn.confidence < 0.45) continue;
+    if (locked(speech.id)) continue;
+    const answer = answers[`speech_${speech.id}`];
+    const currentOption = optionById.get(current);
+    const currentProbability = answer && currentOption ? answer.probabilities[currentOption] ?? 0 : 0;
+    if (currentProbability >= 0.6) continue;
+    const review = answers[`relationship_review_${speech.id}`];
+    const reviewProbability = review && currentOption ? review.probabilities[currentOption] ?? 0 : 0;
+    if (review && review.choice === currentOption && reviewProbability >= 0.6 && review.confidence >= 0.5) continue;
+    const alternative = Object.entries(answer?.probabilities ?? {}).filter(([option, probability]) => {
+      const id = optionIds[option];
+      return Boolean(id) && castIds.has(id) && id !== current && probability >= 0.3;
+    }).sort((left, right) => right[1] - left[1])[0];
+    if (!alternative) continue;
+    identities[index] = optionIds[alternative[0]];
+    paths.set(index, "resolution:turn-taking (a reply is normally the other participant)");
+  }
+  for (let index = 0; index < plan.state.speeches.length; index += 1) {
+    const speech = plan.state.speeches[index];
+    const match = speech.text.trim().match(/^(?:no[,.]?\s*)?i\s+said[,:]?\s+(.+)$/iu);
+    if (!match) continue;
+    const echoed = normalizedQuoteText(match[1]);
+    if (echoed.length < 4) continue;
+    const source = plan.state.speeches.slice(0, index).findIndex((previous) => normalizedQuoteText(previous.text) === echoed);
+    const sourceIdentity = source >= 0 ? identities[source] : void 0;
+    if (!sourceIdentity || sourceIdentity === identities[index]) continue;
+    if (locked(speech.id)) continue;
+    identities[index] = sourceIdentity;
+    paths.set(index, "resolution:echo (the speaker repeats their own earlier line)");
+  }
+}
+function normalizedQuoteText(text) {
+  return text.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").replace(/\s+/gu, " ").trim();
 }
 var DEFAULT_SPEAKER_LOOKBACK = 6;
 var MAX_SPEAKER_LOOKBACK = 100;
@@ -6012,6 +6076,8 @@ function resolveSpeakerDecisionSegments(content, plan, answers, speakers, option
     discoursePathBySpeechIndex.set(index, outcome.reason === "overrode-conflict" ? "resolution:discourse-identity (overrode paragraph/speech conflict)" : "resolution:discourse-identity (filled unresolved first pass)");
     return outcome.identity ?? void 0;
   });
+  const conversationFlowPaths = /* @__PURE__ */ new Map();
+  applyConversationFlow(plan, answers, speechIdentities, conversationFlowPaths);
   const hasLocalIdentity = [...paragraphIdentities.values(), ...speechIdentities].some((identity) => identity !== void 0);
   const hasUncastIdentity = [...paragraphIdentities.values(), ...speechIdentities].some((identity) => identity === UNCAST_SPEAKER_ID);
   const explicitUncastCue = hasExplicitUncastCue(content, options.skippedTrackerTagPairs ?? "");
@@ -6082,7 +6148,7 @@ function resolveSpeakerDecisionSegments(content, plan, answers, speakers, option
       upstreamIdentity = direct;
       upstreamSource = `speech-s${index}`;
       resolutionPaths.push([
-        discoursePathBySpeechIndex.get(index) ?? chainPathBySpeechIndex.get(index) ?? "resolution:direct-speech-identity"
+        conversationFlowPaths.get(index) ?? discoursePathBySpeechIndex.get(index) ?? chainPathBySpeechIndex.get(index) ?? "resolution:direct-speech-identity"
       ]);
     } else if (upstreamIdentity && !clearSpeakerSwitch && !options.evidenceOnly) {
       speakerId = upstreamIdentity;

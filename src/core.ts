@@ -4671,16 +4671,27 @@ export function buildContextualUserReconciliation(plan: SpeakerDecisionPlan, ans
 /** Preserve a user assignment only after explicit attribution or contextual confirmation. */
 export function applyContextualUserReconciliation(plan: SpeakerDecisionPlan, answers: Record<string, SpeakerDecisionChoice>, reviewed: Record<string, SpeakerDecisionChoice>, questions: SpeakerDecisionPlan['questions']): void {
   const speakers = plan.state.speakers.map(speaker => ({ id: speaker.id, name: speaker.name }))
+  const userOption = plan.state.speakers.find(speaker => speaker.id === USER_SPEAKER_ID)?.option
   for (const speech of plan.state.speeches) {
     const key = `persona_check_${speech.id}`
     if (!questions[key]) continue
     const result = reviewed[key]
     answers[`persona_check_${speech.id}`] = result ?? { choice: 'no_clear_identity', probabilities: {}, confidence: 0 }
     const checked = evaluateSpeakerDecisionAnswer(result, { user: USER_SPEAKER_ID, other: 'other' }, { probability: 0.8, confidence: 0.75, margin: 0.25 })
+    // The persona question is a dedicated three-way test (user / other /
+    // unclear), not an N-way identity guess, so a clear lead there combined
+    // with the model's own identity answer naming the user persona is enough
+    // evidence. Requiring both keeps role leakage blocked while a POV character
+    // who genuinely speaks is no longer silenced into the connection default.
+    const leaned = evaluateSpeakerDecisionAnswer(result, { user: USER_SPEAKER_ID, other: 'other' }, { probability: 0.6, confidence: 0.45, margin: 0.2 })
+    const identityLeanedUser = Boolean(userOption) && [answers[`speech_${speech.id}`], answers[`relationship_review_${speech.id}`]]
+      .some(answer => Boolean(answer) && answer!.choice === userOption && (answer!.probabilities[userOption!] ?? 0) >= 0.6)
+    const personaConfirmed = checked.identity === USER_SPEAKER_ID
+      || (leaned.identity === USER_SPEAKER_ID && identityLeanedUser)
     const explicit = narrativeAttributionSpeaker(`${speech.narrativeBefore} ${speech.narrativeAfter}`, speakers)
     const candidate = answers[`relationship_review_${speech.id}`]
     const candidateIdentity = evaluateSpeakerDecisionAnswer(candidate, plan.optionSpeakerIds).identity
-    if ((checked.identity === USER_SPEAKER_ID && (!explicit || explicit === USER_SPEAKER_ID)) || explicit === USER_SPEAKER_ID) {
+    if ((personaConfirmed && (!explicit || explicit === USER_SPEAKER_ID)) || explicit === USER_SPEAKER_ID) {
       const currentIdentity = evaluateSpeakerDecisionAnswer(answers[`speech_${speech.id}`], plan.optionSpeakerIds).identity
       if (currentIdentity !== USER_SPEAKER_ID && candidateIdentity === USER_SPEAKER_ID) {
         answers[`relationship_original_${speech.id}`] = answers[`speech_${speech.id}`]
@@ -4696,7 +4707,11 @@ export function applyContextualUserReconciliation(plan: SpeakerDecisionPlan, ans
         answers[`persona_original_${speech.id}`] = answers[`speech_${speech.id}`]
         const before = answers[`relationship_original_${speech.id}`]
         const beforeIdentity = evaluateSpeakerDecisionAnswer(before, plan.optionSpeakerIds).identity
-        answers[`speech_${speech.id}`] = before && beforeIdentity !== USER_SPEAKER_ID ? before : { choice: 'no_clear_identity', probabilities: {}, confidence: 0 }
+        // Dropping the persona must not strand the line on the connection
+        // default: keep the model's remaining preferences, renormalized.
+        answers[`speech_${speech.id}`] = before && beforeIdentity !== USER_SPEAKER_ID
+          ? before
+          : withoutUserCandidate(answers[`speech_${speech.id}`], userOption)
         delete answers[`relationship_confirmed_${speech.id}`]
         delete answers[`relationship_applied_${speech.id}`]
         delete answers[`relationship_global_${speech.id}`]
@@ -4707,9 +4722,101 @@ export function applyContextualUserReconciliation(plan: SpeakerDecisionPlan, ans
   }
 }
 
+/**
+ * After the persona review rejects the user, keep the model's next-best
+ * speaker instead of discarding the whole distribution, which would leave the
+ * quotation unresolved and route it to the connection default voice.
+ */
+function withoutUserCandidate(answer: SpeakerDecisionChoice | undefined, userOption: string | undefined): SpeakerDecisionChoice {
+  const cleared: SpeakerDecisionChoice = { choice: 'no_clear_identity', probabilities: {}, confidence: 0 }
+  if (!answer || !userOption) return cleared
+  const remaining = Object.entries(answer.probabilities).filter(([option]) => option !== userOption)
+  const total = remaining.reduce((sum, [, probability]) => sum + probability, 0)
+  if (!(total > 0)) return cleared
+  const probabilities = Object.fromEntries(remaining.map(([option, probability]) => [option, probability / total]))
+  const [best] = Object.entries(probabilities).sort((left, right) => right[1] - left[1])
+  if (!best || best[0] === DECISION_UNCLEAR_OPTION) return cleared
+  return { choice: best[0], probabilities, confidence: answer.confidence }
+}
+
+/**
+ * Two deterministic speech facts that a fast exchange keeps losing:
+ * - a quotation that responds to the previous speaker is normally the other
+ *   participant, so a weak same-speaker answer yields to the runner-up;
+ * - "I said X" repeats the speaker's own earlier line, so it belongs to
+ *   whoever said X.
+ * Confident answers, confirmed links, and the user persona are never touched.
+ */
+export function applyConversationFlow(
+  plan: SpeakerDecisionPlan,
+  answers: Record<string, SpeakerDecisionChoice>,
+  identities: Array<string | null | undefined>,
+  paths: Map<number, string>,
+): void {
+  const optionIds = plan.optionSpeakerIds
+  const optionById = new Map(Object.entries(optionIds).map(([option, id]) => [id, option]))
+  const castIds = new Set(plan.state.speakers
+    .map(speaker => speaker.id)
+    .filter(id => id !== USER_SPEAKER_ID && id !== UNCAST_SPEAKER_ID && id !== UNRESOLVED_SPEAKER_ID))
+  const locked = (speechId: string): boolean => Boolean(
+    answers[`relationship_confirmed_${speechId}`]
+    || answers[`relationship_continuity_${speechId}`]
+    || answers[`persona_confirmed_${speechId}`]
+    || answers[`switch_reconciled_${speechId}`],
+  )
+  for (let index = 1; index < plan.state.speeches.length; index += 1) {
+    const speech = plan.state.speeches[index]
+    const current = identities[index]
+    const previous = identities[index - 1]
+    if (!current || !previous || current !== previous) continue
+    if (!castIds.has(current)) continue
+    const turn = answers[`turn_${speech.id}`]
+    const responds = turn?.probabilities?.[TURN_RESPOND_OPTION] ?? 0
+    if (turn?.choice !== TURN_RESPOND_OPTION || responds < 0.55 || turn.confidence < 0.45) continue
+    if (locked(speech.id)) continue
+    const answer = answers[`speech_${speech.id}`]
+    const currentOption = optionById.get(current)
+    const currentProbability = answer && currentOption ? answer.probabilities[currentOption] ?? 0 : 0
+    // A confident identity stands; only a weak or guessed answer yields.
+    if (currentProbability >= 0.6) continue
+    // A relationship review that clearly backs this same speaker also stands.
+    const review = answers[`relationship_review_${speech.id}`]
+    const reviewProbability = review && currentOption ? review.probabilities[currentOption] ?? 0 : 0
+    if (review && review.choice === currentOption && reviewProbability >= 0.6 && review.confidence >= 0.5) continue
+    const alternative = Object.entries(answer?.probabilities ?? {})
+      .filter(([option, probability]) => {
+        const id = optionIds[option]
+        return Boolean(id) && castIds.has(id!) && id !== current && probability >= 0.3
+      })
+      .sort((left, right) => right[1] - left[1])[0]
+    if (!alternative) continue
+    identities[index] = optionIds[alternative[0]]
+    paths.set(index, 'resolution:turn-taking (a reply is normally the other participant)')
+  }
+  for (let index = 0; index < plan.state.speeches.length; index += 1) {
+    const speech = plan.state.speeches[index]
+    const match = speech.text.trim().match(/^(?:no[,.]?\s*)?i\s+said[,:]?\s+(.+)$/iu)
+    if (!match) continue
+    const echoed = normalizedQuoteText(match[1])
+    if (echoed.length < 4) continue
+    const source = plan.state.speeches
+      .slice(0, index)
+      .findIndex(previous => normalizedQuoteText(previous.text) === echoed)
+    const sourceIdentity = source >= 0 ? identities[source] : undefined
+    if (!sourceIdentity || sourceIdentity === identities[index]) continue
+    if (locked(speech.id)) continue
+    identities[index] = sourceIdentity
+    paths.set(index, 'resolution:echo (the speaker repeats their own earlier line)')
+  }
+}
+
+/** Compare quotations ignoring case, punctuation, and spacing. */
+function normalizedQuoteText(text: string): string {
+  return text.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').replace(/\s+/gu, ' ').trim()
+}
+
 /** Resolve a historically safe ghost to a unique named roster entry, if any. */
-export function continuityRosterIdentity(id: string | null, context: RelationshipReviewContext, speakers: CharacterLike[]): string | null {
-  if (!id?.startsWith('ghost:')) return id
+export function continuityRosterIdentity(id: string | null, context: RelationshipReviewContext, speakers: CharacterLike[]): string | null {  if (!id?.startsWith('ghost:')) return id
   const ghost = context.ghosts.find(item => `ghost:${item.id}` === id)
   if (!ghost) return id
   const aliases = new Set(ghost.aliases.map(alias => alias.toLowerCase()))
@@ -8881,6 +8988,10 @@ export function resolveSpeakerDecisionSegments(
       : 'resolution:discourse-identity (filled unresolved first pass)')
     return outcome.identity ?? undefined
   })
+  // Turn-taking and self-quotation are deterministic conversation facts the
+  // model misses in fast exchanges; they only nudge weak or guessed identities.
+  const conversationFlowPaths = new Map<number, string>()
+  applyConversationFlow(plan, answers, speechIdentities, conversationFlowPaths)
   const hasLocalIdentity = [...paragraphIdentities.values(), ...speechIdentities]
     .some(identity => identity !== undefined)
   const hasUncastIdentity = [...paragraphIdentities.values(), ...speechIdentities]
@@ -8982,7 +9093,8 @@ export function resolveSpeakerDecisionSegments(
       upstreamIdentity = direct
       upstreamSource = `speech-s${index}`
       resolutionPaths.push([
-        discoursePathBySpeechIndex.get(index)
+        conversationFlowPaths.get(index)
+          ?? discoursePathBySpeechIndex.get(index)
           ?? chainPathBySpeechIndex.get(index)
           ?? 'resolution:direct-speech-identity',
       ])

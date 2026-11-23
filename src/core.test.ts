@@ -33,6 +33,7 @@ import {
   speakerAssignmentSourceFromTrace,
   buildAssistantUserSpeakerReview,
   buildContextualUserReconciliation,
+  applyConversationFlow,
   applyContextualUserReconciliation,
   buildRelationshipSpeakerReview,
   independentlyGroundedSpeakerIds,
@@ -4468,6 +4469,69 @@ test('contextual persona reconciliation reviews existing and newly introduced us
   assert.ok(wrongPersona.global_uncertain_s0)
   assert.equal(wrongPersona.persona_confirmed_s0, undefined)
   assert.equal(buildContextualUserReconciliation(buildSpeakerDecisionPlan('"I agree."', speakers, true), genuineAnswers, context).questions.persona_check_s0, undefined)
+})
+
+test('keeps a fast exchange alternating and follows a self-quotation', () => {
+  // Reported scene: "Bowl," she says. → both replies after it (including "I
+  // said I know.") were handed to the mother. A reply normally belongs to the
+  // other participant, and "I said X" repeats the speaker's own earlier line.
+  const speakers = [{ id: 'aiko', name: 'Aiko' }, { id: 'npc:nao', name: 'nao' }]
+  const message = '"Bowl," she says.\n\n"I know."\n\n"The one that\u2019s not chipped. I\u2019ll take\u2014"\n\n"I said I know."'
+  const plan = buildSpeakerDecisionPlan(message, speakers, false)
+  assert.equal(plan.state.speeches.length, 4)
+  const identities: Array<string | null | undefined> = ['aiko', 'aiko', 'aiko', 'aiko']
+  const answers: Record<string, SpeakerDecisionChoice> = {
+    // The model was torn on the reply and its best-available guess picked the
+    // speaker it had just heard.
+    speech_s1: { choice: 'known_0', probabilities: { known_0: 0.357, known_1: 0.412, known_2: 0.163, uncast_character: 0.035, no_clear_identity: 0.033 }, confidence: 0.266 },
+    turn_s1: { choice: 'responds_to_previous_speaker', probabilities: { responds_to_previous_speaker: 0.6, continues_previous_turn: 0.254, no_clear_identity: 0.116, responds_to_other_participant: 0.03 }, confidence: 0.467 },
+    speech_s3: { choice: 'known_0', probabilities: { known_0: 0.915, known_1: 0.069, uncast_character: 0.008, no_clear_identity: 0.002 }, confidence: 0.894 },
+  }
+  const paths = new Map<number, string>()
+  applyConversationFlow(plan, answers, identities, paths)
+  assert.deepEqual(identities, ['aiko', 'npc:nao', 'aiko', 'npc:nao'])
+  assert.match(paths.get(1) ?? '', /turn-taking/u)
+  assert.match(paths.get(3) ?? '', /echo/u)
+  // A confirmed link and a confident answer are never overridden.
+  const guarded = ['aiko', 'aiko', 'aiko', 'aiko']
+  const guardedAnswers = { ...answers, relationship_confirmed_s1: confidentDecision('known_0') }
+  applyConversationFlow(plan, guardedAnswers, guarded, new Map())
+  assert.equal(guarded[1], 'aiko')
+  const confident = ['aiko', 'aiko', 'aiko', 'aiko']
+  applyConversationFlow(plan, {
+    ...answers,
+    speech_s1: { choice: 'known_0', probabilities: { known_0: 0.83, known_1: 0.14 }, confidence: 0.8 },
+  }, confident, new Map())
+  assert.equal(confident[1], 'aiko')
+})
+
+test('confirms a POV persona that clearly speaks and never strands a rejected user line', () => {
+  const speakers = [{ id: 'aiko', name: 'Aiko' }, { id: 'npc:nao', name: 'nao' }, { id: USER_SPEAKER_ID, name: 'Ken' }]
+  const plan = buildSpeakerDecisionPlan('"It was dead quiet up there."', speakers, false)
+  const firstPass: SpeakerDecisionChoice = {
+    choice: 'known_2',
+    probabilities: { known_2: 0.899, known_1: 0.082, known_0: 0.015, uncast_character: 0.002, no_clear_identity: 0.002 },
+    confidence: 0.874,
+  }
+  // Reported scene: the dedicated persona check leaned "user" (0.674) but the
+  // strict single threshold rejected it, dropping the line to the connection
+  // default voice.
+  const confirmed: Record<string, SpeakerDecisionChoice> = { speech_s0: firstPass }
+  const review = buildContextualUserReconciliation(plan, confirmed, { previousMessages: [], ghosts: [] })
+  applyContextualUserReconciliation(plan, confirmed, {
+    persona_check_s0: { choice: 'user', probabilities: { user: 0.674, other: 0.176, no_clear_identity: 0.151 }, confidence: 0.511 },
+  }, review.questions)
+  assert.ok(confirmed.persona_confirmed_s0)
+  assert.equal(confirmed.global_uncertain_s0, undefined)
+  // Rejected outright: the runner-up keeps the line off the connection default.
+  const rejected: Record<string, SpeakerDecisionChoice> = { speech_s0: { ...firstPass } }
+  const rejectedReview = buildContextualUserReconciliation(plan, rejected, { previousMessages: [], ghosts: [] })
+  applyContextualUserReconciliation(plan, rejected, {
+    persona_check_s0: { choice: 'other', probabilities: { user: 0.12, other: 0.83, no_clear_identity: 0.05 }, confidence: 0.8 },
+  }, rejectedReview.questions)
+  assert.equal(rejected.persona_confirmed_s0, undefined)
+  assert.equal(rejected.speech_s0.choice, 'known_1')
+  assert.ok((rejected.speech_s0.probabilities.known_1 ?? 0) > 0.8)
 })
 
 test('replays opening user-confusion and later text-message agreement without mixing identities', () => {
