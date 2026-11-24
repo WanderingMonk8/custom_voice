@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { SoundLibrary, type SoundUserStorage } from './sound-library'
+import { parseSoundScenePlan } from './sound-scene'
+import { renderSoundMix } from './sound-mix'
 import { AutoplayRequestRegistry, PlaybackLongPress, PlaybackStartupGuard, syncAutoplayIndicators, syncPlaybackButtons, waitForAutoplayDeadline, waitForAutoplayWork, type PlaybackButtonState } from './playback-ui'
 import { evaluateSpeakerReviews } from './speaker-review-evaluation'
 
@@ -88,6 +90,41 @@ test('sound library ignores corrupt records without erasing them and reports sto
   assert.equal(storage.files.get(path), '{invalid')
   storage.read = async () => { throw new Error('Storage unavailable') }
   await assert.rejects(() => library.list('alice'), /Storage unavailable/)
+})
+
+test('sound scene plans require unique source anchors and known compatible assets', async () => {
+  const storage = new FakeSoundStorage()
+  const library = new SoundLibrary(storage)
+  const wav = new TextEncoder().encode('RIFF0000WAVEaudio')
+  const door = await library.add({ name: 'Door', kind: 'event', mime: 'audio/wav' }, wav, 'alice')
+  const rain = await library.add({ name: 'Rain', kind: 'ambience', mime: 'audio/wav' }, wav, 'alice')
+  const message = 'Rain fell. The door shut. Rain fell.'
+  const data = JSON.stringify({ cues: [
+    { kind: 'event', action: 'play', assetId: door.id, anchor: 'The door shut.', position: 'after' },
+    { kind: 'event', action: 'play', assetId: rain.id, anchor: 'The door shut.', position: 'after' },
+    { kind: 'ambience', action: 'play', assetId: rain.id, anchor: 'Rain fell.', position: 'before' },
+    { kind: 'event', action: 'play', assetId: 'missing', anchor: 'The door shut.', position: 'before' },
+    { kind: 'ambience', action: 'stop', anchor: 'The door shut.', position: 'before' },
+  ] })
+  assert.deepEqual(parseSoundScenePlan(data, message, [door, rain]), [
+    { kind: 'event', action: 'play', assetId: door.id, anchor: 'The door shut.', position: 'after', offset: 11 },
+    { kind: 'ambience', action: 'stop', anchor: 'The door shut.', position: 'before', offset: 11 },
+  ])
+  assert.deepEqual(parseSoundScenePlan('not JSON', message, [door]), [])
+})
+
+test('local sound mix permits ambience under speech and events but prohibits event/voice overlap', () => {
+  const mono = (values: number[]) => [new Float32Array(values)]
+  const tracks = [
+    { kind: 'voice' as const, startFrame: 0, endFrame: 2, channels: mono([0.4, 0.4]), gain: 1 },
+    { kind: 'event' as const, startFrame: 2, endFrame: 4, channels: mono([0.6, 0.6]), gain: 1 },
+    { kind: 'ambience' as const, startFrame: 0, endFrame: 4, channels: mono([0.1]), gain: 1, loop: true },
+  ]
+  const mix = renderSoundMix(tracks, 4, 1)
+  assert.ok(Math.abs(mix.channels[0][0] - 0.5) < 0.001)
+  assert.ok(Math.abs(mix.channels[0][2] - 0.7) < 0.001)
+  assert.throws(() => renderSoundMix([...tracks, { ...tracks[1], startFrame: 1, endFrame: 3 }], 4), /overlaps voice/)
+  assert.throws(() => renderSoundMix(tracks, 50_000_000), /limits/)
 })
 import {
   adaptiveGenerationConcurrency,
