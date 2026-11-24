@@ -3444,6 +3444,41 @@ export interface SkippedTrackerTagPair {
 const TRACKER_TAG_NAME_RE = /^[a-z][a-z0-9:._-]*$/u
 const TRACKER_COMMENT_RE = /<!--[\s\S]*?-->/gu
 
+/** Enclosure rules occupy their own line, so markers may contain commas. */
+function extractEnclosedSkipRules(value: string): { remaining: string; pairs: Array<{ open: string; close: string }> } {
+  const pairs: Array<{ open: string; close: string }> = []
+  const remaining = value.replace(/^[\t ]*enclosed:[^\r\n]*/gimu, line => {
+    const rule = line.replace(/^[\t ]*enclosed:/iu, '')
+    let separator = -1
+    let quoted = false
+    let escaped = false
+    for (let index = 0; index < rule.length; index++) {
+      const char = rule[index]
+      if (escaped) { escaped = false; continue }
+      if (char === '\\') { escaped = true; continue }
+      if (char === '"') { quoted = !quoted; continue }
+      if (char === '|' && !quoted) { separator = index; break }
+    }
+    if (separator < 0) return ''
+    const parseMarker = (raw: string): string | null => {
+      const trimmed = raw.trim()
+      if (!trimmed) return null
+      if (trimmed.startsWith('"')) {
+        try {
+          const parsed: unknown = JSON.parse(trimmed)
+          return typeof parsed === 'string' && parsed.length ? parsed : null
+        } catch { return null }
+      }
+      return trimmed.replace(/\\([\\|])/gu, '$1')
+    }
+    const open = parseMarker(rule.slice(0, separator))
+    const close = parseMarker(rule.slice(separator + 1))
+    if (open && close && pairs.length < 100) pairs.push({ open, close })
+    return ''
+  })
+  return { remaining, pairs }
+}
+
 function normalizeTrackerTagName(value: string): string | null {
   const tag = value.trim().toLowerCase()
   return TRACKER_TAG_NAME_RE.test(tag) ? tag : null
@@ -3462,7 +3497,7 @@ function normalizeTrackerTagName(value: string): string | null {
  * retained so the same entry matches tags with attributes in the message.
  */
 export function parseSkippedTrackerTagPairs(value: string): SkippedTrackerTagPair[] {
-  const decoded = decodePlaybackEntities(value)
+  const decoded = decodePlaybackEntities(extractEnclosedSkipRules(value).remaining)
   const pairs: SkippedTrackerTagPair[] = []
   const seen = new Set<string>()
   const addPair = (open: string | null, close: string | null, marker = false) => {
@@ -3609,10 +3644,24 @@ function stripMarkerBlock(value: string, openMarker: string, closeMarker: string
 }
 
 export function stripSkippedTrackerBlocks(content: string, tagPairs: string): string {
+  const enclosedRules = extractEnclosedSkipRules(tagPairs)
   let result = content
     .replace(/&lt;|&#60;|&#x3c;/gi, '<')
     .replace(/&gt;|&#62;|&#x3e;/gi, '>')
-  const pairs = parseSkippedTrackerTagPairs(tagPairs)
+  for (const { open, close } of enclosedRules.pairs) {
+    const ranges: Array<{ start: number; end: number }> = []
+    let searchFrom = 0
+    while (searchFrom < result.length) {
+      const start = result.indexOf(open, searchFrom)
+      if (start < 0) break
+      const end = result.indexOf(close, start + open.length)
+      if (end < 0) break
+      searchFrom = end + close.length
+      ranges.push({ start, end: searchFrom })
+    }
+    result = applyStripRanges(result, ranges)
+  }
+  const pairs = parseSkippedTrackerTagPairs(enclosedRules.remaining)
   // Marker pairs run first: their markers are HTML comments, and the generic
   // comment pass below would remove those before the enclosed block could be
   // read, leaving the tracker text behind.
@@ -3623,7 +3672,7 @@ export function stripSkippedTrackerBlocks(content: string, tagPairs: string): st
     if (!pair.marker) result = stripTagBlock(result, pair.open, pair.close)
   }
   result = result.replace(/<!--[\s\S]*?-->/g, ' ')
-  const prefixes = [...decodePlaybackEntities(tagPairs).matchAll(/(?:^|,)\s*prefix:([^,\s]+)\s*(?=,|$)/giu)]
+  const prefixes = [...decodePlaybackEntities(enclosedRules.remaining).matchAll(/(?:^|,)\s*prefix:([^,\s]+)\s*(?=,|$)/giu)]
     .map(match => (match[1] ?? '').toLowerCase())
   if (prefixes.length) {
     result = result.replace(/\S+/gu, token => prefixes.some(prefix => token.toLowerCase().includes(prefix)) ? ' ' : token)

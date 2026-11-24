@@ -1405,12 +1405,59 @@ function decodePlaybackEntities(value) {
 }
 var TRACKER_TAG_NAME_RE = /^[a-z][a-z0-9:._-]*$/u;
 var TRACKER_COMMENT_RE = /<!--[\s\S]*?-->/gu;
+function extractEnclosedSkipRules(value) {
+  const pairs = [];
+  const remaining = value.replace(/^[\t ]*enclosed:[^\r\n]*/gimu, (line) => {
+    const rule = line.replace(/^[\t ]*enclosed:/iu, "");
+    let separator = -1;
+    let quoted = false;
+    let escaped = false;
+    for (let index = 0; index < rule.length; index++) {
+      const char = rule[index];
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+      if (char === "\\") {
+        escaped = true;
+        continue;
+      }
+      if (char === '"') {
+        quoted = !quoted;
+        continue;
+      }
+      if (char === "|" && !quoted) {
+        separator = index;
+        break;
+      }
+    }
+    if (separator < 0) return "";
+    const parseMarker = (raw) => {
+      const trimmed = raw.trim();
+      if (!trimmed) return null;
+      if (trimmed.startsWith('"')) {
+        try {
+          const parsed = JSON.parse(trimmed);
+          return typeof parsed === "string" && parsed.length ? parsed : null;
+        } catch {
+          return null;
+        }
+      }
+      return trimmed.replace(/\\([\\|])/gu, "$1");
+    };
+    const open = parseMarker(rule.slice(0, separator));
+    const close = parseMarker(rule.slice(separator + 1));
+    if (open && close && pairs.length < 100) pairs.push({ open, close });
+    return "";
+  });
+  return { remaining, pairs };
+}
 function normalizeTrackerTagName(value) {
   const tag = value.trim().toLowerCase();
   return TRACKER_TAG_NAME_RE.test(tag) ? tag : null;
 }
 function parseSkippedTrackerTagPairs(value) {
-  const decoded = decodePlaybackEntities(value);
+  const decoded = decodePlaybackEntities(extractEnclosedSkipRules(value).remaining);
   const pairs = [];
   const seen = /* @__PURE__ */ new Set();
   const addPair = (open, close, marker = false) => {
@@ -1534,8 +1581,22 @@ function stripMarkerBlock(value, openMarker, closeMarker) {
   ));
 }
 function stripSkippedTrackerBlocks(content, tagPairs) {
+  const enclosedRules = extractEnclosedSkipRules(tagPairs);
   let result = content.replace(/&lt;|&#60;|&#x3c;/gi, "<").replace(/&gt;|&#62;|&#x3e;/gi, ">");
-  const pairs = parseSkippedTrackerTagPairs(tagPairs);
+  for (const { open, close } of enclosedRules.pairs) {
+    const ranges = [];
+    let searchFrom = 0;
+    while (searchFrom < result.length) {
+      const start = result.indexOf(open, searchFrom);
+      if (start < 0) break;
+      const end = result.indexOf(close, start + open.length);
+      if (end < 0) break;
+      searchFrom = end + close.length;
+      ranges.push({ start, end: searchFrom });
+    }
+    result = applyStripRanges(result, ranges);
+  }
+  const pairs = parseSkippedTrackerTagPairs(enclosedRules.remaining);
   for (const pair of pairs) {
     if (pair.marker) result = stripMarkerBlock(result, pair.open, pair.close);
   }
@@ -1543,7 +1604,7 @@ function stripSkippedTrackerBlocks(content, tagPairs) {
     if (!pair.marker) result = stripTagBlock(result, pair.open, pair.close);
   }
   result = result.replace(/<!--[\s\S]*?-->/g, " ");
-  const prefixes = [...decodePlaybackEntities(tagPairs).matchAll(/(?:^|,)\s*prefix:([^,\s]+)\s*(?=,|$)/giu)].map((match) => (match[1] ?? "").toLowerCase());
+  const prefixes = [...decodePlaybackEntities(enclosedRules.remaining).matchAll(/(?:^|,)\s*prefix:([^,\s]+)\s*(?=,|$)/giu)].map((match) => (match[1] ?? "").toLowerCase());
   if (prefixes.length) {
     result = result.replace(/\S+/gu, (token) => prefixes.some((prefix) => token.toLowerCase().includes(prefix)) ? " " : token);
   }
@@ -3274,7 +3335,7 @@ function setup(ctx) {
   scanButton.textContent = "Scan";
   scanButton.disabled = true;
   scanRow.append(scanButton);
-  const skippedTagsField = createField("Skipped tracker tags (global)");
+  const skippedTagsField = createField("Skipped text and tags (global)");
   const speakerParsingField = createField("Jev speaker assignment (global)");
   const ttsTagField = createField("TTS vocal tags (global)");
   const ttsTagPlacementField = createField("Vocal tag placement");
@@ -4308,14 +4369,14 @@ function setup(ctx) {
   favoritePickers.add(userFavoritePicker);
   const skippedTrackerTagsInput = ctx.components.mountTextArea(skippedTagsField.slot, {
     value: "",
-    placeholder: "tracker, status, prefix:http:, prefix:https:",
+    placeholder: "tracker, prefix:http:, prefix:https:\nenclosed: ![ | ]",
     rows: 3,
-    ariaLabel: "Tracker tag names, asymmetric tag pairs, or comment marker pairs to skip globally",
+    ariaLabel: "Tags, prefixes, or enclosed text to skip globally",
     onChange: () => scheduleSkippedTrackerTagsSave()
   });
   const skippedTagsHint = document.createElement("div");
   skippedTagsHint.className = "chat-voice-hint";
-  skippedTagsHint.textContent = "Enter tag names, tag or comment marker pairs, or prefix:http: to skip any whitespace-delimited text containing http:. Add prefix:https: separately for HTTPS links.";
+  skippedTagsHint.textContent = "Enter tag names, tag or comment marker pairs, or prefix:http: to skip whitespace-delimited text containing http:. On a separate line, use enclosed: ![ | ] to skip text from ![ through the next ]. Markers are case-sensitive; use \\| for a literal pipe, or JSON-quoted markers to preserve surrounding spaces.";
   skippedTagsField.slot.append(skippedTagsHint);
   const speakerParsingPicker = ctx.components.mountSelect(speakerParsingField.slot, {
     value: "ambiguous",

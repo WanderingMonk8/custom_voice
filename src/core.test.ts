@@ -2056,6 +2056,23 @@ test('skips whitespace-delimited text containing configured literal prefixes', (
   ])
 })
 
+test('skips literal enclosures alongside other global exclusions', () => {
+  const rules = 'tracker, prefix:http:\nenclosed: ![ | ]\nenclosed: START, | END'
+  assert.deepEqual(parseSkippedTrackerTags(rules), ['tracker'])
+  assert.equal(stripSkippedTrackerBlocks('A ![abc, def] B ![more\ncontent] C START, secret END D http://example.com E <tracker>hidden</tracker>', rules), 'A   B   C   D   E  ')
+  assert.equal(stripSkippedTrackerBlocks('A ![unfinished B', 'enclosed: ![ | ]'), 'A ![unfinished B')
+  assert.equal(stripSkippedTrackerBlocks('A XoneX B XtwoX C', 'enclosed: X | X'), 'A   B   C')
+  assert.equal(stripSkippedTrackerBlocks('A start hidden END B START hidden END C', 'enclosed: START | END'), 'A start hidden END B   C')
+  assert.equal(stripSkippedTrackerBlocks('A <open/>hidden</end> B', 'enclosed: <open/> | </end>'), 'A   B')
+  assert.equal(stripSkippedTrackerBlocks('A ![visible] B', ''), 'A ![visible] B')
+  assert.equal(stripSkippedTrackerBlocks('A ![visible] B', 'enclosed: | ]'), 'A ![visible] B')
+  assert.equal(stripSkippedTrackerBlocks('A a|b secret END B', String.raw`enclosed: a\|b | END`), 'A   B')
+  assert.equal(stripSkippedTrackerBlocks('A < start secret end > B', 'enclosed: "< start " | " end >"'), 'A   B')
+  assert.deepEqual(parseRosterVoiceSegments('Before ![abc, def] after.', null, [], 'enclosed: ![ | ]'), [
+    { text: 'Before after.', speakerId: null },
+  ])
+})
+
 test('continues to accept previously saved paired tracker tags', () => {
   assert.deepEqual(
     parseSkippedTrackerTags('<tracker></tracker>, <status>example</status>'),

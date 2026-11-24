@@ -1307,7 +1307,7 @@ export function setup(ctx: SpindleFrontendContext) {
   scanButton.textContent = 'Scan'
   scanButton.disabled = true
   scanRow.append(scanButton)
-  const skippedTagsField = createField('Skipped tracker tags (global)')
+  const skippedTagsField = createField('Skipped text and tags (global)')
   const speakerParsingField = createField('Jev speaker assignment (global)')
   const ttsTagField = createField('TTS vocal tags (global)')
   const ttsTagPlacementField = createField('Vocal tag placement')
@@ -2363,14 +2363,14 @@ export function setup(ctx: SpindleFrontendContext) {
 
   const skippedTrackerTagsInput = ctx.components.mountTextArea(skippedTagsField.slot, {
     value: '',
-    placeholder: 'tracker, status, prefix:http:, prefix:https:',
+    placeholder: 'tracker, prefix:http:, prefix:https:\nenclosed: ![ | ]',
     rows: 3,
-    ariaLabel: 'Tracker tag names, asymmetric tag pairs, or comment marker pairs to skip globally',
+    ariaLabel: 'Tags, prefixes, or enclosed text to skip globally',
     onChange: () => scheduleSkippedTrackerTagsSave(),
   })
   const skippedTagsHint = document.createElement('div')
   skippedTagsHint.className = 'chat-voice-hint'
-  skippedTagsHint.textContent = 'Enter tag names, tag or comment marker pairs, or prefix:http: to skip any whitespace-delimited text containing http:. Add prefix:https: separately for HTTPS links.'
+  skippedTagsHint.textContent = 'Enter tag names, tag or comment marker pairs, or prefix:http: to skip whitespace-delimited text containing http:. On a separate line, use enclosed: ![ | ] to skip text from ![ through the next ]. Markers are case-sensitive; use \\| for a literal pipe, or JSON-quoted markers to preserve surrounding spaces.'
   skippedTagsField.slot.append(skippedTagsHint)
 
   const speakerParsingPicker = ctx.components.mountSelect(speakerParsingField.slot, {
