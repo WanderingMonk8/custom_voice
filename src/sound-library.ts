@@ -9,6 +9,7 @@ export interface SoundUserStorage {
   delete(path: string, userId?: string): Promise<void>
   list(prefix?: string, userId?: string): Promise<string[]>
   exists(path: string, userId?: string): Promise<boolean>
+  move(from: string, to: string, userId?: string): Promise<void>
 }
 
 export type SoundKind = 'ambience' | 'event'
@@ -35,8 +36,22 @@ export interface NewFavoriteSound {
 const ROOT = 'sound-effects/v1'
 const RECORDS = `${ROOT}/favorites`
 const AUDIO = `${ROOT}/audio`
-export const MAX_FAVORITE_SOUND_BYTES = 3 * 1024 * 1024
+// Base64-encoded data plus the RPC envelope must remain below the host's 4 MiB message limit.
+export const MAX_FAVORITE_SOUND_BYTES = 2 * 1024 * 1024
+export const MAX_FAVORITE_SOUNDS = 200
+export const MAX_FAVORITE_LIBRARY_BYTES = 100 * 1024 * 1024
 const ID_PATTERN = /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/u
+const writes = new Map<string, Promise<void>>()
+
+function serializeUserWrite<T>(userId: string | undefined, task: () => Promise<T>): Promise<T> {
+  const key = userId ?? '__extension_owner__'
+  const previous = writes.get(key) ?? Promise.resolve()
+  const result = previous.catch(() => undefined).then(task)
+  const tail = result.then(() => undefined, () => undefined)
+  writes.set(key, tail)
+  void tail.then(() => { if (writes.get(key) === tail) writes.delete(key) })
+  return result
+}
 
 function assertId(id: string): void {
   if (!ID_PATTERN.test(id)) throw new Error('Invalid sound ID.')
@@ -74,6 +89,7 @@ export class SoundLibrary {
   constructor(private readonly storage: SoundUserStorage, private readonly makeId: () => string = generateUuidV7) {}
 
   async add(input: NewFavoriteSound, data: Uint8Array, userId?: string): Promise<FavoriteSound> {
+    return serializeUserWrite(userId, async () => {
     const name = typeof input.name === 'string' ? input.name.trim() : ''
     const description = typeof input.description === 'string' ? input.description.trim() : ''
     const tags = Array.isArray(input.tags) ? input.tags.map(tag => typeof tag === 'string' ? tag.trim() : '') : []
@@ -82,6 +98,10 @@ export class SoundLibrary {
       || (input.kind !== 'ambience' && input.kind !== 'event')) throw new Error('Invalid favorite sound metadata.')
     if (!(data instanceof Uint8Array) || data.length < 1 || data.length > MAX_FAVORITE_SOUND_BYTES || !validAudio(data, mime)) {
       throw new Error('Invalid or oversized audio file.')
+    }
+    const existing = await this.list(userId)
+    if (existing.length >= MAX_FAVORITE_SOUNDS || existing.reduce((total, item) => total + item.bytes, 0) + data.byteLength > MAX_FAVORITE_LIBRARY_BYTES) {
+      throw new Error('Sound library is full. Remove a favorite before adding another.')
     }
     const id = this.makeId().toLowerCase()
     const metaPath = recordPath(id)
@@ -97,6 +117,7 @@ export class SoundLibrary {
       throw error
     }
     return record
+    })
   }
 
   async list(userId?: string): Promise<FavoriteSound[]> {
@@ -120,5 +141,40 @@ export class SoundLibrary {
     const data = await this.storage.readBinary(audioPath(id), userId)
     if (data.byteLength !== record.bytes || !validAudio(data, record.mime)) throw new Error('Sound audio is missing or invalid.')
     return { record, data }
+  }
+
+  async remove(id: string, userId?: string): Promise<void> {
+    return serializeUserWrite(userId, async () => {
+    const metadata = recordPath(id)
+    const audio = audioPath(id)
+    // Validate the record before deleting either file; a foreign/missing ID never touches another path.
+    const record = readRecord(JSON.parse(await this.storage.read(metadata, userId)), id)
+    if (!record) throw new Error('Invalid sound record.')
+    await this.storage.delete(metadata, userId)
+    await this.storage.delete(audio, userId)
+    })
+  }
+
+  async edit(id: string, input: Pick<NewFavoriteSound, 'name' | 'description' | 'tags' | 'kind'>, userId?: string): Promise<FavoriteSound> {
+    return serializeUserWrite(userId, async () => {
+      const metadata = recordPath(id)
+      const current = readRecord(JSON.parse(await this.storage.read(metadata, userId)), id)
+      if (!current) throw new Error('Invalid sound record.')
+      const name = typeof input.name === 'string' ? input.name.trim() : ''
+      const description = typeof input.description === 'string' ? input.description.trim() : ''
+      const tags = Array.isArray(input.tags) ? input.tags.map(tag => typeof tag === 'string' ? tag.trim() : '') : []
+      if (!name || name.length > 120 || description.length > 500 || tags.length > 20 || tags.some(tag => !tag || tag.length > 40)
+        || (input.kind !== 'ambience' && input.kind !== 'event')) throw new Error('Invalid favorite sound metadata.')
+      const next: FavoriteSound = { ...current, name, description, tags, kind: input.kind }
+      const temp = `${ROOT}/pending/${this.makeId()}.json`
+      try {
+        await this.storage.write(temp, JSON.stringify(next), userId)
+        await this.storage.move(temp, metadata, userId)
+      } catch (error) {
+        await this.storage.delete(temp, userId).catch(() => undefined)
+        throw error
+      }
+      return next
+    })
   }
 }

@@ -3918,6 +3918,44 @@ function setup(ctx) {
   favoriteError.setAttribute("role", "alert");
   favoriteError.hidden = true;
   favoritesSection.append(favoriteForm, favoriteError, favoriteFilter, favoriteList);
+  const soundsSection = document.createElement("details");
+  soundsSection.className = "chat-voice-advanced-section";
+  const soundsSummary = document.createElement("summary");
+  soundsSummary.className = "chat-voice-advanced-summary";
+  soundsSummary.textContent = "Favorite sound effects (experimental)";
+  const soundsBody = document.createElement("div");
+  soundsBody.className = "chat-voice-advanced";
+  const soundsHint = document.createElement("div");
+  soundsHint.className = "chat-voice-hint";
+  soundsHint.textContent = "Manage your per-user sound library. Sound-effects playback is not available yet. Audio must be at most 2 MiB and 120 seconds.";
+  const soundFile = document.createElement("input");
+  soundFile.type = "file";
+  soundFile.accept = "audio/mpeg,audio/wav,audio/ogg,audio/mp4,audio/webm,.mp3,.wav,.ogg,.m4a,.webm";
+  soundFile.setAttribute("aria-label", "Audio file to add");
+  const soundName = document.createElement("input");
+  soundName.placeholder = "Sound name";
+  soundName.maxLength = 120;
+  soundName.setAttribute("aria-label", "Sound name");
+  const soundTags = document.createElement("input");
+  soundTags.placeholder = "Trigger words, comma separated";
+  soundTags.setAttribute("aria-label", "Sound trigger words");
+  const soundKind = document.createElement("select");
+  soundKind.setAttribute("aria-label", "Sound type");
+  for (const [value, label] of [["event", "Event sound"], ["ambience", "Ambience"]]) {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = label;
+    soundKind.appendChild(option);
+  }
+  const soundAdd = document.createElement("button");
+  soundAdd.type = "button";
+  soundAdd.className = "chat-voice-add-button";
+  soundAdd.textContent = "Add sound";
+  const soundList = document.createElement("div");
+  soundList.className = "chat-voice-favorite-list";
+  soundList.setAttribute("aria-label", "Favorite sound effects");
+  soundsBody.append(soundsHint, soundFile, soundName, soundTags, soundKind, soundAdd, soundList);
+  soundsSection.append(soundsSummary, soundsBody);
   const status = document.createElement("div");
   status.className = "chat-voice-status";
   status.setAttribute("role", "status");
@@ -3950,6 +3988,7 @@ function setup(ctx) {
     voicesTabStrip,
     favoritesSection,
     communitySection,
+    soundsSection,
     status,
     advancedSection
   );
@@ -4269,6 +4308,12 @@ function setup(ctx) {
   let lastContextMessageId = null;
   const nativeButtonStates = /* @__PURE__ */ new Map();
   const pendingMessageRequests = /* @__PURE__ */ new Map();
+  const pendingSoundLibrary = /* @__PURE__ */ new Map();
+  let soundLibrarySequence = 0;
+  let soundPreview = null;
+  let soundPreviewUrl = "";
+  let soundPreviewGeneration = 0;
+  let soundLibraryDisposed = false;
   const pendingStateRequests = /* @__PURE__ */ new Map();
   const pendingSpeakerParseRequests = /* @__PURE__ */ new Map();
   const pendingDecisionStatusRequests = /* @__PURE__ */ new Map();
@@ -4286,6 +4331,164 @@ function setup(ctx) {
     status.textContent = message;
     status.dataset.state = state;
   };
+  function soundLibraryRequest(type, fields = {}) {
+    const requestId = `sound-${Date.now().toString(36)}-${++soundLibrarySequence}`;
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        pendingSoundLibrary.delete(requestId);
+        reject(new Error("Sound library request timed out."));
+      }, 3e4);
+      pendingSoundLibrary.set(requestId, { resolve, reject, timer });
+      ctx.sendToBackend({ type, requestId, ...fields });
+    });
+  }
+  function stopSoundPreview() {
+    soundPreviewGeneration += 1;
+    soundPreview?.pause();
+    soundPreview = null;
+    if (soundPreviewUrl) URL.revokeObjectURL(soundPreviewUrl);
+    soundPreviewUrl = "";
+  }
+  async function refreshSoundLibrary() {
+    const response = await soundLibraryRequest("chat_voice_sound_library_list");
+    if (soundLibraryDisposed) return;
+    soundList.replaceChildren();
+    if (!response.favorites?.length) {
+      const empty = document.createElement("div");
+      empty.className = "chat-voice-hint";
+      empty.textContent = "No favorite sounds yet.";
+      soundList.appendChild(empty);
+      return;
+    }
+    for (const favorite of response.favorites) {
+      const row = document.createElement("div");
+      row.className = "chat-voice-favorite-row";
+      const name = document.createElement("input");
+      name.value = favorite.name;
+      name.maxLength = 120;
+      name.setAttribute("aria-label", "Favorite sound name");
+      const tags = document.createElement("input");
+      tags.value = favorite.tags.join(", ");
+      tags.setAttribute("aria-label", `Trigger words for ${favorite.name}`);
+      const kind = document.createElement("select");
+      kind.setAttribute("aria-label", `Sound type for ${favorite.name}`);
+      for (const [value, label] of [["event", "Event sound"], ["ambience", "Ambience"]]) {
+        const option = document.createElement("option");
+        option.value = value;
+        option.textContent = label;
+        kind.appendChild(option);
+      }
+      kind.value = favorite.kind;
+      const preview = document.createElement("button");
+      preview.type = "button";
+      preview.className = "chat-voice-preview-button";
+      preview.textContent = "Preview";
+      preview.addEventListener("click", () => {
+        void (async () => {
+          try {
+            stopSoundPreview();
+            stopVoicePreview();
+            const generation = soundPreviewGeneration;
+            const result = await soundLibraryRequest("chat_voice_sound_library_read", { id: favorite.id });
+            if (soundLibraryDisposed || generation !== soundPreviewGeneration || !result.audio || !result.favorite) return;
+            const binary = atob(result.audio);
+            const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
+            soundPreviewUrl = URL.createObjectURL(new Blob([bytes], { type: result.favorite.mime }));
+            soundPreview = new Audio(soundPreviewUrl);
+            soundPreview.onended = stopSoundPreview;
+            await soundPreview.play();
+          } catch (error) {
+            setStatus(error instanceof Error ? error.message : "Could not preview sound.", "error");
+          }
+        })();
+      });
+      const save = document.createElement("button");
+      save.type = "button";
+      save.className = "chat-voice-preview-button";
+      save.textContent = "Save";
+      save.addEventListener("click", () => {
+        void (async () => {
+          try {
+            save.disabled = true;
+            await soundLibraryRequest("chat_voice_sound_library_edit", { id: favorite.id, favorite: { name: name.value, description: favorite.description, tags: tags.value.split(",").map((tag) => tag.trim()).filter(Boolean), kind: kind.value } });
+            await refreshSoundLibrary();
+            setStatus("Favorite sound saved.", "saved");
+          } catch (error) {
+            setStatus(error instanceof Error ? error.message : "Could not save sound.", "error");
+          } finally {
+            save.disabled = false;
+          }
+        })();
+      });
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.className = "chat-voice-delete-button";
+      remove.textContent = "\xD7";
+      remove.setAttribute("aria-label", `Delete ${favorite.name}`);
+      remove.addEventListener("click", () => {
+        void (async () => {
+          const { confirmed } = await ctx.ui.showConfirm({ title: "Delete favorite sound?", message: `Remove \u201C${favorite.name}\u201D and its stored audio?`, confirmLabel: "Delete", cancelLabel: "Cancel", variant: "warning" });
+          if (!confirmed) return;
+          try {
+            await soundLibraryRequest("chat_voice_sound_library_remove", { id: favorite.id });
+            await refreshSoundLibrary();
+            setStatus("Favorite sound deleted.", "saved");
+          } catch (error) {
+            setStatus(error instanceof Error ? error.message : "Could not delete sound.", "error");
+          }
+        })();
+      });
+      row.append(name, tags, kind, preview, save, remove);
+      soundList.appendChild(row);
+    }
+  }
+  soundsSection.addEventListener("toggle", () => {
+    if (soundsSection.open) void refreshSoundLibrary().catch((error) => setStatus(error instanceof Error ? error.message : "Could not load sounds.", "error"));
+  });
+  soundFile.addEventListener("change", () => {
+    if (!soundName.value && soundFile.files?.[0]) soundName.value = soundFile.files[0].name.replace(/\.[^.]+$/u, "").slice(0, 120);
+  });
+  soundAdd.addEventListener("click", () => {
+    void (async () => {
+      const file = soundFile.files?.[0];
+      if (!file) {
+        setStatus("Choose an audio file first.", "error");
+        return;
+      }
+      if (file.size > 2 * 1024 * 1024) {
+        setStatus("Sound files must be at most 2 MiB.", "error");
+        return;
+      }
+      const types = { mp3: "audio/mpeg", wav: "audio/wav", ogg: "audio/ogg", m4a: "audio/mp4", webm: "audio/webm" };
+      const mime = types[file.name.split(".").pop()?.toLowerCase() ?? ""] ?? file.type;
+      soundAdd.disabled = true;
+      try {
+        const data = await file.arrayBuffer();
+        const Context = window.AudioContext ?? window.webkitAudioContext;
+        if (!Context) throw new Error("This browser cannot validate audio files.");
+        const audioContext = new Context();
+        try {
+          const audio = await audioContext.decodeAudioData(data.slice(0));
+          if (!Number.isFinite(audio.duration) || audio.duration <= 0 || audio.duration > 120) throw new Error("Sound must be between 0 and 120 seconds long.");
+        } finally {
+          await audioContext.close().catch(() => void 0);
+        }
+        const bytes = new Uint8Array(data);
+        let binary = "";
+        for (let offset = 0; offset < bytes.length; offset += 8192) binary += String.fromCharCode(...bytes.subarray(offset, offset + 8192));
+        await soundLibraryRequest("chat_voice_sound_library_add", { favorite: { name: soundName.value, tags: soundTags.value.split(",").map((tag) => tag.trim()).filter(Boolean), kind: soundKind.value, mime }, audio: btoa(binary) });
+        soundFile.value = "";
+        soundName.value = "";
+        soundTags.value = "";
+        await refreshSoundLibrary();
+        setStatus("Favorite sound added.", "saved");
+      } catch (error) {
+        setStatus(error instanceof Error ? error.message : "Could not add sound.", "error");
+      } finally {
+        soundAdd.disabled = false;
+      }
+    })();
+  });
   function nativeTtsButtonLabel(button) {
     return [
       button.getAttribute("title"),
@@ -5298,6 +5501,7 @@ function setup(ctx) {
     });
   }
   async function playMessage(messageId, nativeRegenerationAction = false, automatic = false, expectedSwipe) {
+    stopSoundPreview();
     if (activePlayback?.messageId === messageId) {
       if (automatic) return;
       playbackStartup.cancel();
@@ -6376,6 +6580,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
     previewUrl = null;
   }
   async function previewVoice(voiceId, voiceLabel) {
+    stopSoundPreview();
     const connectionId = connectionPicker.getValue() || lumiverseConnectionId;
     if (!connectionId) {
       setStatus("Choose a TTS connection to preview a voice.", "error");
@@ -7935,6 +8140,15 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
   hostWindow.requestAnimationFrame(updatePlaybackButtons);
   const unsubscribeBackend = ctx.onBackendMessage((rawPayload) => {
     const payload = rawPayload;
+    if (payload.type === "chat_voice_sound_library") {
+      const pending = pendingSoundLibrary.get(payload.requestId);
+      if (!pending) return;
+      clearTimeout(pending.timer);
+      pendingSoundLibrary.delete(payload.requestId);
+      if (payload.error) pending.reject(new Error(payload.error));
+      else pending.resolve(payload);
+      return;
+    }
     if (payload.type === "chat_voice_community_results") {
       const pending = pendingCommunityRequests.get(payload.requestId);
       if (!pending) return;
@@ -8251,6 +8465,13 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
   void ensureQuotationRouting().catch(() => void 0);
   refreshLocalState();
   return () => {
+    soundLibraryDisposed = true;
+    stopSoundPreview();
+    for (const pending of pendingSoundLibrary.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(new Error("Chat Voice was closed."));
+    }
+    pendingSoundLibrary.clear();
     autoPlaybackDisposed = true;
     autoPlaybackRequests.cancelAll();
     playbackStartup.cancel();

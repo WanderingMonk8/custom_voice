@@ -29,6 +29,12 @@ class FakeSoundStorage implements SoundUserStorage {
     return [...this.files.keys()].filter(path => path.startsWith(base)).map(path => path.slice(base.length))
   }
   async exists(path: string, userId?: string): Promise<boolean> { return this.files.has(this.key(path, userId)) }
+  async move(from: string, to: string, userId?: string): Promise<void> {
+    const value = this.files.get(this.key(from, userId))
+    if (value === undefined) throw new Error('File not found')
+    this.files.set(this.key(to, userId), value)
+    this.files.delete(this.key(from, userId))
+  }
 }
 
 test('sound favorites persist across library instances and stay isolated by user', async () => {
@@ -44,6 +50,13 @@ test('sound favorites persist across library instances and stay isolated by user
   assert.deepEqual(await reinstalled.list('bob'), [])
   await assert.rejects(() => reinstalled.read(favorite.id, 'bob'), /File not found/)
   await assert.rejects(() => reinstalled.read('../other', 'alice'), /Invalid sound ID/)
+  const edited = await reinstalled.edit(favorite.id, { name: 'Rain on glass', description: 'Quiet rain', tags: ['window'], kind: 'ambience' }, 'alice')
+  assert.equal(edited.name, 'Rain on glass')
+  assert.deepEqual((await reinstalled.list('alice'))[0].tags, ['window'])
+  await assert.rejects(() => reinstalled.remove(favorite.id, 'bob'), /File not found/)
+  await reinstalled.remove(favorite.id, 'alice')
+  assert.deepEqual(await reinstalled.list('alice'), [])
+  assert.equal(storage.files.size, 0)
 })
 
 test('sound favorites validate inputs and clean up a failed record write', async () => {

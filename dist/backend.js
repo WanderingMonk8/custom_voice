@@ -46,8 +46,22 @@ function generateUuidV7() {
 var ROOT = "sound-effects/v1";
 var RECORDS = `${ROOT}/favorites`;
 var AUDIO = `${ROOT}/audio`;
-var MAX_FAVORITE_SOUND_BYTES = 3 * 1024 * 1024;
+var MAX_FAVORITE_SOUND_BYTES = 2 * 1024 * 1024;
+var MAX_FAVORITE_SOUNDS = 200;
+var MAX_FAVORITE_LIBRARY_BYTES = 100 * 1024 * 1024;
 var ID_PATTERN = /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/u;
+var writes = /* @__PURE__ */ new Map();
+function serializeUserWrite(userId, task) {
+  const key = userId ?? "__extension_owner__";
+  const previous = writes.get(key) ?? Promise.resolve();
+  const result = previous.catch(() => void 0).then(task);
+  const tail = result.then(() => void 0, () => void 0);
+  writes.set(key, tail);
+  void tail.then(() => {
+    if (writes.get(key) === tail) writes.delete(key);
+  });
+  return result;
+}
 function assertId(id) {
   if (!ID_PATTERN.test(id)) throw new Error("Invalid sound ID.");
 }
@@ -80,27 +94,33 @@ var SoundLibrary = class {
     this.makeId = makeId;
   }
   async add(input, data, userId) {
-    const name = typeof input.name === "string" ? input.name.trim() : "";
-    const description = typeof input.description === "string" ? input.description.trim() : "";
-    const tags = Array.isArray(input.tags) ? input.tags.map((tag) => typeof tag === "string" ? tag.trim() : "") : [];
-    const mime = typeof input.mime === "string" ? input.mime.trim().toLowerCase() : "";
-    if (!name || name.length > 120 || description.length > 500 || tags.length > 20 || tags.some((tag) => !tag || tag.length > 40) || input.kind !== "ambience" && input.kind !== "event") throw new Error("Invalid favorite sound metadata.");
-    if (!(data instanceof Uint8Array) || data.length < 1 || data.length > MAX_FAVORITE_SOUND_BYTES || !validAudio(data, mime)) {
-      throw new Error("Invalid or oversized audio file.");
-    }
-    const id = this.makeId().toLowerCase();
-    const metaPath = recordPath(id);
-    const bytesPath = audioPath(id);
-    if (await this.storage.exists(metaPath, userId) || await this.storage.exists(bytesPath, userId)) throw new Error("Sound ID already exists.");
-    const record = { version: 1, id, name, description, tags, kind: input.kind, mime, bytes: data.byteLength, createdAt: (/* @__PURE__ */ new Date()).toISOString() };
-    try {
-      await this.storage.writeBinary(bytesPath, data, userId);
-      await this.storage.write(metaPath, JSON.stringify(record), userId);
-    } catch (error) {
-      await Promise.allSettled([this.storage.delete(metaPath, userId), this.storage.delete(bytesPath, userId)]);
-      throw error;
-    }
-    return record;
+    return serializeUserWrite(userId, async () => {
+      const name = typeof input.name === "string" ? input.name.trim() : "";
+      const description = typeof input.description === "string" ? input.description.trim() : "";
+      const tags = Array.isArray(input.tags) ? input.tags.map((tag) => typeof tag === "string" ? tag.trim() : "") : [];
+      const mime = typeof input.mime === "string" ? input.mime.trim().toLowerCase() : "";
+      if (!name || name.length > 120 || description.length > 500 || tags.length > 20 || tags.some((tag) => !tag || tag.length > 40) || input.kind !== "ambience" && input.kind !== "event") throw new Error("Invalid favorite sound metadata.");
+      if (!(data instanceof Uint8Array) || data.length < 1 || data.length > MAX_FAVORITE_SOUND_BYTES || !validAudio(data, mime)) {
+        throw new Error("Invalid or oversized audio file.");
+      }
+      const existing = await this.list(userId);
+      if (existing.length >= MAX_FAVORITE_SOUNDS || existing.reduce((total, item) => total + item.bytes, 0) + data.byteLength > MAX_FAVORITE_LIBRARY_BYTES) {
+        throw new Error("Sound library is full. Remove a favorite before adding another.");
+      }
+      const id = this.makeId().toLowerCase();
+      const metaPath = recordPath(id);
+      const bytesPath = audioPath(id);
+      if (await this.storage.exists(metaPath, userId) || await this.storage.exists(bytesPath, userId)) throw new Error("Sound ID already exists.");
+      const record = { version: 1, id, name, description, tags, kind: input.kind, mime, bytes: data.byteLength, createdAt: (/* @__PURE__ */ new Date()).toISOString() };
+      try {
+        await this.storage.writeBinary(bytesPath, data, userId);
+        await this.storage.write(metaPath, JSON.stringify(record), userId);
+      } catch (error) {
+        await Promise.allSettled([this.storage.delete(metaPath, userId), this.storage.delete(bytesPath, userId)]);
+        throw error;
+      }
+      return record;
+    });
   }
   async list(userId) {
     const entries = await this.storage.list(RECORDS, userId);
@@ -126,6 +146,37 @@ var SoundLibrary = class {
     const data = await this.storage.readBinary(audioPath(id), userId);
     if (data.byteLength !== record.bytes || !validAudio(data, record.mime)) throw new Error("Sound audio is missing or invalid.");
     return { record, data };
+  }
+  async remove(id, userId) {
+    return serializeUserWrite(userId, async () => {
+      const metadata = recordPath(id);
+      const audio = audioPath(id);
+      const record = readRecord(JSON.parse(await this.storage.read(metadata, userId)), id);
+      if (!record) throw new Error("Invalid sound record.");
+      await this.storage.delete(metadata, userId);
+      await this.storage.delete(audio, userId);
+    });
+  }
+  async edit(id, input, userId) {
+    return serializeUserWrite(userId, async () => {
+      const metadata = recordPath(id);
+      const current = readRecord(JSON.parse(await this.storage.read(metadata, userId)), id);
+      if (!current) throw new Error("Invalid sound record.");
+      const name = typeof input.name === "string" ? input.name.trim() : "";
+      const description = typeof input.description === "string" ? input.description.trim() : "";
+      const tags = Array.isArray(input.tags) ? input.tags.map((tag) => typeof tag === "string" ? tag.trim() : "") : [];
+      if (!name || name.length > 120 || description.length > 500 || tags.length > 20 || tags.some((tag) => !tag || tag.length > 40) || input.kind !== "ambience" && input.kind !== "event") throw new Error("Invalid favorite sound metadata.");
+      const next = { ...current, name, description, tags, kind: input.kind };
+      const temp = `${ROOT}/pending/${this.makeId()}.json`;
+      try {
+        await this.storage.write(temp, JSON.stringify(next), userId);
+        await this.storage.move(temp, metadata, userId);
+      } catch (error) {
+        await this.storage.delete(temp, userId).catch(() => void 0);
+        throw error;
+      }
+      return next;
+    });
   }
 };
 
@@ -8195,10 +8246,30 @@ async function fetchCommunityModels(fishApiKey, request) {
 spindle.onFrontendMessage(async (rawPayload, userId, frontendSessionId) => {
   const payload = rawPayload;
   try {
-    if (payload?.type === "chat_voice_sound_library_list") {
+    if (payload?.type === "chat_voice_sound_library_list" || payload?.type === "chat_voice_sound_library_add" || payload?.type === "chat_voice_sound_library_read" || payload?.type === "chat_voice_sound_library_remove" || payload?.type === "chat_voice_sound_library_edit") {
       try {
-        const favorites = await new SoundLibrary(spindle.userStorage).list(userId);
-        sendFrontend({ type: "chat_voice_sound_library", requestId: payload.requestId, favorites }, userId, frontendSessionId);
+        const library = new SoundLibrary(spindle.userStorage);
+        if (payload.type === "chat_voice_sound_library_add") {
+          if (typeof payload.audio !== "string" || payload.audio.length > Math.ceil(MAX_FAVORITE_SOUND_BYTES / 3) * 4 || payload.audio.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/u.test(payload.audio)) throw new Error("Invalid or oversized audio encoding.");
+          const binary = atob(payload.audio);
+          const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
+          const favorite = await library.add(payload.favorite, bytes, userId);
+          sendFrontend({ type: "chat_voice_sound_library", requestId: payload.requestId, favorite }, userId, frontendSessionId);
+        } else if (payload.type === "chat_voice_sound_library_read") {
+          const { record, data } = await library.read(payload.id, userId);
+          let binary = "";
+          for (let offset = 0; offset < data.length; offset += 8192) binary += String.fromCharCode(...data.subarray(offset, offset + 8192));
+          sendFrontend({ type: "chat_voice_sound_library", requestId: payload.requestId, favorite: record, audio: btoa(binary) }, userId, frontendSessionId);
+        } else if (payload.type === "chat_voice_sound_library_remove") {
+          await library.remove(payload.id, userId);
+          sendFrontend({ type: "chat_voice_sound_library", requestId: payload.requestId }, userId, frontendSessionId);
+        } else if (payload.type === "chat_voice_sound_library_edit") {
+          const favorite = await library.edit(payload.id, payload.favorite, userId);
+          sendFrontend({ type: "chat_voice_sound_library", requestId: payload.requestId, favorite }, userId, frontendSessionId);
+        } else {
+          const favorites = await library.list(userId);
+          sendFrontend({ type: "chat_voice_sound_library", requestId: payload.requestId, favorites }, userId, frontendSessionId);
+        }
       } catch (error) {
         sendFrontend({ type: "chat_voice_sound_library", requestId: payload.requestId, error: error instanceof Error ? error.message : "Could not read sound library." }, userId, frontendSessionId);
       }

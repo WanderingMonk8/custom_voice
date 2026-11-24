@@ -1,4 +1,4 @@
-import { SoundLibrary } from './sound-library'
+import { MAX_FAVORITE_SOUND_BYTES, SoundLibrary, type NewFavoriteSound } from './sound-library'
 import {
   addScannedFirstNameAliases,
   addUnconfiguredDialogueSpeakers,
@@ -159,6 +159,10 @@ interface CardPromptData {
 type FrontendMessage =
   | { type: 'chat_voice_refresh'; chatId?: string | null; requestId?: string; ghostLifetime?: number }
   | { type: 'chat_voice_sound_library_list'; requestId: string }
+  | { type: 'chat_voice_sound_library_add'; requestId: string; favorite: NewFavoriteSound; audio: string }
+  | { type: 'chat_voice_sound_library_read'; requestId: string; id: string }
+  | { type: 'chat_voice_sound_library_remove'; requestId: string; id: string }
+  | { type: 'chat_voice_sound_library_edit'; requestId: string; id: string; favorite: NewFavoriteSound }
   | { type: 'chat_voice_decision_status'; requestId?: string }
   | { type: 'chat_voice_list_llm_connections'; requestId: string }
   | {
@@ -1970,10 +1974,30 @@ async function fetchCommunityModels(fishApiKey: string, request: CommunityModelR
 spindle.onFrontendMessage(async (rawPayload: unknown, userId, frontendSessionId) => {
   const payload = rawPayload as FrontendMessage
   try {
-    if (payload?.type === 'chat_voice_sound_library_list') {
+    if (payload?.type === 'chat_voice_sound_library_list' || payload?.type === 'chat_voice_sound_library_add' || payload?.type === 'chat_voice_sound_library_read' || payload?.type === 'chat_voice_sound_library_remove' || payload?.type === 'chat_voice_sound_library_edit') {
       try {
-        const favorites = await new SoundLibrary(spindle.userStorage).list(userId)
-        sendFrontend({ type: 'chat_voice_sound_library', requestId: payload.requestId, favorites }, userId, frontendSessionId)
+        const library = new SoundLibrary(spindle.userStorage)
+        if (payload.type === 'chat_voice_sound_library_add') {
+          if (typeof payload.audio !== 'string' || payload.audio.length > Math.ceil(MAX_FAVORITE_SOUND_BYTES / 3) * 4 || payload.audio.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/u.test(payload.audio)) throw new Error('Invalid or oversized audio encoding.')
+          const binary = atob(payload.audio)
+          const bytes = Uint8Array.from(binary, char => char.charCodeAt(0))
+          const favorite = await library.add(payload.favorite, bytes, userId)
+          sendFrontend({ type: 'chat_voice_sound_library', requestId: payload.requestId, favorite }, userId, frontendSessionId)
+        } else if (payload.type === 'chat_voice_sound_library_read') {
+          const { record, data } = await library.read(payload.id, userId)
+          let binary = ''
+          for (let offset = 0; offset < data.length; offset += 8192) binary += String.fromCharCode(...data.subarray(offset, offset + 8192))
+          sendFrontend({ type: 'chat_voice_sound_library', requestId: payload.requestId, favorite: record, audio: btoa(binary) }, userId, frontendSessionId)
+        } else if (payload.type === 'chat_voice_sound_library_remove') {
+          await library.remove(payload.id, userId)
+          sendFrontend({ type: 'chat_voice_sound_library', requestId: payload.requestId }, userId, frontendSessionId)
+        } else if (payload.type === 'chat_voice_sound_library_edit') {
+          const favorite = await library.edit(payload.id, payload.favorite, userId)
+          sendFrontend({ type: 'chat_voice_sound_library', requestId: payload.requestId, favorite }, userId, frontendSessionId)
+        } else {
+          const favorites = await library.list(userId)
+          sendFrontend({ type: 'chat_voice_sound_library', requestId: payload.requestId, favorites }, userId, frontendSessionId)
+        }
       } catch (error) {
         sendFrontend({ type: 'chat_voice_sound_library', requestId: payload.requestId, error: error instanceof Error ? error.message : 'Could not read sound library.' }, userId, frontendSessionId)
       }

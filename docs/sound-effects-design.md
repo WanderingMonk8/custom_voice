@@ -1,12 +1,12 @@
 # Scene-aware sound effects for Chat Voice
 
-Status: design proposal with an initial backend storage foundation; sound-effects playback and the library UI are not implemented.
+Status: implementation in progress; an experimental manual favorites library is available, but scene planning, effect playback, and final mixing are not implemented.
 
 Branch: `sound-effects`
 
 Research: 2026-11-24
 
-Initial implementation: `src/sound-library.ts` provides per-user favorite record and binary write/read/list primitives, with a read-only backend list request. Mock-storage tests cover user isolation, recreation of the library object, concurrent additions, corrupt metadata, and cleanup after failed writes. The 3 MiB upload ceiling and container-signature checks are preliminary; they do **not** establish that a file can be decoded or that its reported duration is safe. Do not expose uploads or promote assets until full decode/duration checks, provenance, aggregate quotas, secure frontend transport, and the real-host lifecycle gate below are implemented. Object recreation in a mock is not an uninstall/reinstall test.
+Initial implementation: `src/sound-library.ts` provides per-user favorite records and binary write/read/list/edit/remove primitives. The experimental drawer can add, preview, edit, and remove user-provided sounds; browser-side decoding checks a 120-second maximum, while backend checks container signatures and limits each upload to 2 MiB. Backend signature checks are not a full decoder and the RPC does not prove a client performed the browser-side check; independently validate any asset before automatic playback. Preliminary per-user limits are 200 favorites and 100 MiB within one backend runtime; cross-runtime quota enforcement and orphan reconciliation remain open. Mock-storage tests cover user isolation, object recreation, concurrent additions, corrupt metadata, and failed writes. Object recreation in a mock is not an uninstall/reinstall test. Provenance, portable backup, robust host transport, and the real-host lifecycle gate remain required before release.
 
 ## 1. Product goal
 
