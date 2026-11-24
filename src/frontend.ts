@@ -2370,7 +2370,7 @@ export function setup(ctx: SpindleFrontendContext) {
   })
   const skippedTagsHint = document.createElement('div')
   skippedTagsHint.className = 'chat-voice-hint'
-  skippedTagsHint.textContent = 'Enter tag names, tag or comment marker pairs, or prefix:http: to skip whitespace-delimited text containing http:. On a separate line, use enclosed: ![ | ] to skip text from ![ through the next ]. Markers are case-sensitive; use \\| for a literal pipe, or JSON-quoted markers to preserve surrounding spaces.'
+  skippedTagsHint.textContent = 'Separate tag names, tag/comment marker pairs, and prefix rules with commas, for example: tracker, prefix:http:, prefix:https:. A prefix skips whitespace-delimited text containing it. Put each enclosed rule on its own line without a trailing comma, for example: enclosed: ![ | ]. It skips text from the opening marker through the next closing marker. Markers are case-sensitive; use \\| for a literal pipe, or JSON-quoted markers to preserve surrounding spaces.'
   skippedTagsField.slot.append(skippedTagsHint)
 
   const speakerParsingPicker = ctx.components.mountSelect(speakerParsingField.slot, {
