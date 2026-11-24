@@ -9,6 +9,29 @@ export interface SoundSceneCue {
   offset: number
 }
 
+export interface SoundSceneSegment {
+  start: number
+  end: number
+}
+
+/** Map validated source anchors to clip boundaries; never split or overlap a voice clip. */
+export function mapSoundCueBoundaries(cues: readonly SoundSceneCue[], segments: readonly SoundSceneSegment[], messageLength: number): Array<{ cue: SoundSceneCue; boundary: number }> {
+  let lastEnd = 0
+  for (const segment of segments) {
+    if (!Number.isSafeInteger(segment.start) || !Number.isSafeInteger(segment.end)
+      || segment.start < lastEnd || segment.end <= segment.start || segment.end > messageLength) throw new Error('Invalid scene segment boundaries.')
+    lastEnd = segment.end
+  }
+  const mapped: Array<{ cue: SoundSceneCue; boundary: number }> = []
+  for (const cue of cues) {
+    const end = cue.offset + cue.anchor.length
+    const index = segments.findIndex(segment => cue.offset >= segment.start && end <= segment.end)
+    if (index < 0) continue
+    mapped.push({ cue, boundary: cue.position === 'before' ? index : index + 1 })
+  }
+  return mapped
+}
+
 /** Reject malformed or ungrounded candidates; never invent an anchor. */
 export function parseSoundScenePlan(raw: string, message: string, favorites: readonly FavoriteSound[]): SoundSceneCue[] {
   const cleaned = raw.trim().replace(/^```(?:json)?\s*/iu, '').replace(/\s*```$/u, '')

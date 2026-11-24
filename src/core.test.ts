@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { SoundLibrary, type SoundUserStorage } from './sound-library'
-import { parseSoundScenePlan } from './sound-scene'
+import { mapSoundCueBoundaries, parseSoundScenePlan } from './sound-scene'
 import { renderSoundMix } from './sound-mix'
 import { AutoplayRequestRegistry, PlaybackLongPress, PlaybackStartupGuard, syncAutoplayIndicators, syncPlaybackButtons, waitForAutoplayDeadline, waitForAutoplayWork, type PlaybackButtonState } from './playback-ui'
 import { evaluateSpeakerReviews } from './speaker-review-evaluation'
@@ -111,6 +111,13 @@ test('sound scene plans require unique source anchors and known compatible asset
     { kind: 'ambience', action: 'stop', anchor: 'The door shut.', position: 'before', offset: 11 },
   ])
   assert.deepEqual(parseSoundScenePlan('not JSON', message, [door]), [])
+})
+
+test('sound cues map only to whole clip boundaries using original source offsets', () => {
+  const cue = { kind: 'event' as const, action: 'play' as const, assetId: 'door', anchor: 'door', position: 'after' as const, offset: 4 }
+  assert.deepEqual(mapSoundCueBoundaries([cue], [{ start: 0, end: 9 }, { start: 10, end: 20 }], 20), [{ cue, boundary: 1 }])
+  assert.deepEqual(mapSoundCueBoundaries([{ ...cue, anchor: 'door opens' }], [{ start: 0, end: 9 }, { start: 10, end: 20 }], 20), [])
+  assert.throws(() => mapSoundCueBoundaries([cue], [{ start: 0, end: 9 }, { start: 8, end: 20 }], 20), /Invalid scene segment/)
 })
 
 test('local sound mix permits ambience under speech and events but prohibits event/voice overlap', () => {
