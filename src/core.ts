@@ -3498,6 +3498,7 @@ export function parseSkippedTrackerTagPairs(value: string): SkippedTrackerTagPai
   for (const entry of entries.split(',')) {
     const trimmed = entry.trim()
     if (!trimmed) continue
+    if (/^prefix:/iu.test(trimmed)) continue
     // A lone comment marker excludes everything up to the next occurrence of
     // the same marker, the way a symmetric tag name does.
     const loneMarker = trimmed.match(/^<!--[\s\S]*?-->$/u)
@@ -3621,7 +3622,13 @@ export function stripSkippedTrackerBlocks(content: string, tagPairs: string): st
   for (const pair of pairs) {
     if (!pair.marker) result = stripTagBlock(result, pair.open, pair.close)
   }
-  return result.replace(/<!--[\s\S]*?-->/g, ' ')
+  result = result.replace(/<!--[\s\S]*?-->/g, ' ')
+  const prefixes = [...decodePlaybackEntities(tagPairs).matchAll(/(?:^|,)\s*prefix:([^,\s]+)\s*(?=,|$)/giu)]
+    .map(match => (match[1] ?? '').toLowerCase())
+  if (prefixes.length) {
+    result = result.replace(/\S+/gu, token => prefixes.some(prefix => token.toLowerCase().includes(prefix)) ? ' ' : token)
+  }
+  return result
 }
 
 export function preparePlaybackContent(content: string, skippedTrackerTagPairs = ''): string {

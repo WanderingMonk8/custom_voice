@@ -2363,14 +2363,14 @@ export function setup(ctx: SpindleFrontendContext) {
 
   const skippedTrackerTagsInput = ctx.components.mountTextArea(skippedTagsField.slot, {
     value: '',
-    placeholder: 'tracker, status, <o_ledger></o_l>, <!-- GFX_START --><!-- GFX_END -->',
+    placeholder: 'tracker, status, prefix:http:, prefix:https:',
     rows: 3,
     ariaLabel: 'Tracker tag names, asymmetric tag pairs, or comment marker pairs to skip globally',
     onChange: () => scheduleSkippedTrackerTagsSave(),
   })
   const skippedTagsHint = document.createElement('div')
   skippedTagsHint.className = 'chat-voice-hint'
-  skippedTagsHint.textContent = 'Enter tag names, full pairs for asymmetric tags such as <o_ledger></o_l>, or a pair of markers such as <!-- GFX_START --><!-- GFX_END --> to skip everything between them.'
+  skippedTagsHint.textContent = 'Enter tag names, tag or comment marker pairs, or prefix:http: to skip any whitespace-delimited text containing http:. Add prefix:https: separately for HTTPS links.'
   skippedTagsField.slot.append(skippedTagsHint)
 
   const speakerParsingPicker = ctx.components.mountSelect(speakerParsingField.slot, {

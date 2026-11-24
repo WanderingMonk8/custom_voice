@@ -2041,6 +2041,21 @@ test('parses comma-separated tracker tag names and removes their contents before
   )
 })
 
+test('skips whitespace-delimited text containing configured literal prefixes', () => {
+  const setting = 'tracker, prefix:http:, prefix:https:'
+  assert.deepEqual(parseSkippedTrackerTags(setting), ['tracker'])
+  assert.equal(
+    stripSkippedTrackerBlocks('Before [http://aaa.com](http://aaa.com)\n[https://bbb.com](https://bbb.com) after HTTP://example.com end', setting),
+    'Before  \n  after   end',
+  )
+  assert.equal(stripSkippedTrackerBlocks('Keep http://example.com', ''), 'Keep http://example.com')
+  assert.equal(stripSkippedTrackerBlocks('a x.a+b tail xaaab', 'prefix:.a+'), 'a   tail xaaab')
+  assert.equal(stripSkippedTrackerBlocks('Keep text', 'prefix:'), 'Keep text')
+  assert.deepEqual(parseRosterVoiceSegments('Before [http://example.com](http://example.com) after.', null, [], 'prefix:http:'), [
+    { text: 'Before after.', speakerId: null },
+  ])
+})
+
 test('continues to accept previously saved paired tracker tags', () => {
   assert.deepEqual(
     parseSkippedTrackerTags('<tracker></tracker>, <status>example</status>'),

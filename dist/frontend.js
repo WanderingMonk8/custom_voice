@@ -1441,6 +1441,7 @@ function parseSkippedTrackerTagPairs(value) {
   for (const entry of entries.split(",")) {
     const trimmed = entry.trim();
     if (!trimmed) continue;
+    if (/^prefix:/iu.test(trimmed)) continue;
     const loneMarker = trimmed.match(/^<!--[\s\S]*?-->$/u);
     if (loneMarker) {
       addSymmetric(loneMarker[0], true);
@@ -1541,7 +1542,12 @@ function stripSkippedTrackerBlocks(content, tagPairs) {
   for (const pair of pairs) {
     if (!pair.marker) result = stripTagBlock(result, pair.open, pair.close);
   }
-  return result.replace(/<!--[\s\S]*?-->/g, " ");
+  result = result.replace(/<!--[\s\S]*?-->/g, " ");
+  const prefixes = [...decodePlaybackEntities(tagPairs).matchAll(/(?:^|,)\s*prefix:([^,\s]+)\s*(?=,|$)/giu)].map((match) => (match[1] ?? "").toLowerCase());
+  if (prefixes.length) {
+    result = result.replace(/\S+/gu, (token) => prefixes.some((prefix) => token.toLowerCase().includes(prefix)) ? " " : token);
+  }
+  return result;
 }
 function preparePlaybackContent(content, skippedTrackerTagPairs = "") {
   return stripPlaybackMarkup(stripSkippedTrackerBlocks(content, skippedTrackerTagPairs)).replace(/&quot;|&#34;|&#x22;/giu, '"').replace(/["“”]{2,}/gu, '"');
@@ -4302,14 +4308,14 @@ function setup(ctx) {
   favoritePickers.add(userFavoritePicker);
   const skippedTrackerTagsInput = ctx.components.mountTextArea(skippedTagsField.slot, {
     value: "",
-    placeholder: "tracker, status, <o_ledger></o_l>, <!-- GFX_START --><!-- GFX_END -->",
+    placeholder: "tracker, status, prefix:http:, prefix:https:",
     rows: 3,
     ariaLabel: "Tracker tag names, asymmetric tag pairs, or comment marker pairs to skip globally",
     onChange: () => scheduleSkippedTrackerTagsSave()
   });
   const skippedTagsHint = document.createElement("div");
   skippedTagsHint.className = "chat-voice-hint";
-  skippedTagsHint.textContent = "Enter tag names, full pairs for asymmetric tags such as <o_ledger></o_l>, or a pair of markers such as <!-- GFX_START --><!-- GFX_END --> to skip everything between them.";
+  skippedTagsHint.textContent = "Enter tag names, tag or comment marker pairs, or prefix:http: to skip any whitespace-delimited text containing http:. Add prefix:https: separately for HTTPS links.";
   skippedTagsField.slot.append(skippedTagsHint);
   const speakerParsingPicker = ctx.components.mountSelect(speakerParsingField.slot, {
     value: "ambiguous",
