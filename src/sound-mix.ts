@@ -17,6 +17,23 @@ export interface SoundMixResult {
 
 const MAX_MIX_BYTES = 128 * 1024 * 1024
 
+/** Conservative RMS normalization targets per category; retain original PCM unchanged. */
+export function soundCategoryGain(channels: readonly Float32Array[], kind: 'event' | 'ambience'): number {
+  if (!['event', 'ambience'].includes(kind) || ![1, 2].includes(channels.length) || !channels[0]?.length
+    || channels.some(channel => !(channel instanceof Float32Array) || channel.length !== channels[0].length)) throw new Error('Invalid sound audio.')
+  let sum = 0
+  let peak = 0
+  for (const channel of channels) for (const sample of channel) {
+    if (!Number.isFinite(sample)) throw new Error('Invalid audio sample.')
+    sum += sample * sample
+    peak = Math.max(peak, Math.abs(sample))
+  }
+  const rms = Math.sqrt(sum / (channels.length * channels[0].length))
+  if (rms < 0.0001 || peak === 0) return 1
+  const target = kind === 'ambience' ? 0.05 : 0.125
+  return Math.min(4, target / rms, 0.98 / peak)
+}
+
 /** Render a bounded PCM timeline. All input tracks must share the target sample rate. */
 export function renderSoundMix(tracks: readonly SoundMixTrack[], totalFrames: number, channels = 2): SoundMixResult {
   if (!Number.isSafeInteger(totalFrames) || totalFrames < 1 || (channels !== 1 && channels !== 2)

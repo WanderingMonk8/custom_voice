@@ -8277,7 +8277,22 @@ async function fetchCommunityModels(fishApiKey, request) {
 spindle.onFrontendMessage(async (rawPayload, userId, frontendSessionId) => {
   const payload = rawPayload;
   try {
-    if (payload?.type === "chat_voice_sound_scene_plan") {
+    if (payload?.type === "chat_voice_freesound_key") {
+      try {
+        if (!userId) throw new Error("An authenticated user is required.");
+        if (payload.action === "save") {
+          const key = typeof payload.key === "string" ? payload.key.trim() : "";
+          if (!key || key.length > 512 || /[\r\n]/u.test(key)) throw new Error("Enter a valid Freesound API key.");
+          await spindle.enclave.put("freesound_api_key", key, userId);
+        } else if (payload.action === "remove") {
+          await spindle.enclave.delete("freesound_api_key", userId);
+        } else if (payload.action !== "status") throw new Error("Invalid key action.");
+        const hasKey = await spindle.enclave.has("freesound_api_key", userId);
+        sendFrontend({ type: "chat_voice_sound_library", requestId: payload.requestId, hasKey }, userId, frontendSessionId);
+      } catch {
+        sendFrontend({ type: "chat_voice_sound_library", requestId: payload.requestId, error: "Could not update Freesound key in secure storage." }, userId, frontendSessionId);
+      }
+    } else if (payload?.type === "chat_voice_sound_scene_plan") {
       try {
         if (typeof payload.message !== "string" || payload.message.length > 3e4) throw new Error("Invalid or oversized scene.");
         const favorites = await new SoundLibrary(spindle.userStorage).list(userId);

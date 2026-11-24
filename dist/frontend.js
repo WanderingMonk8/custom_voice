@@ -3331,6 +3331,7 @@ function setup(ctx) {
     .chat-voice-copy-report-button:disabled { cursor:not-allowed; opacity:.5; }
     .chat-voice-voices-tabs { display:flex; gap:4px; }
     .chat-voice-voices-tabs[hidden], .chat-voice-favorites[hidden], .chat-voice-community[hidden] { display:none; }
+    .chat-voice-advanced[hidden] { display:none; }
     .chat-voice-voices-tab { flex:1; min-height:36px; padding:7px 10px; border:1px solid var(--lumiverse-border);
       border-radius:var(--lumiverse-radius); background:var(--lumiverse-fill-subtle); color:var(--lumiverse-text);
       font:inherit; font-size:12px; font-weight:600; cursor:pointer; }
@@ -3922,12 +3923,91 @@ function setup(ctx) {
   soundsSection.className = "chat-voice-advanced-section";
   const soundsSummary = document.createElement("summary");
   soundsSummary.className = "chat-voice-advanced-summary";
-  soundsSummary.textContent = "Favorite sound effects (experimental)";
+  soundsSummary.textContent = "Sound effects (experimental)";
   const soundsBody = document.createElement("div");
   soundsBody.className = "chat-voice-advanced";
   const soundsHint = document.createElement("div");
   soundsHint.className = "chat-voice-hint";
-  soundsHint.textContent = "Manage your per-user sound library. Sound-effects playback is not available yet. Audio must be at most 2 MiB and 120 seconds.";
+  soundsHint.textContent = "Manage your per-user sound library. Audio must be at most 2 MiB and 120 seconds.";
+  const soundTabs = document.createElement("div");
+  soundTabs.className = "chat-voice-voices-tabs";
+  soundTabs.setAttribute("role", "tablist");
+  soundTabs.setAttribute("aria-label", "Sound effects settings");
+  const soundEffectsPanel = document.createElement("div");
+  const soundLibraryPanel = document.createElement("div");
+  const soundAdvancedPanel = document.createElement("div");
+  for (const panel2 of [soundEffectsPanel, soundLibraryPanel, soundAdvancedPanel]) {
+    panel2.className = "chat-voice-advanced";
+    panel2.setAttribute("role", "tabpanel");
+  }
+  const effectsNote = document.createElement("div");
+  effectsNote.className = "chat-voice-hint";
+  effectsNote.textContent = "Sound-effects playback is not available yet. Ambience will play under voices; event sounds will play between clips. Scene planning will send the message and relevant sound-library details to your configured generation connection.";
+  soundEffectsPanel.append(effectsNote);
+  const soundTabButtons = [];
+  const soundPanels = [soundEffectsPanel, soundLibraryPanel, soundAdvancedPanel];
+  for (const [index, label] of ["Effects", "Library", "Advanced"].entries()) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "chat-voice-voices-tab";
+    button.textContent = label;
+    button.id = `chat-voice-sound-tab-${index}`;
+    button.setAttribute("role", "tab");
+    soundPanels[index].id = `chat-voice-sound-panel-${index}`;
+    button.setAttribute("aria-controls", soundPanels[index].id);
+    soundPanels[index].setAttribute("aria-labelledby", button.id);
+    button.addEventListener("click", () => {
+      for (let n = 0; n < soundPanels.length; n++) {
+        soundPanels[n].hidden = n !== index;
+        soundTabButtons[n].setAttribute("aria-selected", String(n === index));
+        soundTabButtons[n].tabIndex = n === index ? 0 : -1;
+      }
+    });
+    soundTabButtons.push(button);
+    soundTabs.append(button);
+  }
+  soundTabButtons[0].setAttribute("aria-selected", "true");
+  soundTabButtons[1].setAttribute("aria-selected", "false");
+  soundTabButtons[1].tabIndex = -1;
+  soundTabButtons[2].setAttribute("aria-selected", "false");
+  soundTabButtons[2].tabIndex = -1;
+  soundLibraryPanel.hidden = true;
+  soundAdvancedPanel.hidden = true;
+  const freesoundHint = document.createElement("div");
+  freesoundHint.className = "chat-voice-hint";
+  freesoundHint.textContent = "Freesound search is not available yet. Your API key is stored encrypted per user and is never shown again after saving.";
+  const freesoundLink = document.createElement("a");
+  freesoundLink.href = "https://freesound.org/apiv2/apply/";
+  freesoundLink.target = "_blank";
+  freesoundLink.rel = "noopener noreferrer";
+  freesoundLink.textContent = "Get a Freesound API key";
+  const freesoundKey = document.createElement("input");
+  freesoundKey.type = "password";
+  freesoundKey.placeholder = "Freesound API key";
+  freesoundKey.autocomplete = "off";
+  freesoundKey.maxLength = 512;
+  freesoundKey.setAttribute("aria-label", "Freesound API key");
+  const freesoundShow = document.createElement("button");
+  freesoundShow.type = "button";
+  freesoundShow.className = "chat-voice-add-button";
+  freesoundShow.textContent = "Show key";
+  freesoundShow.addEventListener("click", () => {
+    const show = freesoundKey.type === "password";
+    freesoundKey.type = show ? "text" : "password";
+    freesoundShow.textContent = show ? "Hide key" : "Show key";
+  });
+  const freesoundSave = document.createElement("button");
+  freesoundSave.type = "button";
+  freesoundSave.className = "chat-voice-add-button";
+  freesoundSave.textContent = "Save key";
+  const freesoundRemove = document.createElement("button");
+  freesoundRemove.type = "button";
+  freesoundRemove.className = "chat-voice-add-button";
+  freesoundRemove.textContent = "Remove key";
+  const freesoundStatus = document.createElement("div");
+  freesoundStatus.className = "chat-voice-hint";
+  freesoundStatus.textContent = "Key status not loaded.";
+  soundAdvancedPanel.append(freesoundHint, freesoundLink, freesoundKey, freesoundShow, freesoundSave, freesoundRemove, freesoundStatus);
   const soundFile = document.createElement("input");
   soundFile.type = "file";
   soundFile.accept = "audio/mpeg,audio/wav,audio/ogg,audio/mp4,audio/webm,.mp3,.wav,.ogg,.m4a,.webm";
@@ -3954,7 +4034,8 @@ function setup(ctx) {
   const soundList = document.createElement("div");
   soundList.className = "chat-voice-favorite-list";
   soundList.setAttribute("aria-label", "Favorite sound effects");
-  soundsBody.append(soundsHint, soundFile, soundName, soundTags, soundKind, soundAdd, soundList);
+  soundLibraryPanel.append(soundsHint, soundFile, soundName, soundTags, soundKind, soundAdd, soundList);
+  soundsBody.append(soundTabs, soundEffectsPanel, soundLibraryPanel, soundAdvancedPanel);
   soundsSection.append(soundsSummary, soundsBody);
   const status = document.createElement("div");
   status.className = "chat-voice-status";
@@ -4342,6 +4423,27 @@ function setup(ctx) {
       ctx.sendToBackend({ type, requestId, ...fields });
     });
   }
+  async function updateFreesoundKey(action) {
+    freesoundSave.disabled = true;
+    freesoundRemove.disabled = true;
+    try {
+      const result = await soundLibraryRequest("chat_voice_freesound_key", { action, ...action === "save" ? { key: freesoundKey.value } : {} });
+      if (soundLibraryDisposed) return;
+      freesoundKey.value = "";
+      freesoundStatus.textContent = result.hasKey ? "Freesound API key saved." : "No Freesound API key saved.";
+    } catch (error) {
+      freesoundStatus.textContent = error instanceof Error ? error.message : "Could not update Freesound key.";
+    } finally {
+      freesoundSave.disabled = false;
+      freesoundRemove.disabled = false;
+    }
+  }
+  freesoundSave.addEventListener("click", () => {
+    void updateFreesoundKey("save");
+  });
+  freesoundRemove.addEventListener("click", () => {
+    void updateFreesoundKey("remove");
+  });
   function stopSoundPreview() {
     soundPreviewGeneration += 1;
     soundPreview?.pause();
@@ -4443,7 +4545,10 @@ function setup(ctx) {
     }
   }
   soundsSection.addEventListener("toggle", () => {
-    if (soundsSection.open) void refreshSoundLibrary().catch((error) => setStatus(error instanceof Error ? error.message : "Could not load sounds.", "error"));
+    if (soundsSection.open) {
+      void refreshSoundLibrary().catch((error) => setStatus(error instanceof Error ? error.message : "Could not load sounds.", "error"));
+      void updateFreesoundKey("status");
+    }
   });
   soundFile.addEventListener("change", () => {
     if (!soundName.value && soundFile.files?.[0]) soundName.value = soundFile.files[0].name.replace(/\.[^.]+$/u, "").slice(0, 120);

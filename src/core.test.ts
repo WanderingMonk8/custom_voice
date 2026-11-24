@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { SoundLibrary, type SoundUserStorage } from './sound-library'
 import { mapSoundCueBoundaries, parseSoundScenePlan } from './sound-scene'
-import { renderSoundMix } from './sound-mix'
+import { renderSoundMix, soundCategoryGain } from './sound-mix'
 import { AutoplayRequestRegistry, PlaybackLongPress, PlaybackStartupGuard, syncAutoplayIndicators, syncPlaybackButtons, waitForAutoplayDeadline, waitForAutoplayWork, type PlaybackButtonState } from './playback-ui'
 import { evaluateSpeakerReviews } from './speaker-review-evaluation'
 
@@ -132,6 +132,16 @@ test('local sound mix permits ambience under speech and events but prohibits eve
   assert.ok(Math.abs(mix.channels[0][2] - 0.7) < 0.001)
   assert.throws(() => renderSoundMix([...tracks, { ...tracks[1], startFrame: 1, endFrame: 3 }], 4), /overlaps voice/)
   assert.throws(() => renderSoundMix(tracks, 50_000_000), /limits/)
+})
+
+test('sound normalization uses category targets and limits boost and peaks', () => {
+  const audio = [new Float32Array([0.1, -0.1])]
+  assert.ok(Math.abs(soundCategoryGain(audio, 'ambience') - 0.5) < 0.00001)
+  assert.ok(Math.abs(soundCategoryGain(audio, 'event') - 1.25) < 0.00001)
+  assert.equal(soundCategoryGain([new Float32Array([0, 0])], 'event'), 1)
+  assert.equal(soundCategoryGain([new Float32Array([0.001, -0.001])], 'event'), 4)
+  assert.ok(soundCategoryGain([new Float32Array([1, 0, 0, 0])], 'event') <= 0.98)
+  assert.throws(() => soundCategoryGain([new Float32Array([NaN])], 'event'), /Invalid audio sample/)
 })
 import {
   adaptiveGenerationConcurrency,
