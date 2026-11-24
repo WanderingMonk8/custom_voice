@@ -1,7 +1,81 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
+import { SoundLibrary, type SoundUserStorage } from './sound-library'
 import { AutoplayRequestRegistry, PlaybackLongPress, PlaybackStartupGuard, syncAutoplayIndicators, syncPlaybackButtons, waitForAutoplayDeadline, waitForAutoplayWork, type PlaybackButtonState } from './playback-ui'
 import { evaluateSpeakerReviews } from './speaker-review-evaluation'
+
+class FakeSoundStorage implements SoundUserStorage {
+  readonly files = new Map<string, string | Uint8Array>()
+  failRecordWrite = false
+  private key(path: string, userId?: string): string { return `${userId ?? 'owner'}/${path}` }
+  async read(path: string, userId?: string): Promise<string> {
+    const value = this.files.get(this.key(path, userId))
+    if (typeof value !== 'string') throw new Error('File not found')
+    return value
+  }
+  async write(path: string, data: string, userId?: string): Promise<void> {
+    if (this.failRecordWrite) throw new Error('Disk full')
+    this.files.set(this.key(path, userId), data)
+  }
+  async readBinary(path: string, userId?: string): Promise<Uint8Array> {
+    const value = this.files.get(this.key(path, userId))
+    if (!(value instanceof Uint8Array)) throw new Error('File not found')
+    return value.slice()
+  }
+  async writeBinary(path: string, data: Uint8Array, userId?: string): Promise<void> { this.files.set(this.key(path, userId), data.slice()) }
+  async delete(path: string, userId?: string): Promise<void> { this.files.delete(this.key(path, userId)) }
+  async list(prefix = '', userId?: string): Promise<string[]> {
+    const base = `${this.key(prefix, userId)}/`
+    return [...this.files.keys()].filter(path => path.startsWith(base)).map(path => path.slice(base.length))
+  }
+  async exists(path: string, userId?: string): Promise<boolean> { return this.files.has(this.key(path, userId)) }
+}
+
+test('sound favorites persist across library instances and stay isolated by user', async () => {
+  const storage = new FakeSoundStorage()
+  const wav = new TextEncoder().encode('RIFF0000WAVEaudio')
+  const original = new SoundLibrary(storage)
+  const favorite = await original.add({ name: ' Rain ', kind: 'ambience', mime: 'audio/wav', tags: [' rain '] }, wav, 'alice')
+  const reinstalled = new SoundLibrary(storage)
+  assert.deepEqual(await reinstalled.list('alice'), [favorite])
+  assert.equal(favorite.name, 'Rain')
+  assert.deepEqual(favorite.tags, ['rain'])
+  assert.deepEqual((await reinstalled.read(favorite.id, 'alice')).data, wav)
+  assert.deepEqual(await reinstalled.list('bob'), [])
+  await assert.rejects(() => reinstalled.read(favorite.id, 'bob'), /File not found/)
+  await assert.rejects(() => reinstalled.read('../other', 'alice'), /Invalid sound ID/)
+})
+
+test('sound favorites validate inputs and clean up a failed record write', async () => {
+  const storage = new FakeSoundStorage()
+  const library = new SoundLibrary(storage)
+  const wav = new TextEncoder().encode('RIFF0000WAVEaudio')
+  await assert.rejects(() => library.add({ name: 'not audio', kind: 'event', mime: 'audio/wav' }, new Uint8Array([1, 2, 3]), 'alice'), /Invalid or oversized/)
+  await assert.rejects(() => library.add({ name: '', kind: 'event', mime: 'audio/wav' }, wav, 'alice'), /metadata/)
+  storage.failRecordWrite = true
+  await assert.rejects(() => library.add({ name: 'Knock', kind: 'event', mime: 'audio/wav' }, wav, 'alice'), /Disk full/)
+  assert.equal(storage.files.size, 0)
+})
+
+test('sound library accepts concurrent independent additions without a shared index', async () => {
+  const storage = new FakeSoundStorage()
+  const library = new SoundLibrary(storage)
+  const wav = new TextEncoder().encode('RIFF0000WAVEaudio')
+  await Promise.all(['Rain', 'Door', 'Wind'].map(name => library.add({ name, kind: 'event', mime: 'audio/wav' }, wav, 'alice')))
+  assert.deepEqual((await new SoundLibrary(storage).list('alice')).map(record => record.name), ['Door', 'Rain', 'Wind'])
+})
+
+test('sound library ignores corrupt records without erasing them and reports storage errors', async () => {
+  const storage = new FakeSoundStorage()
+  const id = '00000000-0000-7000-8000-000000000000'
+  const path = `alice/sound-effects/v1/favorites/${id}.json`
+  storage.files.set(path, '{invalid')
+  const library = new SoundLibrary(storage)
+  assert.deepEqual(await library.list('alice'), [])
+  assert.equal(storage.files.get(path), '{invalid')
+  storage.read = async () => { throw new Error('Storage unavailable') }
+  await assert.rejects(() => library.list('alice'), /Storage unavailable/)
+})
 import {
   adaptiveGenerationConcurrency,
   addScannedFirstNameAliases,

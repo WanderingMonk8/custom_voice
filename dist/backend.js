@@ -1,3 +1,134 @@
+// src/uuid.ts
+var lastTimestamp = 0;
+var counter = 0;
+var uuidBytes = () => {
+  const now = Math.max(0, Math.min(Number(2n ** 48n - 1n), Date.now()));
+  let timestamp = now;
+  if (timestamp === lastTimestamp) {
+    counter = counter + 1 & 4095;
+    if (counter === 0 && timestamp < Number(2n ** 48n - 1n)) {
+      timestamp += 1;
+      lastTimestamp = timestamp;
+    } else {
+      lastTimestamp = timestamp;
+    }
+  } else {
+    counter = 0;
+    lastTimestamp = timestamp;
+  }
+  const bytes = new Uint8Array(16);
+  const value = BigInt(timestamp);
+  bytes[0] = Number(value >> 40n & 0xffn);
+  bytes[1] = Number(value >> 32n & 0xffn);
+  bytes[2] = Number(value >> 24n & 0xffn);
+  bytes[3] = Number(value >> 16n & 0xffn);
+  bytes[4] = Number(value >> 8n & 0xffn);
+  bytes[5] = Number(value & 0xffn);
+  bytes[6] = 112 | counter >> 8 & 15;
+  bytes[7] = counter & 255;
+  for (let index = 8; index < 16; index += 1) bytes[index] = Math.floor(Math.random() * 256);
+  bytes[8] = bytes[8] & 63 | 128;
+  return bytes;
+};
+var UUID_HEX = Array.from({ length: 256 }, (_, index) => index.toString(16).padStart(2, "0"));
+function generateUuidV7() {
+  const bytes = uuidBytes();
+  return [
+    UUID_HEX[bytes[0]] + UUID_HEX[bytes[1]] + UUID_HEX[bytes[2]] + UUID_HEX[bytes[3]],
+    UUID_HEX[bytes[4]] + UUID_HEX[bytes[5]],
+    UUID_HEX[bytes[6]] + UUID_HEX[bytes[7]],
+    UUID_HEX[bytes[8]] + UUID_HEX[bytes[9]],
+    Array.from(bytes.slice(10), (byte) => UUID_HEX[byte]).join("")
+  ].join("-");
+}
+
+// src/sound-library.ts
+var ROOT = "sound-effects/v1";
+var RECORDS = `${ROOT}/favorites`;
+var AUDIO = `${ROOT}/audio`;
+var MAX_FAVORITE_SOUND_BYTES = 3 * 1024 * 1024;
+var ID_PATTERN = /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/u;
+function assertId(id) {
+  if (!ID_PATTERN.test(id)) throw new Error("Invalid sound ID.");
+}
+function recordPath(id) {
+  assertId(id);
+  return `${RECORDS}/${id}.json`;
+}
+function audioPath(id) {
+  assertId(id);
+  return `${AUDIO}/${id}.audio`;
+}
+function readRecord(value, id) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const row = value;
+  if (row.version !== 1 || row.id !== id || typeof row.name !== "string" || !row.name.trim() || row.name.length > 120 || typeof row.description !== "string" || row.description.length > 500 || !Array.isArray(row.tags) || row.tags.length > 20 || !row.tags.every((tag) => typeof tag === "string" && !!tag.trim() && tag.length <= 40) || row.kind !== "ambience" && row.kind !== "event" || typeof row.mime !== "string" || !/^audio\/(?:mpeg|wav|ogg|mp4|webm)$/u.test(row.mime) || typeof row.bytes !== "number" || !Number.isInteger(row.bytes) || row.bytes < 1 || row.bytes > MAX_FAVORITE_SOUND_BYTES || typeof row.createdAt !== "string" || !Number.isFinite(Date.parse(row.createdAt))) return null;
+  return row;
+}
+function validAudio(data, mime) {
+  const ascii = (at, text) => [...text].every((char, index) => data[at + index] === char.charCodeAt(0));
+  if (mime === "audio/wav") return data.length >= 12 && ascii(0, "RIFF") && ascii(8, "WAVE");
+  if (mime === "audio/ogg") return data.length >= 4 && ascii(0, "OggS");
+  if (mime === "audio/mp4") return data.length >= 12 && ascii(4, "ftyp");
+  if (mime === "audio/webm") return data.length >= 4 && data[0] === 26 && data[1] === 69 && data[2] === 223 && data[3] === 163;
+  if (mime === "audio/mpeg") return data.length >= 4 && (ascii(0, "ID3") || data[0] === 255 && (data[1] & 224) === 224);
+  return false;
+}
+var SoundLibrary = class {
+  constructor(storage, makeId = generateUuidV7) {
+    this.storage = storage;
+    this.makeId = makeId;
+  }
+  async add(input, data, userId) {
+    const name = typeof input.name === "string" ? input.name.trim() : "";
+    const description = typeof input.description === "string" ? input.description.trim() : "";
+    const tags = Array.isArray(input.tags) ? input.tags.map((tag) => typeof tag === "string" ? tag.trim() : "") : [];
+    const mime = typeof input.mime === "string" ? input.mime.trim().toLowerCase() : "";
+    if (!name || name.length > 120 || description.length > 500 || tags.length > 20 || tags.some((tag) => !tag || tag.length > 40) || input.kind !== "ambience" && input.kind !== "event") throw new Error("Invalid favorite sound metadata.");
+    if (!(data instanceof Uint8Array) || data.length < 1 || data.length > MAX_FAVORITE_SOUND_BYTES || !validAudio(data, mime)) {
+      throw new Error("Invalid or oversized audio file.");
+    }
+    const id = this.makeId().toLowerCase();
+    const metaPath = recordPath(id);
+    const bytesPath = audioPath(id);
+    if (await this.storage.exists(metaPath, userId) || await this.storage.exists(bytesPath, userId)) throw new Error("Sound ID already exists.");
+    const record = { version: 1, id, name, description, tags, kind: input.kind, mime, bytes: data.byteLength, createdAt: (/* @__PURE__ */ new Date()).toISOString() };
+    try {
+      await this.storage.writeBinary(bytesPath, data, userId);
+      await this.storage.write(metaPath, JSON.stringify(record), userId);
+    } catch (error) {
+      await Promise.allSettled([this.storage.delete(metaPath, userId), this.storage.delete(bytesPath, userId)]);
+      throw error;
+    }
+    return record;
+  }
+  async list(userId) {
+    const entries = await this.storage.list(RECORDS, userId);
+    const result = [];
+    for (const entry of entries) {
+      const match = /^([a-f0-9-]+)\.json$/u.exec(entry);
+      if (!match || !ID_PATTERN.test(match[1])) continue;
+      const raw = await this.storage.read(recordPath(match[1]), userId);
+      let parsed;
+      try {
+        parsed = JSON.parse(raw);
+      } catch {
+        continue;
+      }
+      const record = readRecord(parsed, match[1]);
+      if (record && await this.storage.exists(audioPath(record.id), userId)) result.push(record);
+    }
+    return result.sort((a, b) => a.name.localeCompare(b.name) || a.id.localeCompare(b.id));
+  }
+  async read(id, userId) {
+    const record = readRecord(JSON.parse(await this.storage.read(recordPath(id), userId)), id);
+    if (!record) throw new Error("Invalid sound record.");
+    const data = await this.storage.readBinary(audioPath(id), userId);
+    if (data.byteLength !== record.bytes || !validAudio(data, record.mime)) throw new Error("Sound audio is missing or invalid.");
+    return { record, data };
+  }
+};
+
 // src/core.ts
 var CONFIG_KEY = "chat_voice";
 var USER_SPEAKER_ID = "__chat_voice_user__";
@@ -6642,50 +6773,6 @@ function applyConfigToMetadata(metadata, config) {
 // src/version.ts
 var BUILD_VERSION = "3.34.1";
 
-// src/uuid.ts
-var lastTimestamp = 0;
-var counter = 0;
-var uuidBytes = () => {
-  const now = Math.max(0, Math.min(Number(2n ** 48n - 1n), Date.now()));
-  let timestamp = now;
-  if (timestamp === lastTimestamp) {
-    counter = counter + 1 & 4095;
-    if (counter === 0 && timestamp < Number(2n ** 48n - 1n)) {
-      timestamp += 1;
-      lastTimestamp = timestamp;
-    } else {
-      lastTimestamp = timestamp;
-    }
-  } else {
-    counter = 0;
-    lastTimestamp = timestamp;
-  }
-  const bytes = new Uint8Array(16);
-  const value = BigInt(timestamp);
-  bytes[0] = Number(value >> 40n & 0xffn);
-  bytes[1] = Number(value >> 32n & 0xffn);
-  bytes[2] = Number(value >> 24n & 0xffn);
-  bytes[3] = Number(value >> 16n & 0xffn);
-  bytes[4] = Number(value >> 8n & 0xffn);
-  bytes[5] = Number(value & 0xffn);
-  bytes[6] = 112 | counter >> 8 & 15;
-  bytes[7] = counter & 255;
-  for (let index = 8; index < 16; index += 1) bytes[index] = Math.floor(Math.random() * 256);
-  bytes[8] = bytes[8] & 63 | 128;
-  return bytes;
-};
-var UUID_HEX = Array.from({ length: 256 }, (_, index) => index.toString(16).padStart(2, "0"));
-function generateUuidV7() {
-  const bytes = uuidBytes();
-  return [
-    UUID_HEX[bytes[0]] + UUID_HEX[bytes[1]] + UUID_HEX[bytes[2]] + UUID_HEX[bytes[3]],
-    UUID_HEX[bytes[4]] + UUID_HEX[bytes[5]],
-    UUID_HEX[bytes[6]] + UUID_HEX[bytes[7]],
-    UUID_HEX[bytes[8]] + UUID_HEX[bytes[9]],
-    Array.from(bytes.slice(10), (byte) => UUID_HEX[byte]).join("")
-  ].join("-");
-}
-
 // src/backend.ts
 async function decisionConnectionStatus(userId) {
   const available = (spindle.host.capabilities["decisions-v1"] ?? 0) >= 1;
@@ -8108,7 +8195,14 @@ async function fetchCommunityModels(fishApiKey, request) {
 spindle.onFrontendMessage(async (rawPayload, userId, frontendSessionId) => {
   const payload = rawPayload;
   try {
-    if (payload?.type === "chat_voice_refresh") {
+    if (payload?.type === "chat_voice_sound_library_list") {
+      try {
+        const favorites = await new SoundLibrary(spindle.userStorage).list(userId);
+        sendFrontend({ type: "chat_voice_sound_library", requestId: payload.requestId, favorites }, userId, frontendSessionId);
+      } catch (error) {
+        sendFrontend({ type: "chat_voice_sound_library", requestId: payload.requestId, error: error instanceof Error ? error.message : "Could not read sound library." }, userId, frontendSessionId);
+      }
+    } else if (payload?.type === "chat_voice_refresh") {
       if (payload.chatId && Number.isFinite(payload.ghostLifetime)) {
         const chatId = payload.chatId;
         const lifetime = Math.min(1e3, Math.max(1, Math.round(payload.ghostLifetime)));

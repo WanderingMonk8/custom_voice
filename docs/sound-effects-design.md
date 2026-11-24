@@ -1,10 +1,12 @@
 # Scene-aware sound effects for Chat Voice
 
-Status: design proposal; no sound-effects code is implemented.
+Status: design proposal with an initial backend storage foundation; sound-effects playback and the library UI are not implemented.
 
 Branch: `sound-effects`
 
 Research: 2026-11-24
+
+Initial implementation: `src/sound-library.ts` provides per-user favorite record and binary write/read/list primitives, with a read-only backend list request. Mock-storage tests cover user isolation, recreation of the library object, concurrent additions, corrupt metadata, and cleanup after failed writes. The 3 MiB upload ceiling and container-signature checks are preliminary; they do **not** establish that a file can be decoded or that its reported duration is safe. Do not expose uploads or promote assets until full decode/duration checks, provenance, aggregate quotas, secure frontend transport, and the real-host lifecycle gate below are implemented. Object recreation in a mock is not an uninstall/reinstall test.
 
 ## 1. Product goal
 

@@ -1,3 +1,4 @@
+import { SoundLibrary } from './sound-library'
 import {
   addScannedFirstNameAliases,
   addUnconfiguredDialogueSpeakers,
@@ -157,6 +158,7 @@ interface CardPromptData {
 
 type FrontendMessage =
   | { type: 'chat_voice_refresh'; chatId?: string | null; requestId?: string; ghostLifetime?: number }
+  | { type: 'chat_voice_sound_library_list'; requestId: string }
   | { type: 'chat_voice_decision_status'; requestId?: string }
   | { type: 'chat_voice_list_llm_connections'; requestId: string }
   | {
@@ -1968,7 +1970,14 @@ async function fetchCommunityModels(fishApiKey: string, request: CommunityModelR
 spindle.onFrontendMessage(async (rawPayload: unknown, userId, frontendSessionId) => {
   const payload = rawPayload as FrontendMessage
   try {
-    if (payload?.type === 'chat_voice_refresh') {
+    if (payload?.type === 'chat_voice_sound_library_list') {
+      try {
+        const favorites = await new SoundLibrary(spindle.userStorage).list(userId)
+        sendFrontend({ type: 'chat_voice_sound_library', requestId: payload.requestId, favorites }, userId, frontendSessionId)
+      } catch (error) {
+        sendFrontend({ type: 'chat_voice_sound_library', requestId: payload.requestId, error: error instanceof Error ? error.message : 'Could not read sound library.' }, userId, frontendSessionId)
+      }
+    } else if (payload?.type === 'chat_voice_refresh') {
       if (payload.chatId && Number.isFinite(payload.ghostLifetime)) {
         const chatId = payload.chatId
         const lifetime = Math.min(1000, Math.max(1, Math.round(payload.ghostLifetime!)))
