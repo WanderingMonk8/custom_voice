@@ -1,3 +1,20 @@
+// src/sound-mix.ts
+var MAX_MIX_BYTES = 128 * 1024 * 1024;
+function soundCategoryGain(channels, kind) {
+  if (!["event", "ambience"].includes(kind) || ![1, 2].includes(channels.length) || !channels[0]?.length || channels.some((channel) => !(channel instanceof Float32Array) || channel.length !== channels[0].length)) throw new Error("Invalid sound audio.");
+  let sum = 0;
+  let peak = 0;
+  for (const channel of channels) for (const sample of channel) {
+    if (!Number.isFinite(sample)) throw new Error("Invalid audio sample.");
+    sum += sample * sample;
+    peak = Math.max(peak, Math.abs(sample));
+  }
+  const rms = Math.sqrt(sum / (channels.length * channels[0].length));
+  if (rms < 1e-4 || peak === 0) return 1;
+  const target = kind === "ambience" ? 0.05 : 0.125;
+  return Math.min(4, target / rms, 0.98 / peak);
+}
+
 // src/playback-ui.ts
 function waitForAutoplayDeadline(deadline, signal) {
   if (signal.aborted) return Promise.resolve(false);
@@ -4034,7 +4051,18 @@ function setup(ctx) {
   const soundList = document.createElement("div");
   soundList.className = "chat-voice-favorite-list";
   soundList.setAttribute("aria-label", "Favorite sound effects");
-  soundLibraryPanel.append(soundsHint, soundFile, soundName, soundTags, soundKind, soundAdd, soundList);
+  const soundSearch = document.createElement("input");
+  soundSearch.placeholder = "Search favorite sounds";
+  soundSearch.setAttribute("aria-label", "Search favorite sounds");
+  const soundFilter = document.createElement("select");
+  soundFilter.setAttribute("aria-label", "Filter favorite sounds");
+  for (const [value, label] of [["all", "All sounds"], ["ambience", "Ambience"], ["event", "Events"]]) {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = label;
+    soundFilter.append(option);
+  }
+  soundLibraryPanel.append(soundsHint, soundFile, soundName, soundTags, soundKind, soundAdd, soundSearch, soundFilter, soundList);
   soundsBody.append(soundTabs, soundEffectsPanel, soundLibraryPanel, soundAdvancedPanel);
   soundsSection.append(soundsSummary, soundsBody);
   const status = document.createElement("div");
@@ -4391,8 +4419,8 @@ function setup(ctx) {
   const pendingMessageRequests = /* @__PURE__ */ new Map();
   const pendingSoundLibrary = /* @__PURE__ */ new Map();
   let soundLibrarySequence = 0;
-  let soundPreview = null;
-  let soundPreviewUrl = "";
+  let soundPreviewContext = null;
+  let soundPreviewSource = null;
   let soundPreviewGeneration = 0;
   let soundLibraryDisposed = false;
   const pendingStateRequests = /* @__PURE__ */ new Map();
@@ -4446,23 +4474,33 @@ function setup(ctx) {
   });
   function stopSoundPreview() {
     soundPreviewGeneration += 1;
-    soundPreview?.pause();
-    soundPreview = null;
-    if (soundPreviewUrl) URL.revokeObjectURL(soundPreviewUrl);
-    soundPreviewUrl = "";
+    try {
+      soundPreviewSource?.stop();
+    } catch {
+    }
+    soundPreviewSource = null;
+    if (soundPreviewContext) void soundPreviewContext.close().catch(() => void 0);
+    soundPreviewContext = null;
   }
+  let favoriteSounds = [];
   async function refreshSoundLibrary() {
     const response = await soundLibraryRequest("chat_voice_sound_library_list");
     if (soundLibraryDisposed) return;
+    favoriteSounds = response.favorites ?? [];
+    renderSoundLibrary();
+  }
+  function renderSoundLibrary() {
     soundList.replaceChildren();
-    if (!response.favorites?.length) {
+    const query = soundSearch.value.trim().toLocaleLowerCase();
+    const visible = favoriteSounds.filter((favorite) => (soundFilter.value === "all" || soundFilter.value === favorite.kind) && (!query || [favorite.name, favorite.description, ...favorite.tags].some((text) => text.toLocaleLowerCase().includes(query))));
+    if (!visible.length) {
       const empty = document.createElement("div");
       empty.className = "chat-voice-hint";
-      empty.textContent = "No favorite sounds yet.";
+      empty.textContent = favoriteSounds.length ? "No matching favorite sounds." : "No favorite sounds yet.";
       soundList.appendChild(empty);
       return;
     }
-    for (const favorite of response.favorites) {
+    for (const favorite of visible) {
       const row = document.createElement("div");
       row.className = "chat-voice-favorite-row";
       const name = document.createElement("input");
@@ -4487,20 +4525,39 @@ function setup(ctx) {
       preview.textContent = "Preview";
       preview.addEventListener("click", () => {
         void (async () => {
+          stopSoundPreview();
+          stopVoicePreview();
+          const generation = soundPreviewGeneration;
           try {
-            stopSoundPreview();
-            stopVoicePreview();
-            const generation = soundPreviewGeneration;
+            const Context = window.AudioContext ?? window.webkitAudioContext;
+            if (!Context) throw new Error("Audio preview is unavailable in this browser.");
+            const context2 = new Context();
+            soundPreviewContext = context2;
+            await context2.resume();
             const result = await soundLibraryRequest("chat_voice_sound_library_read", { id: favorite.id });
             if (soundLibraryDisposed || generation !== soundPreviewGeneration || !result.audio || !result.favorite) return;
             const binary = atob(result.audio);
             const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
-            soundPreviewUrl = URL.createObjectURL(new Blob([bytes], { type: result.favorite.mime }));
-            soundPreview = new Audio(soundPreviewUrl);
-            soundPreview.onended = stopSoundPreview;
-            await soundPreview.play();
+            const decoded = await context2.decodeAudioData(bytes.buffer);
+            if (soundLibraryDisposed || generation !== soundPreviewGeneration) return;
+            if (decoded.duration > 120 || decoded.numberOfChannels > 2) throw new Error("Sound preview requires mono or stereo audio of at most 120 seconds.");
+            const channels = Array.from({ length: decoded.numberOfChannels }, (_, index) => decoded.getChannelData(index));
+            const source = context2.createBufferSource();
+            const gain = context2.createGain();
+            gain.gain.value = soundCategoryGain(channels, result.favorite.kind);
+            source.buffer = decoded;
+            source.connect(gain);
+            gain.connect(context2.destination);
+            soundPreviewSource = source;
+            source.onended = () => {
+              if (generation === soundPreviewGeneration) stopSoundPreview();
+            };
+            source.start();
           } catch (error) {
-            setStatus(error instanceof Error ? error.message : "Could not preview sound.", "error");
+            if (generation === soundPreviewGeneration) {
+              stopSoundPreview();
+              setStatus(error instanceof Error ? error.message : "Could not preview sound.", "error");
+            }
           }
         })();
       });
@@ -4544,6 +4601,8 @@ function setup(ctx) {
       soundList.appendChild(row);
     }
   }
+  soundSearch.addEventListener("input", renderSoundLibrary);
+  soundFilter.addEventListener("change", renderSoundLibrary);
   soundsSection.addEventListener("toggle", () => {
     if (soundsSection.open) {
       void refreshSoundLibrary().catch((error) => setStatus(error instanceof Error ? error.message : "Could not load sounds.", "error"));

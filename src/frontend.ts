@@ -3,6 +3,7 @@ import type {
   SpindleTextInputHandle,
 } from 'lumiverse-spindle-types'
 import type { FavoriteSound } from './sound-library'
+import { soundCategoryGain } from './sound-mix'
 import { AutoplayRequestRegistry, PlaybackLongPress, PlaybackStartupGuard, syncAutoplayIndicators, syncPlaybackButtons, waitForAutoplayDeadline, waitForAutoplayWork, type PlaybackButtonState } from './playback-ui'
 import {
   activeGhostVoices,
@@ -1836,7 +1837,14 @@ export function setup(ctx: SpindleFrontendContext) {
   const soundList = document.createElement('div')
   soundList.className = 'chat-voice-favorite-list'
   soundList.setAttribute('aria-label', 'Favorite sound effects')
-  soundLibraryPanel.append(soundsHint, soundFile, soundName, soundTags, soundKind, soundAdd, soundList)
+  const soundSearch = document.createElement('input')
+  soundSearch.placeholder = 'Search favorite sounds'; soundSearch.setAttribute('aria-label', 'Search favorite sounds')
+  const soundFilter = document.createElement('select')
+  soundFilter.setAttribute('aria-label', 'Filter favorite sounds')
+  for (const [value, label] of [['all', 'All sounds'], ['ambience', 'Ambience'], ['event', 'Events']]) {
+    const option = document.createElement('option'); option.value = value; option.textContent = label; soundFilter.append(option)
+  }
+  soundLibraryPanel.append(soundsHint, soundFile, soundName, soundTags, soundKind, soundAdd, soundSearch, soundFilter, soundList)
   soundsBody.append(soundTabs, soundEffectsPanel, soundLibraryPanel, soundAdvancedPanel)
   soundsSection.append(soundsSummary, soundsBody)
   const status = document.createElement('div')
@@ -2224,8 +2232,8 @@ export function setup(ctx: SpindleFrontendContext) {
   }>()
   const pendingSoundLibrary = new Map<string, { resolve: (value: SoundLibraryPayload) => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout> }>()
   let soundLibrarySequence = 0
-  let soundPreview: HTMLAudioElement | null = null
-  let soundPreviewUrl = ''
+  let soundPreviewContext: AudioContext | null = null
+  let soundPreviewSource: AudioBufferSourceNode | null = null
   let soundPreviewGeneration = 0
   let soundLibraryDisposed = false
   const pendingStateRequests = new Map<string, {
@@ -2302,21 +2310,30 @@ export function setup(ctx: SpindleFrontendContext) {
 
   function stopSoundPreview(): void {
     soundPreviewGeneration += 1
-    soundPreview?.pause()
-    soundPreview = null
-    if (soundPreviewUrl) URL.revokeObjectURL(soundPreviewUrl)
-    soundPreviewUrl = ''
+    try { soundPreviewSource?.stop() } catch { /* already stopped */ }
+    soundPreviewSource = null
+    if (soundPreviewContext) void soundPreviewContext.close().catch(() => undefined)
+    soundPreviewContext = null
   }
 
+  let favoriteSounds: FavoriteSound[] = []
   async function refreshSoundLibrary(): Promise<void> {
     const response = await soundLibraryRequest('chat_voice_sound_library_list')
     if (soundLibraryDisposed) return
+    favoriteSounds = response.favorites ?? []
+    renderSoundLibrary()
+  }
+
+  function renderSoundLibrary(): void {
     soundList.replaceChildren()
-    if (!response.favorites?.length) {
-      const empty = document.createElement('div'); empty.className = 'chat-voice-hint'; empty.textContent = 'No favorite sounds yet.'; soundList.appendChild(empty)
+    const query = soundSearch.value.trim().toLocaleLowerCase()
+    const visible = favoriteSounds.filter(favorite => (soundFilter.value === 'all' || soundFilter.value === favorite.kind)
+      && (!query || [favorite.name, favorite.description, ...favorite.tags].some(text => text.toLocaleLowerCase().includes(query))))
+    if (!visible.length) {
+      const empty = document.createElement('div'); empty.className = 'chat-voice-hint'; empty.textContent = favoriteSounds.length ? 'No matching favorite sounds.' : 'No favorite sounds yet.'; soundList.appendChild(empty)
       return
     }
-    for (const favorite of response.favorites) {
+    for (const favorite of visible) {
       const row = document.createElement('div'); row.className = 'chat-voice-favorite-row'
       const name = document.createElement('input'); name.value = favorite.name; name.maxLength = 120; name.setAttribute('aria-label', 'Favorite sound name')
       const tags = document.createElement('input'); tags.value = favorite.tags.join(', '); tags.setAttribute('aria-label', `Trigger words for ${favorite.name}`)
@@ -2327,18 +2344,30 @@ export function setup(ctx: SpindleFrontendContext) {
       kind.value = favorite.kind
       const preview = document.createElement('button'); preview.type = 'button'; preview.className = 'chat-voice-preview-button'; preview.textContent = 'Preview'
       preview.addEventListener('click', () => { void (async () => {
+        stopSoundPreview(); stopVoicePreview()
+        const generation = soundPreviewGeneration
         try {
-          stopSoundPreview(); stopVoicePreview()
-          const generation = soundPreviewGeneration
+          const Context = window.AudioContext ?? (window as typeof window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext
+          if (!Context) throw new Error('Audio preview is unavailable in this browser.')
+          const context = new Context()
+          soundPreviewContext = context
+          await context.resume()
           const result = await soundLibraryRequest('chat_voice_sound_library_read', { id: favorite.id })
           if (soundLibraryDisposed || generation !== soundPreviewGeneration || !result.audio || !result.favorite) return
           const binary = atob(result.audio)
           const bytes = Uint8Array.from(binary, char => char.charCodeAt(0))
-          soundPreviewUrl = URL.createObjectURL(new Blob([bytes], { type: result.favorite.mime }))
-          soundPreview = new Audio(soundPreviewUrl)
-          soundPreview.onended = stopSoundPreview
-          await soundPreview.play()
-        } catch (error) { setStatus(error instanceof Error ? error.message : 'Could not preview sound.', 'error') }
+          const decoded = await context.decodeAudioData(bytes.buffer)
+          if (soundLibraryDisposed || generation !== soundPreviewGeneration) return
+          if (decoded.duration > 120 || decoded.numberOfChannels > 2) throw new Error('Sound preview requires mono or stereo audio of at most 120 seconds.')
+          const channels = Array.from({ length: decoded.numberOfChannels }, (_, index) => decoded.getChannelData(index))
+          const source = context.createBufferSource()
+          const gain = context.createGain()
+          gain.gain.value = soundCategoryGain(channels, result.favorite.kind)
+          source.buffer = decoded; source.connect(gain); gain.connect(context.destination)
+          soundPreviewSource = source
+          source.onended = () => { if (generation === soundPreviewGeneration) stopSoundPreview() }
+          source.start()
+        } catch (error) { if (generation === soundPreviewGeneration) { stopSoundPreview(); setStatus(error instanceof Error ? error.message : 'Could not preview sound.', 'error') } }
       })() })
       const save = document.createElement('button'); save.type = 'button'; save.className = 'chat-voice-preview-button'; save.textContent = 'Save'
       save.addEventListener('click', () => { void (async () => {
@@ -2358,6 +2387,8 @@ export function setup(ctx: SpindleFrontendContext) {
       row.append(name, tags, kind, preview, save, remove); soundList.appendChild(row)
     }
   }
+  soundSearch.addEventListener('input', renderSoundLibrary)
+  soundFilter.addEventListener('change', renderSoundLibrary)
 
   soundsSection.addEventListener('toggle', () => {
     if (soundsSection.open) {
