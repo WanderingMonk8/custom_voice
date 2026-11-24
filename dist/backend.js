@@ -211,6 +211,7 @@ function readGhostVoices(value) {
     if (!item || typeof item !== "object") return [];
     const row = item;
     if (typeof row.id !== "string" || typeof row.speakerId !== "string" || typeof row.voiceId !== "string" || !row.id || !row.voiceId) return [];
+    if (isNonNameSpeakerId(row.speakerId)) return [];
     return [{
       id: row.id.slice(0, 128),
       speakerId: row.speakerId.slice(0, 256),
@@ -314,6 +315,18 @@ function purgeExpiredGhostContexts(ghosts, assistantMessageIds, lifetime) {
     changed = true;
   }
   return changed;
+}
+function hasStrongNarrativeName(text) {
+  const narrative = narrativeOnly(text);
+  for (const match of narrative.matchAll(/\b([\p{Lu}][\p{Ll}\p{M}'’-]{1,39})\s+(?:is|was|has|had|stands|stood|sits|sat|turns|turned|looks|looked|says|said|asks|asked|answers|answered|replies|replied|huffs|huffed|slaps|slapped|calls|called|shouts|shouted|speaks|spoke|mutters|muttered|laughs|laughed|glances|glanced|walks|walked|moves|moved|steps|stepped|nods|nodded)\b/gu)) {
+    const name = normalizeSpeakerName(match[1]);
+    if (name && !NON_NAME_PARAGRAPH_LEADS.has(name.toLowerCase())) return true;
+  }
+  return false;
+}
+var NEW_UNCAST_VOICE_CUE_PATTERN = /(?:\b(?:a|an|another)\s+(?:new|different|other|second|third|next)\s+(?:voice|speaker)\b|\bthe\s+other\s+(?:voice|speaker)\b|\bsomeone else\s+(?:answers|answer|says|speaks|replies|responds)\b)/iu;
+function hasNewAnonymousVoiceCue(text) {
+  return NEW_UNCAST_VOICE_CUE_PATTERN.test(narrativeOnly(text));
 }
 function canReserveAutomaticVoice(voiceId, reserved, ghosts, existingGhostId = "") {
   return !!voiceId && !reserved.has(voiceId) && !ghosts.some((ghost) => ghost.voiceId === voiceId && ghost.id !== existingGhostId);
@@ -500,13 +513,14 @@ function voiceDecisionSummaryTerse(voice) {
   if (tags.length) parts.push(`tags: ${tags.join(", ")}`);
   return parts.join("; ") || "No details provided.";
 }
-function buildUncastVoiceDecision(groups, voices, message, ghosts = [], previousMessages = [], trimCriteria = false) {
+function buildUncastVoiceDecision(groups, voices, message, ghosts = [], previousMessages = [], trimCriteria = false, cast = []) {
   const labels = uncastIdentityLabels(message, ghosts);
   const narrativeNames = uncastNarrativeNameCandidates(message);
   const state = {
     message,
     previousMessages,
     narrativeNames,
+    ...cast.length ? { cast: cast.map((member) => ({ id: member.id, name: member.name, ...member.description ? { description: member.description } : {} })) } : {},
     characters: groups.map((group) => ({
       id: group.id,
       identity: group.speakerId,
@@ -559,6 +573,14 @@ function buildUncastVoiceDecision(groups, voices, message, ghosts = [], previous
       instructions: `Does a person explicitly named in CURRENT narration actually speak the quotations in ${group.id}? Trace nearby pronouns, actions, dialogue and previousMessages. Names of addressees, bystanders, narrators, and people merely discussed are not speaker identities. Choose none unless the evidence clearly identifies the speaker.`,
       criteria: { none: "No named person is clearly identified as this speaker.", ...Object.fromEntries(narrativeNames.map((name, index) => [`name_${index}`, name])) }
     };
+    if (cast.length) questions[`cast_${group.id}`] = {
+      type: "choice",
+      instructions: `Is the person who speaks the quoted dialogue in ${group.id} one of the established cast characters listed in state.cast? Established cast members already have their own voice, so an unlisted voice is only for someone new. When the scene refers to the speaker by family role or relationship ("his mother answers", "the sister calls"), a cast member whose description matches that role is the speaker. Trace the current exchange and previousMessages: who is present, who acts, who is addressed, and who a name or relationship refers to. A person mentioned in narration, addressed by the speaker, or merely present is not the speaker. Choose none only when no cast member plausibly fits.`,
+      criteria: {
+        none: "The speaker is a new, unnamed, or unlisted character.",
+        ...Object.fromEntries(cast.map((member, index) => [`cast_${index}`, member.description ? `${member.name} (${member.id}) \u2014 ${member.description}` : `${member.name} (${member.id})`]))
+      }
+    };
     const earlier = groups.slice(0, groups.indexOf(group));
     if (ghosts.length || earlier.length) questions[`identity_${group.id}`] = {
       type: "choice",
@@ -598,6 +620,97 @@ function revealedUncastName(group, answers = {}, message = "") {
   const jev = match && answer && answer.confidence >= 0.8 && probability >= 0.8 && probability - runnerUp >= 0.25 ? (uncastNarrativeNameCandidates(message)[Number(match[1])] ?? "").toLowerCase() : "";
   if (jev) return jev;
   return group.inferredName && !isBroadPersonLabel(group.inferredName) ? group.inferredName.toLowerCase() : "";
+}
+var RELATIONSHIP_ROLE_WORDS = new Map([
+  ...["mother", "mom", "mommy", "mum", "mummy", "mama"].map((word) => [word, "mother"]),
+  ...["father", "dad", "daddy", "papa"].map((word) => [word, "father"]),
+  ...["sister", "brother", "daughter", "son", "wife", "husband", "niece", "nephew", "cousin", "girlfriend", "boyfriend", "roommate", "fiance", "fiancee"].map((word) => [word, word]),
+  ...["aunt", "auntie"].map((word) => [word, "aunt"]),
+  ...["uncle"].map((word) => [word, "uncle"]),
+  ...["grandmother", "grandma", "granny", "nana"].map((word) => [word, "grandmother"]),
+  ...["grandfather", "grandpa"].map((word) => [word, "grandfather"]),
+  ...["stepmother", "stepfather", "stepsister", "stepbrother"].map((word) => [word, word])
+]);
+var RELATIONSHIP_ROLE_ALIAS_WORDS = {
+  mother: ["Mother", "Mom"],
+  father: ["Father", "Dad"],
+  sister: ["Sister"],
+  brother: ["Brother"],
+  daughter: ["Daughter"],
+  son: ["Son"],
+  wife: ["Wife"],
+  husband: ["Husband"],
+  aunt: ["Aunt", "Auntie"],
+  uncle: ["Uncle"],
+  grandmother: ["Grandmother", "Grandma"],
+  grandfather: ["Grandfather", "Grandpa"],
+  niece: ["Niece"],
+  nephew: ["Nephew"],
+  cousin: ["Cousin"],
+  girlfriend: ["Girlfriend"],
+  boyfriend: ["Boyfriend"],
+  roommate: ["Roommate"],
+  fiance: ["Fiance"],
+  fiancee: ["Fiancee"],
+  stepmother: ["Stepmother"],
+  stepfather: ["Stepfather"],
+  stepsister: ["Stepsister"],
+  stepbrother: ["Stepbrother"]
+};
+function cardRelationshipRoles(text, aliases) {
+  const names = [...new Set(aliases.map((alias) => alias.trim()).filter(Boolean))].sort((left, right) => right.length - left.length);
+  if (!names.length || !text.trim()) return [];
+  const source = text.replace(/[\u2019]/gu, "'").replace(/\{\{\s*char\s*\}\}/giu, names[0]);
+  const escape = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const namePattern = names.map(escape).join("|");
+  const namedPossessive = "[A-Z][\\p{L}'-]*(?:\\s*(?:,|and|&|\\+)\\s*[A-Z][\\p{L}'-]*)*'s";
+  const possessive = `(?:${namedPossessive}\\s+|his\\s+|her\\s+|their\\s+|its\\s+)?`;
+  const roleWords = [...RELATIONSHIP_ROLE_WORDS.keys()].sort((left, right) => right.length - left.length).map(escape).join("|");
+  const modifiers = "(?:[\\p{Ll}'-]+\\s+){0,2}";
+  const patterns = [
+    // "Aiko is Ken's mother", "Aiko is a mother"
+    new RegExp(`\\b(?:${namePattern})\\s+(?:is|was|serves as|acts as)\\s+(?:the\\s+|a\\s+|an\\s+)?${possessive}${modifiers}(${roleWords})\\b`, "giu"),
+    // "Aiko, Ken's mother, …", "Aiko — the mother — …"
+    new RegExp(`\\b(?:${namePattern})\\s*[,\u2014\u2013-]\\s*(?:the\\s+)?${possessive}${modifiers}(${roleWords})\\b`, "giu"),
+    // "She is Ken's mother", "He acts as their father"
+    new RegExp(`\\b(?:he|she|they)\\s+(?:is|was|serves as|acts as)\\s+(?:the\\s+|a\\s+|an\\s+)?${possessive}${modifiers}(${roleWords})\\b`, "giu"),
+    // First and second person cards: "I am Ken's mother", "You are the mother."
+    new RegExp(`\\b(?:i(?:'m| am)|you(?:'re| are))\\s+(?:the\\s+|a\\s+|an\\s+)?${possessive}${modifiers}(${roleWords})\\b`, "giu"),
+    // "Ken's mother is Aiko"
+    new RegExp(`\\b${namedPossessive}\\s+${modifiers}(${roleWords})\\s+(?:is|was)\\s+(?:${namePattern})\\b`, "gu")
+  ];
+  const roles = [];
+  for (const pattern of patterns) {
+    for (const match of source.matchAll(pattern)) {
+      const role = RELATIONSHIP_ROLE_WORDS.get(match[1].toLowerCase());
+      if (role && !roles.includes(role)) roles.push(role);
+    }
+  }
+  return roles;
+}
+function cardRelationshipAliases(cards) {
+  const claims = /* @__PURE__ */ new Map();
+  const rolesByCard = /* @__PURE__ */ new Map();
+  for (const card of cards) {
+    const text = [card.description, card.personality, card.scenario, card.creatorNotes, card.firstMes].filter((part) => typeof part === "string" && part.trim().length > 0).join("\n").slice(0, 6e3);
+    const roles = cardRelationshipRoles(text, speakerAliases(card.name));
+    rolesByCard.set(card.id, roles);
+    for (const role of roles) claims.set(role, [...claims.get(role) ?? [], card.id]);
+  }
+  const result = /* @__PURE__ */ new Map();
+  for (const [id, roles] of rolesByCard) {
+    const words = roles.filter((role) => (claims.get(role) ?? []).length === 1).flatMap((role) => RELATIONSHIP_ROLE_ALIAS_WORDS[role] ?? []);
+    if (words.length) result.set(id, words.slice(0, 2));
+  }
+  return result;
+}
+function withRelationshipAliases(name, aliases) {
+  const base = name.trim();
+  if (!base) return name;
+  const existing = new Set(speakerAliases(name).map((alias) => alias.toLowerCase()));
+  const additions = [...new Set(aliases.filter((alias) => alias.trim() && !existing.has(alias.trim().toLowerCase())))];
+  if (!additions.length) return name;
+  return [base, ...additions].join(" / ").slice(0, 4096);
 }
 function latestGhostOccurrenceIndex(ghosts, key) {
   let found = -1;
@@ -703,6 +816,33 @@ function buildUncastIdentityReview(groups, answers, message, ghosts = [], messag
   }
   return { state: { message, previousMessages, characters: groups.map((group) => ({ id: group.id, identity: group.speakerId, speeches: group.speeches, context: group.context })), ghosts: ghosts.map((ghost, index) => ({ option: `ghost_${index}`, identity: ghost.speakerId, aliases: ghostCastAliases(ghost), priorMessageIds: ghostPriorMessageIds(ghost, previousMessages), context: ghost.context, conversationHistory: ghost.conversationHistory ?? [] })) }, questions };
 }
+var NARRATED_ROLE_ALIASES = new Map([
+  ...["mother", "mom", "mommy", "mum", "mummy", "mama"].map((word) => [word, "mother"]),
+  ...["father", "dad", "daddy", "papa"].map((word) => [word, "father"]),
+  ...["sister", "sis"].map((word) => [word, "sister"]),
+  ...["brother", "bro"].map((word) => [word, "brother"]),
+  ...["daughter", "son", "wife", "husband", "aunt", "uncle", "niece", "nephew", "cousin", "girlfriend", "boyfriend", "fiance", "fiancee", "friend", "boss", "teacher", "landlady", "landlord", "neighbor", "roommate", "partner"].map((word) => [word, word]),
+  ...["grandmother", "grandma", "granny", "nana"].map((word) => [word, "grandmother"]),
+  ...["grandfather", "grandpa"].map((word) => [word, "grandfather"])
+]);
+function narratedSpeakerRoles(context) {
+  const text = context.replace(/[\u2019]/gu, "'");
+  const roles = [];
+  const pattern = /(?:\b(?:his|her|their|my|your|His|Her|Their|My|Your)\s+|\bthe\s+|\b[\p{Lu}][\p{L}'’-]{1,30}'s\s+)([\p{Ll}]{3,})\s+(?:answers?|answered|repl(?:y|ies|ied)|says?|said|asks?|asked|calls?|called|whispers?|whispered|murmurs?|murmured|adds?|added|continues?|continued|snaps?|snapped|sighs?|sighed|laughs?|laughed|shouts?|shouted|tells?|told|begins?|began|returns?|returned|agrees?|agreed)\b/gu;
+  for (const match of text.matchAll(pattern)) {
+    const role = NARRATED_ROLE_ALIASES.get(match[1].toLowerCase());
+    if (role && !roles.includes(role)) roles.push(role);
+  }
+  return roles;
+}
+function castDescriptionRoles(description) {
+  const roles = [];
+  for (const token of description.toLowerCase().replace(/[^\p{L}']+/gu, " ").split(/\s+/u)) {
+    const role = NARRATED_ROLE_ALIASES.get(token.replace(/'s$/u, ""));
+    if (role && !roles.includes(role)) roles.push(role);
+  }
+  return roles;
+}
 function isBroadPersonLabel(label) {
   return /^(?:(?:the|a|an)\s+)?(?:(?:young|younger|old|older|elderly|middle-aged|tall|short)\s+)*(?:woman|man|person|girl|boy|guy|lady|stranger|someone|somebody)$/iu.test(label.trim());
 }
@@ -733,7 +873,7 @@ function labelGenderHint(label) {
 function narrationBoostsPair(group, partner) {
   return !!group.narratedName && group.flankPartners?.includes(partner.id) === true && partner.addressee === group.narratedName;
 }
-function resolveUncastVoiceDecisions(groups, voices, answers, ghosts = [], reserved = [], messageId = "", message = "", previousMessageIds = [], random = Math.random) {
+function resolveUncastVoiceDecisions(groups, voices, answers, ghosts = [], reserved = [], messageId = "", message = "", previousMessageIds = [], random = Math.random, cast = []) {
   const used = /* @__PURE__ */ new Set([...reserved.filter(Boolean), ...ghosts.map((it) => it.voiceId).filter(Boolean)]);
   const assignments = [];
   const roots = /* @__PURE__ */ new Map();
@@ -746,12 +886,41 @@ function resolveUncastVoiceDecisions(groups, voices, answers, ghosts = [], reser
   const groupLabels = /* @__PURE__ */ new Map();
   const rootByLabel = /* @__PURE__ */ new Map();
   const rootByRevealedName = /* @__PURE__ */ new Map();
+  const pendingUnnamedVoices = [];
+  const pendingCastVoices = [];
+  const hasNewVoiceEvidence = (members) => members.some((group) => group.context.some((context) => hasNewAnonymousVoiceCue(context) || hasStrongNarrativeName(context)));
+  const groupShowsNamedIdentity = (group) => {
+    if (revealedUncastName(group, answers, message)) return true;
+    if (normalizeSpeakerName(group.narratedName ?? "")) return true;
+    const label = groupLabels.get(group.id);
+    return !!label && !isBroadPersonLabel(label);
+  };
   const strongChoice = (answer) => {
     if (!answer || answer.choice === "new_or_unclear") return false;
     if (!Number.isFinite(answer.confidence) || answer.confidence < 0 || answer.confidence > 1 || !answer.probabilities || Object.values(answer.probabilities).some((value) => !Number.isFinite(value) || value < 0 || value > 1)) return false;
     const probability = answer.probabilities[answer.choice] ?? 0;
     const runnerUp = Math.max(0, ...Object.entries(answer.probabilities).filter(([key]) => key !== answer.choice).map(([, p]) => p));
     return answer.confidence >= 0.8 && probability >= 0.8 && probability - runnerUp >= 0.25;
+  };
+  const castChoice = (answer) => {
+    if (!answer || !answer.choice.startsWith("cast_") || !answer.probabilities) return false;
+    const probability = answer.probabilities[answer.choice] ?? 0;
+    const runnerUp = Math.max(0, ...Object.entries(answer.probabilities).filter(([key]) => key !== answer.choice).map(([, p]) => p));
+    return Number.isFinite(answer.confidence) && answer.confidence >= 0.6 && probability >= 0.7 && probability - runnerUp >= 0.25;
+  };
+  const castSpeakerFor = (members) => {
+    const picks = members.flatMap((group) => {
+      const answer = answers[`cast_${group.id}`];
+      if (!castChoice(answer)) return [];
+      const match = answer.choice.match(/^cast_(\d+)$/u);
+      const member = match ? cast[Number(match[1])] : void 0;
+      return member ? [member] : [];
+    });
+    if (picks.length) return picks.every((member) => member.id === picks[0].id) ? picks[0] : void 0;
+    const roles = [...new Set(members.flatMap((group) => narratedSpeakerRoles(group.context.join(" "))))];
+    if (!roles.length) return void 0;
+    const matching = cast.filter((member) => member.description && roles.every((role) => castDescriptionRoles(member.description).includes(role)));
+    return matching.length === 1 ? matching[0] : void 0;
   };
   for (const group of groups) {
     let root = group.id;
@@ -920,6 +1089,45 @@ function resolveUncastVoiceDecisions(groups, voices, answers, ghosts = [], reser
         linkReasons.delete(root);
       }
     }
+    const castMember = ghost || !cast.length ? void 0 : castSpeakerFor(members);
+    if (castMember && members.every((group) => !groupShowsNamedIdentity(group))) {
+      used.add(castMember.voiceId);
+      if (!pendingCastVoices.some((member) => member.id === castMember.id)) pendingCastVoices.push(castMember);
+      for (const group of members) {
+        assignments.push({
+          groupId: group.id,
+          voiceId: castMember.voiceId,
+          gender,
+          castSpeakerId: castMember.id,
+          matchReason: `existing cast member: ${castMember.name} (${castMember.id})`
+        });
+      }
+      continue;
+    }
+    if (!ghost) {
+      const unidentified = members.every((group) => !strongChoice(answers[`identity_${group.id}`]));
+      const unnamedMembers = members.every((group) => group.speakerId === UNCAST_SPEAKER_ID && !groupShowsNamedIdentity(group));
+      const definiteGender = gender === "male" || gender === "female";
+      const sharedCast = unidentified && unnamedMembers && definiteGender && pendingCastVoices.length === 1 && !hasNewVoiceEvidence(members) ? pendingCastVoices[0] : void 0;
+      if (sharedCast) {
+        for (const group of members) {
+          assignments.push({
+            groupId: group.id,
+            voiceId: sharedCast.voiceId,
+            gender,
+            castSpeakerId: sharedCast.id,
+            matchReason: `same exchange as cast member: ${sharedCast.name} (${sharedCast.id})`
+          });
+        }
+        continue;
+      }
+      const shared = unidentified && unnamedMembers && definiteGender ? pendingUnnamedVoices.find((entry) => voiceGenderCompatible(entry.voice, gender)) : void 0;
+      if (shared) {
+        ghost = shared.ghost;
+        ghost.context = [ghost.context, ...members.flatMap((group) => group.context)].filter(Boolean).join(" ").slice(0, 2e3);
+        linkReasons.set(root, "reuses the exchange's unidentified voice");
+      }
+    }
     if (!ghost) {
       const matches = members.map((group) => answers[`voice_${group.id}`]).filter((answer) => !!answer);
       const candidates = voices.flatMap((voice, index) => {
@@ -932,6 +1140,9 @@ function resolveUncastVoiceDecisions(groups, voices, answers, ghosts = [], reser
       const shortlist = shortlistRankedVoices(candidates, (entry) => entry.score);
       const chosen = shortlist[Math.min(shortlist.length - 1, Math.floor(random() * shortlist.length))].voice;
       ghost = { id: `pending:${root}`, speakerId: members[0].speakerId, voiceId: chosen.id, context: members.flatMap((group) => group.context).join(" ").slice(0, 2e3), occurrenceKeys: [], lastSeenMessageId: messageId };
+      if (members.every((group) => group.speakerId === UNCAST_SPEAKER_ID && !groupShowsNamedIdentity(group))) {
+        pendingUnnamedVoices.push({ ghost, voice: chosen });
+      }
       linkReasons.set(root, "new voice selected from favorites");
     }
     used.add(ghost.voiceId);
@@ -1285,6 +1496,100 @@ var PREPOSITION_BEFORE_NAME_PATTERN = new RegExp(
   `\\b(?:${PREPOSITION_WORDS.join("|")})\\s*$`,
   "iu"
 );
+function isNonNameSpeakerId(speakerId) {
+  const name = speakerId.startsWith("unconfigured:") ? speakerId.slice("unconfigured:".length) : "";
+  if (!name) return false;
+  const aliases = speakerAliases(name);
+  const first = aliases[0]?.split(/\s+/u)[0]?.toLowerCase() ?? "";
+  return !first || NON_NAME_WORDS.has(first) || aliases.some((alias) => NON_NAME_WORDS.has(alias.toLowerCase()));
+}
+var NON_NAME_WORDS = /* @__PURE__ */ new Set([
+  ...NON_NAME_PARAGRAPH_LEADS,
+  "all",
+  "almost",
+  "already",
+  "also",
+  "always",
+  "another",
+  "any",
+  "anything",
+  "anywhere",
+  "both",
+  "each",
+  "either",
+  "even",
+  "eventually",
+  "every",
+  "everybody",
+  "everything",
+  "everywhere",
+  "finally",
+  "fine",
+  "first",
+  "good",
+  "half",
+  "hey",
+  "hi",
+  "however",
+  "instead",
+  "just",
+  "last",
+  "later",
+  "many",
+  "maybe",
+  "meanwhile",
+  "most",
+  "much",
+  "neither",
+  "never",
+  "next",
+  "no",
+  "nobody",
+  "noone",
+  "none",
+  "not",
+  "nothing",
+  "nowhere",
+  "now",
+  "oh",
+  "ok",
+  "okay",
+  "once",
+  "only",
+  "other",
+  "otherwise",
+  "perhaps",
+  "probably",
+  "quite",
+  "rather",
+  "really",
+  "right",
+  "second",
+  "simply",
+  "since",
+  "soon",
+  "still",
+  "such",
+  "sure",
+  "suddenly",
+  "third",
+  "too",
+  "twice",
+  "very",
+  "well",
+  "whatever",
+  "whenever",
+  "wherever",
+  "why",
+  "yes",
+  "yet"
+]);
+function isPlausiblePersonName(name, narration, aliases) {
+  const first = aliases[0]?.split(/\s+/u)[0]?.toLowerCase() ?? "";
+  if (!first || NON_NAME_WORDS.has(first)) return false;
+  if (aliases.some((alias) => NON_NAME_WORDS.has(alias.toLowerCase()))) return false;
+  return !new RegExp(`\\b${escapedPattern(name.toLowerCase())}\\b`, "u").test(narration);
+}
 var INTRODUCTORY_PREPOSITIONAL_PHRASE_PATTERN = new RegExp(
   `^\\s*(?:${PREPOSITION_WORDS.join("|")})\\b(?:\\s+[\\p{L}\\p{M}'\u2019-]+){1,7}\\s*,?\\s*$`,
   "iu"
@@ -1296,11 +1601,13 @@ function addUnconfiguredDialogueSpeakers(content, speakers, skippedTrackerTagPai
   const preparedContent = preparePlaybackContent(content, skippedTrackerTagPairs);
   const result = [...speakers];
   const knownAliases = new Set(result.flatMap((speaker) => speakerAliases(speaker.name).map((alias) => alias.toLowerCase())));
+  const narrationForNames = narrativeOnly(preparedContent);
   const addCandidate = (rawName, explicitlyAttributed = false) => {
     const name = normalizeSpeakerName(rawName.replace(/['’]s$/u, ""));
     const aliases = speakerAliases(name);
     const first = aliases[0]?.split(/\s+/u)[0]?.toLowerCase() ?? "";
-    if (!name || !first || NON_NAME_PARAGRAPH_LEADS.has(first)) return;
+    if (!name || !first) return;
+    if (!isPlausiblePersonName(name, narrationForNames, aliases)) return;
     if (aliases.some((alias) => knownAliases.has(alias.toLowerCase()))) return;
     if (!explicitlyAttributed) {
       const occurrences = [...preparedContent.matchAll(
@@ -1316,7 +1623,7 @@ function addUnconfiguredDialogueSpeakers(content, speakers, skippedTrackerTagPai
     result.push({ id, name });
     for (const alias of aliases) knownAliases.add(alias.toLowerCase());
   };
-  const narrative = narrativeOnly(preparedContent);
+  const narrative = narrationForNames;
   for (const match of narrative.matchAll(/\b([\p{Lu}][\p{L}\p{M}-]{1,63})['\u2019]s\s+[\p{L}\p{M}-]+/gu)) addCandidate(match[1]);
   for (const match of narrative.matchAll(/\b(?:and|but|then)\s+([\p{Lu}][\p{L}\p{M}-]{1,63})\s+[\p{Ll}][\p{L}\p{M}-]+/gu)) addCandidate(match[1]);
   for (const quote of playbackQuotes(preparedContent)) {
@@ -1481,25 +1788,97 @@ function decodePlaybackEntities(value) {
   return value.replace(/&nbsp;/gi, " ").replace(/&quot;|&#34;|&#x22;/gi, '"').replace(/&apos;|&#39;|&#x27;/gi, "'").replace(/&lt;|&#60;|&#x3c;/gi, "<").replace(/&gt;|&#62;|&#x3e;/gi, ">").replace(/&amp;|&#38;|&#x26;/gi, "&");
 }
 var TRACKER_TAG_NAME_RE = /^[a-z][a-z0-9:._-]*$/u;
+var TRACKER_COMMENT_RE = /<!--[\s\S]*?-->/gu;
+function extractEnclosedSkipRules(value) {
+  const pairs = [];
+  const remaining = value.replace(/^[\t ]*enclosed:[^\r\n]*/gimu, (line) => {
+    const rule = line.replace(/^[\t ]*enclosed:/iu, "");
+    let separator = -1;
+    let quoted = false;
+    let escaped = false;
+    for (let index = 0; index < rule.length; index++) {
+      const char = rule[index];
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+      if (char === "\\") {
+        escaped = true;
+        continue;
+      }
+      if (char === '"') {
+        quoted = !quoted;
+        continue;
+      }
+      if (char === "|" && !quoted) {
+        separator = index;
+        break;
+      }
+    }
+    if (separator < 0) return "";
+    const parseMarker = (raw) => {
+      const trimmed = raw.trim();
+      if (!trimmed) return null;
+      if (trimmed.startsWith('"')) {
+        try {
+          const parsed = JSON.parse(trimmed);
+          return typeof parsed === "string" && parsed.length ? parsed : null;
+        } catch {
+          return null;
+        }
+      }
+      return trimmed.replace(/\\([\\|])/gu, "$1");
+    };
+    const open = parseMarker(rule.slice(0, separator));
+    const close = parseMarker(rule.slice(separator + 1));
+    if (open && close && pairs.length < 100) pairs.push({ open, close });
+    return "";
+  });
+  return { remaining, pairs };
+}
 function normalizeTrackerTagName(value) {
   const tag = value.trim().toLowerCase();
   return TRACKER_TAG_NAME_RE.test(tag) ? tag : null;
 }
 function parseSkippedTrackerTagPairs(value) {
-  const decoded = decodePlaybackEntities(value);
+  const decoded = decodePlaybackEntities(extractEnclosedSkipRules(value).remaining);
   const pairs = [];
   const seen = /* @__PURE__ */ new Set();
-  const addPair = (open, close) => {
+  const addPair = (open, close, marker = false) => {
     if (!open || !close) return;
-    const key = `${open}\0${close}`;
+    const key = `${open.toLowerCase()}\0${close.toLowerCase()}`;
     if (seen.has(key)) return;
     seen.add(key);
-    pairs.push({ open, close });
+    pairs.push(marker ? { open, close, marker: true } : { open, close });
   };
-  const addSymmetric = (name) => addPair(name, name);
-  for (const entry of decoded.split(",")) {
+  const addSymmetric = (name, marker = false) => addPair(name, name, marker);
+  const full = () => pairs.length >= 100;
+  const comments = [...decoded.matchAll(TRACKER_COMMENT_RE)];
+  const consumed = [];
+  for (let index = 0; index + 1 < comments.length && !full(); index += 1) {
+    const left = comments[index];
+    const right = comments[index + 1];
+    if (left.index === void 0 || right.index === void 0) continue;
+    const leftEnd = left.index + left[0].length;
+    if (!/^\s*,?\s*$/u.test(decoded.slice(leftEnd, right.index))) continue;
+    addPair(left[0].trim(), right[0].trim(), true);
+    consumed.push({ start: left.index, end: right.index + right[0].length });
+    index += 1;
+  }
+  let entries = decoded;
+  for (let index = consumed.length - 1; index >= 0; index -= 1) {
+    entries = `${entries.slice(0, consumed[index].start)}${entries.slice(consumed[index].end)}`;
+  }
+  for (const entry of entries.split(",")) {
     const trimmed = entry.trim();
     if (!trimmed) continue;
+    if (/^prefix:/iu.test(trimmed)) continue;
+    const loneMarker = trimmed.match(/^<!--[\s\S]*?-->$/u);
+    if (loneMarker) {
+      addSymmetric(loneMarker[0], true);
+      if (full()) return pairs;
+      continue;
+    }
     const pairMatch = trimmed.match(
       /^\\?<\s*([a-z][a-z0-9:._-]*)(?=\s|>)[^>]*>\s*\\?<\s*\/\s*([a-z][a-z0-9:._-]*)(?=\s|>)[^>]*>$/iu
     );
@@ -1508,32 +1887,34 @@ function parseSkippedTrackerTagPairs(value) {
         normalizeTrackerTagName(pairMatch[1] ?? ""),
         normalizeTrackerTagName(pairMatch[2] ?? "")
       );
-      if (pairs.length >= 100) return pairs;
+      if (full()) return pairs;
       continue;
     }
     const tagMatch = trimmed.match(/^\\?<\s*([a-z][a-z0-9:._-]*)(?=\s|>)[^>]*>$/iu);
     if (tagMatch) {
       addSymmetric(normalizeTrackerTagName(tagMatch[1] ?? ""));
-      if (pairs.length >= 100) return pairs;
+      if (full()) return pairs;
       continue;
     }
     addSymmetric(normalizeTrackerTagName(trimmed));
-    if (pairs.length >= 100) return pairs;
+    if (full()) return pairs;
   }
   const legacyPattern = /\\?<\s*([a-z][a-z0-9:._-]*)(?=\s|>)[^>]*>[\s\S]*?\\?<\s*\/\s*\1\s*>/giu;
   for (const match of decoded.matchAll(legacyPattern)) {
     addSymmetric(normalizeTrackerTagName(match[1] ?? ""));
-    if (pairs.length >= 100) break;
+    if (full()) break;
   }
   return pairs;
 }
-function stripTagBlock(value, openTag, closeTag) {
-  const open = escapedPattern(openTag);
-  const close = escapedPattern(closeTag);
-  const tokenPattern = new RegExp(
-    `(\\\\?<\\s*${open}(?=\\s|>)[^>]*>)|(\\\\?<\\s*\\/\\s*${close}(?=\\s|>)[^>]*>)`,
-    "giu"
-  );
+function applyStripRanges(value, ranges) {
+  if (ranges.length === 0) return value;
+  let result = value;
+  for (let index = ranges.length - 1; index >= 0; index--) {
+    result = `${result.slice(0, ranges[index].start)} ${result.slice(ranges[index].end)}`;
+  }
+  return result;
+}
+function stripDelimitedBlock(value, tokenPattern) {
   const ranges = [];
   let depth = 0;
   let blockStart = -1;
@@ -1553,17 +1934,63 @@ function stripTagBlock(value, openTag, closeTag) {
       }
     }
   }
-  if (ranges.length === 0) return value;
-  let result = value;
-  for (let index = ranges.length - 1; index >= 0; index--) {
-    result = `${result.slice(0, ranges[index].start)} ${result.slice(ranges[index].end)}`;
+  return applyStripRanges(value, ranges);
+}
+function stripTagBlock(value, openTag, closeTag) {
+  const open = escapedPattern(openTag);
+  const close = escapedPattern(closeTag);
+  return stripDelimitedBlock(value, new RegExp(
+    `(\\\\?<\\s*${open}(?=\\s|>)[^>]*>)|(\\\\?<\\s*\\/\\s*${close}(?=\\s|>)[^>]*>)`,
+    "giu"
+  ));
+}
+function stripMarkerBlock(value, openMarker, closeMarker) {
+  if (openMarker.toLowerCase() === closeMarker.toLowerCase()) {
+    const ranges = [];
+    let openAt = -1;
+    for (const match of value.matchAll(new RegExp(escapedPattern(openMarker), "giu"))) {
+      if (match.index === void 0) continue;
+      if (openAt < 0) {
+        openAt = match.index;
+      } else {
+        ranges.push({ start: openAt, end: match.index + match[0].length });
+        openAt = -1;
+      }
+    }
+    return applyStripRanges(value, ranges);
   }
-  return result;
+  return stripDelimitedBlock(value, new RegExp(
+    `(${escapedPattern(openMarker)})|(${escapedPattern(closeMarker)})`,
+    "giu"
+  ));
 }
 function stripSkippedTrackerBlocks(content, tagPairs) {
-  let result = content.replace(/&lt;|&#60;|&#x3c;/gi, "<").replace(/&gt;|&#62;|&#x3e;/gi, ">").replace(/<!--[\s\S]*?-->/g, " ");
-  for (const pair of parseSkippedTrackerTagPairs(tagPairs)) {
-    result = stripTagBlock(result, pair.open, pair.close);
+  const enclosedRules = extractEnclosedSkipRules(tagPairs);
+  let result = content.replace(/&lt;|&#60;|&#x3c;/gi, "<").replace(/&gt;|&#62;|&#x3e;/gi, ">");
+  for (const { open, close } of enclosedRules.pairs) {
+    const ranges = [];
+    let searchFrom = 0;
+    while (searchFrom < result.length) {
+      const start = result.indexOf(open, searchFrom);
+      if (start < 0) break;
+      const end = result.indexOf(close, start + open.length);
+      if (end < 0) break;
+      searchFrom = end + close.length;
+      ranges.push({ start, end: searchFrom });
+    }
+    result = applyStripRanges(result, ranges);
+  }
+  const pairs = parseSkippedTrackerTagPairs(enclosedRules.remaining);
+  for (const pair of pairs) {
+    if (pair.marker) result = stripMarkerBlock(result, pair.open, pair.close);
+  }
+  for (const pair of pairs) {
+    if (!pair.marker) result = stripTagBlock(result, pair.open, pair.close);
+  }
+  result = result.replace(/<!--[\s\S]*?-->/g, " ");
+  const prefixes = [...decodePlaybackEntities(enclosedRules.remaining).matchAll(/(?:^|,)\s*prefix:([^,\s]+)\s*(?=,|$)/giu)].map((match) => (match[1] ?? "").toLowerCase());
+  if (prefixes.length) {
+    result = result.replace(/\S+/gu, (token) => prefixes.some((prefix) => token.toLowerCase().includes(prefix)) ? " " : token);
   }
   return result;
 }
@@ -2724,16 +3151,20 @@ function buildContextualUserReconciliation(plan, answers, context) {
 }
 function applyContextualUserReconciliation(plan, answers, reviewed, questions) {
   const speakers = plan.state.speakers.map((speaker) => ({ id: speaker.id, name: speaker.name }));
+  const userOption = plan.state.speakers.find((speaker) => speaker.id === USER_SPEAKER_ID)?.option;
   for (const speech of plan.state.speeches) {
     const key = `persona_check_${speech.id}`;
     if (!questions[key]) continue;
     const result = reviewed[key];
     answers[`persona_check_${speech.id}`] = result ?? { choice: "no_clear_identity", probabilities: {}, confidence: 0 };
     const checked = evaluateSpeakerDecisionAnswer(result, { user: USER_SPEAKER_ID, other: "other" }, { probability: 0.8, confidence: 0.75, margin: 0.25 });
+    const leaned = evaluateSpeakerDecisionAnswer(result, { user: USER_SPEAKER_ID, other: "other" }, { probability: 0.6, confidence: 0.45, margin: 0.2 });
+    const identityLeanedUser = Boolean(userOption) && [answers[`speech_${speech.id}`], answers[`relationship_review_${speech.id}`]].some((answer) => Boolean(answer) && answer.choice === userOption && (answer.probabilities[userOption] ?? 0) >= 0.6);
+    const personaConfirmed = checked.identity === USER_SPEAKER_ID || leaned.identity === USER_SPEAKER_ID && identityLeanedUser;
     const explicit = narrativeAttributionSpeaker(`${speech.narrativeBefore} ${speech.narrativeAfter}`, speakers);
     const candidate = answers[`relationship_review_${speech.id}`];
     const candidateIdentity = evaluateSpeakerDecisionAnswer(candidate, plan.optionSpeakerIds).identity;
-    if (checked.identity === USER_SPEAKER_ID && (!explicit || explicit === USER_SPEAKER_ID) || explicit === USER_SPEAKER_ID) {
+    if (personaConfirmed && (!explicit || explicit === USER_SPEAKER_ID) || explicit === USER_SPEAKER_ID) {
       const currentIdentity = evaluateSpeakerDecisionAnswer(answers[`speech_${speech.id}`], plan.optionSpeakerIds).identity;
       if (currentIdentity !== USER_SPEAKER_ID && candidateIdentity === USER_SPEAKER_ID) {
         answers[`relationship_original_${speech.id}`] = answers[`speech_${speech.id}`];
@@ -2749,7 +3180,7 @@ function applyContextualUserReconciliation(plan, answers, reviewed, questions) {
         answers[`persona_original_${speech.id}`] = answers[`speech_${speech.id}`];
         const before = answers[`relationship_original_${speech.id}`];
         const beforeIdentity = evaluateSpeakerDecisionAnswer(before, plan.optionSpeakerIds).identity;
-        answers[`speech_${speech.id}`] = before && beforeIdentity !== USER_SPEAKER_ID ? before : { choice: "no_clear_identity", probabilities: {}, confidence: 0 };
+        answers[`speech_${speech.id}`] = before && beforeIdentity !== USER_SPEAKER_ID ? before : withoutUserCandidate(answers[`speech_${speech.id}`], userOption);
         delete answers[`relationship_confirmed_${speech.id}`];
         delete answers[`relationship_applied_${speech.id}`];
         delete answers[`relationship_global_${speech.id}`];
@@ -2758,6 +3189,66 @@ function applyContextualUserReconciliation(plan, answers, reviewed, questions) {
       answers[`global_uncertain_${speech.id}`] = result ?? { choice: "no_clear_identity", probabilities: {}, confidence: 0 };
     }
   }
+}
+function withoutUserCandidate(answer, userOption) {
+  const cleared = { choice: "no_clear_identity", probabilities: {}, confidence: 0 };
+  if (!answer || !userOption) return cleared;
+  const remaining = Object.entries(answer.probabilities).filter(([option]) => option !== userOption);
+  const total = remaining.reduce((sum, [, probability]) => sum + probability, 0);
+  if (!(total > 0)) return cleared;
+  const probabilities = Object.fromEntries(remaining.map(([option, probability]) => [option, probability / total]));
+  const [best] = Object.entries(probabilities).sort((left, right) => right[1] - left[1]);
+  if (!best || best[0] === DECISION_UNCLEAR_OPTION) return cleared;
+  return { choice: best[0], probabilities, confidence: answer.confidence };
+}
+function applyConversationFlow(plan, answers, identities, paths) {
+  const optionIds = plan.optionSpeakerIds;
+  const optionById = new Map(Object.entries(optionIds).map(([option, id]) => [id, option]));
+  const castIds = new Set(plan.state.speakers.map((speaker) => speaker.id).filter((id) => id !== USER_SPEAKER_ID && id !== UNCAST_SPEAKER_ID && id !== UNRESOLVED_SPEAKER_ID));
+  const locked = (speechId) => Boolean(
+    answers[`relationship_confirmed_${speechId}`] || answers[`relationship_continuity_${speechId}`] || answers[`persona_confirmed_${speechId}`] || answers[`switch_reconciled_${speechId}`]
+  );
+  for (let index = 1; index < plan.state.speeches.length; index += 1) {
+    const speech = plan.state.speeches[index];
+    const current = identities[index];
+    const previous = identities[index - 1];
+    if (!current || !previous || current !== previous) continue;
+    if (!castIds.has(current)) continue;
+    const turn = answers[`turn_${speech.id}`];
+    const responds = turn?.probabilities?.[TURN_RESPOND_OPTION] ?? 0;
+    if (turn?.choice !== TURN_RESPOND_OPTION || responds < 0.55 || turn.confidence < 0.45) continue;
+    if (locked(speech.id)) continue;
+    const answer = answers[`speech_${speech.id}`];
+    const currentOption = optionById.get(current);
+    const currentProbability = answer && currentOption ? answer.probabilities[currentOption] ?? 0 : 0;
+    if (currentProbability >= 0.6) continue;
+    const review = answers[`relationship_review_${speech.id}`];
+    const reviewProbability = review && currentOption ? review.probabilities[currentOption] ?? 0 : 0;
+    if (review && review.choice === currentOption && reviewProbability >= 0.6 && review.confidence >= 0.5) continue;
+    const alternative = Object.entries(answer?.probabilities ?? {}).filter(([option, probability]) => {
+      const id = optionIds[option];
+      return Boolean(id) && castIds.has(id) && id !== current && probability >= 0.3;
+    }).sort((left, right) => right[1] - left[1])[0];
+    if (!alternative) continue;
+    identities[index] = optionIds[alternative[0]];
+    paths.set(index, "resolution:turn-taking (a reply is normally the other participant)");
+  }
+  for (let index = 0; index < plan.state.speeches.length; index += 1) {
+    const speech = plan.state.speeches[index];
+    const match = speech.text.trim().match(/^(?:no[,.]?\s*)?i\s+said[,:]?\s+(.+)$/iu);
+    if (!match) continue;
+    const echoed = normalizedQuoteText(match[1]);
+    if (echoed.length < 4) continue;
+    const source = plan.state.speeches.slice(0, index).findIndex((previous) => normalizedQuoteText(previous.text) === echoed);
+    const sourceIdentity = source >= 0 ? identities[source] : void 0;
+    if (!sourceIdentity || sourceIdentity === identities[index]) continue;
+    if (locked(speech.id)) continue;
+    identities[index] = sourceIdentity;
+    paths.set(index, "resolution:echo (the speaker repeats their own earlier line)");
+  }
+}
+function normalizedQuoteText(text) {
+  return text.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").replace(/\s+/gu, " ").trim();
 }
 var DEFAULT_SPEAKER_LOOKBACK = 6;
 var MAX_SPEAKER_LOOKBACK = 100;
@@ -5743,6 +6234,8 @@ function resolveSpeakerDecisionSegments(content, plan, answers, speakers, option
     discoursePathBySpeechIndex.set(index, outcome.reason === "overrode-conflict" ? "resolution:discourse-identity (overrode paragraph/speech conflict)" : "resolution:discourse-identity (filled unresolved first pass)");
     return outcome.identity ?? void 0;
   });
+  const conversationFlowPaths = /* @__PURE__ */ new Map();
+  applyConversationFlow(plan, answers, speechIdentities, conversationFlowPaths);
   const hasLocalIdentity = [...paragraphIdentities.values(), ...speechIdentities].some((identity) => identity !== void 0);
   const hasUncastIdentity = [...paragraphIdentities.values(), ...speechIdentities].some((identity) => identity === UNCAST_SPEAKER_ID);
   const explicitUncastCue = hasExplicitUncastCue(content, options.skippedTrackerTagPairs ?? "");
@@ -5813,7 +6306,7 @@ function resolveSpeakerDecisionSegments(content, plan, answers, speakers, option
       upstreamIdentity = direct;
       upstreamSource = `speech-s${index}`;
       resolutionPaths.push([
-        discoursePathBySpeechIndex.get(index) ?? chainPathBySpeechIndex.get(index) ?? "resolution:direct-speech-identity"
+        conversationFlowPaths.get(index) ?? discoursePathBySpeechIndex.get(index) ?? chainPathBySpeechIndex.get(index) ?? "resolution:direct-speech-identity"
       ]);
     } else if (upstreamIdentity && !clearSpeakerSwitch && !options.evidenceOnly) {
       speakerId = upstreamIdentity;
@@ -6261,6 +6754,15 @@ async function buildState(chat, userId) {
     const savedName = name || (id.startsWith("npc:") ? id.slice(4) : "");
     return character ? [{ ...character, name: savedName || character.name, messageCount }] : savedName ? [{ id, name: savedName, messageCount }] : [];
   });
+  const relationshipAliases = cardRelationshipAliases(candidates.map((card) => ({
+    id: card.id,
+    name: card.name,
+    description: card.description,
+    personality: card.personality,
+    scenario: card.scenario,
+    creatorNotes: card.creator_notes,
+    firstMes: card.first_mes
+  })));
   const messages = await spindle.chat.getMessages(chat.id);
   return {
     id: chat.id,
@@ -6277,6 +6779,7 @@ async function buildState(chat, userId) {
     cardCharacterIds: candidates.map((character) => character.id),
     characters: detected.map((character) => ({
       ...character,
+      name: withRelationshipAliases(character.name, relationshipAliases.get(character.id) ?? []),
       voice: config.characterVoices[character.id] ?? ""
     }))
   };
@@ -6750,6 +7253,10 @@ async function saveGhostVoiceAssignments(chatId, messageId, assistantIds, groups
     const accepted = [];
     const pendingIds = /* @__PURE__ */ new Map();
     for (const assignment of assignments) {
+      if (assignment.castSpeakerId) {
+        accepted.push(assignment);
+        continue;
+      }
       const group = groups.find((item) => item.id === assignment.groupId);
       if (!group) continue;
       let ghostId = assignment.ghostId ?? "";
@@ -6796,7 +7303,7 @@ async function saveGhostVoiceAssignments(chatId, messageId, assistantIds, groups
       const covered = groups.reduce((sum, group) => sum + group.speeches.length, 0);
       const previousRecords = metadata.chat_voice_speaker_continuity;
       const records = previousRecords && typeof previousRecords === "object" && !Array.isArray(previousRecords) ? { ...previousRecords } : {};
-      if (source && !source.is_user && expected > 0 && covered === expected && accepted.length === groups.length && matchingIds.size === 1) {
+      if (source && !source.is_user && expected > 0 && covered === expected && accepted.length === groups.length && accepted.every((item) => !!item.ghostId) && matchingIds.size === 1) {
         records[messageId] = { contentHash: hashMessageContent(source.content ?? ""), speakerId: `ghost:${accepted[0].ghostId}` };
       }
       await spindle.chats.update(chatId, { metadata: { ...metadata, chat_voice_ghost_cast: ghosts.slice(-200), chat_voice_speaker_continuity: records } }, userId);
@@ -6840,8 +7347,24 @@ function queueSpeakerParse(payload, userId, frontendSessionId) {
     }
     const scannedScenarioIds = Array.isArray(chat.metadata?.chat_voice_non_speaker_cards) ? chat.metadata.chat_voice_non_speaker_cards.filter((id) => typeof id === "string") : [];
     const scenarioCardIds = /* @__PURE__ */ new Set([...scannedScenarioIds, ...cards.filter((card) => isScenarioCardTitle(card.name)).map((card) => card.id)]);
+    const relationshipAliases = cardRelationshipAliases(cards.map((card) => ({
+      id: card.id,
+      name: card.name,
+      description: card.description,
+      personality: card.personality,
+      scenario: card.scenario,
+      creatorNotes: card.creator_notes,
+      firstMes: card.first_mes
+    })));
+    const cardNamesById = new Map(cards.map((card) => [card.id, card.name]));
     const configuredSpeakers = speakersForMessageRole(
-      config.detectedCharacters.filter((character) => !scenarioCardIds.has(character.id)),
+      config.detectedCharacters.filter((character) => !scenarioCardIds.has(character.id)).map((character) => ({
+        ...character,
+        name: withRelationshipAliases(
+          character.name || cardNamesById.get(character.id) || (character.id.startsWith("npc:") ? character.id.slice(4) : ""),
+          relationshipAliases.get(character.id) ?? []
+        )
+      })),
       message.is_user,
       userAliases.join(" / ") || "User"
     );
@@ -7709,6 +8232,16 @@ spindle.onFrontendMessage(async (rawPayload, userId, frontendSessionId) => {
         }));
         const chat = await spindle.chats.get(payload.chatId, userId);
         if (!chat) throw new Error("The chat is no longer available.");
+        const castCards = payload.cast?.length ? await loadCharacters(chat, userId).catch(() => []) : [];
+        const cast = (payload.cast ?? []).slice(0, 32).flatMap((member) => {
+          if (!member || typeof member.id !== "string" || typeof member.name !== "string" || typeof member.voiceId !== "string") return [];
+          const id = member.id.trim().slice(0, 200);
+          const voiceId = member.voiceId.trim().slice(0, 512);
+          const name = member.name.trim().slice(0, 200) || id;
+          const card = castCards.find((item) => item.id === id);
+          const description = (card?.description ?? "").replace(/\s+/gu, " ").trim().slice(0, 300);
+          return id && voiceId ? [{ id, name, voiceId, ...description ? { description } : {} }] : [];
+        });
         const messages = await spindle.chat.getMessages(payload.chatId);
         const targetIndex = messages.findIndex((message) => message.id === payload.messageId);
         if (targetIndex < 0) throw new Error("The message is no longer available.");
@@ -7732,7 +8265,7 @@ spindle.onFrontendMessage(async (rawPayload, userId, frontendSessionId) => {
         if (!groups.length || !voices.length && !ghosts.length) {
           sendFrontend({ type: "chat_voice_uncast_matches", requestId: payload.requestId, assignments: [], diagnostics: [`No matching request: groups=${groups.length}, availableFavorites=${voices.length}, historicalGhosts=${ghosts.length}, currentGhosts=${currentGhosts.length}.`] }, userId, frontendSessionId);
         } else {
-          const plan = buildUncastVoiceDecision(groups, voices, payload.message.slice(0, 3e4), ghosts, matchingContext.previousMessages, reduction.trimVoiceCriteria);
+          const plan = buildUncastVoiceDecision(groups, voices, payload.message.slice(0, 3e4), ghosts, matchingContext.previousMessages, reduction.trimVoiceCriteria, cast);
           const answers = {};
           let decisionError = "";
           const captureAnswers = (result) => {
@@ -7773,7 +8306,7 @@ spindle.onFrontendMessage(async (rawPayload, userId, frontendSessionId) => {
               spindle.log.warn(`[Chat Voice] Uncast identity review failed: ${reviewError}`);
             }
           }
-          let assignments = resolveUncastVoiceDecisions(groups, voices, answers, ghosts, payload.reserved, payload.messageId, payload.message.slice(0, 3e4), assistantIds.slice(0, Math.max(0, assistantIds.indexOf(anchor))));
+          let assignments = resolveUncastVoiceDecisions(groups, voices, answers, ghosts, payload.reserved, payload.messageId, payload.message.slice(0, 3e4), assistantIds.slice(0, Math.max(0, assistantIds.indexOf(anchor))), void 0, cast);
           const proposedAssignments = assignments;
           if (assignments.length) {
             assignments = await saveGhostVoiceAssignments(payload.chatId, payload.messageId, assistantIds, groups, assignments, userId, anchor, payload.reserved, lifetime, payload.message, payload.sourceHash, hashMessageContent(JSON.stringify(savedGhosts)));
@@ -7785,11 +8318,12 @@ spindle.onFrontendMessage(async (rawPayload, userId, frontendSessionId) => {
             const voice = answers[`voice_${group.id}`];
             const comparisons = Object.entries(answers).filter(([key]) => key.startsWith(`same_${group.id}_`) || key.startsWith(`review_same_${group.id}_`) || key.startsWith(`review_ghost_${group.id}_`) || key.startsWith(`review_occurrence_${group.id}_`) || key.startsWith(`review_occurrence_disposition_${group.id}_`) || key.startsWith(`review_reveal_${group.id}_`) || key.startsWith(`review_scene_${group.id}_`) || key.startsWith(`review_continuity_${group.id}_`)).map(([key, answer]) => `${key}=${answer.choice} confidence=${answer.confidence} probabilities=${JSON.stringify(answer.probabilities)}`).join(";") || "none";
             const narrativeName = answers[`narrative_name_${group.id}`];
+            const castAnswer = answers[`cast_${group.id}`];
             const assignment = assignments.find((item) => item.groupId === group.id);
             const proposed = proposedAssignments.find((item) => item.groupId === group.id);
-            return `${group.id} segments=${group.segmentIndexes.map((index) => index + 1).join(",")} identity=${identity ? `${identity.choice} confidence=${identity.confidence} probabilities=${JSON.stringify(identity.probabilities)}` : "none"} gender=${gender ? `${gender.choice} confidence=${gender.confidence} probabilities=${JSON.stringify(gender.probabilities)}` : "none"} label=${label ? `${label.choice} confidence=${label.confidence} probabilities=${JSON.stringify(label.probabilities)}` : "none"} narrative-name=${narrativeName ? `${narrativeName.choice} (${plan.state.narrativeNames[Number(narrativeName.choice.replace("name_", ""))] ?? "none"}) confidence=${narrativeName.confidence} probabilities=${JSON.stringify(narrativeName.probabilities)}` : "none"} comparisons=${comparisons} proposed=${proposed ? `${proposed.ghostId} / ${proposed.voiceId} / ${proposed.gender}` : "none"} match-reason=${proposed?.matchReason ?? "none"} voice-choice=${voice ? `${voice.choice} confidence=${voice.confidence} probabilities=${JSON.stringify(voice.probabilities)}` : "none"} final=${assignment ? `${assignment.label || "unnamed"} / ${assignment.ghostId} / ${assignment.voiceId}` : "connection default"}`;
+            return `${group.id} segments=${group.segmentIndexes.map((index) => index + 1).join(",")} identity=${identity ? `${identity.choice} confidence=${identity.confidence} probabilities=${JSON.stringify(identity.probabilities)}` : "none"} cast=${castAnswer ? `${castAnswer.choice} confidence=${castAnswer.confidence} probabilities=${JSON.stringify(castAnswer.probabilities)}` : "none"} gender=${gender ? `${gender.choice} confidence=${gender.confidence} probabilities=${JSON.stringify(gender.probabilities)}` : "none"} label=${label ? `${label.choice} confidence=${label.confidence} probabilities=${JSON.stringify(label.probabilities)}` : "none"} narrative-name=${narrativeName ? `${narrativeName.choice} (${plan.state.narrativeNames[Number(narrativeName.choice.replace("name_", ""))] ?? "none"}) confidence=${narrativeName.confidence} probabilities=${JSON.stringify(narrativeName.probabilities)}` : "none"} comparisons=${comparisons} proposed=${proposed ? `${proposed.castSpeakerId ? `cast:${proposed.castSpeakerId} ` : ""}${proposed.ghostId ?? "none"} / ${proposed.voiceId} / ${proposed.gender}` : "none"} match-reason=${proposed?.matchReason ?? "none"} voice-choice=${voice ? `${voice.choice} confidence=${voice.confidence} probabilities=${JSON.stringify(voice.probabilities)}` : "none"} final=${assignment ? `${assignment.castSpeakerId ? `${assignment.castSpeakerId} (configured)` : assignment.label || "unnamed"} / ${assignment.ghostId ?? "none"} / ${assignment.voiceId}` : "connection default"}`;
           });
-          diagnostics.unshift(`build=${BUILD_VERSION}; Available favorites=${voices.length}, historical ghosts=${ghosts.length}, current ghosts=${currentGhosts.length}; prior messages=${matchingContext.previousMessages.length}${decisionError ? `; Jev failed: ${decisionError}` : ""}; identity review questions=${Object.keys(review.questions).length}${reviewError ? `; review failed: ${reviewError}` : ""}; reduction=${Object.entries(reduction).filter(([, enabled]) => !enabled).map(([id]) => id).join(",") || "full"}.`);
+          diagnostics.unshift(`build=${BUILD_VERSION}; Available favorites=${voices.length}, cast=${cast.length} (${cast.map((member) => `${member.name}${member.description ? "*" : ""}`).join(", ") || "none"}); historical ghosts=${ghosts.length}, current ghosts=${currentGhosts.length}; prior messages=${matchingContext.previousMessages.length}${decisionError ? `; Jev failed: ${decisionError}` : ""}; identity review questions=${Object.keys(review.questions).length}${reviewError ? `; review failed: ${reviewError}` : ""}; reduction=${Object.entries(reduction).filter(([, enabled]) => !enabled).map(([id]) => id).join(",") || "full"}.`);
           diagnostics.splice(1, 0, `Candidate context: ${ghosts.map((ghost, index) => `ghost_${index}=${ghost.id} last=${ghost.lastSeenMessageId || "none"} history=${(ghost.conversationHistory ?? []).map((entry) => `${entry.messageId}(${entry.text.length} chars)`).join(",") || "none"} context=${ghost.context.length} chars`).join("; ") || "none"}; prior=${matchingContext.previousMessages.map((item) => `${item.role ?? "unknown"}:${item.id}(${item.text.length} chars)`).join(",") || "none"}.`);
           sendFrontend({ type: "chat_voice_uncast_matches", requestId: payload.requestId, assignments, diagnostics }, userId, frontendSessionId);
           if (assignments.length) await sendState(userId, void 0, payload.chatId, frontendSessionId);

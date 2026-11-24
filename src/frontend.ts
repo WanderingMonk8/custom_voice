@@ -41,6 +41,7 @@ import {
   markUnresolvedSpeechSegments,
   npcSpeakerId,
   normalizeSpeechBoundaryDashes,
+  speechDurationGuard,
   normalizeSpeakerName,
   parseRosterVoiceSegments,
   playbackVoiceForSpeaker,
@@ -60,6 +61,7 @@ import {
   speakerAliasIdLookup,
   speakersForMessageRole,
   splitLargeVoicePlanSegments,
+  planNeedsVoiceSerialization,
   shouldPersistMessageAudio,
   UNCAST_SPEAKER_ID,
   UNRESOLVED_SPEAKER_ID,
@@ -73,6 +75,7 @@ import {
   type AutoplaySwipeSnapshot,
   type UncastVoiceGroup,
   type UncastVoiceAssignment,
+  type CastSpeaker,
   type SavedAudioRecord,
   type ReductionComponentMap,
 } from './core'
@@ -888,7 +891,7 @@ async function synthesizeVoiceSegment(
   signal: AbortSignal,
   pacer: SynthesisPacer,
   rateLimitBudget: RateLimitBudget,
-  voiceGate: ConnectionVoiceGate,
+  voiceGate: ConnectionVoiceGate | null,
   onRateLimit: (delayMs: number, cumulativeWaitMs: number) => void,
 ): Promise<SynthesizedVoiceSegment> {
   while (true) {
@@ -897,7 +900,7 @@ async function synthesizeVoiceSegment(
     let response: Response
     let audioData: ArrayBuffer | null = null
     try {
-      releaseVoice = await voiceGate.acquire(voice, signal)
+      releaseVoice = voiceGate ? await voiceGate.acquire(voice, signal) : null
       await waitForSynthesisSlot(pacer, signal)
       response = await fetch('/api/v1/tts/synthesize', {
         method: 'POST',
@@ -1305,7 +1308,7 @@ export function setup(ctx: SpindleFrontendContext) {
   scanButton.textContent = 'Scan'
   scanButton.disabled = true
   scanRow.append(scanButton)
-  const skippedTagsField = createField('Skipped tracker tags (global)')
+  const skippedTagsField = createField('Skipped text and tags (global)')
   const speakerParsingField = createField('Jev speaker assignment (global)')
   const ttsTagField = createField('TTS vocal tags (global)')
   const ttsTagPlacementField = createField('Vocal tag placement')
@@ -2361,14 +2364,14 @@ export function setup(ctx: SpindleFrontendContext) {
 
   const skippedTrackerTagsInput = ctx.components.mountTextArea(skippedTagsField.slot, {
     value: '',
-    placeholder: 'tracker, status, <o_ledger></o_l>',
+    placeholder: 'tracker, prefix:http:, prefix:https:\nenclosed: ![ | ]',
     rows: 3,
-    ariaLabel: 'Tracker tag names or full asymmetric tag pairs to skip globally',
+    ariaLabel: 'Tags, prefixes, or enclosed text to skip globally',
     onChange: () => scheduleSkippedTrackerTagsSave(),
   })
   const skippedTagsHint = document.createElement('div')
   skippedTagsHint.className = 'chat-voice-hint'
-  skippedTagsHint.textContent = 'Enter tag names, or full pairs for asymmetric tags such as <o_ledger></o_l>.'
+  skippedTagsHint.textContent = 'Separate tag names, tag/comment marker pairs, and prefix rules with commas, for example: tracker, prefix:http:, prefix:https:. A prefix skips whitespace-delimited text containing it. Put each enclosed rule on its own line without a trailing comma, for example: enclosed: ![ | ]. It skips text from the opening marker through the next closing marker. Markers are case-sensitive; use \\| for a literal pipe, or JSON-quoted markers to preserve surrounding spaces.'
   skippedTagsField.slot.append(skippedTagsHint)
 
   const speakerParsingPicker = ctx.components.mountSelect(speakerParsingField.slot, {
@@ -2688,7 +2691,7 @@ export function setup(ctx: SpindleFrontendContext) {
     })
   }
 
-  function requestUncastVoiceMatches(chatId: string, messageId: string, message: string, sourceHash: string, groups: UncastVoiceGroup[], voices: FavoriteVoice[], reserved: string[], lifetime: number, speakerLookback: number, skippedTrackerTags: string, reduction: ReductionComponentMap): Promise<UncastVoiceAssignment[]> {
+  function requestUncastVoiceMatches(chatId: string, messageId: string, message: string, sourceHash: string, groups: UncastVoiceGroup[], voices: FavoriteVoice[], reserved: string[], lifetime: number, speakerLookback: number, skippedTrackerTags: string, reduction: ReductionComponentMap, cast: CastSpeaker[]): Promise<UncastVoiceAssignment[]> {
     const requestId = `uncast-${Date.now().toString(36)}-${++uncastRequestSequence}`
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -2696,7 +2699,7 @@ export function setup(ctx: SpindleFrontendContext) {
         reject(new Error('Uncast voice matching timed out.'))
       }, 35_000)
       pendingUncastRequests.set(requestId, { resolve, reject, timer })
-      ctx.sendToBackend({ type: 'chat_voice_match_uncast', requestId, chatId, messageId, message, sourceHash, groups, voices, reserved, lifetime, speakerLookback, skippedTrackerTags, reduction })
+      ctx.sendToBackend({ type: 'chat_voice_match_uncast', requestId, chatId, messageId, message, sourceHash, groups, voices, reserved, lifetime, speakerLookback, skippedTrackerTags, reduction, cast })
     })
   }
 
@@ -3620,11 +3623,20 @@ export function setup(ctx: SpindleFrontendContext) {
       const poolVoices = poolVoicesForAutoCast()
       if (preferences.autoVoiceCasting && speakerAssignmentDebug) appendSpeakerDebugLog(`Voice pool: ${autoVoiceCastingPool === 'community' && communityIsAvailable() ? `community (${communityVoices.length} snapshot voices)` : 'favorites'}.`)
       const uncastVoices = availableUncastVoices(poolVoices, reservedVoices)
+      // The parser roster plus each character's configured voice. Uncast
+      // matching checks these before it invents a voice, so an off-screen cast
+      // member is not given a second, random voice.
+      const castSpeakers: CastSpeaker[] = [...new Map(playbackSpeakers
+        .filter(speaker => speaker.id !== USER_SPEAKER_ID && speaker.id !== UNCAST_SPEAKER_ID && speaker.id !== UNRESOLVED_SPEAKER_ID)
+        .flatMap(speaker => {
+          const voiceId = config.characterVoices[speaker.id] ?? ''
+          return voiceId ? [[speaker.id, { id: speaker.id, name: speaker.name, voiceId }] as const] : []
+        })).values()]
       const uncastMatchPromise = preferences.autoVoiceCasting && uncastGroups.length
         ? requestUncastVoiceMatches(
             playbackChat.id, messageId, preparePlaybackContent(message.content, preferences.skippedTrackerTags), hashMessageContent(message.content),
             uncastGroups, uncastVoices, reservedVoices, preferences.ghostVoiceLifetime, preferences.speakerLookback, preferences.skippedTrackerTags,
-            preferences.reductionComponents,
+            preferences.reductionComponents, castSpeakers,
           ).catch(error => {
             appendSpeakerDebugLog(`Uncast voice matching failed; using connection default: ${error instanceof Error ? error.message : String(error)}`)
             return [] as UncastVoiceAssignment[]
@@ -3652,6 +3664,7 @@ export function setup(ctx: SpindleFrontendContext) {
             ? normalizeSpeechBoundaryDashes(segment.ttsText ?? segment.text)
             : segment.ttsText ?? segment.text,
           voice,
+          ...(speakerId ? { originalSpeech: segment.text } : {}),
           ...(segment.ttsTag ? { tagId: segment.ttsTag.id } : {}),
         }
       })
@@ -3944,11 +3957,14 @@ export function setup(ctx: SpindleFrontendContext) {
       if (playback.controller.signal.aborted) throw new DOMException('Playback stopped.', 'AbortError')
       for (const match of uncastMatches) {
         const group = uncastGroups.find(item => item.id === match.groupId)
-        if (!group || reservedVoices.includes(match.voiceId)) continue
+        if (!group) continue
+        // A cast member keeps their configured voice, which is in the reserved
+        // set; only new-voice assignments must avoid the reserved voices.
+        if (!match.castSpeakerId && reservedVoices.includes(match.voiceId)) continue
         for (const segmentIndex of group.segmentIndexes) {
           for (const index of segmentPlanIndexes[segmentIndex] ?? []) plan[index] = { ...plan[index], voice: match.voiceId }
         }
-        appendSpeakerDebugLog(`Uncast voice ${group.id}: gender=${match.gender}, ghost=${match.ghostId ?? 'none'}, voice=${JSON.stringify(match.voiceId)}.`)
+        appendSpeakerDebugLog(`Uncast voice ${group.id}: gender=${match.gender}, ghost=${match.ghostId ?? 'none'}, cast=${match.castSpeakerId ?? 'none'}, voice=${JSON.stringify(match.voiceId)}.`)
       }
       synthesisPlanFrozen = true
       const splitPlan = splitLargeVoicePlanSegments(plan)
@@ -3994,6 +4010,22 @@ export function setup(ctx: SpindleFrontendContext) {
       let shortConcurrencyCooldown = 0
       let longWindowStreak = 0
       let rateLimitedForRemainder = false
+      // Requests that carry an explicit voice identify their own voice, so they
+      // may overlap another voice on the connection. Only a clip that leans on
+      // the connection's mutable "current voice" has to stay exclusive.
+      const serializeVoices = planNeedsVoiceSerialization(plan)
+      const playbackVoiceGate = serializeVoices
+        ? connectionVoiceGates.get(connectionId) ?? (() => {
+            const gate = new ConnectionVoiceGate()
+            connectionVoiceGates.set(connectionId, gate)
+            return gate
+          })()
+        : null
+      appendSpeakerDebugLog(
+        `Voice serialization: ${serializeVoices
+          ? 'on (a clip uses the connection default voice)'
+          : 'off (every clip carries an explicit voice)'}.`,
+      )
       const prepare = async (index: number): Promise<PreparedSegment> => {
         try {
           appendSpeakerDebugLog(
@@ -4014,11 +4046,7 @@ export function setup(ctx: SpindleFrontendContext) {
               synthesisController.signal,
               sharedSynthesisPacer,
               rateLimitBudget,
-              connectionVoiceGates.get(connectionId) ?? (() => {
-                const gate = new ConnectionVoiceGate()
-                connectionVoiceGates.set(connectionId, gate)
-                return gate
-              })(),
+              playbackVoiceGate,
               (delayMs, cumulativeWaitMs) => {
                 rateLimitedForRemainder = true
                 adaptiveConcurrency = 1
@@ -4146,11 +4174,53 @@ export function setup(ctx: SpindleFrontendContext) {
         ?? (window as typeof window & { webkitAudioContext: typeof AudioContext }).webkitAudioContext)()
       const voiceLoudnessProfiles = new Map<string, number>()
       let normalizationChain: Promise<void> = Promise.resolve()
-      const processed = prepared.map((pending, index) => {
+      const validated = prepared.map(async (pending, index): Promise<PreparedSegment> => {
+        const result = await pending
+        if (!result.ok) return result
+        try {
+          let segment = result.segment
+          let decodedBuffer = await normalizationContext.decodeAudioData(segment.data.slice(0))
+          const entry = plan[index]
+          const guard = entry.originalSpeech !== undefined
+            ? speechDurationGuard(entry.text, entry.originalSpeech, preferences.speed)
+            : null
+          if (guard && decodedBuffer.duration > guard.maxSeconds) {
+            appendSpeakerDebugLog(`Audio duration guard [${index + 1}]: ${decodedBuffer.duration.toFixed(2)}s exceeds ${guard.maxSeconds.toFixed(2)}s for ${guard.spokenCharacters} spoken characters; retrying once without generated vocal directions.`)
+            if (ctx.getActiveChat().chatId === playbackChat.id && activePlayback === playback && !playback.playbackStopped) {
+              setStatus(`Retrying unusually long speech segment ${index + 1}…`)
+            }
+            segment = await runSynthesisTask(() => synthesizeVoiceSegment(
+              connectionId, guard.retryText, entry.voice, preferences.speed,
+              synthesisController.signal, sharedSynthesisPacer, rateLimitBudget, playbackVoiceGate,
+              (delayMs, cumulativeWaitMs) => {
+                rateLimitedForRemainder = true
+                adaptiveConcurrency = 1
+                shortConcurrencyCooldown = 0
+                longWindowStreak = 0
+                if (adaptiveSynthesisLimits.has(adaptiveLimitToken)) adaptiveSynthesisLimits.set(adaptiveLimitToken, 1)
+                drainSynthesisQueue()
+                if (ctx.getActiveChat().chatId === playbackChat.id && (!activePlayback || activePlayback === playback)) {
+                  setStatus(`Rate limited; resuming in ${Math.max(1, Math.ceil(delayMs / 1_000))}s… (${Math.ceil(cumulativeWaitMs / 1_000)}s of ${preferences.rateLimitWaitSeconds}s wait budget)`)
+                }
+              },
+            ), activePlayback === playback && !playback.playbackStopped)
+            decodedBuffer = await normalizationContext.decodeAudioData(segment.data.slice(0))
+            appendSpeakerDebugLog(`Audio duration guard [${index + 1}]: retry ${decodedBuffer.duration.toFixed(2)}s, threshold ${guard.maxSeconds.toFixed(2)}s.`)
+            if (decodedBuffer.duration > guard.maxSeconds) {
+              throw new Error(`Speech segment ${index + 1} remained unusually long after retry (${decodedBuffer.duration.toFixed(1)}s; limit ${guard.maxSeconds.toFixed(1)}s). Please regenerate the audio.`)
+            }
+          }
+          return { ok: true, segment: { ...segment, decodedBuffer } }
+        } catch (error) {
+          appendSpeakerDebugLog(`Audio validation [${index + 1}] failed: ${error instanceof Error ? error.message : String(error)}`)
+          return { ok: false, error }
+        }
+      })
+      const processed = validated.map((pending, index) => {
         const processing = normalizationChain.then(async (): Promise<PreparedSegment> => {
           const result = await pending
           if (!result.ok) return result
-          const decodedBuffer = await normalizationContext.decodeAudioData(result.segment.data.slice(0))
+          const decodedBuffer = result.segment.decodedBuffer!
           const voiceKey = plan[index].voice.trim().toLowerCase() || '__connection-default__'
           const normalizationGain = normalizedVoiceGain(decodedBuffer, voiceKey, voiceLoudnessProfiles)
           return {
@@ -4566,8 +4636,9 @@ export function setup(ctx: SpindleFrontendContext) {
       blockedUntil: 0, cumulativeWaitMs: 0, consecutiveResponses: 0,
       maximumWaitMs: rateLimitWaitSeconds * 1_000, recovering: false, recoveryTail: Promise.resolve(),
     }
-    const gate = connectionVoiceGates.get(connectionId) ?? new ConnectionVoiceGate()
-    connectionVoiceGates.set(connectionId, gate)
+    // A preview always names its voice, so it only has to join a queue that a
+    // serializing playback already opened for this connection.
+    const gate = connectionVoiceGates.get(connectionId) ?? null
     try {
       const segment = await runSynthesisTask(() => synthesizeVoiceSegment(
         connectionId, 'Hello. This is a preview of my voice.', voiceId, 1,

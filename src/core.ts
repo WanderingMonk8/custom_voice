@@ -440,6 +440,10 @@ export function readGhostVoices(value: unknown): GhostVoice[] {
     if (!item || typeof item !== 'object') return []
     const row = item as Record<string, unknown>
     if (typeof row.id !== 'string' || typeof row.speakerId !== 'string' || typeof row.voiceId !== 'string' || !row.id || !row.voiceId) return []
+    // Names inferred from prose used to include ordinary capitalized words
+    // ("Not", "Nothing"). A saved voice for one of those would keep being offered
+    // as a cast member, so drop it instead of reviving it.
+    if (isNonNameSpeakerId(row.speakerId)) return []
     return [{ id: row.id.slice(0, 128), speakerId: row.speakerId.slice(0, 256), voiceId: row.voiceId.slice(0, 512),
       label: typeof row.label === 'string' ? row.label.trim().slice(0, 100) : '',
       aliases: mergeGhostAliases(Array.isArray(row.aliases) ? row.aliases.filter((value): value is string => typeof value === 'string') : []),
@@ -571,12 +575,21 @@ function hasStrongNarrativeName(text: string): boolean {
 const STORY_NARRATION_SKIP_STARTERS = new Set(['then', 'so', 'and', 'but', 'still', 'yet', 'meanwhile', 'now', 'anyway'])
 const STORY_MALE_PRONOUNS = new Set(['he', 'him', 'hisself', 'himself', 'his'])
 const STORY_FEMALE_PRONOUNS = new Set(['she', 'her', 'herself', 'hers'])
+/** Determiners that own the noun after them ("his mother", "her brother"), not the paragraph's subject. */
+const POSSESSIVE_DETERMINERS = new Set(['his', 'her', 'my', 'your', 'their', 'our', 'its'])
 /** Gender of a narration paragraph's first-subject pronoun; named or neutral starts carry none. */
 export function narrationFirstPronounClass(text: string): 'male' | 'female' | null {
   const tokens = text.toLowerCase().replace(/[^a-z'-]+/gu, ' ').split(/\s+/u).filter(Boolean)
   let head = tokens[0]
   if (!head) return null
   if (STORY_NARRATION_SKIP_STARTERS.has(head)) head = tokens[1] ?? ''
+  // "His mother answers" is about the mother. A possessive determiner in front
+  // of a person noun surfaces that noun's own gender (the noun scan reads it),
+  // so the narrator's or another character's sex never leaks onto the speaker.
+  if (POSSESSIVE_DETERMINERS.has(head)) {
+    const owned = (tokens[1] ?? '').replace(POSSESSIVE_SUFFIX, '')
+    if (LABEL_GENDER_TOKENS.has(owned)) return null
+  }
   if (STORY_MALE_PRONOUNS.has(head)) return 'male'
   if (STORY_FEMALE_PRONOUNS.has(head)) return 'female'
   return null
@@ -623,6 +636,10 @@ function paragraphGenderedMentions(narrative: string, ignorePronouns: boolean): 
       if (PERSON_ARTICLES.has(token)) { sinceArticle = 0; continue }
       const possessive = POSSESSIVE_SUFFIX.test(token)
       const bare = possessive ? token.replace(POSSESSIVE_SUFFIX, '') : token
+      // A possessive determiner owns the noun after it ("his mother", "her
+      // brother"), so that noun is a person mention even though no article
+      // precedes it, and its own gender is the evidence.
+      if (POSSESSIVE_DETERMINERS.has(token)) { sinceArticle = 0; continue }
       // Pronouns share the gender lexicon with nouns ("her"), so they must
       // never be read as an article-led noun ("the register, her mask").
       if (STORY_MALE_PRONOUNS.has(bare) || STORY_FEMALE_PRONOUNS.has(bare)) {
@@ -1251,13 +1268,14 @@ export function voiceDecisionSummaryTerse(voice: FavoriteVoice): string {
 }
 
 /** One decision call classifies each uncast group and ranks the available voice descriptions. */
-export function buildUncastVoiceDecision(groups: UncastVoiceGroup[], voices: FavoriteVoice[], message: string, ghosts: GhostVoice[] = [], previousMessages: RelationshipReviewContext['previousMessages'] = [], trimCriteria = false) {
+export function buildUncastVoiceDecision(groups: UncastVoiceGroup[], voices: FavoriteVoice[], message: string, ghosts: GhostVoice[] = [], previousMessages: RelationshipReviewContext['previousMessages'] = [], trimCriteria = false, cast: readonly CastSpeaker[] = []) {
   const labels = uncastIdentityLabels(message, ghosts)
   const narrativeNames = uncastNarrativeNameCandidates(message)
   const state = {
     message,
     previousMessages,
     narrativeNames,
+    ...(cast.length ? { cast: cast.map(member => ({ id: member.id, name: member.name, ...(member.description ? { description: member.description } : {}) })) } : {}),
     characters: groups.map(group => ({
       id: group.id,
       identity: group.speakerId,
@@ -1317,6 +1335,14 @@ export function buildUncastVoiceDecision(groups: UncastVoiceGroup[], voices: Fav
       instructions: `Does a person explicitly named in CURRENT narration actually speak the quotations in ${group.id}? Trace nearby pronouns, actions, dialogue and previousMessages. Names of addressees, bystanders, narrators, and people merely discussed are not speaker identities. Choose none unless the evidence clearly identifies the speaker.`,
       criteria: { none: 'No named person is clearly identified as this speaker.', ...Object.fromEntries(narrativeNames.map((name, index) => [`name_${index}`, name])) },
     }
+    if (cast.length) questions[`cast_${group.id}`] = {
+      type: 'choice',
+      instructions: `Is the person who speaks the quoted dialogue in ${group.id} one of the established cast characters listed in state.cast? Established cast members already have their own voice, so an unlisted voice is only for someone new. When the scene refers to the speaker by family role or relationship ("his mother answers", "the sister calls"), a cast member whose description matches that role is the speaker. Trace the current exchange and previousMessages: who is present, who acts, who is addressed, and who a name or relationship refers to. A person mentioned in narration, addressed by the speaker, or merely present is not the speaker. Choose none only when no cast member plausibly fits.`,
+      criteria: {
+        none: 'The speaker is a new, unnamed, or unlisted character.',
+        ...Object.fromEntries(cast.map((member, index) => [`cast_${index}`, member.description ? `${member.name} (${member.id}) — ${member.description}` : `${member.name} (${member.id})`])),
+      },
+    }
     const earlier = groups.slice(0, groups.indexOf(group))
     if (ghosts.length || earlier.length) questions[`identity_${group.id}`] = {
       type: 'choice', instructions: `Does character ${group.id} clearly represent the same individual as one prior character? Compare the CURRENT exchange with previousMessages and the prior character's own conversation history. Use topic, activity, actions, objects, physical location, actors, addressees and continuing pair relationships as intra-message and inter-message anchors. Appearance anchors (state.characters[].appearance and state.ghosts[].appearance) — e.g. "denim overalls", "faded grey soccer hoodie" — pin down a specific person; unlike shared nouns such as "the girl" or "the guy", distinct appearance descriptions signal different individuals, and matching appearance anchors support continuity. Explicit narration that announces another, new, or a second/different voice marks a potentially different participant, not a stylistic quirk; honor that boundary unless the surrounding evidence clearly shows continuity. Activities and conversation topics can evolve over time; use anchors and interactivityTrail as a sequence to trace that evolution rather than requiring identical phrasing or a static topic. Compare who acts with whom, who receives the action, and who addresses whom before and after the target speech. Several agreeing anchors can identify someone when their name is revealed later. A shared object, setting, gender, occupation, topic or voice alone is insufficient; check for multiple people, scene changes, interruptions, and names that identify an addressee or bystander rather than the speaker. Do not confuse the speaker with the person they address. Select new_or_unclear unless identity is clear.`,
@@ -1355,6 +1381,142 @@ function revealedUncastName(group: UncastVoiceGroup, answers: Record<string, Spe
   const jev = match && answer && answer.confidence >= 0.8 && probability >= 0.8 && probability - runnerUp >= 0.25 ? (uncastNarrativeNameCandidates(message)[Number(match[1])] ?? '').toLowerCase() : ''
   if (jev) return jev
   return group.inferredName && !isBroadPersonLabel(group.inferredName) ? group.inferredName.toLowerCase() : ''
+}
+
+/**
+ * Relationship words a card can establish about its own character: "Aiko is
+ * Ken's mother". They become speaker aliases, because narration and dialogue
+ * address the character by the role ("his mother answers", "Mom.") rather than
+ * by name.
+ */
+const RELATIONSHIP_ROLE_WORDS: ReadonlyMap<string, string> = new Map([
+  ...['mother', 'mom', 'mommy', 'mum', 'mummy', 'mama'].map(word => [word, 'mother'] as const),
+  ...['father', 'dad', 'daddy', 'papa'].map(word => [word, 'father'] as const),
+  ...['sister', 'brother', 'daughter', 'son', 'wife', 'husband', 'niece', 'nephew', 'cousin', 'girlfriend', 'boyfriend', 'roommate', 'fiance', 'fiancee'].map(word => [word, word] as const),
+  ...['aunt', 'auntie'].map(word => [word, 'aunt'] as const),
+  ...['uncle'].map(word => [word, 'uncle'] as const),
+  ...['grandmother', 'grandma', 'granny', 'nana'].map(word => [word, 'grandmother'] as const),
+  ...['grandfather', 'grandpa'].map(word => [word, 'grandfather'] as const),
+  ...['stepmother', 'stepfather', 'stepsister', 'stepbrother'].map(word => [word, word] as const),
+])
+
+/** Words to add to the roster for each claimed role, most natural first. */
+const RELATIONSHIP_ROLE_ALIAS_WORDS: Readonly<Record<string, readonly string[]>> = {
+  mother: ['Mother', 'Mom'],
+  father: ['Father', 'Dad'],
+  sister: ['Sister'],
+  brother: ['Brother'],
+  daughter: ['Daughter'],
+  son: ['Son'],
+  wife: ['Wife'],
+  husband: ['Husband'],
+  aunt: ['Aunt', 'Auntie'],
+  uncle: ['Uncle'],
+  grandmother: ['Grandmother', 'Grandma'],
+  grandfather: ['Grandfather', 'Grandpa'],
+  niece: ['Niece'],
+  nephew: ['Nephew'],
+  cousin: ['Cousin'],
+  girlfriend: ['Girlfriend'],
+  boyfriend: ['Boyfriend'],
+  roommate: ['Roommate'],
+  fiance: ['Fiance'],
+  fiancee: ['Fiancee'],
+  stepmother: ['Stepmother'],
+  stepfather: ['Stepfather'],
+  stepsister: ['Stepsister'],
+  stepbrother: ['Stepbrother'],
+}
+
+/**
+ * Roles a character card claims for its own character. Only claims attached to
+ * the card's own name (or to the card speaking in first or second person) count,
+ * so a card that merely describes someone else's mother claims nothing.
+ */
+export function cardRelationshipRoles(text: string, aliases: readonly string[]): string[] {
+  const names = [...new Set(aliases.map(alias => alias.trim()).filter(Boolean))].sort((left, right) => right.length - left.length)
+  if (!names.length || !text.trim()) return []
+  const source = text
+    .replace(/[\u2019]/gu, "'")
+    .replace(/\{\{\s*char\s*\}\}/giu, names[0]!)
+  const escape = (value: string): string => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const namePattern = names.map(escape).join('|')
+  // "Ken's", "Ken and Nao's" — the person the role belongs to. A lowercase
+  // pronoun ("his mother") is only honored for a named subject, because the
+  // pronoun may point at another character.
+  const namedPossessive = "[A-Z][\\p{L}'-]*(?:\\s*(?:,|and|&|\\+)\\s*[A-Z][\\p{L}'-]*)*'s"
+  const possessive = `(?:${namedPossessive}\\s+|his\\s+|her\\s+|their\\s+|its\\s+)?`
+  const roleWords = [...RELATIONSHIP_ROLE_WORDS.keys()].sort((left, right) => right.length - left.length).map(escape).join('|')
+  // "Nao's older sister", "the younger brother" — a couple of modifiers may sit
+  // between the relationship and the role noun.
+  const modifiers = "(?:[\\p{Ll}'-]+\\s+){0,2}"
+  const patterns = [
+    // "Aiko is Ken's mother", "Aiko is a mother"
+    new RegExp(`\\b(?:${namePattern})\\s+(?:is|was|serves as|acts as)\\s+(?:the\\s+|a\\s+|an\\s+)?${possessive}${modifiers}(${roleWords})\\b`, 'giu'),
+    // "Aiko, Ken's mother, …", "Aiko — the mother — …"
+    new RegExp(`\\b(?:${namePattern})\\s*[,—–-]\\s*(?:the\\s+)?${possessive}${modifiers}(${roleWords})\\b`, 'giu'),
+    // "She is Ken's mother", "He acts as their father"
+    new RegExp(`\\b(?:he|she|they)\\s+(?:is|was|serves as|acts as)\\s+(?:the\\s+|a\\s+|an\\s+)?${possessive}${modifiers}(${roleWords})\\b`, 'giu'),
+    // First and second person cards: "I am Ken's mother", "You are the mother."
+    new RegExp(`\\b(?:i(?:'m| am)|you(?:'re| are))\\s+(?:the\\s+|a\\s+|an\\s+)?${possessive}${modifiers}(${roleWords})\\b`, 'giu'),
+    // "Ken's mother is Aiko"
+    new RegExp(`\\b${namedPossessive}\\s+${modifiers}(${roleWords})\\s+(?:is|was)\\s+(?:${namePattern})\\b`, 'gu'),
+  ]
+  const roles: string[] = []
+  for (const pattern of patterns) {
+    for (const match of source.matchAll(pattern)) {
+      const role = RELATIONSHIP_ROLE_WORDS.get(match[1].toLowerCase())
+      if (role && !roles.includes(role)) roles.push(role)
+    }
+  }
+  return roles
+}
+
+/**
+ * Relationship aliases for every card in the chat. A role claimed by more than
+ * one card is ambiguous and stays out of the roster, so two cards mentioning
+ * "mother" cannot both answer to "Mom".
+ */
+export function cardRelationshipAliases(
+  cards: ReadonlyArray<{
+    id: string
+    name: string
+    description?: string
+    personality?: string
+    scenario?: string
+    creatorNotes?: string
+    firstMes?: string
+  }>,
+): Map<string, string[]> {
+  const claims = new Map<string, string[]>()
+  const rolesByCard = new Map<string, string[]>()
+  for (const card of cards) {
+    const text = [card.description, card.personality, card.scenario, card.creatorNotes, card.firstMes]
+      .filter((part): part is string => typeof part === 'string' && part.trim().length > 0)
+      .join('\n')
+      .slice(0, 6_000)
+    const roles = cardRelationshipRoles(text, speakerAliases(card.name))
+    rolesByCard.set(card.id, roles)
+    for (const role of roles) claims.set(role, [...(claims.get(role) ?? []), card.id])
+  }
+  const result = new Map<string, string[]>()
+  for (const [id, roles] of rolesByCard) {
+    const words = roles
+      .filter(role => (claims.get(role) ?? []).length === 1)
+      .flatMap(role => RELATIONSHIP_ROLE_ALIAS_WORDS[role] ?? [])
+    if (words.length) result.set(id, words.slice(0, 2))
+  }
+  return result
+}
+
+/** Append relationship aliases to a roster name unless it already answers to them. */
+export function withRelationshipAliases(name: string, aliases: readonly string[]): string {
+  const base = name.trim()
+  if (!base) return name
+  const existing = new Set(speakerAliases(name).map(alias => alias.toLowerCase()))
+  const additions = [...new Set(aliases.filter(alias => alias.trim() && !existing.has(alias.trim().toLowerCase())))]
+  if (!additions.length) return name
+  return [base, ...additions].join(' / ').slice(0, 4_096)
 }
 
 /** Prefer the most recently recorded claim if a rejected old occurrence was superseded. */
@@ -1471,7 +1633,48 @@ export function buildUncastIdentityReview(groups: UncastVoiceGroup[], answers: R
   return { state: { message, previousMessages, characters: groups.map(group => ({ id: group.id, identity: group.speakerId, speeches: group.speeches, context: group.context })), ghosts: ghosts.map((ghost, index) => ({ option: `ghost_${index}`, identity: ghost.speakerId, aliases: ghostCastAliases(ghost), priorMessageIds: ghostPriorMessageIds(ghost, previousMessages), context: ghost.context, conversationHistory: ghost.conversationHistory ?? [] })) }, questions }
 }
 
-export interface UncastVoiceAssignment { groupId: string; voiceId: string; gender: string; ghostId?: string; label?: string; aliases?: string[]; matchReason?: string }
+/** Family and relationship words used both in narration and in character descriptions. */
+const NARRATED_ROLE_ALIASES: ReadonlyMap<string, string> = new Map([
+  ...['mother', 'mom', 'mommy', 'mum', 'mummy', 'mama'].map(word => [word, 'mother'] as const),
+  ...['father', 'dad', 'daddy', 'papa'].map(word => [word, 'father'] as const),
+  ...['sister', 'sis'].map(word => [word, 'sister'] as const),
+  ...['brother', 'bro'].map(word => [word, 'brother'] as const),
+  ...['daughter', 'son', 'wife', 'husband', 'aunt', 'uncle', 'niece', 'nephew', 'cousin', 'girlfriend', 'boyfriend', 'fiance', 'fiancee', 'friend', 'boss', 'teacher', 'landlady', 'landlord', 'neighbor', 'roommate', 'partner'].map(word => [word, word] as const),
+  ...['grandmother', 'grandma', 'granny', 'nana'].map(word => [word, 'grandmother'] as const),
+  ...['grandfather', 'grandpa'].map(word => [word, 'grandfather'] as const),
+])
+
+/**
+ * Roles narration attributes to the speaker right where it introduces them:
+ * "his mother answers", "the landlord replies". Only speech attributions
+ * count, so a merely present relative ("her brother sets the tray down") is
+ * not mistaken for the speaker.
+ */
+export function narratedSpeakerRoles(context: string): string[] {
+  const text = context.replace(/[\u2019]/gu, "'")
+  const roles: string[] = []
+  const pattern = /(?:\b(?:his|her|their|my|your|His|Her|Their|My|Your)\s+|\bthe\s+|\b[\p{Lu}][\p{L}'’-]{1,30}'s\s+)([\p{Ll}]{3,})\s+(?:answers?|answered|repl(?:y|ies|ied)|says?|said|asks?|asked|calls?|called|whispers?|whispered|murmurs?|murmured|adds?|added|continues?|continued|snaps?|snapped|sighs?|sighed|laughs?|laughed|shouts?|shouted|tells?|told|begins?|began|returns?|returned|agrees?|agreed)\b/gu
+  for (const match of text.matchAll(pattern)) {
+    const role = NARRATED_ROLE_ALIASES.get(match[1].toLowerCase())
+    if (role && !roles.includes(role)) roles.push(role)
+  }
+  return roles
+}
+
+/** Roles a character card claims for itself ("Aiko is Ken's mother"). */
+function castDescriptionRoles(description: string): string[] {
+  const roles: string[] = []
+  for (const token of description.toLowerCase().replace(/[^\p{L}']+/gu, ' ').split(/\s+/u)) {
+    const role = NARRATED_ROLE_ALIASES.get(token.replace(/'s$/u, ''))
+    if (role && !roles.includes(role)) roles.push(role)
+  }
+  return roles
+}
+
+export interface UncastVoiceAssignment { groupId: string; voiceId: string; gender: string; ghostId?: string; label?: string; aliases?: string[]; matchReason?: string; castSpeakerId?: string }
+
+/** A chat character that already owns a configured voice. */
+export interface CastSpeaker { id: string; name: string; voiceId: string; description?: string }
 
 /** Broad descriptions are useful context, but do not uniquely identify a person. */
 export function isBroadPersonLabel(label: string): boolean {
@@ -1529,6 +1732,7 @@ export function resolveUncastVoiceDecisions(
   groups: UncastVoiceGroup[], voices: FavoriteVoice[], answers: Record<string, SpeakerDecisionChoice>,
   ghosts: GhostVoice[] = [], reserved: readonly string[] = [], messageId = '', message = '', previousMessageIds: readonly string[] = [],
   random: () => number = Math.random,
+  cast: readonly CastSpeaker[] = [],
 ): UncastVoiceAssignment[] {
   // Voices held by live ghosts stay reserved for their owners; Jev's shortlist
   // must not reassign one to a new character (the reservation recheck would
@@ -1545,12 +1749,63 @@ export function resolveUncastVoiceDecisions(
   const groupLabels = new Map<string, string>()
   const rootByLabel = new Map<string, string>()
   const rootByRevealedName = new Map<string, string>()
+  // One exchange can split a single unidentified participant into several
+  // groups: a cast character answers between their lines, or narration breaks
+  // the quote run. Jev then reports each fragment as "new or unclear" because
+  // nothing in the text distinguishes them, and minting a favorite per
+  // fragment produced four or five voices for one off-screen speaker. An
+  // unidentified fragment instead reuses the first pending voice of a
+  // compatible sex.
+  const pendingUnnamedVoices: Array<{ ghost: GhostVoice; voice: FavoriteVoice }> = []
+  // A cast member identified within this message also owns the message's
+  // remaining unidentified lines when the exchange has only that one unnamed
+  // participant: the mother answering off-screen and then "Mm." are the same
+  // person, so "Mm." must not mint a separate favorite either.
+  const pendingCastVoices: CastSpeaker[] = []
+  const hasNewVoiceEvidence = (members: UncastVoiceGroup[]): boolean =>
+    members.some(group => group.context.some(context => hasNewAnonymousVoiceCue(context) || hasStrongNarrativeName(context)))
+  const groupShowsNamedIdentity = (group: UncastVoiceGroup): boolean => {
+    if (revealedUncastName(group, answers, message)) return true
+    if (normalizeSpeakerName(group.narratedName ?? '')) return true
+    const label = groupLabels.get(group.id)
+    return !!label && !isBroadPersonLabel(label)
+  }
   const strongChoice = (answer: SpeakerDecisionChoice | undefined): boolean => {
     if (!answer || answer.choice === 'new_or_unclear') return false
     if (!Number.isFinite(answer.confidence) || answer.confidence < 0 || answer.confidence > 1 || !answer.probabilities || Object.values(answer.probabilities).some(value => !Number.isFinite(value) || value < 0 || value > 1)) return false
     const probability = answer.probabilities[answer.choice] ?? 0
     const runnerUp = Math.max(0, ...Object.entries(answer.probabilities).filter(([key]) => key !== answer.choice).map(([, p]) => p))
     return answer.confidence >= 0.8 && probability >= 0.8 && probability - runnerUp >= 0.25
+  }
+  // A group Jev places among the established cast characters must keep that
+  // character's configured voice instead of minting a new favorite, so the bar
+  // is a clear lead rather than Jev's strict "strong" verdict: the cast list is
+  // small and carries each member's description, and a random voice for an
+  // off-screen cast member is the worse error. A root is one person, so
+  // conflicting picks do not count.
+  const castChoice = (answer: SpeakerDecisionChoice | undefined): boolean => {
+    if (!answer || !answer.choice.startsWith('cast_') || !answer.probabilities) return false
+    const probability = answer.probabilities[answer.choice] ?? 0
+    const runnerUp = Math.max(0, ...Object.entries(answer.probabilities).filter(([key]) => key !== answer.choice).map(([, p]) => p))
+    return Number.isFinite(answer.confidence) && answer.confidence >= 0.6 && probability >= 0.7 && probability - runnerUp >= 0.25
+  }
+  const castSpeakerFor = (members: UncastVoiceGroup[]): CastSpeaker | undefined => {
+    const picks = members.flatMap(group => {
+      const answer = answers[`cast_${group.id}`]
+      if (!castChoice(answer)) return []
+      const match = answer!.choice.match(/^cast_(\d+)$/u)
+      const member = match ? cast[Number(match[1])] : undefined
+      return member ? [member] : []
+    })
+    if (picks.length) return picks.every(member => member.id === picks[0].id) ? picks[0] : undefined
+    // Deterministic backstop when Jev leaves the group unidentified: narration
+    // that attributes the speech to a role ("his mother answers") names the
+    // speaker's relation, and exactly one cast member whose card claims that
+    // relation must be that person.
+    const roles = [...new Set(members.flatMap(group => narratedSpeakerRoles(group.context.join(' '))))]
+    if (!roles.length) return undefined
+    const matching = cast.filter(member => member.description && roles.every(role => castDescriptionRoles(member.description!).includes(role)))
+    return matching.length === 1 ? matching[0] : undefined
   }
   // Resolve identity links before choosing voices, so later evidence can help
   // the whole character even when the first group has no suitable match.
@@ -1759,6 +2014,60 @@ export function resolveUncastVoiceDecisions(
         linkReasons.delete(root)
       }
     }
+    // Before adding a voice, check the group against the existing cast: the
+    // speaker may simply be a cast member who is off-screen. Cast members
+    // already own a configured voice, so creating a favorite here gives one
+    // character two voices. Named newcomers never take this path.
+    const castMember = ghost || !cast.length ? undefined : castSpeakerFor(members)
+    if (castMember && members.every(group => !groupShowsNamedIdentity(group))) {
+      used.add(castMember.voiceId)
+      if (!pendingCastVoices.some(member => member.id === castMember.id)) pendingCastVoices.push(castMember)
+      for (const group of members) {
+        assignments.push({
+          groupId: group.id, voiceId: castMember.voiceId, gender,
+          castSpeakerId: castMember.id, matchReason: `existing cast member: ${castMember.name} (${castMember.id})`,
+        })
+      }
+      continue
+    }
+    // A fragment Jev leaves unidentified is not evidence of a second unnamed
+    // person. Reuse the first pending voice of a compatible sex so one
+    // off-screen participant keeps one voice across the exchange. A weak
+    // identity lean ("group_g2" at 0.14 confidence) is still unidentified:
+    // strong links already merged the roots or set `ghost` above, so anything
+    // that reaches this point without one has no confident identity. Named and
+    // specifically labelled fragments never take this path, so mutually named
+    // uncast speakers still keep separate voices.
+    if (!ghost) {
+      const unidentified = members.every(group => !strongChoice(answers[`identity_${group.id}`]))
+      const unnamedMembers = members.every(group => group.speakerId === UNCAST_SPEAKER_ID && !groupShowsNamedIdentity(group))
+      // An unknown-gender fragment is compatible with every voice, so it
+      // cannot be shown to belong to the same person; it keeps its own voice.
+      const definiteGender = gender === 'male' || gender === 'female'
+      // A cast member identified earlier in this same message owns the rest of
+      // the exchange's unnamed lines unless they introduce someone new. The
+      // gender stays definite: an unknown-gender fragment proves nothing.
+      const sharedCast = unidentified && unnamedMembers && definiteGender && pendingCastVoices.length === 1 && !hasNewVoiceEvidence(members)
+        ? pendingCastVoices[0]
+        : undefined
+      if (sharedCast) {
+        for (const group of members) {
+          assignments.push({
+            groupId: group.id, voiceId: sharedCast.voiceId, gender, castSpeakerId: sharedCast.id,
+            matchReason: `same exchange as cast member: ${sharedCast.name} (${sharedCast.id})`,
+          })
+        }
+        continue
+      }
+      const shared = unidentified && unnamedMembers && definiteGender
+        ? pendingUnnamedVoices.find(entry => voiceGenderCompatible(entry.voice, gender))
+        : undefined
+      if (shared) {
+        ghost = shared.ghost
+        ghost.context = [ghost.context, ...members.flatMap(group => group.context)].filter(Boolean).join(' ').slice(0, 2_000)
+        linkReasons.set(root, "reuses the exchange's unidentified voice")
+      }
+    }
     if (!ghost) {
       const matches = members.map(group => answers[`voice_${group.id}`]).filter((answer): answer is SpeakerDecisionChoice => !!answer)
       const candidates = voices.flatMap((voice, index) => {
@@ -1777,6 +2086,11 @@ export function resolveUncastVoiceDecisions(
       const shortlist = shortlistRankedVoices(candidates, entry => entry.score)
       const chosen = shortlist[Math.min(shortlist.length - 1, Math.floor(random() * shortlist.length))].voice
       ghost = { id: `pending:${root}`, speakerId: members[0].speakerId, voiceId: chosen.id, context: members.flatMap(group => group.context).join(' ').slice(0, 2_000), occurrenceKeys: [], lastSeenMessageId: messageId }
+      // Only an unnamed, unlabelled root becomes the reusable baseline; a
+      // labelled or named newcomer is a distinct person by construction.
+      if (members.every(group => group.speakerId === UNCAST_SPEAKER_ID && !groupShowsNamedIdentity(group))) {
+        pendingUnnamedVoices.push({ ghost, voice: chosen })
+      }
       linkReasons.set(root, 'new voice selected from favorites')
     }
     used.add(ghost.voiceId)
@@ -1965,6 +2279,8 @@ export function filterNarrationSegments(segments: PlaybackSegment[], skipNarrati
 export interface VoicePlanSegment {
   text: string
   voice: string
+  /** Original speech, for distinguishing generated vocal tags from user text. */
+  originalSpeech?: string
   /** Speech plan ID so late tag placements can update this entry. */
   tagId?: string
 }
@@ -2080,11 +2396,16 @@ export function adaptiveGenerationConcurrency(
   const lowerQuartileLength = sorted[Math.floor((sorted.length - 1) * 0.25)] ?? 0
   const shortCount = lengths.filter(length => length < 160).length
   const mixedDenseWindow = lengths.length >= 4 && lowerQuartileLength < 220
+  // Dense, short, frequently alternating lines are the case that drains the
+  // playback buffer fastest: each clip holds a second or two of audio, so a
+  // single in-flight request cannot keep up with playback. Keep at least two
+  // requests in flight instead of serializing the whole scene.
+  const denseFloor = Math.min(safeConfiguredMaximum, 2)
   if (shortCount >= 3 || medianLength < 200 || mixedDenseWindow || voiceChanges >= 3) {
-    return { concurrency: 1, shortCooldown: 6, longWindowStreak: 0 }
+    return { concurrency: Math.max(denseFloor, safeCurrent), shortCooldown: 6, longWindowStreak: 0 }
   }
   if (safeCooldown > 0) {
-    return { concurrency: 1, shortCooldown: safeCooldown - 1, longWindowStreak: 0 }
+    return { concurrency: denseFloor, shortCooldown: safeCooldown - 1, longWindowStreak: 0 }
   }
   const uniformlyLongWindow = lengths.length >= 3
     && Math.min(...lengths) >= 300
@@ -2105,9 +2426,12 @@ export function adaptiveGenerationConcurrency(
 }
 
 /**
- * Raise synthesis concurrency only while playback is at risk of exhausting its
- * ready-audio buffer. The ordinary adaptive result remains authoritative once
- * enough segments are available, and rate limiting always forces serialization.
+ * Keep synthesis concurrency high enough to feed playback, and hold it there
+ * instead of snapping back to the content-aware baseline the moment the buffer
+ * is satisfied. Returning to the baseline as soon as a few clips are ready made
+ * the pipeline oscillate between starved and idle, so the buffer drained again
+ * before the next request landed. Concurrency now decays one step only once the
+ * buffer is comfortably ahead, and rate limiting still forces serialization.
  */
 export function bufferAwareGenerationConcurrency(
   current: number,
@@ -2127,8 +2451,20 @@ export function bufferAwareGenerationConcurrency(
   const safeBaseline = Math.min(ceiling, Math.max(1, Math.round(adaptiveBaseline)))
   const ready = Math.max(0, Math.round(readyAhead))
   const target = Math.max(1, Math.round(targetBuffer))
-  if (ready >= target || ceiling === 1) return safeBaseline
-  return Math.min(ceiling, Math.max(2, safeCurrent + 1))
+  if (ceiling === 1) return 1
+  if (ready < target) return Math.min(ceiling, Math.max(2, safeCurrent + 1))
+  if (ready >= target * 2) return Math.min(ceiling, Math.max(safeBaseline, safeCurrent - 1))
+  return Math.min(ceiling, Math.max(safeBaseline, safeCurrent))
+}
+
+/**
+ * Some TTS providers apply a request's voice through mutable connection state,
+ * so a clip that falls back to the connection's own voice must not overlap a
+ * different voice on the same connection. A clip that carries an explicit voice
+ * identifies its own voice, so its requests may overlap freely.
+ */
+export function planNeedsVoiceSerialization(segments: ReadonlyArray<{ voice: string }>): boolean {
+  return segments.some(segment => !segment.voice.trim())
 }
 
 /** Combine decoded audio into one PCM WAV so the host does not need FFmpeg to save it. */
@@ -2214,6 +2550,7 @@ export function mergeVoicePlan(segments: VoicePlanSegment[]): VoicePlanSegment[]
       result.push({
         text,
         voice: segment.voice,
+        ...(segment.originalSpeech !== undefined ? { originalSpeech: segment.originalSpeech } : {}),
         ...(segment.tagId ? { tagId: segment.tagId } : {}),
       })
     }
@@ -2279,6 +2616,7 @@ export function splitLargeVoicePlanSegments(
       result.push({
         text,
         voice: segment.voice,
+        ...(segment.originalSpeech !== undefined ? { originalSpeech: segment.originalSpeech } : {}),
         ...(segment.tagId ? { tagId: segment.tagId } : {}),
       })
       remaining = remaining.slice(splitAt).trim()
@@ -2287,11 +2625,35 @@ export function splitLargeVoicePlanSegments(
       result.push({
         text: remaining,
         voice: segment.voice,
+        ...(segment.originalSpeech !== undefined ? { originalSpeech: segment.originalSpeech } : {}),
         ...(segment.tagId ? { tagId: segment.tagId } : {}),
       })
     }
   }
   return result
+}
+
+/** Conservative runaway-audio threshold; original user-authored cues survive retries. */
+export function speechDurationGuard(text: string, originalSpeech: string, speed: number): { retryText: string; maxSeconds: number; spokenCharacters: number } | null {
+  const retryText = text.replace(/\[[^\]\r\n]+\]|<[^>\r\n]+>/gu, token => {
+    const category = ttsTagCategory(token.slice(1, -1))
+    return originalSpeech.includes(token) || category === 'sound' || category === 'pause' ? token : ''
+  })
+    .replace(/\s+/gu, ' ').trim()
+  const spoken = stripTtsTags(retryText).trim()
+  const spokenCharacters = Array.from(spoken).filter(char => /[\p{L}\p{N}]/u.test(char)).length
+  if (!spokenCharacters) return null
+  const words = (spoken.match(/[\p{L}\p{N}]+/gu) ?? []).length
+  const events = extractTtsTags(retryText).filter(tag => {
+    const category = ttsTagCategory(tag)
+    return category === 'sound' || category === 'pause'
+  }).length
+  const safeSpeed = Number.isFinite(speed) ? Math.max(0.25, Math.min(1, speed)) : 1
+  return {
+    retryText,
+    maxSeconds: (Math.max(20, 4 + words * 2.5, spokenCharacters / 3) + events * 8) / safeSpeed,
+    spokenCharacters,
+  }
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -2752,6 +3114,51 @@ const PREPOSITION_BEFORE_NAME_PATTERN = new RegExp(
   'iu',
 )
 
+/**
+ * Whether a saved speaker id was built from a word that cannot be a name, such
+ * as `unconfigured:not`. Used to retire voices created before name inference
+ * rejected ordinary capitalized words.
+ */
+function isNonNameSpeakerId(speakerId: string): boolean {
+  const name = speakerId.startsWith('unconfigured:') ? speakerId.slice('unconfigured:'.length) : ''
+  if (!name) return false
+  const aliases = speakerAliases(name)
+  const first = aliases[0]?.split(/\s+/u)[0]?.toLowerCase() ?? ''
+  return !first || NON_NAME_WORDS.has(first) || aliases.some(alias => NON_NAME_WORDS.has(alias.toLowerCase()))
+}
+
+/**
+ * Words that must never be read as a person's name. Name inference runs on
+ * capitalized words at the start of a paragraph or sentence, where ordinary
+ * English is capitalized too ("Not that it matters.", "Nothing moves."). A
+ * repeated one used to become a roster candidate with its own voice.
+ */
+const NON_NAME_WORDS = new Set<string>([
+  ...NON_NAME_PARAGRAPH_LEADS,
+  'all', 'almost', 'already', 'also', 'always', 'another', 'any', 'anything', 'anywhere',
+  'both', 'each', 'either', 'even', 'eventually', 'every', 'everybody', 'everything',
+  'everywhere', 'finally', 'fine', 'first', 'good', 'half', 'hey', 'hi', 'however',
+  'instead', 'just', 'last', 'later', 'many', 'maybe', 'meanwhile', 'most', 'much', 'neither',
+  'never', 'next', 'no', 'nobody', 'noone', 'none', 'not', 'nothing', 'nowhere', 'now',
+  'oh', 'ok', 'okay', 'once', 'only', 'other', 'otherwise', 'perhaps', 'probably', 'quite',
+  'rather', 'really', 'right', 'second', 'simply', 'since', 'soon', 'still', 'such', 'sure',
+  'suddenly', 'third', 'too', 'twice', 'very', 'well', 'whatever', 'whenever', 'wherever',
+  'why', 'yes', 'yet',
+])
+
+/**
+ * Whether a capitalized word plausibly names a person. A proper name keeps its
+ * capital wherever it appears, so a word that also occurs in lower case in the
+ * narration ("Not that it matters" beside "not words so much as shape") is
+ * ordinary prose rather than somebody new.
+ */
+function isPlausiblePersonName(name: string, narration: string, aliases: readonly string[]): boolean {
+  const first = aliases[0]?.split(/\s+/u)[0]?.toLowerCase() ?? ''
+  if (!first || NON_NAME_WORDS.has(first)) return false
+  if (aliases.some(alias => NON_NAME_WORDS.has(alias.toLowerCase()))) return false
+  return !new RegExp(`\\b${escapedPattern(name.toLowerCase())}\\b`, 'u').test(narration)
+}
+
 const INTRODUCTORY_PREPOSITIONAL_PHRASE_PATTERN = new RegExp(
   `^\\s*(?:${PREPOSITION_WORDS.join('|')})\\b(?:\\s+[\\p{L}\\p{M}'’-]+){1,7}\\s*,?\\s*$`,
   'iu',
@@ -2776,11 +3183,13 @@ export function addUnconfiguredDialogueSpeakers(
   const knownAliases = new Set(result.flatMap(speaker => (
     speakerAliases(speaker.name).map(alias => alias.toLowerCase())
   )))
+  const narrationForNames = narrativeOnly(preparedContent)
   const addCandidate = (rawName: string, explicitlyAttributed = false) => {
     const name = normalizeSpeakerName(rawName.replace(/['’]s$/u, ''))
     const aliases = speakerAliases(name)
     const first = aliases[0]?.split(/\s+/u)[0]?.toLowerCase() ?? ''
-    if (!name || !first || NON_NAME_PARAGRAPH_LEADS.has(first)) return
+    if (!name || !first) return
+    if (!isPlausiblePersonName(name, narrationForNames, aliases)) return
     if (aliases.some(alias => knownAliases.has(alias.toLowerCase()))) return
     if (!explicitlyAttributed) {
       const occurrences = [...preparedContent.matchAll(
@@ -2799,7 +3208,7 @@ export function addUnconfiguredDialogueSpeakers(
 
   // Possessive subjects can establish an unconfigured person even when the
   // name follows another sentence, as in a phone conversation's action beat.
-  const narrative = narrativeOnly(preparedContent)
+  const narrative = narrationForNames
   for (const match of narrative.matchAll(/\b([\p{Lu}][\p{L}\p{M}-]{1,63})['\u2019]s\s+[\p{L}\p{M}-]+/gu)) addCandidate(match[1])
   // Collect repeated proper-name subjects within a sentence, not just at a
   // paragraph's beginning. These are candidates; Jev still attributes speech.
@@ -3052,9 +3461,51 @@ function decodePlaybackEntities(value: string): string {
 export interface SkippedTrackerTagPair {
   open: string
   close: string
+  /**
+   * True when the pair is marker text matched literally, such as the HTML
+   * comments `<!-- GFX_START -->` / `<!-- GFX_END -->`, instead of an
+   * XML-style tag name.
+   */
+  marker?: boolean
 }
 
 const TRACKER_TAG_NAME_RE = /^[a-z][a-z0-9:._-]*$/u
+const TRACKER_COMMENT_RE = /<!--[\s\S]*?-->/gu
+
+/** Enclosure rules occupy their own line, so markers may contain commas. */
+function extractEnclosedSkipRules(value: string): { remaining: string; pairs: Array<{ open: string; close: string }> } {
+  const pairs: Array<{ open: string; close: string }> = []
+  const remaining = value.replace(/^[\t ]*enclosed:[^\r\n]*/gimu, line => {
+    const rule = line.replace(/^[\t ]*enclosed:/iu, '')
+    let separator = -1
+    let quoted = false
+    let escaped = false
+    for (let index = 0; index < rule.length; index++) {
+      const char = rule[index]
+      if (escaped) { escaped = false; continue }
+      if (char === '\\') { escaped = true; continue }
+      if (char === '"') { quoted = !quoted; continue }
+      if (char === '|' && !quoted) { separator = index; break }
+    }
+    if (separator < 0) return ''
+    const parseMarker = (raw: string): string | null => {
+      const trimmed = raw.trim()
+      if (!trimmed) return null
+      if (trimmed.startsWith('"')) {
+        try {
+          const parsed: unknown = JSON.parse(trimmed)
+          return typeof parsed === 'string' && parsed.length ? parsed : null
+        } catch { return null }
+      }
+      return trimmed.replace(/\\([\\|])/gu, '$1')
+    }
+    const open = parseMarker(rule.slice(0, separator))
+    const close = parseMarker(rule.slice(separator + 1))
+    if (open && close && pairs.length < 100) pairs.push({ open, close })
+    return ''
+  })
+  return { remaining, pairs }
+}
 
 function normalizeTrackerTagName(value: string): string | null {
   const tag = value.trim().toLowerCase()
@@ -3066,27 +3517,59 @@ function normalizeTrackerTagName(value: string): string | null {
  * - a tag name (`tracker`), treated as a symmetric pair;
  * - a single full tag (`<tracker>`), treated as a symmetric pair;
  * - a full pair (`<o_ledger></o_l>`), which may open and close with different
- *   names.
+ *   names;
+ * - a pair of comment markers (`<!-- GFX_START --><!-- GFX_END -->`) or one
+ *   marker on its own (`<!-- GFX_START -->`), matched literally.
  *
  * Attributes and surrounding whitespace are ignored; only the tag names are
  * retained so the same entry matches tags with attributes in the message.
  */
 export function parseSkippedTrackerTagPairs(value: string): SkippedTrackerTagPair[] {
-  const decoded = decodePlaybackEntities(value)
+  const decoded = decodePlaybackEntities(extractEnclosedSkipRules(value).remaining)
   const pairs: SkippedTrackerTagPair[] = []
   const seen = new Set<string>()
-  const addPair = (open: string | null, close: string | null) => {
+  const addPair = (open: string | null, close: string | null, marker = false) => {
     if (!open || !close) return
-    const key = `${open}\u0000${close}`
+    const key = `${open.toLowerCase()}\u0000${close.toLowerCase()}`
     if (seen.has(key)) return
     seen.add(key)
-    pairs.push({ open, close })
+    pairs.push(marker ? { open, close, marker: true } : { open, close })
   }
-  const addSymmetric = (name: string | null) => addPair(name, name)
+  const addSymmetric = (name: string | null, marker = false) => addPair(name, name, marker)
+  const full = () => pairs.length >= 100
 
-  for (const entry of decoded.split(',')) {
+  // Markers use comment syntax, which has no tag name, and a marker may itself
+  // contain commas ("<!-- GFX: state, scene -->"). Pair them before the comma
+  // split, then drop the matched spans so the remaining entries parse as tags.
+  const comments = [...decoded.matchAll(TRACKER_COMMENT_RE)]
+  const consumed: Array<{ start: number; end: number }> = []
+  for (let index = 0; index + 1 < comments.length && !full(); index += 1) {
+    const left = comments[index]
+    const right = comments[index + 1]
+    if (left.index === undefined || right.index === undefined) continue
+    const leftEnd = left.index + left[0].length
+    if (!/^\s*,?\s*$/u.test(decoded.slice(leftEnd, right.index))) continue
+    addPair(left[0].trim(), right[0].trim(), true)
+    consumed.push({ start: left.index, end: right.index + right[0].length })
+    index += 1
+  }
+  let entries = decoded
+  for (let index = consumed.length - 1; index >= 0; index -= 1) {
+    entries = `${entries.slice(0, consumed[index].start)}${entries.slice(consumed[index].end)}`
+  }
+
+  for (const entry of entries.split(',')) {
     const trimmed = entry.trim()
     if (!trimmed) continue
+    if (/^prefix:/iu.test(trimmed)) continue
+    // A lone comment marker excludes everything up to the next occurrence of
+    // the same marker, the way a symmetric tag name does.
+    const loneMarker = trimmed.match(/^<!--[\s\S]*?-->$/u)
+    if (loneMarker) {
+      addSymmetric(loneMarker[0], true)
+      if (full()) return pairs
+      continue
+    }
     const pairMatch = trimmed.match(
       /^\\?<\s*([a-z][a-z0-9:._-]*)(?=\s|>)[^>]*>\s*\\?<\s*\/\s*([a-z][a-z0-9:._-]*)(?=\s|>)[^>]*>$/iu,
     )
@@ -3095,17 +3578,17 @@ export function parseSkippedTrackerTagPairs(value: string): SkippedTrackerTagPai
         normalizeTrackerTagName(pairMatch[1] ?? ''),
         normalizeTrackerTagName(pairMatch[2] ?? ''),
       )
-      if (pairs.length >= 100) return pairs
+      if (full()) return pairs
       continue
     }
     const tagMatch = trimmed.match(/^\\?<\s*([a-z][a-z0-9:._-]*)(?=\s|>)[^>]*>$/iu)
     if (tagMatch) {
       addSymmetric(normalizeTrackerTagName(tagMatch[1] ?? ''))
-      if (pairs.length >= 100) return pairs
+      if (full()) return pairs
       continue
     }
     addSymmetric(normalizeTrackerTagName(trimmed))
-    if (pairs.length >= 100) return pairs
+    if (full()) return pairs
   }
   // Keep previously saved paired-tag settings working after the simpler
   // name-only format was introduced. This also accepts an entry that embeds
@@ -3113,7 +3596,7 @@ export function parseSkippedTrackerTagPairs(value: string): SkippedTrackerTagPai
   const legacyPattern = /\\?<\s*([a-z][a-z0-9:._-]*)(?=\s|>)[^>]*>[\s\S]*?\\?<\s*\/\s*\1\s*>/giu
   for (const match of decoded.matchAll(legacyPattern)) {
     addSymmetric(normalizeTrackerTagName(match[1] ?? ''))
-    if (pairs.length >= 100) break
+    if (full()) break
   }
   return pairs
 }
@@ -3123,13 +3606,16 @@ export function parseSkippedTrackerTags(value: string): string[] {
   return [...new Set(parseSkippedTrackerTagPairs(value).map(pair => pair.open))].slice(0, 100)
 }
 
-function stripTagBlock(value: string, openTag: string, closeTag: string): string {
-  const open = escapedPattern(openTag)
-  const close = escapedPattern(closeTag)
-  const tokenPattern = new RegExp(
-    `(\\\\?<\\s*${open}(?=\\s|>)[^>]*>)|(\\\\?<\\s*\\/\\s*${close}(?=\\s|>)[^>]*>)`,
-    'giu',
-  )
+function applyStripRanges(value: string, ranges: Array<{ start: number; end: number }>): string {
+  if (ranges.length === 0) return value
+  let result = value
+  for (let index = ranges.length - 1; index >= 0; index--) {
+    result = `${result.slice(0, ranges[index].start)} ${result.slice(ranges[index].end)}`
+  }
+  return result
+}
+
+function stripDelimitedBlock(value: string, tokenPattern: RegExp): string {
   const ranges: Array<{ start: number; end: number }> = []
   let depth = 0
   let blockStart = -1
@@ -3149,21 +3635,75 @@ function stripTagBlock(value: string, openTag: string, closeTag: string): string
       }
     }
   }
-  if (ranges.length === 0) return value
-  let result = value
-  for (let index = ranges.length - 1; index >= 0; index--) {
-    result = `${result.slice(0, ranges[index].start)} ${result.slice(ranges[index].end)}`
+  return applyStripRanges(value, ranges)
+}
+
+function stripTagBlock(value: string, openTag: string, closeTag: string): string {
+  const open = escapedPattern(openTag)
+  const close = escapedPattern(closeTag)
+  return stripDelimitedBlock(value, new RegExp(
+    `(\\\\?<\\s*${open}(?=\\s|>)[^>]*>)|(\\\\?<\\s*\\/\\s*${close}(?=\\s|>)[^>]*>)`,
+    'giu',
+  ))
+}
+
+/** Remove everything between two literal markers, such as HTML comments. */
+function stripMarkerBlock(value: string, openMarker: string, closeMarker: string): string {
+  if (openMarker.toLowerCase() === closeMarker.toLowerCase()) {
+    // One marker used for both ends: alternate open/close so a single marker is
+    // not counted as its own closer.
+    const ranges: Array<{ start: number; end: number }> = []
+    let openAt = -1
+    for (const match of value.matchAll(new RegExp(escapedPattern(openMarker), 'giu'))) {
+      if (match.index === undefined) continue
+      if (openAt < 0) {
+        openAt = match.index
+      } else {
+        ranges.push({ start: openAt, end: match.index + match[0].length })
+        openAt = -1
+      }
+    }
+    return applyStripRanges(value, ranges)
   }
-  return result
+  return stripDelimitedBlock(value, new RegExp(
+    `(${escapedPattern(openMarker)})|(${escapedPattern(closeMarker)})`,
+    'giu',
+  ))
 }
 
 export function stripSkippedTrackerBlocks(content: string, tagPairs: string): string {
+  const enclosedRules = extractEnclosedSkipRules(tagPairs)
   let result = content
     .replace(/&lt;|&#60;|&#x3c;/gi, '<')
     .replace(/&gt;|&#62;|&#x3e;/gi, '>')
-    .replace(/<!--[\s\S]*?-->/g, ' ')
-  for (const pair of parseSkippedTrackerTagPairs(tagPairs)) {
-    result = stripTagBlock(result, pair.open, pair.close)
+  for (const { open, close } of enclosedRules.pairs) {
+    const ranges: Array<{ start: number; end: number }> = []
+    let searchFrom = 0
+    while (searchFrom < result.length) {
+      const start = result.indexOf(open, searchFrom)
+      if (start < 0) break
+      const end = result.indexOf(close, start + open.length)
+      if (end < 0) break
+      searchFrom = end + close.length
+      ranges.push({ start, end: searchFrom })
+    }
+    result = applyStripRanges(result, ranges)
+  }
+  const pairs = parseSkippedTrackerTagPairs(enclosedRules.remaining)
+  // Marker pairs run first: their markers are HTML comments, and the generic
+  // comment pass below would remove those before the enclosed block could be
+  // read, leaving the tracker text behind.
+  for (const pair of pairs) {
+    if (pair.marker) result = stripMarkerBlock(result, pair.open, pair.close)
+  }
+  for (const pair of pairs) {
+    if (!pair.marker) result = stripTagBlock(result, pair.open, pair.close)
+  }
+  result = result.replace(/<!--[\s\S]*?-->/g, ' ')
+  const prefixes = [...decodePlaybackEntities(enclosedRules.remaining).matchAll(/(?:^|,)\s*prefix:([^,\s]+)\s*(?=,|$)/giu)]
+    .map(match => (match[1] ?? '').toLowerCase())
+  if (prefixes.length) {
+    result = result.replace(/\S+/gu, token => prefixes.some(prefix => token.toLowerCase().includes(prefix)) ? ' ' : token)
   }
   return result
 }
@@ -4351,16 +4891,27 @@ export function buildContextualUserReconciliation(plan: SpeakerDecisionPlan, ans
 /** Preserve a user assignment only after explicit attribution or contextual confirmation. */
 export function applyContextualUserReconciliation(plan: SpeakerDecisionPlan, answers: Record<string, SpeakerDecisionChoice>, reviewed: Record<string, SpeakerDecisionChoice>, questions: SpeakerDecisionPlan['questions']): void {
   const speakers = plan.state.speakers.map(speaker => ({ id: speaker.id, name: speaker.name }))
+  const userOption = plan.state.speakers.find(speaker => speaker.id === USER_SPEAKER_ID)?.option
   for (const speech of plan.state.speeches) {
     const key = `persona_check_${speech.id}`
     if (!questions[key]) continue
     const result = reviewed[key]
     answers[`persona_check_${speech.id}`] = result ?? { choice: 'no_clear_identity', probabilities: {}, confidence: 0 }
     const checked = evaluateSpeakerDecisionAnswer(result, { user: USER_SPEAKER_ID, other: 'other' }, { probability: 0.8, confidence: 0.75, margin: 0.25 })
+    // The persona question is a dedicated three-way test (user / other /
+    // unclear), not an N-way identity guess, so a clear lead there combined
+    // with the model's own identity answer naming the user persona is enough
+    // evidence. Requiring both keeps role leakage blocked while a POV character
+    // who genuinely speaks is no longer silenced into the connection default.
+    const leaned = evaluateSpeakerDecisionAnswer(result, { user: USER_SPEAKER_ID, other: 'other' }, { probability: 0.6, confidence: 0.45, margin: 0.2 })
+    const identityLeanedUser = Boolean(userOption) && [answers[`speech_${speech.id}`], answers[`relationship_review_${speech.id}`]]
+      .some(answer => Boolean(answer) && answer!.choice === userOption && (answer!.probabilities[userOption!] ?? 0) >= 0.6)
+    const personaConfirmed = checked.identity === USER_SPEAKER_ID
+      || (leaned.identity === USER_SPEAKER_ID && identityLeanedUser)
     const explicit = narrativeAttributionSpeaker(`${speech.narrativeBefore} ${speech.narrativeAfter}`, speakers)
     const candidate = answers[`relationship_review_${speech.id}`]
     const candidateIdentity = evaluateSpeakerDecisionAnswer(candidate, plan.optionSpeakerIds).identity
-    if ((checked.identity === USER_SPEAKER_ID && (!explicit || explicit === USER_SPEAKER_ID)) || explicit === USER_SPEAKER_ID) {
+    if ((personaConfirmed && (!explicit || explicit === USER_SPEAKER_ID)) || explicit === USER_SPEAKER_ID) {
       const currentIdentity = evaluateSpeakerDecisionAnswer(answers[`speech_${speech.id}`], plan.optionSpeakerIds).identity
       if (currentIdentity !== USER_SPEAKER_ID && candidateIdentity === USER_SPEAKER_ID) {
         answers[`relationship_original_${speech.id}`] = answers[`speech_${speech.id}`]
@@ -4376,7 +4927,11 @@ export function applyContextualUserReconciliation(plan: SpeakerDecisionPlan, ans
         answers[`persona_original_${speech.id}`] = answers[`speech_${speech.id}`]
         const before = answers[`relationship_original_${speech.id}`]
         const beforeIdentity = evaluateSpeakerDecisionAnswer(before, plan.optionSpeakerIds).identity
-        answers[`speech_${speech.id}`] = before && beforeIdentity !== USER_SPEAKER_ID ? before : { choice: 'no_clear_identity', probabilities: {}, confidence: 0 }
+        // Dropping the persona must not strand the line on the connection
+        // default: keep the model's remaining preferences, renormalized.
+        answers[`speech_${speech.id}`] = before && beforeIdentity !== USER_SPEAKER_ID
+          ? before
+          : withoutUserCandidate(answers[`speech_${speech.id}`], userOption)
         delete answers[`relationship_confirmed_${speech.id}`]
         delete answers[`relationship_applied_${speech.id}`]
         delete answers[`relationship_global_${speech.id}`]
@@ -4387,9 +4942,101 @@ export function applyContextualUserReconciliation(plan: SpeakerDecisionPlan, ans
   }
 }
 
+/**
+ * After the persona review rejects the user, keep the model's next-best
+ * speaker instead of discarding the whole distribution, which would leave the
+ * quotation unresolved and route it to the connection default voice.
+ */
+function withoutUserCandidate(answer: SpeakerDecisionChoice | undefined, userOption: string | undefined): SpeakerDecisionChoice {
+  const cleared: SpeakerDecisionChoice = { choice: 'no_clear_identity', probabilities: {}, confidence: 0 }
+  if (!answer || !userOption) return cleared
+  const remaining = Object.entries(answer.probabilities).filter(([option]) => option !== userOption)
+  const total = remaining.reduce((sum, [, probability]) => sum + probability, 0)
+  if (!(total > 0)) return cleared
+  const probabilities = Object.fromEntries(remaining.map(([option, probability]) => [option, probability / total]))
+  const [best] = Object.entries(probabilities).sort((left, right) => right[1] - left[1])
+  if (!best || best[0] === DECISION_UNCLEAR_OPTION) return cleared
+  return { choice: best[0], probabilities, confidence: answer.confidence }
+}
+
+/**
+ * Two deterministic speech facts that a fast exchange keeps losing:
+ * - a quotation that responds to the previous speaker is normally the other
+ *   participant, so a weak same-speaker answer yields to the runner-up;
+ * - "I said X" repeats the speaker's own earlier line, so it belongs to
+ *   whoever said X.
+ * Confident answers, confirmed links, and the user persona are never touched.
+ */
+export function applyConversationFlow(
+  plan: SpeakerDecisionPlan,
+  answers: Record<string, SpeakerDecisionChoice>,
+  identities: Array<string | null | undefined>,
+  paths: Map<number, string>,
+): void {
+  const optionIds = plan.optionSpeakerIds
+  const optionById = new Map(Object.entries(optionIds).map(([option, id]) => [id, option]))
+  const castIds = new Set(plan.state.speakers
+    .map(speaker => speaker.id)
+    .filter(id => id !== USER_SPEAKER_ID && id !== UNCAST_SPEAKER_ID && id !== UNRESOLVED_SPEAKER_ID))
+  const locked = (speechId: string): boolean => Boolean(
+    answers[`relationship_confirmed_${speechId}`]
+    || answers[`relationship_continuity_${speechId}`]
+    || answers[`persona_confirmed_${speechId}`]
+    || answers[`switch_reconciled_${speechId}`],
+  )
+  for (let index = 1; index < plan.state.speeches.length; index += 1) {
+    const speech = plan.state.speeches[index]
+    const current = identities[index]
+    const previous = identities[index - 1]
+    if (!current || !previous || current !== previous) continue
+    if (!castIds.has(current)) continue
+    const turn = answers[`turn_${speech.id}`]
+    const responds = turn?.probabilities?.[TURN_RESPOND_OPTION] ?? 0
+    if (turn?.choice !== TURN_RESPOND_OPTION || responds < 0.55 || turn.confidence < 0.45) continue
+    if (locked(speech.id)) continue
+    const answer = answers[`speech_${speech.id}`]
+    const currentOption = optionById.get(current)
+    const currentProbability = answer && currentOption ? answer.probabilities[currentOption] ?? 0 : 0
+    // A confident identity stands; only a weak or guessed answer yields.
+    if (currentProbability >= 0.6) continue
+    // A relationship review that clearly backs this same speaker also stands.
+    const review = answers[`relationship_review_${speech.id}`]
+    const reviewProbability = review && currentOption ? review.probabilities[currentOption] ?? 0 : 0
+    if (review && review.choice === currentOption && reviewProbability >= 0.6 && review.confidence >= 0.5) continue
+    const alternative = Object.entries(answer?.probabilities ?? {})
+      .filter(([option, probability]) => {
+        const id = optionIds[option]
+        return Boolean(id) && castIds.has(id!) && id !== current && probability >= 0.3
+      })
+      .sort((left, right) => right[1] - left[1])[0]
+    if (!alternative) continue
+    identities[index] = optionIds[alternative[0]]
+    paths.set(index, 'resolution:turn-taking (a reply is normally the other participant)')
+  }
+  for (let index = 0; index < plan.state.speeches.length; index += 1) {
+    const speech = plan.state.speeches[index]
+    const match = speech.text.trim().match(/^(?:no[,.]?\s*)?i\s+said[,:]?\s+(.+)$/iu)
+    if (!match) continue
+    const echoed = normalizedQuoteText(match[1])
+    if (echoed.length < 4) continue
+    const source = plan.state.speeches
+      .slice(0, index)
+      .findIndex(previous => normalizedQuoteText(previous.text) === echoed)
+    const sourceIdentity = source >= 0 ? identities[source] : undefined
+    if (!sourceIdentity || sourceIdentity === identities[index]) continue
+    if (locked(speech.id)) continue
+    identities[index] = sourceIdentity
+    paths.set(index, 'resolution:echo (the speaker repeats their own earlier line)')
+  }
+}
+
+/** Compare quotations ignoring case, punctuation, and spacing. */
+function normalizedQuoteText(text: string): string {
+  return text.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').replace(/\s+/gu, ' ').trim()
+}
+
 /** Resolve a historically safe ghost to a unique named roster entry, if any. */
-export function continuityRosterIdentity(id: string | null, context: RelationshipReviewContext, speakers: CharacterLike[]): string | null {
-  if (!id?.startsWith('ghost:')) return id
+export function continuityRosterIdentity(id: string | null, context: RelationshipReviewContext, speakers: CharacterLike[]): string | null {  if (!id?.startsWith('ghost:')) return id
   const ghost = context.ghosts.find(item => `ghost:${item.id}` === id)
   if (!ghost) return id
   const aliases = new Set(ghost.aliases.map(alias => alias.toLowerCase()))
@@ -8561,6 +9208,10 @@ export function resolveSpeakerDecisionSegments(
       : 'resolution:discourse-identity (filled unresolved first pass)')
     return outcome.identity ?? undefined
   })
+  // Turn-taking and self-quotation are deterministic conversation facts the
+  // model misses in fast exchanges; they only nudge weak or guessed identities.
+  const conversationFlowPaths = new Map<number, string>()
+  applyConversationFlow(plan, answers, speechIdentities, conversationFlowPaths)
   const hasLocalIdentity = [...paragraphIdentities.values(), ...speechIdentities]
     .some(identity => identity !== undefined)
   const hasUncastIdentity = [...paragraphIdentities.values(), ...speechIdentities]
@@ -8662,7 +9313,8 @@ export function resolveSpeakerDecisionSegments(
       upstreamIdentity = direct
       upstreamSource = `speech-s${index}`
       resolutionPaths.push([
-        discoursePathBySpeechIndex.get(index)
+        conversationFlowPaths.get(index)
+          ?? discoursePathBySpeechIndex.get(index)
           ?? chainPathBySpeechIndex.get(index)
           ?? 'resolution:direct-speech-identity',
       ])

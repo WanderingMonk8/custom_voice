@@ -461,11 +461,16 @@ function hasStrongNarrativeName(text) {
 var STORY_NARRATION_SKIP_STARTERS = /* @__PURE__ */ new Set(["then", "so", "and", "but", "still", "yet", "meanwhile", "now", "anyway"]);
 var STORY_MALE_PRONOUNS = /* @__PURE__ */ new Set(["he", "him", "hisself", "himself", "his"]);
 var STORY_FEMALE_PRONOUNS = /* @__PURE__ */ new Set(["she", "her", "herself", "hers"]);
+var POSSESSIVE_DETERMINERS = /* @__PURE__ */ new Set(["his", "her", "my", "your", "their", "our", "its"]);
 function narrationFirstPronounClass(text) {
   const tokens = text.toLowerCase().replace(/[^a-z'-]+/gu, " ").split(/\s+/u).filter(Boolean);
   let head = tokens[0];
   if (!head) return null;
   if (STORY_NARRATION_SKIP_STARTERS.has(head)) head = tokens[1] ?? "";
+  if (POSSESSIVE_DETERMINERS.has(head)) {
+    const owned = (tokens[1] ?? "").replace(POSSESSIVE_SUFFIX, "");
+    if (LABEL_GENDER_TOKENS.has(owned)) return null;
+  }
   if (STORY_MALE_PRONOUNS.has(head)) return "male";
   if (STORY_FEMALE_PRONOUNS.has(head)) return "female";
   return null;
@@ -486,6 +491,10 @@ function paragraphGenderedMentions(narrative, ignorePronouns) {
       }
       const possessive = POSSESSIVE_SUFFIX.test(token);
       const bare = possessive ? token.replace(POSSESSIVE_SUFFIX, "") : token;
+      if (POSSESSIVE_DETERMINERS.has(token)) {
+        sinceArticle = 0;
+        continue;
+      }
       if (STORY_MALE_PRONOUNS.has(bare) || STORY_FEMALE_PRONOUNS.has(bare)) {
         sinceArticle += 1;
         continue;
@@ -782,6 +791,25 @@ function uncastNarrativeNameCandidates(message) {
   }
   return [...names.values()];
 }
+var RELATIONSHIP_ROLE_WORDS = new Map([
+  ...["mother", "mom", "mommy", "mum", "mummy", "mama"].map((word) => [word, "mother"]),
+  ...["father", "dad", "daddy", "papa"].map((word) => [word, "father"]),
+  ...["sister", "brother", "daughter", "son", "wife", "husband", "niece", "nephew", "cousin", "girlfriend", "boyfriend", "roommate", "fiance", "fiancee"].map((word) => [word, word]),
+  ...["aunt", "auntie"].map((word) => [word, "aunt"]),
+  ...["uncle"].map((word) => [word, "uncle"]),
+  ...["grandmother", "grandma", "granny", "nana"].map((word) => [word, "grandmother"]),
+  ...["grandfather", "grandpa"].map((word) => [word, "grandfather"]),
+  ...["stepmother", "stepfather", "stepsister", "stepbrother"].map((word) => [word, word])
+]);
+var NARRATED_ROLE_ALIASES = new Map([
+  ...["mother", "mom", "mommy", "mum", "mummy", "mama"].map((word) => [word, "mother"]),
+  ...["father", "dad", "daddy", "papa"].map((word) => [word, "father"]),
+  ...["sister", "sis"].map((word) => [word, "sister"]),
+  ...["brother", "bro"].map((word) => [word, "brother"]),
+  ...["daughter", "son", "wife", "husband", "aunt", "uncle", "niece", "nephew", "cousin", "girlfriend", "boyfriend", "fiance", "fiancee", "friend", "boss", "teacher", "landlady", "landlord", "neighbor", "roommate", "partner"].map((word) => [word, word]),
+  ...["grandmother", "grandma", "granny", "nana"].map((word) => [word, "grandmother"]),
+  ...["grandfather", "grandpa"].map((word) => [word, "grandfather"])
+]);
 function isBroadPersonLabel(label) {
   return /^(?:(?:the|a|an)\s+)?(?:(?:young|younger|old|older|elderly|middle-aged|tall|short)\s+)*(?:woman|man|person|girl|boy|guy|lady|stranger|someone|somebody)$/iu.test(label.trim());
 }
@@ -867,11 +895,12 @@ function adaptiveGenerationConcurrency(current, configuredMaximum, segmentLength
   const lowerQuartileLength = sorted[Math.floor((sorted.length - 1) * 0.25)] ?? 0;
   const shortCount = lengths.filter((length) => length < 160).length;
   const mixedDenseWindow = lengths.length >= 4 && lowerQuartileLength < 220;
+  const denseFloor = Math.min(safeConfiguredMaximum, 2);
   if (shortCount >= 3 || medianLength < 200 || mixedDenseWindow || voiceChanges >= 3) {
-    return { concurrency: 1, shortCooldown: 6, longWindowStreak: 0 };
+    return { concurrency: Math.max(denseFloor, safeCurrent), shortCooldown: 6, longWindowStreak: 0 };
   }
   if (safeCooldown > 0) {
-    return { concurrency: 1, shortCooldown: safeCooldown - 1, longWindowStreak: 0 };
+    return { concurrency: denseFloor, shortCooldown: safeCooldown - 1, longWindowStreak: 0 };
   }
   const uniformlyLongWindow = lengths.length >= 3 && Math.min(...lengths) >= 300 && lowerQuartileLength > 320 && medianLength > 420;
   if (uniformlyLongWindow) {
@@ -897,8 +926,13 @@ function bufferAwareGenerationConcurrency(current, configuredMaximum, readyAhead
   const safeBaseline = Math.min(ceiling, Math.max(1, Math.round(adaptiveBaseline)));
   const ready = Math.max(0, Math.round(readyAhead));
   const target = Math.max(1, Math.round(targetBuffer));
-  if (ready >= target || ceiling === 1) return safeBaseline;
-  return Math.min(ceiling, Math.max(2, safeCurrent + 1));
+  if (ceiling === 1) return 1;
+  if (ready < target) return Math.min(ceiling, Math.max(2, safeCurrent + 1));
+  if (ready >= target * 2) return Math.min(ceiling, Math.max(safeBaseline, safeCurrent - 1));
+  return Math.min(ceiling, Math.max(safeBaseline, safeCurrent));
+}
+function planNeedsVoiceSerialization(segments) {
+  return segments.some((segment) => !segment.voice.trim());
 }
 function encodeConcatenatedWav(segments) {
   const usable = segments.filter((segment) => Number.isFinite(segment.sampleRate) && segment.sampleRate > 0 && segment.channels.length > 0 && segment.channels.some((channel) => channel.length > 0));
@@ -962,6 +996,7 @@ function mergeVoicePlan(segments) {
       result.push({
         text,
         voice: segment.voice,
+        ...segment.originalSpeech !== void 0 ? { originalSpeech: segment.originalSpeech } : {},
         ...segment.tagId ? { tagId: segment.tagId } : {}
       });
     }
@@ -1002,6 +1037,7 @@ function splitLargeVoicePlanSegments(segments, maximumChars = DEFAULT_MAX_TTS_SE
       result.push({
         text,
         voice: segment.voice,
+        ...segment.originalSpeech !== void 0 ? { originalSpeech: segment.originalSpeech } : {},
         ...segment.tagId ? { tagId: segment.tagId } : {}
       });
       remaining = remaining.slice(splitAt).trim();
@@ -1010,11 +1046,32 @@ function splitLargeVoicePlanSegments(segments, maximumChars = DEFAULT_MAX_TTS_SE
       result.push({
         text: remaining,
         voice: segment.voice,
+        ...segment.originalSpeech !== void 0 ? { originalSpeech: segment.originalSpeech } : {},
         ...segment.tagId ? { tagId: segment.tagId } : {}
       });
     }
   }
   return result;
+}
+function speechDurationGuard(text, originalSpeech, speed) {
+  const retryText = text.replace(/\[[^\]\r\n]+\]|<[^>\r\n]+>/gu, (token) => {
+    const category = ttsTagCategory(token.slice(1, -1));
+    return originalSpeech.includes(token) || category === "sound" || category === "pause" ? token : "";
+  }).replace(/\s+/gu, " ").trim();
+  const spoken = stripTtsTags(retryText).trim();
+  const spokenCharacters = Array.from(spoken).filter((char) => /[\p{L}\p{N}]/u.test(char)).length;
+  if (!spokenCharacters) return null;
+  const words = (spoken.match(/[\p{L}\p{N}]+/gu) ?? []).length;
+  const events = extractTtsTags(retryText).filter((tag) => {
+    const category = ttsTagCategory(tag);
+    return category === "sound" || category === "pause";
+  }).length;
+  const safeSpeed = Number.isFinite(speed) ? Math.max(0.25, Math.min(1, speed)) : 1;
+  return {
+    retryText,
+    maxSeconds: (Math.max(20, 4 + words * 2.5, spokenCharacters / 3) + events * 8) / safeSpeed,
+    spokenCharacters
+  };
 }
 function isRecord(value) {
   return !!value && typeof value === "object" && !Array.isArray(value);
@@ -1184,6 +1241,93 @@ var PREPOSITION_BEFORE_NAME_PATTERN = new RegExp(
   `\\b(?:${PREPOSITION_WORDS.join("|")})\\s*$`,
   "iu"
 );
+var NON_NAME_WORDS = /* @__PURE__ */ new Set([
+  ...NON_NAME_PARAGRAPH_LEADS,
+  "all",
+  "almost",
+  "already",
+  "also",
+  "always",
+  "another",
+  "any",
+  "anything",
+  "anywhere",
+  "both",
+  "each",
+  "either",
+  "even",
+  "eventually",
+  "every",
+  "everybody",
+  "everything",
+  "everywhere",
+  "finally",
+  "fine",
+  "first",
+  "good",
+  "half",
+  "hey",
+  "hi",
+  "however",
+  "instead",
+  "just",
+  "last",
+  "later",
+  "many",
+  "maybe",
+  "meanwhile",
+  "most",
+  "much",
+  "neither",
+  "never",
+  "next",
+  "no",
+  "nobody",
+  "noone",
+  "none",
+  "not",
+  "nothing",
+  "nowhere",
+  "now",
+  "oh",
+  "ok",
+  "okay",
+  "once",
+  "only",
+  "other",
+  "otherwise",
+  "perhaps",
+  "probably",
+  "quite",
+  "rather",
+  "really",
+  "right",
+  "second",
+  "simply",
+  "since",
+  "soon",
+  "still",
+  "such",
+  "sure",
+  "suddenly",
+  "third",
+  "too",
+  "twice",
+  "very",
+  "well",
+  "whatever",
+  "whenever",
+  "wherever",
+  "why",
+  "yes",
+  "yet"
+]);
+function isPlausiblePersonName(name, narration, aliases) {
+  const first = aliases[0]?.split(/\s+/u)[0]?.toLowerCase() ?? "";
+  if (!first || NON_NAME_WORDS.has(first)) return false;
+  if (aliases.some((alias) => NON_NAME_WORDS.has(alias.toLowerCase()))) return false;
+  return !new RegExp(`\\b${escapedPattern(name.toLowerCase())}\\b`, "u").test(narration);
+}
 var INTRODUCTORY_PREPOSITIONAL_PHRASE_PATTERN = new RegExp(
   `^\\s*(?:${PREPOSITION_WORDS.join("|")})\\b(?:\\s+[\\p{L}\\p{M}'\u2019-]+){1,7}\\s*,?\\s*$`,
   "iu"
@@ -1195,11 +1339,13 @@ function addUnconfiguredDialogueSpeakers(content, speakers, skippedTrackerTagPai
   const preparedContent = preparePlaybackContent(content, skippedTrackerTagPairs);
   const result = [...speakers];
   const knownAliases = new Set(result.flatMap((speaker) => speakerAliases(speaker.name).map((alias) => alias.toLowerCase())));
+  const narrationForNames = narrativeOnly(preparedContent);
   const addCandidate = (rawName, explicitlyAttributed = false) => {
     const name = normalizeSpeakerName(rawName.replace(/['’]s$/u, ""));
     const aliases = speakerAliases(name);
     const first = aliases[0]?.split(/\s+/u)[0]?.toLowerCase() ?? "";
-    if (!name || !first || NON_NAME_PARAGRAPH_LEADS.has(first)) return;
+    if (!name || !first) return;
+    if (!isPlausiblePersonName(name, narrationForNames, aliases)) return;
     if (aliases.some((alias) => knownAliases.has(alias.toLowerCase()))) return;
     if (!explicitlyAttributed) {
       const occurrences = [...preparedContent.matchAll(
@@ -1215,7 +1361,7 @@ function addUnconfiguredDialogueSpeakers(content, speakers, skippedTrackerTagPai
     result.push({ id, name });
     for (const alias of aliases) knownAliases.add(alias.toLowerCase());
   };
-  const narrative = narrativeOnly(preparedContent);
+  const narrative = narrationForNames;
   for (const match of narrative.matchAll(/\b([\p{Lu}][\p{L}\p{M}-]{1,63})['\u2019]s\s+[\p{L}\p{M}-]+/gu)) addCandidate(match[1]);
   for (const match of narrative.matchAll(/\b(?:and|but|then)\s+([\p{Lu}][\p{L}\p{M}-]{1,63})\s+[\p{Ll}][\p{L}\p{M}-]+/gu)) addCandidate(match[1]);
   for (const quote of playbackQuotes(preparedContent)) {
@@ -1281,25 +1427,97 @@ function decodePlaybackEntities(value) {
   return value.replace(/&nbsp;/gi, " ").replace(/&quot;|&#34;|&#x22;/gi, '"').replace(/&apos;|&#39;|&#x27;/gi, "'").replace(/&lt;|&#60;|&#x3c;/gi, "<").replace(/&gt;|&#62;|&#x3e;/gi, ">").replace(/&amp;|&#38;|&#x26;/gi, "&");
 }
 var TRACKER_TAG_NAME_RE = /^[a-z][a-z0-9:._-]*$/u;
+var TRACKER_COMMENT_RE = /<!--[\s\S]*?-->/gu;
+function extractEnclosedSkipRules(value) {
+  const pairs = [];
+  const remaining = value.replace(/^[\t ]*enclosed:[^\r\n]*/gimu, (line) => {
+    const rule = line.replace(/^[\t ]*enclosed:/iu, "");
+    let separator = -1;
+    let quoted = false;
+    let escaped = false;
+    for (let index = 0; index < rule.length; index++) {
+      const char = rule[index];
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+      if (char === "\\") {
+        escaped = true;
+        continue;
+      }
+      if (char === '"') {
+        quoted = !quoted;
+        continue;
+      }
+      if (char === "|" && !quoted) {
+        separator = index;
+        break;
+      }
+    }
+    if (separator < 0) return "";
+    const parseMarker = (raw) => {
+      const trimmed = raw.trim();
+      if (!trimmed) return null;
+      if (trimmed.startsWith('"')) {
+        try {
+          const parsed = JSON.parse(trimmed);
+          return typeof parsed === "string" && parsed.length ? parsed : null;
+        } catch {
+          return null;
+        }
+      }
+      return trimmed.replace(/\\([\\|])/gu, "$1");
+    };
+    const open = parseMarker(rule.slice(0, separator));
+    const close = parseMarker(rule.slice(separator + 1));
+    if (open && close && pairs.length < 100) pairs.push({ open, close });
+    return "";
+  });
+  return { remaining, pairs };
+}
 function normalizeTrackerTagName(value) {
   const tag = value.trim().toLowerCase();
   return TRACKER_TAG_NAME_RE.test(tag) ? tag : null;
 }
 function parseSkippedTrackerTagPairs(value) {
-  const decoded = decodePlaybackEntities(value);
+  const decoded = decodePlaybackEntities(extractEnclosedSkipRules(value).remaining);
   const pairs = [];
   const seen = /* @__PURE__ */ new Set();
-  const addPair = (open, close) => {
+  const addPair = (open, close, marker = false) => {
     if (!open || !close) return;
-    const key = `${open}\0${close}`;
+    const key = `${open.toLowerCase()}\0${close.toLowerCase()}`;
     if (seen.has(key)) return;
     seen.add(key);
-    pairs.push({ open, close });
+    pairs.push(marker ? { open, close, marker: true } : { open, close });
   };
-  const addSymmetric = (name) => addPair(name, name);
-  for (const entry of decoded.split(",")) {
+  const addSymmetric = (name, marker = false) => addPair(name, name, marker);
+  const full = () => pairs.length >= 100;
+  const comments = [...decoded.matchAll(TRACKER_COMMENT_RE)];
+  const consumed = [];
+  for (let index = 0; index + 1 < comments.length && !full(); index += 1) {
+    const left = comments[index];
+    const right = comments[index + 1];
+    if (left.index === void 0 || right.index === void 0) continue;
+    const leftEnd = left.index + left[0].length;
+    if (!/^\s*,?\s*$/u.test(decoded.slice(leftEnd, right.index))) continue;
+    addPair(left[0].trim(), right[0].trim(), true);
+    consumed.push({ start: left.index, end: right.index + right[0].length });
+    index += 1;
+  }
+  let entries = decoded;
+  for (let index = consumed.length - 1; index >= 0; index -= 1) {
+    entries = `${entries.slice(0, consumed[index].start)}${entries.slice(consumed[index].end)}`;
+  }
+  for (const entry of entries.split(",")) {
     const trimmed = entry.trim();
     if (!trimmed) continue;
+    if (/^prefix:/iu.test(trimmed)) continue;
+    const loneMarker = trimmed.match(/^<!--[\s\S]*?-->$/u);
+    if (loneMarker) {
+      addSymmetric(loneMarker[0], true);
+      if (full()) return pairs;
+      continue;
+    }
     const pairMatch = trimmed.match(
       /^\\?<\s*([a-z][a-z0-9:._-]*)(?=\s|>)[^>]*>\s*\\?<\s*\/\s*([a-z][a-z0-9:._-]*)(?=\s|>)[^>]*>$/iu
     );
@@ -1308,32 +1526,34 @@ function parseSkippedTrackerTagPairs(value) {
         normalizeTrackerTagName(pairMatch[1] ?? ""),
         normalizeTrackerTagName(pairMatch[2] ?? "")
       );
-      if (pairs.length >= 100) return pairs;
+      if (full()) return pairs;
       continue;
     }
     const tagMatch = trimmed.match(/^\\?<\s*([a-z][a-z0-9:._-]*)(?=\s|>)[^>]*>$/iu);
     if (tagMatch) {
       addSymmetric(normalizeTrackerTagName(tagMatch[1] ?? ""));
-      if (pairs.length >= 100) return pairs;
+      if (full()) return pairs;
       continue;
     }
     addSymmetric(normalizeTrackerTagName(trimmed));
-    if (pairs.length >= 100) return pairs;
+    if (full()) return pairs;
   }
   const legacyPattern = /\\?<\s*([a-z][a-z0-9:._-]*)(?=\s|>)[^>]*>[\s\S]*?\\?<\s*\/\s*\1\s*>/giu;
   for (const match of decoded.matchAll(legacyPattern)) {
     addSymmetric(normalizeTrackerTagName(match[1] ?? ""));
-    if (pairs.length >= 100) break;
+    if (full()) break;
   }
   return pairs;
 }
-function stripTagBlock(value, openTag, closeTag) {
-  const open = escapedPattern(openTag);
-  const close = escapedPattern(closeTag);
-  const tokenPattern = new RegExp(
-    `(\\\\?<\\s*${open}(?=\\s|>)[^>]*>)|(\\\\?<\\s*\\/\\s*${close}(?=\\s|>)[^>]*>)`,
-    "giu"
-  );
+function applyStripRanges(value, ranges) {
+  if (ranges.length === 0) return value;
+  let result = value;
+  for (let index = ranges.length - 1; index >= 0; index--) {
+    result = `${result.slice(0, ranges[index].start)} ${result.slice(ranges[index].end)}`;
+  }
+  return result;
+}
+function stripDelimitedBlock(value, tokenPattern) {
   const ranges = [];
   let depth = 0;
   let blockStart = -1;
@@ -1353,17 +1573,63 @@ function stripTagBlock(value, openTag, closeTag) {
       }
     }
   }
-  if (ranges.length === 0) return value;
-  let result = value;
-  for (let index = ranges.length - 1; index >= 0; index--) {
-    result = `${result.slice(0, ranges[index].start)} ${result.slice(ranges[index].end)}`;
+  return applyStripRanges(value, ranges);
+}
+function stripTagBlock(value, openTag, closeTag) {
+  const open = escapedPattern(openTag);
+  const close = escapedPattern(closeTag);
+  return stripDelimitedBlock(value, new RegExp(
+    `(\\\\?<\\s*${open}(?=\\s|>)[^>]*>)|(\\\\?<\\s*\\/\\s*${close}(?=\\s|>)[^>]*>)`,
+    "giu"
+  ));
+}
+function stripMarkerBlock(value, openMarker, closeMarker) {
+  if (openMarker.toLowerCase() === closeMarker.toLowerCase()) {
+    const ranges = [];
+    let openAt = -1;
+    for (const match of value.matchAll(new RegExp(escapedPattern(openMarker), "giu"))) {
+      if (match.index === void 0) continue;
+      if (openAt < 0) {
+        openAt = match.index;
+      } else {
+        ranges.push({ start: openAt, end: match.index + match[0].length });
+        openAt = -1;
+      }
+    }
+    return applyStripRanges(value, ranges);
   }
-  return result;
+  return stripDelimitedBlock(value, new RegExp(
+    `(${escapedPattern(openMarker)})|(${escapedPattern(closeMarker)})`,
+    "giu"
+  ));
 }
 function stripSkippedTrackerBlocks(content, tagPairs) {
-  let result = content.replace(/&lt;|&#60;|&#x3c;/gi, "<").replace(/&gt;|&#62;|&#x3e;/gi, ">").replace(/<!--[\s\S]*?-->/g, " ");
-  for (const pair of parseSkippedTrackerTagPairs(tagPairs)) {
-    result = stripTagBlock(result, pair.open, pair.close);
+  const enclosedRules = extractEnclosedSkipRules(tagPairs);
+  let result = content.replace(/&lt;|&#60;|&#x3c;/gi, "<").replace(/&gt;|&#62;|&#x3e;/gi, ">");
+  for (const { open, close } of enclosedRules.pairs) {
+    const ranges = [];
+    let searchFrom = 0;
+    while (searchFrom < result.length) {
+      const start = result.indexOf(open, searchFrom);
+      if (start < 0) break;
+      const end = result.indexOf(close, start + open.length);
+      if (end < 0) break;
+      searchFrom = end + close.length;
+      ranges.push({ start, end: searchFrom });
+    }
+    result = applyStripRanges(result, ranges);
+  }
+  const pairs = parseSkippedTrackerTagPairs(enclosedRules.remaining);
+  for (const pair of pairs) {
+    if (pair.marker) result = stripMarkerBlock(result, pair.open, pair.close);
+  }
+  for (const pair of pairs) {
+    if (!pair.marker) result = stripTagBlock(result, pair.open, pair.close);
+  }
+  result = result.replace(/<!--[\s\S]*?-->/g, " ");
+  const prefixes = [...decodePlaybackEntities(enclosedRules.remaining).matchAll(/(?:^|,)\s*prefix:([^,\s]+)\s*(?=,|$)/giu)].map((match) => (match[1] ?? "").toLowerCase());
+  if (prefixes.length) {
+    result = result.replace(/\S+/gu, (token) => prefixes.some((prefix) => token.toLowerCase().includes(prefix)) ? " " : token);
   }
   return result;
 }
@@ -2078,12 +2344,108 @@ var TTS_EMOTION_NAMES = new Set(TTS_EMOTION_OPTIONS.map((option) => option.value
 var TTS_SOUND_NAMES = new Set(TTS_TAG_OPTIONS.map((option) => option.value));
 var TTS_PAUSE_NAMES = new Set(TTS_PAUSE_OPTIONS.map((option) => option.value));
 var TTS_STYLE_NAMES = new Set(TTS_STYLE_OPTIONS.map((option) => option.value));
+var TTS_TAG_ALIASES = /* @__PURE__ */ new Map([
+  // Sound aliases.
+  ["laughter", "laugh"],
+  ["laughs", "laugh"],
+  ["laughing", "laugh"],
+  ["chuckles", "chuckle"],
+  ["chuckling", "chuckle"],
+  ["giggles", "giggle"],
+  ["snickers", "snicker"],
+  ["cackles", "cackle"],
+  ["cheers", "cheer"],
+  ["gasps", "gasp"],
+  ["gasping", "gasp"],
+  ["sighs", "sigh"],
+  ["sighing", "sigh"],
+  ["groans", "groan"],
+  ["groaning", "groan"],
+  ["grunts", "grunt"],
+  ["growls", "growl"],
+  ["hisses", "hiss"],
+  ["moans", "moan"],
+  ["pants", "pant"],
+  ["panting", "pant"],
+  ["whisper", "whispering"],
+  ["whispering", "whispering"],
+  ["shouts", "shout"],
+  ["shouting", "shouting"],
+  ["screaming", "screaming"],
+  ["cries", "cry"],
+  ["crying", "cry"],
+  ["crying loudly", "cry"],
+  ["sobs", "sob"],
+  ["sobbing", "sob"],
+  ["screams", "scream"],
+  ["shrieks", "shriek"],
+  ["snorts", "snort"],
+  ["breaths", "breath"],
+  ["inhale", "breath"],
+  ["exhale", "exhales"],
+  ["coughs", "cough"],
+  ["clear throat", "throat-clearing"],
+  ["clears throat", "throat-clearing"],
+  ["sneezes", "sneeze"],
+  ["yawns", "yawn"],
+  ["yawning", "yawn"],
+  ["snoring", "snore"],
+  // Style aliases.
+  ["soft", "soft voice"],
+  ["loud", "loud voice"],
+  ["low", "low voice"],
+  // Pause aliases.
+  ["break", "short"],
+  ["short pause", "short"],
+  ["long-break", "long"],
+  ["long pause", "long"],
+  // Emotion aliases used by common prompts.
+  ["furious", "angry"],
+  ["terrified", "scared"],
+  ["ecstatic", "excited"],
+  ["relieved", "calm"],
+  ["enthusiastic", "excited"],
+  ["friendly", "calm"],
+  ["encouraging", "hopeful"],
+  ["mysterious", "uncertain"]
+]);
 var TTS_TAG_NAMES = /* @__PURE__ */ new Set([
   ...TTS_EMOTION_NAMES,
   ...TTS_SOUND_NAMES,
   ...TTS_PAUSE_NAMES,
   ...TTS_STYLE_NAMES
 ]);
+var TTS_TAG_TOKEN_RE = /\[\s*([a-z][a-z -]*?)\s*\]|<\s*([a-z][a-z -]*?)\s*>/giu;
+function normalizeTtsTagName(value) {
+  const tag = value.trim().toLowerCase();
+  if (TTS_TAG_NAMES.has(tag)) return tag;
+  return TTS_TAG_ALIASES.get(tag) ?? null;
+}
+function ttsTagCategory(value) {
+  const tag = normalizeTtsTagName(value);
+  if (!tag) return null;
+  if (TTS_EMOTION_NAMES.has(tag)) return "emotion";
+  if (TTS_STYLE_NAMES.has(tag)) return "style";
+  if (TTS_PAUSE_NAMES.has(tag)) return "pause";
+  return "sound";
+}
+function replaceTtsTags(text, replacer) {
+  return text.replace(TTS_TAG_TOKEN_RE, (match, square, angle) => {
+    const tag = normalizeTtsTagName(square ?? angle ?? "");
+    return tag ? replacer(tag, match) : match;
+  });
+}
+function stripTtsTags(text) {
+  return replaceTtsTags(text, () => "");
+}
+function extractTtsTags(text) {
+  const tags = [];
+  replaceTtsTags(text, (tag) => {
+    tags.push(tag);
+    return "";
+  });
+  return tags;
+}
 var NARRATIVE_SPEECH_VERB_PATTERN = new RegExp(
   `\\b(?:${SPEECH_VERBS}|blurt(?:s|ed)|laugh(?:s|ed)|mutter(?:s|ed)|hiss(?:es|ed)|snap(?:s|ped))\\b`,
   "iu"
@@ -2698,7 +3060,7 @@ async function synthesizeVoiceSegment(connectionId, text, voice, speed, signal, 
     let response;
     let audioData = null;
     try {
-      releaseVoice = await voiceGate.acquire(voice, signal);
+      releaseVoice = voiceGate ? await voiceGate.acquire(voice, signal) : null;
       await waitForSynthesisSlot(pacer, signal);
       response = await fetch("/api/v1/tts/synthesize", {
         method: "POST",
@@ -3092,7 +3454,7 @@ function setup(ctx) {
   scanButton.textContent = "Scan";
   scanButton.disabled = true;
   scanRow.append(scanButton);
-  const skippedTagsField = createField("Skipped tracker tags (global)");
+  const skippedTagsField = createField("Skipped text and tags (global)");
   const speakerParsingField = createField("Jev speaker assignment (global)");
   const ttsTagField = createField("TTS vocal tags (global)");
   const ttsTagPlacementField = createField("Vocal tag placement");
@@ -4126,14 +4488,14 @@ function setup(ctx) {
   favoritePickers.add(userFavoritePicker);
   const skippedTrackerTagsInput = ctx.components.mountTextArea(skippedTagsField.slot, {
     value: "",
-    placeholder: "tracker, status, <o_ledger></o_l>",
+    placeholder: "tracker, prefix:http:, prefix:https:\nenclosed: ![ | ]",
     rows: 3,
-    ariaLabel: "Tracker tag names or full asymmetric tag pairs to skip globally",
+    ariaLabel: "Tags, prefixes, or enclosed text to skip globally",
     onChange: () => scheduleSkippedTrackerTagsSave()
   });
   const skippedTagsHint = document.createElement("div");
   skippedTagsHint.className = "chat-voice-hint";
-  skippedTagsHint.textContent = "Enter tag names, or full pairs for asymmetric tags such as <o_ledger></o_l>.";
+  skippedTagsHint.textContent = "Separate tag names, tag/comment marker pairs, and prefix rules with commas, for example: tracker, prefix:http:, prefix:https:. A prefix skips whitespace-delimited text containing it. Put each enclosed rule on its own line without a trailing comma, for example: enclosed: ![ | ]. It skips text from the opening marker through the next closing marker. Markers are case-sensitive; use \\| for a literal pipe, or JSON-quoted markers to preserve surrounding spaces.";
   skippedTagsField.slot.append(skippedTagsHint);
   const speakerParsingPicker = ctx.components.mountSelect(speakerParsingField.slot, {
     value: "ambiguous",
@@ -4434,7 +4796,7 @@ function setup(ctx) {
       ctx.sendToBackend({ type: "chat_voice_auto_cast", requestId, chatId, voices, reserved, narratorMissing, userMissing, ghostLifetime: ghostVoiceLifetime });
     });
   }
-  function requestUncastVoiceMatches(chatId, messageId, message, sourceHash, groups, voices, reserved, lifetime, speakerLookback2, skippedTrackerTags2, reduction) {
+  function requestUncastVoiceMatches(chatId, messageId, message, sourceHash, groups, voices, reserved, lifetime, speakerLookback2, skippedTrackerTags2, reduction, cast) {
     const requestId = `uncast-${Date.now().toString(36)}-${++uncastRequestSequence}`;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -4442,7 +4804,7 @@ function setup(ctx) {
         reject(new Error("Uncast voice matching timed out."));
       }, 35e3);
       pendingUncastRequests.set(requestId, { resolve, reject, timer });
-      ctx.sendToBackend({ type: "chat_voice_match_uncast", requestId, chatId, messageId, message, sourceHash, groups, voices, reserved, lifetime, speakerLookback: speakerLookback2, skippedTrackerTags: skippedTrackerTags2, reduction });
+      ctx.sendToBackend({ type: "chat_voice_match_uncast", requestId, chatId, messageId, message, sourceHash, groups, voices, reserved, lifetime, speakerLookback: speakerLookback2, skippedTrackerTags: skippedTrackerTags2, reduction, cast });
     });
   }
   const pendingCommunityRequests = /* @__PURE__ */ new Map();
@@ -5187,6 +5549,10 @@ function setup(ctx) {
         const poolVoices = poolVoicesForAutoCast();
         if (preferences.autoVoiceCasting && speakerAssignmentDebug) appendSpeakerDebugLog(`Voice pool: ${autoVoiceCastingPool === "community" && communityIsAvailable() ? `community (${communityVoices.length} snapshot voices)` : "favorites"}.`);
         const uncastVoices = availableUncastVoices(poolVoices, reservedVoices);
+        const castSpeakers = [...new Map(playbackSpeakers.filter((speaker) => speaker.id !== USER_SPEAKER_ID && speaker.id !== UNCAST_SPEAKER_ID && speaker.id !== UNRESOLVED_SPEAKER_ID).flatMap((speaker) => {
+          const voiceId = config.characterVoices[speaker.id] ?? "";
+          return voiceId ? [[speaker.id, { id: speaker.id, name: speaker.name, voiceId }]] : [];
+        })).values()];
         const uncastMatchPromise = preferences.autoVoiceCasting && uncastGroups.length ? requestUncastVoiceMatches(
           playbackChat.id,
           messageId,
@@ -5198,7 +5564,8 @@ function setup(ctx) {
           preferences.ghostVoiceLifetime,
           preferences.speakerLookback,
           preferences.skippedTrackerTags,
-          preferences.reductionComponents
+          preferences.reductionComponents,
+          castSpeakers
         ).catch((error) => {
           appendSpeakerDebugLog(`Uncast voice matching failed; using connection default: ${error instanceof Error ? error.message : String(error)}`);
           return [];
@@ -5221,6 +5588,7 @@ function setup(ctx) {
           return {
             text: speakerId ? normalizeSpeechBoundaryDashes(segment.ttsText ?? segment.text) : segment.ttsText ?? segment.text,
             voice,
+            ...speakerId ? { originalSpeech: segment.text } : {},
             ...segment.ttsTag ? { tagId: segment.ttsTag.id } : {}
           };
         });
@@ -5400,11 +5768,12 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
         if (playback.controller.signal.aborted) throw new DOMException("Playback stopped.", "AbortError");
         for (const match of uncastMatches) {
           const group = uncastGroups.find((item) => item.id === match.groupId);
-          if (!group || reservedVoices.includes(match.voiceId)) continue;
+          if (!group) continue;
+          if (!match.castSpeakerId && reservedVoices.includes(match.voiceId)) continue;
           for (const segmentIndex of group.segmentIndexes) {
             for (const index of segmentPlanIndexes[segmentIndex] ?? []) plan[index] = { ...plan[index], voice: match.voiceId };
           }
-          appendSpeakerDebugLog(`Uncast voice ${group.id}: gender=${match.gender}, ghost=${match.ghostId ?? "none"}, voice=${JSON.stringify(match.voiceId)}.`);
+          appendSpeakerDebugLog(`Uncast voice ${group.id}: gender=${match.gender}, ghost=${match.ghostId ?? "none"}, cast=${match.castSpeakerId ?? "none"}, voice=${JSON.stringify(match.voiceId)}.`);
         }
         synthesisPlanFrozen = true;
         const splitPlan = splitLargeVoicePlanSegments(plan);
@@ -5445,6 +5814,15 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
         let shortConcurrencyCooldown = 0;
         let longWindowStreak = 0;
         let rateLimitedForRemainder = false;
+        const serializeVoices = planNeedsVoiceSerialization(plan);
+        const playbackVoiceGate = serializeVoices ? connectionVoiceGates.get(connectionId) ?? (() => {
+          const gate = new ConnectionVoiceGate();
+          connectionVoiceGates.set(connectionId, gate);
+          return gate;
+        })() : null;
+        appendSpeakerDebugLog(
+          `Voice serialization: ${serializeVoices ? "on (a clip uses the connection default voice)" : "off (every clip carries an explicit voice)"}.`
+        );
         const prepare = async (index) => {
           try {
             appendSpeakerDebugLog(
@@ -5464,11 +5842,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
                 synthesisController.signal,
                 sharedSynthesisPacer,
                 rateLimitBudget,
-                connectionVoiceGates.get(connectionId) ?? (() => {
-                  const gate = new ConnectionVoiceGate();
-                  connectionVoiceGates.set(connectionId, gate);
-                  return gate;
-                })(),
+                playbackVoiceGate,
                 (delayMs, cumulativeWaitMs) => {
                   rateLimitedForRemainder = true;
                   adaptiveConcurrency = 1;
@@ -5583,11 +5957,57 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
         const normalizationContext = new (window.AudioContext ?? window.webkitAudioContext)();
         const voiceLoudnessProfiles = /* @__PURE__ */ new Map();
         let normalizationChain = Promise.resolve();
-        const processed = prepared.map((pending, index) => {
+        const validated = prepared.map(async (pending, index) => {
+          const result = await pending;
+          if (!result.ok) return result;
+          try {
+            let segment = result.segment;
+            let decodedBuffer = await normalizationContext.decodeAudioData(segment.data.slice(0));
+            const entry = plan[index];
+            const guard = entry.originalSpeech !== void 0 ? speechDurationGuard(entry.text, entry.originalSpeech, preferences.speed) : null;
+            if (guard && decodedBuffer.duration > guard.maxSeconds) {
+              appendSpeakerDebugLog(`Audio duration guard [${index + 1}]: ${decodedBuffer.duration.toFixed(2)}s exceeds ${guard.maxSeconds.toFixed(2)}s for ${guard.spokenCharacters} spoken characters; retrying once without generated vocal directions.`);
+              if (ctx.getActiveChat().chatId === playbackChat.id && activePlayback === playback && !playback.playbackStopped) {
+                setStatus(`Retrying unusually long speech segment ${index + 1}\u2026`);
+              }
+              segment = await runSynthesisTask(() => synthesizeVoiceSegment(
+                connectionId,
+                guard.retryText,
+                entry.voice,
+                preferences.speed,
+                synthesisController.signal,
+                sharedSynthesisPacer,
+                rateLimitBudget,
+                playbackVoiceGate,
+                (delayMs, cumulativeWaitMs) => {
+                  rateLimitedForRemainder = true;
+                  adaptiveConcurrency = 1;
+                  shortConcurrencyCooldown = 0;
+                  longWindowStreak = 0;
+                  if (adaptiveSynthesisLimits.has(adaptiveLimitToken)) adaptiveSynthesisLimits.set(adaptiveLimitToken, 1);
+                  drainSynthesisQueue();
+                  if (ctx.getActiveChat().chatId === playbackChat.id && (!activePlayback || activePlayback === playback)) {
+                    setStatus(`Rate limited; resuming in ${Math.max(1, Math.ceil(delayMs / 1e3))}s\u2026 (${Math.ceil(cumulativeWaitMs / 1e3)}s of ${preferences.rateLimitWaitSeconds}s wait budget)`);
+                  }
+                }
+              ), activePlayback === playback && !playback.playbackStopped);
+              decodedBuffer = await normalizationContext.decodeAudioData(segment.data.slice(0));
+              appendSpeakerDebugLog(`Audio duration guard [${index + 1}]: retry ${decodedBuffer.duration.toFixed(2)}s, threshold ${guard.maxSeconds.toFixed(2)}s.`);
+              if (decodedBuffer.duration > guard.maxSeconds) {
+                throw new Error(`Speech segment ${index + 1} remained unusually long after retry (${decodedBuffer.duration.toFixed(1)}s; limit ${guard.maxSeconds.toFixed(1)}s). Please regenerate the audio.`);
+              }
+            }
+            return { ok: true, segment: { ...segment, decodedBuffer } };
+          } catch (error) {
+            appendSpeakerDebugLog(`Audio validation [${index + 1}] failed: ${error instanceof Error ? error.message : String(error)}`);
+            return { ok: false, error };
+          }
+        });
+        const processed = validated.map((pending, index) => {
           const processing = normalizationChain.then(async () => {
             const result = await pending;
             if (!result.ok) return result;
-            const decodedBuffer = await normalizationContext.decodeAudioData(result.segment.data.slice(0));
+            const decodedBuffer = result.segment.decodedBuffer;
             const voiceKey = plan[index].voice.trim().toLowerCase() || "__connection-default__";
             const normalizationGain = normalizedVoiceGain(decodedBuffer, voiceKey, voiceLoudnessProfiles);
             return {
@@ -5973,8 +6393,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
       recovering: false,
       recoveryTail: Promise.resolve()
     };
-    const gate = connectionVoiceGates.get(connectionId) ?? new ConnectionVoiceGate();
-    connectionVoiceGates.set(connectionId, gate);
+    const gate = connectionVoiceGates.get(connectionId) ?? null;
     try {
       const segment = await runSynthesisTask(() => synthesizeVoiceSegment(
         connectionId,

@@ -33,6 +33,7 @@ import {
   speakerAssignmentSourceFromTrace,
   buildAssistantUserSpeakerReview,
   buildContextualUserReconciliation,
+  applyConversationFlow,
   applyContextualUserReconciliation,
   buildRelationshipSpeakerReview,
   independentlyGroundedSpeakerIds,
@@ -88,6 +89,7 @@ import {
   hasUncertainFirstPass,
   TTS_NARRATION_WINDOW,
   bufferAwareGenerationConcurrency,
+  planNeedsVoiceSerialization,
   availableUncastVoices,
   canReserveAutomaticVoice,
   selectAutomaticVoice,
@@ -124,6 +126,7 @@ import {
   filterNarrationSegments,
   markUnresolvedSpeechSegments,
   normalizeSpeechBoundaryDashes,
+  speechDurationGuard,
   normalizeTtsTags,
   normalizeCustomTtsEmotionTag,
   npcSpeakerId,
@@ -163,6 +166,9 @@ import {
   resolveSpeakerDiscourseAnswers,
   resolveTtsTagAnswers,
   speakerAliases,
+  cardRelationshipRoles,
+  cardRelationshipAliases,
+  withRelationshipAliases,
   speakerAliasIdLookup,
   speakerIdMatchingCardTitle,
   speakerReviewQuoteIndexes,
@@ -170,6 +176,7 @@ import {
   shouldPersistMessageAudio,
   splitLargeVoicePlanSegments,
   rollingRequestWindowDelay,
+  narratedSpeakerRoles,
   SPEAKER_DECISION_THRESHOLDS,
   TTS_MODULATION_MARKER,
   stripSkippedTrackerBlocks,
@@ -1240,10 +1247,16 @@ test('applies per-segment gain while assembling PCM WAV audio', () => {
   assert.equal(view.getInt16(46, true), -8192)
 })
 
-test('forces fragmented generation windows to one despite long outliers', () => {
+test('keeps at least two requests in flight for fragmented short windows', () => {
+  // Short, densely alternating lines are the case that drains the playback
+  // buffer fastest, so they must not be serialized to a single request.
   assert.deepEqual(
     adaptiveGenerationConcurrency(3, 3, [80, 90, 500, 100, 450, 110]),
-    { concurrency: 1, shortCooldown: 6, longWindowStreak: 0 },
+    { concurrency: 3, shortCooldown: 6, longWindowStreak: 0 },
+  )
+  assert.deepEqual(
+    adaptiveGenerationConcurrency(1, 3, [80, 90, 500, 100, 450, 110]),
+    { concurrency: 2, shortCooldown: 6, longWindowStreak: 0 },
   )
 })
 
@@ -1266,24 +1279,28 @@ test('requires sustained long windows before raising concurrency to its configur
   )
 })
 
-test('holds concurrency at one during the short-segment cooldown', () => {
+test('holds the dense-line floor during the short-segment cooldown', () => {
   assert.deepEqual(
     adaptiveGenerationConcurrency(1, 4, [250, 260, 270], 6, 0),
+    { concurrency: 2, shortCooldown: 5, longWindowStreak: 0 },
+  )
+  assert.deepEqual(
+    adaptiveGenerationConcurrency(1, 1, [250, 260, 270], 6, 0),
     { concurrency: 1, shortCooldown: 5, longWindowStreak: 0 },
   )
 })
 
-test('keeps mixed long and short synthesis windows at one request', () => {
+test('keeps mixed long and short synthesis windows above one request', () => {
   assert.deepEqual(
     adaptiveGenerationConcurrency(4, 4, [520, 190, 610, 205, 480, 175]),
-    { concurrency: 1, shortCooldown: 6, longWindowStreak: 0 },
+    { concurrency: 4, shortCooldown: 6, longWindowStreak: 0 },
   )
 })
 
-test('keeps frequently switching voice windows at one request', () => {
+test('keeps frequently switching voice windows above one request', () => {
   assert.deepEqual(
     adaptiveGenerationConcurrency(3, 4, [420, 460, 500, 440, 480, 520], 0, 0, 10, 4),
-    { concurrency: 1, shortCooldown: 6, longWindowStreak: 0 },
+    { concurrency: 3, shortCooldown: 6, longWindowStreak: 0 },
   )
 })
 
@@ -1293,10 +1310,22 @@ test('raises synthesis concurrency while the playback buffer is under target', (
   assert.equal(bufferAwareGenerationConcurrency(3, 4, 0, 2, 1), 4)
 })
 
-test('returns to the adaptive baseline when buffered and serializes after rate limiting', () => {
-  assert.equal(bufferAwareGenerationConcurrency(3, 4, 2, 2, 1), 1)
+test('holds concurrency while buffered and decays only when comfortably ahead', () => {
+  // Snap-back to the baseline as soon as the buffer was satisfied made the
+  // pipeline oscillate between starved and idle, so a healthy buffer now holds.
+  assert.equal(bufferAwareGenerationConcurrency(3, 4, 2, 2, 1), 3)
+  assert.equal(bufferAwareGenerationConcurrency(4, 4, 3, 2, 2), 4)
+  assert.equal(bufferAwareGenerationConcurrency(4, 4, 4, 2, 2), 3)
+  assert.equal(bufferAwareGenerationConcurrency(2, 4, 8, 2, 2), 2)
   assert.equal(bufferAwareGenerationConcurrency(3, 4, 0, 2, 3, true), 1)
   assert.equal(bufferAwareGenerationConcurrency(1, 1, 0, 2, 1), 1)
+})
+
+test('serializes voices only when a clip leans on the connection default voice', () => {
+  assert.equal(planNeedsVoiceSerialization([{ voice: 'aiko' }, { voice: 'nao' }]), false)
+  assert.equal(planNeedsVoiceSerialization([{ voice: 'aiko' }, { voice: '' }]), true)
+  assert.equal(planNeedsVoiceSerialization([{ voice: '   ' }]), true)
+  assert.equal(planNeedsVoiceSerialization([]), false)
 })
 
 test('paces synthesis starts inside a rolling request window', () => {
@@ -1370,11 +1399,12 @@ test('splits oversized paragraph jobs at sentence boundaries', () => {
 
 test('falls back to safe word boundaries for long sentences and preserves plan metadata', () => {
   const text = Array.from({ length: 45 }, (_, index) => `word${index}`).join(' ')
-  const result = splitLargeVoicePlanSegments([{ text, voice: 'ruby', tagId: 'speech-2' }], 100)
+  const result = splitLargeVoicePlanSegments([{ text, voice: 'ruby', tagId: 'speech-2', originalSpeech: text }], 100)
 
   assert.ok(result.length > 1)
   assert.ok(result.every(segment => segment.text.length <= 100))
   assert.ok(result.every(segment => segment.voice === 'ruby' && segment.tagId === 'speech-2'))
+  assert.ok(result.every(segment => segment.originalSpeech === text))
   assert.equal(result.map(segment => segment.text).join(' '), text)
 })
 
@@ -1987,10 +2017,25 @@ test('attaches emotion, sound, and pause text without changing narration', () =>
   assert.equal(tagged.find(segment => segment.text === 'Narration.')?.ttsText, undefined)
 })
 
-test('preserves speech IDs when splitting plans', () => {
+test('uses conservative speech duration limits and preserves authored cues on retry', () => {
+  const guarded = speechDurationGuard('[mortified, throat-tight and cracking] Fuck. [mortified, throat-tight and cracking] Okay. [mortified, throat-tight and cracking] Yeah, that’s—', 'Fuck. Okay. Yeah, that’s—', 1)
+  assert.equal(guarded?.retryText, 'Fuck. Okay. Yeah, that’s—')
+  assert.equal(guarded?.maxSeconds, 20)
+  assert.equal(speechDurationGuard('[calm] Hello. [long pause] [gasp]', 'Hello.', 1)?.maxSeconds, 36)
+  assert.equal(speechDurationGuard('[calm] Hello.', 'Hello.', 0.5)?.maxSeconds, 40)
+  assert.equal(speechDurationGuard('[sad] [mysterious aside] Hello.', '[mysterious aside] Hello.', 1)?.retryText, '[mysterious aside] Hello.')
+  assert.equal(speechDurationGuard('[gasp]', '[gasp]', 1), null)
+  assert.ok((speechDurationGuard('漢'.repeat(120), '漢'.repeat(120), 1)?.maxSeconds ?? 0) >= 40)
+})
+
+test('preserves speech IDs and original speech when splitting plans', () => {
   assert.deepEqual(mergeVoicePlan([{ text: 'One.\n\nTwo.', voice: 'alice', tagId: 's0' }]), [
     { text: 'One.', voice: 'alice', tagId: 's0' },
     { text: 'Two.', voice: 'alice', tagId: 's0' },
+  ])
+  assert.deepEqual(mergeVoicePlan([{ text: 'One.\n\nTwo.', voice: 'alice', originalSpeech: 'One.\n\nTwo.' }]), [
+    { text: 'One.', voice: 'alice', originalSpeech: 'One.\n\nTwo.' },
+    { text: 'Two.', voice: 'alice', originalSpeech: 'One.\n\nTwo.' },
   ])
 })
 
@@ -2011,6 +2056,38 @@ test('parses comma-separated tracker tag names and removes their contents before
       { text: 'Narration remains.', speakerId: null },
     ],
   )
+})
+
+test('skips whitespace-delimited text containing configured literal prefixes', () => {
+  const setting = 'tracker, prefix:http:, prefix:https:'
+  assert.deepEqual(parseSkippedTrackerTags(setting), ['tracker'])
+  assert.equal(
+    stripSkippedTrackerBlocks('Before [http://aaa.com](http://aaa.com)\n[https://bbb.com](https://bbb.com) after HTTP://example.com end', setting),
+    'Before  \n  after   end',
+  )
+  assert.equal(stripSkippedTrackerBlocks('Keep http://example.com', ''), 'Keep http://example.com')
+  assert.equal(stripSkippedTrackerBlocks('a x.a+b tail xaaab', 'prefix:.a+'), 'a   tail xaaab')
+  assert.equal(stripSkippedTrackerBlocks('Keep text', 'prefix:'), 'Keep text')
+  assert.deepEqual(parseRosterVoiceSegments('Before [http://example.com](http://example.com) after.', null, [], 'prefix:http:'), [
+    { text: 'Before after.', speakerId: null },
+  ])
+})
+
+test('skips literal enclosures alongside other global exclusions', () => {
+  const rules = 'tracker, prefix:http:\nenclosed: ![ | ]\nenclosed: START, | END'
+  assert.deepEqual(parseSkippedTrackerTags(rules), ['tracker'])
+  assert.equal(stripSkippedTrackerBlocks('A ![abc, def] B ![more\ncontent] C START, secret END D http://example.com E <tracker>hidden</tracker>', rules), 'A   B   C   D   E  ')
+  assert.equal(stripSkippedTrackerBlocks('A ![unfinished B', 'enclosed: ![ | ]'), 'A ![unfinished B')
+  assert.equal(stripSkippedTrackerBlocks('A XoneX B XtwoX C', 'enclosed: X | X'), 'A   B   C')
+  assert.equal(stripSkippedTrackerBlocks('A start hidden END B START hidden END C', 'enclosed: START | END'), 'A start hidden END B   C')
+  assert.equal(stripSkippedTrackerBlocks('A <open/>hidden</end> B', 'enclosed: <open/> | </end>'), 'A   B')
+  assert.equal(stripSkippedTrackerBlocks('A ![visible] B', ''), 'A ![visible] B')
+  assert.equal(stripSkippedTrackerBlocks('A ![visible] B', 'enclosed: | ]'), 'A ![visible] B')
+  assert.equal(stripSkippedTrackerBlocks('A a|b secret END B', String.raw`enclosed: a\|b | END`), 'A   B')
+  assert.equal(stripSkippedTrackerBlocks('A < start secret end > B', 'enclosed: "< start " | " end >"'), 'A   B')
+  assert.deepEqual(parseRosterVoiceSegments('Before ![abc, def] after.', null, [], 'enclosed: ![ | ]'), [
+    { text: 'Before after.', speakerId: null },
+  ])
 })
 
 test('continues to accept previously saved paired tracker tags', () => {
@@ -2088,6 +2165,60 @@ test('skips quotations inside asymmetric tracker blocks during playback', () => 
       { text: 'Keep this.', speakerId: 'alice' },
       { text: 'Narration remains.', speakerId: null },
     ],
+  )
+})
+
+test('skips everything between configured comment markers', () => {
+  // Reported case: the card wraps its tracker output in `<!-- GFX_START -->`
+  // comments. Comment syntax has no tag name, so the entry used to parse to
+  // nothing and the enclosed tracker text reached the speaker pipeline.
+  const setting = '<!-- GFX_START --><!-- GFX_END -->'
+  assert.deepEqual(parseSkippedTrackerTagPairs(setting), [
+    { open: '<!-- GFX_START -->', close: '<!-- GFX_END -->', marker: true },
+  ])
+  const content = [
+    '"Keep this line."',
+    '',
+    '<!-- GFX_START -->',
+    '<o_ledger>Date: 1/2/2026</o_l>',
+    '<tracker>HP 40, state, scene</tracker>',
+    '<!-- GFX_END -->',
+    '',
+    'Narration remains.',
+  ].join('\n')
+  assert.deepEqual(
+    parseRosterVoiceSegments(content, 'alice', [{ id: 'alice', name: 'Alice' }], setting),
+    [
+      { text: 'Keep this line.', speakerId: 'alice' },
+      { text: 'Narration remains.', speakerId: null },
+    ],
+  )
+  // Escaped markers, markers containing commas, and marker pairs mixed with
+  // ordinary tag entries all work from the same setting.
+  assert.equal(
+    stripSkippedTrackerBlocks(
+      'A &lt;!-- GFX_START --&gt;hidden&lt;!-- GFX_END --&gt; B',
+      '&lt;!-- GFX_START --&gt;&lt;!-- GFX_END --&gt;',
+    ),
+    'A   B',
+  )
+  assert.equal(
+    stripSkippedTrackerBlocks('A <!-- GFX: state, scene -->hidden<!-- GTFO --> B', '<!-- GFX: state, scene --><!-- GTFO -->'),
+    'A   B',
+  )
+  assert.equal(
+    stripSkippedTrackerBlocks('A <tracker>t</tracker> B <!-- X -->m<!-- Y --> C', 'tracker, <!-- X --><!-- Y -->'),
+    'A   B   C',
+  )
+  // One marker on its own excludes the text between alternating occurrences.
+  assert.equal(
+    stripSkippedTrackerBlocks('A <!-- HIDDEN -->secret<!-- HIDDEN --> B', '<!-- HIDDEN -->'),
+    'A   B',
+  )
+  // An unclosed marker leaves the text alone rather than swallowing the rest.
+  assert.equal(
+    stripSkippedTrackerBlocks('A <!-- GFX_START -->hidden tail', setting),
+    'A  hidden tail',
   )
 })
 
@@ -2409,6 +2540,17 @@ test('a possessive person noun anchors gender even mid-paragraph ("The boy\u2019
 
   const girl = [nar('The lantern gutters once. the girl\u2019s voice cracks high in the cold air.'), speech('I am here.')]
   assert.deepEqual(backwardNarrationAnchorGender(girl, 1), { gender: 'female', strong: false })
+})
+
+test('a possessive determiner surfaces the owned person noun, not the owner', () => {
+  const nar = (text: string) => ({ text, speakerId: null })
+  const speech = (text: string) => ({ text, speakerId: UNCAST_SPEAKER_ID })
+  // "His mother answers" is about the mother; the brother's "his" must not
+  // send the next unnamed speaker to a male voice, and vice versa.
+  assert.equal(narrationFirstPronounClass('His mother answers from the kitchen.'), null)
+  assert.equal(narrationFirstPronounClass('Her brother sets the tray down.'), null)
+  assert.equal(backwardNarrationPronounGender([nar('His mother answers from the kitchen.'), speech('Out back.')], 1), 'female')
+  assert.equal(backwardNarrationPronounGender([nar('Her brother sets the tray down.'), speech('Out back.')], 1), 'male')
 })
 
 test('a possessive in the opening sentence is a strong anchor', () => {
@@ -3154,6 +3296,166 @@ test('combines interrupted uncast groups before selecting their voice', () => {
     voice_g1: confidentDecision('voice_0'),
   })
   assert.deepEqual(weak.map(match => match.groupId), ['g1'])
+})
+
+test('reuses one pending voice when an exchange splits one unidentified participant into fragments', () => {
+  // Reported case: a three-character scene (cast mother and sister, silent
+  // POV) had one off-screen speaker quoted between cast lines. Jev called
+  // every fragment "new or unclear", so each one minted another favorite and
+  // the scene played four or five voices for one person. Fragments that stay
+  // unidentified belong to the exchange's one unnamed voice.
+  const groups = collectUncastVoiceGroups([
+    { speakerId: 'npc:nao', text: 'Where is she?' },
+    { speakerId: UNCAST_SPEAKER_ID, text: 'Out back.' },
+    { speakerId: 'npc:nao', text: 'Still?' },
+    { speakerId: UNCAST_SPEAKER_ID, text: 'Since noon.' },
+    { speakerId: 'npc:nao', text: 'Did she eat?' },
+    { speakerId: UNCAST_SPEAKER_ID, text: 'She had tea.' },
+  ])
+  assert.equal(groups.length, 3)
+  const voices = readFavoriteVoices([
+    { id: 'voice-1', category: 'female' },
+    { id: 'voice-2', category: 'female' },
+    { id: 'voice-3', category: 'female' },
+  ])
+  const assigned = resolveUncastVoiceDecisions(groups, voices, {
+    identity_g1: confidentDecision('new_or_unclear'),
+    identity_g2: confidentDecision('new_or_unclear'),
+    gender_g0: confidentDecision('female'),
+    gender_g1: confidentDecision('female'),
+    gender_g2: confidentDecision('female'),
+    voice_g0: confidentDecision('voice_0'),
+    voice_g1: confidentDecision('voice_1'),
+    voice_g2: confidentDecision('voice_2'),
+  })
+  assert.deepEqual(assigned.map(item => item.voiceId), ['voice-1', 'voice-1', 'voice-1'])
+  assert.equal(new Set(assigned.map(item => item.ghostId)).size, 1)
+})
+
+test('treats a weak identity lean as unresolved instead of evidence of a second person', () => {
+  // Reported scene: the same off-screen speaker was split into five groups and
+  // Jev answered "group_g2" at 0.14 confidence for the last one. A weak lean is
+  // noise, not a second participant, so it must not mint another favorite.
+  const groups = collectUncastVoiceGroups([
+    { speakerId: UNCAST_SPEAKER_ID, text: 'Out back.' },
+    { speakerId: 'npc:nao', text: 'Still?' },
+    { speakerId: UNCAST_SPEAKER_ID, text: 'Since noon.' },
+    { speakerId: 'npc:nao', text: 'Did she eat?' },
+    { speakerId: UNCAST_SPEAKER_ID, text: 'She had tea.' },
+  ])
+  assert.equal(groups.length, 3)
+  const voices = readFavoriteVoices([
+    { id: 'voice-1', category: 'female' },
+    { id: 'voice-2', category: 'female' },
+  ])
+  const assigned = resolveUncastVoiceDecisions(groups, voices, {
+    identity_g1: confidentDecision('new_or_unclear'),
+    identity_g2: { choice: 'group_g0', probabilities: { group_g0: 0.315, new_or_unclear: 0.311, group_g1: 0.044 }, confidence: 0.144 },
+    gender_g0: confidentDecision('female'),
+    gender_g1: confidentDecision('female'),
+    gender_g2: confidentDecision('female'),
+    voice_g0: confidentDecision('voice_0'),
+    voice_g1: confidentDecision('voice_1'),
+    voice_g2: confidentDecision('voice_1'),
+  })
+  assert.deepEqual(assigned.map(item => item.voiceId), ['voice-1', 'voice-1', 'voice-1'])
+  assert.equal(new Set(assigned.map(item => item.ghostId)).size, 1)
+})
+
+test('checks an unidentified group against the existing cast before adding a voice', () => {
+  // Cast members already own a configured voice, so an off-screen cast member
+  // must not be given a second, random favorite.
+  const groups = collectUncastVoiceGroups([
+    { speakerId: 'npc:nao', text: 'Where is she?' },
+    { speakerId: UNCAST_SPEAKER_ID, text: 'Out back.' },
+  ])
+  assert.equal(groups.length, 1)
+  const voices = readFavoriteVoices([{ id: 'voice-1', category: 'female' }])
+  const cast = [{ id: 'aiko', name: 'Aiko', voiceId: 'cast-voice', description: "Aiko is Ken and Nao's mother." }]
+  const plan = buildUncastVoiceDecision(groups, voices, 'His mother answers from the kitchen.', [], [], false, cast)
+  assert.ok(plan.questions.cast_g0)
+  assert.ok(Object.values(plan.questions.cast_g0.criteria).includes("Aiko (aiko) \u2014 Aiko is Ken and Nao's mother."))
+  assert.deepEqual(plan.state.cast, [{ id: 'aiko', name: 'Aiko', description: "Aiko is Ken and Nao's mother." }])
+  assert.equal(buildUncastVoiceDecision(groups, voices, 'Aiko answers.').questions.cast_g0, undefined)
+  const resolved = resolveUncastVoiceDecisions(groups, voices, {
+    cast_g0: confidentDecision('cast_0'),
+    gender_g0: confidentDecision('female'),
+    voice_g0: confidentDecision('voice_0'),
+  }, [], [], 'current', 'Aiko answers from the kitchen.', [], undefined, cast)
+  assert.deepEqual(resolved.map(item => item.voiceId), ['cast-voice'])
+  assert.equal(resolved[0]?.castSpeakerId, 'aiko')
+  assert.equal(resolved[0]?.ghostId, undefined)
+  // A clear lead is enough even below Jev's strict "strong" verdict.
+  const leading = resolveUncastVoiceDecisions(groups, voices, {
+    cast_g0: { choice: 'cast_0', probabilities: { cast_0: 0.74, none: 0.26 }, confidence: 0.61 },
+    gender_g0: confidentDecision('female'),
+    voice_g0: confidentDecision('voice_0'),
+  }, [], [], 'current', 'Aiko answers from the kitchen.', [], () => 0, cast)
+  assert.deepEqual(leading.map(item => item.voiceId), ['cast-voice'])
+  // A weak pick is not evidence: the group keeps its own new voice.
+  const weak = resolveUncastVoiceDecisions(groups, voices, {
+    cast_g0: { choice: 'cast_0', probabilities: { cast_0: 0.45, none: 0.55 }, confidence: 0.2 },
+    gender_g0: confidentDecision('female'),
+    voice_g0: confidentDecision('voice_0'),
+  }, [], [], 'current', 'Aiko answers from the kitchen.', [], () => 0, cast)
+  assert.deepEqual(weak.map(item => item.voiceId), ['voice-1'])
+  assert.equal(weak[0]?.castSpeakerId, undefined)
+})
+
+test('matches a narrator-attributed role to the cast member whose card claims it', () => {
+  // Reported scene: the mother answers off-screen, the cast already holds her
+  // with her own configured voice, but Jev sees no name and leaves the group
+  // unidentified. Narration states the role, so the cast member who claims
+  // that role speaks it instead of a fresh favorite.
+  const groups = collectUncastVoiceGroups([
+    { speakerId: null, text: "Through the floor it's mush. Her voice comes up thin and low.\n\nHis mother answers. That's the same. A murmur, warm, moving." },
+    { speakerId: UNCAST_SPEAKER_ID, text: "...cold out? Take your coat off, you're dripping on-" },
+  ])
+  assert.deepEqual(narratedSpeakerRoles(groups[0].context.join(' ')), ['mother'])
+  // A relative who merely acts is not attributed a speech.
+  assert.deepEqual(narratedSpeakerRoles('Her brother sets the tray down and leaves.'), [])
+  const voices = readFavoriteVoices([{ id: 'voice-1', category: 'female' }])
+  const answers = { gender_g0: confidentDecision('female'), voice_g0: confidentDecision('voice_0') }
+  const aiko = [{ id: 'aiko', name: 'Aiko', voiceId: 'cast-voice', description: "Aiko is Ken and Nao's mother." }]
+  const assigned = resolveUncastVoiceDecisions(groups, voices, answers, [], [], 'current', '', [], () => 0, aiko)
+  assert.deepEqual(assigned.map(item => item.voiceId), ['cast-voice'])
+  assert.equal(assigned[0]?.castSpeakerId, 'aiko')
+  // A card that does not claim the role is no evidence.
+  const other = [{ id: 'aiko', name: 'Aiko', voiceId: 'cast-voice', description: 'Aiko runs the tea shop on the corner.' }]
+  const unrelated = resolveUncastVoiceDecisions(groups, voices, answers, [], [], 'current', '', [], () => 0, other)
+  assert.deepEqual(unrelated.map(item => item.voiceId), ['voice-1'])
+  assert.equal(unrelated[0]?.castSpeakerId, undefined)
+})
+
+test('keeps the rest of an off-screen exchange on the cast voice the narration identified', () => {
+  // Reported scene: the mother answers off-screen between her daughter's
+  // lines. Narration names her role, so she is cast, and the replies that
+  // follow belong to the same person rather than to new arrivals.
+  const groups = collectUncastVoiceGroups([
+    { speakerId: null, text: "Through the floor it's mush. Her voice comes up thin and low.\n\nHis mother answers. That's the same. A murmur, warm, moving." },
+    { speakerId: UNCAST_SPEAKER_ID, text: "...cold out? Take your coat off, you're dripping on-" },
+    { speakerId: 'npc:nao', text: "I'm not dripping." },
+    { speakerId: UNCAST_SPEAKER_ID, text: "Then what's that, exactly." },
+    { speakerId: 'npc:nao', text: "Rain. It's raining out there." },
+    { speakerId: UNCAST_SPEAKER_ID, text: "Go and hang the coat up, then, before it drips." },
+    { speakerId: null, text: 'A clatter. Something set down hard.\n\nThen, quieter. Not muffled. Clear as if said on the stairs.' },
+    { speakerId: UNCAST_SPEAKER_ID, text: 'It is not rain, it is the gutter overflowing.' },
+  ])
+  assert.deepEqual(narratedSpeakerRoles(groups[0].context.join(' ')), ['mother'])
+  const voices = readFavoriteVoices([
+    { id: 'voice-1', category: 'female' },
+    { id: 'voice-2', category: 'female' },
+  ])
+  const answers = Object.fromEntries(groups.flatMap((group, index) => [
+    [`gender_${group.id}`, confidentDecision('female')],
+    [`voice_${group.id}`, confidentDecision(index === 0 ? 'voice_0' : 'voice_1')],
+  ]))
+  const cast = [{ id: 'aiko', name: 'Aiko', voiceId: 'cast-voice', description: "Aiko is Ken and Nao's mother." }]
+  const assigned = resolveUncastVoiceDecisions(groups, voices, answers, [], [], 'current', '', [], () => 0, cast)
+  assert.equal(assigned.length, groups.length)
+  assert.ok(assigned.every(item => item.voiceId === 'cast-voice'), JSON.stringify(assigned))
+  assert.ok(assigned.every(item => item.castSpeakerId === 'aiko'), JSON.stringify(assigned))
+  assert.ok(assigned.every(item => !item.ghostId), JSON.stringify(assigned))
 })
 
 test('strong pairwise identity links override conflicting cached turn voices', () => {
@@ -4219,6 +4521,104 @@ test('contextual persona reconciliation reviews existing and newly introduced us
   assert.ok(wrongPersona.global_uncertain_s0)
   assert.equal(wrongPersona.persona_confirmed_s0, undefined)
   assert.equal(buildContextualUserReconciliation(buildSpeakerDecisionPlan('"I agree."', speakers, true), genuineAnswers, context).questions.persona_check_s0, undefined)
+})
+
+test('keeps a fast exchange alternating and follows a self-quotation', () => {
+  // Reported scene: "Bowl," she says. → both replies after it (including "I
+  // said I know.") were handed to the mother. A reply normally belongs to the
+  // other participant, and "I said X" repeats the speaker's own earlier line.
+  const speakers = [{ id: 'aiko', name: 'Aiko' }, { id: 'npc:nao', name: 'nao' }]
+  const message = '"Bowl," she says.\n\n"I know."\n\n"The one that\u2019s not chipped. I\u2019ll take\u2014"\n\n"I said I know."'
+  const plan = buildSpeakerDecisionPlan(message, speakers, false)
+  assert.equal(plan.state.speeches.length, 4)
+  const identities: Array<string | null | undefined> = ['aiko', 'aiko', 'aiko', 'aiko']
+  const answers: Record<string, SpeakerDecisionChoice> = {
+    // The model was torn on the reply and its best-available guess picked the
+    // speaker it had just heard.
+    speech_s1: { choice: 'known_0', probabilities: { known_0: 0.357, known_1: 0.412, known_2: 0.163, uncast_character: 0.035, no_clear_identity: 0.033 }, confidence: 0.266 },
+    turn_s1: { choice: 'responds_to_previous_speaker', probabilities: { responds_to_previous_speaker: 0.6, continues_previous_turn: 0.254, no_clear_identity: 0.116, responds_to_other_participant: 0.03 }, confidence: 0.467 },
+    speech_s3: { choice: 'known_0', probabilities: { known_0: 0.915, known_1: 0.069, uncast_character: 0.008, no_clear_identity: 0.002 }, confidence: 0.894 },
+  }
+  const paths = new Map<number, string>()
+  applyConversationFlow(plan, answers, identities, paths)
+  assert.deepEqual(identities, ['aiko', 'npc:nao', 'aiko', 'npc:nao'])
+  assert.match(paths.get(1) ?? '', /turn-taking/u)
+  assert.match(paths.get(3) ?? '', /echo/u)
+  // A confirmed link and a confident answer are never overridden.
+  const guarded = ['aiko', 'aiko', 'aiko', 'aiko']
+  const guardedAnswers = { ...answers, relationship_confirmed_s1: confidentDecision('known_0') }
+  applyConversationFlow(plan, guardedAnswers, guarded, new Map())
+  assert.equal(guarded[1], 'aiko')
+  const confident = ['aiko', 'aiko', 'aiko', 'aiko']
+  applyConversationFlow(plan, {
+    ...answers,
+    speech_s1: { choice: 'known_0', probabilities: { known_0: 0.83, known_1: 0.14 }, confidence: 0.8 },
+  }, confident, new Map())
+  assert.equal(confident[1], 'aiko')
+})
+
+test('reads a character card as answering to its family role', () => {
+  // Reported case: the card never said "Aiko" in narration, only "his mother",
+  // so the line fell to a new voice until the role was added by hand.
+  assert.deepEqual(cardRelationshipRoles("Aiko is Ken and Nao's mother.", ['Aiko Takayama', 'Aiko']), ['mother'])
+  assert.deepEqual(cardRelationshipRoles('Aiko, Ken\u2019s mother, keeps the kitchen.', ['Aiko']), ['mother'])
+  assert.deepEqual(cardRelationshipRoles('{{char}} is the mother of Ken.', ['Aiko']), ['mother'])
+  assert.deepEqual(cardRelationshipRoles("I'm Ken's mom.", ['Aiko']), ['mother'])
+  assert.deepEqual(cardRelationshipRoles('She is Nao\u2019s older sister.', ['Aiko']), ['sister'])
+  assert.deepEqual(cardRelationshipRoles("Ken's mother is Aiko.", ['Aiko']), ['mother'])
+  // A card that only describes someone else's relative claims nothing.
+  assert.deepEqual(cardRelationshipRoles("Aiko works with Ken's mother at the shop.", ['Aiko']), [])
+  assert.deepEqual(cardRelationshipRoles('She is a firefighter.', ['Aiko']), [])
+  const aliases = cardRelationshipAliases([
+    { id: 'aiko', name: 'Aiko', description: "Aiko is Ken and Nao's mother.", personality: '', scenario: '' },
+    { id: 'nao', name: 'nao', description: "Nao is Ken's sister.", personality: '', scenario: '' },
+    { id: 'ken', name: 'Ken', description: 'Ken is the youngest.', personality: '', scenario: '' },
+  ])
+  assert.deepEqual(aliases.get('aiko'), ['Mother', 'Mom'])
+  assert.deepEqual(aliases.get('nao'), ['Sister'])
+  assert.equal(aliases.get('ken'), undefined)
+  // Creator notes and first messages often state the relationship too.
+  assert.deepEqual(cardRelationshipAliases([{ id: 'aiko', name: 'Aiko', creatorNotes: "Aiko is Ken's mother." }]).get('aiko'), ['Mother', 'Mom'])
+  // Two cards claiming the same role leave it ambiguous.
+  const ambiguous = cardRelationshipAliases([
+    { id: 'a', name: 'Aiko', description: "Aiko is Ken's mother." },
+    { id: 'b', name: 'Yumi', description: "Yumi is Nao's mother." },
+  ])
+  assert.equal(ambiguous.get('a'), undefined)
+  assert.equal(ambiguous.get('b'), undefined)
+  assert.equal(withRelationshipAliases('Aiko', ['Mother', 'Mom']), 'Aiko / Mother / Mom')
+  assert.equal(withRelationshipAliases('Aiko / Mother', ['Mother', 'Mom']), 'Aiko / Mother / Mom')
+  assert.equal(withRelationshipAliases('', ['Mother']), '')
+  assert.equal(withRelationshipAliases('Aiko', []), 'Aiko')
+  assert.deepEqual(speakerAliases(withRelationshipAliases('Aiko Takayama / Aiko', ['Mother', 'Mom'])), ['Aiko Takayama', 'Aiko', 'Mother', 'Mom'])
+})
+
+test('confirms a POV persona that clearly speaks and never strands a rejected user line', () => {  const speakers = [{ id: 'aiko', name: 'Aiko' }, { id: 'npc:nao', name: 'nao' }, { id: USER_SPEAKER_ID, name: 'Ken' }]
+  const plan = buildSpeakerDecisionPlan('"It was dead quiet up there."', speakers, false)
+  const firstPass: SpeakerDecisionChoice = {
+    choice: 'known_2',
+    probabilities: { known_2: 0.899, known_1: 0.082, known_0: 0.015, uncast_character: 0.002, no_clear_identity: 0.002 },
+    confidence: 0.874,
+  }
+  // Reported scene: the dedicated persona check leaned "user" (0.674) but the
+  // strict single threshold rejected it, dropping the line to the connection
+  // default voice.
+  const confirmed: Record<string, SpeakerDecisionChoice> = { speech_s0: firstPass }
+  const review = buildContextualUserReconciliation(plan, confirmed, { previousMessages: [], ghosts: [] })
+  applyContextualUserReconciliation(plan, confirmed, {
+    persona_check_s0: { choice: 'user', probabilities: { user: 0.674, other: 0.176, no_clear_identity: 0.151 }, confidence: 0.511 },
+  }, review.questions)
+  assert.ok(confirmed.persona_confirmed_s0)
+  assert.equal(confirmed.global_uncertain_s0, undefined)
+  // Rejected outright: the runner-up keeps the line off the connection default.
+  const rejected: Record<string, SpeakerDecisionChoice> = { speech_s0: { ...firstPass } }
+  const rejectedReview = buildContextualUserReconciliation(plan, rejected, { previousMessages: [], ghosts: [] })
+  applyContextualUserReconciliation(plan, rejected, {
+    persona_check_s0: { choice: 'other', probabilities: { user: 0.12, other: 0.83, no_clear_identity: 0.05 }, confidence: 0.8 },
+  }, rejectedReview.questions)
+  assert.equal(rejected.persona_confirmed_s0, undefined)
+  assert.equal(rejected.speech_s0.choice, 'known_1')
+  assert.ok((rejected.speech_s0.probabilities.known_1 ?? 0) > 0.8)
 })
 
 test('replays opening user-confusion and later text-message agreement without mixing identities', () => {
@@ -5513,6 +5913,69 @@ test('rejects common prepositional paragraph leads as inferred character names',
       `${preposition} must not become a speaker`,
     )
   }
+})
+
+test('rejects sentence-leading function words as inferred character names', () => {
+  // Reported case: a roster listed a fourth "character" named "Not", because a
+  // capitalized sentence lead before dialogue repeated ("Not that it matters.").
+  // Such a word then had its own voice available for any quotation.
+  const joiner = [
+    'Not that it matters.',
+    '',
+    'Not that he cares.',
+    '',
+    '"I\u2019m home."',
+  ].join('\n')
+  assert.deepEqual(
+    addUnconfiguredDialogueSpeakers(joiner, [{ id: 'aiko', name: 'Aiko' }]).map(speaker => speaker.id),
+    ['aiko'],
+  )
+  const nothing = [
+    'Nothing moves. Even the cat is still.',
+    '',
+    'Nothing but the pipes.',
+    '',
+    '"I\u2019m home."',
+  ].join('\n')
+  assert.deepEqual(
+    addUnconfiguredDialogueSpeakers(nothing, [{ id: 'aiko', name: 'Aiko' }]).map(speaker => speaker.id),
+    ['aiko'],
+  )
+  // A repeated capital that also occurs in lower case is ordinary prose.
+  const lowerCase = [
+    'Quiet holds the hall. Quiet again.',
+    '',
+    'It stays quiet for a long minute.',
+    '',
+    '"I\u2019m home."',
+  ].join('\n')
+  assert.deepEqual(
+    addUnconfiguredDialogueSpeakers(lowerCase, [{ id: 'aiko', name: 'Aiko' }]).map(speaker => speaker.id),
+    ['aiko'],
+  )
+  // A real name repeating at sentence starts is still inferred.
+  const named = [
+    'Kaito drops his bag. The hall stays dark.',
+    '',
+    'Kaito does not knock.',
+    '',
+    '"I\u2019m home."',
+  ].join('\n')
+  assert.deepEqual(
+    addUnconfiguredDialogueSpeakers(named, [{ id: 'aiko', name: 'Aiko' }]).map(speaker => speaker.id),
+    ['aiko', unconfiguredSpeakerId('Kaito')],
+  )
+})
+
+test('retires saved voices for speakers named after ordinary words', () => {
+  const base = { context: '', occurrenceKeys: [], lastSeenMessageId: '', voiceId: 'voice-1' }
+  const ghosts = readGhostVoices([
+    { ...base, id: 'g1', speakerId: unconfiguredSpeakerId('Not'), label: 'Not' },
+    { ...base, id: 'g2', speakerId: unconfiguredSpeakerId('Nothing') },
+    { ...base, id: 'g3', speakerId: unconfiguredSpeakerId('Kaito'), label: 'Kaito' },
+    { ...base, id: 'g4', speakerId: 'npc:nao', label: 'nao' },
+  ])
+  assert.deepEqual(ghosts.map(ghost => ghost.id), ['g3', 'g4'])
 })
 
 test('does not treat a configured name after a preposition as a speaker without attribution', () => {
