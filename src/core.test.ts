@@ -3,6 +3,7 @@ import test from 'node:test'
 import { SoundLibrary, type SoundUserStorage } from './sound-library'
 import { mapSoundCueBoundaries, parseSoundScenePlan } from './sound-scene'
 import { renderSoundMix, soundCategoryGain } from './sound-mix'
+import { buildSoundTimeline } from './sound-timeline'
 import { AutoplayRequestRegistry, PlaybackLongPress, PlaybackStartupGuard, syncAutoplayIndicators, syncPlaybackButtons, waitForAutoplayDeadline, waitForAutoplayWork, type PlaybackButtonState } from './playback-ui'
 import { evaluateSpeakerReviews } from './speaker-review-evaluation'
 
@@ -142,6 +143,25 @@ test('sound normalization uses category targets and limits boost and peaks', () 
   assert.equal(soundCategoryGain([new Float32Array([0.001, -0.001])], 'event'), 4)
   assert.ok(soundCategoryGain([new Float32Array([1, 0, 0, 0])], 'event') <= 0.98)
   assert.throws(() => soundCategoryGain([new Float32Array([NaN])], 'event'), /Invalid audio sample/)
+})
+
+test('sound timeline injects events, blends ambience and skips unavailable assets', () => {
+  const clip = (length: number) => [new Float32Array(length).fill(0.1)]
+  const assets = new Map([
+    ['rain', { kind: 'ambience' as const, channels: clip(80) }],
+    ['door', { kind: 'event' as const, channels: clip(40) }],
+  ])
+  const timeline = buildSoundTimeline([{ channels: clip(100), gain: 1 }, { channels: clip(100), gain: 1 }], [
+    { boundary: 0, kind: 'ambience', action: 'play', assetId: 'rain' },
+    { boundary: 1, kind: 'event', action: 'play', assetId: 'door' },
+    { boundary: 1, kind: 'event', action: 'play', assetId: 'missing' },
+    { boundary: 2, kind: 'ambience', action: 'stop' },
+  ], assets, 8000, { ambience: 0.5, event: 1 })
+  assert.equal(timeline.totalFrames, 240)
+  assert.deepEqual(timeline.tracks.filter(track => track.kind === 'voice').map(track => [track.startFrame, track.endFrame]), [[0, 100], [140, 240]])
+  assert.deepEqual(timeline.tracks.filter(track => track.kind === 'event').map(track => [track.startFrame, track.endFrame]), [[100, 140]])
+  assert.deepEqual(timeline.tracks.filter(track => track.kind === 'ambience').map(track => [track.startFrame, track.endFrame]), [[0, 240]])
+  assert.equal(renderSoundMix(timeline.tracks, timeline.totalFrames, 1).channels[0].length, 240)
 })
 import {
   adaptiveGenerationConcurrency,
