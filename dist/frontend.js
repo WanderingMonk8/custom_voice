@@ -996,6 +996,7 @@ function mergeVoicePlan(segments) {
       result.push({
         text,
         voice: segment.voice,
+        ...segment.originalSpeech !== void 0 ? { originalSpeech: segment.originalSpeech } : {},
         ...segment.tagId ? { tagId: segment.tagId } : {}
       });
     }
@@ -1036,6 +1037,7 @@ function splitLargeVoicePlanSegments(segments, maximumChars = DEFAULT_MAX_TTS_SE
       result.push({
         text,
         voice: segment.voice,
+        ...segment.originalSpeech !== void 0 ? { originalSpeech: segment.originalSpeech } : {},
         ...segment.tagId ? { tagId: segment.tagId } : {}
       });
       remaining = remaining.slice(splitAt).trim();
@@ -1044,11 +1046,32 @@ function splitLargeVoicePlanSegments(segments, maximumChars = DEFAULT_MAX_TTS_SE
       result.push({
         text: remaining,
         voice: segment.voice,
+        ...segment.originalSpeech !== void 0 ? { originalSpeech: segment.originalSpeech } : {},
         ...segment.tagId ? { tagId: segment.tagId } : {}
       });
     }
   }
   return result;
+}
+function speechDurationGuard(text, originalSpeech, speed) {
+  const retryText = text.replace(/\[[^\]\r\n]+\]|<[^>\r\n]+>/gu, (token) => {
+    const category = ttsTagCategory(token.slice(1, -1));
+    return originalSpeech.includes(token) || category === "sound" || category === "pause" ? token : "";
+  }).replace(/\s+/gu, " ").trim();
+  const spoken = stripTtsTags(retryText).trim();
+  const spokenCharacters = Array.from(spoken).filter((char) => /[\p{L}\p{N}]/u.test(char)).length;
+  if (!spokenCharacters) return null;
+  const words = (spoken.match(/[\p{L}\p{N}]+/gu) ?? []).length;
+  const events = extractTtsTags(retryText).filter((tag) => {
+    const category = ttsTagCategory(tag);
+    return category === "sound" || category === "pause";
+  }).length;
+  const safeSpeed = Number.isFinite(speed) ? Math.max(0.25, Math.min(1, speed)) : 1;
+  return {
+    retryText,
+    maxSeconds: (Math.max(20, 4 + words * 2.5, spokenCharacters / 3) + events * 8) / safeSpeed,
+    spokenCharacters
+  };
 }
 function isRecord(value) {
   return !!value && typeof value === "object" && !Array.isArray(value);
@@ -2321,12 +2344,108 @@ var TTS_EMOTION_NAMES = new Set(TTS_EMOTION_OPTIONS.map((option) => option.value
 var TTS_SOUND_NAMES = new Set(TTS_TAG_OPTIONS.map((option) => option.value));
 var TTS_PAUSE_NAMES = new Set(TTS_PAUSE_OPTIONS.map((option) => option.value));
 var TTS_STYLE_NAMES = new Set(TTS_STYLE_OPTIONS.map((option) => option.value));
+var TTS_TAG_ALIASES = /* @__PURE__ */ new Map([
+  // Sound aliases.
+  ["laughter", "laugh"],
+  ["laughs", "laugh"],
+  ["laughing", "laugh"],
+  ["chuckles", "chuckle"],
+  ["chuckling", "chuckle"],
+  ["giggles", "giggle"],
+  ["snickers", "snicker"],
+  ["cackles", "cackle"],
+  ["cheers", "cheer"],
+  ["gasps", "gasp"],
+  ["gasping", "gasp"],
+  ["sighs", "sigh"],
+  ["sighing", "sigh"],
+  ["groans", "groan"],
+  ["groaning", "groan"],
+  ["grunts", "grunt"],
+  ["growls", "growl"],
+  ["hisses", "hiss"],
+  ["moans", "moan"],
+  ["pants", "pant"],
+  ["panting", "pant"],
+  ["whisper", "whispering"],
+  ["whispering", "whispering"],
+  ["shouts", "shout"],
+  ["shouting", "shouting"],
+  ["screaming", "screaming"],
+  ["cries", "cry"],
+  ["crying", "cry"],
+  ["crying loudly", "cry"],
+  ["sobs", "sob"],
+  ["sobbing", "sob"],
+  ["screams", "scream"],
+  ["shrieks", "shriek"],
+  ["snorts", "snort"],
+  ["breaths", "breath"],
+  ["inhale", "breath"],
+  ["exhale", "exhales"],
+  ["coughs", "cough"],
+  ["clear throat", "throat-clearing"],
+  ["clears throat", "throat-clearing"],
+  ["sneezes", "sneeze"],
+  ["yawns", "yawn"],
+  ["yawning", "yawn"],
+  ["snoring", "snore"],
+  // Style aliases.
+  ["soft", "soft voice"],
+  ["loud", "loud voice"],
+  ["low", "low voice"],
+  // Pause aliases.
+  ["break", "short"],
+  ["short pause", "short"],
+  ["long-break", "long"],
+  ["long pause", "long"],
+  // Emotion aliases used by common prompts.
+  ["furious", "angry"],
+  ["terrified", "scared"],
+  ["ecstatic", "excited"],
+  ["relieved", "calm"],
+  ["enthusiastic", "excited"],
+  ["friendly", "calm"],
+  ["encouraging", "hopeful"],
+  ["mysterious", "uncertain"]
+]);
 var TTS_TAG_NAMES = /* @__PURE__ */ new Set([
   ...TTS_EMOTION_NAMES,
   ...TTS_SOUND_NAMES,
   ...TTS_PAUSE_NAMES,
   ...TTS_STYLE_NAMES
 ]);
+var TTS_TAG_TOKEN_RE = /\[\s*([a-z][a-z -]*?)\s*\]|<\s*([a-z][a-z -]*?)\s*>/giu;
+function normalizeTtsTagName(value) {
+  const tag = value.trim().toLowerCase();
+  if (TTS_TAG_NAMES.has(tag)) return tag;
+  return TTS_TAG_ALIASES.get(tag) ?? null;
+}
+function ttsTagCategory(value) {
+  const tag = normalizeTtsTagName(value);
+  if (!tag) return null;
+  if (TTS_EMOTION_NAMES.has(tag)) return "emotion";
+  if (TTS_STYLE_NAMES.has(tag)) return "style";
+  if (TTS_PAUSE_NAMES.has(tag)) return "pause";
+  return "sound";
+}
+function replaceTtsTags(text, replacer) {
+  return text.replace(TTS_TAG_TOKEN_RE, (match, square, angle) => {
+    const tag = normalizeTtsTagName(square ?? angle ?? "");
+    return tag ? replacer(tag, match) : match;
+  });
+}
+function stripTtsTags(text) {
+  return replaceTtsTags(text, () => "");
+}
+function extractTtsTags(text) {
+  const tags = [];
+  replaceTtsTags(text, (tag) => {
+    tags.push(tag);
+    return "";
+  });
+  return tags;
+}
 var NARRATIVE_SPEECH_VERB_PATTERN = new RegExp(
   `\\b(?:${SPEECH_VERBS}|blurt(?:s|ed)|laugh(?:s|ed)|mutter(?:s|ed)|hiss(?:es|ed)|snap(?:s|ped))\\b`,
   "iu"
@@ -5469,6 +5588,7 @@ function setup(ctx) {
           return {
             text: speakerId ? normalizeSpeechBoundaryDashes(segment.ttsText ?? segment.text) : segment.ttsText ?? segment.text,
             voice,
+            ...speakerId ? { originalSpeech: segment.text } : {},
             ...segment.ttsTag ? { tagId: segment.ttsTag.id } : {}
           };
         });
@@ -5837,11 +5957,57 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
         const normalizationContext = new (window.AudioContext ?? window.webkitAudioContext)();
         const voiceLoudnessProfiles = /* @__PURE__ */ new Map();
         let normalizationChain = Promise.resolve();
-        const processed = prepared.map((pending, index) => {
+        const validated = prepared.map(async (pending, index) => {
+          const result = await pending;
+          if (!result.ok) return result;
+          try {
+            let segment = result.segment;
+            let decodedBuffer = await normalizationContext.decodeAudioData(segment.data.slice(0));
+            const entry = plan[index];
+            const guard = entry.originalSpeech !== void 0 ? speechDurationGuard(entry.text, entry.originalSpeech, preferences.speed) : null;
+            if (guard && decodedBuffer.duration > guard.maxSeconds) {
+              appendSpeakerDebugLog(`Audio duration guard [${index + 1}]: ${decodedBuffer.duration.toFixed(2)}s exceeds ${guard.maxSeconds.toFixed(2)}s for ${guard.spokenCharacters} spoken characters; retrying once without generated vocal directions.`);
+              if (ctx.getActiveChat().chatId === playbackChat.id && activePlayback === playback && !playback.playbackStopped) {
+                setStatus(`Retrying unusually long speech segment ${index + 1}\u2026`);
+              }
+              segment = await runSynthesisTask(() => synthesizeVoiceSegment(
+                connectionId,
+                guard.retryText,
+                entry.voice,
+                preferences.speed,
+                synthesisController.signal,
+                sharedSynthesisPacer,
+                rateLimitBudget,
+                playbackVoiceGate,
+                (delayMs, cumulativeWaitMs) => {
+                  rateLimitedForRemainder = true;
+                  adaptiveConcurrency = 1;
+                  shortConcurrencyCooldown = 0;
+                  longWindowStreak = 0;
+                  if (adaptiveSynthesisLimits.has(adaptiveLimitToken)) adaptiveSynthesisLimits.set(adaptiveLimitToken, 1);
+                  drainSynthesisQueue();
+                  if (ctx.getActiveChat().chatId === playbackChat.id && (!activePlayback || activePlayback === playback)) {
+                    setStatus(`Rate limited; resuming in ${Math.max(1, Math.ceil(delayMs / 1e3))}s\u2026 (${Math.ceil(cumulativeWaitMs / 1e3)}s of ${preferences.rateLimitWaitSeconds}s wait budget)`);
+                  }
+                }
+              ), activePlayback === playback && !playback.playbackStopped);
+              decodedBuffer = await normalizationContext.decodeAudioData(segment.data.slice(0));
+              appendSpeakerDebugLog(`Audio duration guard [${index + 1}]: retry ${decodedBuffer.duration.toFixed(2)}s, threshold ${guard.maxSeconds.toFixed(2)}s.`);
+              if (decodedBuffer.duration > guard.maxSeconds) {
+                throw new Error(`Speech segment ${index + 1} remained unusually long after retry (${decodedBuffer.duration.toFixed(1)}s; limit ${guard.maxSeconds.toFixed(1)}s). Please regenerate the audio.`);
+              }
+            }
+            return { ok: true, segment: { ...segment, decodedBuffer } };
+          } catch (error) {
+            appendSpeakerDebugLog(`Audio validation [${index + 1}] failed: ${error instanceof Error ? error.message : String(error)}`);
+            return { ok: false, error };
+          }
+        });
+        const processed = validated.map((pending, index) => {
           const processing = normalizationChain.then(async () => {
             const result = await pending;
             if (!result.ok) return result;
-            const decodedBuffer = await normalizationContext.decodeAudioData(result.segment.data.slice(0));
+            const decodedBuffer = result.segment.decodedBuffer;
             const voiceKey = plan[index].voice.trim().toLowerCase() || "__connection-default__";
             const normalizationGain = normalizedVoiceGain(decodedBuffer, voiceKey, voiceLoudnessProfiles);
             return {

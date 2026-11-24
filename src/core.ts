@@ -2279,6 +2279,8 @@ export function filterNarrationSegments(segments: PlaybackSegment[], skipNarrati
 export interface VoicePlanSegment {
   text: string
   voice: string
+  /** Original speech, for distinguishing generated vocal tags from user text. */
+  originalSpeech?: string
   /** Speech plan ID so late tag placements can update this entry. */
   tagId?: string
 }
@@ -2548,6 +2550,7 @@ export function mergeVoicePlan(segments: VoicePlanSegment[]): VoicePlanSegment[]
       result.push({
         text,
         voice: segment.voice,
+        ...(segment.originalSpeech !== undefined ? { originalSpeech: segment.originalSpeech } : {}),
         ...(segment.tagId ? { tagId: segment.tagId } : {}),
       })
     }
@@ -2613,6 +2616,7 @@ export function splitLargeVoicePlanSegments(
       result.push({
         text,
         voice: segment.voice,
+        ...(segment.originalSpeech !== undefined ? { originalSpeech: segment.originalSpeech } : {}),
         ...(segment.tagId ? { tagId: segment.tagId } : {}),
       })
       remaining = remaining.slice(splitAt).trim()
@@ -2621,11 +2625,35 @@ export function splitLargeVoicePlanSegments(
       result.push({
         text: remaining,
         voice: segment.voice,
+        ...(segment.originalSpeech !== undefined ? { originalSpeech: segment.originalSpeech } : {}),
         ...(segment.tagId ? { tagId: segment.tagId } : {}),
       })
     }
   }
   return result
+}
+
+/** Conservative runaway-audio threshold; original user-authored cues survive retries. */
+export function speechDurationGuard(text: string, originalSpeech: string, speed: number): { retryText: string; maxSeconds: number; spokenCharacters: number } | null {
+  const retryText = text.replace(/\[[^\]\r\n]+\]|<[^>\r\n]+>/gu, token => {
+    const category = ttsTagCategory(token.slice(1, -1))
+    return originalSpeech.includes(token) || category === 'sound' || category === 'pause' ? token : ''
+  })
+    .replace(/\s+/gu, ' ').trim()
+  const spoken = stripTtsTags(retryText).trim()
+  const spokenCharacters = Array.from(spoken).filter(char => /[\p{L}\p{N}]/u.test(char)).length
+  if (!spokenCharacters) return null
+  const words = (spoken.match(/[\p{L}\p{N}]+/gu) ?? []).length
+  const events = extractTtsTags(retryText).filter(tag => {
+    const category = ttsTagCategory(tag)
+    return category === 'sound' || category === 'pause'
+  }).length
+  const safeSpeed = Number.isFinite(speed) ? Math.max(0.25, Math.min(1, speed)) : 1
+  return {
+    retryText,
+    maxSeconds: (Math.max(20, 4 + words * 2.5, spokenCharacters / 3) + events * 8) / safeSpeed,
+    spokenCharacters,
+  }
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

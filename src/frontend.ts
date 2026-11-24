@@ -41,6 +41,7 @@ import {
   markUnresolvedSpeechSegments,
   npcSpeakerId,
   normalizeSpeechBoundaryDashes,
+  speechDurationGuard,
   normalizeSpeakerName,
   parseRosterVoiceSegments,
   playbackVoiceForSpeaker,
@@ -3663,6 +3664,7 @@ export function setup(ctx: SpindleFrontendContext) {
             ? normalizeSpeechBoundaryDashes(segment.ttsText ?? segment.text)
             : segment.ttsText ?? segment.text,
           voice,
+          ...(speakerId ? { originalSpeech: segment.text } : {}),
           ...(segment.ttsTag ? { tagId: segment.ttsTag.id } : {}),
         }
       })
@@ -4172,11 +4174,53 @@ export function setup(ctx: SpindleFrontendContext) {
         ?? (window as typeof window & { webkitAudioContext: typeof AudioContext }).webkitAudioContext)()
       const voiceLoudnessProfiles = new Map<string, number>()
       let normalizationChain: Promise<void> = Promise.resolve()
-      const processed = prepared.map((pending, index) => {
+      const validated = prepared.map(async (pending, index): Promise<PreparedSegment> => {
+        const result = await pending
+        if (!result.ok) return result
+        try {
+          let segment = result.segment
+          let decodedBuffer = await normalizationContext.decodeAudioData(segment.data.slice(0))
+          const entry = plan[index]
+          const guard = entry.originalSpeech !== undefined
+            ? speechDurationGuard(entry.text, entry.originalSpeech, preferences.speed)
+            : null
+          if (guard && decodedBuffer.duration > guard.maxSeconds) {
+            appendSpeakerDebugLog(`Audio duration guard [${index + 1}]: ${decodedBuffer.duration.toFixed(2)}s exceeds ${guard.maxSeconds.toFixed(2)}s for ${guard.spokenCharacters} spoken characters; retrying once without generated vocal directions.`)
+            if (ctx.getActiveChat().chatId === playbackChat.id && activePlayback === playback && !playback.playbackStopped) {
+              setStatus(`Retrying unusually long speech segment ${index + 1}…`)
+            }
+            segment = await runSynthesisTask(() => synthesizeVoiceSegment(
+              connectionId, guard.retryText, entry.voice, preferences.speed,
+              synthesisController.signal, sharedSynthesisPacer, rateLimitBudget, playbackVoiceGate,
+              (delayMs, cumulativeWaitMs) => {
+                rateLimitedForRemainder = true
+                adaptiveConcurrency = 1
+                shortConcurrencyCooldown = 0
+                longWindowStreak = 0
+                if (adaptiveSynthesisLimits.has(adaptiveLimitToken)) adaptiveSynthesisLimits.set(adaptiveLimitToken, 1)
+                drainSynthesisQueue()
+                if (ctx.getActiveChat().chatId === playbackChat.id && (!activePlayback || activePlayback === playback)) {
+                  setStatus(`Rate limited; resuming in ${Math.max(1, Math.ceil(delayMs / 1_000))}s… (${Math.ceil(cumulativeWaitMs / 1_000)}s of ${preferences.rateLimitWaitSeconds}s wait budget)`)
+                }
+              },
+            ), activePlayback === playback && !playback.playbackStopped)
+            decodedBuffer = await normalizationContext.decodeAudioData(segment.data.slice(0))
+            appendSpeakerDebugLog(`Audio duration guard [${index + 1}]: retry ${decodedBuffer.duration.toFixed(2)}s, threshold ${guard.maxSeconds.toFixed(2)}s.`)
+            if (decodedBuffer.duration > guard.maxSeconds) {
+              throw new Error(`Speech segment ${index + 1} remained unusually long after retry (${decodedBuffer.duration.toFixed(1)}s; limit ${guard.maxSeconds.toFixed(1)}s). Please regenerate the audio.`)
+            }
+          }
+          return { ok: true, segment: { ...segment, decodedBuffer } }
+        } catch (error) {
+          appendSpeakerDebugLog(`Audio validation [${index + 1}] failed: ${error instanceof Error ? error.message : String(error)}`)
+          return { ok: false, error }
+        }
+      })
+      const processed = validated.map((pending, index) => {
         const processing = normalizationChain.then(async (): Promise<PreparedSegment> => {
           const result = await pending
           if (!result.ok) return result
-          const decodedBuffer = await normalizationContext.decodeAudioData(result.segment.data.slice(0))
+          const decodedBuffer = result.segment.decodedBuffer!
           const voiceKey = plan[index].voice.trim().toLowerCase() || '__connection-default__'
           const normalizationGain = normalizedVoiceGain(decodedBuffer, voiceKey, voiceLoudnessProfiles)
           return {

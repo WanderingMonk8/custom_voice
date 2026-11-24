@@ -126,6 +126,7 @@ import {
   filterNarrationSegments,
   markUnresolvedSpeechSegments,
   normalizeSpeechBoundaryDashes,
+  speechDurationGuard,
   normalizeTtsTags,
   normalizeCustomTtsEmotionTag,
   npcSpeakerId,
@@ -1398,11 +1399,12 @@ test('splits oversized paragraph jobs at sentence boundaries', () => {
 
 test('falls back to safe word boundaries for long sentences and preserves plan metadata', () => {
   const text = Array.from({ length: 45 }, (_, index) => `word${index}`).join(' ')
-  const result = splitLargeVoicePlanSegments([{ text, voice: 'ruby', tagId: 'speech-2' }], 100)
+  const result = splitLargeVoicePlanSegments([{ text, voice: 'ruby', tagId: 'speech-2', originalSpeech: text }], 100)
 
   assert.ok(result.length > 1)
   assert.ok(result.every(segment => segment.text.length <= 100))
   assert.ok(result.every(segment => segment.voice === 'ruby' && segment.tagId === 'speech-2'))
+  assert.ok(result.every(segment => segment.originalSpeech === text))
   assert.equal(result.map(segment => segment.text).join(' '), text)
 })
 
@@ -2015,10 +2017,25 @@ test('attaches emotion, sound, and pause text without changing narration', () =>
   assert.equal(tagged.find(segment => segment.text === 'Narration.')?.ttsText, undefined)
 })
 
-test('preserves speech IDs when splitting plans', () => {
+test('uses conservative speech duration limits and preserves authored cues on retry', () => {
+  const guarded = speechDurationGuard('[mortified, throat-tight and cracking] Fuck. [mortified, throat-tight and cracking] Okay. [mortified, throat-tight and cracking] Yeah, that’s—', 'Fuck. Okay. Yeah, that’s—', 1)
+  assert.equal(guarded?.retryText, 'Fuck. Okay. Yeah, that’s—')
+  assert.equal(guarded?.maxSeconds, 20)
+  assert.equal(speechDurationGuard('[calm] Hello. [long pause] [gasp]', 'Hello.', 1)?.maxSeconds, 36)
+  assert.equal(speechDurationGuard('[calm] Hello.', 'Hello.', 0.5)?.maxSeconds, 40)
+  assert.equal(speechDurationGuard('[sad] [mysterious aside] Hello.', '[mysterious aside] Hello.', 1)?.retryText, '[mysterious aside] Hello.')
+  assert.equal(speechDurationGuard('[gasp]', '[gasp]', 1), null)
+  assert.ok((speechDurationGuard('漢'.repeat(120), '漢'.repeat(120), 1)?.maxSeconds ?? 0) >= 40)
+})
+
+test('preserves speech IDs and original speech when splitting plans', () => {
   assert.deepEqual(mergeVoicePlan([{ text: 'One.\n\nTwo.', voice: 'alice', tagId: 's0' }]), [
     { text: 'One.', voice: 'alice', tagId: 's0' },
     { text: 'Two.', voice: 'alice', tagId: 's0' },
+  ])
+  assert.deepEqual(mergeVoicePlan([{ text: 'One.\n\nTwo.', voice: 'alice', originalSpeech: 'One.\n\nTwo.' }]), [
+    { text: 'One.', voice: 'alice', originalSpeech: 'One.\n\nTwo.' },
+    { text: 'Two.', voice: 'alice', originalSpeech: 'One.\n\nTwo.' },
   ])
 })
 
