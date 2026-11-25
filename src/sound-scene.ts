@@ -14,10 +14,49 @@ export interface SoundSceneSegment {
   end: number
 }
 
+/** Align unmodified clip text to its source, tolerating whitespace only.
+ * Duplicate or missing text stays unaligned rather than guessing an occurrence.
+ * Null entries retain clip indexes so later cue boundaries cannot shift.
+ */
+export function alignSoundSourceSegments(message: string, clipTexts: readonly string[]): Array<SoundSceneSegment | null> {
+  const normalize = (input: string): { text: string; offsets: number[] } => {
+    let text = ''
+    const offsets: number[] = []
+    for (let i = 0; i < input.length; i++) {
+      const char = input[i]
+      if (/\s/u.test(char)) {
+        if (!text || text.endsWith(' ')) continue
+        text += ' '; offsets.push(i)
+      } else { text += char; offsets.push(i) }
+    }
+    if (text.endsWith(' ')) { text = text.slice(0, -1); offsets.pop() }
+    return { text, offsets }
+  }
+  const source = normalize(message)
+  const matches = clipTexts.map(clip => {
+    const text = normalize(clip).text
+    if (!text) return null
+    const start = source.text.indexOf(text)
+    if (start < 0 || source.text.lastIndexOf(text) !== start) return null
+    return { start: source.offsets[start], end: source.offsets[start + text.length - 1] + 1 }
+  })
+  // Any overlap or out-of-order pair is ambiguous; discard both, not the clip index.
+  const invalid = new Set<number>()
+  for (let i = 0; i < matches.length; i++) {
+    for (let j = i + 1; j < matches.length; j++) {
+      if (matches[i] && matches[j] && matches[i]!.end > matches[j]!.start) {
+        invalid.add(i); invalid.add(j)
+      }
+    }
+  }
+  return matches.map((match, index) => invalid.has(index) ? null : match)
+}
+
 /** Map validated source anchors to clip boundaries; never split or overlap a voice clip. */
-export function mapSoundCueBoundaries(cues: readonly SoundSceneCue[], segments: readonly SoundSceneSegment[], messageLength: number): Array<{ cue: SoundSceneCue; boundary: number }> {
+export function mapSoundCueBoundaries(cues: readonly SoundSceneCue[], segments: readonly (SoundSceneSegment | null)[], messageLength: number): Array<{ cue: SoundSceneCue; boundary: number }> {
   let lastEnd = 0
   for (const segment of segments) {
+    if (!segment) continue
     if (!Number.isSafeInteger(segment.start) || !Number.isSafeInteger(segment.end)
       || segment.start < lastEnd || segment.end <= segment.start || segment.end > messageLength) throw new Error('Invalid scene segment boundaries.')
     lastEnd = segment.end
@@ -25,7 +64,7 @@ export function mapSoundCueBoundaries(cues: readonly SoundSceneCue[], segments: 
   const mapped: Array<{ cue: SoundSceneCue; boundary: number }> = []
   for (const cue of cues) {
     const end = cue.offset + cue.anchor.length
-    const index = segments.findIndex(segment => cue.offset >= segment.start && end <= segment.end)
+    const index = segments.findIndex(segment => segment !== null && cue.offset >= segment.start && end <= segment.end)
     if (index < 0) continue
     mapped.push({ cue, boundary: cue.position === 'before' ? index : index + 1 })
   }

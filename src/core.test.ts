@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { SoundLibrary, type SoundUserStorage } from './sound-library'
-import { mapSoundCueBoundaries, parseSoundScenePlan } from './sound-scene'
+import { alignSoundSourceSegments, mapSoundCueBoundaries, parseSoundScenePlan } from './sound-scene'
 import { renderSoundMix, soundCategoryGain } from './sound-mix'
 import { buildSoundTimeline } from './sound-timeline'
 import { AutoplayRequestRegistry, PlaybackLongPress, PlaybackStartupGuard, syncAutoplayIndicators, syncPlaybackButtons, waitForAutoplayDeadline, waitForAutoplayWork, type PlaybackButtonState } from './playback-ui'
@@ -119,6 +119,20 @@ test('sound cues map only to whole clip boundaries using original source offsets
   assert.deepEqual(mapSoundCueBoundaries([cue], [{ start: 0, end: 9 }, { start: 10, end: 20 }], 20), [{ cue, boundary: 1 }])
   assert.deepEqual(mapSoundCueBoundaries([{ ...cue, anchor: 'door opens' }], [{ start: 0, end: 9 }, { start: 10, end: 20 }], 20), [])
   assert.throws(() => mapSoundCueBoundaries([cue], [{ start: 0, end: 9 }, { start: 8, end: 20 }], 20), /Invalid scene segment/)
+})
+
+test('sound source alignment handles whitespace without guessing repeated or missing clips', () => {
+  const message = 'First   sentence.\n\nDoor shuts.\nYes. Yes.'
+  const clips = ['First sentence.', 'missing', 'Door shuts.', 'Yes.']
+  const spans = alignSoundSourceSegments(message, clips)
+  assert.equal(message.slice(spans[0]!.start, spans[0]!.end), 'First   sentence.')
+  assert.equal(spans[1], null)
+  assert.equal(message.slice(spans[2]!.start, spans[2]!.end), 'Door shuts.')
+  assert.equal(spans[3], null)
+  const cue = { kind: 'event' as const, action: 'play' as const, anchor: 'Door shuts.', offset: message.indexOf('Door shuts.'), position: 'after' as const }
+  assert.deepEqual(mapSoundCueBoundaries([cue], spans, message.length), [{ cue, boundary: 3 }])
+  assert.deepEqual(alignSoundSourceSegments('Hello there.', ['Hello', 'Hello there.']), [null, null])
+  assert.deepEqual(alignSoundSourceSegments('Alpha. Beta.', ['Beta.', 'Alpha.']), [null, null])
 })
 
 test('local sound mix permits ambience under speech and events but prohibits event/voice overlap', () => {
