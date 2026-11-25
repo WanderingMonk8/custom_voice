@@ -3,7 +3,7 @@ import test from 'node:test'
 import { SoundLibrary, type SoundUserStorage } from './sound-library'
 import { alignSoundSourceSegments, mapSoundCueBoundaries, parseSoundScenePlan } from './sound-scene'
 import { renderSoundMix, soundCategoryGain } from './sound-mix'
-import { buildSoundTimeline } from './sound-timeline'
+import { buildSoundTimeline, encodeSoundTimelineWav, resampleSoundClip } from './sound-timeline'
 import { AutoplayRequestRegistry, PlaybackLongPress, PlaybackStartupGuard, syncAutoplayIndicators, syncPlaybackButtons, waitForAutoplayDeadline, waitForAutoplayWork, type PlaybackButtonState } from './playback-ui'
 import { evaluateSpeakerReviews } from './speaker-review-evaluation'
 
@@ -176,6 +176,21 @@ test('sound timeline injects events, blends ambience and skips unavailable asset
   assert.deepEqual(timeline.tracks.filter(track => track.kind === 'event').map(track => [track.startFrame, track.endFrame]), [[100, 140]])
   assert.deepEqual(timeline.tracks.filter(track => track.kind === 'ambience').map(track => [track.startFrame, track.endFrame]), [[0, 240]])
   assert.equal(renderSoundMix(timeline.tracks, timeline.totalFrames, 1).channels[0].length, 240)
+})
+
+test('sound timeline resamples decoded clips and encodes one mixed WAV', () => {
+  const source = { channels: [new Float32Array([0, 0.5, 1, 0.5])], gain: 1, sampleRate: 8000 }
+  const resampled = resampleSoundClip(source, 16000)
+  assert.equal(resampled.channels[0].length, 8)
+  assert.equal(resampled.channels[0][1], 0.25)
+  const timeline = buildSoundTimeline([resampled], [], new Map(), 16000, { event: 1, ambience: 1 })
+  const result = encodeSoundTimelineWav(timeline, 16000)
+  const view = new DataView(result)
+  assert.equal(view.getUint32(24, true), 16000)
+  assert.equal(view.getUint16(22, true), 2)
+  assert.equal(view.getUint32(40, true), 8 * 2 * 2)
+  assert.equal(view.getInt16(44 + 2 * 2, true), 8191)
+  assert.throws(() => resampleSoundClip({ ...source, sampleRate: 0 }, 16000), /Invalid sampled sound/)
 })
 import {
   adaptiveGenerationConcurrency,

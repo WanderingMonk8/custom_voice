@@ -1,4 +1,5 @@
-import { soundCategoryGain, type SoundMixTrack } from './sound-mix'
+import { renderSoundMix, soundCategoryGain, type SoundMixTrack } from './sound-mix'
+import { encodeConcatenatedWav } from './core'
 
 export interface SoundTimelineClip {
   channels: readonly Float32Array[]
@@ -15,6 +16,39 @@ export interface SoundTimelineCue {
 export interface SoundTimelineAsset {
   kind: 'event' | 'ambience'
   channels: readonly Float32Array[]
+}
+
+export interface SampledSoundClip extends SoundTimelineClip {
+  sampleRate: number
+}
+
+/** Resample bounded decoded PCM into a common rate before timeline assembly. */
+export function resampleSoundClip(clip: SampledSoundClip, sampleRate: number): SoundTimelineClip {
+  if (!Number.isSafeInteger(sampleRate) || sampleRate < 8000 || sampleRate > 192000
+    || !Number.isSafeInteger(clip.sampleRate) || clip.sampleRate < 8000 || clip.sampleRate > 192000
+    || ![1, 2].includes(clip.channels.length) || !clip.channels[0]?.length
+    || clip.channels.some(channel => !(channel instanceof Float32Array) || channel.length !== clip.channels[0].length)) throw new Error('Invalid sampled sound clip.')
+  const frames = Math.max(1, Math.round(clip.channels[0].length * sampleRate / clip.sampleRate))
+  if (!Number.isSafeInteger(frames) || frames * clip.channels.length * 4 > 64 * 1024 * 1024) throw new Error('Resampled sound exceeds supported limits.')
+  if (sampleRate === clip.sampleRate) return { channels: clip.channels, gain: clip.gain }
+  const channels = clip.channels.map(source => {
+    const output = new Float32Array(frames)
+    for (let frame = 0; frame < frames; frame++) {
+      const pos = Math.min(source.length - 1, frame * clip.sampleRate / sampleRate)
+      const index = Math.floor(pos)
+      const fraction = pos - index
+      output[frame] = source[index] + ((source[Math.min(index + 1, source.length - 1)] - source[index]) * fraction)
+    }
+    return output
+  })
+  return { channels, gain: clip.gain }
+}
+
+/** Encode the already-selected timeline as a single WAV attachment. */
+export function encodeSoundTimelineWav(timeline: { tracks: readonly SoundMixTrack[]; totalFrames: number }, sampleRate: number): ArrayBuffer {
+  if (!Number.isSafeInteger(sampleRate) || sampleRate < 8000 || sampleRate > 192000) throw new Error('Invalid sound sample rate.')
+  const mixed = renderSoundMix(timeline.tracks, timeline.totalFrames, 2)
+  return encodeConcatenatedWav([{ sampleRate, channels: mixed.channels }])
 }
 
 /** Construct a deterministic timeline from clips that already share one sample rate.
