@@ -4,6 +4,7 @@ import { SoundLibrary, type SoundUserStorage } from './sound-library'
 import { alignSoundSourceSegments, mapSoundCueBoundaries, parseSoundScenePlan } from './sound-scene'
 import { renderSoundMix, soundCategoryGain } from './sound-mix'
 import { buildSoundTimeline, encodeSoundTimelineWav, resampleSoundClip } from './sound-timeline'
+import { SoundCuePreparation } from './sound-preparation'
 import { AutoplayRequestRegistry, PlaybackLongPress, PlaybackStartupGuard, syncAutoplayIndicators, syncPlaybackButtons, waitForAutoplayDeadline, waitForAutoplayWork, type PlaybackButtonState } from './playback-ui'
 import { evaluateSpeakerReviews } from './speaker-review-evaluation'
 
@@ -191,6 +192,27 @@ test('sound timeline resamples decoded clips and encodes one mixed WAV', () => {
   assert.equal(view.getUint32(40, true), 8 * 2 * 2)
   assert.equal(view.getInt16(44 + 2 * 2, true), 8191)
   assert.throws(() => resampleSoundClip({ ...source, sampleRate: 0 }, 16000), /Invalid sampled sound/)
+})
+
+test('sound preparation never waits for a late asset or replays an elapsed boundary', async () => {
+  let resolve!: (asset: { kind: 'event'; channels: Float32Array[] }) => void
+  let calls = 0
+  const cue = { kind: 'event' as const, action: 'play' as const, assetId: 'door', anchor: 'door', position: 'after' as const, offset: 0 }
+  const preparation = new SoundCuePreparation([{ cue, boundary: 1 }, { cue, boundary: 2 }], () => {
+    calls++
+    return new Promise(done => { resolve = done })
+  })
+  preparation.start(); preparation.start()
+  await Promise.resolve()
+  assert.equal(calls, 1)
+  assert.deepEqual(preparation.take(1), [])
+  resolve({ kind: 'event', channels: [new Float32Array([0.1])] })
+  await new Promise<void>(resolveTurn => setTimeout(resolveTurn, 0))
+  assert.deepEqual(preparation.take(1), [])
+  assert.equal(preparation.take(2).length, 1)
+  assert.deepEqual(preparation.take(2), [])
+  preparation.cancel()
+  assert.deepEqual(preparation.take(3), [])
 })
 import {
   adaptiveGenerationConcurrency,
