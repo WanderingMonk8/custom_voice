@@ -238,6 +238,46 @@ var SoundUploadTransfers = class {
     if (this.uploads.get(id)?.owner === owner) this.uploads.delete(id);
   }
 };
+var SoundDownloadTransfers = class {
+  constructor(id, now = Date.now) {
+    this.id = id;
+    this.now = now;
+  }
+  downloads = /* @__PURE__ */ new Map();
+  expire(id) {
+    const timer = setTimeout(() => {
+      const state = this.downloads.get(id);
+      if (!state) return;
+      if (this.now() - state.touched >= 12e4) this.downloads.delete(id);
+      else this.expire(id);
+    }, 12e4);
+    timer.unref?.();
+  }
+  begin(owner, record, data) {
+    for (const [key, value] of this.downloads) if (this.now() - value.touched >= 12e4) this.downloads.delete(key);
+    if (!owner || !(data instanceof Uint8Array) || !data.length || data.length !== record.bytes || data.length > MAX_FAVORITE_SOUND_BYTES) throw new Error("Invalid sound download.");
+    const used = [...this.downloads.values()].reduce((total, item) => total + item.data.length, 0);
+    if (used + data.length > 64 * 1024 * 1024) throw new Error("Sound download capacity is busy. Try again shortly.");
+    const id = this.id();
+    if (this.downloads.has(id)) throw new Error("Sound download ID already exists.");
+    this.downloads.set(id, { owner, record, data, touched: this.now() });
+    this.expire(id);
+    return id;
+  }
+  chunk(owner, id, offset) {
+    const state = this.downloads.get(id);
+    if (!state || state.owner !== owner || this.now() - state.touched >= 12e4) {
+      if (state?.owner === owner && this.now() - state.touched >= 12e4) this.downloads.delete(id);
+      throw new Error("Sound download not found or expired.");
+    }
+    if (!Number.isSafeInteger(offset) || offset < 0 || offset >= state.data.length) throw new Error("Invalid sound download offset.");
+    state.touched = this.now();
+    return { record: state.record, data: state.data.subarray(offset, offset + SOUND_TRANSFER_CHUNK_BYTES) };
+  }
+  release(owner, id) {
+    if (this.downloads.get(id)?.owner === owner) this.downloads.delete(id);
+  }
+};
 
 // src/sound-scene.ts
 function competingSoundCueIndexes(cues) {
@@ -8347,10 +8387,11 @@ async function fetchCommunityModels(fishApiKey, request) {
   return parsed;
 }
 var soundUploads = new SoundUploadTransfers(generateUuidV7);
+var soundDownloads = new SoundDownloadTransfers(generateUuidV7);
 spindle.onFrontendMessage(async (rawPayload, userId, frontendSessionId) => {
   const payload = rawPayload;
   try {
-    if (payload?.type === "chat_voice_sound_upload_begin" || payload?.type === "chat_voice_sound_upload_chunk" || payload?.type === "chat_voice_sound_upload_finish" || payload?.type === "chat_voice_sound_upload_cancel" || payload?.type === "chat_voice_sound_library_read_chunk") {
+    if (payload?.type === "chat_voice_sound_upload_begin" || payload?.type === "chat_voice_sound_upload_chunk" || payload?.type === "chat_voice_sound_upload_finish" || payload?.type === "chat_voice_sound_upload_cancel" || payload?.type === "chat_voice_sound_library_read_chunk" || payload?.type === "chat_voice_sound_download_release") {
       try {
         if (!userId || !frontendSessionId) throw new Error("An authenticated frontend session is required for large sound files.");
         const owner = JSON.stringify([userId, frontendSessionId]);
@@ -8373,10 +8414,11 @@ spindle.onFrontendMessage(async (rawPayload, userId, frontendSessionId) => {
         } else if (payload.type === "chat_voice_sound_upload_cancel") {
           soundUploads.cancel(owner, payload.uploadId);
           sendFrontend({ type: "chat_voice_sound_library", requestId: payload.requestId }, userId, frontendSessionId);
+        } else if (payload.type === "chat_voice_sound_download_release") {
+          soundDownloads.release(owner, payload.downloadId);
+          sendFrontend({ type: "chat_voice_sound_library", requestId: payload.requestId }, userId, frontendSessionId);
         } else {
-          const { record, data } = await new SoundLibrary(spindle.userStorage).read(payload.id, userId);
-          if (!Number.isSafeInteger(payload.offset) || payload.offset < 0 || payload.offset >= data.length) throw new Error("Invalid sound download offset.");
-          const part = data.subarray(payload.offset, payload.offset + SOUND_TRANSFER_CHUNK_BYTES);
+          const { record, data: part } = soundDownloads.chunk(owner, payload.downloadId, payload.offset);
           let binary = "";
           for (let offset = 0; offset < part.length; offset += 8192) binary += String.fromCharCode(...part.subarray(offset, offset + 8192));
           sendFrontend({ type: "chat_voice_sound_library", requestId: payload.requestId, audio: btoa(binary), favorite: record, offset: payload.offset }, userId, frontendSessionId);
@@ -8461,7 +8503,9 @@ spindle.onFrontendMessage(async (rawPayload, userId, frontendSessionId) => {
         } else if (payload.type === "chat_voice_sound_library_read") {
           const { record, data } = await library.read(payload.id, userId);
           if (data.length > 2 * 1024 * 1024) {
-            sendFrontend({ type: "chat_voice_sound_library", requestId: payload.requestId, favorite: record, chunked: true }, userId, frontendSessionId);
+            if (!userId || !frontendSessionId) throw new Error("An authenticated frontend session is required for large sound files.");
+            const downloadId = soundDownloads.begin(JSON.stringify([userId, frontendSessionId]), record, data);
+            sendFrontend({ type: "chat_voice_sound_library", requestId: payload.requestId, favorite: record, chunked: true, downloadId }, userId, frontendSessionId);
           } else {
             let binary = "";
             for (let offset = 0; offset < data.length; offset += 8192) binary += String.fromCharCode(...data.subarray(offset, offset + 8192));

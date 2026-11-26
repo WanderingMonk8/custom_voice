@@ -348,6 +348,7 @@ interface SoundLibraryPayload {
   cues?: SoundSceneCue[]
   chunked?: boolean
   uploadId?: string
+  downloadId?: string
   offset?: number
   error?: string
 }
@@ -2260,6 +2261,9 @@ export function setup(ctx: SpindleFrontendContext) {
   let soundLibrarySequence = 0
   let soundPreviewContext: AudioContext | null = null
   let soundPreviewSource: AudioBufferSourceNode | null = null
+  let soundPreviewId: string | null = null
+  let soundPreviewProgress = ''
+  const soundPreviewButtons = new Map<string, HTMLButtonElement>()
   let soundPreviewGeneration = 0
   let soundLibraryDisposed = false
   const pendingStateRequests = new Map<string, {
@@ -2341,6 +2345,7 @@ export function setup(ctx: SpindleFrontendContext) {
 
   async function readSoundAudio(id: string, isCancelled: () => boolean = () => false, onProgress: (received: number, total: number) => void = () => undefined): Promise<{ favorite: FavoriteSound; bytes: Uint8Array<ArrayBuffer> }> {
     const result = await soundLibraryRequest('chat_voice_sound_library_read', { id })
+    try {
     if (isCancelled()) throw new DOMException('Sound download stopped.', 'AbortError')
     if (!result.favorite || result.favorite.id !== id || !Number.isSafeInteger(result.favorite.bytes) || result.favorite.bytes < 1 || result.favorite.bytes > MAX_FAVORITE_SOUND_BYTES) throw new Error('Invalid sound record.')
     const bytes = new Uint8Array(result.favorite.bytes)
@@ -2355,9 +2360,10 @@ export function setup(ctx: SpindleFrontendContext) {
       if (!result.audio || decode(result.audio, 0) !== bytes.length) throw new Error('Incomplete sound download.')
       onProgress(bytes.length, bytes.length)
     } else {
+      if (!result.downloadId) throw new Error('Sound download could not be started.')
       for (let offset = 0; offset < bytes.length;) {
         if (isCancelled()) throw new DOMException('Sound download stopped.', 'AbortError')
-        const chunk = await soundLibraryRequest('chat_voice_sound_library_read_chunk', { id, offset })
+        const chunk = await soundLibraryRequest('chat_voice_sound_library_read_chunk', { downloadId: result.downloadId, offset })
         if (!chunk.audio || chunk.offset !== offset || chunk.favorite?.id !== id || chunk.favorite.bytes !== bytes.length) throw new Error('Invalid sound download response.')
         const length = decode(chunk.audio, offset)
         if (length !== Math.min(SOUND_TRANSFER_CHUNK_BYTES, bytes.length - offset)) throw new Error('Incomplete sound download chunk.')
@@ -2366,6 +2372,9 @@ export function setup(ctx: SpindleFrontendContext) {
       }
     }
     return { favorite: result.favorite, bytes }
+    } finally {
+      if (result.downloadId) void soundLibraryRequest('chat_voice_sound_download_release', { downloadId: result.downloadId }).catch(() => undefined)
+    }
   }
 
   async function updateFreesoundKey(action: 'status' | 'save' | 'remove'): Promise<void> {
@@ -2382,12 +2391,28 @@ export function setup(ctx: SpindleFrontendContext) {
   freesoundSave.addEventListener('click', () => { void updateFreesoundKey('save') })
   freesoundRemove.addEventListener('click', () => { void updateFreesoundKey('remove') })
 
+  function updateSoundPreviewButton(id: string): void {
+    const button = soundPreviewButtons.get(id)
+    if (!button) return
+    const active = id === soundPreviewId
+    button.innerHTML = active ? STOP_ACTION_ICON : PLAY_TTS_ACTION_ICON
+    const label = active ? (soundPreviewProgress ? `Stop preview (${soundPreviewProgress})` : 'Stop preview') : 'Preview sound'
+    button.setAttribute('aria-label', label)
+    button.title = label
+    button.setAttribute('aria-pressed', String(active))
+    if (active && soundPreviewProgress) button.append(document.createTextNode(` ${soundPreviewProgress}`))
+  }
+
   function stopSoundPreview(): void {
+    const previous = soundPreviewId
+    soundPreviewId = null
+    soundPreviewProgress = ''
     soundPreviewGeneration += 1
     try { soundPreviewSource?.stop() } catch { /* already stopped */ }
     soundPreviewSource = null
     if (soundPreviewContext) void soundPreviewContext.close().catch(() => undefined)
     soundPreviewContext = null
+    if (previous) updateSoundPreviewButton(previous)
   }
 
   let favoriteSounds: FavoriteSound[] = []
@@ -2400,6 +2425,7 @@ export function setup(ctx: SpindleFrontendContext) {
 
   function renderSoundLibrary(): void {
     soundList.replaceChildren()
+    soundPreviewButtons.clear()
     const query = soundSearch.value.trim().toLocaleLowerCase()
     const visible = favoriteSounds.filter(favorite => (soundFilter.value === 'all' || soundFilter.value === favorite.kind)
       && (!query || [favorite.name, favorite.description, ...favorite.tags].some(text => text.toLocaleLowerCase().includes(query))))
@@ -2416,18 +2442,28 @@ export function setup(ctx: SpindleFrontendContext) {
         const option = document.createElement('option'); option.value = value; option.textContent = label; kind.appendChild(option)
       }
       kind.value = favorite.kind
-      const preview = document.createElement('button'); preview.type = 'button'; preview.className = 'chat-voice-preview-button'; preview.textContent = 'Preview'
+      const preview = document.createElement('button'); preview.type = 'button'; preview.className = 'chat-voice-preview-button'
+      soundPreviewButtons.set(favorite.id, preview); updateSoundPreviewButton(favorite.id)
       preview.addEventListener('click', () => { void (async () => {
+        if (soundPreviewId === favorite.id) { stopSoundPreview(); setStatus('Sound preview stopped.'); return }
         stopSoundPreview(); stopVoicePreview()
         const generation = soundPreviewGeneration
+        soundPreviewId = favorite.id
+        soundPreviewProgress = 'Loading'
+        updateSoundPreviewButton(favorite.id)
         try {
           const Context = window.AudioContext ?? (window as typeof window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext
           if (!Context) throw new Error('Audio preview is unavailable in this browser.')
           const context = new Context()
           soundPreviewContext = context
           await context.resume()
-          const result = await readSoundAudio(favorite.id, () => soundLibraryDisposed || generation !== soundPreviewGeneration)
+          const result = await readSoundAudio(favorite.id, () => soundLibraryDisposed || generation !== soundPreviewGeneration, (received, total) => {
+            if (generation !== soundPreviewGeneration) return
+            soundPreviewProgress = `${Math.floor(received * 100 / total)}%`
+            updateSoundPreviewButton(favorite.id)
+          })
           if (soundLibraryDisposed || generation !== soundPreviewGeneration) return
+          soundPreviewProgress = 'Decoding'; updateSoundPreviewButton(favorite.id)
           const decoded = await context.decodeAudioData(result.bytes.buffer)
           if (soundLibraryDisposed || generation !== soundPreviewGeneration) return
           if (decoded.duration > 120 || decoded.numberOfChannels > 2) throw new Error('Sound preview requires mono or stereo audio of at most 120 seconds.')
@@ -2438,6 +2474,7 @@ export function setup(ctx: SpindleFrontendContext) {
           source.buffer = decoded; source.connect(gain); gain.connect(context.destination)
           soundPreviewSource = source
           source.onended = () => { if (generation === soundPreviewGeneration) stopSoundPreview() }
+          soundPreviewProgress = ''; updateSoundPreviewButton(favorite.id)
           source.start()
         } catch (error) { if (generation === soundPreviewGeneration) { stopSoundPreview(); setStatus(error instanceof Error ? error.message : 'Could not preview sound.', 'error') } }
       })() })

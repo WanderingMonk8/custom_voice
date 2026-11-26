@@ -1,4 +1,4 @@
-import { MAX_FAVORITE_SOUND_BYTES, SOUND_TRANSFER_CHUNK_BYTES } from './sound-library'
+import { MAX_FAVORITE_SOUND_BYTES, SOUND_TRANSFER_CHUNK_BYTES, type FavoriteSound } from './sound-library'
 
 interface UploadState {
   owner: string
@@ -68,5 +68,55 @@ export class SoundUploadTransfers {
 
   release(owner: string, id: string): void {
     if (this.uploads.get(id)?.owner === owner) this.uploads.delete(id)
+  }
+}
+
+interface DownloadState {
+  owner: string
+  record: FavoriteSound
+  data: Uint8Array
+  touched: number
+}
+
+/** One bounded, per-session snapshot avoids rereading a large file for every chunk. */
+export class SoundDownloadTransfers {
+  private readonly downloads = new Map<string, DownloadState>()
+  constructor(private readonly id: () => string, private readonly now: () => number = Date.now) {}
+
+  private expire(id: string): void {
+    const timer = setTimeout(() => {
+      const state = this.downloads.get(id)
+      if (!state) return
+      if (this.now() - state.touched >= 120_000) this.downloads.delete(id)
+      else this.expire(id)
+    }, 120_000)
+    ;(timer as unknown as { unref?: () => void }).unref?.()
+  }
+
+  begin(owner: string, record: FavoriteSound, data: Uint8Array): string {
+    for (const [key, value] of this.downloads) if (this.now() - value.touched >= 120_000) this.downloads.delete(key)
+    if (!owner || !(data instanceof Uint8Array) || !data.length || data.length !== record.bytes || data.length > MAX_FAVORITE_SOUND_BYTES) throw new Error('Invalid sound download.')
+    const used = [...this.downloads.values()].reduce((total, item) => total + item.data.length, 0)
+    if (used + data.length > 64 * 1024 * 1024) throw new Error('Sound download capacity is busy. Try again shortly.')
+    const id = this.id()
+    if (this.downloads.has(id)) throw new Error('Sound download ID already exists.')
+    this.downloads.set(id, { owner, record, data, touched: this.now() })
+    this.expire(id)
+    return id
+  }
+
+  chunk(owner: string, id: string, offset: number): { record: FavoriteSound; data: Uint8Array } {
+    const state = this.downloads.get(id)
+    if (!state || state.owner !== owner || this.now() - state.touched >= 120_000) {
+      if (state?.owner === owner && this.now() - state.touched >= 120_000) this.downloads.delete(id)
+      throw new Error('Sound download not found or expired.')
+    }
+    if (!Number.isSafeInteger(offset) || offset < 0 || offset >= state.data.length) throw new Error('Invalid sound download offset.')
+    state.touched = this.now()
+    return { record: state.record, data: state.data.subarray(offset, offset + SOUND_TRANSFER_CHUNK_BYTES) }
+  }
+
+  release(owner: string, id: string): void {
+    if (this.downloads.get(id)?.owner === owner) this.downloads.delete(id)
   }
 }

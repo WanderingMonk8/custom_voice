@@ -4575,6 +4575,9 @@ function setup(ctx) {
   let soundLibrarySequence = 0;
   let soundPreviewContext = null;
   let soundPreviewSource = null;
+  let soundPreviewId = null;
+  let soundPreviewProgress = "";
+  const soundPreviewButtons = /* @__PURE__ */ new Map();
   let soundPreviewGeneration = 0;
   let soundLibraryDisposed = false;
   const pendingStateRequests = /* @__PURE__ */ new Map();
@@ -4633,31 +4636,36 @@ function setup(ctx) {
   }
   async function readSoundAudio(id, isCancelled = () => false, onProgress = () => void 0) {
     const result = await soundLibraryRequest("chat_voice_sound_library_read", { id });
-    if (isCancelled()) throw new DOMException("Sound download stopped.", "AbortError");
-    if (!result.favorite || result.favorite.id !== id || !Number.isSafeInteger(result.favorite.bytes) || result.favorite.bytes < 1 || result.favorite.bytes > MAX_FAVORITE_SOUND_BYTES) throw new Error("Invalid sound record.");
-    const bytes = new Uint8Array(result.favorite.bytes);
-    onProgress(0, bytes.length);
-    const decode = (audio, offset) => {
-      const binary = atob(audio);
-      if (!binary.length || offset + binary.length > bytes.length) throw new Error("Invalid sound download chunk.");
-      for (let i = 0; i < binary.length; i++) bytes[offset + i] = binary.charCodeAt(i);
-      return binary.length;
-    };
-    if (!result.chunked) {
-      if (!result.audio || decode(result.audio, 0) !== bytes.length) throw new Error("Incomplete sound download.");
-      onProgress(bytes.length, bytes.length);
-    } else {
-      for (let offset = 0; offset < bytes.length; ) {
-        if (isCancelled()) throw new DOMException("Sound download stopped.", "AbortError");
-        const chunk = await soundLibraryRequest("chat_voice_sound_library_read_chunk", { id, offset });
-        if (!chunk.audio || chunk.offset !== offset || chunk.favorite?.id !== id || chunk.favorite.bytes !== bytes.length) throw new Error("Invalid sound download response.");
-        const length = decode(chunk.audio, offset);
-        if (length !== Math.min(SOUND_TRANSFER_CHUNK_BYTES, bytes.length - offset)) throw new Error("Incomplete sound download chunk.");
-        offset += length;
-        onProgress(offset, bytes.length);
+    try {
+      if (isCancelled()) throw new DOMException("Sound download stopped.", "AbortError");
+      if (!result.favorite || result.favorite.id !== id || !Number.isSafeInteger(result.favorite.bytes) || result.favorite.bytes < 1 || result.favorite.bytes > MAX_FAVORITE_SOUND_BYTES) throw new Error("Invalid sound record.");
+      const bytes = new Uint8Array(result.favorite.bytes);
+      onProgress(0, bytes.length);
+      const decode = (audio, offset) => {
+        const binary = atob(audio);
+        if (!binary.length || offset + binary.length > bytes.length) throw new Error("Invalid sound download chunk.");
+        for (let i = 0; i < binary.length; i++) bytes[offset + i] = binary.charCodeAt(i);
+        return binary.length;
+      };
+      if (!result.chunked) {
+        if (!result.audio || decode(result.audio, 0) !== bytes.length) throw new Error("Incomplete sound download.");
+        onProgress(bytes.length, bytes.length);
+      } else {
+        if (!result.downloadId) throw new Error("Sound download could not be started.");
+        for (let offset = 0; offset < bytes.length; ) {
+          if (isCancelled()) throw new DOMException("Sound download stopped.", "AbortError");
+          const chunk = await soundLibraryRequest("chat_voice_sound_library_read_chunk", { downloadId: result.downloadId, offset });
+          if (!chunk.audio || chunk.offset !== offset || chunk.favorite?.id !== id || chunk.favorite.bytes !== bytes.length) throw new Error("Invalid sound download response.");
+          const length = decode(chunk.audio, offset);
+          if (length !== Math.min(SOUND_TRANSFER_CHUNK_BYTES, bytes.length - offset)) throw new Error("Incomplete sound download chunk.");
+          offset += length;
+          onProgress(offset, bytes.length);
+        }
       }
+      return { favorite: result.favorite, bytes };
+    } finally {
+      if (result.downloadId) void soundLibraryRequest("chat_voice_sound_download_release", { downloadId: result.downloadId }).catch(() => void 0);
     }
-    return { favorite: result.favorite, bytes };
   }
   async function updateFreesoundKey(action) {
     freesoundSave.disabled = true;
@@ -4680,7 +4688,21 @@ function setup(ctx) {
   freesoundRemove.addEventListener("click", () => {
     void updateFreesoundKey("remove");
   });
+  function updateSoundPreviewButton(id) {
+    const button = soundPreviewButtons.get(id);
+    if (!button) return;
+    const active = id === soundPreviewId;
+    button.innerHTML = active ? STOP_ACTION_ICON : PLAY_TTS_ACTION_ICON;
+    const label = active ? soundPreviewProgress ? `Stop preview (${soundPreviewProgress})` : "Stop preview" : "Preview sound";
+    button.setAttribute("aria-label", label);
+    button.title = label;
+    button.setAttribute("aria-pressed", String(active));
+    if (active && soundPreviewProgress) button.append(document.createTextNode(` ${soundPreviewProgress}`));
+  }
   function stopSoundPreview() {
+    const previous = soundPreviewId;
+    soundPreviewId = null;
+    soundPreviewProgress = "";
     soundPreviewGeneration += 1;
     try {
       soundPreviewSource?.stop();
@@ -4689,6 +4711,7 @@ function setup(ctx) {
     soundPreviewSource = null;
     if (soundPreviewContext) void soundPreviewContext.close().catch(() => void 0);
     soundPreviewContext = null;
+    if (previous) updateSoundPreviewButton(previous);
   }
   let favoriteSounds = [];
   async function refreshSoundLibrary() {
@@ -4699,6 +4722,7 @@ function setup(ctx) {
   }
   function renderSoundLibrary() {
     soundList.replaceChildren();
+    soundPreviewButtons.clear();
     const query = soundSearch.value.trim().toLocaleLowerCase();
     const visible = favoriteSounds.filter((favorite) => (soundFilter.value === "all" || soundFilter.value === favorite.kind) && (!query || [favorite.name, favorite.description, ...favorite.tags].some((text) => text.toLocaleLowerCase().includes(query))));
     if (!visible.length) {
@@ -4730,20 +4754,35 @@ function setup(ctx) {
       const preview = document.createElement("button");
       preview.type = "button";
       preview.className = "chat-voice-preview-button";
-      preview.textContent = "Preview";
+      soundPreviewButtons.set(favorite.id, preview);
+      updateSoundPreviewButton(favorite.id);
       preview.addEventListener("click", () => {
         void (async () => {
+          if (soundPreviewId === favorite.id) {
+            stopSoundPreview();
+            setStatus("Sound preview stopped.");
+            return;
+          }
           stopSoundPreview();
           stopVoicePreview();
           const generation = soundPreviewGeneration;
+          soundPreviewId = favorite.id;
+          soundPreviewProgress = "Loading";
+          updateSoundPreviewButton(favorite.id);
           try {
             const Context = window.AudioContext ?? window.webkitAudioContext;
             if (!Context) throw new Error("Audio preview is unavailable in this browser.");
             const context2 = new Context();
             soundPreviewContext = context2;
             await context2.resume();
-            const result = await readSoundAudio(favorite.id, () => soundLibraryDisposed || generation !== soundPreviewGeneration);
+            const result = await readSoundAudio(favorite.id, () => soundLibraryDisposed || generation !== soundPreviewGeneration, (received, total) => {
+              if (generation !== soundPreviewGeneration) return;
+              soundPreviewProgress = `${Math.floor(received * 100 / total)}%`;
+              updateSoundPreviewButton(favorite.id);
+            });
             if (soundLibraryDisposed || generation !== soundPreviewGeneration) return;
+            soundPreviewProgress = "Decoding";
+            updateSoundPreviewButton(favorite.id);
             const decoded = await context2.decodeAudioData(result.bytes.buffer);
             if (soundLibraryDisposed || generation !== soundPreviewGeneration) return;
             if (decoded.duration > 120 || decoded.numberOfChannels > 2) throw new Error("Sound preview requires mono or stereo audio of at most 120 seconds.");
@@ -4758,6 +4797,8 @@ function setup(ctx) {
             source.onended = () => {
               if (generation === soundPreviewGeneration) stopSoundPreview();
             };
+            soundPreviewProgress = "";
+            updateSoundPreviewButton(favorite.id);
             source.start();
           } catch (error) {
             if (generation === soundPreviewGeneration) {

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { SoundLibrary, type SoundUserStorage } from './sound-library'
-import { SoundUploadTransfers } from './sound-transfer'
+import { SoundDownloadTransfers, SoundUploadTransfers } from './sound-transfer'
 import { alignSoundSourceSegments, ambienceInstructionAtBoundary, competingSoundCueIndexes, interleaveSoundEvents, mapSoundCueBoundaries, parseSoundScenePlan, shortlistSoundAssets, splitNarrationForSoundEvents } from './sound-scene'
 import { mixAmbienceClip, renderSoundMix, soundCategoryGain } from './sound-mix'
 import { buildSoundTimeline, encodeSoundTimelineWav, resampleSoundClip } from './sound-timeline'
@@ -103,6 +103,22 @@ test('sound transfer reassembles a file spanning multiple 1 MiB chunks', () => {
   for (let offset = 0; offset < input.length; offset += 1024 * 1024) uploads.append('alice/session-a', id, offset, input.subarray(offset, offset + 1024 * 1024))
   assert.deepEqual(uploads.take('alice/session-a', id), input)
   uploads.release('alice/session-a', id)
+})
+
+test('large sound download snapshots are session-scoped, bounded and releasable', () => {
+  let now = 0
+  const transfers = new SoundDownloadTransfers(() => 'download-1', () => now)
+  const bytes = new Uint8Array(1024 * 1024 + 3)
+  bytes[0] = 7; bytes[bytes.length - 1] = 9
+  const record = { version: 1 as const, id: 'sound', name: 'Creek', description: '', tags: [], kind: 'ambience' as const, mime: 'audio/wav', bytes: bytes.length, createdAt: new Date().toISOString() }
+  const id = transfers.begin('alice/session-a', record, bytes)
+  assert.throws(() => transfers.chunk('alice/session-b', id, 0), /not found/)
+  assert.equal(transfers.chunk('alice/session-a', id, 0).data.length, 1024 * 1024)
+  assert.deepEqual([...transfers.chunk('alice/session-a', id, 1024 * 1024).data], [0, 0, 9])
+  transfers.release('alice/session-b', id)
+  assert.equal(transfers.chunk('alice/session-a', id, 0).data[0], 7)
+  now = 120_001
+  assert.throws(() => transfers.chunk('alice/session-a', id, 0), /expired/)
 })
 
 test('sound favorites validate inputs and clean up a failed record write', async () => {
