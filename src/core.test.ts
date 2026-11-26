@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { SoundLibrary, type SoundUserStorage } from './sound-library'
 import { alignSoundSourceSegments, competingSoundCueIndexes, interleaveSoundEvents, mapSoundCueBoundaries, parseSoundScenePlan, shortlistSoundAssets, splitNarrationForSoundEvents } from './sound-scene'
-import { renderSoundMix, soundCategoryGain } from './sound-mix'
+import { mixAmbienceClip, renderSoundMix, soundCategoryGain } from './sound-mix'
 import { buildSoundTimeline, encodeSoundTimelineWav, resampleSoundClip } from './sound-timeline'
 import { SoundCuePreparation } from './sound-preparation'
 import { AutoplayRequestRegistry, PlaybackLongPress, PlaybackStartupGuard, syncAutoplayIndicators, syncPlaybackButtons, waitForAutoplayDeadline, waitForAutoplayWork, type PlaybackButtonState } from './playback-ui'
@@ -188,6 +188,18 @@ test('sound normalization uses category targets and limits boost and peaks', () 
   assert.equal(soundCategoryGain([new Float32Array([0.001, -0.001])], 'event'), 4)
   assert.ok(soundCategoryGain([new Float32Array([1, 0, 0, 0])], 'event') <= 0.98)
   assert.throws(() => soundCategoryGain([new Float32Array([NaN])], 'event'), /Invalid audio sample/)
+})
+
+test('ambience mixes under consecutive clips with a continuous loop and fade', () => {
+  const ambience = { channels: [new Float32Array([0.1, 0.2, 0.3, 0.4])], sampleRate: 8000, gain: 1 }
+  const foreground = { channels: [new Float32Array([0.1, 0.1])], sampleRate: 8000, gain: 1 }
+  const first = mixAmbienceClip(foreground, ambience, 0, 0)
+  const second = mixAmbienceClip(foreground, ambience, first.elapsedSeconds, 0)
+  const combined = mixAmbienceClip({ ...foreground, channels: [new Float32Array([0.1, 0.1, 0.1, 0.1])] }, ambience, 0, 0)
+  assert.deepEqual([...first.channels[0], ...second.channels[0]], [...combined.channels[0]])
+  const faded = mixAmbienceClip(foreground, ambience, 0, 1)
+  assert.ok(Math.abs(faded.channels[0][0] - 0.1) < 0.00001)
+  assert.throws(() => mixAmbienceClip(foreground, { ...ambience, channels: [new Float32Array([NaN])] }, 0), /Invalid audio sample/)
 })
 
 test('sound timeline injects events, blends ambience and skips unavailable assets', () => {
