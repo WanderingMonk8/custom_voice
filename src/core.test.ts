@@ -7,7 +7,7 @@ import { SoundLoadQueue } from './sound-load-queue'
 import { AutomaticSoundCache } from './sound-auto-cache'
 import { selectSoundLibraryTab } from './sound-library-tabs'
 import { soundPlanErrorCategory, soundRequestTimeoutMs } from './sound-plan-diagnostics'
-import { isFreesoundCc0, parseFreesoundSearch, safeFreesoundPreviewUrl } from './freesound'
+import { isFreesoundCc0, parseFreesoundSearch, rankAutomaticFreesoundResults, safeFreesoundPreviewUrl } from './freesound'
 import { alignSoundSourceSegments, ambienceInstructionAtBoundary, competingSoundCueIndexes, interleaveSoundEvents, mapSoundCueBoundaries, mergeOpeningSoundCues, parseMissingSoundSuggestions, parseSoundScenePlan, playBoundaryThenWaitForVoice, shortlistSoundAssets, shortlistSoundPlannerAssets, soundAlignmentText, soundOpeningExcerpt, splitNarrationForSoundEvents } from './sound-scene'
 import { DEFAULT_AMBIENCE_VOLUME, DEFAULT_EVENT_VOLUME, mixAmbienceClip, readSoundVolume, renderSoundMix, soundCategoryGain } from './sound-mix'
 import { buildSoundTimeline, encodeSoundTimelineWav, resampleSoundClip } from './sound-timeline'
@@ -196,6 +196,13 @@ test('sound favorites persist across library instances and stay isolated by user
   await reinstalled.remove(favorite.id, 'alice')
   assert.deepEqual(await reinstalled.list('alice'), [])
   assert.equal(storage.files.size, 0)
+})
+
+test('automatic Freesound results require relevant terms, allowed license, duration and safe preview', () => {
+  const result = { id: 42, name: 'wooden door opening', username: 'artist', license: 'https://creativecommons.org/publicdomain/zero/1.0/', duration: 3, url: 'https://freesound.org/s/42/', previewUrl: 'https://cdn.freesound.org/previews/0/42_123-hq.mp3', tags: ['door', 'open'] }
+  assert.deepEqual(rankAutomaticFreesoundResults('wooden door open', 'event', [result]), [result])
+  assert.deepEqual(rankAutomaticFreesoundResults('wooden door close', 'event', [result]), [])
+  assert.deepEqual(rankAutomaticFreesoundResults('wooden door open', 'event', [{ ...result, license: 'unsupported' }, { ...result, previewUrl: 'https://example.com/audio' }, { ...result, duration: 40 }]), [])
 })
 
 test('automatic cache persists independently of favorites and deduplicates by sound and category', async () => {

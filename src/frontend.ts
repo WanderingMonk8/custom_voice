@@ -7,7 +7,7 @@ import { SoundPreviewCache } from './sound-preview-cache'
 import { SoundLoadQueue } from './sound-load-queue'
 import { selectSoundLibraryTab } from './sound-library-tabs'
 import { soundRequestTimeoutMs } from './sound-plan-diagnostics'
-import { isFreesoundCc0, isFreesoundImportLicense, safeFreesoundPreviewUrl, type FreesoundSearchResult } from './freesound'
+import { isFreesoundCc0, isFreesoundImportLicense, rankAutomaticFreesoundResults, safeFreesoundPreviewUrl, type FreesoundSearchResult } from './freesound'
 import { alignSoundSourceSegments, ambienceInstructionAtBoundary, interleaveSoundEvents, mapSoundCueBoundaries, mergeOpeningSoundCues, playBoundaryThenWaitForVoice, shortlistSoundAssets, soundAlignmentText, splitNarrationForSoundEvents, type MissingSoundSuggestion, type SoundSceneCue } from './sound-scene'
 import { DEFAULT_AMBIENCE_VOLUME, DEFAULT_EVENT_VOLUME, mixAmbienceClip, readSoundVolume, soundCategoryGain } from './sound-mix'
 import { AutoplayRequestRegistry, PlaybackLongPress, PlaybackStartupGuard, syncAutoplayIndicators, syncPlaybackButtons, waitForAutoplayDeadline, waitForAutoplayWork, type PlaybackButtonState } from './playback-ui'
@@ -425,6 +425,7 @@ interface PlaybackPreferences {
   eventSounds: boolean
   ambienceSounds: boolean
   suggestMissingSounds: boolean
+  autoSoundLookup: boolean
   soundStartupWaitSeconds: number
   eventSoundVolume: number
   ambienceSoundVolume: number
@@ -512,6 +513,7 @@ async function loadPlaybackPreferences(): Promise<PlaybackPreferences> {
     eventSounds: false,
     ambienceSounds: false,
     suggestMissingSounds: false,
+    autoSoundLookup: false,
     soundStartupWaitSeconds: 0,
     eventSoundVolume: DEFAULT_EVENT_VOLUME,
     ambienceSoundVolume: DEFAULT_AMBIENCE_VOLUME,
@@ -561,6 +563,7 @@ async function loadPlaybackPreferences(): Promise<PlaybackPreferences> {
     eventSounds: row.value?.chatVoiceEventSounds === true,
     ambienceSounds: row.value?.chatVoiceAmbienceSounds === true,
     suggestMissingSounds: row.value?.chatVoiceSuggestMissingSounds === true,
+    autoSoundLookup: row.value?.chatVoiceAutoSoundLookup === true,
     soundStartupWaitSeconds: Math.min(10, Math.max(0, Number.isFinite(Number(row.value?.chatVoiceSoundStartupWaitSeconds)) ? Number(row.value?.chatVoiceSoundStartupWaitSeconds) : 0)),
     eventSoundVolume: readSoundVolume(row.value?.chatVoiceEventSoundVolume, DEFAULT_EVENT_VOLUME),
     ambienceSoundVolume: readSoundVolume(row.value?.chatVoiceAmbienceSoundVolume, DEFAULT_AMBIENCE_VOLUME),
@@ -1856,6 +1859,12 @@ export function setup(ctx: SpindleFrontendContext) {
   const missingSoundsToggle = document.createElement('input'); missingSoundsToggle.type = 'checkbox'
   const missingSoundsText = document.createElement('span'); missingSoundsText.textContent = 'Suggest missing sounds'
   missingSoundsLabel.append(missingSoundsToggle, missingSoundsText)
+  const autoSoundLookupLabel = document.createElement('label'); autoSoundLookupLabel.className = 'chat-voice-toggle'
+  const autoSoundLookupToggle = document.createElement('input'); autoSoundLookupToggle.type = 'checkbox'
+  const autoSoundLookupText = document.createElement('span'); autoSoundLookupText.textContent = 'Automatically find missing sounds on Freesound'
+  autoSoundLookupLabel.append(autoSoundLookupToggle, autoSoundLookupText)
+  const autoSoundLookupHint = document.createElement('div'); autoSoundLookupHint.className = 'chat-voice-hint'
+  autoSoundLookupHint.textContent = 'Sends short sound search terms to Freesound and downloads matching previews. Sounds are cached separately from favorites. Requires a Freesound API key.'
   const missingSoundsHint = document.createElement('div'); missingSoundsHint.className = 'chat-voice-hint'
   missingSoundsHint.textContent = 'When sound effects are enabled, the scene planner may suggest search terms for sounds missing from favorites. Suggestions appear in Library → Freesound; Freesound is contacted only when you search.'
   function makeSoundVolume(label: string, initial: number): { container: HTMLElement; input: HTMLInputElement; value: HTMLElement } {
@@ -1874,7 +1883,7 @@ export function setup(ctx: SpindleFrontendContext) {
   const volumeHint = document.createElement('div')
   volumeHint.className = 'chat-voice-hint'
   volumeHint.textContent = 'Volume applies to previews and newly generated audio. Saved recordings are unchanged until regenerated.'
-  soundEffectsPanel.append(eventSoundsLabel, eventSoundVolumeControl.container, ambienceSoundsLabel, ambienceSoundVolumeControl.container, soundStartupWaitLabel, missingSoundsLabel, missingSoundsHint, volumeHint, effectsNote)
+  soundEffectsPanel.append(eventSoundsLabel, eventSoundVolumeControl.container, ambienceSoundsLabel, ambienceSoundVolumeControl.container, soundStartupWaitLabel, missingSoundsLabel, missingSoundsHint, autoSoundLookupLabel, autoSoundLookupHint, volumeHint, effectsNote)
   const soundTabButtons: HTMLButtonElement[] = []
   const soundPanels = [soundEffectsPanel, soundLibraryPanel, soundAdvancedPanel]
   for (const [index, label] of ['Effects', 'Library', 'Advanced'].entries()) {
@@ -1963,6 +1972,9 @@ export function setup(ctx: SpindleFrontendContext) {
   libraryTabs.className = 'chat-voice-voices-tabs'; libraryTabs.setAttribute('role', 'tablist'); libraryTabs.setAttribute('aria-label', 'Sound library sources')
   const ownSoundsPanel = document.createElement('div')
   const freesoundPanel = document.createElement('div')
+  const automaticCacheHeading = document.createElement('div'); automaticCacheHeading.className = 'chat-voice-hint'; automaticCacheHeading.textContent = 'Automatically cached sounds'
+  const automaticCacheRefresh = document.createElement('button'); automaticCacheRefresh.type = 'button'; automaticCacheRefresh.className = 'chat-voice-add-button'; automaticCacheRefresh.textContent = 'Show cached sounds'
+  const automaticCacheList = document.createElement('div'); automaticCacheList.className = 'chat-voice-favorite-list'
   const libraryPanels = [ownSoundsPanel, freesoundPanel]
   const libraryTabButtons: HTMLButtonElement[] = []
   const selectLibraryTab = (index: number, focus = false) => selectSoundLibraryTab(libraryPanels, libraryTabButtons, index, focus)
@@ -1983,7 +1995,7 @@ export function setup(ctx: SpindleFrontendContext) {
   }
   selectLibraryTab(0)
   ownSoundsPanel.append(soundsHint, soundFile, soundName, soundTags, soundKind, soundAdd, soundSearch, soundFilter, soundList)
-  freesoundPanel.append(freesoundSearchHint, missingSoundSuggestions, freesoundQuery, licenseFilter, freesoundSearchButton, freesoundResults, freesoundMore)
+  freesoundPanel.append(freesoundSearchHint, missingSoundSuggestions, freesoundQuery, licenseFilter, freesoundSearchButton, freesoundResults, freesoundMore, automaticCacheHeading, automaticCacheRefresh, automaticCacheList)
   soundLibraryPanel.append(libraryTabs, ownSoundsPanel, freesoundPanel)
   const creditsButton = document.createElement('button')
   creditsButton.type = 'button'; creditsButton.className = 'chat-voice-add-button'; creditsButton.textContent = 'Show saved recording credits'
@@ -2484,6 +2496,7 @@ export function setup(ctx: SpindleFrontendContext) {
   let savingEventSounds = false
   let savingAmbienceSounds = false
   let savingMissingSounds = false
+  let savingAutoSoundLookup = false
   let savingSoundStartupWait = false
   let savingSoundVolumes = 0
   let eventSoundVolume = DEFAULT_EVENT_VOLUME
@@ -2534,6 +2547,13 @@ export function setup(ctx: SpindleFrontendContext) {
       .catch(error => { missingSoundsToggle.checked = !enabled; setStatus(error instanceof Error ? error.message : 'Could not save suggestion settings.', 'error') })
       .finally(() => { savingMissingSounds = false; missingSoundsToggle.disabled = false })
   })
+  autoSoundLookupToggle.addEventListener('change', () => {
+    const enabled = autoSoundLookupToggle.checked
+    savingAutoSoundLookup = true; autoSoundLookupToggle.disabled = true
+    void updateVoiceSettings(current => ({ ...current, chatVoiceAutoSoundLookup: enabled }))
+      .catch(error => { autoSoundLookupToggle.checked = !enabled; setStatus(error instanceof Error ? error.message : 'Could not save automatic sound lookup.', 'error') })
+      .finally(() => { savingAutoSoundLookup = false; autoSoundLookupToggle.disabled = false })
+  })
   soundStartupWaitInput.addEventListener('change', () => {
     const seconds = Math.min(10, Math.max(0, Math.round(Number(soundStartupWaitInput.value) || 0)))
     soundStartupWaitInput.value = String(seconds)
@@ -2553,12 +2573,11 @@ export function setup(ctx: SpindleFrontendContext) {
     })
   }
 
-  async function uploadFavoriteSound(favorite: NewFavoriteSound, bytes: Uint8Array): Promise<void> {
+  async function uploadFavoriteSound(favorite: NewFavoriteSound, bytes: Uint8Array, automatic = false): Promise<FavoriteSound | undefined> {
     if (bytes.length <= 2 * 1024 * 1024) {
       let binary = ''
       for (let index = 0; index < bytes.length; index += 8192) binary += String.fromCharCode(...bytes.subarray(index, index + 8192))
-      await soundLibraryRequest('chat_voice_sound_library_add', { favorite, audio: btoa(binary) })
-      return
+      return (await soundLibraryRequest('chat_voice_sound_library_add', { favorite, audio: btoa(binary), automatic })).favorite
     }
     const begin = await soundLibraryRequest('chat_voice_sound_upload_begin', { size: bytes.length })
     if (!begin.uploadId) throw new Error('Could not start sound upload.')
@@ -2570,7 +2589,7 @@ export function setup(ctx: SpindleFrontendContext) {
         for (let index = 0; index < part.length; index += 8192) binary += String.fromCharCode(...part.subarray(index, index + 8192))
         await soundLibraryRequest('chat_voice_sound_upload_chunk', { uploadId, offset, audio: btoa(binary) })
       }
-      await soundLibraryRequest('chat_voice_sound_upload_finish', { uploadId, favorite })
+      return (await soundLibraryRequest('chat_voice_sound_upload_finish', { uploadId, favorite, automatic })).favorite
     } catch (error) {
       void soundLibraryRequest('chat_voice_sound_upload_cancel', { uploadId }).catch(() => undefined)
       throw error
@@ -2708,8 +2727,8 @@ export function setup(ctx: SpindleFrontendContext) {
   freesoundMore.addEventListener('click', () => { freesoundPage++; void searchFreesound(true) })
   licenseFilter.addEventListener('change', renderFreesoundPage)
 
-  async function readSoundAudio(id: string, isCancelled: () => boolean = () => false, onProgress: (received: number, total: number) => void = () => undefined): Promise<{ favorite: FavoriteSound; bytes: Uint8Array<ArrayBuffer> }> {
-    const result = await soundLibraryRequest('chat_voice_sound_library_read', { id })
+  async function readSoundAudio(id: string, isCancelled: () => boolean = () => false, onProgress: (received: number, total: number) => void = () => undefined, automatic = false): Promise<{ favorite: FavoriteSound; bytes: Uint8Array<ArrayBuffer> }> {
+    const result = await soundLibraryRequest('chat_voice_sound_library_read', { id, automatic })
     try {
     if (isCancelled()) throw new DOMException('Sound download stopped.', 'AbortError')
     if (!result.favorite || result.favorite.id !== id || !Number.isSafeInteger(result.favorite.bytes) || result.favorite.bytes < 1 || result.favorite.bytes > MAX_FAVORITE_SOUND_BYTES) throw new Error('Invalid sound record.')
@@ -2741,6 +2760,35 @@ export function setup(ctx: SpindleFrontendContext) {
       if (result.downloadId) void soundLibraryRequest('chat_voice_sound_download_release', { downloadId: result.downloadId }).catch(() => undefined)
     }
   }
+
+  async function refreshAutomaticCache(): Promise<void> {
+    const entries = (await soundLibraryRequest('chat_voice_sound_library_list', { automatic: true })).favorites ?? []
+    automaticCacheList.replaceChildren()
+    if (!entries.length) { automaticCacheList.textContent = 'No automatically cached sounds.'; return }
+    for (const entry of entries) {
+      const row = document.createElement('div'); row.className = 'chat-voice-favorite-row'
+      const label = document.createElement('div'); label.textContent = `${entry.name} (${entry.kind})`
+      const credit = document.createElement('div'); credit.className = 'chat-voice-hint'; credit.textContent = `Freesound · ${entry.provenance?.creator ?? ''} · ${entry.provenance?.license ?? ''}`
+      const save = document.createElement('button'); save.type = 'button'; save.className = 'chat-voice-preview-button'; save.textContent = 'Add to favorites'
+      save.addEventListener('click', () => { void (async () => {
+        try {
+          save.disabled = true
+          const sound = await readSoundAudio(entry.id, undefined, undefined, true)
+          await uploadFavoriteSound({ name: sound.favorite.name, description: '', tags: sound.favorite.tags, kind: sound.favorite.kind, mime: sound.favorite.mime, provenance: sound.favorite.provenance }, sound.bytes)
+          await refreshSoundLibrary(); setStatus('Cached sound added to favorites.', 'saved')
+        } catch (error) { setStatus(error instanceof Error ? error.message : 'Could not save sound.', 'error') } finally { save.disabled = false }
+      })() })
+      const remove = document.createElement('button'); remove.type = 'button'; remove.className = 'chat-voice-delete-button'; remove.textContent = '×'; remove.setAttribute('aria-label', `Remove cached ${entry.name}`)
+      remove.addEventListener('click', () => { void (async () => {
+        const { confirmed } = await ctx.ui.showConfirm({ title: 'Remove cached sound?', message: `Remove “${entry.name}” from the automatic cache? It may be found again later.`, confirmLabel: 'Remove', cancelLabel: 'Cancel', variant: 'warning' })
+        if (!confirmed) return
+        try { await soundLibraryRequest('chat_voice_sound_library_remove', { id: entry.id, automatic: true }); await refreshAutomaticCache() }
+        catch (error) { setStatus(error instanceof Error ? error.message : 'Could not remove cached sound.', 'error') }
+      })() })
+      row.append(label, credit, save, remove); automaticCacheList.append(row)
+    }
+  }
+  automaticCacheRefresh.addEventListener('click', () => { void refreshAutomaticCache().catch(error => setStatus(error instanceof Error ? error.message : 'Could not load cached sounds.', 'error')) })
 
   async function updateFreesoundKey(action: 'status' | 'save' | 'remove'): Promise<void> {
     freesoundSave.disabled = true; freesoundRemove.disabled = true
@@ -4216,7 +4264,7 @@ export function setup(ctx: SpindleFrontendContext) {
     const soundPlanStarted = Date.now()
     const soundPlanProgress: Array<{ stage: string; elapsedMs: number }> = []
     const earlySoundPlan = (preferences.eventSounds || preferences.ambienceSounds) && eventSourceText.length <= 30000 && eventSourceText.trim()
-      ? soundLibraryRequest('chat_voice_sound_scene_plan', { message: eventSourceText, connectionId: preferences.tagLlmConnectionId, model: preferences.tagLlmModel, suggestMissing: preferences.suggestMissingSounds }, progress => { soundPlanProgress.push(progress) })
+      ? soundLibraryRequest('chat_voice_sound_scene_plan', { message: eventSourceText, connectionId: preferences.tagLlmConnectionId, model: preferences.tagLlmModel, suggestMissing: preferences.suggestMissingSounds || preferences.autoSoundLookup }, progress => { soundPlanProgress.push(progress) })
         .then(result => ({ result, error: null, completedAt: Date.now() }), error => ({ result: null, error, completedAt: Date.now() }))
       : null
     const openingSoundPlan = earlySoundPlan && eventSourceText.length > 420
@@ -4321,6 +4369,10 @@ export function setup(ctx: SpindleFrontendContext) {
     const soundCreditAssets = new Map<string, NonNullable<SavedAudioRecord['soundCredits']>[number]>()
     const usedSoundCredits = new Map<number, NonNullable<SavedAudioRecord['soundCredits']>[number]>()
     const soundLoadQueue = new SoundLoadQueue(2)
+    const automaticSoundIds = new Set<string>()
+    const automaticCache = preferences.autoSoundLookup
+      ? soundLibraryRequest('chat_voice_sound_library_list', { automatic: true }).then(result => result.favorites ?? []).catch(() => [] as FavoriteSound[])
+      : Promise.resolve([] as FavoriteSound[])
     let soundWorkClosed = false
     const soundLoadStatus = new Map<string, string>()
     let eventPlanState = 'not-requested'
@@ -4344,7 +4396,7 @@ export function setup(ctx: SpindleFrontendContext) {
         const loadStart = Date.now()
         soundLoadStatus.set(id, 'requesting')
         try {
-          const asset = await readSoundAudio(id, () => soundWorkClosed || playback.controller.signal.aborted, (received, total) => { soundLoadStatus.set(id, `transferring ${received}/${total} bytes`) })
+          const asset = await readSoundAudio(id, () => soundWorkClosed || playback.controller.signal.aborted, (received, total) => { soundLoadStatus.set(id, `transferring ${received}/${total} bytes`) }, automaticSoundIds.has(id))
           if (soundWorkClosed || playback.controller.signal.aborted) return
           if (!['event', 'ambience'].includes(asset.favorite.kind)) throw new Error('Unavailable sound.')
           soundAssetNames.set(id, asset.favorite.name)
@@ -4417,6 +4469,34 @@ export function setup(ctx: SpindleFrontendContext) {
           mergedPlan = eventSpans.length ? eventCues : null
           planReceivedAfterBoundary = lastReachedSoundBoundary
           eventPlanState = 'completed'
+          if (preferences.autoSoundLookup) {
+            const missing = (result.missing ?? []).filter(item => item.kind === 'event' ? preferences.eventSounds : preferences.ambienceSounds).slice(0, 2)
+            void Promise.all(missing.map(async suggestion => {
+              try {
+                const cached = await automaticCache
+                let favorite = cached.find(item => item.kind === suggestion.kind && item.description === `query:${suggestion.query.toLocaleLowerCase()}`)
+                if (!favorite) {
+                  const search = await soundLibraryRequest('chat_voice_freesound_search', { query: suggestion.query })
+                  const candidate = rankAutomaticFreesoundResults(suggestion.query, suggestion.kind, search.results ?? [])[0]
+                  if (!candidate?.previewUrl) return
+                  const bytes = await downloadFreesoundPreview(candidate.previewUrl)
+                  favorite = await uploadFavoriteSound({ name: candidate.name.slice(0, 120), description: `query:${suggestion.query.toLocaleLowerCase()}`, tags: (candidate.tags ?? []).slice(0, 20).filter(tag => tag.length <= 40), kind: suggestion.kind, mime: 'audio/mpeg', provenance: { provider: 'freesound', soundId: candidate.id, creator: candidate.username, title: candidate.name, license: candidate.license, sourceUrl: candidate.url } }, bytes, true)
+                }
+                if (!favorite || soundWorkClosed || playback.controller.signal.aborted || !fullCues) return
+                automaticSoundIds.add(favorite.id)
+                await prepareEventAsset(favorite.id, true)
+                if (soundWorkClosed || playback.controller.signal.aborted || !eventAssets.has(favorite.id) || !fullCues) return
+                const offset = eventSourceText.indexOf(suggestion.anchor)
+                if (offset < 0) return
+                const cue: SoundSceneCue = { kind: suggestion.kind, action: 'play', assetId: favorite.id, anchor: suggestion.anchor, offset, position: suggestion.kind === 'event' ? 'after' : 'before' }
+                cueArrivalBoundary.set(cue, lastReachedSoundBoundary)
+                fullCues.push(cue)
+                eventCues = mergeOpeningSoundCues(openingCues, fullCues, eventSpans, eventSourceText.length, lastReachedSoundBoundary)
+                mergedPlan = eventSpans.length ? eventCues : null
+                appendSpeakerDebugLog(`Automatic sound: ${suggestion.kind} asset ready; playback was not delayed.`)
+              } catch { appendSpeakerDebugLog('Automatic sound lookup failed; continuing playback without it.') }
+            }))
+          }
           await Promise.all([...new Set(fullCues.flatMap(cue => cue.action === 'play' && cue.assetId ? [cue.assetId] : []))].map(id => prepareEventAsset(id, true)))
         }).catch(error => {
           eventPlanState = 'failed'
@@ -6747,6 +6827,7 @@ export function setup(ctx: SpindleFrontendContext) {
       if (!savingEventSounds) eventSoundsToggle.checked = preferences.eventSounds
       if (!savingAmbienceSounds) ambienceSoundsToggle.checked = preferences.ambienceSounds
       if (!savingMissingSounds) missingSoundsToggle.checked = preferences.suggestMissingSounds
+      if (!savingAutoSoundLookup) autoSoundLookupToggle.checked = preferences.autoSoundLookup
       if (!savingSoundStartupWait) soundStartupWaitInput.value = String(preferences.soundStartupWaitSeconds)
       if (!savingSoundVolumes) {
         eventSoundVolume = preferences.eventSoundVolume

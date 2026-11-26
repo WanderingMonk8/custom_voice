@@ -2,6 +2,16 @@
 var UUID_HEX = Array.from({ length: 256 }, (_, index) => index.toString(16).padStart(2, "0"));
 
 // src/freesound.ts
+function rankAutomaticFreesoundResults(query, kind, results) {
+  const words = (value) => (value.toLocaleLowerCase().match(/[\p{L}\p{N}]+/gu) ?? []).filter((word) => word.length > 2 && !["the", "and", "sound", "sounds", "effect", "effects", "audio", "ambience", "ambient", "background", "recording"].includes(word)).map((word) => word.replace(/(?:ing|ed|es|s)$/u, "").replace(/e$/u, ""));
+  const requested = [...new Set(words(query))];
+  if (!requested.length) return [];
+  return results.filter((item) => {
+    if (!isFreesoundImportLicense(item.license) || !safeFreesoundPreviewUrl(item.previewUrl, item.id) || !Number.isFinite(item.duration) || item.duration <= 0 || item.duration > (kind === "event" ? 30 : 180)) return false;
+    const available = new Set(words(`${item.name} ${(item.tags ?? []).join(" ")}`));
+    return requested.every((word) => available.has(word));
+  });
+}
 function isFreesoundCc0(license) {
   if (typeof license !== "string") return false;
   return /^(?:creative commons 0|cc0|https?:\/\/creativecommons\.org\/publicdomain\/zero\/1\.0\/?$)$/iu.test(license.trim());
@@ -3149,6 +3159,7 @@ async function loadPlaybackPreferences() {
     eventSounds: false,
     ambienceSounds: false,
     suggestMissingSounds: false,
+    autoSoundLookup: false,
     soundStartupWaitSeconds: 0,
     eventSoundVolume: DEFAULT_EVENT_VOLUME,
     ambienceSoundVolume: DEFAULT_AMBIENCE_VOLUME,
@@ -3192,6 +3203,7 @@ async function loadPlaybackPreferences() {
     eventSounds: row.value?.chatVoiceEventSounds === true,
     ambienceSounds: row.value?.chatVoiceAmbienceSounds === true,
     suggestMissingSounds: row.value?.chatVoiceSuggestMissingSounds === true,
+    autoSoundLookup: row.value?.chatVoiceAutoSoundLookup === true,
     soundStartupWaitSeconds: Math.min(10, Math.max(0, Number.isFinite(Number(row.value?.chatVoiceSoundStartupWaitSeconds)) ? Number(row.value?.chatVoiceSoundStartupWaitSeconds) : 0)),
     eventSoundVolume: readSoundVolume(row.value?.chatVoiceEventSoundVolume, DEFAULT_EVENT_VOLUME),
     ambienceSoundVolume: readSoundVolume(row.value?.chatVoiceAmbienceSoundVolume, DEFAULT_AMBIENCE_VOLUME),
@@ -4436,6 +4448,16 @@ function setup(ctx) {
   const missingSoundsText = document.createElement("span");
   missingSoundsText.textContent = "Suggest missing sounds";
   missingSoundsLabel.append(missingSoundsToggle, missingSoundsText);
+  const autoSoundLookupLabel = document.createElement("label");
+  autoSoundLookupLabel.className = "chat-voice-toggle";
+  const autoSoundLookupToggle = document.createElement("input");
+  autoSoundLookupToggle.type = "checkbox";
+  const autoSoundLookupText = document.createElement("span");
+  autoSoundLookupText.textContent = "Automatically find missing sounds on Freesound";
+  autoSoundLookupLabel.append(autoSoundLookupToggle, autoSoundLookupText);
+  const autoSoundLookupHint = document.createElement("div");
+  autoSoundLookupHint.className = "chat-voice-hint";
+  autoSoundLookupHint.textContent = "Sends short sound search terms to Freesound and downloads matching previews. Sounds are cached separately from favorites. Requires a Freesound API key.";
   const missingSoundsHint = document.createElement("div");
   missingSoundsHint.className = "chat-voice-hint";
   missingSoundsHint.textContent = "When sound effects are enabled, the scene planner may suggest search terms for sounds missing from favorites. Suggestions appear in Library \u2192 Freesound; Freesound is contacted only when you search.";
@@ -4459,7 +4481,7 @@ function setup(ctx) {
   const volumeHint = document.createElement("div");
   volumeHint.className = "chat-voice-hint";
   volumeHint.textContent = "Volume applies to previews and newly generated audio. Saved recordings are unchanged until regenerated.";
-  soundEffectsPanel.append(eventSoundsLabel, eventSoundVolumeControl.container, ambienceSoundsLabel, ambienceSoundVolumeControl.container, soundStartupWaitLabel, missingSoundsLabel, missingSoundsHint, volumeHint, effectsNote);
+  soundEffectsPanel.append(eventSoundsLabel, eventSoundVolumeControl.container, ambienceSoundsLabel, ambienceSoundVolumeControl.container, soundStartupWaitLabel, missingSoundsLabel, missingSoundsHint, autoSoundLookupLabel, autoSoundLookupHint, volumeHint, effectsNote);
   const soundTabButtons = [];
   const soundPanels = [soundEffectsPanel, soundLibraryPanel, soundAdvancedPanel];
   for (const [index, label] of ["Effects", "Library", "Advanced"].entries()) {
@@ -4598,6 +4620,15 @@ function setup(ctx) {
   libraryTabs.setAttribute("aria-label", "Sound library sources");
   const ownSoundsPanel = document.createElement("div");
   const freesoundPanel = document.createElement("div");
+  const automaticCacheHeading = document.createElement("div");
+  automaticCacheHeading.className = "chat-voice-hint";
+  automaticCacheHeading.textContent = "Automatically cached sounds";
+  const automaticCacheRefresh = document.createElement("button");
+  automaticCacheRefresh.type = "button";
+  automaticCacheRefresh.className = "chat-voice-add-button";
+  automaticCacheRefresh.textContent = "Show cached sounds";
+  const automaticCacheList = document.createElement("div");
+  automaticCacheList.className = "chat-voice-favorite-list";
   const libraryPanels = [ownSoundsPanel, freesoundPanel];
   const libraryTabButtons = [];
   const selectLibraryTab = (index, focus = false) => selectSoundLibraryTab(libraryPanels, libraryTabButtons, index, focus);
@@ -4625,7 +4656,7 @@ function setup(ctx) {
   }
   selectLibraryTab(0);
   ownSoundsPanel.append(soundsHint, soundFile, soundName, soundTags, soundKind, soundAdd, soundSearch, soundFilter, soundList);
-  freesoundPanel.append(freesoundSearchHint, missingSoundSuggestions, freesoundQuery, licenseFilter, freesoundSearchButton, freesoundResults, freesoundMore);
+  freesoundPanel.append(freesoundSearchHint, missingSoundSuggestions, freesoundQuery, licenseFilter, freesoundSearchButton, freesoundResults, freesoundMore, automaticCacheHeading, automaticCacheRefresh, automaticCacheList);
   soundLibraryPanel.append(libraryTabs, ownSoundsPanel, freesoundPanel);
   const creditsButton = document.createElement("button");
   creditsButton.type = "button";
@@ -5080,6 +5111,7 @@ function setup(ctx) {
   let savingEventSounds = false;
   let savingAmbienceSounds = false;
   let savingMissingSounds = false;
+  let savingAutoSoundLookup = false;
   let savingSoundStartupWait = false;
   let savingSoundVolumes = 0;
   let eventSoundVolume = DEFAULT_EVENT_VOLUME;
@@ -5145,6 +5177,18 @@ function setup(ctx) {
       missingSoundsToggle.disabled = false;
     });
   });
+  autoSoundLookupToggle.addEventListener("change", () => {
+    const enabled = autoSoundLookupToggle.checked;
+    savingAutoSoundLookup = true;
+    autoSoundLookupToggle.disabled = true;
+    void updateVoiceSettings((current) => ({ ...current, chatVoiceAutoSoundLookup: enabled })).catch((error) => {
+      autoSoundLookupToggle.checked = !enabled;
+      setStatus(error instanceof Error ? error.message : "Could not save automatic sound lookup.", "error");
+    }).finally(() => {
+      savingAutoSoundLookup = false;
+      autoSoundLookupToggle.disabled = false;
+    });
+  });
   soundStartupWaitInput.addEventListener("change", () => {
     const seconds = Math.min(10, Math.max(0, Math.round(Number(soundStartupWaitInput.value) || 0)));
     soundStartupWaitInput.value = String(seconds);
@@ -5167,12 +5211,11 @@ function setup(ctx) {
       ctx.sendToBackend({ type, requestId, ...fields });
     });
   }
-  async function uploadFavoriteSound(favorite, bytes) {
+  async function uploadFavoriteSound(favorite, bytes, automatic = false) {
     if (bytes.length <= 2 * 1024 * 1024) {
       let binary = "";
       for (let index = 0; index < bytes.length; index += 8192) binary += String.fromCharCode(...bytes.subarray(index, index + 8192));
-      await soundLibraryRequest("chat_voice_sound_library_add", { favorite, audio: btoa(binary) });
-      return;
+      return (await soundLibraryRequest("chat_voice_sound_library_add", { favorite, audio: btoa(binary), automatic })).favorite;
     }
     const begin = await soundLibraryRequest("chat_voice_sound_upload_begin", { size: bytes.length });
     if (!begin.uploadId) throw new Error("Could not start sound upload.");
@@ -5184,7 +5227,7 @@ function setup(ctx) {
         for (let index = 0; index < part.length; index += 8192) binary += String.fromCharCode(...part.subarray(index, index + 8192));
         await soundLibraryRequest("chat_voice_sound_upload_chunk", { uploadId, offset, audio: btoa(binary) });
       }
-      await soundLibraryRequest("chat_voice_sound_upload_finish", { uploadId, favorite });
+      return (await soundLibraryRequest("chat_voice_sound_upload_finish", { uploadId, favorite, automatic })).favorite;
     } catch (error) {
       void soundLibraryRequest("chat_voice_sound_upload_cancel", { uploadId }).catch(() => void 0);
       throw error;
@@ -5410,8 +5453,8 @@ function setup(ctx) {
     void searchFreesound(true);
   });
   licenseFilter.addEventListener("change", renderFreesoundPage);
-  async function readSoundAudio(id, isCancelled = () => false, onProgress = () => void 0) {
-    const result = await soundLibraryRequest("chat_voice_sound_library_read", { id });
+  async function readSoundAudio(id, isCancelled = () => false, onProgress = () => void 0, automatic = false) {
+    const result = await soundLibraryRequest("chat_voice_sound_library_read", { id, automatic });
     try {
       if (isCancelled()) throw new DOMException("Sound download stopped.", "AbortError");
       if (!result.favorite || result.favorite.id !== id || !Number.isSafeInteger(result.favorite.bytes) || result.favorite.bytes < 1 || result.favorite.bytes > MAX_FAVORITE_SOUND_BYTES) throw new Error("Invalid sound record.");
@@ -5443,6 +5486,64 @@ function setup(ctx) {
       if (result.downloadId) void soundLibraryRequest("chat_voice_sound_download_release", { downloadId: result.downloadId }).catch(() => void 0);
     }
   }
+  async function refreshAutomaticCache() {
+    const entries = (await soundLibraryRequest("chat_voice_sound_library_list", { automatic: true })).favorites ?? [];
+    automaticCacheList.replaceChildren();
+    if (!entries.length) {
+      automaticCacheList.textContent = "No automatically cached sounds.";
+      return;
+    }
+    for (const entry of entries) {
+      const row = document.createElement("div");
+      row.className = "chat-voice-favorite-row";
+      const label = document.createElement("div");
+      label.textContent = `${entry.name} (${entry.kind})`;
+      const credit = document.createElement("div");
+      credit.className = "chat-voice-hint";
+      credit.textContent = `Freesound \xB7 ${entry.provenance?.creator ?? ""} \xB7 ${entry.provenance?.license ?? ""}`;
+      const save = document.createElement("button");
+      save.type = "button";
+      save.className = "chat-voice-preview-button";
+      save.textContent = "Add to favorites";
+      save.addEventListener("click", () => {
+        void (async () => {
+          try {
+            save.disabled = true;
+            const sound = await readSoundAudio(entry.id, void 0, void 0, true);
+            await uploadFavoriteSound({ name: sound.favorite.name, description: "", tags: sound.favorite.tags, kind: sound.favorite.kind, mime: sound.favorite.mime, provenance: sound.favorite.provenance }, sound.bytes);
+            await refreshSoundLibrary();
+            setStatus("Cached sound added to favorites.", "saved");
+          } catch (error) {
+            setStatus(error instanceof Error ? error.message : "Could not save sound.", "error");
+          } finally {
+            save.disabled = false;
+          }
+        })();
+      });
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.className = "chat-voice-delete-button";
+      remove.textContent = "\xD7";
+      remove.setAttribute("aria-label", `Remove cached ${entry.name}`);
+      remove.addEventListener("click", () => {
+        void (async () => {
+          const { confirmed } = await ctx.ui.showConfirm({ title: "Remove cached sound?", message: `Remove \u201C${entry.name}\u201D from the automatic cache? It may be found again later.`, confirmLabel: "Remove", cancelLabel: "Cancel", variant: "warning" });
+          if (!confirmed) return;
+          try {
+            await soundLibraryRequest("chat_voice_sound_library_remove", { id: entry.id, automatic: true });
+            await refreshAutomaticCache();
+          } catch (error) {
+            setStatus(error instanceof Error ? error.message : "Could not remove cached sound.", "error");
+          }
+        })();
+      });
+      row.append(label, credit, save, remove);
+      automaticCacheList.append(row);
+    }
+  }
+  automaticCacheRefresh.addEventListener("click", () => {
+    void refreshAutomaticCache().catch((error) => setStatus(error instanceof Error ? error.message : "Could not load cached sounds.", "error"));
+  });
   async function updateFreesoundKey(action) {
     freesoundSave.disabled = true;
     freesoundRemove.disabled = true;
@@ -6815,7 +6916,7 @@ function setup(ctx) {
       const eventSourceText = preparePlaybackContent(message.content, preferences.skippedTrackerTags);
       const soundPlanStarted = Date.now();
       const soundPlanProgress = [];
-      const earlySoundPlan = (preferences.eventSounds || preferences.ambienceSounds) && eventSourceText.length <= 3e4 && eventSourceText.trim() ? soundLibraryRequest("chat_voice_sound_scene_plan", { message: eventSourceText, connectionId: preferences.tagLlmConnectionId, model: preferences.tagLlmModel, suggestMissing: preferences.suggestMissingSounds }, (progress) => {
+      const earlySoundPlan = (preferences.eventSounds || preferences.ambienceSounds) && eventSourceText.length <= 3e4 && eventSourceText.trim() ? soundLibraryRequest("chat_voice_sound_scene_plan", { message: eventSourceText, connectionId: preferences.tagLlmConnectionId, model: preferences.tagLlmModel, suggestMissing: preferences.suggestMissingSounds || preferences.autoSoundLookup }, (progress) => {
         soundPlanProgress.push(progress);
       }).then((result) => ({ result, error: null, completedAt: Date.now() }), (error) => ({ result: null, error, completedAt: Date.now() })) : null;
       const openingSoundPlan = earlySoundPlan && eventSourceText.length > 420 ? soundLibraryRequest("chat_voice_sound_scene_plan", { message: eventSourceText, connectionId: preferences.tagLlmConnectionId, model: preferences.tagLlmModel, opening: true }).then((result) => ({ result, error: null, completedAt: Date.now() }), (error) => ({ result: null, error, completedAt: Date.now() })) : null;
@@ -6913,6 +7014,8 @@ function setup(ctx) {
       const soundCreditAssets = /* @__PURE__ */ new Map();
       const usedSoundCredits = /* @__PURE__ */ new Map();
       const soundLoadQueue = new SoundLoadQueue(2);
+      const automaticSoundIds = /* @__PURE__ */ new Set();
+      const automaticCache = preferences.autoSoundLookup ? soundLibraryRequest("chat_voice_sound_library_list", { automatic: true }).then((result) => result.favorites ?? []).catch(() => []) : Promise.resolve([]);
       let soundWorkClosed = false;
       const soundLoadStatus = /* @__PURE__ */ new Map();
       let eventPlanState = "not-requested";
@@ -6940,7 +7043,7 @@ function setup(ctx) {
           try {
             const asset = await readSoundAudio(id, () => soundWorkClosed || playback.controller.signal.aborted, (received, total) => {
               soundLoadStatus.set(id, `transferring ${received}/${total} bytes`);
-            });
+            }, automaticSoundIds.has(id));
             if (soundWorkClosed || playback.controller.signal.aborted) return;
             if (!["event", "ambience"].includes(asset.favorite.kind)) throw new Error("Unavailable sound.");
             soundAssetNames.set(id, asset.favorite.name);
@@ -7035,6 +7138,36 @@ function setup(ctx) {
           mergedPlan = eventSpans.length ? eventCues : null;
           planReceivedAfterBoundary = lastReachedSoundBoundary;
           eventPlanState = "completed";
+          if (preferences.autoSoundLookup) {
+            const missing = (result.missing ?? []).filter((item) => item.kind === "event" ? preferences.eventSounds : preferences.ambienceSounds).slice(0, 2);
+            void Promise.all(missing.map(async (suggestion) => {
+              try {
+                const cached = await automaticCache;
+                let favorite = cached.find((item) => item.kind === suggestion.kind && item.description === `query:${suggestion.query.toLocaleLowerCase()}`);
+                if (!favorite) {
+                  const search = await soundLibraryRequest("chat_voice_freesound_search", { query: suggestion.query });
+                  const candidate = rankAutomaticFreesoundResults(suggestion.query, suggestion.kind, search.results ?? [])[0];
+                  if (!candidate?.previewUrl) return;
+                  const bytes = await downloadFreesoundPreview(candidate.previewUrl);
+                  favorite = await uploadFavoriteSound({ name: candidate.name.slice(0, 120), description: `query:${suggestion.query.toLocaleLowerCase()}`, tags: (candidate.tags ?? []).slice(0, 20).filter((tag) => tag.length <= 40), kind: suggestion.kind, mime: "audio/mpeg", provenance: { provider: "freesound", soundId: candidate.id, creator: candidate.username, title: candidate.name, license: candidate.license, sourceUrl: candidate.url } }, bytes, true);
+                }
+                if (!favorite || soundWorkClosed || playback.controller.signal.aborted || !fullCues) return;
+                automaticSoundIds.add(favorite.id);
+                await prepareEventAsset(favorite.id, true);
+                if (soundWorkClosed || playback.controller.signal.aborted || !eventAssets.has(favorite.id) || !fullCues) return;
+                const offset = eventSourceText.indexOf(suggestion.anchor);
+                if (offset < 0) return;
+                const cue = { kind: suggestion.kind, action: "play", assetId: favorite.id, anchor: suggestion.anchor, offset, position: suggestion.kind === "event" ? "after" : "before" };
+                cueArrivalBoundary.set(cue, lastReachedSoundBoundary);
+                fullCues.push(cue);
+                eventCues = mergeOpeningSoundCues(openingCues, fullCues, eventSpans, eventSourceText.length, lastReachedSoundBoundary);
+                mergedPlan = eventSpans.length ? eventCues : null;
+                appendSpeakerDebugLog(`Automatic sound: ${suggestion.kind} asset ready; playback was not delayed.`);
+              } catch {
+                appendSpeakerDebugLog("Automatic sound lookup failed; continuing playback without it.");
+              }
+            }));
+          }
           await Promise.all([...new Set(fullCues.flatMap((cue) => cue.action === "play" && cue.assetId ? [cue.assetId] : []))].map((id) => prepareEventAsset(id, true)));
         }).catch((error) => {
           eventPlanState = "failed";
@@ -9203,6 +9336,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
       if (!savingEventSounds) eventSoundsToggle.checked = preferences.eventSounds;
       if (!savingAmbienceSounds) ambienceSoundsToggle.checked = preferences.ambienceSounds;
       if (!savingMissingSounds) missingSoundsToggle.checked = preferences.suggestMissingSounds;
+      if (!savingAutoSoundLookup) autoSoundLookupToggle.checked = preferences.autoSoundLookup;
       if (!savingSoundStartupWait) soundStartupWaitInput.value = String(preferences.soundStartupWaitSeconds);
       if (!savingSoundVolumes) {
         eventSoundVolume = preferences.eventSoundVolume;

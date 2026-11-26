@@ -9,6 +9,21 @@ export interface FreesoundSearchResult {
   tags?: string[]
 }
 
+/** Require every meaningful search term to be supported by result metadata. */
+export function rankAutomaticFreesoundResults(query: string, kind: 'event' | 'ambience', results: readonly FreesoundSearchResult[]): FreesoundSearchResult[] {
+  const words = (value: string) => (value.toLocaleLowerCase().match(/[\p{L}\p{N}]+/gu) ?? [])
+    .filter(word => word.length > 2 && !['the', 'and', 'sound', 'sounds', 'effect', 'effects', 'audio', 'ambience', 'ambient', 'background', 'recording'].includes(word))
+    .map(word => word.replace(/(?:ing|ed|es|s)$/u, '').replace(/e$/u, ''))
+  const requested = [...new Set(words(query))]
+  if (!requested.length) return []
+  return results.filter(item => {
+    if (!isFreesoundImportLicense(item.license) || !safeFreesoundPreviewUrl(item.previewUrl, item.id)
+      || !Number.isFinite(item.duration) || item.duration <= 0 || item.duration > (kind === 'event' ? 30 : 180)) return false
+    const available = new Set(words(`${item.name} ${(item.tags ?? []).join(' ')}`))
+    return requested.every(word => available.has(word))
+  })
+}
+
 /** Recognize only explicitly supported Freesound licenses. */
 export function isFreesoundCc0(license: unknown): boolean {
   if (typeof license !== 'string') return false

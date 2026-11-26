@@ -229,6 +229,66 @@ var SoundLibrary = class {
   }
 };
 
+// src/sound-auto-cache.ts
+var PREFIX = "automatic-cache/";
+var MAX_AUTO_SOUND_CACHE_BYTES = 48 * 1024 * 1024;
+var MAX_AUTO_SOUND_CACHE_ITEMS = 40;
+var pendingWrites = /* @__PURE__ */ new Map();
+function scopedStorage(storage) {
+  const path = (value) => PREFIX + value;
+  return {
+    read: (value, user) => storage.read(path(value), user),
+    write: (value, data, user) => storage.write(path(value), data, user),
+    readBinary: (value, user) => storage.readBinary(path(value), user),
+    writeBinary: (value, data, user) => storage.writeBinary(path(value), data, user),
+    delete: (value, user) => storage.delete(path(value), user),
+    list: (value, user) => storage.list(path(value ?? ""), user),
+    exists: (value, user) => storage.exists(path(value), user),
+    move: (from, to, user) => storage.move(path(from), path(to), user)
+  };
+}
+var AutomaticSoundCache = class {
+  library;
+  constructor(storage) {
+    this.library = new SoundLibrary(scopedStorage(storage));
+  }
+  list(userId) {
+    return this.library.list(userId);
+  }
+  read(id, userId) {
+    return this.library.read(id, userId);
+  }
+  remove(id, userId) {
+    return this.library.remove(id, userId);
+  }
+  async add(input, bytes, userId) {
+    if (!input.provenance || bytes.byteLength > MAX_AUTO_SOUND_CACHE_BYTES) throw new Error("Invalid automatic cache entry.");
+    const key = userId ?? "__extension_owner__";
+    const previous = pendingWrites.get(key) ?? Promise.resolve();
+    const work = previous.catch(() => void 0).then(async () => {
+      const entries = await this.library.list(userId);
+      const duplicate = entries.find((entry) => entry.kind === input.kind && entry.provenance?.soundId === input.provenance?.soundId);
+      if (duplicate) return duplicate;
+      const result = await this.library.add(input, bytes, userId);
+      let size = entries.reduce((sum, item) => sum + item.bytes, 0) + result.bytes;
+      let count = entries.length + 1;
+      for (const entry of entries.sort((a, b) => a.createdAt.localeCompare(b.createdAt))) {
+        if (size <= MAX_AUTO_SOUND_CACHE_BYTES && count <= MAX_AUTO_SOUND_CACHE_ITEMS) break;
+        await this.library.remove(entry.id, userId);
+        size -= entry.bytes;
+        count--;
+      }
+      return result;
+    });
+    const tail = work.then(() => void 0, () => void 0);
+    pendingWrites.set(key, tail);
+    void tail.then(() => {
+      if (pendingWrites.get(key) === tail) pendingWrites.delete(key);
+    });
+    return work;
+  }
+};
+
 // src/sound-transfer.ts
 var SoundUploadTransfers = class {
   constructor(id, now = Date.now) {
@@ -8581,7 +8641,8 @@ spindle.onFrontendMessage(async (rawPayload, userId, frontendSessionId) => {
         } else if (payload.type === "chat_voice_sound_upload_finish") {
           const bytes = soundUploads.take(owner, payload.uploadId);
           try {
-            const favorite = await new SoundLibrary(spindle.userStorage).add(payload.favorite, bytes, userId);
+            const library = payload.automatic ? new AutomaticSoundCache(spindle.userStorage) : new SoundLibrary(spindle.userStorage);
+            const favorite = await library.add(payload.favorite, bytes, userId);
             sendFrontend({ type: "chat_voice_sound_library", requestId: payload.requestId, favorite }, userId, frontendSessionId);
           } finally {
             soundUploads.release(owner, payload.uploadId);
@@ -8692,7 +8753,7 @@ spindle.onFrontendMessage(async (rawPayload, userId, frontendSessionId) => {
       }
     } else if (payload?.type === "chat_voice_sound_library_list" || payload?.type === "chat_voice_sound_library_add" || payload?.type === "chat_voice_sound_library_read" || payload?.type === "chat_voice_sound_library_remove" || payload?.type === "chat_voice_sound_library_edit") {
       try {
-        const library = new SoundLibrary(spindle.userStorage);
+        const library = payload.type !== "chat_voice_sound_library_edit" && payload.automatic ? new AutomaticSoundCache(spindle.userStorage) : new SoundLibrary(spindle.userStorage);
         if (payload.type === "chat_voice_sound_library_add") {
           if (typeof payload.audio !== "string" || payload.audio.length > Math.ceil(2 * 1024 * 1024 / 3) * 4 || payload.audio.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/u.test(payload.audio)) throw new Error("Invalid or oversized audio encoding.");
           const binary = atob(payload.audio);
@@ -8714,7 +8775,7 @@ spindle.onFrontendMessage(async (rawPayload, userId, frontendSessionId) => {
           await library.remove(payload.id, userId);
           sendFrontend({ type: "chat_voice_sound_library", requestId: payload.requestId }, userId, frontendSessionId);
         } else if (payload.type === "chat_voice_sound_library_edit") {
-          const favorite = await library.edit(payload.id, payload.favorite, userId);
+          const favorite = await new SoundLibrary(spindle.userStorage).edit(payload.id, payload.favorite, userId);
           sendFrontend({ type: "chat_voice_sound_library", requestId: payload.requestId, favorite }, userId, frontendSessionId);
         } else {
           const favorites = await library.list(userId);

@@ -1,4 +1,5 @@
 import { SOUND_TRANSFER_CHUNK_BYTES, SoundLibrary, type NewFavoriteSound } from './sound-library'
+import { AutomaticSoundCache } from './sound-auto-cache'
 import { SoundDownloadTransfers, SoundUploadTransfers } from './sound-transfer'
 import { parseFreesoundSearch } from './freesound'
 import { competingSoundCueIndexes, parseMissingSoundSuggestions, parseSoundScenePlan, shortlistSoundPlannerAssets, soundOpeningExcerpt } from './sound-scene'
@@ -162,14 +163,14 @@ interface CardPromptData {
 
 type FrontendMessage =
   | { type: 'chat_voice_refresh'; chatId?: string | null; requestId?: string; ghostLifetime?: number }
-  | { type: 'chat_voice_sound_library_list'; requestId: string }
-  | { type: 'chat_voice_sound_library_add'; requestId: string; favorite: NewFavoriteSound; audio: string }
-  | { type: 'chat_voice_sound_library_read'; requestId: string; id: string }
-  | { type: 'chat_voice_sound_library_remove'; requestId: string; id: string }
+  | { type: 'chat_voice_sound_library_list'; requestId: string; automatic?: boolean }
+  | { type: 'chat_voice_sound_library_add'; requestId: string; favorite: NewFavoriteSound; audio: string; automatic?: boolean }
+  | { type: 'chat_voice_sound_library_read'; requestId: string; id: string; automatic?: boolean }
+  | { type: 'chat_voice_sound_library_remove'; requestId: string; id: string; automatic?: boolean }
   | { type: 'chat_voice_sound_library_edit'; requestId: string; id: string; favorite: NewFavoriteSound }
   | { type: 'chat_voice_sound_upload_begin'; requestId: string; size: number }
   | { type: 'chat_voice_sound_upload_chunk'; requestId: string; uploadId: string; offset: number; audio: string }
-  | { type: 'chat_voice_sound_upload_finish'; requestId: string; uploadId: string; favorite: NewFavoriteSound }
+  | { type: 'chat_voice_sound_upload_finish'; requestId: string; uploadId: string; favorite: NewFavoriteSound; automatic?: boolean }
   | { type: 'chat_voice_sound_upload_cancel'; requestId: string; uploadId: string }
   | { type: 'chat_voice_sound_library_read_chunk'; requestId: string; downloadId: string; offset: number }
   | { type: 'chat_voice_sound_download_release'; requestId: string; downloadId: string }
@@ -2034,7 +2035,8 @@ spindle.onFrontendMessage(async (rawPayload: unknown, userId, frontendSessionId)
         } else if (payload.type === 'chat_voice_sound_upload_finish') {
           const bytes = soundUploads.take(owner, payload.uploadId)
           try {
-            const favorite = await new SoundLibrary(spindle.userStorage).add(payload.favorite, bytes, userId)
+            const library = payload.automatic ? new AutomaticSoundCache(spindle.userStorage) : new SoundLibrary(spindle.userStorage)
+            const favorite = await library.add(payload.favorite, bytes, userId)
             sendFrontend({ type: 'chat_voice_sound_library', requestId: payload.requestId, favorite }, userId, frontendSessionId)
           } finally { soundUploads.release(owner, payload.uploadId) }
         } else if (payload.type === 'chat_voice_sound_upload_cancel') {
@@ -2138,7 +2140,7 @@ spindle.onFrontendMessage(async (rawPayload: unknown, userId, frontendSessionId)
       }
     } else if (payload?.type === 'chat_voice_sound_library_list' || payload?.type === 'chat_voice_sound_library_add' || payload?.type === 'chat_voice_sound_library_read' || payload?.type === 'chat_voice_sound_library_remove' || payload?.type === 'chat_voice_sound_library_edit') {
       try {
-        const library = new SoundLibrary(spindle.userStorage)
+        const library = payload.type !== 'chat_voice_sound_library_edit' && payload.automatic ? new AutomaticSoundCache(spindle.userStorage) : new SoundLibrary(spindle.userStorage)
         if (payload.type === 'chat_voice_sound_library_add') {
           if (typeof payload.audio !== 'string' || payload.audio.length > Math.ceil(2 * 1024 * 1024 / 3) * 4 || payload.audio.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/u.test(payload.audio)) throw new Error('Invalid or oversized audio encoding.')
           const binary = atob(payload.audio)
@@ -2160,7 +2162,7 @@ spindle.onFrontendMessage(async (rawPayload: unknown, userId, frontendSessionId)
           await library.remove(payload.id, userId)
           sendFrontend({ type: 'chat_voice_sound_library', requestId: payload.requestId }, userId, frontendSessionId)
         } else if (payload.type === 'chat_voice_sound_library_edit') {
-          const favorite = await library.edit(payload.id, payload.favorite, userId)
+          const favorite = await new SoundLibrary(spindle.userStorage).edit(payload.id, payload.favorite, userId)
           sendFrontend({ type: 'chat_voice_sound_library', requestId: payload.requestId, favorite }, userId, frontendSessionId)
         } else {
           const favorites = await library.list(userId)
