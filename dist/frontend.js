@@ -6,6 +6,9 @@ function isFreesoundCc0(license) {
   if (typeof license !== "string") return false;
   return /^(?:creative commons 0|cc0|https?:\/\/creativecommons\.org\/publicdomain\/zero\/1\.0\/?$)$/iu.test(license.trim());
 }
+function isFreesoundImportLicense(license) {
+  return isFreesoundCc0(license) || typeof license === "string" && /^https?:\/\/creativecommons\.org\/licenses\/by\/(?:3\.0|4\.0)\/?$/iu.test(license.trim());
+}
 function safeFreesoundPreviewUrl(value, id) {
   if (typeof value !== "string" || !Number.isSafeInteger(id) || id < 1) return void 0;
   try {
@@ -1271,7 +1274,12 @@ function readSavedAudioHistory(value) {
     if (!chatId || !messageId || !audioId || !Number.isFinite(swipeId) || !Number.isFinite(savedAt)) continue;
     if (seenAudioIds.has(audioId)) continue;
     seenAudioIds.add(audioId);
-    records.push({ chatId, messageId, audioId, swipeId, savedAt });
+    const soundCredits = [];
+    if (Array.isArray(item.soundCredits)) for (const credit of item.soundCredits.slice(0, 100)) {
+      if (!isRecord(credit) || typeof credit.title !== "string" || !credit.title.trim() || typeof credit.creator !== "string" || !credit.creator.trim() || !Number.isSafeInteger(credit.soundId) || credit.soundId < 1 || typeof credit.license !== "string" || !/^https?:\/\/creativecommons\.org\/(?:licenses\/by\/(?:3\.0|4\.0)|publicdomain\/zero\/1\.0)\/?$/iu.test(credit.license)) continue;
+      soundCredits.push({ title: credit.title.slice(0, 160), creator: credit.creator.slice(0, 120), soundId: credit.soundId, license: credit.license });
+    }
+    records.push({ chatId, messageId, audioId, swipeId, savedAt, ...soundCredits.length ? { soundCredits } : {} });
   }
   return records;
 }
@@ -4274,7 +4282,7 @@ function setup(ctx) {
   }
   const freesoundSearchHint = document.createElement("div");
   freesoundSearchHint.className = "chat-voice-hint";
-  freesoundSearchHint.textContent = "Search terms are sent to Freesound. Previews and imports connect your browser to Freesound\u2019s audio server. Only CC0 previews can be imported for now; other licenses require recording-level attribution support.";
+  freesoundSearchHint.textContent = "Search terms are sent to Freesound. Previews and imports connect your browser to Freesound\u2019s audio server. CC0 and CC BY previews can be imported; credits are saved with recordings. Other licenses are not supported.";
   const freesoundQuery = document.createElement("input");
   freesoundQuery.placeholder = "Search Freesound";
   freesoundQuery.maxLength = 120;
@@ -4287,6 +4295,49 @@ function setup(ctx) {
   freesoundResults.className = "chat-voice-favorite-list";
   freesoundResults.setAttribute("aria-live", "polite");
   soundLibraryPanel.append(soundsHint, soundFile, soundName, soundTags, soundKind, soundAdd, soundSearch, soundFilter, soundList, freesoundSearchHint, freesoundQuery, freesoundSearchButton, freesoundResults);
+  const creditsButton = document.createElement("button");
+  creditsButton.type = "button";
+  creditsButton.className = "chat-voice-add-button";
+  creditsButton.textContent = "Show saved recording credits";
+  const creditsList = document.createElement("div");
+  creditsList.setAttribute("aria-live", "polite");
+  soundLibraryPanel.append(creditsButton, creditsList);
+  creditsButton.addEventListener("click", () => {
+    void (async () => {
+      creditsButton.disabled = true;
+      try {
+        const response = await fetch("/api/v1/settings/voiceSettings", { credentials: "same-origin", headers: { Accept: "application/json" } });
+        if (!response.ok) throw new Error("Could not load recording credits.");
+        const settings = await response.json();
+        const records = readSavedAudioHistory(settings.value?.chatVoiceSavedAudioHistory).filter((record) => record.soundCredits?.length).reverse();
+        creditsList.replaceChildren();
+        if (!records.length) creditsList.textContent = "No saved recording credits.";
+        for (const record of records) {
+          const group = document.createElement("div");
+          group.className = "chat-voice-favorite-row";
+          const label = document.createElement("div");
+          label.textContent = `Recording ${new Date(record.savedAt).toLocaleString()} \xB7 message ${record.messageId} \xB7 swipe ${record.swipeId + 1}`;
+          const text = record.soundCredits.map((credit) => `\u201C${credit.title}\u201D by ${credit.creator} \xB7 https://freesound.org/s/${credit.soundId}/ \xB7 ${credit.license} \xB7 Modified: trimmed, volume adjusted and mixed with other audio.`).join("\n");
+          const details = document.createElement("div");
+          details.className = "chat-voice-hint";
+          details.textContent = text;
+          const copy = document.createElement("button");
+          copy.type = "button";
+          copy.className = "chat-voice-add-button";
+          copy.textContent = "Copy credits";
+          copy.addEventListener("click", () => {
+            void navigator.clipboard.writeText(text).then(() => setStatus("Credits copied.", "saved")).catch(() => setStatus("Could not copy credits.", "error"));
+          });
+          group.append(label, details, copy);
+          creditsList.append(group);
+        }
+      } catch (error) {
+        creditsList.textContent = error instanceof Error ? error.message : "Could not load recording credits.";
+      } finally {
+        creditsButton.disabled = false;
+      }
+    })();
+  });
   soundsBody.append(soundTabs, soundEffectsPanel, soundLibraryPanel, soundAdvancedPanel);
   soundsSection.append(soundsSummary, soundsBody);
   const status = document.createElement("div");
@@ -4896,7 +4947,7 @@ function setup(ctx) {
               });
             });
             row.append(preview);
-            if (isFreesoundCc0(item.license)) {
+            if (isFreesoundImportLicense(item.license)) {
               const category = document.createElement("select");
               category.setAttribute("aria-label", `Sound type for ${item.name}`);
               for (const [value, label] of [["event", "Event sound"], ["ambience", "Ambience"]]) {
@@ -4908,14 +4959,14 @@ function setup(ctx) {
               const add = document.createElement("button");
               add.type = "button";
               add.className = "chat-voice-add-button";
-              add.textContent = "Import CC0 preview";
+              add.textContent = "Import preview";
               add.addEventListener("click", () => {
                 void (async () => {
                   add.disabled = true;
                   add.textContent = "Importing\u2026";
                   try {
                     const url = safeFreesoundPreviewUrl(item.previewUrl, item.id);
-                    if (!url || !isFreesoundCc0(item.license)) throw new Error("This preview is not available for import.");
+                    if (!url || !isFreesoundImportLicense(item.license)) throw new Error("This preview is not available for import.");
                     if (item.duration > 120) throw new Error("Sound must be at most 120 seconds long.");
                     const bytes = await downloadFreesoundPreview(url);
                     const Context = window.AudioContext ?? window.webkitAudioContext;
@@ -4927,14 +4978,14 @@ function setup(ctx) {
                     } finally {
                       await context2.close().catch(() => void 0);
                     }
-                    await uploadFavoriteSound({ name: item.name.trim().slice(0, 120), description: "", tags: item.tags ?? [], kind: category.value === "ambience" ? "ambience" : "event", mime: "audio/mpeg", provenance: { provider: "freesound", soundId: item.id, creator: item.username, license: item.license, sourceUrl: `https://freesound.org/s/${item.id}/` } }, bytes);
+                    await uploadFavoriteSound({ name: item.name.trim().slice(0, 120), description: "", tags: item.tags ?? [], kind: category.value === "ambience" ? "ambience" : "event", mime: "audio/mpeg", provenance: { provider: "freesound", soundId: item.id, title: item.name, creator: item.username, license: item.license, sourceUrl: `https://freesound.org/s/${item.id}/` } }, bytes);
                     await refreshSoundLibrary();
                     setStatus("Freesound preview imported to favorites.", "saved");
                   } catch (error) {
                     setStatus(error instanceof Error && error.name === "AbortError" ? "Freesound preview download timed out." : error instanceof TypeError ? "Could not download the preview; your browser or server may block cross-origin requests." : error instanceof Error ? error.message : "Could not import the Freesound preview.", "error");
                   } finally {
                     add.disabled = false;
-                    add.textContent = "Import CC0 preview";
+                    add.textContent = "Import preview";
                   }
                 })();
               });
@@ -6433,6 +6484,8 @@ function setup(ctx) {
       let eventCues = [];
       const eventAssets = /* @__PURE__ */ new Map();
       const soundAssetKinds = /* @__PURE__ */ new Map();
+      const soundCreditAssets = /* @__PURE__ */ new Map();
+      const usedSoundCredits = /* @__PURE__ */ new Map();
       const eventLoads = /* @__PURE__ */ new Map();
       const soundLoadStatus = /* @__PURE__ */ new Map();
       let eventPlanState = "not-requested";
@@ -6467,6 +6520,8 @@ function setup(ctx) {
             for (let channel = 0; channel < decoded.numberOfChannels; channel++) cropped.copyToChannel(decoded.getChannelData(channel).subarray(0, frames), channel);
             const channels = Array.from({ length: cropped.numberOfChannels }, (_, channel) => cropped.getChannelData(channel));
             soundAssetKinds.set(id, asset.favorite.kind);
+            const provenance = asset.favorite.provenance;
+            if (provenance && isFreesoundImportLicense(provenance.license)) soundCreditAssets.set(id, { title: provenance.title || asset.favorite.name, creator: provenance.creator, soundId: provenance.soundId, license: isFreesoundCc0(provenance.license) ? "https://creativecommons.org/publicdomain/zero/1.0/" : provenance.license });
             const categoryVolume = asset.favorite.kind === "ambience" ? preferences.ambienceSoundVolume : preferences.eventSoundVolume;
             eventAssets.set(id, { data: new ArrayBuffer(0), mime: "audio/wav", decodedBuffer: cropped, normalizationGain: soundCategoryGain(channels, asset.favorite.kind) * categoryVolume });
             soundLoadStatus.set(id, "ready");
@@ -7107,10 +7162,16 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
                   messageId,
                   audioId: savedAudioId,
                   swipeId: saved.swipe_id ?? message.swipe_id ?? 0,
-                  savedAt: Date.now()
+                  savedAt: Date.now(),
+                  soundCredits: [...usedSoundCredits.values()]
                 });
               } catch (error) {
                 console.warn("[Chat Voice] Saved audio retention cleanup failed.", error);
+                if (usedSoundCredits.size) {
+                  const credits = [...usedSoundCredits.values()].map((credit) => `\u201C${credit.title}\u201D by ${credit.creator} \xB7 https://freesound.org/s/${credit.soundId}/ \xB7 ${credit.license} \xB7 Modified: volume adjusted and mixed with other audio.`).join("\n");
+                  console.error("[Chat Voice] Preserve these recording credits:", credits);
+                  throw new Error("Audio was saved, but recording credits could not be confirmed. See the browser console for the credits before sharing.");
+                }
               }
             }
             playback.persistenceState = "saved";
@@ -7163,12 +7224,14 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
           if (!instruction) activeAmbience = null;
           else if (activeAmbience?.key !== instruction.key) {
             const asset = eventAssets.get(instruction.assetId);
-            activeAmbience = asset && soundAssetKinds.get(instruction.assetId) === "ambience" ? { key: instruction.key, segment: asset, elapsed: 0 } : null;
+            activeAmbience = asset && soundAssetKinds.get(instruction.assetId) === "ambience" ? { key: instruction.key, assetId: instruction.assetId, segment: asset, elapsed: 0 } : null;
           }
           for (const { cue } of mapped.filter((item) => item.boundary === boundary && item.cue.kind === "event")) {
             const asset = cue.assetId ? eventAssets.get(cue.assetId) : void 0;
             if (!asset || !cue.assetId || soundAssetKinds.get(cue.assetId) !== cue.kind) continue;
             chosen.push(asset);
+            const credit = soundCreditAssets.get(cue.assetId);
+            if (credit) usedSoundCredits.set(credit.soundId, credit);
           }
           return chosen;
         };
@@ -7183,6 +7246,8 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
               activeAmbience.elapsed
             );
             activeAmbience.elapsed = mixed.elapsedSeconds;
+            const credit = soundCreditAssets.get(activeAmbience.assetId);
+            if (credit) usedSoundCredits.set(credit.soundId, credit);
             const buffer = audioContext.createBuffer(2, source.length, source.sampleRate);
             for (let channel = 0; channel < 2; channel++) buffer.getChannelData(channel).set(mixed.channels[channel]);
             return { data: new ArrayBuffer(0), mime: "audio/wav", decodedBuffer: buffer, normalizationGain: 1 };

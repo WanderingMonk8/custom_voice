@@ -102,7 +102,9 @@ test('sound provenance persists through edits and canonicalizes the source URL',
   const edited = await library.edit(favorite.id, { name: 'Stream', kind: 'ambience', tags: [] }, 'alice')
   assert.deepEqual(edited.provenance, favorite.provenance)
   assert.deepEqual((await library.read(favorite.id, 'alice')).record.provenance, favorite.provenance)
-  await assert.rejects(() => library.add({ name: 'Other', kind: 'event', mime: 'audio/wav', provenance: { provider: 'freesound', soundId: 124, creator: 'artist', license: 'CC BY', sourceUrl: 'https://freesound.org/s/124/' } }, audio, 'alice'), /Only CC0/)
+  const licensed = await library.add({ name: 'Other', kind: 'event', mime: 'audio/wav', provenance: { provider: 'freesound', soundId: 124, creator: 'artist', title: 'Original title', license: 'https://creativecommons.org/licenses/by/4.0/', sourceUrl: 'https://freesound.org/s/124/' } }, audio, 'alice')
+  assert.equal((await library.read(licensed.id, 'alice')).record.provenance?.title, 'Original title')
+  await assert.rejects(() => library.add({ name: 'Other', kind: 'event', mime: 'audio/wav', provenance: { provider: 'freesound', soundId: 125, creator: 'artist', license: 'https://creativecommons.org/licenses/by-nc/4.0/', sourceUrl: 'https://freesound.org/s/125/' } }, audio, 'alice'), /Unsupported Freesound license/)
 })
 
 test('large sound uploads are ordered, bounded and isolated by frontend session', () => {
@@ -6042,6 +6044,14 @@ test('replaces a saved swipe record and expires the oldest recordings', () => {
   })
   assert.deepEqual(history.map(record => record.audioId), ['two', 'new-one'])
   assert.deepEqual(expiredSavedAudioRecords(history, 1).map(record => record.audioId), ['two'])
+})
+
+test('recording credits survive history reads and stay with their swipe', () => {
+  const credit = { title: 'Market', creator: 'artist', soundId: 42, license: 'https://creativecommons.org/licenses/by/4.0/' }
+  const original = readSavedAudioHistory([{ chatId: 'chat', messageId: 'one', audioId: 'one', swipeId: 0, savedAt: 1, soundCredits: [credit] }, { chatId: 'chat', messageId: 'one', audioId: 'two', swipeId: 1, savedAt: 2, soundCredits: [credit] }])
+  assert.deepEqual(original[0].soundCredits, [credit])
+  const updated = upsertSavedAudioRecord(original, { chatId: 'chat', messageId: 'one', audioId: 'three', swipeId: 0, savedAt: 3 })
+  assert.deepEqual(readSavedAudioHistory(updated).map(record => record.soundCredits), [[credit], undefined])
 })
 
 test('detects recent assistant speakers and ignores user messages', () => {

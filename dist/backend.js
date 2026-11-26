@@ -47,6 +47,9 @@ function isFreesoundCc0(license) {
   if (typeof license !== "string") return false;
   return /^(?:creative commons 0|cc0|https?:\/\/creativecommons\.org\/publicdomain\/zero\/1\.0\/?$)$/iu.test(license.trim());
 }
+function isFreesoundImportLicense(license) {
+  return isFreesoundCc0(license) || typeof license === "string" && /^https?:\/\/creativecommons\.org\/licenses\/by\/(?:3\.0|4\.0)\/?$/iu.test(license.trim());
+}
 function safeFreesoundPreviewUrl(value, id) {
   if (typeof value !== "string" || !Number.isSafeInteger(id) || id < 1) return void 0;
   try {
@@ -88,7 +91,7 @@ function normalizeProvenance(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return void 0;
   const item = value;
   if (item.provider !== "freesound" || !Number.isSafeInteger(item.soundId) || item.soundId < 1 || typeof item.creator !== "string" || !item.creator.trim() || item.creator.length > 120 || typeof item.license !== "string" || !item.license.trim() || item.license.length > 300) return void 0;
-  return { provider: "freesound", soundId: item.soundId, creator: item.creator.trim(), license: item.license.trim(), sourceUrl: `https://freesound.org/s/${item.soundId}/` };
+  return { provider: "freesound", soundId: item.soundId, creator: item.creator.trim(), license: item.license.trim(), sourceUrl: `https://freesound.org/s/${item.soundId}/`, ...typeof item.title === "string" && item.title.trim() ? { title: item.title.trim().slice(0, 160) } : {} };
 }
 function serializeUserWrite(userId, task) {
   const key = userId ?? "__extension_owner__";
@@ -144,7 +147,7 @@ var SoundLibrary = class {
       const mime = typeof input.mime === "string" ? input.mime.trim().toLowerCase() : "";
       const provenance = input.provenance === void 0 ? void 0 : normalizeProvenance(input.provenance);
       if (input.provenance !== void 0 && !provenance) throw new Error("Invalid sound provenance.");
-      if (provenance && !isFreesoundCc0(provenance.license)) throw new Error("Only CC0 Freesound imports are supported until recording attribution is available.");
+      if (provenance && !isFreesoundImportLicense(provenance.license)) throw new Error("Unsupported Freesound license.");
       if (!name || name.length > 120 || description.length > 500 || tags.length > 20 || tags.some((tag) => !tag || tag.length > 40) || input.kind !== "ambience" && input.kind !== "event") throw new Error("Invalid favorite sound metadata.");
       if (!(data instanceof Uint8Array) || data.length < 1 || data.length > MAX_FAVORITE_SOUND_BYTES || !validAudio(data, mime)) {
         throw new Error("Invalid or oversized audio file.");

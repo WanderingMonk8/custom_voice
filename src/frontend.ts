@@ -3,7 +3,7 @@ import type {
   SpindleTextInputHandle,
 } from 'lumiverse-spindle-types'
 import { MAX_FAVORITE_SOUND_BYTES, SOUND_TRANSFER_CHUNK_BYTES, type FavoriteSound, type NewFavoriteSound } from './sound-library'
-import { isFreesoundCc0, safeFreesoundPreviewUrl, type FreesoundSearchResult } from './freesound'
+import { isFreesoundCc0, isFreesoundImportLicense, safeFreesoundPreviewUrl, type FreesoundSearchResult } from './freesound'
 import { alignSoundSourceSegments, ambienceInstructionAtBoundary, interleaveSoundEvents, mapSoundCueBoundaries, shortlistSoundAssets, splitNarrationForSoundEvents, type SoundSceneCue } from './sound-scene'
 import { DEFAULT_AMBIENCE_VOLUME, DEFAULT_EVENT_VOLUME, mixAmbienceClip, readSoundVolume, soundCategoryGain } from './sound-mix'
 import { AutoplayRequestRegistry, PlaybackLongPress, PlaybackStartupGuard, syncAutoplayIndicators, syncPlaybackButtons, waitForAutoplayDeadline, waitForAutoplayWork, type PlaybackButtonState } from './playback-ui'
@@ -1906,7 +1906,7 @@ export function setup(ctx: SpindleFrontendContext) {
   }
   const freesoundSearchHint = document.createElement('div')
   freesoundSearchHint.className = 'chat-voice-hint'
-  freesoundSearchHint.textContent = 'Search terms are sent to Freesound. Previews and imports connect your browser to Freesound’s audio server. Only CC0 previews can be imported for now; other licenses require recording-level attribution support.'
+  freesoundSearchHint.textContent = 'Search terms are sent to Freesound. Previews and imports connect your browser to Freesound’s audio server. CC0 and CC BY previews can be imported; credits are saved with recordings. Other licenses are not supported.'
   const freesoundQuery = document.createElement('input')
   freesoundQuery.placeholder = 'Search Freesound'; freesoundQuery.maxLength = 120; freesoundQuery.setAttribute('aria-label', 'Search Freesound')
   const freesoundSearchButton = document.createElement('button')
@@ -1914,6 +1914,32 @@ export function setup(ctx: SpindleFrontendContext) {
   const freesoundResults = document.createElement('div')
   freesoundResults.className = 'chat-voice-favorite-list'; freesoundResults.setAttribute('aria-live', 'polite')
   soundLibraryPanel.append(soundsHint, soundFile, soundName, soundTags, soundKind, soundAdd, soundSearch, soundFilter, soundList, freesoundSearchHint, freesoundQuery, freesoundSearchButton, freesoundResults)
+  const creditsButton = document.createElement('button')
+  creditsButton.type = 'button'; creditsButton.className = 'chat-voice-add-button'; creditsButton.textContent = 'Show saved recording credits'
+  const creditsList = document.createElement('div')
+  creditsList.setAttribute('aria-live', 'polite')
+  soundLibraryPanel.append(creditsButton, creditsList)
+  creditsButton.addEventListener('click', () => { void (async () => {
+    creditsButton.disabled = true
+    try {
+      const response = await fetch('/api/v1/settings/voiceSettings', { credentials: 'same-origin', headers: { Accept: 'application/json' } })
+      if (!response.ok) throw new Error('Could not load recording credits.')
+      const settings = await response.json() as { value?: Record<string, unknown> }
+      const records = readSavedAudioHistory(settings.value?.chatVoiceSavedAudioHistory).filter(record => record.soundCredits?.length).reverse()
+      creditsList.replaceChildren()
+      if (!records.length) creditsList.textContent = 'No saved recording credits.'
+      for (const record of records) {
+        const group = document.createElement('div'); group.className = 'chat-voice-favorite-row'
+        const label = document.createElement('div'); label.textContent = `Recording ${new Date(record.savedAt).toLocaleString()} · message ${record.messageId} · swipe ${record.swipeId + 1}`
+        const text = record.soundCredits!.map(credit => `“${credit.title}” by ${credit.creator} · https://freesound.org/s/${credit.soundId}/ · ${credit.license} · Modified: trimmed, volume adjusted and mixed with other audio.`).join('\n')
+        const details = document.createElement('div'); details.className = 'chat-voice-hint'; details.textContent = text
+        const copy = document.createElement('button'); copy.type = 'button'; copy.className = 'chat-voice-add-button'; copy.textContent = 'Copy credits'
+        copy.addEventListener('click', () => { void navigator.clipboard.writeText(text).then(() => setStatus('Credits copied.', 'saved')).catch(() => setStatus('Could not copy credits.', 'error')) })
+        group.append(label, details, copy); creditsList.append(group)
+      }
+    } catch (error) { creditsList.textContent = error instanceof Error ? error.message : 'Could not load recording credits.' }
+    finally { creditsButton.disabled = false }
+  })() })
   soundsBody.append(soundTabs, soundEffectsPanel, soundLibraryPanel, soundAdvancedPanel)
   soundsSection.append(soundsSummary, soundsBody)
   const status = document.createElement('div')
@@ -2528,19 +2554,19 @@ export function setup(ctx: SpindleFrontendContext) {
             void audio.play().catch(() => { if (generation === soundPreviewGeneration) { stopSoundPreview(); setStatus('Could not play the Freesound preview.', 'error') } })
           })
           row.append(preview)
-          if (isFreesoundCc0(item.license)) {
+          if (isFreesoundImportLicense(item.license)) {
             const category = document.createElement('select')
             category.setAttribute('aria-label', `Sound type for ${item.name}`)
             for (const [value, label] of [['event', 'Event sound'], ['ambience', 'Ambience']]) {
               const option = document.createElement('option'); option.value = value; option.textContent = label; category.append(option)
             }
             const add = document.createElement('button')
-            add.type = 'button'; add.className = 'chat-voice-add-button'; add.textContent = 'Import CC0 preview'
+            add.type = 'button'; add.className = 'chat-voice-add-button'; add.textContent = 'Import preview'
             add.addEventListener('click', () => { void (async () => {
               add.disabled = true; add.textContent = 'Importing…'
               try {
                 const url = safeFreesoundPreviewUrl(item.previewUrl, item.id)
-                if (!url || !isFreesoundCc0(item.license)) throw new Error('This preview is not available for import.')
+                if (!url || !isFreesoundImportLicense(item.license)) throw new Error('This preview is not available for import.')
                 if (item.duration > 120) throw new Error('Sound must be at most 120 seconds long.')
                 const bytes = await downloadFreesoundPreview(url)
                 const Context = window.AudioContext ?? (window as typeof window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext
@@ -2550,12 +2576,12 @@ export function setup(ctx: SpindleFrontendContext) {
                   const decoded = await context.decodeAudioData(bytes.buffer.slice(0))
                   if (!Number.isFinite(decoded.duration) || decoded.duration <= 0 || decoded.duration > 120 || decoded.numberOfChannels > 2) throw new Error('Preview must be mono or stereo and at most 120 seconds.')
                 } finally { await context.close().catch(() => undefined) }
-                await uploadFavoriteSound({ name: item.name.trim().slice(0, 120), description: '', tags: item.tags ?? [], kind: category.value === 'ambience' ? 'ambience' : 'event', mime: 'audio/mpeg', provenance: { provider: 'freesound', soundId: item.id, creator: item.username, license: item.license, sourceUrl: `https://freesound.org/s/${item.id}/` } }, bytes)
+                await uploadFavoriteSound({ name: item.name.trim().slice(0, 120), description: '', tags: item.tags ?? [], kind: category.value === 'ambience' ? 'ambience' : 'event', mime: 'audio/mpeg', provenance: { provider: 'freesound', soundId: item.id, title: item.name, creator: item.username, license: item.license, sourceUrl: `https://freesound.org/s/${item.id}/` } }, bytes)
                 await refreshSoundLibrary()
                 setStatus('Freesound preview imported to favorites.', 'saved')
               } catch (error) {
                 setStatus(error instanceof Error && error.name === 'AbortError' ? 'Freesound preview download timed out.' : error instanceof TypeError ? 'Could not download the preview; your browser or server may block cross-origin requests.' : error instanceof Error ? error.message : 'Could not import the Freesound preview.', 'error')
-              } finally { add.disabled = false; add.textContent = 'Import CC0 preview' }
+              } finally { add.disabled = false; add.textContent = 'Import preview' }
             })() })
             row.append(category, add)
           }
@@ -4153,6 +4179,8 @@ export function setup(ctx: SpindleFrontendContext) {
     let eventCues: SoundSceneCue[] = []
     const eventAssets = new Map<string, SynthesizedVoiceSegment>()
     const soundAssetKinds = new Map<string, 'event' | 'ambience'>()
+    const soundCreditAssets = new Map<string, NonNullable<SavedAudioRecord['soundCredits']>[number]>()
+    const usedSoundCredits = new Map<number, NonNullable<SavedAudioRecord['soundCredits']>[number]>()
     const eventLoads = new Map<string, Promise<void>>()
     const soundLoadStatus = new Map<string, string>()
     let eventPlanState = 'not-requested'
@@ -4183,6 +4211,8 @@ export function setup(ctx: SpindleFrontendContext) {
           for (let channel = 0; channel < decoded.numberOfChannels; channel++) cropped.copyToChannel(decoded.getChannelData(channel).subarray(0, frames), channel)
           const channels = Array.from({ length: cropped.numberOfChannels }, (_, channel) => cropped.getChannelData(channel))
           soundAssetKinds.set(id, asset.favorite.kind)
+          const provenance = asset.favorite.provenance
+          if (provenance && isFreesoundImportLicense(provenance.license)) soundCreditAssets.set(id, { title: provenance.title || asset.favorite.name, creator: provenance.creator, soundId: provenance.soundId, license: isFreesoundCc0(provenance.license) ? 'https://creativecommons.org/publicdomain/zero/1.0/' : provenance.license })
           const categoryVolume = asset.favorite.kind === 'ambience' ? preferences.ambienceSoundVolume : preferences.eventSoundVolume
           eventAssets.set(id, { data: new ArrayBuffer(0), mime: 'audio/wav', decodedBuffer: cropped, normalizationGain: soundCategoryGain(channels, asset.favorite.kind) * categoryVolume })
           soundLoadStatus.set(id, 'ready')
@@ -4967,9 +4997,15 @@ export function setup(ctx: SpindleFrontendContext) {
                 audioId: savedAudioId,
                 swipeId: saved.swipe_id ?? message.swipe_id ?? 0,
                 savedAt: Date.now(),
+                soundCredits: [...usedSoundCredits.values()],
               })
             } catch (error) {
               console.warn('[Chat Voice] Saved audio retention cleanup failed.', error)
+              if (usedSoundCredits.size) {
+                const credits = [...usedSoundCredits.values()].map(credit => `“${credit.title}” by ${credit.creator} · https://freesound.org/s/${credit.soundId}/ · ${credit.license} · Modified: volume adjusted and mixed with other audio.`).join('\n')
+                console.error('[Chat Voice] Preserve these recording credits:', credits)
+                throw new Error('Audio was saved, but recording credits could not be confirmed. See the browser console for the credits before sharing.')
+              }
             }
           }
           playback.persistenceState = 'saved'
@@ -5022,7 +5058,7 @@ export function setup(ctx: SpindleFrontendContext) {
 
       const eventSpans = (preferences.eventSounds || preferences.ambienceSounds) ? alignSoundSourceSegments(eventSourceText, plan.map(entry => stripTtsTags(entry.text))) : []
       eventSelectionStarted = true
-      let activeAmbience: { key: string; segment: SynthesizedVoiceSegment; elapsed: number } | null = null
+      let activeAmbience: { key: string; assetId: string; segment: SynthesizedVoiceSegment; elapsed: number } | null = null
       const selectEventsAt = (boundary: number): SynthesizedVoiceSegment[] => {
         if (!eventCues.length) return []
         const chosen: SynthesizedVoiceSegment[] = []
@@ -5031,12 +5067,14 @@ export function setup(ctx: SpindleFrontendContext) {
         if (!instruction) activeAmbience = null
         else if (activeAmbience?.key !== instruction.key) {
           const asset = eventAssets.get(instruction.assetId)
-          activeAmbience = asset && soundAssetKinds.get(instruction.assetId) === 'ambience' ? { key: instruction.key, segment: asset, elapsed: 0 } : null
+          activeAmbience = asset && soundAssetKinds.get(instruction.assetId) === 'ambience' ? { key: instruction.key, assetId: instruction.assetId, segment: asset, elapsed: 0 } : null
         }
         for (const { cue } of mapped.filter(item => item.boundary === boundary && item.cue.kind === 'event')) {
           const asset = cue.assetId ? eventAssets.get(cue.assetId) : undefined
           if (!asset || !cue.assetId || soundAssetKinds.get(cue.assetId) !== cue.kind) continue
           chosen.push(asset)
+          const credit = soundCreditAssets.get(cue.assetId)
+          if (credit) usedSoundCredits.set(credit.soundId, credit)
         }
         return chosen
       }
@@ -5051,6 +5089,8 @@ export function setup(ctx: SpindleFrontendContext) {
           activeAmbience.elapsed,
         )
         activeAmbience.elapsed = mixed.elapsedSeconds
+        const credit = soundCreditAssets.get(activeAmbience.assetId)
+        if (credit) usedSoundCredits.set(credit.soundId, credit)
         const buffer = audioContext.createBuffer(2, source.length, source.sampleRate)
         for (let channel = 0; channel < 2; channel++) buffer.getChannelData(channel).set(mixed.channels[channel])
         return { data: new ArrayBuffer(0), mime: 'audio/wav', decodedBuffer: buffer, normalizationGain: 1 }

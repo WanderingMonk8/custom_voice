@@ -2113,6 +2113,14 @@ export interface SavedAudioRecord {
   audioId: string
   swipeId: number
   savedAt: number
+  soundCredits?: SoundCredit[]
+}
+
+export interface SoundCredit {
+  title: string
+  creator: string
+  soundId: number
+  license: string
 }
 
 export interface VoiceRef {
@@ -2686,7 +2694,12 @@ export function readSavedAudioHistory(value: unknown): SavedAudioRecord[] {
     if (!chatId || !messageId || !audioId || !Number.isFinite(swipeId) || !Number.isFinite(savedAt)) continue
     if (seenAudioIds.has(audioId)) continue
     seenAudioIds.add(audioId)
-    records.push({ chatId, messageId, audioId, swipeId, savedAt })
+    const soundCredits: SoundCredit[] = []
+    if (Array.isArray(item.soundCredits)) for (const credit of item.soundCredits.slice(0, 100)) {
+      if (!isRecord(credit) || typeof credit.title !== 'string' || !credit.title.trim() || typeof credit.creator !== 'string' || !credit.creator.trim() || !Number.isSafeInteger(credit.soundId) || (credit.soundId as number) < 1 || typeof credit.license !== 'string' || !/^https?:\/\/creativecommons\.org\/(?:licenses\/by\/(?:3\.0|4\.0)|publicdomain\/zero\/1\.0)\/?$/iu.test(credit.license)) continue
+      soundCredits.push({ title: credit.title.slice(0, 160), creator: credit.creator.slice(0, 120), soundId: credit.soundId as number, license: credit.license })
+    }
+    records.push({ chatId, messageId, audioId, swipeId, savedAt, ...(soundCredits.length ? { soundCredits } : {}) })
   }
   return records
 }

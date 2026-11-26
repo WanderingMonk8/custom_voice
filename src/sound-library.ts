@@ -1,5 +1,5 @@
 import { generateUuidV7 } from './uuid'
-import { isFreesoundCc0 } from './freesound'
+import { isFreesoundImportLicense } from './freesound'
 
 /** Small, per-user foundation for the future sound-effects library. */
 export interface SoundUserStorage {
@@ -18,6 +18,7 @@ export interface SoundProvenance {
   provider: 'freesound'
   soundId: number
   creator: string
+  title?: string
   license: string
   sourceUrl: string
 }
@@ -60,7 +61,7 @@ function normalizeProvenance(value: unknown): SoundProvenance | undefined {
   if (item.provider !== 'freesound' || !Number.isSafeInteger(item.soundId) || (item.soundId as number) < 1
     || typeof item.creator !== 'string' || !item.creator.trim() || item.creator.length > 120
     || typeof item.license !== 'string' || !item.license.trim() || item.license.length > 300) return undefined
-  return { provider: 'freesound', soundId: item.soundId as number, creator: item.creator.trim(), license: item.license.trim(), sourceUrl: `https://freesound.org/s/${item.soundId}/` }
+  return { provider: 'freesound', soundId: item.soundId as number, creator: item.creator.trim(), license: item.license.trim(), sourceUrl: `https://freesound.org/s/${item.soundId}/`, ...(typeof item.title === 'string' && item.title.trim() ? { title: item.title.trim().slice(0, 160) } : {}) }
 }
 
 function serializeUserWrite<T>(userId: string | undefined, task: () => Promise<T>): Promise<T> {
@@ -120,7 +121,7 @@ export class SoundLibrary {
     const mime = typeof input.mime === 'string' ? input.mime.trim().toLowerCase() : ''
     const provenance = input.provenance === undefined ? undefined : normalizeProvenance(input.provenance)
     if (input.provenance !== undefined && !provenance) throw new Error('Invalid sound provenance.')
-    if (provenance && !isFreesoundCc0(provenance.license)) throw new Error('Only CC0 Freesound imports are supported until recording attribution is available.')
+    if (provenance && !isFreesoundImportLicense(provenance.license)) throw new Error('Unsupported Freesound license.')
     if (!name || name.length > 120 || description.length > 500 || tags.length > 20 || tags.some(tag => !tag || tag.length > 40)
       || (input.kind !== 'ambience' && input.kind !== 'event')) throw new Error('Invalid favorite sound metadata.')
     if (!(data instanceof Uint8Array) || data.length < 1 || data.length > MAX_FAVORITE_SOUND_BYTES || !validAudio(data, mime)) {

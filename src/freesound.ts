@@ -9,10 +9,14 @@ export interface FreesoundSearchResult {
   tags?: string[]
 }
 
-/** Restrict early import to CC0 until recording-level attribution is supported. */
+/** Recognize only explicitly supported Freesound licenses. */
 export function isFreesoundCc0(license: unknown): boolean {
   if (typeof license !== 'string') return false
   return /^(?:creative commons 0|cc0|https?:\/\/creativecommons\.org\/publicdomain\/zero\/1\.0\/?$)$/iu.test(license.trim())
+}
+
+export function isFreesoundImportLicense(license: unknown): boolean {
+  return isFreesoundCc0(license) || (typeof license === 'string' && /^https?:\/\/creativecommons\.org\/licenses\/by\/(?:3\.0|4\.0)\/?$/iu.test(license.trim()))
 }
 
 /** Accept only canonical Freesound MP3 previews tied to the result ID. */
