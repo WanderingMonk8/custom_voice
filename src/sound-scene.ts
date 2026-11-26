@@ -289,24 +289,12 @@ export function mapSoundCueBoundaries(cues: readonly SoundSceneCue[], segments: 
     const end = cue.offset + cue.anchor.length
     const index = segments.findIndex(segment => segment !== null && cue.offset >= segment.start && end <= segment.end)
     if (index < 0) continue
-    mapped.push({ cue, boundary: cue.position === 'before' ? index : index + 1 })
-  }
-  // A start anchored AFTER one voice and a stop BEFORE the next otherwise
-  // collapse to the same boundary and never play. For an unambiguous pair,
-  // place the start at the beginning of its own source clip, retaining the
-  // original stop boundary. This is clip-level approximation, not word timing.
-  for (const start of mapped) {
-    if (start.cue.kind !== 'ambience' || start.cue.action !== 'play' || start.cue.position !== 'after' || start.boundary < 1) continue
-    const sameBoundary = mapped.filter(item => item.cue.kind === 'ambience' && item.boundary === start.boundary)
-    if (sameBoundary.length !== 2) continue
-    const stop = sameBoundary.find(item => item.cue.action === 'stop' && item.cue.position === 'before')
-    const previous = segments[start.boundary - 1]
-    const next = segments[start.boundary]
-    if (!stop || !previous || !next || start.cue.offset < previous.start || start.cue.offset + start.cue.anchor.length > previous.end
-      || stop.cue.offset < next.start || stop.cue.offset + stop.cue.anchor.length > next.end
-      || start.cue.offset + start.cue.anchor.length > stop.cue.offset) continue
-    start.boundary -= 1
-    start.adjustment = 'ambience-start-before-source-clip'
+    // Ambience is a background layer: begin with the narration that
+    // establishes it, even when the planner asks for "after". Events and
+    // stop cues retain their explicit before/after boundary semantics.
+    const ambienceStart = cue.kind === 'ambience' && cue.action === 'play' && cue.position === 'after'
+    mapped.push({ cue, boundary: ambienceStart || cue.position === 'before' ? index : index + 1,
+      ...(ambienceStart ? { adjustment: 'ambience-start-before-source-clip' as const } : {}) })
   }
   return mapped
 }

@@ -488,9 +488,28 @@ test('ambience start and stop at the same boundary cover the introducing clip on
   assert.equal(ambienceInstructionAtBoundary(mapped, 1), null)
   assert.equal(ambienceInstructionAtBoundary(mapped, 2), null)
   const ambiguous = mapSoundCueBoundaries([start, stop, { ...stop, anchor: 'cabin door', offset: message.indexOf('cabin door') }], segments, message.length)
-  assert.deepEqual(ambiguous.map(item => item.boundary), [1, 1, 1])
+  assert.deepEqual(ambiguous.map(item => item.boundary), [0, 1, 1])
   const sameClip = { ...stop, anchor: 'grass', offset: message.indexOf('grass') }
-  assert.deepEqual(mapSoundCueBoundaries([start, sameClip], segments, message.length).map(item => item.boundary), [1, 0])
+  assert.deepEqual(mapSoundCueBoundaries([start, sameClip], segments, message.length).map(item => item.boundary), [0, 0])
+  assert.equal(ambienceInstructionAtBoundary(mapSoundCueBoundaries([start, sameClip], segments, message.length), 0), null)
+})
+
+test('ambience starts under its source clip but event and stop after positions remain unchanged', () => {
+  const message = 'Crickets chirped. Maya opened the door. The refrigerator hummed.'
+  const clips = ['Crickets chirped.', 'Maya opened the door.', 'The refrigerator hummed.']
+  const spans = alignSoundSourceSegments(message, clips)
+  const start = { kind: 'ambience' as const, action: 'play' as const, assetId: 'crickets', anchor: 'Crickets chirped.', offset: 0, position: 'after' as const }
+  const stop = { kind: 'ambience' as const, action: 'stop' as const, anchor: 'Maya opened the door.', offset: message.indexOf('Maya opened'), position: 'after' as const }
+  const event = { kind: 'event' as const, action: 'play' as const, assetId: 'door', anchor: 'Maya opened the door.', offset: message.indexOf('Maya opened'), position: 'after' as const }
+  const mapped = mapSoundCueBoundaries([start, stop, event], spans, message.length)
+  assert.deepEqual(mapped.map(item => item.boundary), [0, 2, 2])
+  assert.equal(mapped[0].adjustment, 'ambience-start-before-source-clip')
+  assert.equal(ambienceInstructionAtBoundary(mapped, 0)?.assetId, 'crickets')
+  assert.equal(ambienceInstructionAtBoundary(mapped, 1)?.assetId, 'crickets')
+  assert.equal(ambienceInstructionAtBoundary(mapped, 2), null)
+  assert.equal(ambienceInstructionAtBoundary(mapped, 3), null)
+  const before = { ...start, position: 'before' as const }
+  assert.equal(mapSoundCueBoundaries([before], spans, message.length)[0].adjustment, undefined)
 })
 
 test('local sound mix permits ambience under speech and events but prohibits event/voice overlap', () => {
