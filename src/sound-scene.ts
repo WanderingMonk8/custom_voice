@@ -45,8 +45,17 @@ export interface SoundSceneSegment {
 }
 
 /** Add natural narration boundaries without changing dialogue or vocal-tag jobs. */
-export function splitNarrationForSoundEvents(segments: readonly VoicePlanSegment[]): VoicePlanSegment[] {
+export function splitNarrationForSoundEvents(
+  segments: readonly VoicePlanSegment[],
+  options?: { eventSounds: readonly FavoriteSound[]; cues?: readonly SoundSceneCue[] },
+): VoicePlanSegment[] {
   const result: VoicePlanSegment[] = []
+  const ignored = new Set(['the', 'and', 'sound', 'audio', 'with', 'from', 'this', 'that', 'short', 'effect', 'recording', 'mp3', 'wav'])
+  const wordForms = (text: string) => (text.toLocaleLowerCase().match(/[\p{L}]{4,}/gu) ?? [])
+    .map(word => word.endsWith('s') && word.length > 4 ? word.slice(0, -1) : word)
+    .filter(word => !ignored.has(word))
+  const eventTerms = new Set((options?.eventSounds ?? []).filter(sound => sound.kind === 'event')
+    .flatMap(sound => wordForms([sound.name, ...sound.tags].join(' '))))
   for (const segment of segments) {
     if (segment.originalSpeech !== undefined || segment.tagId || /[\[\]<>]/u.test(segment.text)) { result.push(segment); continue }
     // Avoid splitting obvious abbreviations and decimals into unrelated jobs.
@@ -61,6 +70,21 @@ export function splitNarrationForSoundEvents(segments: readonly VoicePlanSegment
     if (pending) {
       if (parts.length) parts[parts.length - 1] += ` ${pending}`
       else parts.push(pending)
+    }
+    // Commas are useful near an event, but splitting every comma can exhaust
+    // the TTS request window. Keep sentence boundaries and any known cue edge.
+    // If metadata is unavailable, retain the prior conservative behavior.
+    if (options && eventTerms.size) {
+      for (let i = 0; i < parts.length - 1;) {
+        const left = parts[i]
+        const right = parts[i + 1]
+        const commaBoundary = /[,;]["'”’)]*$/u.test(left)
+        const eventNearby = wordForms(left).some(word => eventTerms.has(word))
+        const knownCueEdge = (options.cues ?? []).some(cue => cue.kind === 'event' && cue.action === 'play'
+          && ((cue.position === 'after' && left.includes(cue.anchor)) || (cue.position === 'before' && right.includes(cue.anchor))))
+        if (commaBoundary && !eventNearby && !knownCueEdge) parts.splice(i, 2, `${left} ${right}`)
+        else i++
+      }
     }
     // Keep the request count bounded without giving up every useful boundary.
     while (parts.length > 12) {

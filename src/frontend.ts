@@ -4262,6 +4262,7 @@ export function setup(ctx: SpindleFrontendContext) {
     const eventAssets = new Map<string, SynthesizedVoiceSegment>()
     const soundAssetKinds = new Map<string, 'event' | 'ambience'>()
     const soundAssetNames = new Map<string, string>()
+    let soundLibrarySnapshot: FavoriteSound[] | null = null
     const soundCreditAssets = new Map<string, NonNullable<SavedAudioRecord['soundCredits']>[number]>()
     const usedSoundCredits = new Map<number, NonNullable<SavedAudioRecord['soundCredits']>[number]>()
     const soundLoadQueue = new SoundLoadQueue(2)
@@ -4319,6 +4320,7 @@ export function setup(ctx: SpindleFrontendContext) {
       const soundListStarted = Date.now()
       void soundLibraryRequest('chat_voice_sound_library_list').then(result => {
         appendSpeakerDebugLog(`Sound timing: local library list=${Date.now() - soundListStarted}ms.`)
+        soundLibrarySnapshot = result.favorites ?? []
         for (const sound of result.favorites ?? []) soundAssetNames.set(sound.id, sound.name)
         const kinds: Array<'event' | 'ambience'> = []
         if (preferences.eventSounds) kinds.push('event')
@@ -4783,9 +4785,9 @@ export function setup(ctx: SpindleFrontendContext) {
         plan.splice(0, plan.length, ...splitPlan)
       }
       if (preferences.eventSounds) {
-        const narrationPlan = splitNarrationForSoundEvents(plan)
+        const narrationPlan = splitNarrationForSoundEvents(plan, soundLibrarySnapshot === null ? undefined : { eventSounds: soundLibrarySnapshot, cues: eventCues })
         if (narrationPlan.length !== plan.length) {
-          appendSpeakerDebugLog(`Sound effects: added ${narrationPlan.length - plan.length} natural narration boundary/boundaries.`)
+          appendSpeakerDebugLog(`Sound effects: added ${narrationPlan.length - plan.length} natural narration boundary/boundaries; event-aware=${soundLibrarySnapshot !== null}, planner-cues=${eventCues.length}.`)
           plan.splice(0, plan.length, ...narrationPlan)
         }
       }

@@ -353,6 +353,32 @@ test('short narration fragments do not prevent splitting the rest of a sound-ric
   assert.equal(splitNarrationForSoundEvents([{ text: abbreviation, voice: 'narrator' }]).length, 1)
 })
 
+test('event-aware splitting reduces the sample scene jobs while preserving door boundaries', () => {
+  const sounds = [
+    { version: 1 as const, id: 'door', name: 'door open close', description: '', tags: ['door open', 'door close'], kind: 'event' as const, mime: 'audio/wav', bytes: 1, createdAt: new Date().toISOString() },
+    { version: 1 as const, id: 'steps', name: 'Foot step', description: '', tags: ['footsteps'], kind: 'event' as const, mime: 'audio/wav', bytes: 1, createdAt: new Date().toISOString() },
+  ]
+  const segments = [
+    { voice: 'narrator', text: 'The following is a test message:' },
+    { voice: 'narrator', text: 'The restaurant door opened, and a wave of conversation spilled into the street. Inside, people chatted over dinner while dishes clinked in the crowded room.' },
+    { voice: 'maya', text: 'This place is louder than I expected,', originalSpeech: 'This place is louder than I expected,' },
+    { voice: 'narrator', text: 'Maya said. She stepped back outside, and the door closed behind her. Her footsteps crossed the pavement toward the park. In the park, a creek burbled beside the path. The afternoon was sunny, and Maya paused on a bench to listen to the water.' },
+    { voice: 'maya', text: 'Much better.', originalSpeech: 'Much better.' },
+    { voice: 'narrator', text: 'By the time she reached the cabin, darkness had settled over the trees. Crickets chirped in the grass, and a coyote called in the distance. Maya opened the cabin door. Inside, the refrigerator hummed steadily in the quiet kitchen. She closed the door and set her keys on the counter.' },
+  ]
+  const previous = splitNarrationForSoundEvents(segments)
+  const optimized = splitNarrationForSoundEvents(segments, { eventSounds: sounds })
+  assert.ok(previous.length > 18)
+  assert.ok(optimized.length <= 18, `expected at most 18 jobs, got ${optimized.length}`)
+  assert.ok(optimized.some(item => item.text === 'The restaurant door opened,'))
+  assert.ok(optimized.some(item => item.text === 'Maya opened the cabin door.'))
+  assert.ok(optimized.some(item => item.text.includes('She closed the door')))
+  assert.equal(optimized.filter(item => item.originalSpeech !== undefined).length, 2)
+  const cue = { kind: 'event' as const, action: 'play' as const, anchor: 'stepped back outside', offset: 0, position: 'after' as const }
+  const cueProtected = splitNarrationForSoundEvents([{ voice: 'narrator', text: 'She stepped back outside, and the door closed behind her.' }], { eventSounds: sounds, cues: [cue] })
+  assert.equal(cueProtected.length, 2)
+})
+
 test('sound prefetch shortlist matches metadata without selecting the cue', () => {
   const sound = { version: 1 as const, id: 'door', name: 'door close', description: '', tags: ['door'], kind: 'event' as const, mime: 'audio/wav', bytes: 1, createdAt: new Date().toISOString() }
   assert.deepEqual(shortlistSoundAssets('The door opened.', [sound]).map(item => item.id), ['door'])

@@ -128,8 +128,11 @@ var SoundLoadQueue = class {
 };
 
 // src/sound-scene.ts
-function splitNarrationForSoundEvents(segments) {
+function splitNarrationForSoundEvents(segments, options) {
   const result = [];
+  const ignored = /* @__PURE__ */ new Set(["the", "and", "sound", "audio", "with", "from", "this", "that", "short", "effect", "recording", "mp3", "wav"]);
+  const wordForms = (text) => (text.toLocaleLowerCase().match(/[\p{L}]{4,}/gu) ?? []).map((word) => word.endsWith("s") && word.length > 4 ? word.slice(0, -1) : word).filter((word) => !ignored.has(word));
+  const eventTerms = new Set((options?.eventSounds ?? []).filter((sound) => sound.kind === "event").flatMap((sound) => wordForms([sound.name, ...sound.tags].join(" "))));
   for (const segment of segments) {
     if (segment.originalSpeech !== void 0 || segment.tagId || /[\[\]<>]/u.test(segment.text)) {
       result.push(segment);
@@ -152,6 +155,17 @@ function splitNarrationForSoundEvents(segments) {
     if (pending) {
       if (parts.length) parts[parts.length - 1] += ` ${pending}`;
       else parts.push(pending);
+    }
+    if (options && eventTerms.size) {
+      for (let i = 0; i < parts.length - 1; ) {
+        const left = parts[i];
+        const right = parts[i + 1];
+        const commaBoundary = /[,;]["'”’)]*$/u.test(left);
+        const eventNearby = wordForms(left).some((word) => eventTerms.has(word));
+        const knownCueEdge = (options.cues ?? []).some((cue) => cue.kind === "event" && cue.action === "play" && (cue.position === "after" && left.includes(cue.anchor) || cue.position === "before" && right.includes(cue.anchor)));
+        if (commaBoundary && !eventNearby && !knownCueEdge) parts.splice(i, 2, `${left} ${right}`);
+        else i++;
+      }
     }
     while (parts.length > 12) {
       let shortest = 0;
@@ -6719,6 +6733,7 @@ function setup(ctx) {
       const eventAssets = /* @__PURE__ */ new Map();
       const soundAssetKinds = /* @__PURE__ */ new Map();
       const soundAssetNames = /* @__PURE__ */ new Map();
+      let soundLibrarySnapshot = null;
       const soundCreditAssets = /* @__PURE__ */ new Map();
       const usedSoundCredits = /* @__PURE__ */ new Map();
       const soundLoadQueue = new SoundLoadQueue(2);
@@ -6784,6 +6799,7 @@ function setup(ctx) {
         const soundListStarted = Date.now();
         void soundLibraryRequest("chat_voice_sound_library_list").then((result) => {
           appendSpeakerDebugLog(`Sound timing: local library list=${Date.now() - soundListStarted}ms.`);
+          soundLibrarySnapshot = result.favorites ?? [];
           for (const sound of result.favorites ?? []) soundAssetNames.set(sound.id, sound.name);
           const kinds = [];
           if (preferences.eventSounds) kinds.push("event");
@@ -7136,9 +7152,9 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
           plan.splice(0, plan.length, ...splitPlan);
         }
         if (preferences.eventSounds) {
-          const narrationPlan = splitNarrationForSoundEvents(plan);
+          const narrationPlan = splitNarrationForSoundEvents(plan, soundLibrarySnapshot === null ? void 0 : { eventSounds: soundLibrarySnapshot, cues: eventCues });
           if (narrationPlan.length !== plan.length) {
-            appendSpeakerDebugLog(`Sound effects: added ${narrationPlan.length - plan.length} natural narration boundary/boundaries.`);
+            appendSpeakerDebugLog(`Sound effects: added ${narrationPlan.length - plan.length} natural narration boundary/boundaries; event-aware=${soundLibrarySnapshot !== null}, planner-cues=${eventCues.length}.`);
             plan.splice(0, plan.length, ...narrationPlan);
           }
         }
