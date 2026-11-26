@@ -1,4 +1,5 @@
 import { generateUuidV7 } from './uuid'
+import { isFreesoundCc0 } from './freesound'
 
 /** Small, per-user foundation for the future sound-effects library. */
 export interface SoundUserStorage {
@@ -119,6 +120,7 @@ export class SoundLibrary {
     const mime = typeof input.mime === 'string' ? input.mime.trim().toLowerCase() : ''
     const provenance = input.provenance === undefined ? undefined : normalizeProvenance(input.provenance)
     if (input.provenance !== undefined && !provenance) throw new Error('Invalid sound provenance.')
+    if (provenance && !isFreesoundCc0(provenance.license)) throw new Error('Only CC0 Freesound imports are supported until recording attribution is available.')
     if (!name || name.length > 120 || description.length > 500 || tags.length > 20 || tags.some(tag => !tag || tag.length > 40)
       || (input.kind !== 'ambience' && input.kind !== 'event')) throw new Error('Invalid favorite sound metadata.')
     if (!(data instanceof Uint8Array) || data.length < 1 || data.length > MAX_FAVORITE_SOUND_BYTES || !validAudio(data, mime)) {

@@ -1,15 +1,11 @@
 // src/uuid.ts
 var UUID_HEX = Array.from({ length: 256 }, (_, index) => index.toString(16).padStart(2, "0"));
 
-// src/sound-library.ts
-var ROOT = "sound-effects/v1";
-var RECORDS = `${ROOT}/favorites`;
-var AUDIO = `${ROOT}/audio`;
-var MAX_FAVORITE_SOUND_BYTES = 24 * 1024 * 1024;
-var SOUND_TRANSFER_CHUNK_BYTES = 1024 * 1024;
-var MAX_FAVORITE_LIBRARY_BYTES = 100 * 1024 * 1024;
-
 // src/freesound.ts
+function isFreesoundCc0(license) {
+  if (typeof license !== "string") return false;
+  return /^(?:creative commons 0|cc0|https?:\/\/creativecommons\.org\/publicdomain\/zero\/1\.0\/?$)$/iu.test(license.trim());
+}
 function safeFreesoundPreviewUrl(value, id) {
   if (typeof value !== "string" || !Number.isSafeInteger(id) || id < 1) return void 0;
   try {
@@ -22,6 +18,14 @@ function safeFreesoundPreviewUrl(value, id) {
     return void 0;
   }
 }
+
+// src/sound-library.ts
+var ROOT = "sound-effects/v1";
+var RECORDS = `${ROOT}/favorites`;
+var AUDIO = `${ROOT}/audio`;
+var MAX_FAVORITE_SOUND_BYTES = 24 * 1024 * 1024;
+var SOUND_TRANSFER_CHUNK_BYTES = 1024 * 1024;
+var MAX_FAVORITE_LIBRARY_BYTES = 100 * 1024 * 1024;
 
 // src/sound-scene.ts
 function splitNarrationForSoundEvents(segments) {
@@ -4270,7 +4274,7 @@ function setup(ctx) {
   }
   const freesoundSearchHint = document.createElement("div");
   freesoundSearchHint.className = "chat-voice-hint";
-  freesoundSearchHint.textContent = "Search terms are sent to Freesound. Playing a preview connects your browser to Freesound\u2019s audio server. Review the creator and license on the sound\u2019s page. Importing results is not available yet.";
+  freesoundSearchHint.textContent = "Search terms are sent to Freesound. Previews and imports connect your browser to Freesound\u2019s audio server. Only CC0 previews can be imported for now; other licenses require recording-level attribution support.";
   const freesoundQuery = document.createElement("input");
   freesoundQuery.placeholder = "Search Freesound";
   freesoundQuery.maxLength = 120;
@@ -4753,6 +4757,64 @@ function setup(ctx) {
       ctx.sendToBackend({ type, requestId, ...fields });
     });
   }
+  async function uploadFavoriteSound(favorite, bytes) {
+    if (bytes.length <= 2 * 1024 * 1024) {
+      let binary = "";
+      for (let index = 0; index < bytes.length; index += 8192) binary += String.fromCharCode(...bytes.subarray(index, index + 8192));
+      await soundLibraryRequest("chat_voice_sound_library_add", { favorite, audio: btoa(binary) });
+      return;
+    }
+    const begin = await soundLibraryRequest("chat_voice_sound_upload_begin", { size: bytes.length });
+    if (!begin.uploadId) throw new Error("Could not start sound upload.");
+    const uploadId = begin.uploadId;
+    try {
+      for (let offset = 0; offset < bytes.length; offset += SOUND_TRANSFER_CHUNK_BYTES) {
+        const part = bytes.subarray(offset, offset + SOUND_TRANSFER_CHUNK_BYTES);
+        let binary = "";
+        for (let index = 0; index < part.length; index += 8192) binary += String.fromCharCode(...part.subarray(index, index + 8192));
+        await soundLibraryRequest("chat_voice_sound_upload_chunk", { uploadId, offset, audio: btoa(binary) });
+      }
+      await soundLibraryRequest("chat_voice_sound_upload_finish", { uploadId, favorite });
+    } catch (error) {
+      void soundLibraryRequest("chat_voice_sound_upload_cancel", { uploadId }).catch(() => void 0);
+      throw error;
+    }
+  }
+  async function downloadFreesoundPreview(url) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 3e4);
+    try {
+      const response = await fetch(url, { credentials: "omit", redirect: "error", referrerPolicy: "no-referrer", signal: controller.signal });
+      if (!response.ok || !response.body) throw new Error("Freesound preview download is unavailable.");
+      const size = Number(response.headers.get("content-length"));
+      if (Number.isFinite(size) && size > MAX_FAVORITE_SOUND_BYTES) throw new Error("The preview exceeds 24 MiB.");
+      const reader = response.body.getReader();
+      const chunks = [];
+      let total = 0;
+      try {
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          total += value.byteLength;
+          if (total > MAX_FAVORITE_SOUND_BYTES) throw new Error("The preview exceeds 24 MiB.");
+          chunks.push(value);
+        }
+      } catch (error) {
+        await reader.cancel().catch(() => void 0);
+        throw error;
+      }
+      if (!total) throw new Error("The Freesound preview was empty.");
+      const bytes = new Uint8Array(total);
+      let offset = 0;
+      for (const chunk of chunks) {
+        bytes.set(chunk, offset);
+        offset += chunk.length;
+      }
+      return bytes;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
   freesoundSearchButton.addEventListener("click", () => {
     void (async () => {
       const query = freesoundQuery.value.trim();
@@ -4834,6 +4896,50 @@ function setup(ctx) {
               });
             });
             row.append(preview);
+            if (isFreesoundCc0(item.license)) {
+              const category = document.createElement("select");
+              category.setAttribute("aria-label", `Sound type for ${item.name}`);
+              for (const [value, label] of [["event", "Event sound"], ["ambience", "Ambience"]]) {
+                const option = document.createElement("option");
+                option.value = value;
+                option.textContent = label;
+                category.append(option);
+              }
+              const add = document.createElement("button");
+              add.type = "button";
+              add.className = "chat-voice-add-button";
+              add.textContent = "Import CC0 preview";
+              add.addEventListener("click", () => {
+                void (async () => {
+                  add.disabled = true;
+                  add.textContent = "Importing\u2026";
+                  try {
+                    const url = safeFreesoundPreviewUrl(item.previewUrl, item.id);
+                    if (!url || !isFreesoundCc0(item.license)) throw new Error("This preview is not available for import.");
+                    if (item.duration > 120) throw new Error("Sound must be at most 120 seconds long.");
+                    const bytes = await downloadFreesoundPreview(url);
+                    const Context = window.AudioContext ?? window.webkitAudioContext;
+                    if (!Context) throw new Error("This browser cannot validate audio files.");
+                    const context2 = new Context();
+                    try {
+                      const decoded = await context2.decodeAudioData(bytes.buffer.slice(0));
+                      if (!Number.isFinite(decoded.duration) || decoded.duration <= 0 || decoded.duration > 120 || decoded.numberOfChannels > 2) throw new Error("Preview must be mono or stereo and at most 120 seconds.");
+                    } finally {
+                      await context2.close().catch(() => void 0);
+                    }
+                    await uploadFavoriteSound({ name: item.name.trim().slice(0, 120), description: "", tags: item.tags ?? [], kind: category.value === "ambience" ? "ambience" : "event", mime: "audio/mpeg", provenance: { provider: "freesound", soundId: item.id, creator: item.username, license: item.license, sourceUrl: `https://freesound.org/s/${item.id}/` } }, bytes);
+                    await refreshSoundLibrary();
+                    setStatus("Freesound preview imported to favorites.", "saved");
+                  } catch (error) {
+                    setStatus(error instanceof Error && error.name === "AbortError" ? "Freesound preview download timed out." : error instanceof TypeError ? "Could not download the preview; your browser or server may block cross-origin requests." : error instanceof Error ? error.message : "Could not import the Freesound preview.", "error");
+                  } finally {
+                    add.disabled = false;
+                    add.textContent = "Import CC0 preview";
+                  }
+                })();
+              });
+              row.append(category, add);
+            }
           }
           freesoundResults.append(row);
         }
@@ -5117,27 +5223,7 @@ function setup(ctx) {
         }
         const bytes = new Uint8Array(data);
         const favorite = { name: soundName.value, tags: soundTags.value.split(",").map((tag) => tag.trim()).filter(Boolean), kind: soundKind.value, mime };
-        if (bytes.length <= 2 * 1024 * 1024) {
-          let binary = "";
-          for (let index = 0; index < bytes.length; index += 8192) binary += String.fromCharCode(...bytes.subarray(index, index + 8192));
-          await soundLibraryRequest("chat_voice_sound_library_add", { favorite, audio: btoa(binary) });
-        } else {
-          const begin = await soundLibraryRequest("chat_voice_sound_upload_begin", { size: bytes.length });
-          if (!begin.uploadId) throw new Error("Could not start sound upload.");
-          const uploadId = begin.uploadId;
-          try {
-            for (let offset = 0; offset < bytes.length; offset += SOUND_TRANSFER_CHUNK_BYTES) {
-              const part = bytes.subarray(offset, offset + SOUND_TRANSFER_CHUNK_BYTES);
-              let binary = "";
-              for (let index = 0; index < part.length; index += 8192) binary += String.fromCharCode(...part.subarray(index, index + 8192));
-              await soundLibraryRequest("chat_voice_sound_upload_chunk", { uploadId, offset, audio: btoa(binary) });
-            }
-            await soundLibraryRequest("chat_voice_sound_upload_finish", { uploadId, favorite });
-          } catch (error) {
-            void soundLibraryRequest("chat_voice_sound_upload_cancel", { uploadId }).catch(() => void 0);
-            throw error;
-          }
-        }
+        await uploadFavoriteSound(favorite, bytes);
         soundFile.value = "";
         soundName.value = "";
         soundTags.value = "";

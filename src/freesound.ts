@@ -6,6 +6,13 @@ export interface FreesoundSearchResult {
   duration: number
   url: string
   previewUrl?: string
+  tags?: string[]
+}
+
+/** Restrict early import to CC0 until recording-level attribution is supported. */
+export function isFreesoundCc0(license: unknown): boolean {
+  if (typeof license !== 'string') return false
+  return /^(?:creative commons 0|cc0|https?:\/\/creativecommons\.org\/publicdomain\/zero\/1\.0\/?$)$/iu.test(license.trim())
 }
 
 /** Accept only canonical Freesound MP3 previews tied to the result ID. */
@@ -32,7 +39,8 @@ export function parseFreesoundSearch(payload: unknown): FreesoundSearchResult[] 
       || typeof row.duration !== 'number' || !Number.isFinite(row.duration) || row.duration < 0) continue
     const previews = row.previews && typeof row.previews === 'object' && !Array.isArray(row.previews) ? row.previews as Record<string, unknown> : {}
     const previewUrl = safeFreesoundPreviewUrl(previews['preview-hq-mp3'], row.id as number)
-    result.push({ id: row.id as number, name: row.name.trim().slice(0, 160), username: row.username.trim().slice(0, 120), license: row.license.trim().slice(0, 300), duration: row.duration, url: `https://freesound.org/s/${row.id}/`, ...(previewUrl ? { previewUrl } : {}) })
+    const tags = Array.isArray(row.tags) ? row.tags.filter((tag): tag is string => typeof tag === 'string' && !!tag.trim()).map(tag => tag.trim().slice(0, 40)).slice(0, 20) : []
+    result.push({ id: row.id as number, name: row.name.trim().slice(0, 160), username: row.username.trim().slice(0, 120), license: row.license.trim().slice(0, 300), duration: row.duration, url: `https://freesound.org/s/${row.id}/`, ...(previewUrl ? { previewUrl } : {}), ...(tags.length ? { tags } : {}) })
   }
   return result
 }

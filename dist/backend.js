@@ -42,6 +42,38 @@ function generateUuidV7() {
   ].join("-");
 }
 
+// src/freesound.ts
+function isFreesoundCc0(license) {
+  if (typeof license !== "string") return false;
+  return /^(?:creative commons 0|cc0|https?:\/\/creativecommons\.org\/publicdomain\/zero\/1\.0\/?$)$/iu.test(license.trim());
+}
+function safeFreesoundPreviewUrl(value, id) {
+  if (typeof value !== "string" || !Number.isSafeInteger(id) || id < 1) return void 0;
+  try {
+    const url = new URL(value);
+    if (url.protocol !== "https:" || url.username || url.password || url.port || url.search || url.hash) return void 0;
+    const prefix = url.hostname === "cdn.freesound.org" ? "/previews/" : url.hostname === "freesound.org" ? "/data/previews/" : "";
+    if (!prefix || !new RegExp(`^${prefix}\\d+/${id}_[0-9]+-hq\\.mp3$`, "u").test(url.pathname)) return void 0;
+    return url.href;
+  } catch {
+    return void 0;
+  }
+}
+function parseFreesoundSearch(payload) {
+  if (!payload || typeof payload !== "object" || !Array.isArray(payload.results)) throw new Error("Unexpected Freesound search response.");
+  const result = [];
+  for (const value of payload.results.slice(0, 20)) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) continue;
+    const row = value;
+    if (!Number.isSafeInteger(row.id) || row.id < 1 || typeof row.name !== "string" || !row.name.trim() || typeof row.username !== "string" || !row.username.trim() || typeof row.license !== "string" || !row.license.trim() || typeof row.duration !== "number" || !Number.isFinite(row.duration) || row.duration < 0) continue;
+    const previews = row.previews && typeof row.previews === "object" && !Array.isArray(row.previews) ? row.previews : {};
+    const previewUrl = safeFreesoundPreviewUrl(previews["preview-hq-mp3"], row.id);
+    const tags = Array.isArray(row.tags) ? row.tags.filter((tag) => typeof tag === "string" && !!tag.trim()).map((tag) => tag.trim().slice(0, 40)).slice(0, 20) : [];
+    result.push({ id: row.id, name: row.name.trim().slice(0, 160), username: row.username.trim().slice(0, 120), license: row.license.trim().slice(0, 300), duration: row.duration, url: `https://freesound.org/s/${row.id}/`, ...previewUrl ? { previewUrl } : {}, ...tags.length ? { tags } : {} });
+  }
+  return result;
+}
+
 // src/sound-library.ts
 var ROOT = "sound-effects/v1";
 var RECORDS = `${ROOT}/favorites`;
@@ -112,6 +144,7 @@ var SoundLibrary = class {
       const mime = typeof input.mime === "string" ? input.mime.trim().toLowerCase() : "";
       const provenance = input.provenance === void 0 ? void 0 : normalizeProvenance(input.provenance);
       if (input.provenance !== void 0 && !provenance) throw new Error("Invalid sound provenance.");
+      if (provenance && !isFreesoundCc0(provenance.license)) throw new Error("Only CC0 Freesound imports are supported until recording attribution is available.");
       if (!name || name.length > 120 || description.length > 500 || tags.length > 20 || tags.some((tag) => !tag || tag.length > 40) || input.kind !== "ambience" && input.kind !== "event") throw new Error("Invalid favorite sound metadata.");
       if (!(data instanceof Uint8Array) || data.length < 1 || data.length > MAX_FAVORITE_SOUND_BYTES || !validAudio(data, mime)) {
         throw new Error("Invalid or oversized audio file.");
@@ -290,33 +323,6 @@ var SoundDownloadTransfers = class {
     if (this.downloads.get(id)?.owner === owner) this.downloads.delete(id);
   }
 };
-
-// src/freesound.ts
-function safeFreesoundPreviewUrl(value, id) {
-  if (typeof value !== "string" || !Number.isSafeInteger(id) || id < 1) return void 0;
-  try {
-    const url = new URL(value);
-    if (url.protocol !== "https:" || url.username || url.password || url.port || url.search || url.hash) return void 0;
-    const prefix = url.hostname === "cdn.freesound.org" ? "/previews/" : url.hostname === "freesound.org" ? "/data/previews/" : "";
-    if (!prefix || !new RegExp(`^${prefix}\\d+/${id}_[0-9]+-hq\\.mp3$`, "u").test(url.pathname)) return void 0;
-    return url.href;
-  } catch {
-    return void 0;
-  }
-}
-function parseFreesoundSearch(payload) {
-  if (!payload || typeof payload !== "object" || !Array.isArray(payload.results)) throw new Error("Unexpected Freesound search response.");
-  const result = [];
-  for (const value of payload.results.slice(0, 20)) {
-    if (!value || typeof value !== "object" || Array.isArray(value)) continue;
-    const row = value;
-    if (!Number.isSafeInteger(row.id) || row.id < 1 || typeof row.name !== "string" || !row.name.trim() || typeof row.username !== "string" || !row.username.trim() || typeof row.license !== "string" || !row.license.trim() || typeof row.duration !== "number" || !Number.isFinite(row.duration) || row.duration < 0) continue;
-    const previews = row.previews && typeof row.previews === "object" && !Array.isArray(row.previews) ? row.previews : {};
-    const previewUrl = safeFreesoundPreviewUrl(previews["preview-hq-mp3"], row.id);
-    result.push({ id: row.id, name: row.name.trim().slice(0, 160), username: row.username.trim().slice(0, 120), license: row.license.trim().slice(0, 300), duration: row.duration, url: `https://freesound.org/s/${row.id}/`, ...previewUrl ? { previewUrl } : {} });
-  }
-  return result;
-}
 
 // src/sound-scene.ts
 function competingSoundCueIndexes(cues) {
@@ -8437,7 +8443,7 @@ spindle.onFrontendMessage(async (rawPayload, userId, frontendSessionId) => {
         if (!query || query.length > 120) throw new Error("Enter a search of up to 120 characters.");
         const key = await spindle.enclave.get("freesound_api_key", userId);
         if (!key) throw new Error("Save a Freesound API key in Sound effects \u2192 Advanced first.");
-        const params = new URLSearchParams({ query, fields: "id,name,username,license,duration,previews", page_size: "12" });
+        const params = new URLSearchParams({ query, fields: "id,name,username,license,duration,previews,tags", page_size: "12" });
         const response = await Promise.race([
           spindle.cors(`https://freesound.org/apiv2/search/text/?${params}`, { method: "GET", headers: { Authorization: `Token ${key}` } }),
           new Promise((_, reject) => setTimeout(() => reject(new Error("Freesound search timed out.")), 2e4))

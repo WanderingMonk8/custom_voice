@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { SoundLibrary, type SoundUserStorage } from './sound-library'
 import { SoundDownloadTransfers, SoundUploadTransfers } from './sound-transfer'
-import { parseFreesoundSearch, safeFreesoundPreviewUrl } from './freesound'
+import { isFreesoundCc0, parseFreesoundSearch, safeFreesoundPreviewUrl } from './freesound'
 import { alignSoundSourceSegments, ambienceInstructionAtBoundary, competingSoundCueIndexes, interleaveSoundEvents, mapSoundCueBoundaries, parseSoundScenePlan, shortlistSoundAssets, splitNarrationForSoundEvents } from './sound-scene'
 import { DEFAULT_AMBIENCE_VOLUME, DEFAULT_EVENT_VOLUME, mixAmbienceClip, readSoundVolume, renderSoundMix, soundCategoryGain } from './sound-mix'
 import { buildSoundTimeline, encodeSoundTimelineWav, resampleSoundClip } from './sound-timeline'
@@ -64,6 +64,14 @@ test('Freesound preview URLs must use a known HTTPS host and matching sound ID',
   assert.equal(parsed[0].previewUrl, valid)
 })
 
+test('early Freesound imports accept CC0 and reject licenses requiring attribution', () => {
+  assert.equal(isFreesoundCc0('http://creativecommons.org/publicdomain/zero/1.0/'), true)
+  assert.equal(isFreesoundCc0('https://creativecommons.org/publicdomain/zero/1.0/'), true)
+  assert.equal(isFreesoundCc0('Creative Commons 0'), true)
+  assert.equal(isFreesoundCc0('https://creativecommons.org/licenses/by/4.0/'), false)
+  assert.equal(isFreesoundCc0('https://creativecommons.org/publicdomain/zero/1.0.evil/'), false)
+})
+
 test('sound favorites persist across library instances and stay isolated by user', async () => {
   const storage = new FakeSoundStorage()
   const wav = new TextEncoder().encode('RIFF0000WAVEaudio')
@@ -89,11 +97,12 @@ test('sound favorites persist across library instances and stay isolated by user
 test('sound provenance persists through edits and canonicalizes the source URL', async () => {
   const library = new SoundLibrary(new FakeSoundStorage())
   const audio = new TextEncoder().encode('RIFF0000WAVEaudio')
-  const favorite = await library.add({ name: 'Creek', kind: 'ambience', mime: 'audio/wav', provenance: { provider: 'freesound', soundId: 123, creator: 'artist', license: 'CC BY', sourceUrl: 'https://evil.example/' } }, audio, 'alice')
+  const favorite = await library.add({ name: 'Creek', kind: 'ambience', mime: 'audio/wav', provenance: { provider: 'freesound', soundId: 123, creator: 'artist', license: 'CC0', sourceUrl: 'https://evil.example/' } }, audio, 'alice')
   assert.equal(favorite.provenance?.sourceUrl, 'https://freesound.org/s/123/')
   const edited = await library.edit(favorite.id, { name: 'Stream', kind: 'ambience', tags: [] }, 'alice')
   assert.deepEqual(edited.provenance, favorite.provenance)
   assert.deepEqual((await library.read(favorite.id, 'alice')).record.provenance, favorite.provenance)
+  await assert.rejects(() => library.add({ name: 'Other', kind: 'event', mime: 'audio/wav', provenance: { provider: 'freesound', soundId: 124, creator: 'artist', license: 'CC BY', sourceUrl: 'https://freesound.org/s/124/' } }, audio, 'alice'), /Only CC0/)
 })
 
 test('large sound uploads are ordered, bounded and isolated by frontend session', () => {
