@@ -14,6 +14,16 @@ export interface SoundSceneSegment {
   end: number
 }
 
+/** Insert events at voice boundaries, preserving both voice and event order. */
+export function interleaveSoundEvents<T>(voices: readonly T[], events: ReadonlyMap<number, readonly T[]>): T[] {
+  const result: T[] = []
+  for (let index = 0; index <= voices.length; index++) {
+    result.push(...(events.get(index) ?? []))
+    if (index < voices.length) result.push(voices[index])
+  }
+  return result
+}
+
 /** Select competing cues for one batched Decision-model review. */
 export function competingSoundCueIndexes(cues: readonly SoundSceneCue[]): number[] {
   const selected = new Set<number>()

@@ -1997,7 +1997,7 @@ spindle.onFrontendMessage(async (rawPayload: unknown, userId, frontendSessionId)
         if (typeof payload.message !== 'string' || payload.message.length > 30000) throw new Error('Invalid or oversized scene.')
         const favorites = await new SoundLibrary(spindle.userStorage).list(userId)
         if (!favorites.length || !payload.message.trim()) {
-          sendFrontend({ type: 'chat_voice_sound_scene_plan', requestId: payload.requestId, cues: [] }, userId, frontendSessionId)
+          sendFrontend({ type: 'chat_voice_sound_library', requestId: payload.requestId, cues: [] }, userId, frontendSessionId)
           return
         }
         const connectionId = await resolveGenerationConnection(userId, payload.connectionId)
@@ -2034,9 +2034,9 @@ spindle.onFrontendMessage(async (rawPayload: unknown, userId, frontendSessionId)
             })
           } catch { /* Decision review is optional; keep locally validated proposals. */ }
         }
-        sendFrontend({ type: 'chat_voice_sound_scene_plan', requestId: payload.requestId, cues }, userId, frontendSessionId)
+        sendFrontend({ type: 'chat_voice_sound_library', requestId: payload.requestId, cues }, userId, frontendSessionId)
       } catch (error) {
-        sendFrontend({ type: 'chat_voice_sound_scene_plan', requestId: payload.requestId, error: error instanceof Error ? error.message : 'Could not plan sound effects.' }, userId, frontendSessionId)
+        sendFrontend({ type: 'chat_voice_sound_library', requestId: payload.requestId, error: 'Could not plan sound effects.' }, userId, frontendSessionId)
       }
     } else if (payload?.type === 'chat_voice_sound_library_list' || payload?.type === 'chat_voice_sound_library_add' || payload?.type === 'chat_voice_sound_library_read' || payload?.type === 'chat_voice_sound_library_remove' || payload?.type === 'chat_voice_sound_library_edit') {
       try {

@@ -1,3 +1,69 @@
+// src/sound-scene.ts
+function interleaveSoundEvents(voices, events) {
+  const result = [];
+  for (let index = 0; index <= voices.length; index++) {
+    result.push(...events.get(index) ?? []);
+    if (index < voices.length) result.push(voices[index]);
+  }
+  return result;
+}
+function alignSoundSourceSegments(message, clipTexts) {
+  const normalize = (input) => {
+    let text = "";
+    const offsets = [];
+    for (let i = 0; i < input.length; i++) {
+      const char = input[i];
+      if (/\s/u.test(char)) {
+        if (!text || text.endsWith(" ")) continue;
+        text += " ";
+        offsets.push(i);
+      } else {
+        text += char;
+        offsets.push(i);
+      }
+    }
+    if (text.endsWith(" ")) {
+      text = text.slice(0, -1);
+      offsets.pop();
+    }
+    return { text, offsets };
+  };
+  const source = normalize(message);
+  const matches = clipTexts.map((clip) => {
+    const text = normalize(clip).text;
+    if (!text) return null;
+    const start = source.text.indexOf(text);
+    if (start < 0 || source.text.lastIndexOf(text) !== start) return null;
+    return { start: source.offsets[start], end: source.offsets[start + text.length - 1] + 1 };
+  });
+  const invalid = /* @__PURE__ */ new Set();
+  for (let i = 0; i < matches.length; i++) {
+    for (let j = i + 1; j < matches.length; j++) {
+      if (matches[i] && matches[j] && matches[i].end > matches[j].start) {
+        invalid.add(i);
+        invalid.add(j);
+      }
+    }
+  }
+  return matches.map((match, index) => invalid.has(index) ? null : match);
+}
+function mapSoundCueBoundaries(cues, segments, messageLength) {
+  let lastEnd = 0;
+  for (const segment of segments) {
+    if (!segment) continue;
+    if (!Number.isSafeInteger(segment.start) || !Number.isSafeInteger(segment.end) || segment.start < lastEnd || segment.end <= segment.start || segment.end > messageLength) throw new Error("Invalid scene segment boundaries.");
+    lastEnd = segment.end;
+  }
+  const mapped = [];
+  for (const cue of cues) {
+    const end = cue.offset + cue.anchor.length;
+    const index = segments.findIndex((segment) => segment !== null && cue.offset >= segment.start && end <= segment.end);
+    if (index < 0) continue;
+    mapped.push({ cue, boundary: cue.position === "before" ? index : index + 1 });
+  }
+  return mapped;
+}
+
 // src/sound-mix.ts
 var MAX_MIX_BYTES = 128 * 1024 * 1024;
 function soundCategoryGain(channels, kind) {
@@ -2739,6 +2805,7 @@ async function loadPlaybackPreferences() {
     headers: { Accept: "application/json" }
   });
   if (!response.ok) return {
+    eventSounds: false,
     speed: 1,
     volume: 1,
     connectionId: "",
@@ -2776,6 +2843,7 @@ async function loadPlaybackPreferences() {
   const ttsTagStyle = row.value?.chatVoiceTtsTagStyle === "gemini" || row.value?.chatVoiceTtsTagStyle === "gemini38" || row.value?.chatVoiceTtsTagStyle === "fish" ? row.value.chatVoiceTtsTagStyle : "off";
   const ttsTagPlacement = row.value?.chatVoiceTtsTagPlacement === "llm" ? "llm" : "jev";
   return {
+    eventSounds: row.value?.chatVoiceEventSounds === true,
     speed: Math.min(4, Math.max(0.25, speed)),
     volume: Math.min(1, Math.max(0, volume)),
     connectionId: globalTtsConnectionPreference(row.value ?? {}),
@@ -3959,8 +4027,15 @@ function setup(ctx) {
   }
   const effectsNote = document.createElement("div");
   effectsNote.className = "chat-voice-hint";
-  effectsNote.textContent = "Sound-effects playback is not available yet. Ambience will play under voices; event sounds will play between clips. Scene planning will send the message and relevant sound-library details to your configured generation connection.";
-  soundEffectsPanel.append(effectsNote);
+  effectsNote.textContent = "Experimental event sounds play between voice clips. When enabled, the current message and your favorite sounds\u2019 names, descriptions, tags, types and IDs are sent to your selected LLM connection and, for competing cues, the default Decision connection. Ambience and online search are not available yet. Late or ambiguous effects are skipped.";
+  const eventSoundsLabel = document.createElement("label");
+  eventSoundsLabel.className = "chat-voice-toggle";
+  const eventSoundsToggle = document.createElement("input");
+  eventSoundsToggle.type = "checkbox";
+  const eventSoundsText = document.createElement("span");
+  eventSoundsText.textContent = "Enable experimental event sounds";
+  eventSoundsLabel.append(eventSoundsToggle, eventSoundsText);
+  soundEffectsPanel.append(eventSoundsLabel, effectsNote);
   const soundTabButtons = [];
   const soundPanels = [soundEffectsPanel, soundLibraryPanel, soundAdvancedPanel];
   for (const [index, label] of ["Effects", "Library", "Advanced"].entries()) {
@@ -4440,6 +4515,19 @@ function setup(ctx) {
     status.textContent = message;
     status.dataset.state = state;
   };
+  let savingEventSounds = false;
+  eventSoundsToggle.addEventListener("change", () => {
+    const enabled = eventSoundsToggle.checked;
+    savingEventSounds = true;
+    eventSoundsToggle.disabled = true;
+    void updateVoiceSettings((current) => ({ ...current, chatVoiceEventSounds: enabled })).catch((error) => {
+      eventSoundsToggle.checked = !enabled;
+      setStatus(error instanceof Error ? error.message : "Could not save sound settings.", "error");
+    }).finally(() => {
+      savingEventSounds = false;
+      eventSoundsToggle.disabled = false;
+    });
+  });
   function soundLibraryRequest(type, fields = {}) {
     const requestId = `sound-${Date.now().toString(36)}-${++soundLibrarySequence}`;
     return new Promise((resolve, reject) => {
@@ -5842,6 +5930,36 @@ function setup(ctx) {
       playbackStartup.finish(startupToken);
       updatePlaybackButtons();
       const playbackSetupFinishedAt = Date.now();
+      const eventSourceText = preparePlaybackContent(message.content, preferences.skippedTrackerTags);
+      let eventCues = [];
+      const eventAssets = /* @__PURE__ */ new Map();
+      let resolveEventSelection;
+      const eventSelection = new Promise((resolve) => {
+        resolveEventSelection = resolve;
+      });
+      if (preferences.eventSounds && eventSourceText.length <= 3e4 && eventSourceText.trim()) {
+        void soundLibraryRequest("chat_voice_sound_scene_plan", { message: eventSourceText, connectionId: preferences.tagLlmConnectionId, model: preferences.tagLlmModel }).then(async (result) => {
+          if (playback.controller.signal.aborted) return;
+          eventCues = (result.cues ?? []).filter((cue) => cue.kind === "event" && cue.action === "play" && cue.assetId);
+          await Promise.all([...new Set(eventCues.map((cue) => cue.assetId))].map(async (id) => {
+            try {
+              const asset = await soundLibraryRequest("chat_voice_sound_library_read", { id });
+              if (playback.controller.signal.aborted || !asset.audio || asset.favorite?.kind !== "event") return;
+              const bytes = Uint8Array.from(atob(asset.audio), (char) => char.charCodeAt(0));
+              const decoded = await audioContext.decodeAudioData(bytes.buffer);
+              if (playback.controller.signal.aborted || decoded.duration > 120 || decoded.numberOfChannels < 1 || decoded.numberOfChannels > 2) return;
+              const frames = Math.min(decoded.length, Math.floor(decoded.sampleRate * 5));
+              if (!frames) return;
+              const cropped = audioContext.createBuffer(decoded.numberOfChannels, frames, decoded.sampleRate);
+              for (let channel = 0; channel < decoded.numberOfChannels; channel++) cropped.copyToChannel(decoded.getChannelData(channel).subarray(0, frames), channel);
+              const channels = Array.from({ length: cropped.numberOfChannels }, (_, channel) => cropped.getChannelData(channel));
+              eventAssets.set(id, { data: new ArrayBuffer(0), mime: "audio/wav", decodedBuffer: cropped, normalizationGain: soundCategoryGain(channels, "event") });
+            } catch {
+            }
+          }));
+        }).catch(() => {
+        });
+      }
       try {
         if (playback.controller.signal.aborted) throw new DOMException("Playback stopped.", "AbortError");
         const playbackSpeakers = addUnconfiguredDialogueSpeakers(
@@ -6396,7 +6514,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
           void Promise.all(processed).then(async (results) => {
             const failed = results.find((result) => !result.ok);
             if (failed) throw failed.error;
-            const captured = results.filter(
+            const voiceCaptured = results.filter(
               (result) => result.ok
             ).map((result) => ({
               data: result.segment.data.slice(0),
@@ -6404,6 +6522,9 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
               decodedBuffer: result.segment.decodedBuffer,
               normalizationGain: result.segment.normalizationGain
             }));
+            const selected = await eventSelection;
+            if (!selected) throw new DOMException("Playback ended before the sound plan was frozen.", "AbortError");
+            const captured = interleaveSoundEvents(voiceCaptured, selected);
             const saved = await persistCapturedAudio(
               playbackChat.id,
               messageId,
@@ -6484,9 +6605,22 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
           `Buffering ${initialBufferSize} voice segment${initialBufferSize === 1 ? "" : "s"} before playback\u2026`
         );
         await Promise.all(processed.slice(0, initialBufferSize));
+        const selectedEvents = /* @__PURE__ */ new Map();
+        if (preferences.eventSounds && eventCues.length) {
+          const spans = alignSoundSourceSegments(eventSourceText, plan.map((entry) => stripTtsTags(entry.text)));
+          const mapped = mapSoundCueBoundaries(eventCues, spans, eventSourceText.length);
+          for (const { cue, boundary } of mapped) {
+            const asset = cue.assetId ? eventAssets.get(cue.assetId) : void 0;
+            if (!asset || selectedEvents.has(boundary)) continue;
+            selectedEvents.set(boundary, [asset]);
+          }
+        }
+        if (preferences.eventSounds) appendSpeakerDebugLog(`Sound effects: ${eventCues.length} event cue(s) proposed; ${selectedEvents.size} ready and aligned before playback. Late or ambiguous cues are skipped.`);
+        resolveEventSelection(selectedEvents);
         for (let index = 0; index < plan.length; index += 1) {
           const current = await processed[index];
           if (!current.ok) throw current.error;
+          for (const event of selectedEvents.get(index) ?? []) await playDecodedBuffer(playback, event, preferences.volume);
           playbackCursor = index + 1;
           if (synthesisCursor < plan.length || localSynthesisTasks > 0) {
             const pressuredConcurrency = bufferAwareGenerationConcurrency(
@@ -6515,6 +6649,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
           setStatus(`Playing ${index + 1} of ${plan.length} voice segment${plan.length === 1 ? "" : "s"}\u2026`);
           await playDecodedBuffer(playback, current.segment, preferences.volume);
         }
+        for (const event of selectedEvents.get(plan.length) ?? []) await playDecodedBuffer(playback, event, preferences.volume);
         adaptiveSynthesisLimits.delete(adaptiveLimitToken);
         drainSynthesisQueue();
         playback.playbackFinished = true;
@@ -6535,6 +6670,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
           setStatus(error instanceof Error ? error.message : "Custom voice playback failed.", "error");
         }
       } finally {
+        resolveEventSelection(null);
         playback.finishAudible();
         if (activePlayback === playback) {
           activePlayback = null;
@@ -7879,6 +8015,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
         refreshDecisionStatus()
       ]);
       connections = loadedConnections;
+      if (!savingEventSounds) eventSoundsToggle.checked = preferences.eventSounds;
       llmConnections = loadedLlmConnections;
       if (!favoritesSaving && !editingFavoriteVoiceId) {
         favoriteVoices = preferences.favoriteVoices;

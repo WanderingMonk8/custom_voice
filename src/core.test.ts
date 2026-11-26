@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { SoundLibrary, type SoundUserStorage } from './sound-library'
-import { alignSoundSourceSegments, competingSoundCueIndexes, mapSoundCueBoundaries, parseSoundScenePlan } from './sound-scene'
+import { alignSoundSourceSegments, competingSoundCueIndexes, interleaveSoundEvents, mapSoundCueBoundaries, parseSoundScenePlan } from './sound-scene'
 import { renderSoundMix, soundCategoryGain } from './sound-mix'
 import { buildSoundTimeline, encodeSoundTimelineWav, resampleSoundClip } from './sound-timeline'
 import { SoundCuePreparation } from './sound-preparation'
@@ -140,6 +140,11 @@ test('sound Decision review targets nearby competing cues only', () => {
   const cue = { kind: 'event' as const, action: 'play' as const, anchor: 'door', position: 'after' as const, offset: 0 }
   assert.deepEqual(competingSoundCueIndexes([cue, { ...cue, offset: 40 }, { ...cue, offset: 500 }, { ...cue, kind: 'ambience', offset: 1 }]), [0, 1])
   assert.deepEqual(competingSoundCueIndexes([cue]), [])
+})
+
+test('saved sound events retain the same boundary ordering as voice playback', () => {
+  assert.deepEqual(interleaveSoundEvents(['voice 1', 'voice 2'], new Map([[0, ['first']], [1, ['middle']], [2, ['last']]])), ['first', 'voice 1', 'middle', 'voice 2', 'last'])
+  assert.deepEqual(interleaveSoundEvents(['voice'], new Map([[9, ['outside']]])), ['voice'])
 })
 
 test('local sound mix permits ambience under speech and events but prohibits event/voice overlap', () => {
