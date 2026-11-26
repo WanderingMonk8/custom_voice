@@ -1508,6 +1508,23 @@ function markUnresolvedSpeechSegments(segments, includeDebug = false) {
     return includeDebug ? { ...segment, speakerId } : { ...plain, speakerId };
   });
 }
+function isSpokenTitlePeriod(text, period) {
+  if (text[period] !== ".") return false;
+  if (!/(?:^|[^\p{L}])(?:mr|mrs|ms|mx|dr|prof|rev|fr|capt|col|gen|lt|maj|sgt|sen|rep|gov|pres|hon|st)\.$/iu.test(text.slice(0, period + 1))) return false;
+  return /^\s+\p{Lu}/u.test(text.slice(period + 1));
+}
+function splitTtsSentences(text) {
+  const result = [];
+  let start = 0;
+  for (const match of text.matchAll(/[.!?…]\s+/gu)) {
+    const index = match.index;
+    if (isSpokenTitlePeriod(text, index)) continue;
+    result.push(text.slice(start, index + 1));
+    start = index + match[0].length;
+  }
+  result.push(text.slice(start));
+  return result.filter(Boolean);
+}
 function isRecord(value) {
   return !!value && typeof value === "object" && !Array.isArray(value);
 }
@@ -4971,6 +4988,7 @@ function ttsTagPositionOptions(text) {
   const boundaries = [];
   for (const match of text.matchAll(/[.!?…]+["'”’)]*\s+/gu)) {
     if (match.index === void 0) continue;
+    if (isSpokenTitlePeriod(text, match.index)) continue;
     const charIndex = match.index + match[0].length;
     if (charIndex > 0 && charIndex < text.length && !boundaries.includes(charIndex)) {
       boundaries.push(charIndex);
@@ -5012,6 +5030,8 @@ function ttsModulationPositionOptions(text) {
   const candidates = [];
   const add = (charIndex) => {
     if (charIndex <= 0 || charIndex >= text.length) return;
+    const previous = text.slice(0, charIndex).trimEnd().length - 1;
+    if (isSpokenTitlePeriod(text, previous)) return;
     if (ttsWordCount(stripTtsTags(text.slice(0, charIndex))) < TTS_MODULATION_MIN_BEFORE_WORDS) return;
     if (ttsWordCount(stripTtsTags(text.slice(charIndex))) < TTS_MODULATION_MIN_REMAINDER_WORDS) return;
     if (!candidates.includes(charIndex)) candidates.push(charIndex);
@@ -5269,7 +5289,7 @@ function renderLeadingCues(body, prefix, repeatPerSentence) {
   if (!body) return prefix;
   if (!repeatPerSentence) return prefix ? `${prefix} ${body}` : body;
   const rendered = [];
-  for (const sentence of body.split(/(?<=[.!?…])\s+/u).filter(Boolean)) {
+  for (const sentence of splitTtsSentences(body)) {
     const words = stripTtsTags(sentence).replace(/\s+/gu, " ").trim();
     if (!words && rendered.length > 0) {
       rendered[rendered.length - 1] += ` ${sentence}`;
@@ -5328,7 +5348,7 @@ function applyCustomTtsEmotionCuesWithModulation(text, customTag, styles, modula
   const rendered = [];
   let activePrefix = leadingPrefix;
   const cleanBody = body.replace(/[ \t]+/gu, " ").trim();
-  for (const sentence of cleanBody.split(/(?<=[.!?…])\s+/u).filter(Boolean)) {
+  for (const sentence of splitTtsSentences(cleanBody)) {
     const markerIndex = sentence.indexOf(TTS_MODULATION_MARKER);
     const sentenceWords = stripTtsTags(
       sentence.split(TTS_MODULATION_MARKER).join(" ")

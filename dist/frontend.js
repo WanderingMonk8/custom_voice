@@ -982,6 +982,21 @@ var DEFAULT_MAX_TTS_SEGMENT_CHARS = 360;
 function normalizeSpeechBoundaryDashes(text) {
   return text.replace(/^((?:\s*(?:\[[^\]\r\n]+\]|<[^>\r\n]+>))*\s*)[—–]\s*/u, "$1").trim();
 }
+function isSpokenTitlePeriod(text, period) {
+  if (text[period] !== ".") return false;
+  if (!/(?:^|[^\p{L}])(?:mr|mrs|ms|mx|dr|prof|rev|fr|capt|col|gen|lt|maj|sgt|sen|rep|gov|pres|hon|st)\.$/iu.test(text.slice(0, period + 1))) return false;
+  return /^\s+\p{Lu}/u.test(text.slice(period + 1));
+}
+function expandSpokenTitles(text) {
+  const names = { mr: "Mister", mrs: "Missus", ms: "Miz", dr: "Doctor", prof: "Professor", rev: "Reverend" };
+  return text.split(/(\[[^\]\r\n]*\]|<[^>\r\n]*>)/gu).map((part) => {
+    if (part.startsWith("[") || part.startsWith("<")) return part;
+    return part.replace(/\b(mr|mrs|ms|dr|prof|rev)\.(\s+)(\p{L})/giu, (match, title, space, initial) => {
+      if (!/^\p{Lu}$/u.test(initial)) return match;
+      return `${names[title.toLowerCase()]}${space}${initial}`;
+    });
+  }).join("");
+}
 function splitLargeVoicePlanSegments(segments, maximumChars = DEFAULT_MAX_TTS_SEGMENT_CHARS) {
   const limit = Math.max(80, Math.round(maximumChars));
   const result = [];
@@ -998,10 +1013,11 @@ function splitLargeVoicePlanSegments(segments, maximumChars = DEFAULT_MAX_TTS_SE
         if (character === "[") bracketDepth += 1;
         else if (character === "]" && bracketDepth > 0) bracketDepth -= 1;
         if (bracketDepth > 0 || !/\s/u.test(character)) continue;
-        wordBreaks.push(index);
         let previousIndex = index - 1;
         while (previousIndex >= 0 && /["”’')\]]/u.test(window2[previousIndex])) previousIndex -= 1;
         const previous = window2[previousIndex] ?? "";
+        if (isSpokenTitlePeriod(remaining, previousIndex)) continue;
+        wordBreaks.push(index);
         if (/[.!?…]/u.test(previous)) sentenceBreaks.push(index);
         else if (/[,;:—–]/u.test(previous)) clauseBreaks.push(index);
       }
@@ -2607,12 +2623,16 @@ function splitNarrationForSoundEvents(segments, options) {
       groupIds.push(group);
       continue;
     }
-    if (/\b(?:Dr|Mr|Mrs|Ms|Prof|St|vs|etc)\.|\d\.\d/iu.test(segment.text)) {
-      result.push(segment);
-      groupIds.push(group);
-      continue;
+    const fragments = [];
+    let fragmentStart = 0;
+    for (const match of segment.text.matchAll(/[,;.!?]+["'”’)]*/gu)) {
+      const index = match.index;
+      if (isSpokenTitlePeriod(segment.text, index) || match[0] === "." && /\d/u.test(segment.text[index - 1] ?? "") && /\d/u.test(segment.text[index + 1] ?? "")) continue;
+      if (match[0] === "." && /(?:^|[^\p{L}])(?:vs|etc)\.$/iu.test(segment.text.slice(0, index + 1))) continue;
+      fragments.push(segment.text.slice(fragmentStart, index + match[0].length).trim());
+      fragmentStart = index + match[0].length;
     }
-    const fragments = segment.text.match(/[^,;.!?]+[,;.!?]+(?:["'”’)]*)|[^,;.!?]+$/gu)?.map((part) => part.trim()).filter(Boolean) ?? [];
+    fragments.push(segment.text.slice(fragmentStart).trim());
     const parts = [];
     let pending = "";
     for (const fragment of fragments) {
@@ -3494,7 +3514,7 @@ async function synthesizeVoiceSegment(connectionId, text, voice, speed, signal, 
         headers: { "Content-Type": "application/json", Accept: "audio/*" },
         body: JSON.stringify({
           connectionId,
-          text,
+          text: expandSpokenTitles(text),
           voice: voice || void 0,
           parameters: { speed }
         })

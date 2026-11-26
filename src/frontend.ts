@@ -43,6 +43,7 @@ import {
   resolveGlobalTtsConnection,
   encodeConcatenatedWav,
   expiredSavedAudioRecords,
+  expandSpokenTitles,
   hashMessageContent,
   mergeVoicePlan,
   filterNarrationSegments,
@@ -966,7 +967,7 @@ async function synthesizeVoiceSegment(
         headers: { 'Content-Type': 'application/json', Accept: 'audio/*' },
         body: JSON.stringify({
           connectionId,
-          text,
+          text: expandSpokenTitles(text),
           voice: voice || undefined,
           parameters: { speed },
         }),

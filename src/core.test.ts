@@ -432,7 +432,7 @@ test('short narration fragments do not prevent splitting the rest of a sound-ric
   assert.equal(bounded.length, 12)
   assert.equal(bounded.map(item => item.text).join(' '), many)
   const abbreviation = 'Dr. Marsh opened the door. She walked inside.'
-  assert.equal(splitNarrationForSoundEvents([{ text: abbreviation, voice: 'narrator' }]).length, 1)
+  assert.deepEqual(splitNarrationForSoundEvents([{ text: abbreviation, voice: 'narrator' }]).map(item => item.text), ['Dr. Marsh opened the door.', 'She walked inside.'])
 })
 
 test('event-aware splitting reduces the sample scene jobs while preserving door boundaries', () => {
@@ -696,6 +696,7 @@ import {
   applyCustomTtsEmotionCues,
   applyCustomTtsEmotionCuesWithModulation,
   applyLeadingTtsCues,
+  expandSpokenTitles,
   applyTtsSpeakerContinuity,
   applyTtsTagSelections,
   assessSpeakerDiscourseEscalation,
@@ -2084,6 +2085,18 @@ test('leaves ordinary synthesis jobs unchanged', () => {
     splitLargeVoicePlanSegments([{ text: 'A short paragraph.', voice: 'alice' }]),
     [{ text: 'A short paragraph.', voice: 'alice' }],
   )
+})
+
+test('keeps titles with names across synthesis splitting and Fish cue rendering', () => {
+  const text = `${'word '.repeat(15)}Dr. Malcolm arrived. Mr. Adam followed.`
+  const chunks = splitLargeVoicePlanSegments([{ text, voice: 'narrator' }], 80)
+  assert.ok(chunks.length > 1)
+  assert.ok(chunks.every(chunk => !/\b(?:Dr|Mr)\.$/u.test(chunk.text)))
+  assert.equal(chunks.map(chunk => chunk.text).join(' '), text)
+  assert.equal(applyLeadingTtsCues('Hello Dr. Malcolm. Welcome Mr. Adam.', ['calm'], [], 'fish'), '[calm] Hello Dr. Malcolm. [calm] Welcome Mr. Adam.')
+  assert.equal(expandSpokenTitles('Dr. Malcolm met Mr. Adam. The story ends.'), 'Doctor Malcolm met Mister Adam. The story ends.')
+  assert.equal(expandSpokenTitles('Dr. arrived. An ordinary sentence.'), 'Dr. arrived. An ordinary sentence.')
+  assert.equal(expandSpokenTitles('[Dr. Adam] Dr. Adam'), '[Dr. Adam] Doctor Adam')
 })
 
 test('builds emotion, sound, and pause questions per speech', () => {

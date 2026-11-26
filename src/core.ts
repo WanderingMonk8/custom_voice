@@ -2585,6 +2585,38 @@ export function normalizeSpeechBoundaryDashes(text: string): string {
  * This runs after tag placement so one tagged paragraph cannot be duplicated
  * into every chunk by a later placement update.
  */
+/** A title followed by a name is not a sentence or a safe clip boundary. */
+export function isSpokenTitlePeriod(text: string, period: number): boolean {
+  if (text[period] !== '.') return false
+  if (!/(?:^|[^\p{L}])(?:mr|mrs|ms|mx|dr|prof|rev|fr|capt|col|gen|lt|maj|sgt|sen|rep|gov|pres|hon|st)\.$/iu.test(text.slice(0, period + 1))) return false
+  return /^\s+\p{Lu}/u.test(text.slice(period + 1))
+}
+
+/** Expand unambiguous common titles only in the text sent for synthesis. */
+export function expandSpokenTitles(text: string): string {
+  const names: Record<string, string> = { mr: 'Mister', mrs: 'Missus', ms: 'Miz', dr: 'Doctor', prof: 'Professor', rev: 'Reverend' }
+  return text.split(/(\[[^\]\r\n]*\]|<[^>\r\n]*>)/gu).map(part => {
+    if (part.startsWith('[') || part.startsWith('<')) return part
+    return part.replace(/\b(mr|mrs|ms|dr|prof|rev)\.(\s+)(\p{L})/giu, (match, title: string, space: string, initial: string) => {
+      if (!/^\p{Lu}$/u.test(initial)) return match
+      return `${names[title.toLowerCase()]}${space}${initial}`
+    })
+  }).join('')
+}
+
+function splitTtsSentences(text: string): string[] {
+  const result: string[] = []
+  let start = 0
+  for (const match of text.matchAll(/[.!?…]\s+/gu)) {
+    const index = match.index
+    if (isSpokenTitlePeriod(text, index)) continue
+    result.push(text.slice(start, index + 1))
+    start = index + match[0].length
+  }
+  result.push(text.slice(start))
+  return result.filter(Boolean)
+}
+
 export function splitLargeVoicePlanSegments(
   segments: VoicePlanSegment[],
   maximumChars = DEFAULT_MAX_TTS_SEGMENT_CHARS,
@@ -2604,10 +2636,11 @@ export function splitLargeVoicePlanSegments(
         if (character === '[') bracketDepth += 1
         else if (character === ']' && bracketDepth > 0) bracketDepth -= 1
         if (bracketDepth > 0 || !/\s/u.test(character)) continue
-        wordBreaks.push(index)
         let previousIndex = index - 1
         while (previousIndex >= 0 && /["”’')\]]/u.test(window[previousIndex])) previousIndex -= 1
         const previous = window[previousIndex] ?? ''
+        if (isSpokenTitlePeriod(remaining, previousIndex)) continue
+        wordBreaks.push(index)
         if (/[.!?…]/u.test(previous)) sentenceBreaks.push(index)
         else if (/[,;:—–]/u.test(previous)) clauseBreaks.push(index)
       }
@@ -6786,6 +6819,7 @@ function ttsTagPositionOptions(text: string): TtsTagPositionOption[] {
   const boundaries: number[] = []
   for (const match of text.matchAll(/[.!?…]+["'”’)]*\s+/gu)) {
     if (match.index === undefined) continue
+    if (isSpokenTitlePeriod(text, match.index)) continue
     const charIndex = match.index + match[0].length
     if (charIndex > 0 && charIndex < text.length && !boundaries.includes(charIndex)) {
       boundaries.push(charIndex)
@@ -6837,6 +6871,8 @@ function ttsModulationPositionOptions(text: string): TtsTagPositionOption[] {
   const candidates: number[] = []
   const add = (charIndex: number) => {
     if (charIndex <= 0 || charIndex >= text.length) return
+    const previous = text.slice(0, charIndex).trimEnd().length - 1
+    if (isSpokenTitlePeriod(text, previous)) return
     if (ttsWordCount(stripTtsTags(text.slice(0, charIndex))) < TTS_MODULATION_MIN_BEFORE_WORDS) return
     if (ttsWordCount(stripTtsTags(text.slice(charIndex))) < TTS_MODULATION_MIN_REMAINDER_WORDS) return
     if (!candidates.includes(charIndex)) candidates.push(charIndex)
@@ -7307,7 +7343,7 @@ function renderLeadingCues(
   if (!body) return prefix
   if (!repeatPerSentence) return prefix ? `${prefix} ${body}` : body
   const rendered: string[] = []
-  for (const sentence of body.split(/(?<=[.!?…])\s+/u).filter(Boolean)) {
+  for (const sentence of splitTtsSentences(body)) {
     const words = stripTtsTags(sentence).replace(/\s+/gu, ' ').trim()
     if (!words && rendered.length > 0) {
       rendered[rendered.length - 1] += ` ${sentence}`
@@ -7414,7 +7450,7 @@ export function applyCustomTtsEmotionCuesWithModulation(
   let activePrefix = leadingPrefix
   const cleanBody = body.replace(/[ \t]+/gu, ' ').trim()
 
-  for (const sentence of cleanBody.split(/(?<=[.!?…])\s+/u).filter(Boolean)) {
+  for (const sentence of splitTtsSentences(cleanBody)) {
     const markerIndex = sentence.indexOf(TTS_MODULATION_MARKER)
     const sentenceWords = stripTtsTags(
       sentence.split(TTS_MODULATION_MARKER).join(' '),
