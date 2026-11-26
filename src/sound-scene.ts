@@ -1,5 +1,5 @@
 import type { FavoriteSound } from './sound-library'
-import type { VoicePlanSegment } from './core'
+import { DEFAULT_MAX_TTS_SEGMENT_CHARS, type VoicePlanSegment } from './core'
 
 export interface SoundSceneCue {
   kind: 'event' | 'ambience'
@@ -47,19 +47,20 @@ export interface SoundSceneSegment {
 /** Add natural narration boundaries without changing dialogue or vocal-tag jobs. */
 export function splitNarrationForSoundEvents(
   segments: readonly VoicePlanSegment[],
-  options?: { eventSounds: readonly FavoriteSound[]; cues?: readonly SoundSceneCue[] },
+  options?: { eventSounds: readonly FavoriteSound[]; cues?: readonly SoundSceneCue[]; maxJobs?: number },
 ): VoicePlanSegment[] {
   const result: VoicePlanSegment[] = []
+  const groupIds: number[] = []
   const ignored = new Set(['the', 'and', 'sound', 'audio', 'with', 'from', 'this', 'that', 'short', 'effect', 'recording', 'mp3', 'wav'])
   const wordForms = (text: string) => (text.toLocaleLowerCase().match(/[\p{L}]{4,}/gu) ?? [])
     .map(word => word.endsWith('s') && word.length > 4 ? word.slice(0, -1) : word)
     .filter(word => !ignored.has(word))
   const eventTerms = new Set((options?.eventSounds ?? []).filter(sound => sound.kind === 'event')
     .flatMap(sound => wordForms([sound.name, ...sound.tags].join(' '))))
-  for (const segment of segments) {
-    if (segment.originalSpeech !== undefined || segment.tagId || /[\[\]<>]/u.test(segment.text)) { result.push(segment); continue }
+  for (const [group, segment] of segments.entries()) {
+    if (segment.originalSpeech !== undefined || segment.tagId || /[\[\]<>]/u.test(segment.text)) { result.push(segment); groupIds.push(group); continue }
     // Avoid splitting obvious abbreviations and decimals into unrelated jobs.
-    if (/\b(?:Dr|Mr|Mrs|Ms|Prof|St|vs|etc)\.|\d\.\d/iu.test(segment.text)) { result.push(segment); continue }
+    if (/\b(?:Dr|Mr|Mrs|Ms|Prof|St|vs|etc)\.|\d\.\d/iu.test(segment.text)) { result.push(segment); groupIds.push(group); continue }
     const fragments = segment.text.match(/[^,;.!?]+[,;.!?]+(?:["'”’)]*)|[^,;.!?]+$/gu)?.map(part => part.trim()).filter(Boolean) ?? []
     const parts: string[] = []
     let pending = ''
@@ -92,8 +93,28 @@ export function splitNarrationForSoundEvents(
       for (let i = 1; i < parts.length - 1; i++) if (parts[i].length + parts[i + 1].length < parts[shortest].length + parts[shortest + 1].length) shortest = i
       parts.splice(shortest, 2, `${parts[shortest]} ${parts[shortest + 1]}`)
     }
-    if (parts.length < 2) result.push(segment)
-    else for (const text of parts) result.push({ ...segment, text })
+    if (parts.length < 2) { result.push(segment); groupIds.push(group) }
+    else for (const text of parts) { result.push({ ...segment, text }); groupIds.push(group) }
+  }
+  const maxJobs = options?.maxJobs
+  if (Number.isSafeInteger(maxJobs) && maxJobs! > 0 && (eventTerms.size || options?.cues?.length)) {
+    while (result.length > maxJobs!) {
+      let selected = -1
+      let bestLength = Infinity
+      for (let i = 0; i < result.length - 1; i++) {
+        const left = result[i]; const right = result[i + 1]
+        if (groupIds[i] !== groupIds[i + 1] || left.originalSpeech !== undefined || right.originalSpeech !== undefined || left.tagId || right.tagId || left.voice !== right.voice) continue
+        const length = left.text.length + 1 + right.text.length
+        if (length > DEFAULT_MAX_TTS_SEGMENT_CHARS) continue
+        // Only remove boundaries with no known or likely event/ambience cue.
+        const knownCue = (options?.cues ?? []).some(cue => (cue.position === 'after' && left.text.includes(cue.anchor)) || (cue.position === 'before' && right.text.includes(cue.anchor)))
+        if (knownCue || wordForms(left.text).some(word => eventTerms.has(word)) || wordForms(right.text).some(word => eventTerms.has(word))) continue
+        if (length < bestLength) { selected = i; bestLength = length }
+      }
+      if (selected < 0) break
+      result[selected] = { ...result[selected], text: `${result[selected].text} ${result[selected + 1].text}` }
+      result.splice(selected + 1, 1); groupIds.splice(selected + 1, 1)
+    }
   }
   return result
 }
@@ -157,6 +178,12 @@ export function interleaveSoundEvents<T>(voices: readonly T[], events: ReadonlyM
     if (index < voices.length) result.push(voices[index])
   }
   return result
+}
+
+/** Events at a reached boundary do not depend on the following voice being ready. */
+export async function playBoundaryThenWaitForVoice<T, V>(events: readonly T[], play: (event: T) => Promise<void>, voice: Promise<V>): Promise<V> {
+  for (const event of events) await play(event)
+  return voice
 }
 
 /** Select competing cues for one batched Decision-model review. */

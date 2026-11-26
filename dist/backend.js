@@ -327,118 +327,6 @@ var SoundDownloadTransfers = class {
   }
 };
 
-// src/sound-scene.ts
-function parseMissingSoundSuggestions(raw, message) {
-  const cleaned = raw.trim().replace(/^```(?:json)?\s*/iu, "").replace(/\s*```$/u, "");
-  let parsed;
-  try {
-    parsed = JSON.parse(cleaned);
-  } catch {
-    return [];
-  }
-  if (!parsed || typeof parsed !== "object" || !Array.isArray(parsed.missing)) return [];
-  const result = [];
-  const seen = /* @__PURE__ */ new Set();
-  for (const value of parsed.missing.slice(0, 12)) {
-    if (!value || typeof value !== "object" || Array.isArray(value)) continue;
-    const item = value;
-    if (item.kind !== "event" && item.kind !== "ambience" || typeof item.query !== "string" || typeof item.anchor !== "string") continue;
-    const query = item.query.trim().replace(/\s+/gu, " ");
-    if (query.length < 3 || query.length > 60 || !/^[\p{L}\p{N} '\-]+$/u.test(query) || /https?|www/iu.test(query)) continue;
-    if (item.anchor.length < 3 || item.anchor.length > 200 || !message.includes(item.anchor) || message.indexOf(item.anchor) !== message.lastIndexOf(item.anchor)) continue;
-    const key = `${item.kind}:${query.toLocaleLowerCase()}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    result.push({ kind: item.kind, query, anchor: item.anchor });
-    if (result.length >= 4) break;
-  }
-  return result;
-}
-function shortlistSoundPlannerAssets(message, favorites, limit = 32) {
-  const cap = Math.max(1, Math.min(32, Math.floor(limit)));
-  if (favorites.length <= cap) return [...favorites];
-  const words = new Set(message.toLocaleLowerCase().match(/[\p{L}\p{N}]{3,}/gu) ?? []);
-  const ranked = favorites.map((sound, order) => {
-    const terms = new Set([sound.name, sound.description, ...sound.tags].join(" ").toLocaleLowerCase().match(/[\p{L}\p{N}]{3,}/gu) ?? []);
-    let score = 0;
-    for (const term of terms) if (words.has(term)) score++;
-    return { sound, order, score };
-  }).sort((a, b) => b.score - a.score || a.order - b.order);
-  const result = ranked.filter((item) => item.score > 0).slice(0, Math.max(0, cap - 8)).map((item) => item.sound);
-  const selected = new Set(result.map((sound) => sound.id));
-  const remaining = ranked.filter((item) => !selected.has(item.sound.id));
-  for (const kind of ["event", "ambience"]) {
-    const candidate = remaining.find((item) => item.sound.kind === kind && !selected.has(item.sound.id));
-    if (candidate && result.length < cap) {
-      result.push(candidate.sound);
-      selected.add(candidate.sound.id);
-    }
-  }
-  for (const item of remaining) {
-    if (result.length >= cap) break;
-    if (!selected.has(item.sound.id)) {
-      result.push(item.sound);
-      selected.add(item.sound.id);
-    }
-  }
-  return result;
-}
-function competingSoundCueIndexes(cues) {
-  const selected = /* @__PURE__ */ new Set();
-  for (let i = 0; i < cues.length; i++) {
-    if (cues[i].action !== "play") continue;
-    for (let j = i + 1; j < cues.length; j++) {
-      if (cues[j].action === "play" && cues[i].kind === cues[j].kind && cues[i].offset < cues[j].offset + cues[j].anchor.length && cues[j].offset < cues[i].offset + cues[i].anchor.length) {
-        selected.add(i);
-        selected.add(j);
-      }
-    }
-  }
-  return [...selected];
-}
-function parseSoundScenePlan(raw, message, favorites) {
-  const cleaned = raw.trim().replace(/^```(?:json)?\s*/iu, "").replace(/\s*```$/u, "");
-  let parsed;
-  try {
-    parsed = JSON.parse(cleaned);
-  } catch {
-    return [];
-  }
-  if (!parsed || typeof parsed !== "object" || !Array.isArray(parsed.cues)) return [];
-  const available = new Map(favorites.map((item) => [item.id, item]));
-  const result = [];
-  const seen = /* @__PURE__ */ new Set();
-  for (const value of parsed.cues.slice(0, 48)) {
-    if (!value || typeof value !== "object" || Array.isArray(value)) continue;
-    const item = value;
-    if (item.kind !== "event" && item.kind !== "ambience" || item.action !== "play" && item.action !== "stop" || item.position !== "before" && item.position !== "after" || typeof item.anchor !== "string" || item.anchor.length < 3 || item.anchor.length > 200) continue;
-    if (item.action === "stop" && item.kind !== "ambience") continue;
-    const offset = message.indexOf(item.anchor);
-    if (offset < 0 || message.lastIndexOf(item.anchor) !== offset) continue;
-    const assetId = typeof item.assetId === "string" ? item.assetId : "";
-    if (item.action === "play" && (!available.has(assetId) || available.get(assetId)?.kind !== item.kind)) continue;
-    const key = `${item.kind}\0${item.action}\0${assetId}\0${offset}\0${item.position}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    result.push({ kind: item.kind, action: item.action, ...item.action === "play" ? { assetId } : {}, anchor: item.anchor, position: item.position, offset });
-    if (result.length >= 16) break;
-  }
-  return result.sort((a, b) => a.offset - b.offset);
-}
-
-// src/sound-plan-diagnostics.ts
-function soundPlanErrorCategory(error) {
-  if (!error || typeof error !== "object") return "unknown failure";
-  const item = error;
-  const status = typeof item.status === "number" ? item.status : item.statusCode;
-  if (status === 429) return "provider rate limit (429)";
-  if (status === 401 || status === 403) return `provider authentication/access (${status})`;
-  if (typeof status === "number" && status >= 500 && status < 600) return `provider/server error (${status})`;
-  if (item.name === "AbortError") return "aborted";
-  if (item.name === "TimeoutError" || item.code === "ETIMEDOUT") return "timeout";
-  return "unknown failure";
-}
-
 // src/core.ts
 var CONFIG_KEY = "chat_voice";
 var USER_SPEAKER_ID = "__chat_voice_user__";
@@ -7078,6 +6966,118 @@ function applyConfigToMetadata(metadata, config) {
   if (voiceOverrides.narrator || voiceOverrides.characters) result.voiceOverrides = voiceOverrides;
   else delete result.voiceOverrides;
   return result;
+}
+
+// src/sound-scene.ts
+function parseMissingSoundSuggestions(raw, message) {
+  const cleaned = raw.trim().replace(/^```(?:json)?\s*/iu, "").replace(/\s*```$/u, "");
+  let parsed;
+  try {
+    parsed = JSON.parse(cleaned);
+  } catch {
+    return [];
+  }
+  if (!parsed || typeof parsed !== "object" || !Array.isArray(parsed.missing)) return [];
+  const result = [];
+  const seen = /* @__PURE__ */ new Set();
+  for (const value of parsed.missing.slice(0, 12)) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) continue;
+    const item = value;
+    if (item.kind !== "event" && item.kind !== "ambience" || typeof item.query !== "string" || typeof item.anchor !== "string") continue;
+    const query = item.query.trim().replace(/\s+/gu, " ");
+    if (query.length < 3 || query.length > 60 || !/^[\p{L}\p{N} '\-]+$/u.test(query) || /https?|www/iu.test(query)) continue;
+    if (item.anchor.length < 3 || item.anchor.length > 200 || !message.includes(item.anchor) || message.indexOf(item.anchor) !== message.lastIndexOf(item.anchor)) continue;
+    const key = `${item.kind}:${query.toLocaleLowerCase()}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push({ kind: item.kind, query, anchor: item.anchor });
+    if (result.length >= 4) break;
+  }
+  return result;
+}
+function shortlistSoundPlannerAssets(message, favorites, limit = 32) {
+  const cap = Math.max(1, Math.min(32, Math.floor(limit)));
+  if (favorites.length <= cap) return [...favorites];
+  const words = new Set(message.toLocaleLowerCase().match(/[\p{L}\p{N}]{3,}/gu) ?? []);
+  const ranked = favorites.map((sound, order) => {
+    const terms = new Set([sound.name, sound.description, ...sound.tags].join(" ").toLocaleLowerCase().match(/[\p{L}\p{N}]{3,}/gu) ?? []);
+    let score = 0;
+    for (const term of terms) if (words.has(term)) score++;
+    return { sound, order, score };
+  }).sort((a, b) => b.score - a.score || a.order - b.order);
+  const result = ranked.filter((item) => item.score > 0).slice(0, Math.max(0, cap - 8)).map((item) => item.sound);
+  const selected = new Set(result.map((sound) => sound.id));
+  const remaining = ranked.filter((item) => !selected.has(item.sound.id));
+  for (const kind of ["event", "ambience"]) {
+    const candidate = remaining.find((item) => item.sound.kind === kind && !selected.has(item.sound.id));
+    if (candidate && result.length < cap) {
+      result.push(candidate.sound);
+      selected.add(candidate.sound.id);
+    }
+  }
+  for (const item of remaining) {
+    if (result.length >= cap) break;
+    if (!selected.has(item.sound.id)) {
+      result.push(item.sound);
+      selected.add(item.sound.id);
+    }
+  }
+  return result;
+}
+function competingSoundCueIndexes(cues) {
+  const selected = /* @__PURE__ */ new Set();
+  for (let i = 0; i < cues.length; i++) {
+    if (cues[i].action !== "play") continue;
+    for (let j = i + 1; j < cues.length; j++) {
+      if (cues[j].action === "play" && cues[i].kind === cues[j].kind && cues[i].offset < cues[j].offset + cues[j].anchor.length && cues[j].offset < cues[i].offset + cues[i].anchor.length) {
+        selected.add(i);
+        selected.add(j);
+      }
+    }
+  }
+  return [...selected];
+}
+function parseSoundScenePlan(raw, message, favorites) {
+  const cleaned = raw.trim().replace(/^```(?:json)?\s*/iu, "").replace(/\s*```$/u, "");
+  let parsed;
+  try {
+    parsed = JSON.parse(cleaned);
+  } catch {
+    return [];
+  }
+  if (!parsed || typeof parsed !== "object" || !Array.isArray(parsed.cues)) return [];
+  const available = new Map(favorites.map((item) => [item.id, item]));
+  const result = [];
+  const seen = /* @__PURE__ */ new Set();
+  for (const value of parsed.cues.slice(0, 48)) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) continue;
+    const item = value;
+    if (item.kind !== "event" && item.kind !== "ambience" || item.action !== "play" && item.action !== "stop" || item.position !== "before" && item.position !== "after" || typeof item.anchor !== "string" || item.anchor.length < 3 || item.anchor.length > 200) continue;
+    if (item.action === "stop" && item.kind !== "ambience") continue;
+    const offset = message.indexOf(item.anchor);
+    if (offset < 0 || message.lastIndexOf(item.anchor) !== offset) continue;
+    const assetId = typeof item.assetId === "string" ? item.assetId : "";
+    if (item.action === "play" && (!available.has(assetId) || available.get(assetId)?.kind !== item.kind)) continue;
+    const key = `${item.kind}\0${item.action}\0${assetId}\0${offset}\0${item.position}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push({ kind: item.kind, action: item.action, ...item.action === "play" ? { assetId } : {}, anchor: item.anchor, position: item.position, offset });
+    if (result.length >= 16) break;
+  }
+  return result.sort((a, b) => a.offset - b.offset);
+}
+
+// src/sound-plan-diagnostics.ts
+function soundPlanErrorCategory(error) {
+  if (!error || typeof error !== "object") return "unknown failure";
+  const item = error;
+  const status = typeof item.status === "number" ? item.status : item.statusCode;
+  if (status === 429) return "provider rate limit (429)";
+  if (status === 401 || status === 403) return `provider authentication/access (${status})`;
+  if (typeof status === "number" && status >= 500 && status < 600) return `provider/server error (${status})`;
+  if (item.name === "AbortError") return "aborted";
+  if (item.name === "TimeoutError" || item.code === "ETIMEDOUT") return "timeout";
+  return "unknown failure";
 }
 
 // src/version.ts

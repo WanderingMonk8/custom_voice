@@ -7,7 +7,7 @@ import { SoundPreviewCache } from './sound-preview-cache'
 import { SoundLoadQueue } from './sound-load-queue'
 import { soundRequestTimeoutMs } from './sound-plan-diagnostics'
 import { isFreesoundCc0, isFreesoundImportLicense, safeFreesoundPreviewUrl, type FreesoundSearchResult } from './freesound'
-import { alignSoundSourceSegments, ambienceInstructionAtBoundary, interleaveSoundEvents, mapSoundCueBoundaries, shortlistSoundAssets, splitNarrationForSoundEvents, type MissingSoundSuggestion, type SoundSceneCue } from './sound-scene'
+import { alignSoundSourceSegments, ambienceInstructionAtBoundary, interleaveSoundEvents, mapSoundCueBoundaries, playBoundaryThenWaitForVoice, shortlistSoundAssets, splitNarrationForSoundEvents, type MissingSoundSuggestion, type SoundSceneCue } from './sound-scene'
 import { DEFAULT_AMBIENCE_VOLUME, DEFAULT_EVENT_VOLUME, mixAmbienceClip, readSoundVolume, soundCategoryGain } from './sound-mix'
 import { AutoplayRequestRegistry, PlaybackLongPress, PlaybackStartupGuard, syncAutoplayIndicators, syncPlaybackButtons, waitForAutoplayDeadline, waitForAutoplayWork, type PlaybackButtonState } from './playback-ui'
 import {
@@ -423,6 +423,7 @@ interface PlaybackPreferences {
   eventSounds: boolean
   ambienceSounds: boolean
   suggestMissingSounds: boolean
+  soundStartupWaitSeconds: number
   eventSoundVolume: number
   ambienceSoundVolume: number
   speed: number
@@ -509,6 +510,7 @@ async function loadPlaybackPreferences(): Promise<PlaybackPreferences> {
     eventSounds: false,
     ambienceSounds: false,
     suggestMissingSounds: false,
+    soundStartupWaitSeconds: 0,
     eventSoundVolume: DEFAULT_EVENT_VOLUME,
     ambienceSoundVolume: DEFAULT_AMBIENCE_VOLUME,
     speed: 1,
@@ -557,6 +559,7 @@ async function loadPlaybackPreferences(): Promise<PlaybackPreferences> {
     eventSounds: row.value?.chatVoiceEventSounds === true,
     ambienceSounds: row.value?.chatVoiceAmbienceSounds === true,
     suggestMissingSounds: row.value?.chatVoiceSuggestMissingSounds === true,
+    soundStartupWaitSeconds: Math.min(10, Math.max(0, Number.isFinite(Number(row.value?.chatVoiceSoundStartupWaitSeconds)) ? Number(row.value?.chatVoiceSoundStartupWaitSeconds) : 0)),
     eventSoundVolume: readSoundVolume(row.value?.chatVoiceEventSoundVolume, DEFAULT_EVENT_VOLUME),
     ambienceSoundVolume: readSoundVolume(row.value?.chatVoiceAmbienceSoundVolume, DEFAULT_AMBIENCE_VOLUME),
     speed: Math.min(4, Math.max(0.25, speed)),
@@ -1842,6 +1845,11 @@ export function setup(ctx: SpindleFrontendContext) {
   const ambienceSoundsText = document.createElement('span')
   ambienceSoundsText.textContent = 'Enable ambience'
   ambienceSoundsLabel.append(ambienceSoundsToggle, ambienceSoundsText)
+  const soundStartupWaitLabel = document.createElement('label'); soundStartupWaitLabel.className = 'chat-voice-advanced'
+  const soundStartupWaitText = document.createElement('span'); soundStartupWaitText.textContent = 'Wait for opening sound plan (seconds)'
+  const soundStartupWaitInput = document.createElement('input'); soundStartupWaitInput.type = 'number'; soundStartupWaitInput.min = '0'; soundStartupWaitInput.max = '10'; soundStartupWaitInput.step = '1'; soundStartupWaitInput.value = '0'; soundStartupWaitInput.setAttribute('aria-label', 'Wait for opening sound plan in seconds')
+  const soundStartupWaitHint = document.createElement('div'); soundStartupWaitHint.className = 'chat-voice-hint'; soundStartupWaitHint.textContent = 'Optional extra wait after the voice buffer is ready. Default 0; maximum 10 seconds. Playback starts sooner if the sound plan is ready.'
+  soundStartupWaitLabel.append(soundStartupWaitText, soundStartupWaitInput, soundStartupWaitHint)
   const missingSoundsLabel = document.createElement('label'); missingSoundsLabel.className = 'chat-voice-toggle'
   const missingSoundsToggle = document.createElement('input'); missingSoundsToggle.type = 'checkbox'
   const missingSoundsText = document.createElement('span'); missingSoundsText.textContent = 'Suggest missing sounds'
@@ -1864,7 +1872,7 @@ export function setup(ctx: SpindleFrontendContext) {
   const volumeHint = document.createElement('div')
   volumeHint.className = 'chat-voice-hint'
   volumeHint.textContent = 'Volume applies to previews and newly generated audio. Saved recordings are unchanged until regenerated.'
-  soundEffectsPanel.append(eventSoundsLabel, eventSoundVolumeControl.container, ambienceSoundsLabel, ambienceSoundVolumeControl.container, missingSoundsLabel, missingSoundsHint, volumeHint, effectsNote)
+  soundEffectsPanel.append(eventSoundsLabel, eventSoundVolumeControl.container, ambienceSoundsLabel, ambienceSoundVolumeControl.container, soundStartupWaitLabel, missingSoundsLabel, missingSoundsHint, volumeHint, effectsNote)
   const soundTabButtons: HTMLButtonElement[] = []
   const soundPanels = [soundEffectsPanel, soundLibraryPanel, soundAdvancedPanel]
   for (const [index, label] of ['Effects', 'Library', 'Advanced'].entries()) {
@@ -2449,6 +2457,7 @@ export function setup(ctx: SpindleFrontendContext) {
   let savingEventSounds = false
   let savingAmbienceSounds = false
   let savingMissingSounds = false
+  let savingSoundStartupWait = false
   let savingSoundVolumes = 0
   let eventSoundVolume = DEFAULT_EVENT_VOLUME
   let ambienceSoundVolume = DEFAULT_AMBIENCE_VOLUME
@@ -2497,6 +2506,14 @@ export function setup(ctx: SpindleFrontendContext) {
     void updateVoiceSettings(current => ({ ...current, chatVoiceSuggestMissingSounds: enabled }))
       .catch(error => { missingSoundsToggle.checked = !enabled; setStatus(error instanceof Error ? error.message : 'Could not save suggestion settings.', 'error') })
       .finally(() => { savingMissingSounds = false; missingSoundsToggle.disabled = false })
+  })
+  soundStartupWaitInput.addEventListener('change', () => {
+    const seconds = Math.min(10, Math.max(0, Math.round(Number(soundStartupWaitInput.value) || 0)))
+    soundStartupWaitInput.value = String(seconds)
+    savingSoundStartupWait = true; soundStartupWaitInput.disabled = true
+    void updateVoiceSettings(current => ({ ...current, chatVoiceSoundStartupWaitSeconds: seconds }))
+      .catch(error => setStatus(error instanceof Error ? error.message : 'Could not save sound startup wait.', 'error'))
+      .finally(() => { savingSoundStartupWait = false; soundStartupWaitInput.disabled = false })
   })
 
   function soundLibraryRequest(type: string, fields: Record<string, unknown> = {}, onProgress?: (progress: NonNullable<SoundLibraryPayload['plannerProgress']>) => void): Promise<SoundLibraryPayload> {
@@ -4787,9 +4804,11 @@ export function setup(ctx: SpindleFrontendContext) {
         plan.splice(0, plan.length, ...splitPlan)
       }
       if (preferences.eventSounds) {
-        const narrationPlan = splitNarrationForSoundEvents(plan, soundLibrarySnapshot === null ? undefined : { eventSounds: soundLibrarySnapshot, cues: eventCues })
+        const recentStarts = sharedSynthesisPacer.recentStarts.filter(start => start > Date.now() - SYNTHESIS_REQUEST_WINDOW_MS).length
+        const remainingBudget = Math.max(1, sharedSynthesisPacer.windowRequestLimit - recentStarts)
+        const narrationPlan = splitNarrationForSoundEvents(plan, soundLibrarySnapshot === null ? undefined : { eventSounds: soundLibrarySnapshot, cues: eventCues, maxJobs: remainingBudget })
         if (narrationPlan.length !== plan.length) {
-          appendSpeakerDebugLog(`Sound effects: added ${narrationPlan.length - plan.length} natural narration boundary/boundaries; event-aware=${soundLibrarySnapshot !== null}, planner-cues=${eventCues.length}.`)
+          appendSpeakerDebugLog(`Sound effects: added ${narrationPlan.length - plan.length} natural narration boundary/boundaries; event-aware=${soundLibrarySnapshot !== null}, planner-cues=${eventCues.length}, current-window-budget=${remainingBudget}, jobs=${narrationPlan.length}.`)
           plan.splice(0, plan.length, ...narrationPlan)
         }
       }
@@ -5179,6 +5198,12 @@ export function setup(ctx: SpindleFrontendContext) {
         `Buffering ${initialBufferSize} voice segment${initialBufferSize === 1 ? '' : 's'} before playback…`,
       )
       await Promise.all(processed.slice(0, initialBufferSize))
+      if (earlySoundPlan && eventPlanState === 'pending' && preferences.soundStartupWaitSeconds > 0) {
+        const waitStarted = Date.now()
+        setStatus('Waiting briefly for opening sound cues…')
+        await Promise.race([earlySoundPlan, abortableDelay(preferences.soundStartupWaitSeconds * 1000, playback.controller.signal)])
+        appendSpeakerDebugLog(`Sound timing: optional startup wait=${Date.now() - waitStarted}ms (limit=${preferences.soundStartupWaitSeconds * 1000}ms).`)
+      }
 
       const eventSpans = (preferences.eventSounds || preferences.ambienceSounds) ? alignSoundSourceSegments(eventSourceText, plan.map(entry => stripTtsTags(entry.text))) : []
       eventSelectionStarted = true
@@ -5242,11 +5267,10 @@ export function setup(ctx: SpindleFrontendContext) {
       }
 
       for (let index = 0; index < plan.length; index += 1) {
-        const current = await processed[index]
-        if (!current.ok) throw current.error
         const events = selectEventsAt(index).map(withAmbience)
         if (events.length) selectedEvents.set(index, events)
-        for (const event of events) await playMeasured(event, 'event')
+        const current = await playBoundaryThenWaitForVoice(events, event => playMeasured(event, 'event'), processed[index])
+        if (!current.ok) throw current.error
         playbackCursor = index + 1
         if (synthesisCursor < plan.length || localSynthesisTasks > 0) {
           const pressuredConcurrency = bufferAwareGenerationConcurrency(
@@ -6667,6 +6691,7 @@ export function setup(ctx: SpindleFrontendContext) {
       if (!savingEventSounds) eventSoundsToggle.checked = preferences.eventSounds
       if (!savingAmbienceSounds) ambienceSoundsToggle.checked = preferences.ambienceSounds
       if (!savingMissingSounds) missingSoundsToggle.checked = preferences.suggestMissingSounds
+      if (!savingSoundStartupWait) soundStartupWaitInput.value = String(preferences.soundStartupWaitSeconds)
       if (!savingSoundVolumes) {
         eventSoundVolume = preferences.eventSoundVolume
         ambienceSoundVolume = preferences.ambienceSoundVolume

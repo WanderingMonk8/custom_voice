@@ -134,362 +134,6 @@ function soundRequestTimeoutMs(type) {
   return type === "chat_voice_sound_scene_plan" ? SOUND_PLANNER_TIMEOUT_MS : SOUND_LIBRARY_TIMEOUT_MS;
 }
 
-// src/sound-scene.ts
-function splitNarrationForSoundEvents(segments, options) {
-  const result = [];
-  const ignored = /* @__PURE__ */ new Set(["the", "and", "sound", "audio", "with", "from", "this", "that", "short", "effect", "recording", "mp3", "wav"]);
-  const wordForms = (text) => (text.toLocaleLowerCase().match(/[\p{L}]{4,}/gu) ?? []).map((word) => word.endsWith("s") && word.length > 4 ? word.slice(0, -1) : word).filter((word) => !ignored.has(word));
-  const eventTerms = new Set((options?.eventSounds ?? []).filter((sound) => sound.kind === "event").flatMap((sound) => wordForms([sound.name, ...sound.tags].join(" "))));
-  for (const segment of segments) {
-    if (segment.originalSpeech !== void 0 || segment.tagId || /[\[\]<>]/u.test(segment.text)) {
-      result.push(segment);
-      continue;
-    }
-    if (/\b(?:Dr|Mr|Mrs|Ms|Prof|St|vs|etc)\.|\d\.\d/iu.test(segment.text)) {
-      result.push(segment);
-      continue;
-    }
-    const fragments = segment.text.match(/[^,;.!?]+[,;.!?]+(?:["'”’)]*)|[^,;.!?]+$/gu)?.map((part) => part.trim()).filter(Boolean) ?? [];
-    const parts = [];
-    let pending = "";
-    for (const fragment of fragments) {
-      pending = pending ? `${pending} ${fragment}` : fragment;
-      if (pending.length >= 8) {
-        parts.push(pending);
-        pending = "";
-      }
-    }
-    if (pending) {
-      if (parts.length) parts[parts.length - 1] += ` ${pending}`;
-      else parts.push(pending);
-    }
-    if (options && eventTerms.size) {
-      for (let i = 0; i < parts.length - 1; ) {
-        const left = parts[i];
-        const right = parts[i + 1];
-        const commaBoundary = /[,;]["'”’)]*$/u.test(left);
-        const eventNearby = wordForms(left).some((word) => eventTerms.has(word));
-        const knownCueEdge = (options.cues ?? []).some((cue) => cue.kind === "event" && cue.action === "play" && (cue.position === "after" && left.includes(cue.anchor) || cue.position === "before" && right.includes(cue.anchor)));
-        if (commaBoundary && !eventNearby && !knownCueEdge) parts.splice(i, 2, `${left} ${right}`);
-        else i++;
-      }
-    }
-    while (parts.length > 12) {
-      let shortest = 0;
-      for (let i = 1; i < parts.length - 1; i++) if (parts[i].length + parts[i + 1].length < parts[shortest].length + parts[shortest + 1].length) shortest = i;
-      parts.splice(shortest, 2, `${parts[shortest]} ${parts[shortest + 1]}`);
-    }
-    if (parts.length < 2) result.push(segment);
-    else for (const text of parts) result.push({ ...segment, text });
-  }
-  return result;
-}
-function shortlistSoundAssets(message, favorites, limit = 8, kinds = ["event", "ambience"]) {
-  const words = new Set(message.toLocaleLowerCase().match(/[\p{L}\p{N}]{3,}/gu) ?? []);
-  return favorites.filter((sound) => kinds.includes(sound.kind)).map((sound, order) => {
-    const terms = new Set([sound.name, sound.description, ...sound.tags].join(" ").toLocaleLowerCase().match(/[\p{L}\p{N}]{3,}/gu) ?? []);
-    let score = 0;
-    for (const term of terms) if (words.has(term)) score++;
-    return { sound, score, order };
-  }).filter((item) => item.score > 0).sort((a, b) => b.score - a.score || a.order - b.order).slice(0, Math.max(0, Math.min(8, Math.floor(limit)))).map((item) => item.sound);
-}
-function ambienceInstructionAtBoundary(mapped, boundary) {
-  let latest = null;
-  mapped.forEach((item, index) => {
-    if (item.cue.kind !== "ambience" || item.boundary > boundary) return;
-    if (!latest || item.boundary > latest.boundary || item.boundary === latest.boundary && index > latest.index) latest = { ...item, index };
-  });
-  const instruction = latest;
-  if (!instruction || instruction.cue.action !== "play" || !instruction.cue.assetId) return null;
-  return { key: `${instruction.boundary}:${instruction.index}:${instruction.cue.assetId}`, assetId: instruction.cue.assetId };
-}
-function interleaveSoundEvents(voices, events) {
-  const result = [];
-  for (let index = 0; index <= voices.length; index++) {
-    result.push(...events.get(index) ?? []);
-    if (index < voices.length) result.push(voices[index]);
-  }
-  return result;
-}
-function alignSoundSourceSegments(message, clipTexts) {
-  const normalize = (input) => {
-    let text = "";
-    const offsets = [];
-    for (let i = 0; i < input.length; i++) {
-      const char = input[i];
-      if (/\s/u.test(char)) {
-        if (!text || text.endsWith(" ")) continue;
-        text += " ";
-        offsets.push(i);
-      } else {
-        text += char;
-        offsets.push(i);
-      }
-    }
-    if (text.endsWith(" ")) {
-      text = text.slice(0, -1);
-      offsets.pop();
-    }
-    return { text, offsets };
-  };
-  const source = normalize(message);
-  const matches = clipTexts.map((clip) => {
-    const text = normalize(clip).text;
-    if (!text) return null;
-    const start = source.text.indexOf(text);
-    if (start < 0 || source.text.lastIndexOf(text) !== start) return null;
-    return { start: source.offsets[start], end: source.offsets[start + text.length - 1] + 1 };
-  });
-  const invalid = /* @__PURE__ */ new Set();
-  for (let i = 0; i < matches.length; i++) {
-    for (let j = i + 1; j < matches.length; j++) {
-      if (matches[i] && matches[j] && matches[i].end > matches[j].start) {
-        invalid.add(i);
-        invalid.add(j);
-      }
-    }
-  }
-  return matches.map((match, index) => invalid.has(index) ? null : match);
-}
-function mapSoundCueBoundaries(cues, segments, messageLength) {
-  let lastEnd = 0;
-  for (const segment of segments) {
-    if (!segment) continue;
-    if (!Number.isSafeInteger(segment.start) || !Number.isSafeInteger(segment.end) || segment.start < lastEnd || segment.end <= segment.start || segment.end > messageLength) throw new Error("Invalid scene segment boundaries.");
-    lastEnd = segment.end;
-  }
-  const mapped = [];
-  for (const cue of cues) {
-    const end = cue.offset + cue.anchor.length;
-    const index = segments.findIndex((segment) => segment !== null && cue.offset >= segment.start && end <= segment.end);
-    if (index < 0) continue;
-    mapped.push({ cue, boundary: cue.position === "before" ? index : index + 1 });
-  }
-  return mapped;
-}
-
-// src/sound-mix.ts
-function mixAmbienceClip(foreground, ambience, elapsedSeconds, fadeInSeconds = 0.25) {
-  const valid = (clip) => Number.isSafeInteger(clip.sampleRate) && clip.sampleRate >= 8e3 && clip.sampleRate <= 192e3 && Number.isFinite(clip.gain) && clip.gain >= 0 && clip.gain <= 4 && [1, 2].includes(clip.channels.length) && !!clip.channels[0]?.length && clip.channels.every((channel) => channel instanceof Float32Array && channel.length === clip.channels[0].length);
-  if (!valid(foreground) || !valid(ambience) || !Number.isFinite(elapsedSeconds) || elapsedSeconds < 0 || !Number.isFinite(fadeInSeconds) || fadeInSeconds < 0 || fadeInSeconds > 30 || foreground.channels[0].length * 2 * 4 > MAX_MIX_BYTES) throw new Error("Invalid ambience mix.");
-  const frames = foreground.channels[0].length;
-  const output = [new Float32Array(frames), new Float32Array(frames)];
-  const ambientFrames = ambience.channels[0].length;
-  let peak = 0;
-  for (let frame = 0; frame < frames; frame++) {
-    const elapsed = elapsedSeconds + frame / foreground.sampleRate;
-    const position = elapsed * ambience.sampleRate % ambientFrames;
-    const lower = Math.floor(position);
-    const upper = (lower + 1) % ambientFrames;
-    const fraction = position - lower;
-    const fade = fadeInSeconds ? Math.min(1, elapsed / fadeInSeconds) : 1;
-    for (let channel = 0; channel < 2; channel++) {
-      const voice = foreground.channels[Math.min(channel, foreground.channels.length - 1)][frame];
-      const ambient = ambience.channels[Math.min(channel, ambience.channels.length - 1)];
-      const sample = voice * foreground.gain + (ambient[lower] + (ambient[upper] - ambient[lower]) * fraction) * ambience.gain * fade;
-      if (!Number.isFinite(sample)) throw new Error("Invalid audio sample.");
-      output[channel][frame] = sample;
-      peak = Math.max(peak, Math.abs(sample));
-    }
-  }
-  const peakGain = peak > 1 ? 1 / peak : 1;
-  if (peakGain < 1) for (const channel of output) for (let frame = 0; frame < frames; frame++) channel[frame] *= peakGain;
-  return { channels: output, peakGain, elapsedSeconds: elapsedSeconds + frames / foreground.sampleRate };
-}
-var MAX_MIX_BYTES = 128 * 1024 * 1024;
-var DEFAULT_EVENT_VOLUME = 0.8;
-var DEFAULT_AMBIENCE_VOLUME = 0.25;
-function readSoundVolume(value, fallback) {
-  return typeof value === "number" && Number.isFinite(value) ? Math.max(0, Math.min(1, value)) : fallback;
-}
-function soundCategoryGain(channels, kind) {
-  if (!["event", "ambience"].includes(kind) || ![1, 2].includes(channels.length) || !channels[0]?.length || channels.some((channel) => !(channel instanceof Float32Array) || channel.length !== channels[0].length)) throw new Error("Invalid sound audio.");
-  let sum = 0;
-  let peak = 0;
-  for (const channel of channels) for (const sample of channel) {
-    if (!Number.isFinite(sample)) throw new Error("Invalid audio sample.");
-    sum += sample * sample;
-    peak = Math.max(peak, Math.abs(sample));
-  }
-  const rms = Math.sqrt(sum / (channels.length * channels[0].length));
-  if (rms < 1e-4 || peak === 0) return 1;
-  const target = kind === "ambience" ? 0.05 : 0.125;
-  return Math.min(kind === "ambience" ? 1 : 4, target / rms, 0.98 / peak);
-}
-
-// src/playback-ui.ts
-function waitForAutoplayDeadline(deadline, signal) {
-  if (signal.aborted) return Promise.resolve(false);
-  const remaining = Math.max(0, deadline - Date.now());
-  if (!remaining) return Promise.resolve(true);
-  return new Promise((resolve) => {
-    const finish = (ready) => {
-      clearTimeout(timer);
-      signal.removeEventListener("abort", abort);
-      resolve(ready);
-    };
-    const abort = () => finish(false);
-    const timer = setTimeout(() => finish(true), remaining);
-    signal.addEventListener("abort", abort, { once: true });
-  });
-}
-var AutoplayRequestRegistry = class {
-  pending = /* @__PURE__ */ new Map();
-  begin(key) {
-    this.pending.get(key)?.abort();
-    const controller = new AbortController();
-    this.pending.set(key, controller);
-    return controller.signal;
-  }
-  finish(key, signal) {
-    if (this.pending.get(key)?.signal === signal) this.pending.delete(key);
-  }
-  cancelAll() {
-    for (const controller of this.pending.values()) controller.abort();
-    this.pending.clear();
-  }
-};
-function waitForAutoplayWork(work, signal) {
-  if (signal.aborted) return Promise.resolve();
-  return new Promise((resolve, reject) => {
-    const abort = () => {
-      signal.removeEventListener("abort", abort);
-      resolve();
-    };
-    signal.addEventListener("abort", abort, { once: true });
-    work.then(() => {
-      signal.removeEventListener("abort", abort);
-      resolve();
-    }, (error) => {
-      signal.removeEventListener("abort", abort);
-      if (signal.aborted) resolve();
-      else reject(error);
-    });
-  });
-}
-var PlaybackStartupGuard = class {
-  serial = 0;
-  pending = null;
-  begin(chatId, messageId, automatic) {
-    if (this.pending?.chatId === chatId && this.pending.messageId === messageId) {
-      if (!automatic) this.cancel();
-      return null;
-    }
-    const token = ++this.serial;
-    this.pending = { token, chatId, messageId, automatic };
-    return token;
-  }
-  owns(token) {
-    return this.pending?.token === token;
-  }
-  finish(token) {
-    if (this.owns(token)) this.pending = null;
-  }
-  cancel() {
-    this.serial++;
-    this.pending = null;
-  }
-  cancelAutomatic() {
-    if (this.pending?.automatic) this.cancel();
-  }
-  cancelAutomaticFor(chatId, messageId) {
-    if (this.pending?.automatic && this.pending.chatId === chatId && this.pending.messageId === messageId) this.cancel();
-  }
-};
-var PlaybackLongPress = class {
-  constructor(toggle, delay = 650) {
-    this.toggle = toggle;
-    this.delay = delay;
-  }
-  active = null;
-  suppressed = null;
-  expiry = null;
-  start(target, pointerId, x, y) {
-    this.cancel();
-    this.suppressed = null;
-    const active = { target, pointerId, x, y, fired: false, timer: setTimeout(() => {
-      if (this.active !== active) return;
-      active.fired = true;
-      this.suppressed = target;
-      this.toggle();
-    }, this.delay) };
-    this.active = active;
-  }
-  move(pointerId, x, y) {
-    if (this.active?.pointerId === pointerId && !this.active.fired && Math.hypot(x - this.active.x, y - this.active.y) > 10) this.cancel();
-  }
-  end(pointerId) {
-    if (this.active?.pointerId !== pointerId) return;
-    const fired = this.active.fired;
-    clearTimeout(this.active.timer);
-    this.active = null;
-    if (fired) this.expiry = setTimeout(() => {
-      this.suppressed = null;
-      this.expiry = null;
-    }, 1e3);
-  }
-  consumeClick(target) {
-    if (this.suppressed !== target) return false;
-    this.suppressed = null;
-    if (this.expiry) clearTimeout(this.expiry);
-    this.expiry = null;
-    return true;
-  }
-  isHolding(target) {
-    return this.active?.target === target;
-  }
-  cancel() {
-    if (this.active) clearTimeout(this.active.timer);
-    if (this.expiry) clearTimeout(this.expiry);
-    this.active = null;
-    this.expiry = null;
-    this.suppressed = null;
-  }
-};
-function syncAutoplayIndicators(buttons, enabled, getMessageId) {
-  for (const button of buttons) {
-    if (enabled && getMessageId(button)) button.dataset.chatVoiceAutoplay = "true";
-    else delete button.dataset.chatVoiceAutoplay;
-  }
-}
-function syncPlaybackButtons(buttons, activeMessageId, getMessageId, states, stopIcon) {
-  for (const button of buttons) {
-    const messageId = getMessageId(button);
-    if (!messageId) continue;
-    const playing = activeMessageId === messageId;
-    const idle = states.get(button);
-    if (!playing) {
-      if (!idle) continue;
-      button.innerHTML = idle.html;
-      if (idle.title === null) button.removeAttribute("title");
-      else button.setAttribute("title", idle.title);
-      if (idle.ariaLabel === null) button.removeAttribute("aria-label");
-      else button.setAttribute("aria-label", idle.ariaLabel);
-      if (idle.ariaPressed === null) button.removeAttribute("aria-pressed");
-      else button.setAttribute("aria-pressed", idle.ariaPressed);
-      delete button.dataset.chatVoiceNativeTts;
-      delete button.dataset.playing;
-      states.delete(button);
-      continue;
-    }
-    if (!idle) states.set(button, {
-      html: button.innerHTML,
-      title: button.getAttribute("title"),
-      ariaLabel: button.getAttribute("aria-label"),
-      ariaPressed: button.getAttribute("aria-pressed")
-    });
-    if (button.dataset.playing === "true" && button.querySelector("[data-chat-voice-stop]")) continue;
-    const label = "Stop custom voice playback";
-    const hasText = !!button.querySelector(":scope > span");
-    button.dataset.chatVoiceNativeTts = "true";
-    button.dataset.playing = "true";
-    button.innerHTML = `${stopIcon}${hasText ? `<span>${label}</span>` : ""}`;
-    button.title = label;
-    button.setAttribute("aria-label", label);
-    button.setAttribute("aria-pressed", "true");
-  }
-}
-
 // src/core.ts
 var USER_SPEAKER_ID = "__chat_voice_user__";
 var UNCAST_SPEAKER_ID = "__chat_voice_uncast__";
@@ -2911,6 +2555,398 @@ function parseRosterVoiceSegments(content, defaultSpeakerId, speakers, skippedTr
   );
 }
 
+// src/sound-scene.ts
+function splitNarrationForSoundEvents(segments, options) {
+  const result = [];
+  const groupIds = [];
+  const ignored = /* @__PURE__ */ new Set(["the", "and", "sound", "audio", "with", "from", "this", "that", "short", "effect", "recording", "mp3", "wav"]);
+  const wordForms = (text) => (text.toLocaleLowerCase().match(/[\p{L}]{4,}/gu) ?? []).map((word) => word.endsWith("s") && word.length > 4 ? word.slice(0, -1) : word).filter((word) => !ignored.has(word));
+  const eventTerms = new Set((options?.eventSounds ?? []).filter((sound) => sound.kind === "event").flatMap((sound) => wordForms([sound.name, ...sound.tags].join(" "))));
+  for (const [group, segment] of segments.entries()) {
+    if (segment.originalSpeech !== void 0 || segment.tagId || /[\[\]<>]/u.test(segment.text)) {
+      result.push(segment);
+      groupIds.push(group);
+      continue;
+    }
+    if (/\b(?:Dr|Mr|Mrs|Ms|Prof|St|vs|etc)\.|\d\.\d/iu.test(segment.text)) {
+      result.push(segment);
+      groupIds.push(group);
+      continue;
+    }
+    const fragments = segment.text.match(/[^,;.!?]+[,;.!?]+(?:["'”’)]*)|[^,;.!?]+$/gu)?.map((part) => part.trim()).filter(Boolean) ?? [];
+    const parts = [];
+    let pending = "";
+    for (const fragment of fragments) {
+      pending = pending ? `${pending} ${fragment}` : fragment;
+      if (pending.length >= 8) {
+        parts.push(pending);
+        pending = "";
+      }
+    }
+    if (pending) {
+      if (parts.length) parts[parts.length - 1] += ` ${pending}`;
+      else parts.push(pending);
+    }
+    if (options && eventTerms.size) {
+      for (let i = 0; i < parts.length - 1; ) {
+        const left = parts[i];
+        const right = parts[i + 1];
+        const commaBoundary = /[,;]["'”’)]*$/u.test(left);
+        const eventNearby = wordForms(left).some((word) => eventTerms.has(word));
+        const knownCueEdge = (options.cues ?? []).some((cue) => cue.kind === "event" && cue.action === "play" && (cue.position === "after" && left.includes(cue.anchor) || cue.position === "before" && right.includes(cue.anchor)));
+        if (commaBoundary && !eventNearby && !knownCueEdge) parts.splice(i, 2, `${left} ${right}`);
+        else i++;
+      }
+    }
+    while (parts.length > 12) {
+      let shortest = 0;
+      for (let i = 1; i < parts.length - 1; i++) if (parts[i].length + parts[i + 1].length < parts[shortest].length + parts[shortest + 1].length) shortest = i;
+      parts.splice(shortest, 2, `${parts[shortest]} ${parts[shortest + 1]}`);
+    }
+    if (parts.length < 2) {
+      result.push(segment);
+      groupIds.push(group);
+    } else for (const text of parts) {
+      result.push({ ...segment, text });
+      groupIds.push(group);
+    }
+  }
+  const maxJobs = options?.maxJobs;
+  if (Number.isSafeInteger(maxJobs) && maxJobs > 0 && (eventTerms.size || options?.cues?.length)) {
+    while (result.length > maxJobs) {
+      let selected = -1;
+      let bestLength = Infinity;
+      for (let i = 0; i < result.length - 1; i++) {
+        const left = result[i];
+        const right = result[i + 1];
+        if (groupIds[i] !== groupIds[i + 1] || left.originalSpeech !== void 0 || right.originalSpeech !== void 0 || left.tagId || right.tagId || left.voice !== right.voice) continue;
+        const length = left.text.length + 1 + right.text.length;
+        if (length > DEFAULT_MAX_TTS_SEGMENT_CHARS) continue;
+        const knownCue = (options?.cues ?? []).some((cue) => cue.position === "after" && left.text.includes(cue.anchor) || cue.position === "before" && right.text.includes(cue.anchor));
+        if (knownCue || wordForms(left.text).some((word) => eventTerms.has(word)) || wordForms(right.text).some((word) => eventTerms.has(word))) continue;
+        if (length < bestLength) {
+          selected = i;
+          bestLength = length;
+        }
+      }
+      if (selected < 0) break;
+      result[selected] = { ...result[selected], text: `${result[selected].text} ${result[selected + 1].text}` };
+      result.splice(selected + 1, 1);
+      groupIds.splice(selected + 1, 1);
+    }
+  }
+  return result;
+}
+function shortlistSoundAssets(message, favorites, limit = 8, kinds = ["event", "ambience"]) {
+  const words = new Set(message.toLocaleLowerCase().match(/[\p{L}\p{N}]{3,}/gu) ?? []);
+  return favorites.filter((sound) => kinds.includes(sound.kind)).map((sound, order) => {
+    const terms = new Set([sound.name, sound.description, ...sound.tags].join(" ").toLocaleLowerCase().match(/[\p{L}\p{N}]{3,}/gu) ?? []);
+    let score = 0;
+    for (const term of terms) if (words.has(term)) score++;
+    return { sound, score, order };
+  }).filter((item) => item.score > 0).sort((a, b) => b.score - a.score || a.order - b.order).slice(0, Math.max(0, Math.min(8, Math.floor(limit)))).map((item) => item.sound);
+}
+function ambienceInstructionAtBoundary(mapped, boundary) {
+  let latest = null;
+  mapped.forEach((item, index) => {
+    if (item.cue.kind !== "ambience" || item.boundary > boundary) return;
+    if (!latest || item.boundary > latest.boundary || item.boundary === latest.boundary && index > latest.index) latest = { ...item, index };
+  });
+  const instruction = latest;
+  if (!instruction || instruction.cue.action !== "play" || !instruction.cue.assetId) return null;
+  return { key: `${instruction.boundary}:${instruction.index}:${instruction.cue.assetId}`, assetId: instruction.cue.assetId };
+}
+function interleaveSoundEvents(voices, events) {
+  const result = [];
+  for (let index = 0; index <= voices.length; index++) {
+    result.push(...events.get(index) ?? []);
+    if (index < voices.length) result.push(voices[index]);
+  }
+  return result;
+}
+async function playBoundaryThenWaitForVoice(events, play, voice) {
+  for (const event of events) await play(event);
+  return voice;
+}
+function alignSoundSourceSegments(message, clipTexts) {
+  const normalize = (input) => {
+    let text = "";
+    const offsets = [];
+    for (let i = 0; i < input.length; i++) {
+      const char = input[i];
+      if (/\s/u.test(char)) {
+        if (!text || text.endsWith(" ")) continue;
+        text += " ";
+        offsets.push(i);
+      } else {
+        text += char;
+        offsets.push(i);
+      }
+    }
+    if (text.endsWith(" ")) {
+      text = text.slice(0, -1);
+      offsets.pop();
+    }
+    return { text, offsets };
+  };
+  const source = normalize(message);
+  const matches = clipTexts.map((clip) => {
+    const text = normalize(clip).text;
+    if (!text) return null;
+    const start = source.text.indexOf(text);
+    if (start < 0 || source.text.lastIndexOf(text) !== start) return null;
+    return { start: source.offsets[start], end: source.offsets[start + text.length - 1] + 1 };
+  });
+  const invalid = /* @__PURE__ */ new Set();
+  for (let i = 0; i < matches.length; i++) {
+    for (let j = i + 1; j < matches.length; j++) {
+      if (matches[i] && matches[j] && matches[i].end > matches[j].start) {
+        invalid.add(i);
+        invalid.add(j);
+      }
+    }
+  }
+  return matches.map((match, index) => invalid.has(index) ? null : match);
+}
+function mapSoundCueBoundaries(cues, segments, messageLength) {
+  let lastEnd = 0;
+  for (const segment of segments) {
+    if (!segment) continue;
+    if (!Number.isSafeInteger(segment.start) || !Number.isSafeInteger(segment.end) || segment.start < lastEnd || segment.end <= segment.start || segment.end > messageLength) throw new Error("Invalid scene segment boundaries.");
+    lastEnd = segment.end;
+  }
+  const mapped = [];
+  for (const cue of cues) {
+    const end = cue.offset + cue.anchor.length;
+    const index = segments.findIndex((segment) => segment !== null && cue.offset >= segment.start && end <= segment.end);
+    if (index < 0) continue;
+    mapped.push({ cue, boundary: cue.position === "before" ? index : index + 1 });
+  }
+  return mapped;
+}
+
+// src/sound-mix.ts
+function mixAmbienceClip(foreground, ambience, elapsedSeconds, fadeInSeconds = 0.25) {
+  const valid = (clip) => Number.isSafeInteger(clip.sampleRate) && clip.sampleRate >= 8e3 && clip.sampleRate <= 192e3 && Number.isFinite(clip.gain) && clip.gain >= 0 && clip.gain <= 4 && [1, 2].includes(clip.channels.length) && !!clip.channels[0]?.length && clip.channels.every((channel) => channel instanceof Float32Array && channel.length === clip.channels[0].length);
+  if (!valid(foreground) || !valid(ambience) || !Number.isFinite(elapsedSeconds) || elapsedSeconds < 0 || !Number.isFinite(fadeInSeconds) || fadeInSeconds < 0 || fadeInSeconds > 30 || foreground.channels[0].length * 2 * 4 > MAX_MIX_BYTES) throw new Error("Invalid ambience mix.");
+  const frames = foreground.channels[0].length;
+  const output = [new Float32Array(frames), new Float32Array(frames)];
+  const ambientFrames = ambience.channels[0].length;
+  let peak = 0;
+  for (let frame = 0; frame < frames; frame++) {
+    const elapsed = elapsedSeconds + frame / foreground.sampleRate;
+    const position = elapsed * ambience.sampleRate % ambientFrames;
+    const lower = Math.floor(position);
+    const upper = (lower + 1) % ambientFrames;
+    const fraction = position - lower;
+    const fade = fadeInSeconds ? Math.min(1, elapsed / fadeInSeconds) : 1;
+    for (let channel = 0; channel < 2; channel++) {
+      const voice = foreground.channels[Math.min(channel, foreground.channels.length - 1)][frame];
+      const ambient = ambience.channels[Math.min(channel, ambience.channels.length - 1)];
+      const sample = voice * foreground.gain + (ambient[lower] + (ambient[upper] - ambient[lower]) * fraction) * ambience.gain * fade;
+      if (!Number.isFinite(sample)) throw new Error("Invalid audio sample.");
+      output[channel][frame] = sample;
+      peak = Math.max(peak, Math.abs(sample));
+    }
+  }
+  const peakGain = peak > 1 ? 1 / peak : 1;
+  if (peakGain < 1) for (const channel of output) for (let frame = 0; frame < frames; frame++) channel[frame] *= peakGain;
+  return { channels: output, peakGain, elapsedSeconds: elapsedSeconds + frames / foreground.sampleRate };
+}
+var MAX_MIX_BYTES = 128 * 1024 * 1024;
+var DEFAULT_EVENT_VOLUME = 0.8;
+var DEFAULT_AMBIENCE_VOLUME = 0.25;
+function readSoundVolume(value, fallback) {
+  return typeof value === "number" && Number.isFinite(value) ? Math.max(0, Math.min(1, value)) : fallback;
+}
+function soundCategoryGain(channels, kind) {
+  if (!["event", "ambience"].includes(kind) || ![1, 2].includes(channels.length) || !channels[0]?.length || channels.some((channel) => !(channel instanceof Float32Array) || channel.length !== channels[0].length)) throw new Error("Invalid sound audio.");
+  let sum = 0;
+  let peak = 0;
+  for (const channel of channels) for (const sample of channel) {
+    if (!Number.isFinite(sample)) throw new Error("Invalid audio sample.");
+    sum += sample * sample;
+    peak = Math.max(peak, Math.abs(sample));
+  }
+  const rms = Math.sqrt(sum / (channels.length * channels[0].length));
+  if (rms < 1e-4 || peak === 0) return 1;
+  const target = kind === "ambience" ? 0.05 : 0.125;
+  return Math.min(kind === "ambience" ? 1 : 4, target / rms, 0.98 / peak);
+}
+
+// src/playback-ui.ts
+function waitForAutoplayDeadline(deadline, signal) {
+  if (signal.aborted) return Promise.resolve(false);
+  const remaining = Math.max(0, deadline - Date.now());
+  if (!remaining) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    const finish = (ready) => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", abort);
+      resolve(ready);
+    };
+    const abort = () => finish(false);
+    const timer = setTimeout(() => finish(true), remaining);
+    signal.addEventListener("abort", abort, { once: true });
+  });
+}
+var AutoplayRequestRegistry = class {
+  pending = /* @__PURE__ */ new Map();
+  begin(key) {
+    this.pending.get(key)?.abort();
+    const controller = new AbortController();
+    this.pending.set(key, controller);
+    return controller.signal;
+  }
+  finish(key, signal) {
+    if (this.pending.get(key)?.signal === signal) this.pending.delete(key);
+  }
+  cancelAll() {
+    for (const controller of this.pending.values()) controller.abort();
+    this.pending.clear();
+  }
+};
+function waitForAutoplayWork(work, signal) {
+  if (signal.aborted) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const abort = () => {
+      signal.removeEventListener("abort", abort);
+      resolve();
+    };
+    signal.addEventListener("abort", abort, { once: true });
+    work.then(() => {
+      signal.removeEventListener("abort", abort);
+      resolve();
+    }, (error) => {
+      signal.removeEventListener("abort", abort);
+      if (signal.aborted) resolve();
+      else reject(error);
+    });
+  });
+}
+var PlaybackStartupGuard = class {
+  serial = 0;
+  pending = null;
+  begin(chatId, messageId, automatic) {
+    if (this.pending?.chatId === chatId && this.pending.messageId === messageId) {
+      if (!automatic) this.cancel();
+      return null;
+    }
+    const token = ++this.serial;
+    this.pending = { token, chatId, messageId, automatic };
+    return token;
+  }
+  owns(token) {
+    return this.pending?.token === token;
+  }
+  finish(token) {
+    if (this.owns(token)) this.pending = null;
+  }
+  cancel() {
+    this.serial++;
+    this.pending = null;
+  }
+  cancelAutomatic() {
+    if (this.pending?.automatic) this.cancel();
+  }
+  cancelAutomaticFor(chatId, messageId) {
+    if (this.pending?.automatic && this.pending.chatId === chatId && this.pending.messageId === messageId) this.cancel();
+  }
+};
+var PlaybackLongPress = class {
+  constructor(toggle, delay = 650) {
+    this.toggle = toggle;
+    this.delay = delay;
+  }
+  active = null;
+  suppressed = null;
+  expiry = null;
+  start(target, pointerId, x, y) {
+    this.cancel();
+    this.suppressed = null;
+    const active = { target, pointerId, x, y, fired: false, timer: setTimeout(() => {
+      if (this.active !== active) return;
+      active.fired = true;
+      this.suppressed = target;
+      this.toggle();
+    }, this.delay) };
+    this.active = active;
+  }
+  move(pointerId, x, y) {
+    if (this.active?.pointerId === pointerId && !this.active.fired && Math.hypot(x - this.active.x, y - this.active.y) > 10) this.cancel();
+  }
+  end(pointerId) {
+    if (this.active?.pointerId !== pointerId) return;
+    const fired = this.active.fired;
+    clearTimeout(this.active.timer);
+    this.active = null;
+    if (fired) this.expiry = setTimeout(() => {
+      this.suppressed = null;
+      this.expiry = null;
+    }, 1e3);
+  }
+  consumeClick(target) {
+    if (this.suppressed !== target) return false;
+    this.suppressed = null;
+    if (this.expiry) clearTimeout(this.expiry);
+    this.expiry = null;
+    return true;
+  }
+  isHolding(target) {
+    return this.active?.target === target;
+  }
+  cancel() {
+    if (this.active) clearTimeout(this.active.timer);
+    if (this.expiry) clearTimeout(this.expiry);
+    this.active = null;
+    this.expiry = null;
+    this.suppressed = null;
+  }
+};
+function syncAutoplayIndicators(buttons, enabled, getMessageId) {
+  for (const button of buttons) {
+    if (enabled && getMessageId(button)) button.dataset.chatVoiceAutoplay = "true";
+    else delete button.dataset.chatVoiceAutoplay;
+  }
+}
+function syncPlaybackButtons(buttons, activeMessageId, getMessageId, states, stopIcon) {
+  for (const button of buttons) {
+    const messageId = getMessageId(button);
+    if (!messageId) continue;
+    const playing = activeMessageId === messageId;
+    const idle = states.get(button);
+    if (!playing) {
+      if (!idle) continue;
+      button.innerHTML = idle.html;
+      if (idle.title === null) button.removeAttribute("title");
+      else button.setAttribute("title", idle.title);
+      if (idle.ariaLabel === null) button.removeAttribute("aria-label");
+      else button.setAttribute("aria-label", idle.ariaLabel);
+      if (idle.ariaPressed === null) button.removeAttribute("aria-pressed");
+      else button.setAttribute("aria-pressed", idle.ariaPressed);
+      delete button.dataset.chatVoiceNativeTts;
+      delete button.dataset.playing;
+      states.delete(button);
+      continue;
+    }
+    if (!idle) states.set(button, {
+      html: button.innerHTML,
+      title: button.getAttribute("title"),
+      ariaLabel: button.getAttribute("aria-label"),
+      ariaPressed: button.getAttribute("aria-pressed")
+    });
+    if (button.dataset.playing === "true" && button.querySelector("[data-chat-voice-stop]")) continue;
+    const label = "Stop custom voice playback";
+    const hasText = !!button.querySelector(":scope > span");
+    button.dataset.chatVoiceNativeTts = "true";
+    button.dataset.playing = "true";
+    button.innerHTML = `${stopIcon}${hasText ? `<span>${label}</span>` : ""}`;
+    button.title = label;
+    button.setAttribute("aria-label", label);
+    button.setAttribute("aria-pressed", "true");
+  }
+}
+
 // src/frontend.ts
 var ConnectionVoiceGate = class {
   activeVoice = null;
@@ -3049,6 +3085,7 @@ async function loadPlaybackPreferences() {
     eventSounds: false,
     ambienceSounds: false,
     suggestMissingSounds: false,
+    soundStartupWaitSeconds: 0,
     eventSoundVolume: DEFAULT_EVENT_VOLUME,
     ambienceSoundVolume: DEFAULT_AMBIENCE_VOLUME,
     speed: 1,
@@ -3091,6 +3128,7 @@ async function loadPlaybackPreferences() {
     eventSounds: row.value?.chatVoiceEventSounds === true,
     ambienceSounds: row.value?.chatVoiceAmbienceSounds === true,
     suggestMissingSounds: row.value?.chatVoiceSuggestMissingSounds === true,
+    soundStartupWaitSeconds: Math.min(10, Math.max(0, Number.isFinite(Number(row.value?.chatVoiceSoundStartupWaitSeconds)) ? Number(row.value?.chatVoiceSoundStartupWaitSeconds) : 0)),
     eventSoundVolume: readSoundVolume(row.value?.chatVoiceEventSoundVolume, DEFAULT_EVENT_VOLUME),
     ambienceSoundVolume: readSoundVolume(row.value?.chatVoiceAmbienceSoundVolume, DEFAULT_AMBIENCE_VOLUME),
     speed: Math.min(4, Math.max(0.25, speed)),
@@ -4312,6 +4350,21 @@ function setup(ctx) {
   const ambienceSoundsText = document.createElement("span");
   ambienceSoundsText.textContent = "Enable ambience";
   ambienceSoundsLabel.append(ambienceSoundsToggle, ambienceSoundsText);
+  const soundStartupWaitLabel = document.createElement("label");
+  soundStartupWaitLabel.className = "chat-voice-advanced";
+  const soundStartupWaitText = document.createElement("span");
+  soundStartupWaitText.textContent = "Wait for opening sound plan (seconds)";
+  const soundStartupWaitInput = document.createElement("input");
+  soundStartupWaitInput.type = "number";
+  soundStartupWaitInput.min = "0";
+  soundStartupWaitInput.max = "10";
+  soundStartupWaitInput.step = "1";
+  soundStartupWaitInput.value = "0";
+  soundStartupWaitInput.setAttribute("aria-label", "Wait for opening sound plan in seconds");
+  const soundStartupWaitHint = document.createElement("div");
+  soundStartupWaitHint.className = "chat-voice-hint";
+  soundStartupWaitHint.textContent = "Optional extra wait after the voice buffer is ready. Default 0; maximum 10 seconds. Playback starts sooner if the sound plan is ready.";
+  soundStartupWaitLabel.append(soundStartupWaitText, soundStartupWaitInput, soundStartupWaitHint);
   const missingSoundsLabel = document.createElement("label");
   missingSoundsLabel.className = "chat-voice-toggle";
   const missingSoundsToggle = document.createElement("input");
@@ -4342,7 +4395,7 @@ function setup(ctx) {
   const volumeHint = document.createElement("div");
   volumeHint.className = "chat-voice-hint";
   volumeHint.textContent = "Volume applies to previews and newly generated audio. Saved recordings are unchanged until regenerated.";
-  soundEffectsPanel.append(eventSoundsLabel, eventSoundVolumeControl.container, ambienceSoundsLabel, ambienceSoundVolumeControl.container, missingSoundsLabel, missingSoundsHint, volumeHint, effectsNote);
+  soundEffectsPanel.append(eventSoundsLabel, eventSoundVolumeControl.container, ambienceSoundsLabel, ambienceSoundVolumeControl.container, soundStartupWaitLabel, missingSoundsLabel, missingSoundsHint, volumeHint, effectsNote);
   const soundTabButtons = [];
   const soundPanels = [soundEffectsPanel, soundLibraryPanel, soundAdvancedPanel];
   for (const [index, label] of ["Effects", "Library", "Advanced"].entries()) {
@@ -4929,6 +4982,7 @@ function setup(ctx) {
   let savingEventSounds = false;
   let savingAmbienceSounds = false;
   let savingMissingSounds = false;
+  let savingSoundStartupWait = false;
   let savingSoundVolumes = 0;
   let eventSoundVolume = DEFAULT_EVENT_VOLUME;
   let ambienceSoundVolume = DEFAULT_AMBIENCE_VOLUME;
@@ -4991,6 +5045,16 @@ function setup(ctx) {
     }).finally(() => {
       savingMissingSounds = false;
       missingSoundsToggle.disabled = false;
+    });
+  });
+  soundStartupWaitInput.addEventListener("change", () => {
+    const seconds = Math.min(10, Math.max(0, Math.round(Number(soundStartupWaitInput.value) || 0)));
+    soundStartupWaitInput.value = String(seconds);
+    savingSoundStartupWait = true;
+    soundStartupWaitInput.disabled = true;
+    void updateVoiceSettings((current) => ({ ...current, chatVoiceSoundStartupWaitSeconds: seconds })).catch((error) => setStatus(error instanceof Error ? error.message : "Could not save sound startup wait.", "error")).finally(() => {
+      savingSoundStartupWait = false;
+      soundStartupWaitInput.disabled = false;
     });
   });
   function soundLibraryRequest(type, fields = {}, onProgress) {
@@ -7160,9 +7224,11 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
           plan.splice(0, plan.length, ...splitPlan);
         }
         if (preferences.eventSounds) {
-          const narrationPlan = splitNarrationForSoundEvents(plan, soundLibrarySnapshot === null ? void 0 : { eventSounds: soundLibrarySnapshot, cues: eventCues });
+          const recentStarts = sharedSynthesisPacer.recentStarts.filter((start) => start > Date.now() - SYNTHESIS_REQUEST_WINDOW_MS).length;
+          const remainingBudget = Math.max(1, sharedSynthesisPacer.windowRequestLimit - recentStarts);
+          const narrationPlan = splitNarrationForSoundEvents(plan, soundLibrarySnapshot === null ? void 0 : { eventSounds: soundLibrarySnapshot, cues: eventCues, maxJobs: remainingBudget });
           if (narrationPlan.length !== plan.length) {
-            appendSpeakerDebugLog(`Sound effects: added ${narrationPlan.length - plan.length} natural narration boundary/boundaries; event-aware=${soundLibrarySnapshot !== null}, planner-cues=${eventCues.length}.`);
+            appendSpeakerDebugLog(`Sound effects: added ${narrationPlan.length - plan.length} natural narration boundary/boundaries; event-aware=${soundLibrarySnapshot !== null}, planner-cues=${eventCues.length}, current-window-budget=${remainingBudget}, jobs=${narrationPlan.length}.`);
             plan.splice(0, plan.length, ...narrationPlan);
           }
         }
@@ -7514,6 +7580,12 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
           `Buffering ${initialBufferSize} voice segment${initialBufferSize === 1 ? "" : "s"} before playback\u2026`
         );
         await Promise.all(processed.slice(0, initialBufferSize));
+        if (earlySoundPlan && eventPlanState === "pending" && preferences.soundStartupWaitSeconds > 0) {
+          const waitStarted = Date.now();
+          setStatus("Waiting briefly for opening sound cues\u2026");
+          await Promise.race([earlySoundPlan, abortableDelay(preferences.soundStartupWaitSeconds * 1e3, playback.controller.signal)]);
+          appendSpeakerDebugLog(`Sound timing: optional startup wait=${Date.now() - waitStarted}ms (limit=${preferences.soundStartupWaitSeconds * 1e3}ms).`);
+        }
         const eventSpans = preferences.eventSounds || preferences.ambienceSounds ? alignSoundSourceSegments(eventSourceText, plan.map((entry) => stripTtsTags(entry.text))) : [];
         eventSelectionStarted = true;
         let activeAmbience = null;
@@ -7577,11 +7649,10 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
           previousAudioEndedAt = Date.now();
         };
         for (let index = 0; index < plan.length; index += 1) {
-          const current = await processed[index];
-          if (!current.ok) throw current.error;
           const events = selectEventsAt(index).map(withAmbience);
           if (events.length) selectedEvents.set(index, events);
-          for (const event of events) await playMeasured(event, "event");
+          const current = await playBoundaryThenWaitForVoice(events, (event) => playMeasured(event, "event"), processed[index]);
+          if (!current.ok) throw current.error;
           playbackCursor = index + 1;
           if (synthesisCursor < plan.length || localSynthesisTasks > 0) {
             const pressuredConcurrency = bufferAwareGenerationConcurrency(
@@ -8997,6 +9068,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
       if (!savingEventSounds) eventSoundsToggle.checked = preferences.eventSounds;
       if (!savingAmbienceSounds) ambienceSoundsToggle.checked = preferences.ambienceSounds;
       if (!savingMissingSounds) missingSoundsToggle.checked = preferences.suggestMissingSounds;
+      if (!savingSoundStartupWait) soundStartupWaitInput.value = String(preferences.soundStartupWaitSeconds);
       if (!savingSoundVolumes) {
         eventSoundVolume = preferences.eventSoundVolume;
         ambienceSoundVolume = preferences.ambienceSoundVolume;

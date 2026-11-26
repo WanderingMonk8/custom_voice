@@ -6,7 +6,7 @@ import { SoundPreviewCache } from './sound-preview-cache'
 import { SoundLoadQueue } from './sound-load-queue'
 import { soundPlanErrorCategory, soundRequestTimeoutMs } from './sound-plan-diagnostics'
 import { isFreesoundCc0, parseFreesoundSearch, safeFreesoundPreviewUrl } from './freesound'
-import { alignSoundSourceSegments, ambienceInstructionAtBoundary, competingSoundCueIndexes, interleaveSoundEvents, mapSoundCueBoundaries, parseMissingSoundSuggestions, parseSoundScenePlan, shortlistSoundAssets, shortlistSoundPlannerAssets, splitNarrationForSoundEvents } from './sound-scene'
+import { alignSoundSourceSegments, ambienceInstructionAtBoundary, competingSoundCueIndexes, interleaveSoundEvents, mapSoundCueBoundaries, parseMissingSoundSuggestions, parseSoundScenePlan, playBoundaryThenWaitForVoice, shortlistSoundAssets, shortlistSoundPlannerAssets, splitNarrationForSoundEvents } from './sound-scene'
 import { DEFAULT_AMBIENCE_VOLUME, DEFAULT_EVENT_VOLUME, mixAmbienceClip, readSoundVolume, renderSoundMix, soundCategoryGain } from './sound-mix'
 import { buildSoundTimeline, encodeSoundTimelineWav, resampleSoundClip } from './sound-timeline'
 import { SoundCuePreparation } from './sound-preparation'
@@ -331,6 +331,17 @@ test('saved sound events retain the same boundary ordering as voice playback', (
   assert.deepEqual(interleaveSoundEvents(['voice'], new Map([[9, ['outside']]])), ['voice'])
 })
 
+test('ready boundary events play before a delayed voice becomes ready', async () => {
+  let resolveVoice!: (value: string) => void
+  const voice = new Promise<string>(resolve => { resolveVoice = resolve })
+  const played: string[] = []
+  const result = playBoundaryThenWaitForVoice(['door', 'steps'], async event => { played.push(event) }, voice)
+  await new Promise(resolve => setTimeout(resolve, 0))
+  assert.deepEqual(played, ['door', 'steps'])
+  resolveVoice('voice')
+  assert.equal(await result, 'voice')
+})
+
 test('event mode adds natural narration boundaries but leaves dialogue intact', () => {
   const text = 'Test received: the door opened, then closed again. What would you like to do next?'
   const narration = splitNarrationForSoundEvents([{ text, voice: 'voice' }])
@@ -383,6 +394,19 @@ test('event-aware splitting reduces the sample scene jobs while preserving door 
   const cue = { kind: 'event' as const, action: 'play' as const, anchor: 'stepped back outside', offset: 0, position: 'after' as const }
   const cueProtected = splitNarrationForSoundEvents([{ voice: 'narrator', text: 'She stepped back outside, and the door closed behind her.' }], { eventSounds: sounds, cues: [cue] })
   assert.equal(cueProtected.length, 2)
+})
+
+test('sound splitting uses available budget only where cue boundaries are safe to merge', () => {
+  const sound = { version: 1 as const, id: 'door', name: 'door', description: '', tags: ['door'], kind: 'event' as const, mime: 'audio/wav', bytes: 1, createdAt: new Date().toISOString() }
+  const narration = { voice: 'narrator', text: 'The sky was gray. She paused a moment. She opened the door. The room was empty. The air was cold.' }
+  const optimized = splitNarrationForSoundEvents([narration], { eventSounds: [sound], maxJobs: 3 })
+  assert.ok(optimized.length <= 3)
+  assert.ok(optimized.some(item => item.text === 'She opened the door.'))
+  assert.equal(optimized.map(item => item.text).join(' '), narration.text)
+  const protectedCue = { kind: 'ambience' as const, action: 'play' as const, anchor: 'The air was cold.', offset: 0, position: 'before' as const }
+  const protectedPlan = splitNarrationForSoundEvents([narration], { eventSounds: [sound], cues: [protectedCue], maxJobs: 1 })
+  assert.ok(protectedPlan.length > 1)
+  assert.ok(protectedPlan.some(item => item.text === 'The air was cold.'))
 })
 
 test('sound prefetch shortlist matches metadata without selecting the cue', () => {
