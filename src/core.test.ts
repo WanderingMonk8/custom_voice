@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { MAX_FAVORITE_SOUND_SECONDS, SoundLibrary, isSupportedSoundDuration, type SoundUserStorage } from './sound-library'
+import { MAX_FAVORITE_SOUND_BYTES, MAX_FAVORITE_SOUND_SECONDS, SoundLibrary, isSupportedSoundDuration, type SoundUserStorage } from './sound-library'
 import { SoundDownloadTransfers, SoundUploadTransfers } from './sound-transfer'
 import { isFreesoundCc0, parseFreesoundSearch, safeFreesoundPreviewUrl } from './freesound'
 import { alignSoundSourceSegments, ambienceInstructionAtBoundary, competingSoundCueIndexes, interleaveSoundEvents, mapSoundCueBoundaries, parseSoundScenePlan, shortlistSoundAssets, splitNarrationForSoundEvents } from './sound-scene'
@@ -134,12 +134,13 @@ test('large sound uploads are ordered, bounded and isolated by frontend session'
   const stale = uploads.begin('alice/session-a', 1)
   now = 120_001
   assert.throws(() => uploads.take('alice/session-a', stale), /not found/)
-  assert.throws(() => uploads.begin('alice/session-a', 24 * 1024 * 1024 + 1), /Invalid upload/)
+  assert.equal(MAX_FAVORITE_SOUND_BYTES, 48 * 1024 * 1024)
+  assert.throws(() => uploads.begin('alice/session-a', MAX_FAVORITE_SOUND_BYTES + 1), /Invalid upload/)
 })
 
-test('sound library accepts an ambience file larger than the old 2 MiB limit', async () => {
+test('sound library accepts an ambience file larger than the old 24 MiB limit', async () => {
   const storage = new FakeSoundStorage()
-  const audio = new Uint8Array(2 * 1024 * 1024 + 12)
+  const audio = new Uint8Array(24 * 1024 * 1024 + 12)
   audio.set(new TextEncoder().encode('RIFF'), 0)
   audio.set(new TextEncoder().encode('WAVE'), 8)
   const library = new SoundLibrary(storage)
@@ -148,9 +149,9 @@ test('sound library accepts an ambience file larger than the old 2 MiB limit', a
   assert.equal((await library.read(favorite.id, 'alice')).data.length, audio.length)
 })
 
-test('sound transfer reassembles a file spanning multiple 1 MiB chunks', () => {
+test('sound transfer reassembles a file larger than 24 MiB in 1 MiB chunks', () => {
   const uploads = new SoundUploadTransfers(() => 'large')
-  const input = new Uint8Array(2 * 1024 * 1024 + 17)
+  const input = new Uint8Array(24 * 1024 * 1024 + 17)
   input[0] = 3; input[1024 * 1024] = 7; input[input.length - 1] = 9
   const id = uploads.begin('alice/session-a', input.length)
   for (let offset = 0; offset < input.length; offset += 1024 * 1024) uploads.append('alice/session-a', id, offset, input.subarray(offset, offset + 1024 * 1024))

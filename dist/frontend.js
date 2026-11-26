@@ -26,7 +26,7 @@ function safeFreesoundPreviewUrl(value, id) {
 var ROOT = "sound-effects/v1";
 var RECORDS = `${ROOT}/favorites`;
 var AUDIO = `${ROOT}/audio`;
-var MAX_FAVORITE_SOUND_BYTES = 24 * 1024 * 1024;
+var MAX_FAVORITE_SOUND_BYTES = 48 * 1024 * 1024;
 var MAX_FAVORITE_SOUND_SECONDS = 180;
 function isSupportedSoundDuration(seconds) {
   return Number.isFinite(seconds) && seconds > 0 && seconds <= MAX_FAVORITE_SOUND_SECONDS;
@@ -4133,7 +4133,7 @@ function setup(ctx) {
   soundsBody.className = "chat-voice-primary-body";
   const soundsHint = document.createElement("div");
   soundsHint.className = "chat-voice-hint";
-  soundsHint.textContent = "Manage your per-user sound library. Audio must be at most 24 MiB and 3 minutes; larger files may take longer to load.";
+  soundsHint.textContent = "Manage your per-user sound library. Audio must be at most 48 MiB and 3 minutes; larger files may take longer to load.";
   const soundTabs = document.createElement("div");
   soundTabs.className = "chat-voice-voices-tabs";
   soundTabs.setAttribute("role", "tablist");
@@ -4855,7 +4855,7 @@ function setup(ctx) {
       const response = await fetch(url, { credentials: "omit", redirect: "error", referrerPolicy: "no-referrer", signal: controller.signal });
       if (!response.ok || !response.body) throw new Error("Freesound preview download is unavailable.");
       const size = Number(response.headers.get("content-length"));
-      if (Number.isFinite(size) && size > MAX_FAVORITE_SOUND_BYTES) throw new Error("The preview exceeds 24 MiB.");
+      if (Number.isFinite(size) && size > MAX_FAVORITE_SOUND_BYTES) throw new Error("The preview exceeds 48 MiB.");
       const reader = response.body.getReader();
       const chunks = [];
       let total = 0;
@@ -4864,7 +4864,7 @@ function setup(ctx) {
           const { value, done } = await reader.read();
           if (done) break;
           total += value.byteLength;
-          if (total > MAX_FAVORITE_SOUND_BYTES) throw new Error("The preview exceeds 24 MiB.");
+          if (total > MAX_FAVORITE_SOUND_BYTES) throw new Error("The preview exceeds 48 MiB.");
           chunks.push(value);
         }
       } catch (error) {
@@ -5314,7 +5314,7 @@ function setup(ctx) {
         return;
       }
       if (file.size > MAX_FAVORITE_SOUND_BYTES) {
-        setStatus("Sound files must be at most 24 MiB.", "error");
+        setStatus("Sound files must be at most 48 MiB.", "error");
         return;
       }
       const types = { mp3: "audio/mpeg", wav: "audio/wav", ogg: "audio/ogg", m4a: "audio/mp4", webm: "audio/webm" };

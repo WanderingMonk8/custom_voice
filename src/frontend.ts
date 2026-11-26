@@ -1791,7 +1791,7 @@ export function setup(ctx: SpindleFrontendContext) {
   soundsBody.className = 'chat-voice-primary-body'
   const soundsHint = document.createElement('div')
   soundsHint.className = 'chat-voice-hint'
-  soundsHint.textContent = 'Manage your per-user sound library. Audio must be at most 24 MiB and 3 minutes; larger files may take longer to load.'
+  soundsHint.textContent = 'Manage your per-user sound library. Audio must be at most 48 MiB and 3 minutes; larger files may take longer to load.'
   const soundTabs = document.createElement('div')
   soundTabs.className = 'chat-voice-voices-tabs'
   soundTabs.setAttribute('role', 'tablist')
@@ -2499,7 +2499,7 @@ export function setup(ctx: SpindleFrontendContext) {
       const response = await fetch(url, { credentials: 'omit', redirect: 'error', referrerPolicy: 'no-referrer', signal: controller.signal })
       if (!response.ok || !response.body) throw new Error('Freesound preview download is unavailable.')
       const size = Number(response.headers.get('content-length'))
-      if (Number.isFinite(size) && size > MAX_FAVORITE_SOUND_BYTES) throw new Error('The preview exceeds 24 MiB.')
+      if (Number.isFinite(size) && size > MAX_FAVORITE_SOUND_BYTES) throw new Error('The preview exceeds 48 MiB.')
       const reader = response.body.getReader()
       const chunks: Uint8Array[] = []
       let total = 0
@@ -2508,7 +2508,7 @@ export function setup(ctx: SpindleFrontendContext) {
           const { value, done } = await reader.read()
           if (done) break
           total += value.byteLength
-          if (total > MAX_FAVORITE_SOUND_BYTES) throw new Error('The preview exceeds 24 MiB.')
+          if (total > MAX_FAVORITE_SOUND_BYTES) throw new Error('The preview exceeds 48 MiB.')
           chunks.push(value)
         }
       } catch (error) { await reader.cancel().catch(() => undefined); throw error }
@@ -2794,7 +2794,7 @@ export function setup(ctx: SpindleFrontendContext) {
   soundAdd.addEventListener('click', () => { void (async () => {
     const file = soundFile.files?.[0]
     if (!file) { setStatus('Choose an audio file first.', 'error'); return }
-    if (file.size > MAX_FAVORITE_SOUND_BYTES) { setStatus('Sound files must be at most 24 MiB.', 'error'); return }
+    if (file.size > MAX_FAVORITE_SOUND_BYTES) { setStatus('Sound files must be at most 48 MiB.', 'error'); return }
     const types: Record<string, string> = { mp3: 'audio/mpeg', wav: 'audio/wav', ogg: 'audio/ogg', m4a: 'audio/mp4', webm: 'audio/webm' }
     const mime = types[file.name.split('.').pop()?.toLowerCase() ?? ''] ?? file.type
     soundAdd.disabled = true

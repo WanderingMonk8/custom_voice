@@ -48,7 +48,7 @@ const ROOT = 'sound-effects/v1'
 const RECORDS = `${ROOT}/favorites`
 const AUDIO = `${ROOT}/audio`
 // Large files use bounded chunks so no single RPC exceeds the host message limit.
-export const MAX_FAVORITE_SOUND_BYTES = 24 * 1024 * 1024
+export const MAX_FAVORITE_SOUND_BYTES = 48 * 1024 * 1024
 export const MAX_FAVORITE_SOUND_SECONDS = 180
 export function isSupportedSoundDuration(seconds: number): boolean {
   return Number.isFinite(seconds) && seconds > 0 && seconds <= MAX_FAVORITE_SOUND_SECONDS

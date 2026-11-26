@@ -81,7 +81,7 @@ function parseFreesoundSearch(payload) {
 var ROOT = "sound-effects/v1";
 var RECORDS = `${ROOT}/favorites`;
 var AUDIO = `${ROOT}/audio`;
-var MAX_FAVORITE_SOUND_BYTES = 24 * 1024 * 1024;
+var MAX_FAVORITE_SOUND_BYTES = 48 * 1024 * 1024;
 var SOUND_TRANSFER_CHUNK_BYTES = 1024 * 1024;
 var MAX_FAVORITE_SOUNDS = 200;
 var MAX_FAVORITE_LIBRARY_BYTES = 100 * 1024 * 1024;
