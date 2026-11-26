@@ -3,7 +3,7 @@ import type {
   SpindleTextInputHandle,
 } from 'lumiverse-spindle-types'
 import type { FavoriteSound } from './sound-library'
-import { alignSoundSourceSegments, interleaveSoundEvents, mapSoundCueBoundaries, type SoundSceneCue } from './sound-scene'
+import { alignSoundSourceSegments, interleaveSoundEvents, mapSoundCueBoundaries, shortlistSoundAssets, splitNarrationForSoundEvents, type SoundSceneCue } from './sound-scene'
 import { soundCategoryGain } from './sound-mix'
 import { AutoplayRequestRegistry, PlaybackLongPress, PlaybackStartupGuard, syncAutoplayIndicators, syncPlaybackButtons, waitForAutoplayDeadline, waitForAutoplayWork, type PlaybackButtonState } from './playback-ui'
 import {
@@ -3830,29 +3830,50 @@ export function setup(ctx: SpindleFrontendContext) {
     const eventSourceText = preparePlaybackContent(message.content, preferences.skippedTrackerTags)
     let eventCues: SoundSceneCue[] = []
     const eventAssets = new Map<string, SynthesizedVoiceSegment>()
+    const eventLoads = new Map<string, Promise<void>>()
+    let eventPlanState = 'not-requested'
+    let eventAssetFailures = 0
+    const selectedEvents = new Map<number, SynthesizedVoiceSegment[]>()
+    let eventSelectionStarted = false
     let resolveEventSelection!: (selection: Map<number, SynthesizedVoiceSegment[]> | null) => void
     const eventSelection = new Promise<Map<number, SynthesizedVoiceSegment[]> | null>(resolve => { resolveEventSelection = resolve })
+    if (!preferences.eventSounds) resolveEventSelection(selectedEvents)
+    const prepareEventAsset = (id: string): Promise<void> => {
+      const existing = eventLoads.get(id)
+      if (existing) return existing
+      const request = (async () => {
+        try {
+          const asset = await soundLibraryRequest('chat_voice_sound_library_read', { id })
+          if (playback.controller.signal.aborted) return
+          if (!asset.audio || asset.favorite?.kind !== 'event') throw new Error('Unavailable event sound.')
+          const bytes = Uint8Array.from(atob(asset.audio), char => char.charCodeAt(0))
+          const decoded = await audioContext.decodeAudioData(bytes.buffer)
+          if (playback.controller.signal.aborted) return
+          if (decoded.duration > 120 || decoded.numberOfChannels < 1 || decoded.numberOfChannels > 2) throw new Error('Unsupported event sound.')
+          const frames = Math.min(decoded.length, Math.floor(decoded.sampleRate * 5))
+          if (!frames) throw new Error('Empty event sound.')
+          const cropped = audioContext.createBuffer(decoded.numberOfChannels, frames, decoded.sampleRate)
+          for (let channel = 0; channel < decoded.numberOfChannels; channel++) cropped.copyToChannel(decoded.getChannelData(channel).subarray(0, frames), channel)
+          const channels = Array.from({ length: cropped.numberOfChannels }, (_, channel) => cropped.getChannelData(channel))
+          eventAssets.set(id, { data: new ArrayBuffer(0), mime: 'audio/wav', decodedBuffer: cropped, normalizationGain: soundCategoryGain(channels, 'event') })
+        } catch { eventAssetFailures++ }
+      })()
+      eventLoads.set(id, request)
+      return request
+    }
     if (preferences.eventSounds && eventSourceText.length <= 30000 && eventSourceText.trim()) {
+      eventPlanState = 'pending'
+      // A bounded local shortlist only prefetches assets; the model still selects cues.
+      void soundLibraryRequest('chat_voice_sound_library_list').then(result => {
+        if (!playback.controller.signal.aborted) for (const sound of shortlistSoundAssets(eventSourceText, result.favorites ?? [])) void prepareEventAsset(sound.id)
+      }).catch(() => { eventAssetFailures++ })
       void soundLibraryRequest('chat_voice_sound_scene_plan', { message: eventSourceText, connectionId: preferences.tagLlmConnectionId, model: preferences.tagLlmModel })
         .then(async result => {
           if (playback.controller.signal.aborted) return
           eventCues = (result.cues ?? []).filter(cue => cue.kind === 'event' && cue.action === 'play' && cue.assetId)
-          await Promise.all([...new Set(eventCues.map(cue => cue.assetId!))].map(async id => {
-            try {
-              const asset = await soundLibraryRequest('chat_voice_sound_library_read', { id })
-              if (playback.controller.signal.aborted || !asset.audio || asset.favorite?.kind !== 'event') return
-              const bytes = Uint8Array.from(atob(asset.audio), char => char.charCodeAt(0))
-              const decoded = await audioContext.decodeAudioData(bytes.buffer)
-              if (playback.controller.signal.aborted || decoded.duration > 120 || decoded.numberOfChannels < 1 || decoded.numberOfChannels > 2) return
-              const frames = Math.min(decoded.length, Math.floor(decoded.sampleRate * 5))
-              if (!frames) return
-              const cropped = audioContext.createBuffer(decoded.numberOfChannels, frames, decoded.sampleRate)
-              for (let channel = 0; channel < decoded.numberOfChannels; channel++) cropped.copyToChannel(decoded.getChannelData(channel).subarray(0, frames), channel)
-              const channels = Array.from({ length: cropped.numberOfChannels }, (_, channel) => cropped.getChannelData(channel))
-              eventAssets.set(id, { data: new ArrayBuffer(0), mime: 'audio/wav', decodedBuffer: cropped, normalizationGain: soundCategoryGain(channels, 'event') })
-            } catch { /* invalid, late, or unavailable assets are skipped */ }
-          }))
-        }).catch(() => { /* optional planning must not block voice playback */ })
+          eventPlanState = 'completed'
+          await Promise.all([...new Set(eventCues.map(cue => cue.assetId!))].map(prepareEventAsset))
+        }).catch(() => { eventPlanState = 'failed' })
     }
 
     try {
@@ -4283,6 +4304,13 @@ export function setup(ctx: SpindleFrontendContext) {
         )
         plan.splice(0, plan.length, ...splitPlan)
       }
+      if (preferences.eventSounds) {
+        const narrationPlan = splitNarrationForSoundEvents(plan)
+        if (narrationPlan.length !== plan.length) {
+          appendSpeakerDebugLog(`Sound effects: added ${narrationPlan.length - plan.length} natural narration boundary/boundaries.`)
+          plan.splice(0, plan.length, ...narrationPlan)
+        }
+      }
       if (plan.length === 0) throw new Error('This message has no playable narration or dialogue.')
       if (preferences.speakerAssignmentDebug) {
         appendSpeakerDebugLog('\nSynthesis plan')
@@ -4652,31 +4680,28 @@ export function setup(ctx: SpindleFrontendContext) {
           })
       }
 
-      const initialBufferSize = Math.min(preferences.playbackBufferSegments, plan.length)
+      const initialBufferSize = Math.min(preferences.eventSounds ? 1 : preferences.playbackBufferSegments, plan.length)
       setStatus(
         `Buffering ${initialBufferSize} voice segment${initialBufferSize === 1 ? '' : 's'} before playback…`,
       )
       await Promise.all(processed.slice(0, initialBufferSize))
 
-      // Freeze once before first audio: persistence and playback use the same
-      // ready-only events, even if an asset completes later or playback stops.
-      const selectedEvents = new Map<number, SynthesizedVoiceSegment[]>()
-      if (preferences.eventSounds && eventCues.length) {
-        const spans = alignSoundSourceSegments(eventSourceText, plan.map(entry => stripTtsTags(entry.text)))
-        const mapped = mapSoundCueBoundaries(eventCues, spans, eventSourceText.length)
-        for (const { cue, boundary } of mapped) {
-          const asset = cue.assetId ? eventAssets.get(cue.assetId) : undefined
-          if (!asset || selectedEvents.has(boundary)) continue
-          selectedEvents.set(boundary, [asset])
-        }
+      const eventSpans = preferences.eventSounds ? alignSoundSourceSegments(eventSourceText, plan.map(entry => stripTtsTags(entry.text))) : []
+      eventSelectionStarted = true
+      const selectEventsAt = (boundary: number): SynthesizedVoiceSegment[] => {
+        if (!preferences.eventSounds || !eventCues.length) return []
+        const chosen = mapSoundCueBoundaries(eventCues, eventSpans, eventSourceText.length)
+          .filter(item => item.boundary === boundary)
+          .flatMap(item => item.cue.assetId && eventAssets.has(item.cue.assetId) ? [eventAssets.get(item.cue.assetId)!] : [])
+        if (chosen.length) selectedEvents.set(boundary, chosen)
+        return chosen
       }
-      if (preferences.eventSounds) appendSpeakerDebugLog(`Sound effects: ${eventCues.length} event cue(s) proposed; ${selectedEvents.size} ready and aligned before playback. Late or ambiguous cues are skipped.`)
-      resolveEventSelection(selectedEvents)
+      if (preferences.eventSounds) appendSpeakerDebugLog(`Sound effects at first playback: planner=${eventPlanState}, event cues=${eventCues.length}, assets ready=${eventAssets.size}, asset failures=${eventAssetFailures}; later boundaries can use newly ready sounds.`)
 
       for (let index = 0; index < plan.length; index += 1) {
         const current = await processed[index]
         if (!current.ok) throw current.error
-        for (const event of selectedEvents.get(index) ?? []) await playDecodedBuffer(playback, event, preferences.volume)
+        for (const event of selectEventsAt(index)) await playDecodedBuffer(playback, event, preferences.volume)
         playbackCursor = index + 1
         if (synthesisCursor < plan.length || localSynthesisTasks > 0) {
           const pressuredConcurrency = bufferAwareGenerationConcurrency(
@@ -4706,7 +4731,11 @@ export function setup(ctx: SpindleFrontendContext) {
         setStatus(`Playing ${index + 1} of ${plan.length} voice segment${plan.length === 1 ? '' : 's'}…`)
         await playDecodedBuffer(playback, current.segment, preferences.volume)
       }
-      for (const event of selectedEvents.get(plan.length) ?? []) await playDecodedBuffer(playback, event, preferences.volume)
+      for (const event of selectEventsAt(plan.length)) await playDecodedBuffer(playback, event, preferences.volume)
+      if (preferences.eventSounds) {
+        const aligned = mapSoundCueBoundaries(eventCues, eventSpans, eventSourceText.length).length
+        appendSpeakerDebugLog(`Sound effects at playback end: planner=${eventPlanState}, event cues=${eventCues.length}, aligned cues=${aligned}, assets ready=${eventAssets.size}, asset failures=${eventAssetFailures}, selected boundaries=${selectedEvents.size}.`)
+      }
       adaptiveSynthesisLimits.delete(adaptiveLimitToken)
       drainSynthesisQueue()
       playback.playbackFinished = true
@@ -4727,7 +4756,7 @@ export function setup(ctx: SpindleFrontendContext) {
         setStatus(error instanceof Error ? error.message : 'Custom voice playback failed.', 'error')
       }
     } finally {
-      resolveEventSelection(null)
+      resolveEventSelection(eventSelectionStarted ? selectedEvents : null)
       playback.finishAudible()
       if (activePlayback === playback) {
         activePlayback = null

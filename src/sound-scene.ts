@@ -1,4 +1,5 @@
 import type { FavoriteSound } from './sound-library'
+import type { VoicePlanSegment } from './core'
 
 export interface SoundSceneCue {
   kind: 'event' | 'ambience'
@@ -12,6 +13,30 @@ export interface SoundSceneCue {
 export interface SoundSceneSegment {
   start: number
   end: number
+}
+
+/** Add natural narration boundaries without changing dialogue or vocal-tag jobs. */
+export function splitNarrationForSoundEvents(segments: readonly VoicePlanSegment[]): VoicePlanSegment[] {
+  const result: VoicePlanSegment[] = []
+  for (const segment of segments) {
+    if (segment.originalSpeech !== undefined || segment.tagId || /[\[\]<>]/u.test(segment.text)) { result.push(segment); continue }
+    const parts = segment.text.match(/[^,;.!?]+[,;.!?]+(?:["'”’)]*)|[^,;.!?]+$/gu)?.map(part => part.trim()).filter(Boolean) ?? []
+    if (parts.length < 2 || parts.length > 12 || parts.some(part => part.length < 8)) result.push(segment)
+    else for (const text of parts) result.push({ ...segment, text })
+  }
+  return result
+}
+
+/** Small deterministic shortlist for speculative local reads, never a cue decision. */
+export function shortlistSoundAssets(message: string, favorites: readonly FavoriteSound[], limit = 8): FavoriteSound[] {
+  const words = new Set((message.toLocaleLowerCase().match(/[\p{L}\p{N}]{3,}/gu) ?? []))
+  return favorites.filter(sound => sound.kind === 'event').map((sound, order) => {
+    const terms = new Set(([sound.name, sound.description, ...sound.tags].join(' ').toLocaleLowerCase().match(/[\p{L}\p{N}]{3,}/gu) ?? []))
+    let score = 0
+    for (const term of terms) if (words.has(term)) score++
+    return { sound, score, order }
+  }).filter(item => item.score > 0).sort((a, b) => b.score - a.score || a.order - b.order)
+    .slice(0, Math.max(0, Math.min(8, Math.floor(limit)))).map(item => item.sound)
 }
 
 /** Insert events at voice boundaries, preserving both voice and event order. */
@@ -31,7 +56,8 @@ export function competingSoundCueIndexes(cues: readonly SoundSceneCue[]): number
     if (cues[i].action !== 'play') continue
     for (let j = i + 1; j < cues.length; j++) {
       if (cues[j].action === 'play' && cues[i].kind === cues[j].kind
-        && Math.abs(cues[i].offset - cues[j].offset) < 160) { selected.add(i); selected.add(j) }
+        && cues[i].offset < cues[j].offset + cues[j].anchor.length
+        && cues[j].offset < cues[i].offset + cues[i].anchor.length) { selected.add(i); selected.add(j) }
     }
   }
   return [...selected]

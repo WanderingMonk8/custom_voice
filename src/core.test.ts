@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { SoundLibrary, type SoundUserStorage } from './sound-library'
-import { alignSoundSourceSegments, competingSoundCueIndexes, interleaveSoundEvents, mapSoundCueBoundaries, parseSoundScenePlan } from './sound-scene'
+import { alignSoundSourceSegments, competingSoundCueIndexes, interleaveSoundEvents, mapSoundCueBoundaries, parseSoundScenePlan, shortlistSoundAssets, splitNarrationForSoundEvents } from './sound-scene'
 import { renderSoundMix, soundCategoryGain } from './sound-mix'
 import { buildSoundTimeline, encodeSoundTimelineWav, resampleSoundClip } from './sound-timeline'
 import { SoundCuePreparation } from './sound-preparation'
@@ -136,15 +136,34 @@ test('sound source alignment handles whitespace without guessing repeated or mis
   assert.deepEqual(alignSoundSourceSegments('Alpha. Beta.', ['Beta.', 'Alpha.']), [null, null])
 })
 
-test('sound Decision review targets nearby competing cues only', () => {
+test('sound Decision review targets overlapping competing cues, not distinct nearby actions', () => {
   const cue = { kind: 'event' as const, action: 'play' as const, anchor: 'door', position: 'after' as const, offset: 0 }
-  assert.deepEqual(competingSoundCueIndexes([cue, { ...cue, offset: 40 }, { ...cue, offset: 500 }, { ...cue, kind: 'ambience', offset: 1 }]), [0, 1])
+  assert.deepEqual(competingSoundCueIndexes([cue, { ...cue, offset: 2 }, { ...cue, offset: 40 }, { ...cue, kind: 'ambience', offset: 1 }]), [0, 1])
   assert.deepEqual(competingSoundCueIndexes([cue]), [])
 })
 
 test('saved sound events retain the same boundary ordering as voice playback', () => {
   assert.deepEqual(interleaveSoundEvents(['voice 1', 'voice 2'], new Map([[0, ['first']], [1, ['middle']], [2, ['last']]])), ['first', 'voice 1', 'middle', 'voice 2', 'last'])
   assert.deepEqual(interleaveSoundEvents(['voice'], new Map([[9, ['outside']]])), ['voice'])
+})
+
+test('event mode adds natural narration boundaries but leaves dialogue intact', () => {
+  const text = 'Test received: the door opened, then closed again. What would you like to do next?'
+  const narration = splitNarrationForSoundEvents([{ text, voice: 'voice' }])
+  assert.deepEqual(narration.map(item => item.text), ['Test received: the door opened,', 'then closed again.', 'What would you like to do next?'])
+  assert.equal(splitNarrationForSoundEvents([{ text, voice: 'voice', originalSpeech: text }]).length, 1)
+  const spans = alignSoundSourceSegments(text, narration.map(item => item.text))
+  const cues = [
+    { kind: 'event' as const, action: 'play' as const, anchor: 'door opened', offset: text.indexOf('door opened'), position: 'after' as const },
+    { kind: 'event' as const, action: 'play' as const, anchor: 'closed again', offset: text.indexOf('closed again'), position: 'after' as const },
+  ]
+  assert.deepEqual(mapSoundCueBoundaries(cues, spans, text.length).map(item => item.boundary), [1, 2])
+})
+
+test('sound prefetch shortlist matches metadata without selecting the cue', () => {
+  const sound = { version: 1 as const, id: 'door', name: 'door close', description: '', tags: ['door'], kind: 'event' as const, mime: 'audio/wav', bytes: 1, createdAt: new Date().toISOString() }
+  assert.deepEqual(shortlistSoundAssets('The door opened.', [sound]).map(item => item.id), ['door'])
+  assert.deepEqual(shortlistSoundAssets('The bell rang.', [sound]), [])
 })
 
 test('local sound mix permits ambience under speech and events but prohibits event/voice overlap', () => {
