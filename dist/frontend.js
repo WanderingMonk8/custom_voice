@@ -155,6 +155,19 @@ var SOUND_LIBRARY_TIMEOUT_MS = 3e4;
 function soundRequestTimeoutMs(type) {
   return type === "chat_voice_sound_scene_plan" ? SOUND_PLANNER_TIMEOUT_MS : SOUND_LIBRARY_TIMEOUT_MS;
 }
+function automaticSoundErrorCategory(error) {
+  if (!(error instanceof Error)) return "unknown failure";
+  if (error.name === "AbortError") return "aborted or download timed out";
+  if (error.name === "TypeError") return "network or browser restriction";
+  const message = error.message;
+  if (message.startsWith("Save a Freesound API key")) return "missing Freesound API key";
+  if (message.startsWith("Freesound rejected")) return "Freesound authentication or access";
+  if (message.startsWith("Freesound rate limit")) return "Freesound rate limit";
+  if (/timed out/iu.test(message)) return "timeout";
+  if (message.startsWith("The preview exceeds")) return "preview too large";
+  if (message.startsWith("Sound library is full")) return "cache full";
+  return "operation failed";
+}
 
 // src/core.ts
 var USER_SPEAKER_ID = "__chat_voice_user__";
@@ -7015,7 +7028,22 @@ function setup(ctx) {
       const usedSoundCredits = /* @__PURE__ */ new Map();
       const soundLoadQueue = new SoundLoadQueue(2);
       const automaticSoundIds = /* @__PURE__ */ new Set();
-      const automaticCache = preferences.autoSoundLookup ? soundLibraryRequest("chat_voice_sound_library_list", { automatic: true }).then((result) => result.favorites ?? []).catch(() => []) : Promise.resolve([]);
+      const automaticDiagnostics = [];
+      let automaticDiagnosticsReady = false;
+      const logAutomaticSound = (line) => {
+        const text = `Automatic sound: ${line}`;
+        if (!automaticDiagnosticsReady) automaticDiagnostics.push(text);
+        else if (suggestionPlayback === playback) appendSpeakerDebugLog(text);
+      };
+      logAutomaticSound(`enabled=${preferences.autoSoundLookup}, events=${preferences.eventSounds}, ambience=${preferences.ambienceSounds}, planner=${earlySoundPlan ? "requested" : "not requested"}.`);
+      const automaticCache = preferences.autoSoundLookup ? soundLibraryRequest("chat_voice_sound_library_list", { automatic: true }).then((result) => {
+        const entries = result.favorites ?? [];
+        logAutomaticSound(`cache loaded: entries=${entries.length}.`);
+        return entries;
+      }).catch(() => {
+        logAutomaticSound("cache read failed; continuing with an empty cache.");
+        return [];
+      }) : Promise.resolve([]);
       let soundWorkClosed = false;
       const soundLoadStatus = /* @__PURE__ */ new Map();
       let eventPlanState = "not-requested";
@@ -7139,32 +7167,63 @@ function setup(ctx) {
           planReceivedAfterBoundary = lastReachedSoundBoundary;
           eventPlanState = "completed";
           if (preferences.autoSoundLookup) {
-            const missing = (result.missing ?? []).filter((item) => item.kind === "event" ? preferences.eventSounds : preferences.ambienceSounds).slice(0, 2);
-            void Promise.all(missing.map(async (suggestion) => {
+            const eligible = (result.missing ?? []).filter((item) => item.kind === "event" ? preferences.eventSounds : preferences.ambienceSounds);
+            const missing = eligible.slice(0, 2);
+            logAutomaticSound(`validated suggestions=${result.missing?.length ?? 0}, enabled-category suggestions=${eligible.length}, lookups scheduled=${missing.length} (limit=2).`);
+            void Promise.all(missing.map(async (suggestion, index) => {
+              const label = `lookup ${index + 1} (${suggestion.kind})`;
+              let stage = "cache";
               try {
                 const cached = await automaticCache;
                 let favorite = cached.find((item) => item.kind === suggestion.kind && item.description === `query:${suggestion.query.toLocaleLowerCase()}`);
+                logAutomaticSound(`${label}: cache ${favorite ? "hit" : "miss"}.`);
                 if (!favorite) {
+                  stage = "search";
+                  logAutomaticSound(`${label}: Freesound search started.`);
                   const search = await soundLibraryRequest("chat_voice_freesound_search", { query: suggestion.query });
-                  const candidate = rankAutomaticFreesoundResults(suggestion.query, suggestion.kind, search.results ?? [])[0];
-                  if (!candidate?.previewUrl) return;
+                  const results = search.results ?? [];
+                  const licensed = results.filter((item) => isFreesoundImportLicense(item.license));
+                  const previewable = licensed.filter((item) => !!safeFreesoundPreviewUrl(item.previewUrl, item.id));
+                  const durationEligible = previewable.filter((item) => item.duration > 0 && item.duration <= (suggestion.kind === "event" ? 30 : 180));
+                  const ranked = rankAutomaticFreesoundResults(suggestion.query, suggestion.kind, results);
+                  logAutomaticSound(`${label}: results=${results.length}, supported-license=${licensed.length}, safe-preview=${previewable.length}, duration-eligible=${durationEligible.length}, metadata-matches=${ranked.length}.`);
+                  const candidate = ranked[0];
+                  if (!candidate?.previewUrl) {
+                    logAutomaticSound(`${label}: no suitable result; skipped.`);
+                    return;
+                  }
+                  stage = "download";
+                  logAutomaticSound(`${label}: downloading preview.`);
                   const bytes = await downloadFreesoundPreview(candidate.previewUrl);
+                  logAutomaticSound(`${label}: preview downloaded (${bytes.length} bytes).`);
+                  stage = "cache write";
                   favorite = await uploadFavoriteSound({ name: candidate.name.slice(0, 120), description: `query:${suggestion.query.toLocaleLowerCase()}`, tags: (candidate.tags ?? []).slice(0, 20).filter((tag) => tag.length <= 40), kind: suggestion.kind, mime: "audio/mpeg", provenance: { provider: "freesound", soundId: candidate.id, creator: candidate.username, title: candidate.name, license: candidate.license, sourceUrl: candidate.url } }, bytes, true);
+                  logAutomaticSound(`${label}: ${favorite ? "saved to cache" : "cache write returned no record"}.`);
                 }
-                if (!favorite || soundWorkClosed || playback.controller.signal.aborted || !fullCues) return;
+                if (!favorite || soundWorkClosed || playback.controller.signal.aborted || !fullCues) {
+                  logAutomaticSound(`${label}: not added to playback (playback finished, stopped, or no cache record).`);
+                  return;
+                }
                 automaticSoundIds.add(favorite.id);
+                stage = "asset preparation";
                 await prepareEventAsset(favorite.id, true);
-                if (soundWorkClosed || playback.controller.signal.aborted || !eventAssets.has(favorite.id) || !fullCues) return;
+                if (soundWorkClosed || playback.controller.signal.aborted || !eventAssets.has(favorite.id) || !fullCues) {
+                  logAutomaticSound(`${label}: asset not ready or playback ended; skipped.`);
+                  return;
+                }
                 const offset = eventSourceText.indexOf(suggestion.anchor);
-                if (offset < 0) return;
+                if (offset < 0) {
+                  logAutomaticSound(`${label}: anchor unavailable; skipped.`);
+                  return;
+                }
                 const cue = { kind: suggestion.kind, action: "play", assetId: favorite.id, anchor: suggestion.anchor, offset, position: suggestion.kind === "event" ? "after" : "before" };
                 cueArrivalBoundary.set(cue, lastReachedSoundBoundary);
                 fullCues.push(cue);
                 eventCues = mergeOpeningSoundCues(openingCues, fullCues, eventSpans, eventSourceText.length, lastReachedSoundBoundary);
                 mergedPlan = eventSpans.length ? eventCues : null;
-                appendSpeakerDebugLog(`Automatic sound: ${suggestion.kind} asset ready; playback was not delayed.`);
-              } catch {
-                appendSpeakerDebugLog("Automatic sound lookup failed; continuing playback without it.");
+                logAutomaticSound(`${label}: cue added at playback boundary ${lastReachedSoundBoundary}; final cue outcome appears below.`);
+              } catch (error) {
+                logAutomaticSound(`${label}: ${stage} failed (${automaticSoundErrorCategory(error)}); playback continues.`);
               }
             }));
           }
@@ -7230,6 +7289,9 @@ function setup(ctx) {
           preferences.speakerParsingMode,
           review
         );
+        automaticDiagnosticsReady = true;
+        for (const line of automaticDiagnostics) appendSpeakerDebugLog(line);
+        automaticDiagnostics.length = 0;
         for (const line of autoCastDiagnostics) appendSpeakerDebugLog(`Automatic casting: ${line}`);
         const segments = filterNarrationSegments(reviewedSegments, preferences.skipNarration);
         if (preferences.skipNarration) appendSpeakerDebugLog(`Narration audio skipped: ${reviewedSegments.length - segments.length} segment(s).`);
@@ -7963,7 +8025,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
             const boundary = mappedIndex < 0 ? null : mapped[mappedIndex].boundary;
             const key = boundary === null ? "" : `${cue.offset}:${cue.position}:${cue.assetId ?? ""}`;
             const state = boundary === null ? "unaligned" : cue.kind === "event" && selectedEventCues.has(cue) ? "selected" : cue.kind === "ambience" && cue.action === "play" && mixedAmbienceKeys.has(key) ? "mixed" : cue.action === "stop" ? boundary <= lastReachedSoundBoundary ? "stop boundary reached" : "boundary not reached" : cue.kind === "event" && boundary <= (cueArrivalBoundary.get(cue) ?? planReceivedAfterBoundary) ? "plan arrived after boundary" : boundary > lastReachedSoundBoundary ? "boundary not reached" : cue.kind === "ambience" && eventAssets.has(cue.assetId ?? "") ? "not mixed (replaced or no foreground clip)" : cue.kind === "event" && eventAssets.has(cue.assetId ?? "") ? "not selected at boundary (asset may have arrived late)" : `asset not ready (${soundLoadStatus.get(cue.assetId ?? "") ?? "not requested"})`;
-            appendSpeakerDebugLog(`Sound cue [${index + 1}]: kind=${cue.kind}, action=${cue.action}, sound=${JSON.stringify(soundAssetNames.get(cue.assetId ?? "") ?? cue.assetId ?? "<none>")}, anchor-offset=${cue.offset}, anchor-length=${cue.anchor.length}, position=${cue.position}, boundary=${boundary ?? "unaligned"}, adjustment=${mappedIndex < 0 ? "none" : mapped[mappedIndex].adjustment ?? "none"}, outcome=${state}.`);
+            appendSpeakerDebugLog(`Sound cue [${index + 1}]: kind=${cue.kind}, action=${cue.action}, origin=${automaticSoundIds.has(cue.assetId ?? "") ? "automatic cache" : "library"}, sound=${JSON.stringify(soundAssetNames.get(cue.assetId ?? "") ?? cue.assetId ?? "<none>")}, anchor-offset=${cue.offset}, anchor-length=${cue.anchor.length}, position=${cue.position}, boundary=${boundary ?? "unaligned"}, adjustment=${mappedIndex < 0 ? "none" : mapped[mappedIndex].adjustment ?? "none"}, outcome=${state}.`);
           });
         }
         adaptiveSynthesisLimits.delete(adaptiveLimitToken);

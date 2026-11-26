@@ -6,7 +6,7 @@ import { SoundPreviewCache } from './sound-preview-cache'
 import { SoundLoadQueue } from './sound-load-queue'
 import { AutomaticSoundCache } from './sound-auto-cache'
 import { selectSoundLibraryTab } from './sound-library-tabs'
-import { soundPlanErrorCategory, soundRequestTimeoutMs } from './sound-plan-diagnostics'
+import { automaticSoundErrorCategory, soundPlanErrorCategory, soundRequestTimeoutMs } from './sound-plan-diagnostics'
 import { isFreesoundCc0, parseFreesoundSearch, rankAutomaticFreesoundResults, safeFreesoundPreviewUrl } from './freesound'
 import { alignSoundSourceSegments, ambienceInstructionAtBoundary, competingSoundCueIndexes, interleaveSoundEvents, mapSoundCueBoundaries, mergeOpeningSoundCues, parseMissingSoundSuggestions, parseSoundScenePlan, playBoundaryThenWaitForVoice, shortlistSoundAssets, shortlistSoundPlannerAssets, soundAlignmentText, soundOpeningExcerpt, splitNarrationForSoundEvents } from './sound-scene'
 import { DEFAULT_AMBIENCE_VOLUME, DEFAULT_EVENT_VOLUME, mixAmbienceClip, readSoundVolume, renderSoundMix, soundCategoryGain } from './sound-mix'
@@ -84,6 +84,9 @@ test('sound planner diagnostic categories never expose provider error text', () 
   assert.equal(soundPlanErrorCategory({ name: 'AbortError' }), 'aborted')
   assert.equal(soundPlanErrorCategory({ code: 'ETIMEDOUT' }), 'timeout')
   assert.equal(soundPlanErrorCategory(new Error('private scene text')), 'unknown failure')
+  assert.equal(automaticSoundErrorCategory(new Error('Save a Freesound API key in settings')), 'missing Freesound API key')
+  assert.equal(automaticSoundErrorCategory(new Error('Freesound rate limit reached; try again later.')), 'Freesound rate limit')
+  assert.equal(automaticSoundErrorCategory(new Error('secret private scene text')), 'operation failed')
 })
 
 test('sound scene planning gets its own bounded deadline without changing library operations', () => {

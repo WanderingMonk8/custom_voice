@@ -18,3 +18,18 @@ export function soundPlanErrorCategory(error: unknown): string {
   if (item.name === 'TimeoutError' || item.code === 'ETIMEDOUT') return 'timeout'
   return 'unknown failure'
 }
+
+/** Classify only known local errors; never copy remote error text into logs. */
+export function automaticSoundErrorCategory(error: unknown): string {
+  if (!(error instanceof Error)) return 'unknown failure'
+  if (error.name === 'AbortError') return 'aborted or download timed out'
+  if (error.name === 'TypeError') return 'network or browser restriction'
+  const message = error.message
+  if (message.startsWith('Save a Freesound API key')) return 'missing Freesound API key'
+  if (message.startsWith('Freesound rejected')) return 'Freesound authentication or access'
+  if (message.startsWith('Freesound rate limit')) return 'Freesound rate limit'
+  if (/timed out/iu.test(message)) return 'timeout'
+  if (message.startsWith('The preview exceeds')) return 'preview too large'
+  if (message.startsWith('Sound library is full')) return 'cache full'
+  return 'operation failed'
+}
