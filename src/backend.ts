@@ -1082,8 +1082,10 @@ async function saveGhostVoiceAssignments(
       // An existing ghost may have been deleted while Jev was matching. Do not
       // recreate it from a stale result; only new pending identities may create one.
       if (!ghost && !assignment.ghostId?.startsWith('pending:')) continue
-      const voiceId = ghost?.voiceId ?? assignment.voiceId
+      const replacement = ghost && assignment.replaceVoiceId === ghost.voiceId && assignment.voiceId !== ghost.voiceId
+      const voiceId = replacement ? assignment.voiceId : ghost?.voiceId ?? assignment.voiceId
       if (!canReserveAutomaticVoice(voiceId, unavailable, ghost ? activeGhosts.filter(item => item.id === ghostId) : activeGhosts, ghostId)) continue
+      if (replacement && ghost) ghost.voiceId = voiceId
       if (!ghost) {
         ghost = { id: ghostId, speakerId: group.speakerId, voiceId, context: '', occurrenceKeys: [], lastSeenMessageId: anchorId, createdAtMessageId: currentAssistantIds.at(-1) ?? anchorId }
         ghosts.push(ghost)
@@ -2381,7 +2383,7 @@ spindle.onFrontendMessage(async (rawPayload: unknown, userId, frontendSessionId)
               spindle.log.warn(`[Chat Voice] Uncast identity review failed: ${reviewError}`)
             }
           }
-          let assignments = resolveUncastVoiceDecisions(groups, voices, answers, ghosts, payload.reserved, payload.messageId, payload.message.slice(0, 30_000), assistantIds.slice(0, Math.max(0, assistantIds.indexOf(anchor))), undefined, cast)
+          let assignments = resolveUncastVoiceDecisions(groups, voices, answers, ghosts, payload.reserved, payload.messageId, payload.message.slice(0, 30_000), assistantIds.slice(0, Math.max(0, assistantIds.indexOf(anchor))), undefined, cast, readFavoriteVoices(payload.voices))
           const proposedAssignments = assignments
           if (assignments.length) {
             assignments = await saveGhostVoiceAssignments(payload.chatId, payload.messageId, assistantIds, groups, assignments, userId, anchor, payload.reserved, lifetime, payload.message, payload.sourceHash, hashMessageContent(JSON.stringify(savedGhosts)))

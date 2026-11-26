@@ -1671,7 +1671,7 @@ function castDescriptionRoles(description: string): string[] {
   return roles
 }
 
-export interface UncastVoiceAssignment { groupId: string; voiceId: string; gender: string; ghostId?: string; label?: string; aliases?: string[]; matchReason?: string; castSpeakerId?: string }
+export interface UncastVoiceAssignment { groupId: string; voiceId: string; gender: string; ghostId?: string; label?: string; aliases?: string[]; matchReason?: string; castSpeakerId?: string; replaceVoiceId?: string }
 
 /** A chat character that already owns a configured voice. */
 export interface CastSpeaker { id: string; name: string; voiceId: string; description?: string }
@@ -1733,6 +1733,7 @@ export function resolveUncastVoiceDecisions(
   ghosts: GhostVoice[] = [], reserved: readonly string[] = [], messageId = '', message = '', previousMessageIds: readonly string[] = [],
   random: () => number = Math.random,
   cast: readonly CastSpeaker[] = [],
+  voiceMetadata: readonly FavoriteVoice[] = voices,
 ): UncastVoiceAssignment[] {
   // Voices held by live ghosts stay reserved for their owners; Jev's shortlist
   // must not reassign one to a new character (the reservation recheck would
@@ -2004,11 +2005,13 @@ export function resolveUncastVoiceDecisions(
     // The pool Jev's shortlist and the assignment sex both use.
     gender = uniformStrong ?? gender
     const existingGhost = ghost
+    let replacedVoiceId: string | undefined
     if (existingGhost) {
-      const carriedVoice = voices.find(voice => voice.id === existingGhost.voiceId)
+      const carriedVoice = voiceMetadata.find(voice => voice.id === existingGhost.voiceId)
       // A stored voice from an earlier generation must not override the now-known
       // sex of the speaker if metadata identifies it as the wrong sex.
       if (carriedVoice && !voiceGenderCompatible(carriedVoice, gender)) {
+        replacedVoiceId = existingGhost.voiceId
         ghost = undefined
         linkedGhosts.delete(root)
         linkReasons.delete(root)
@@ -2085,7 +2088,9 @@ export function resolveUncastVoiceDecisions(
       if (candidates.length > 1 && matches.every(match => match.choice === 'no_match')) continue
       const shortlist = shortlistRankedVoices(candidates, entry => entry.score)
       const chosen = shortlist[Math.min(shortlist.length - 1, Math.floor(random() * shortlist.length))].voice
-      ghost = { id: `pending:${root}`, speakerId: members[0].speakerId, voiceId: chosen.id, context: members.flatMap(group => group.context).join(' ').slice(0, 2_000), occurrenceKeys: [], lastSeenMessageId: messageId }
+      ghost = replacedVoiceId && existingGhost
+        ? { ...existingGhost, voiceId: chosen.id }
+        : { id: `pending:${root}`, speakerId: members[0].speakerId, voiceId: chosen.id, context: members.flatMap(group => group.context).join(' ').slice(0, 2_000), occurrenceKeys: [], lastSeenMessageId: messageId }
       // Only an unnamed, unlabelled root becomes the reusable baseline; a
       // labelled or named newcomer is a distinct person by construction.
       if (members.every(group => group.speakerId === UNCAST_SPEAKER_ID && !groupShowsNamedIdentity(group))) {
@@ -2101,7 +2106,7 @@ export function resolveUncastVoiceDecisions(
         group.speakerId === UNCAST_SPEAKER_ID && revealedUncastName(group, answers, message) ? [revealedUncastName(group, answers, message)] : [],
         groupLabels.has(group.id) ? [groupLabels.get(group.id)!] : [],
       )
-      assignments.push({ groupId: group.id, voiceId: ghost.voiceId, gender, ghostId: ghost.id, matchReason: `${linkReasons.get(root) ?? 'unknown'}${group.id !== root ? `; linked to group ${root}` : ''}`, ...(label ? { label } : {}), ...(aliases.length ? { aliases } : {}) })
+      assignments.push({ groupId: group.id, voiceId: ghost.voiceId, gender, ghostId: ghost.id, ...(replacedVoiceId ? { replaceVoiceId: replacedVoiceId } : {}), matchReason: `${linkReasons.get(root) ?? 'unknown'}${group.id !== root ? `; linked to group ${root}` : ''}`, ...(label ? { label } : {}), ...(aliases.length ? { aliases } : {}) })
     }
   }
   return assignments

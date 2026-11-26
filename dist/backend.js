@@ -1262,7 +1262,7 @@ function labelGenderHint(label) {
 function narrationBoostsPair(group, partner) {
   return !!group.narratedName && group.flankPartners?.includes(partner.id) === true && partner.addressee === group.narratedName;
 }
-function resolveUncastVoiceDecisions(groups, voices, answers, ghosts = [], reserved = [], messageId = "", message = "", previousMessageIds = [], random = Math.random, cast = []) {
+function resolveUncastVoiceDecisions(groups, voices, answers, ghosts = [], reserved = [], messageId = "", message = "", previousMessageIds = [], random = Math.random, cast = [], voiceMetadata = voices) {
   const used = /* @__PURE__ */ new Set([...reserved.filter(Boolean), ...ghosts.map((it) => it.voiceId).filter(Boolean)]);
   const assignments = [];
   const roots = /* @__PURE__ */ new Map();
@@ -1470,9 +1470,11 @@ function resolveUncastVoiceDecisions(groups, voices, answers, ghosts = [], reser
     const uniformStrong = strongHints.length && strongHints.every((hint) => hint === strongHints[0]) ? strongHints[0] : void 0;
     gender = uniformStrong ?? gender;
     const existingGhost = ghost;
+    let replacedVoiceId;
     if (existingGhost) {
-      const carriedVoice = voices.find((voice) => voice.id === existingGhost.voiceId);
+      const carriedVoice = voiceMetadata.find((voice) => voice.id === existingGhost.voiceId);
       if (carriedVoice && !voiceGenderCompatible(carriedVoice, gender)) {
+        replacedVoiceId = existingGhost.voiceId;
         ghost = void 0;
         linkedGhosts.delete(root);
         linkReasons.delete(root);
@@ -1528,7 +1530,7 @@ function resolveUncastVoiceDecisions(groups, voices, answers, ghosts = [], reser
       if (candidates.length > 1 && matches.every((match) => match.choice === "no_match")) continue;
       const shortlist = shortlistRankedVoices(candidates, (entry) => entry.score);
       const chosen = shortlist[Math.min(shortlist.length - 1, Math.floor(random() * shortlist.length))].voice;
-      ghost = { id: `pending:${root}`, speakerId: members[0].speakerId, voiceId: chosen.id, context: members.flatMap((group) => group.context).join(" ").slice(0, 2e3), occurrenceKeys: [], lastSeenMessageId: messageId };
+      ghost = replacedVoiceId && existingGhost ? { ...existingGhost, voiceId: chosen.id } : { id: `pending:${root}`, speakerId: members[0].speakerId, voiceId: chosen.id, context: members.flatMap((group) => group.context).join(" ").slice(0, 2e3), occurrenceKeys: [], lastSeenMessageId: messageId };
       if (members.every((group) => group.speakerId === UNCAST_SPEAKER_ID && !groupShowsNamedIdentity(group))) {
         pendingUnnamedVoices.push({ ghost, voice: chosen });
       }
@@ -1542,7 +1544,7 @@ function resolveUncastVoiceDecisions(groups, voices, answers, ghosts = [], reser
         group.speakerId === UNCAST_SPEAKER_ID && revealedUncastName(group, answers, message) ? [revealedUncastName(group, answers, message)] : [],
         groupLabels.has(group.id) ? [groupLabels.get(group.id)] : []
       );
-      assignments.push({ groupId: group.id, voiceId: ghost.voiceId, gender, ghostId: ghost.id, matchReason: `${linkReasons.get(root) ?? "unknown"}${group.id !== root ? `; linked to group ${root}` : ""}`, ...label ? { label } : {}, ...aliases.length ? { aliases } : {} });
+      assignments.push({ groupId: group.id, voiceId: ghost.voiceId, gender, ghostId: ghost.id, ...replacedVoiceId ? { replaceVoiceId: replacedVoiceId } : {}, matchReason: `${linkReasons.get(root) ?? "unknown"}${group.id !== root ? `; linked to group ${root}` : ""}`, ...label ? { label } : {}, ...aliases.length ? { aliases } : {} });
     }
   }
   return assignments;
@@ -7758,8 +7760,10 @@ async function saveGhostVoiceAssignments(chatId, messageId, assistantIds, groups
       }
       let ghost = ghosts.find((item) => item.id === ghostId);
       if (!ghost && !assignment.ghostId?.startsWith("pending:")) continue;
-      const voiceId = ghost?.voiceId ?? assignment.voiceId;
+      const replacement = ghost && assignment.replaceVoiceId === ghost.voiceId && assignment.voiceId !== ghost.voiceId;
+      const voiceId = replacement ? assignment.voiceId : ghost?.voiceId ?? assignment.voiceId;
       if (!canReserveAutomaticVoice(voiceId, unavailable, ghost ? activeGhosts.filter((item) => item.id === ghostId) : activeGhosts, ghostId)) continue;
+      if (replacement && ghost) ghost.voiceId = voiceId;
       if (!ghost) {
         ghost = { id: ghostId, speakerId: group.speakerId, voiceId, context: "", occurrenceKeys: [], lastSeenMessageId: anchorId, createdAtMessageId: currentAssistantIds.at(-1) ?? anchorId };
         ghosts.push(ghost);
@@ -8982,7 +8986,7 @@ spindle.onFrontendMessage(async (rawPayload, userId, frontendSessionId) => {
               spindle.log.warn(`[Chat Voice] Uncast identity review failed: ${reviewError}`);
             }
           }
-          let assignments = resolveUncastVoiceDecisions(groups, voices, answers, ghosts, payload.reserved, payload.messageId, payload.message.slice(0, 3e4), assistantIds.slice(0, Math.max(0, assistantIds.indexOf(anchor))), void 0, cast);
+          let assignments = resolveUncastVoiceDecisions(groups, voices, answers, ghosts, payload.reserved, payload.messageId, payload.message.slice(0, 3e4), assistantIds.slice(0, Math.max(0, assistantIds.indexOf(anchor))), void 0, cast, readFavoriteVoices(payload.voices));
           const proposedAssignments = assignments;
           if (assignments.length) {
             assignments = await saveGhostVoiceAssignments(payload.chatId, payload.messageId, assistantIds, groups, assignments, userId, anchor, payload.reserved, lifetime, payload.message, payload.sourceHash, hashMessageContent(JSON.stringify(savedGhosts)));

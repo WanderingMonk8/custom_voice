@@ -3604,6 +3604,22 @@ test('rejects an established ghost whose stored voice is incompatible with the e
   assert.deepEqual(accepted.map(match => match.voiceId), ['unknown-voice'])
 })
 
+test('checks an existing ghost against full voice metadata even when its voice is reserved from new choices', () => {
+  const groups = collectUncastVoiceGroups([{ text: 'Sit down.', speakerId: UNCAST_SPEAKER_ID }])
+  const all = readFavoriteVoices([{ id: 'male-voice', category: 'male' }, { id: 'female-voice', category: 'female' }])
+  const available = all.filter(voice => voice.id !== 'male-voice')
+  const ghost = { id: 'garrick', speakerId: UNCAST_SPEAKER_ID, voiceId: 'male-voice', context: '', occurrenceKeys: [], lastSeenMessageId: 'previous' }
+  const answers = { gender_g0: confidentDecision('female'), identity_g0: confidentDecision('ghost_0'), voice_g0: confidentDecision('voice_0') }
+  const result = resolveUncastVoiceDecisions(groups, available, answers, [ghost], [], 'current', '', ['previous'], () => 0, [], all)
+  assert.equal(result[0]?.ghostId, 'garrick')
+  assert.equal(result[0]?.voiceId, 'female-voice')
+  assert.equal(result[0]?.replaceVoiceId, 'male-voice')
+  const unknown = readFavoriteVoices([{ id: 'male-voice', category: 'unspecified' }, { id: 'female-voice', category: 'female' }])
+  const unchanged = resolveUncastVoiceDecisions(groups, available, answers, [ghost], [], 'current', '', ['previous'], () => 0, [], unknown)
+  assert.equal(unchanged[0]?.voiceId, 'male-voice')
+  assert.equal(unchanged[0]?.replaceVoiceId, undefined)
+})
+
 test('keeps ghost voices for the configured count of assistant messages and never links weak identities', () => {
   const ids = Array.from({ length: 13 }, (_, index) => `assistant-${index}`)
   const ghost = { id: 'ghost-1', speakerId: UNCAST_SPEAKER_ID, voiceId: 'voice-1', context: 'The clerk spoke.', occurrenceKeys: [], lastSeenMessageId: ids[0] }
