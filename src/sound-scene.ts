@@ -44,6 +44,42 @@ export interface SoundSceneSegment {
   end: number
 }
 
+/** A short opening excerpt, ending at a sentence boundary where practical. */
+export function soundOpeningExcerpt(message: string): string {
+  if (message.length <= 420) return message
+  const prefix = message.slice(0, 420)
+  const breaks = [...prefix.matchAll(/[.!?](?=\s|$)/gu)].map(match => (match.index ?? 0) + 1)
+  const end = [...breaks].reverse().find(index => index >= 160)
+  if (end) return message.slice(0, end)
+  const space = prefix.lastIndexOf(' ')
+  return message.slice(0, space >= 160 ? space : 420)
+}
+
+/** Merge an early opening plan with the full plan without replaying shared cues. */
+export function mergeOpeningSoundCues(opening: readonly SoundSceneCue[], full: readonly SoundSceneCue[], segments: readonly (SoundSceneSegment | null)[], messageLength: number, lastBoundary: number): SoundSceneCue[] {
+  if (!opening.length) return [...full]
+  const all = [...opening, ...full]
+  const mapped = segments.length ? mapSoundCueBoundaries(all, segments, messageLength) : []
+  const boundaries = new Map(mapped.map(item => [item.cue, item.boundary]))
+  const overlap = (left: SoundSceneCue, right: SoundSceneCue) => left.offset < right.offset + right.anchor.length && right.offset < left.offset + left.anchor.length
+  const sameLocation = (left: SoundSceneCue, right: SoundSceneCue) => {
+    const a = boundaries.get(left); const b = boundaries.get(right)
+    if (overlap(left, right)) return true
+    // Different events can share a coarse clip boundary; do not collapse them
+    // merely because they map to the same place.
+    return a !== undefined && b !== undefined && a === b && !!left.assetId && left.assetId === right.assetId && Math.abs(left.offset - right.offset) <= 100
+  }
+  const openingEstablishedAmbience = opening.some(cue => cue.kind === 'ambience' && (boundaries.get(cue) ?? Infinity) <= lastBoundary)
+  const keepOpening = opening.filter(cue => !full.some(candidate => candidate.kind === cue.kind && candidate.action === cue.action && sameLocation(cue, candidate)
+    && (boundaries.get(cue) ?? Infinity) > lastBoundary))
+  const keepFull = full.filter(cue => {
+    const boundary = boundaries.get(cue)
+    if (cue.kind === 'ambience' && openingEstablishedAmbience && boundary !== undefined && boundary <= lastBoundary) return false
+    return !keepOpening.some(candidate => candidate.kind === cue.kind && candidate.action === cue.action && sameLocation(candidate, cue))
+  })
+  return [...keepOpening, ...keepFull].sort((a, b) => a.offset - b.offset)
+}
+
 /** Add natural narration boundaries without changing dialogue or vocal-tag jobs. */
 export function splitNarrationForSoundEvents(
   segments: readonly VoicePlanSegment[],
@@ -142,7 +178,8 @@ export function shortlistSoundPlannerAssets(message: string, favorites: readonly
     for (const term of terms) if (words.has(term)) score++
     return { sound, order, score }
   }).sort((a, b) => b.score - a.score || a.order - b.order)
-  const result = ranked.filter(item => item.score > 0).slice(0, Math.max(0, cap - 8)).map(item => item.sound)
+  const reserve = Math.min(8, Math.max(2, Math.floor(cap / 4)))
+  const result = ranked.filter(item => item.score > 0).slice(0, Math.max(0, cap - reserve)).map(item => item.sound)
   const selected = new Set(result.map(sound => sound.id))
   const remaining = ranked.filter(item => !selected.has(item.sound.id))
   for (const kind of ['event', 'ambience'] as const) {
@@ -167,7 +204,7 @@ export function ambienceInstructionAtBoundary(
   })
   const instruction = latest as { cue: SoundSceneCue; boundary: number; index: number } | null
   if (!instruction || instruction.cue.action !== 'play' || !instruction.cue.assetId) return null
-  return { key: `${instruction.boundary}:${instruction.index}:${instruction.cue.assetId}`, assetId: instruction.cue.assetId }
+  return { key: `${instruction.cue.offset}:${instruction.cue.position}:${instruction.cue.assetId}`, assetId: instruction.cue.assetId }
 }
 
 /** Insert events at voice boundaries, preserving both voice and event order. */

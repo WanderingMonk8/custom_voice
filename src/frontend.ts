@@ -7,7 +7,7 @@ import { SoundPreviewCache } from './sound-preview-cache'
 import { SoundLoadQueue } from './sound-load-queue'
 import { soundRequestTimeoutMs } from './sound-plan-diagnostics'
 import { isFreesoundCc0, isFreesoundImportLicense, safeFreesoundPreviewUrl, type FreesoundSearchResult } from './freesound'
-import { alignSoundSourceSegments, ambienceInstructionAtBoundary, interleaveSoundEvents, mapSoundCueBoundaries, playBoundaryThenWaitForVoice, shortlistSoundAssets, splitNarrationForSoundEvents, type MissingSoundSuggestion, type SoundSceneCue } from './sound-scene'
+import { alignSoundSourceSegments, ambienceInstructionAtBoundary, interleaveSoundEvents, mapSoundCueBoundaries, mergeOpeningSoundCues, playBoundaryThenWaitForVoice, shortlistSoundAssets, splitNarrationForSoundEvents, type MissingSoundSuggestion, type SoundSceneCue } from './sound-scene'
 import { DEFAULT_AMBIENCE_VOLUME, DEFAULT_EVENT_VOLUME, mixAmbienceClip, readSoundVolume, soundCategoryGain } from './sound-mix'
 import { AutoplayRequestRegistry, PlaybackLongPress, PlaybackStartupGuard, syncAutoplayIndicators, syncPlaybackButtons, waitForAutoplayDeadline, waitForAutoplayWork, type PlaybackButtonState } from './playback-ui'
 import {
@@ -1830,7 +1830,7 @@ export function setup(ctx: SpindleFrontendContext) {
   }
   const effectsNote = document.createElement('div')
   effectsNote.className = 'chat-voice-hint'
-  effectsNote.textContent = 'Events play between clips; ambience mixes underneath clips and may pause during buffering. When enabled, the current message and favorite sound names, descriptions, tags, types and IDs are sent to your selected LLM connection and, for competing cues, the default Decision connection. Automatic online fallback is not available yet. Late or ambiguous effects are skipped.'
+  effectsNote.textContent = 'Events play between clips; ambience mixes underneath clips and may pause during buffering. When enabled, the current message and favorite sound names, descriptions, tags, types and IDs are sent to your selected LLM connection; longer messages also get a separate opening-scene request. Competing cues may be sent to the default Decision connection. Automatic online fallback is not available yet. Late or ambiguous effects are skipped.'
   const eventSoundsLabel = document.createElement('label')
   eventSoundsLabel.className = 'chat-voice-toggle'
   const eventSoundsToggle = document.createElement('input')
@@ -4192,6 +4192,10 @@ export function setup(ctx: SpindleFrontendContext) {
       ? soundLibraryRequest('chat_voice_sound_scene_plan', { message: eventSourceText, connectionId: preferences.tagLlmConnectionId, model: preferences.tagLlmModel, suggestMissing: preferences.suggestMissingSounds }, progress => { soundPlanProgress.push(progress) })
         .then(result => ({ result, error: null, completedAt: Date.now() }), error => ({ result: null, error, completedAt: Date.now() }))
       : null
+    const openingSoundPlan = earlySoundPlan && eventSourceText.length > 420
+      ? soundLibraryRequest('chat_voice_sound_scene_plan', { message: eventSourceText, connectionId: preferences.tagLlmConnectionId, model: preferences.tagLlmModel, opening: true })
+        .then(result => ({ result, error: null, completedAt: Date.now() }), error => ({ result: null, error, completedAt: Date.now() }))
+      : null
     // Fall back explicitly to the connection profile's voice instead of
     // omitting the field. A provider that applies voice through mutable
     // connection state can otherwise replay whichever voice was last used by
@@ -4278,6 +4282,11 @@ export function setup(ctx: SpindleFrontendContext) {
     // Only the explicit event-sounds opt-in authorizes sharing this message and
     // sound metadata with the selected LLM and default Decision connections.
     let eventCues: SoundSceneCue[] = []
+    let openingCues: SoundSceneCue[] = []
+    let fullCues: SoundSceneCue[] | null = null
+    let mergedPlan: SoundSceneCue[] | null = null
+    let eventSpans: Array<{ start: number; end: number } | null> = []
+    const cueArrivalBoundary = new Map<SoundSceneCue, number>()
     const eventAssets = new Map<string, SynthesizedVoiceSegment>()
     const soundAssetKinds = new Map<string, 'event' | 'ambience'>()
     const soundAssetNames = new Map<string, string>()
@@ -4288,6 +4297,7 @@ export function setup(ctx: SpindleFrontendContext) {
     let soundWorkClosed = false
     const soundLoadStatus = new Map<string, string>()
     let eventPlanState = 'not-requested'
+    let openingPlanState = openingSoundPlan ? 'pending' : 'not-requested'
     let eventAssetFailures = 0
     let lastReachedSoundBoundary = -1
     let planReceivedAfterBoundary = -1
@@ -4347,6 +4357,17 @@ export function setup(ctx: SpindleFrontendContext) {
         if (!soundWorkClosed && !playback.controller.signal.aborted) for (const sound of shortlistSoundAssets(eventSourceText, result.favorites ?? [], 8, kinds)) void prepareEventAsset(sound.id)
       }).catch(() => { eventAssetFailures++ })
       missingSoundSuggestions.textContent = preferences.suggestMissingSounds ? 'Looking for missing sounds in this scene…' : 'No missing-sound suggestions for the current playback.'
+      if (openingSoundPlan) void openingSoundPlan.then(async response => {
+        if (soundWorkClosed || playback.controller.signal.aborted) return
+        if (response.error || !response.result) { openingPlanState = 'failed'; appendSpeakerDebugLog(`Opening sound plan failed after ${response.completedAt - soundPlanStarted}ms.`); return }
+        openingPlanState = 'completed'
+        appendSpeakerDebugLog(`Sound timing: opening planner round-trip=${response.completedAt - soundPlanStarted}ms${response.result.soundTimings ? `, generation=${response.result.soundTimings.generationMs}ms, candidates=${response.result.soundTimings.candidateCount ?? '?'}` : ''}.`)
+        if (fullCues !== null) { appendSpeakerDebugLog('Opening sound plan ignored: full plan already arrived.'); return }
+        openingCues = (response.result.cues ?? []).filter(cue => cue.kind === 'event' ? preferences.eventSounds : preferences.ambienceSounds)
+        for (const cue of openingCues) cueArrivalBoundary.set(cue, lastReachedSoundBoundary)
+        eventCues = [...openingCues]
+        await Promise.all([...new Set(openingCues.flatMap(cue => cue.action === 'play' && cue.assetId ? [cue.assetId] : []))].map(id => prepareEventAsset(id, true)))
+      }).catch(() => { openingPlanState = 'failed'; appendSpeakerDebugLog('Opening sound plan processing failed.') })
       void earlySoundPlan!.then(async response => {
           if (response.error || !response.result) throw response.error ?? new Error('Sound planning failed.')
           const result = response.result
@@ -4363,10 +4384,13 @@ export function setup(ctx: SpindleFrontendContext) {
               missingSoundSuggestions.append(button)
             }
           }
-          eventCues = (result.cues ?? []).filter(cue => (cue.kind === 'event' ? preferences.eventSounds : preferences.ambienceSounds))
+          fullCues = (result.cues ?? []).filter(cue => (cue.kind === 'event' ? preferences.eventSounds : preferences.ambienceSounds))
+          for (const cue of fullCues) cueArrivalBoundary.set(cue, lastReachedSoundBoundary)
+          eventCues = mergeOpeningSoundCues(openingCues, fullCues, eventSpans, eventSourceText.length, lastReachedSoundBoundary)
+          mergedPlan = eventSpans.length ? eventCues : null
           planReceivedAfterBoundary = lastReachedSoundBoundary
           eventPlanState = 'completed'
-          await Promise.all([...new Set(eventCues.flatMap(cue => cue.action === 'play' && cue.assetId ? [cue.assetId] : []))].map(id => prepareEventAsset(id, true)))
+          await Promise.all([...new Set(fullCues.flatMap(cue => cue.action === 'play' && cue.assetId ? [cue.assetId] : []))].map(id => prepareEventAsset(id, true)))
         }).catch(error => {
           eventPlanState = 'failed'
           const details = error instanceof Error ? error.message : 'Unknown sound planner failure.'
@@ -5201,14 +5225,19 @@ export function setup(ctx: SpindleFrontendContext) {
       if (earlySoundPlan && eventPlanState === 'pending' && preferences.soundStartupWaitSeconds > 0) {
         const waitStarted = Date.now()
         setStatus('Waiting briefly for opening sound cues…')
-        await Promise.race([earlySoundPlan, abortableDelay(preferences.soundStartupWaitSeconds * 1000, playback.controller.signal)])
+        const firstSuccessfulPlan = Promise.any([earlySoundPlan, openingSoundPlan].filter((item): item is NonNullable<typeof earlySoundPlan> => item !== null)
+          .map(pending => pending.then(response => { if (response.error || !response.result) throw new Error('Sound plan unavailable.'); return response })))
+          .catch(() => null)
+        await Promise.race([firstSuccessfulPlan, abortableDelay(preferences.soundStartupWaitSeconds * 1000, playback.controller.signal)])
         appendSpeakerDebugLog(`Sound timing: optional startup wait=${Date.now() - waitStarted}ms (limit=${preferences.soundStartupWaitSeconds * 1000}ms).`)
       }
 
-      const eventSpans = (preferences.eventSounds || preferences.ambienceSounds) ? alignSoundSourceSegments(eventSourceText, plan.map(entry => stripTtsTags(entry.text))) : []
+      eventSpans = (preferences.eventSounds || preferences.ambienceSounds) ? alignSoundSourceSegments(eventSourceText, plan.map(entry => stripTtsTags(entry.text))) : []
       eventSelectionStarted = true
       let activeAmbience: { key: string; assetId: string; segment: SynthesizedVoiceSegment; elapsed: number } | null = null
       const selectEventsAt = (boundary: number): SynthesizedVoiceSegment[] => {
+        if (fullCues !== null && mergedPlan === null) mergedPlan = mergeOpeningSoundCues(openingCues, fullCues, eventSpans, eventSourceText.length, planReceivedAfterBoundary)
+        if (mergedPlan !== null) eventCues = mergedPlan
         lastReachedSoundBoundary = boundary
         if (!eventCues.length) return []
         const chosen: SynthesizedVoiceSegment[] = []
@@ -5252,7 +5281,7 @@ export function setup(ctx: SpindleFrontendContext) {
           return foreground
         }
       }
-      if (preferences.eventSounds || preferences.ambienceSounds) appendSpeakerDebugLog(`Sound effects at first playback: planner=${eventPlanState}, cues=${eventCues.length}, assets ready=${eventAssets.size}, asset failures=${eventAssetFailures}; asset states=${JSON.stringify(Object.fromEntries(soundLoadStatus))}.`)
+      if (preferences.eventSounds || preferences.ambienceSounds) appendSpeakerDebugLog(`Sound effects at first playback: planner=${eventPlanState}, opening-planner=${openingPlanState}, cues=${eventCues.length}, assets ready=${eventAssets.size}, asset failures=${eventAssetFailures}; asset states=${JSON.stringify(Object.fromEntries(soundLoadStatus))}.`)
 
       let firstSoundStarted = false
       let previousAudioEndedAt: number | null = null
@@ -5312,12 +5341,12 @@ export function setup(ctx: SpindleFrontendContext) {
         eventCues.forEach((cue, index) => {
           const mappedIndex = mapped.findIndex(item => item.cue === cue)
           const boundary = mappedIndex < 0 ? null : mapped[mappedIndex].boundary
-          const key = boundary === null ? '' : `${boundary}:${mappedIndex}:${cue.assetId ?? ''}`
+          const key = boundary === null ? '' : `${cue.offset}:${cue.position}:${cue.assetId ?? ''}`
           const state = boundary === null ? 'unaligned'
             : cue.kind === 'event' && selectedEventCues.has(cue) ? 'selected'
             : cue.kind === 'ambience' && cue.action === 'play' && mixedAmbienceKeys.has(key) ? 'mixed'
             : cue.action === 'stop' ? (boundary <= lastReachedSoundBoundary ? 'stop boundary reached' : 'boundary not reached')
-            : cue.kind === 'event' && boundary <= planReceivedAfterBoundary ? 'plan arrived after boundary'
+            : cue.kind === 'event' && boundary <= (cueArrivalBoundary.get(cue) ?? planReceivedAfterBoundary) ? 'plan arrived after boundary'
             : boundary > lastReachedSoundBoundary ? 'boundary not reached'
             : cue.kind === 'ambience' && eventAssets.has(cue.assetId ?? '') ? 'not mixed (replaced or no foreground clip)'
             : cue.kind === 'event' && eventAssets.has(cue.assetId ?? '') ? 'not selected at boundary (asset may have arrived late)'

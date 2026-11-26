@@ -6,7 +6,7 @@ import { SoundPreviewCache } from './sound-preview-cache'
 import { SoundLoadQueue } from './sound-load-queue'
 import { soundPlanErrorCategory, soundRequestTimeoutMs } from './sound-plan-diagnostics'
 import { isFreesoundCc0, parseFreesoundSearch, safeFreesoundPreviewUrl } from './freesound'
-import { alignSoundSourceSegments, ambienceInstructionAtBoundary, competingSoundCueIndexes, interleaveSoundEvents, mapSoundCueBoundaries, parseMissingSoundSuggestions, parseSoundScenePlan, playBoundaryThenWaitForVoice, shortlistSoundAssets, shortlistSoundPlannerAssets, splitNarrationForSoundEvents } from './sound-scene'
+import { alignSoundSourceSegments, ambienceInstructionAtBoundary, competingSoundCueIndexes, interleaveSoundEvents, mapSoundCueBoundaries, mergeOpeningSoundCues, parseMissingSoundSuggestions, parseSoundScenePlan, playBoundaryThenWaitForVoice, shortlistSoundAssets, shortlistSoundPlannerAssets, soundOpeningExcerpt, splitNarrationForSoundEvents } from './sound-scene'
 import { DEFAULT_AMBIENCE_VOLUME, DEFAULT_EVENT_VOLUME, mixAmbienceClip, readSoundVolume, renderSoundMix, soundCategoryGain } from './sound-mix'
 import { buildSoundTimeline, encodeSoundTimelineWav, resampleSoundClip } from './sound-timeline'
 import { SoundCuePreparation } from './sound-preparation'
@@ -304,6 +304,34 @@ test('sound cues map only to whole clip boundaries using original source offsets
   assert.deepEqual(mapSoundCueBoundaries([cue], [{ start: 0, end: 9 }, { start: 10, end: 20 }], 20), [{ cue, boundary: 1 }])
   assert.deepEqual(mapSoundCueBoundaries([{ ...cue, anchor: 'door opens' }], [{ start: 0, end: 9 }, { start: 10, end: 20 }], 20), [])
   assert.throws(() => mapSoundCueBoundaries([cue], [{ start: 0, end: 9 }, { start: 8, end: 20 }], 20), /Invalid scene segment/)
+})
+
+test('opening sound excerpt is bounded and ends at a safe early boundary', () => {
+  const message = `${'Long scene introduction. '.repeat(10)}The door opens. ${'Further detail. '.repeat(30)}`
+  const opening = soundOpeningExcerpt(message)
+  assert.ok(opening.length <= 420)
+  assert.ok(opening.length >= 160)
+  assert.ok(message.startsWith(opening))
+  assert.match(opening, /[.!?]$/u)
+  assert.equal(soundOpeningExcerpt('Short scene.'), 'Short scene.')
+})
+
+test('opening and full sound plans deduplicate shared boundaries and do not revive stale ambience', () => {
+  const segments = [{ start: 0, end: 10 }, { start: 10, end: 20 }, { start: 20, end: 30 }]
+  const event = { kind: 'event' as const, action: 'play' as const, assetId: 'door', anchor: 'door', offset: 2, position: 'after' as const }
+  const earlierAmbience = { kind: 'ambience' as const, action: 'play' as const, assetId: 'rain', anchor: 'rain', offset: 12, position: 'before' as const }
+  const fullEvent = { ...event, anchor: 'the door', offset: 0 }
+  const staleAmbience = { ...earlierAmbience, assetId: 'crowd' }
+  const futureEvent = { ...event, assetId: 'other', offset: 22, anchor: 'bell' }
+  const merged = mergeOpeningSoundCues([event, earlierAmbience], [fullEvent, staleAmbience, futureEvent], segments, 30, 1)
+  assert.equal(merged.filter(cue => cue.kind === 'event' && cue.offset < 10).length, 1)
+  assert.ok(merged.includes(event))
+  assert.ok(merged.includes(earlierAmbience))
+  assert.ok(!merged.includes(staleAmbience))
+  assert.ok(merged.includes(futureEvent))
+  const before = mergeOpeningSoundCues([event], [fullEvent], segments, 30, -1)
+  assert.deepEqual(before, [fullEvent])
+  assert.deepEqual(mergeOpeningSoundCues([], [fullEvent], segments, 30, 1), [fullEvent])
 })
 
 test('sound source alignment handles whitespace without guessing repeated or missing clips', () => {

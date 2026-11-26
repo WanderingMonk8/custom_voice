@@ -2556,6 +2556,27 @@ function parseRosterVoiceSegments(content, defaultSpeakerId, speakers, skippedTr
 }
 
 // src/sound-scene.ts
+function mergeOpeningSoundCues(opening, full, segments, messageLength, lastBoundary) {
+  if (!opening.length) return [...full];
+  const all = [...opening, ...full];
+  const mapped = segments.length ? mapSoundCueBoundaries(all, segments, messageLength) : [];
+  const boundaries = new Map(mapped.map((item) => [item.cue, item.boundary]));
+  const overlap = (left, right) => left.offset < right.offset + right.anchor.length && right.offset < left.offset + left.anchor.length;
+  const sameLocation = (left, right) => {
+    const a = boundaries.get(left);
+    const b = boundaries.get(right);
+    if (overlap(left, right)) return true;
+    return a !== void 0 && b !== void 0 && a === b && !!left.assetId && left.assetId === right.assetId && Math.abs(left.offset - right.offset) <= 100;
+  };
+  const openingEstablishedAmbience = opening.some((cue) => cue.kind === "ambience" && (boundaries.get(cue) ?? Infinity) <= lastBoundary);
+  const keepOpening = opening.filter((cue) => !full.some((candidate) => candidate.kind === cue.kind && candidate.action === cue.action && sameLocation(cue, candidate) && (boundaries.get(cue) ?? Infinity) > lastBoundary));
+  const keepFull = full.filter((cue) => {
+    const boundary = boundaries.get(cue);
+    if (cue.kind === "ambience" && openingEstablishedAmbience && boundary !== void 0 && boundary <= lastBoundary) return false;
+    return !keepOpening.some((candidate) => candidate.kind === cue.kind && candidate.action === cue.action && sameLocation(candidate, cue));
+  });
+  return [...keepOpening, ...keepFull].sort((a, b) => a.offset - b.offset);
+}
 function splitNarrationForSoundEvents(segments, options) {
   const result = [];
   const groupIds = [];
@@ -2654,7 +2675,7 @@ function ambienceInstructionAtBoundary(mapped, boundary) {
   });
   const instruction = latest;
   if (!instruction || instruction.cue.action !== "play" || !instruction.cue.assetId) return null;
-  return { key: `${instruction.boundary}:${instruction.index}:${instruction.cue.assetId}`, assetId: instruction.cue.assetId };
+  return { key: `${instruction.cue.offset}:${instruction.cue.position}:${instruction.cue.assetId}`, assetId: instruction.cue.assetId };
 }
 function interleaveSoundEvents(voices, events) {
   const result = [];
@@ -4335,7 +4356,7 @@ function setup(ctx) {
   }
   const effectsNote = document.createElement("div");
   effectsNote.className = "chat-voice-hint";
-  effectsNote.textContent = "Events play between clips; ambience mixes underneath clips and may pause during buffering. When enabled, the current message and favorite sound names, descriptions, tags, types and IDs are sent to your selected LLM connection and, for competing cues, the default Decision connection. Automatic online fallback is not available yet. Late or ambiguous effects are skipped.";
+  effectsNote.textContent = "Events play between clips; ambience mixes underneath clips and may pause during buffering. When enabled, the current message and favorite sound names, descriptions, tags, types and IDs are sent to your selected LLM connection; longer messages also get a separate opening-scene request. Competing cues may be sent to the default Decision connection. Automatic online fallback is not available yet. Late or ambiguous effects are skipped.";
   const eventSoundsLabel = document.createElement("label");
   eventSoundsLabel.className = "chat-voice-toggle";
   const eventSoundsToggle = document.createElement("input");
@@ -6720,6 +6741,7 @@ function setup(ctx) {
       const earlySoundPlan = (preferences.eventSounds || preferences.ambienceSounds) && eventSourceText.length <= 3e4 && eventSourceText.trim() ? soundLibraryRequest("chat_voice_sound_scene_plan", { message: eventSourceText, connectionId: preferences.tagLlmConnectionId, model: preferences.tagLlmModel, suggestMissing: preferences.suggestMissingSounds }, (progress) => {
         soundPlanProgress.push(progress);
       }).then((result) => ({ result, error: null, completedAt: Date.now() }), (error) => ({ result: null, error, completedAt: Date.now() })) : null;
+      const openingSoundPlan = earlySoundPlan && eventSourceText.length > 420 ? soundLibraryRequest("chat_voice_sound_scene_plan", { message: eventSourceText, connectionId: preferences.tagLlmConnectionId, model: preferences.tagLlmModel, opening: true }).then((result) => ({ result, error: null, completedAt: Date.now() }), (error) => ({ result: null, error, completedAt: Date.now() })) : null;
       const connectionProfileVoice = (connections.find((connection) => connection.id === connectionId)?.voice ?? "").trim();
       let autoCastDiagnostics = [];
       if (preferences.autoVoiceCasting && poolVoicesForAutoCast().length && (!config.narratorVoice || !config.userVoice || playbackChat.characters.some((character) => !config.characterVoices[character.id]))) {
@@ -6802,6 +6824,11 @@ function setup(ctx) {
       suggestionPlayback = playback;
       missingSoundSuggestions.textContent = "No missing-sound suggestions for the current playback.";
       let eventCues = [];
+      let openingCues = [];
+      let fullCues = null;
+      let mergedPlan = null;
+      let eventSpans = [];
+      const cueArrivalBoundary = /* @__PURE__ */ new Map();
       const eventAssets = /* @__PURE__ */ new Map();
       const soundAssetKinds = /* @__PURE__ */ new Map();
       const soundAssetNames = /* @__PURE__ */ new Map();
@@ -6812,6 +6839,7 @@ function setup(ctx) {
       let soundWorkClosed = false;
       const soundLoadStatus = /* @__PURE__ */ new Map();
       let eventPlanState = "not-requested";
+      let openingPlanState = openingSoundPlan ? "pending" : "not-requested";
       let eventAssetFailures = 0;
       let lastReachedSoundBoundary = -1;
       let planReceivedAfterBoundary = -1;
@@ -6881,6 +6909,27 @@ function setup(ctx) {
           eventAssetFailures++;
         });
         missingSoundSuggestions.textContent = preferences.suggestMissingSounds ? "Looking for missing sounds in this scene\u2026" : "No missing-sound suggestions for the current playback.";
+        if (openingSoundPlan) void openingSoundPlan.then(async (response) => {
+          if (soundWorkClosed || playback.controller.signal.aborted) return;
+          if (response.error || !response.result) {
+            openingPlanState = "failed";
+            appendSpeakerDebugLog(`Opening sound plan failed after ${response.completedAt - soundPlanStarted}ms.`);
+            return;
+          }
+          openingPlanState = "completed";
+          appendSpeakerDebugLog(`Sound timing: opening planner round-trip=${response.completedAt - soundPlanStarted}ms${response.result.soundTimings ? `, generation=${response.result.soundTimings.generationMs}ms, candidates=${response.result.soundTimings.candidateCount ?? "?"}` : ""}.`);
+          if (fullCues !== null) {
+            appendSpeakerDebugLog("Opening sound plan ignored: full plan already arrived.");
+            return;
+          }
+          openingCues = (response.result.cues ?? []).filter((cue) => cue.kind === "event" ? preferences.eventSounds : preferences.ambienceSounds);
+          for (const cue of openingCues) cueArrivalBoundary.set(cue, lastReachedSoundBoundary);
+          eventCues = [...openingCues];
+          await Promise.all([...new Set(openingCues.flatMap((cue) => cue.action === "play" && cue.assetId ? [cue.assetId] : []))].map((id) => prepareEventAsset(id, true)));
+        }).catch(() => {
+          openingPlanState = "failed";
+          appendSpeakerDebugLog("Opening sound plan processing failed.");
+        });
         void earlySoundPlan.then(async (response) => {
           if (response.error || !response.result) throw response.error ?? new Error("Sound planning failed.");
           const result = response.result;
@@ -6903,10 +6952,13 @@ function setup(ctx) {
               missingSoundSuggestions.append(button);
             }
           }
-          eventCues = (result.cues ?? []).filter((cue) => cue.kind === "event" ? preferences.eventSounds : preferences.ambienceSounds);
+          fullCues = (result.cues ?? []).filter((cue) => cue.kind === "event" ? preferences.eventSounds : preferences.ambienceSounds);
+          for (const cue of fullCues) cueArrivalBoundary.set(cue, lastReachedSoundBoundary);
+          eventCues = mergeOpeningSoundCues(openingCues, fullCues, eventSpans, eventSourceText.length, lastReachedSoundBoundary);
+          mergedPlan = eventSpans.length ? eventCues : null;
           planReceivedAfterBoundary = lastReachedSoundBoundary;
           eventPlanState = "completed";
-          await Promise.all([...new Set(eventCues.flatMap((cue) => cue.action === "play" && cue.assetId ? [cue.assetId] : []))].map((id) => prepareEventAsset(id, true)));
+          await Promise.all([...new Set(fullCues.flatMap((cue) => cue.action === "play" && cue.assetId ? [cue.assetId] : []))].map((id) => prepareEventAsset(id, true)));
         }).catch((error) => {
           eventPlanState = "failed";
           const details = error instanceof Error ? error.message : "Unknown sound planner failure.";
@@ -7583,13 +7635,19 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
         if (earlySoundPlan && eventPlanState === "pending" && preferences.soundStartupWaitSeconds > 0) {
           const waitStarted = Date.now();
           setStatus("Waiting briefly for opening sound cues\u2026");
-          await Promise.race([earlySoundPlan, abortableDelay(preferences.soundStartupWaitSeconds * 1e3, playback.controller.signal)]);
+          const firstSuccessfulPlan = Promise.any([earlySoundPlan, openingSoundPlan].filter((item) => item !== null).map((pending) => pending.then((response) => {
+            if (response.error || !response.result) throw new Error("Sound plan unavailable.");
+            return response;
+          }))).catch(() => null);
+          await Promise.race([firstSuccessfulPlan, abortableDelay(preferences.soundStartupWaitSeconds * 1e3, playback.controller.signal)]);
           appendSpeakerDebugLog(`Sound timing: optional startup wait=${Date.now() - waitStarted}ms (limit=${preferences.soundStartupWaitSeconds * 1e3}ms).`);
         }
-        const eventSpans = preferences.eventSounds || preferences.ambienceSounds ? alignSoundSourceSegments(eventSourceText, plan.map((entry) => stripTtsTags(entry.text))) : [];
+        eventSpans = preferences.eventSounds || preferences.ambienceSounds ? alignSoundSourceSegments(eventSourceText, plan.map((entry) => stripTtsTags(entry.text))) : [];
         eventSelectionStarted = true;
         let activeAmbience = null;
         const selectEventsAt = (boundary) => {
+          if (fullCues !== null && mergedPlan === null) mergedPlan = mergeOpeningSoundCues(openingCues, fullCues, eventSpans, eventSourceText.length, planReceivedAfterBoundary);
+          if (mergedPlan !== null) eventCues = mergedPlan;
           lastReachedSoundBoundary = boundary;
           if (!eventCues.length) return [];
           const chosen = [];
@@ -7633,7 +7691,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
             return foreground;
           }
         };
-        if (preferences.eventSounds || preferences.ambienceSounds) appendSpeakerDebugLog(`Sound effects at first playback: planner=${eventPlanState}, cues=${eventCues.length}, assets ready=${eventAssets.size}, asset failures=${eventAssetFailures}; asset states=${JSON.stringify(Object.fromEntries(soundLoadStatus))}.`);
+        if (preferences.eventSounds || preferences.ambienceSounds) appendSpeakerDebugLog(`Sound effects at first playback: planner=${eventPlanState}, opening-planner=${openingPlanState}, cues=${eventCues.length}, assets ready=${eventAssets.size}, asset failures=${eventAssetFailures}; asset states=${JSON.stringify(Object.fromEntries(soundLoadStatus))}.`);
         let firstSoundStarted = false;
         let previousAudioEndedAt = null;
         const playbackStarted = (kind) => {
@@ -7693,8 +7751,8 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
           eventCues.forEach((cue, index) => {
             const mappedIndex = mapped.findIndex((item) => item.cue === cue);
             const boundary = mappedIndex < 0 ? null : mapped[mappedIndex].boundary;
-            const key = boundary === null ? "" : `${boundary}:${mappedIndex}:${cue.assetId ?? ""}`;
-            const state = boundary === null ? "unaligned" : cue.kind === "event" && selectedEventCues.has(cue) ? "selected" : cue.kind === "ambience" && cue.action === "play" && mixedAmbienceKeys.has(key) ? "mixed" : cue.action === "stop" ? boundary <= lastReachedSoundBoundary ? "stop boundary reached" : "boundary not reached" : cue.kind === "event" && boundary <= planReceivedAfterBoundary ? "plan arrived after boundary" : boundary > lastReachedSoundBoundary ? "boundary not reached" : cue.kind === "ambience" && eventAssets.has(cue.assetId ?? "") ? "not mixed (replaced or no foreground clip)" : cue.kind === "event" && eventAssets.has(cue.assetId ?? "") ? "not selected at boundary (asset may have arrived late)" : `asset not ready (${soundLoadStatus.get(cue.assetId ?? "") ?? "not requested"})`;
+            const key = boundary === null ? "" : `${cue.offset}:${cue.position}:${cue.assetId ?? ""}`;
+            const state = boundary === null ? "unaligned" : cue.kind === "event" && selectedEventCues.has(cue) ? "selected" : cue.kind === "ambience" && cue.action === "play" && mixedAmbienceKeys.has(key) ? "mixed" : cue.action === "stop" ? boundary <= lastReachedSoundBoundary ? "stop boundary reached" : "boundary not reached" : cue.kind === "event" && boundary <= (cueArrivalBoundary.get(cue) ?? planReceivedAfterBoundary) ? "plan arrived after boundary" : boundary > lastReachedSoundBoundary ? "boundary not reached" : cue.kind === "ambience" && eventAssets.has(cue.assetId ?? "") ? "not mixed (replaced or no foreground clip)" : cue.kind === "event" && eventAssets.has(cue.assetId ?? "") ? "not selected at boundary (asset may have arrived late)" : `asset not ready (${soundLoadStatus.get(cue.assetId ?? "") ?? "not requested"})`;
             appendSpeakerDebugLog(`Sound cue [${index + 1}]: kind=${cue.kind}, action=${cue.action}, sound=${JSON.stringify(soundAssetNames.get(cue.assetId ?? "") ?? cue.assetId ?? "<none>")}, boundary=${boundary ?? "unaligned"}, outcome=${state}.`);
           });
         }
