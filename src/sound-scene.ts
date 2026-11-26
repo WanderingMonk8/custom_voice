@@ -10,6 +10,35 @@ export interface SoundSceneCue {
   offset: number
 }
 
+export interface MissingSoundSuggestion {
+  kind: 'event' | 'ambience'
+  query: string
+  anchor: string
+}
+
+/** Only expose short, grounded search suggestions; never turn model output into a URL. */
+export function parseMissingSoundSuggestions(raw: string, message: string): MissingSoundSuggestion[] {
+  const cleaned = raw.trim().replace(/^```(?:json)?\s*/iu, '').replace(/\s*```$/u, '')
+  let parsed: unknown
+  try { parsed = JSON.parse(cleaned) } catch { return [] }
+  if (!parsed || typeof parsed !== 'object' || !Array.isArray((parsed as { missing?: unknown }).missing)) return []
+  const result: MissingSoundSuggestion[] = []
+  const seen = new Set<string>()
+  for (const value of (parsed as { missing: unknown[] }).missing.slice(0, 12)) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) continue
+    const item = value as Record<string, unknown>
+    if ((item.kind !== 'event' && item.kind !== 'ambience') || typeof item.query !== 'string' || typeof item.anchor !== 'string') continue
+    const query = item.query.trim().replace(/\s+/gu, ' ')
+    if (query.length < 3 || query.length > 60 || !/^[\p{L}\p{N} '\-]+$/u.test(query) || /https?|www/iu.test(query)) continue
+    if (item.anchor.length < 3 || item.anchor.length > 200 || !message.includes(item.anchor) || message.indexOf(item.anchor) !== message.lastIndexOf(item.anchor)) continue
+    const key = `${item.kind}:${query.toLocaleLowerCase()}`
+    if (seen.has(key)) continue
+    seen.add(key); result.push({ kind: item.kind, query, anchor: item.anchor })
+    if (result.length >= 4) break
+  }
+  return result
+}
+
 export interface SoundSceneSegment {
   start: number
   end: number

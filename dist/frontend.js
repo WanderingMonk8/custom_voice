@@ -2912,6 +2912,7 @@ async function loadPlaybackPreferences() {
   if (!response.ok) return {
     eventSounds: false,
     ambienceSounds: false,
+    suggestMissingSounds: false,
     eventSoundVolume: DEFAULT_EVENT_VOLUME,
     ambienceSoundVolume: DEFAULT_AMBIENCE_VOLUME,
     speed: 1,
@@ -2953,6 +2954,7 @@ async function loadPlaybackPreferences() {
   return {
     eventSounds: row.value?.chatVoiceEventSounds === true,
     ambienceSounds: row.value?.chatVoiceAmbienceSounds === true,
+    suggestMissingSounds: row.value?.chatVoiceSuggestMissingSounds === true,
     eventSoundVolume: readSoundVolume(row.value?.chatVoiceEventSoundVolume, DEFAULT_EVENT_VOLUME),
     ambienceSoundVolume: readSoundVolume(row.value?.chatVoiceAmbienceSoundVolume, DEFAULT_AMBIENCE_VOLUME),
     speed: Math.min(4, Math.max(0.25, speed)),
@@ -4162,6 +4164,16 @@ function setup(ctx) {
   const ambienceSoundsText = document.createElement("span");
   ambienceSoundsText.textContent = "Enable ambience";
   ambienceSoundsLabel.append(ambienceSoundsToggle, ambienceSoundsText);
+  const missingSoundsLabel = document.createElement("label");
+  missingSoundsLabel.className = "chat-voice-toggle";
+  const missingSoundsToggle = document.createElement("input");
+  missingSoundsToggle.type = "checkbox";
+  const missingSoundsText = document.createElement("span");
+  missingSoundsText.textContent = "Suggest missing sounds";
+  missingSoundsLabel.append(missingSoundsToggle, missingSoundsText);
+  const missingSoundsHint = document.createElement("div");
+  missingSoundsHint.className = "chat-voice-hint";
+  missingSoundsHint.textContent = "When sound effects are enabled, the scene planner may suggest search terms for sounds missing from favorites. Suggestions appear in Library; Freesound is contacted only when you search.";
   function makeSoundVolume(label, initial) {
     const container = document.createElement("label");
     container.className = "chat-voice-advanced";
@@ -4182,7 +4194,7 @@ function setup(ctx) {
   const volumeHint = document.createElement("div");
   volumeHint.className = "chat-voice-hint";
   volumeHint.textContent = "Volume applies to previews and newly generated audio. Saved recordings are unchanged until regenerated.";
-  soundEffectsPanel.append(eventSoundsLabel, eventSoundVolumeControl.container, ambienceSoundsLabel, ambienceSoundVolumeControl.container, volumeHint, effectsNote);
+  soundEffectsPanel.append(eventSoundsLabel, eventSoundVolumeControl.container, ambienceSoundsLabel, ambienceSoundVolumeControl.container, missingSoundsLabel, missingSoundsHint, volumeHint, effectsNote);
   const soundTabButtons = [];
   const soundPanels = [soundEffectsPanel, soundLibraryPanel, soundAdvancedPanel];
   for (const [index, label] of ["Effects", "Library", "Advanced"].entries()) {
@@ -4291,6 +4303,10 @@ function setup(ctx) {
   freesoundQuery.placeholder = "Search Freesound";
   freesoundQuery.maxLength = 120;
   freesoundQuery.setAttribute("aria-label", "Search Freesound");
+  const missingSoundSuggestions = document.createElement("div");
+  missingSoundSuggestions.className = "chat-voice-hint";
+  missingSoundSuggestions.textContent = "No missing-sound suggestions for the current playback.";
+  let suggestionPlayback = null;
   const freesoundSearchButton = document.createElement("button");
   freesoundSearchButton.type = "button";
   freesoundSearchButton.className = "chat-voice-add-button";
@@ -4311,7 +4327,7 @@ function setup(ctx) {
   freesoundMore.className = "chat-voice-add-button";
   freesoundMore.textContent = "Next results";
   freesoundMore.hidden = true;
-  soundLibraryPanel.append(soundsHint, soundFile, soundName, soundTags, soundKind, soundAdd, soundSearch, soundFilter, soundList, freesoundSearchHint, freesoundQuery, licenseFilter, freesoundSearchButton, freesoundResults, freesoundMore);
+  soundLibraryPanel.append(soundsHint, soundFile, soundName, soundTags, soundKind, soundAdd, soundSearch, soundFilter, soundList, freesoundSearchHint, missingSoundSuggestions, freesoundQuery, licenseFilter, freesoundSearchButton, freesoundResults, freesoundMore);
   const creditsButton = document.createElement("button");
   creditsButton.type = "button";
   creditsButton.className = "chat-voice-add-button";
@@ -4762,6 +4778,7 @@ function setup(ctx) {
   };
   let savingEventSounds = false;
   let savingAmbienceSounds = false;
+  let savingMissingSounds = false;
   let savingSoundVolumes = 0;
   let eventSoundVolume = DEFAULT_EVENT_VOLUME;
   let ambienceSoundVolume = DEFAULT_AMBIENCE_VOLUME;
@@ -4812,6 +4829,18 @@ function setup(ctx) {
     }).finally(() => {
       savingAmbienceSounds = false;
       ambienceSoundsToggle.disabled = false;
+    });
+  });
+  missingSoundsToggle.addEventListener("change", () => {
+    const enabled = missingSoundsToggle.checked;
+    savingMissingSounds = true;
+    missingSoundsToggle.disabled = true;
+    void updateVoiceSettings((current) => ({ ...current, chatVoiceSuggestMissingSounds: enabled })).catch((error) => {
+      missingSoundsToggle.checked = !enabled;
+      setStatus(error instanceof Error ? error.message : "Could not save suggestion settings.", "error");
+    }).finally(() => {
+      savingMissingSounds = false;
+      missingSoundsToggle.disabled = false;
     });
   });
   function soundLibraryRequest(type, fields = {}) {
@@ -6539,6 +6568,8 @@ function setup(ctx) {
       playbackStartup.finish(startupToken);
       updatePlaybackButtons();
       const playbackSetupFinishedAt = Date.now();
+      suggestionPlayback = playback;
+      missingSoundSuggestions.textContent = "No missing-sound suggestions for the current playback.";
       const eventSourceText = preparePlaybackContent(message.content, preferences.skippedTrackerTags);
       let eventCues = [];
       const eventAssets = /* @__PURE__ */ new Map();
@@ -6604,13 +6635,32 @@ function setup(ctx) {
         }).catch(() => {
           eventAssetFailures++;
         });
-        void soundLibraryRequest("chat_voice_sound_scene_plan", { message: eventSourceText, connectionId: preferences.tagLlmConnectionId, model: preferences.tagLlmModel }).then(async (result) => {
+        missingSoundSuggestions.textContent = preferences.suggestMissingSounds ? "Looking for missing sounds in this scene\u2026" : "No missing-sound suggestions for the current playback.";
+        void soundLibraryRequest("chat_voice_sound_scene_plan", { message: eventSourceText, connectionId: preferences.tagLlmConnectionId, model: preferences.tagLlmModel, suggestMissing: preferences.suggestMissingSounds }).then(async (result) => {
           if (playback.controller.signal.aborted) return;
+          if (preferences.suggestMissingSounds && suggestionPlayback === playback && ctx.getActiveChat().chatId === playbackChat.id) {
+            const suggestions = (result.missing ?? []).filter((item) => item.kind === "event" ? preferences.eventSounds : preferences.ambienceSounds);
+            missingSoundSuggestions.replaceChildren();
+            if (!suggestions.length) missingSoundSuggestions.textContent = "No missing sounds suggested for this scene.";
+            for (const suggestion of suggestions) {
+              const button = document.createElement("button");
+              button.type = "button";
+              button.className = "chat-voice-add-button";
+              button.textContent = `${suggestion.kind}: ${suggestion.query}`;
+              button.title = "Put these terms in the search box; search only when you choose to.";
+              button.addEventListener("click", () => {
+                freesoundQuery.value = suggestion.query;
+                freesoundQuery.focus();
+              });
+              missingSoundSuggestions.append(button);
+            }
+          }
           eventCues = (result.cues ?? []).filter((cue) => cue.kind === "event" ? preferences.eventSounds : preferences.ambienceSounds);
           eventPlanState = "completed";
           await Promise.all([...new Set(eventCues.flatMap((cue) => cue.action === "play" && cue.assetId ? [cue.assetId] : []))].map(prepareEventAsset));
         }).catch(() => {
           eventPlanState = "failed";
+          if (suggestionPlayback === playback && preferences.suggestMissingSounds) missingSoundSuggestions.textContent = "Could not generate missing-sound suggestions.";
         });
       }
       try {
@@ -8727,6 +8777,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
       connections = loadedConnections;
       if (!savingEventSounds) eventSoundsToggle.checked = preferences.eventSounds;
       if (!savingAmbienceSounds) ambienceSoundsToggle.checked = preferences.ambienceSounds;
+      if (!savingMissingSounds) missingSoundsToggle.checked = preferences.suggestMissingSounds;
       if (!savingSoundVolumes) {
         eventSoundVolume = preferences.eventSoundVolume;
         ambienceSoundVolume = preferences.ambienceSoundVolume;

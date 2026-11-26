@@ -3,7 +3,7 @@ import test from 'node:test'
 import { MAX_FAVORITE_SOUND_BYTES, MAX_FAVORITE_SOUND_SECONDS, SoundLibrary, isSupportedSoundDuration, type SoundUserStorage } from './sound-library'
 import { SoundDownloadTransfers, SoundUploadTransfers } from './sound-transfer'
 import { isFreesoundCc0, parseFreesoundSearch, safeFreesoundPreviewUrl } from './freesound'
-import { alignSoundSourceSegments, ambienceInstructionAtBoundary, competingSoundCueIndexes, interleaveSoundEvents, mapSoundCueBoundaries, parseSoundScenePlan, shortlistSoundAssets, splitNarrationForSoundEvents } from './sound-scene'
+import { alignSoundSourceSegments, ambienceInstructionAtBoundary, competingSoundCueIndexes, interleaveSoundEvents, mapSoundCueBoundaries, parseMissingSoundSuggestions, parseSoundScenePlan, shortlistSoundAssets, splitNarrationForSoundEvents } from './sound-scene'
 import { DEFAULT_AMBIENCE_VOLUME, DEFAULT_EVENT_VOLUME, mixAmbienceClip, readSoundVolume, renderSoundMix, soundCategoryGain } from './sound-mix'
 import { buildSoundTimeline, encodeSoundTimelineWav, resampleSoundClip } from './sound-timeline'
 import { SoundCuePreparation } from './sound-preparation'
@@ -51,6 +51,19 @@ test('sound duration validation accepts up to three minutes', () => {
   assert.equal(isSupportedSoundDuration(0), false)
   assert.equal(isSupportedSoundDuration(Number.NaN), false)
   assert.equal(isSupportedSoundDuration(Infinity), false)
+})
+
+test('missing sound suggestions require bounded safe searches and unique scene anchors', () => {
+  const message = 'Rain hits the window. The door opens. Rain hits the window.'
+  const output = JSON.stringify({ missing: [
+    { kind: 'event', query: 'wooden door creak', anchor: 'The door opens.' },
+    { kind: 'event', query: 'wooden door creak', anchor: 'The door opens.' },
+    { kind: 'ambience', query: 'rain', anchor: 'Rain hits the window.' },
+    { kind: 'event', query: 'https://evil.example', anchor: 'The door opens.' },
+    { kind: 'event', query: 'glass smash', anchor: 'not in the message' },
+  ] })
+  assert.deepEqual(parseMissingSoundSuggestions(output, message), [{ kind: 'event', query: 'wooden door creak', anchor: 'The door opens.' }])
+  assert.deepEqual(parseMissingSoundSuggestions('not json', message), [])
 })
 
 test('Freesound search results validate metadata and never trust remote URLs', () => {

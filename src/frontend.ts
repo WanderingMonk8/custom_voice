@@ -4,7 +4,7 @@ import type {
 } from 'lumiverse-spindle-types'
 import { MAX_FAVORITE_SOUND_BYTES, MAX_FAVORITE_SOUND_SECONDS, SOUND_TRANSFER_CHUNK_BYTES, isSupportedSoundDuration, type FavoriteSound, type NewFavoriteSound } from './sound-library'
 import { isFreesoundCc0, isFreesoundImportLicense, safeFreesoundPreviewUrl, type FreesoundSearchResult } from './freesound'
-import { alignSoundSourceSegments, ambienceInstructionAtBoundary, interleaveSoundEvents, mapSoundCueBoundaries, shortlistSoundAssets, splitNarrationForSoundEvents, type SoundSceneCue } from './sound-scene'
+import { alignSoundSourceSegments, ambienceInstructionAtBoundary, interleaveSoundEvents, mapSoundCueBoundaries, shortlistSoundAssets, splitNarrationForSoundEvents, type MissingSoundSuggestion, type SoundSceneCue } from './sound-scene'
 import { DEFAULT_AMBIENCE_VOLUME, DEFAULT_EVENT_VOLUME, mixAmbienceClip, readSoundVolume, soundCategoryGain } from './sound-mix'
 import { AutoplayRequestRegistry, PlaybackLongPress, PlaybackStartupGuard, syncAutoplayIndicators, syncPlaybackButtons, waitForAutoplayDeadline, waitForAutoplayWork, type PlaybackButtonState } from './playback-ui'
 import {
@@ -347,6 +347,7 @@ interface SoundLibraryPayload {
   audio?: string
   hasKey?: boolean
   cues?: SoundSceneCue[]
+  missing?: MissingSoundSuggestion[]
   results?: FreesoundSearchResult[]
   hasMore?: boolean
   chunked?: boolean
@@ -416,6 +417,7 @@ interface SavedMessageAudioResult {
 interface PlaybackPreferences {
   eventSounds: boolean
   ambienceSounds: boolean
+  suggestMissingSounds: boolean
   eventSoundVolume: number
   ambienceSoundVolume: number
   speed: number
@@ -501,6 +503,7 @@ async function loadPlaybackPreferences(): Promise<PlaybackPreferences> {
   if (!response.ok) return {
     eventSounds: false,
     ambienceSounds: false,
+    suggestMissingSounds: false,
     eventSoundVolume: DEFAULT_EVENT_VOLUME,
     ambienceSoundVolume: DEFAULT_AMBIENCE_VOLUME,
     speed: 1,
@@ -548,6 +551,7 @@ async function loadPlaybackPreferences(): Promise<PlaybackPreferences> {
   return {
     eventSounds: row.value?.chatVoiceEventSounds === true,
     ambienceSounds: row.value?.chatVoiceAmbienceSounds === true,
+    suggestMissingSounds: row.value?.chatVoiceSuggestMissingSounds === true,
     eventSoundVolume: readSoundVolume(row.value?.chatVoiceEventSoundVolume, DEFAULT_EVENT_VOLUME),
     ambienceSoundVolume: readSoundVolume(row.value?.chatVoiceAmbienceSoundVolume, DEFAULT_AMBIENCE_VOLUME),
     speed: Math.min(4, Math.max(0.25, speed)),
@@ -1820,6 +1824,12 @@ export function setup(ctx: SpindleFrontendContext) {
   const ambienceSoundsText = document.createElement('span')
   ambienceSoundsText.textContent = 'Enable ambience'
   ambienceSoundsLabel.append(ambienceSoundsToggle, ambienceSoundsText)
+  const missingSoundsLabel = document.createElement('label'); missingSoundsLabel.className = 'chat-voice-toggle'
+  const missingSoundsToggle = document.createElement('input'); missingSoundsToggle.type = 'checkbox'
+  const missingSoundsText = document.createElement('span'); missingSoundsText.textContent = 'Suggest missing sounds'
+  missingSoundsLabel.append(missingSoundsToggle, missingSoundsText)
+  const missingSoundsHint = document.createElement('div'); missingSoundsHint.className = 'chat-voice-hint'
+  missingSoundsHint.textContent = 'When sound effects are enabled, the scene planner may suggest search terms for sounds missing from favorites. Suggestions appear in Library; Freesound is contacted only when you search.'
   function makeSoundVolume(label: string, initial: number): { container: HTMLElement; input: HTMLInputElement; value: HTMLElement } {
     const container = document.createElement('label')
     container.className = 'chat-voice-advanced'
@@ -1836,7 +1846,7 @@ export function setup(ctx: SpindleFrontendContext) {
   const volumeHint = document.createElement('div')
   volumeHint.className = 'chat-voice-hint'
   volumeHint.textContent = 'Volume applies to previews and newly generated audio. Saved recordings are unchanged until regenerated.'
-  soundEffectsPanel.append(eventSoundsLabel, eventSoundVolumeControl.container, ambienceSoundsLabel, ambienceSoundVolumeControl.container, volumeHint, effectsNote)
+  soundEffectsPanel.append(eventSoundsLabel, eventSoundVolumeControl.container, ambienceSoundsLabel, ambienceSoundVolumeControl.container, missingSoundsLabel, missingSoundsHint, volumeHint, effectsNote)
   const soundTabButtons: HTMLButtonElement[] = []
   const soundPanels = [soundEffectsPanel, soundLibraryPanel, soundAdvancedPanel]
   for (const [index, label] of ['Effects', 'Library', 'Advanced'].entries()) {
@@ -1910,6 +1920,8 @@ export function setup(ctx: SpindleFrontendContext) {
   freesoundSearchHint.textContent = 'Search terms are sent to Freesound. Previews and imports connect your browser to Freesound’s audio server. CC0 and CC BY previews can be imported; credits are saved with recordings. Other licenses are not supported.'
   const freesoundQuery = document.createElement('input')
   freesoundQuery.placeholder = 'Search Freesound'; freesoundQuery.maxLength = 120; freesoundQuery.setAttribute('aria-label', 'Search Freesound')
+  const missingSoundSuggestions = document.createElement('div'); missingSoundSuggestions.className = 'chat-voice-hint'; missingSoundSuggestions.textContent = 'No missing-sound suggestions for the current playback.'
+  let suggestionPlayback: object | null = null
   const freesoundSearchButton = document.createElement('button')
   freesoundSearchButton.type = 'button'; freesoundSearchButton.className = 'chat-voice-add-button'; freesoundSearchButton.textContent = 'Search Freesound'
   const licenseFilter = document.createElement('select'); licenseFilter.setAttribute('aria-label', 'Filter licenses on this results page')
@@ -1919,7 +1931,7 @@ export function setup(ctx: SpindleFrontendContext) {
   const freesoundResults = document.createElement('div')
   freesoundResults.className = 'chat-voice-favorite-list'; freesoundResults.setAttribute('aria-live', 'polite')
   const freesoundMore = document.createElement('button'); freesoundMore.type = 'button'; freesoundMore.className = 'chat-voice-add-button'; freesoundMore.textContent = 'Next results'; freesoundMore.hidden = true
-  soundLibraryPanel.append(soundsHint, soundFile, soundName, soundTags, soundKind, soundAdd, soundSearch, soundFilter, soundList, freesoundSearchHint, freesoundQuery, licenseFilter, freesoundSearchButton, freesoundResults, freesoundMore)
+  soundLibraryPanel.append(soundsHint, soundFile, soundName, soundTags, soundKind, soundAdd, soundSearch, soundFilter, soundList, freesoundSearchHint, missingSoundSuggestions, freesoundQuery, licenseFilter, freesoundSearchButton, freesoundResults, freesoundMore)
   const creditsButton = document.createElement('button')
   creditsButton.type = 'button'; creditsButton.className = 'chat-voice-add-button'; creditsButton.textContent = 'Show saved recording credits'
   const creditsList = document.createElement('div')
@@ -2416,6 +2428,7 @@ export function setup(ctx: SpindleFrontendContext) {
 
   let savingEventSounds = false
   let savingAmbienceSounds = false
+  let savingMissingSounds = false
   let savingSoundVolumes = 0
   let eventSoundVolume = DEFAULT_EVENT_VOLUME
   let ambienceSoundVolume = DEFAULT_AMBIENCE_VOLUME
@@ -2457,6 +2470,13 @@ export function setup(ctx: SpindleFrontendContext) {
     void updateVoiceSettings(current => ({ ...current, chatVoiceAmbienceSounds: enabled }))
       .catch(error => { ambienceSoundsToggle.checked = !enabled; setStatus(error instanceof Error ? error.message : 'Could not save ambience settings.', 'error') })
       .finally(() => { savingAmbienceSounds = false; ambienceSoundsToggle.disabled = false })
+  })
+  missingSoundsToggle.addEventListener('change', () => {
+    const enabled = missingSoundsToggle.checked
+    savingMissingSounds = true; missingSoundsToggle.disabled = true
+    void updateVoiceSettings(current => ({ ...current, chatVoiceSuggestMissingSounds: enabled }))
+      .catch(error => { missingSoundsToggle.checked = !enabled; setStatus(error instanceof Error ? error.message : 'Could not save suggestion settings.', 'error') })
+      .finally(() => { savingMissingSounds = false; missingSoundsToggle.disabled = false })
   })
 
   function soundLibraryRequest(type: string, fields: Record<string, unknown> = {}): Promise<SoundLibraryPayload> {
@@ -4197,6 +4217,8 @@ export function setup(ctx: SpindleFrontendContext) {
     playbackStartup.finish(startupToken)
     updatePlaybackButtons()
     const playbackSetupFinishedAt = Date.now()
+    suggestionPlayback = playback
+    missingSoundSuggestions.textContent = 'No missing-sound suggestions for the current playback.'
 
     // Only the explicit event-sounds opt-in authorizes sharing this message and
     // sound metadata with the selected LLM and default Decision connections.
@@ -4255,13 +4277,25 @@ export function setup(ctx: SpindleFrontendContext) {
         if (preferences.ambienceSounds) kinds.push('ambience')
         if (!playback.controller.signal.aborted) for (const sound of shortlistSoundAssets(eventSourceText, result.favorites ?? [], 8, kinds)) void prepareEventAsset(sound.id)
       }).catch(() => { eventAssetFailures++ })
-      void soundLibraryRequest('chat_voice_sound_scene_plan', { message: eventSourceText, connectionId: preferences.tagLlmConnectionId, model: preferences.tagLlmModel })
+      missingSoundSuggestions.textContent = preferences.suggestMissingSounds ? 'Looking for missing sounds in this scene…' : 'No missing-sound suggestions for the current playback.'
+      void soundLibraryRequest('chat_voice_sound_scene_plan', { message: eventSourceText, connectionId: preferences.tagLlmConnectionId, model: preferences.tagLlmModel, suggestMissing: preferences.suggestMissingSounds })
         .then(async result => {
           if (playback.controller.signal.aborted) return
+          if (preferences.suggestMissingSounds && suggestionPlayback === playback && ctx.getActiveChat().chatId === playbackChat.id) {
+            const suggestions = (result.missing ?? []).filter(item => item.kind === 'event' ? preferences.eventSounds : preferences.ambienceSounds)
+            missingSoundSuggestions.replaceChildren()
+            if (!suggestions.length) missingSoundSuggestions.textContent = 'No missing sounds suggested for this scene.'
+            for (const suggestion of suggestions) {
+              const button = document.createElement('button'); button.type = 'button'; button.className = 'chat-voice-add-button'; button.textContent = `${suggestion.kind}: ${suggestion.query}`
+              button.title = 'Put these terms in the search box; search only when you choose to.'
+              button.addEventListener('click', () => { freesoundQuery.value = suggestion.query; freesoundQuery.focus() })
+              missingSoundSuggestions.append(button)
+            }
+          }
           eventCues = (result.cues ?? []).filter(cue => (cue.kind === 'event' ? preferences.eventSounds : preferences.ambienceSounds))
           eventPlanState = 'completed'
           await Promise.all([...new Set(eventCues.flatMap(cue => cue.action === 'play' && cue.assetId ? [cue.assetId] : []))].map(prepareEventAsset))
-        }).catch(() => { eventPlanState = 'failed' })
+        }).catch(() => { eventPlanState = 'failed'; if (suggestionPlayback === playback && preferences.suggestMissingSounds) missingSoundSuggestions.textContent = 'Could not generate missing-sound suggestions.' })
     }
 
     try {
@@ -6534,6 +6568,7 @@ export function setup(ctx: SpindleFrontendContext) {
       connections = loadedConnections
       if (!savingEventSounds) eventSoundsToggle.checked = preferences.eventSounds
       if (!savingAmbienceSounds) ambienceSoundsToggle.checked = preferences.ambienceSounds
+      if (!savingMissingSounds) missingSoundsToggle.checked = preferences.suggestMissingSounds
       if (!savingSoundVolumes) {
         eventSoundVolume = preferences.eventSoundVolume
         ambienceSoundVolume = preferences.ambienceSoundVolume
