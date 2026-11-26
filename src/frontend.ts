@@ -7,7 +7,7 @@ import { SoundPreviewCache } from './sound-preview-cache'
 import { SoundLoadQueue } from './sound-load-queue'
 import { soundRequestTimeoutMs } from './sound-plan-diagnostics'
 import { isFreesoundCc0, isFreesoundImportLicense, safeFreesoundPreviewUrl, type FreesoundSearchResult } from './freesound'
-import { alignSoundSourceSegments, ambienceInstructionAtBoundary, interleaveSoundEvents, mapSoundCueBoundaries, mergeOpeningSoundCues, playBoundaryThenWaitForVoice, shortlistSoundAssets, splitNarrationForSoundEvents, type MissingSoundSuggestion, type SoundSceneCue } from './sound-scene'
+import { alignSoundSourceSegments, ambienceInstructionAtBoundary, interleaveSoundEvents, mapSoundCueBoundaries, mergeOpeningSoundCues, playBoundaryThenWaitForVoice, shortlistSoundAssets, soundAlignmentText, splitNarrationForSoundEvents, type MissingSoundSuggestion, type SoundSceneCue } from './sound-scene'
 import { DEFAULT_AMBIENCE_VOLUME, DEFAULT_EVENT_VOLUME, mixAmbienceClip, readSoundVolume, soundCategoryGain } from './sound-mix'
 import { AutoplayRequestRegistry, PlaybackLongPress, PlaybackStartupGuard, syncAutoplayIndicators, syncPlaybackButtons, waitForAutoplayDeadline, waitForAutoplayWork, type PlaybackButtonState } from './playback-ui'
 import {
@@ -5232,7 +5232,7 @@ export function setup(ctx: SpindleFrontendContext) {
         appendSpeakerDebugLog(`Sound timing: optional startup wait=${Date.now() - waitStarted}ms (limit=${preferences.soundStartupWaitSeconds * 1000}ms).`)
       }
 
-      eventSpans = (preferences.eventSounds || preferences.ambienceSounds) ? alignSoundSourceSegments(eventSourceText, plan.map(entry => stripTtsTags(entry.text))) : []
+      eventSpans = (preferences.eventSounds || preferences.ambienceSounds) ? alignSoundSourceSegments(eventSourceText, plan.map(soundAlignmentText)) : []
       eventSelectionStarted = true
       let activeAmbience: { key: string; assetId: string; segment: SynthesizedVoiceSegment; elapsed: number } | null = null
       const selectEventsAt = (boundary: number): SynthesizedVoiceSegment[] => {

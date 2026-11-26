@@ -2556,6 +2556,11 @@ function parseRosterVoiceSegments(content, defaultSpeakerId, speakers, skippedTr
 }
 
 // src/sound-scene.ts
+function soundAlignmentText(segment) {
+  if (segment.originalSpeech === void 0) return stripTtsTags(segment.text);
+  const source = segment.originalSpeech;
+  return segment.text.replace(/\[[^\]\r\n]{1,255}\]|<[^>\r\n]{1,255}>/gu, (token) => source.includes(token) ? token : "");
+}
 function mergeOpeningSoundCues(opening, full, segments, messageLength, lastBoundary) {
   if (!opening.length) return [...full];
   const all = [...opening, ...full];
@@ -2583,6 +2588,7 @@ function splitNarrationForSoundEvents(segments, options) {
   const ignored = /* @__PURE__ */ new Set(["the", "and", "sound", "audio", "with", "from", "this", "that", "short", "effect", "recording", "mp3", "wav"]);
   const wordForms = (text) => (text.toLocaleLowerCase().match(/[\p{L}]{4,}/gu) ?? []).map((word) => word.endsWith("s") && word.length > 4 ? word.slice(0, -1) : word).filter((word) => !ignored.has(word));
   const eventTerms = new Set((options?.eventSounds ?? []).filter((sound) => sound.kind === "event").flatMap((sound) => wordForms([sound.name, ...sound.tags].join(" "))));
+  const soundTerms = new Set((options?.eventSounds ?? []).flatMap((sound) => wordForms([sound.name, ...sound.tags].join(" "))));
   for (const [group, segment] of segments.entries()) {
     if (segment.originalSpeech !== void 0 || segment.tagId || /[\[\]<>]/u.test(segment.text)) {
       result.push(segment);
@@ -2644,7 +2650,7 @@ function splitNarrationForSoundEvents(segments, options) {
         const length = left.text.length + 1 + right.text.length;
         if (length > DEFAULT_MAX_TTS_SEGMENT_CHARS) continue;
         const knownCue = (options?.cues ?? []).some((cue) => cue.position === "after" && left.text.includes(cue.anchor) || cue.position === "before" && right.text.includes(cue.anchor));
-        if (knownCue || wordForms(left.text).some((word) => eventTerms.has(word)) || wordForms(right.text).some((word) => eventTerms.has(word))) continue;
+        if (knownCue || wordForms(left.text).some((word) => soundTerms.has(word)) || wordForms(right.text).some((word) => soundTerms.has(word))) continue;
         if (length < bestLength) {
           selected = i;
           bestLength = length;
@@ -7647,7 +7653,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
           await Promise.race([firstSuccessfulPlan, abortableDelay(preferences.soundStartupWaitSeconds * 1e3, playback.controller.signal)]);
           appendSpeakerDebugLog(`Sound timing: optional startup wait=${Date.now() - waitStarted}ms (limit=${preferences.soundStartupWaitSeconds * 1e3}ms).`);
         }
-        eventSpans = preferences.eventSounds || preferences.ambienceSounds ? alignSoundSourceSegments(eventSourceText, plan.map((entry) => stripTtsTags(entry.text))) : [];
+        eventSpans = preferences.eventSounds || preferences.ambienceSounds ? alignSoundSourceSegments(eventSourceText, plan.map(soundAlignmentText)) : [];
         eventSelectionStarted = true;
         let activeAmbience = null;
         const selectEventsAt = (boundary) => {

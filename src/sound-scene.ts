@@ -1,5 +1,5 @@
 import type { FavoriteSound } from './sound-library'
-import { DEFAULT_MAX_TTS_SEGMENT_CHARS, type VoicePlanSegment } from './core'
+import { DEFAULT_MAX_TTS_SEGMENT_CHARS, stripTtsTags, type VoicePlanSegment } from './core'
 
 export interface SoundSceneCue {
   kind: 'event' | 'ambience'
@@ -42,6 +42,13 @@ export function parseMissingSoundSuggestions(raw: string, message: string): Miss
 export interface SoundSceneSegment {
   start: number
   end: number
+}
+
+/** Align speech against source words, not generated vocal directions. */
+export function soundAlignmentText(segment: VoicePlanSegment): string {
+  if (segment.originalSpeech === undefined) return stripTtsTags(segment.text)
+  const source = segment.originalSpeech
+  return segment.text.replace(/\[[^\]\r\n]{1,255}\]|<[^>\r\n]{1,255}>/gu, token => source.includes(token) ? token : '')
 }
 
 /** A short opening excerpt, ending at a sentence boundary where practical. */
@@ -92,6 +99,8 @@ export function splitNarrationForSoundEvents(
     .map(word => word.endsWith('s') && word.length > 4 ? word.slice(0, -1) : word)
     .filter(word => !ignored.has(word))
   const eventTerms = new Set((options?.eventSounds ?? []).filter(sound => sound.kind === 'event')
+    .flatMap(sound => wordForms([sound.name, ...sound.tags].join(' '))))
+  const soundTerms = new Set((options?.eventSounds ?? [])
     .flatMap(sound => wordForms([sound.name, ...sound.tags].join(' '))))
   for (const [group, segment] of segments.entries()) {
     if (segment.originalSpeech !== undefined || segment.tagId || /[\[\]<>]/u.test(segment.text)) { result.push(segment); groupIds.push(group); continue }
@@ -144,7 +153,7 @@ export function splitNarrationForSoundEvents(
         if (length > DEFAULT_MAX_TTS_SEGMENT_CHARS) continue
         // Only remove boundaries with no known or likely event/ambience cue.
         const knownCue = (options?.cues ?? []).some(cue => (cue.position === 'after' && left.text.includes(cue.anchor)) || (cue.position === 'before' && right.text.includes(cue.anchor)))
-        if (knownCue || wordForms(left.text).some(word => eventTerms.has(word)) || wordForms(right.text).some(word => eventTerms.has(word))) continue
+        if (knownCue || wordForms(left.text).some(word => soundTerms.has(word)) || wordForms(right.text).some(word => soundTerms.has(word))) continue
         if (length < bestLength) { selected = i; bestLength = length }
       }
       if (selected < 0) break

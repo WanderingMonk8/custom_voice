@@ -6,7 +6,7 @@ import { SoundPreviewCache } from './sound-preview-cache'
 import { SoundLoadQueue } from './sound-load-queue'
 import { soundPlanErrorCategory, soundRequestTimeoutMs } from './sound-plan-diagnostics'
 import { isFreesoundCc0, parseFreesoundSearch, safeFreesoundPreviewUrl } from './freesound'
-import { alignSoundSourceSegments, ambienceInstructionAtBoundary, competingSoundCueIndexes, interleaveSoundEvents, mapSoundCueBoundaries, mergeOpeningSoundCues, parseMissingSoundSuggestions, parseSoundScenePlan, playBoundaryThenWaitForVoice, shortlistSoundAssets, shortlistSoundPlannerAssets, soundOpeningExcerpt, splitNarrationForSoundEvents } from './sound-scene'
+import { alignSoundSourceSegments, ambienceInstructionAtBoundary, competingSoundCueIndexes, interleaveSoundEvents, mapSoundCueBoundaries, mergeOpeningSoundCues, parseMissingSoundSuggestions, parseSoundScenePlan, playBoundaryThenWaitForVoice, shortlistSoundAssets, shortlistSoundPlannerAssets, soundAlignmentText, soundOpeningExcerpt, splitNarrationForSoundEvents } from './sound-scene'
 import { DEFAULT_AMBIENCE_VOLUME, DEFAULT_EVENT_VOLUME, mixAmbienceClip, readSoundVolume, renderSoundMix, soundCategoryGain } from './sound-mix'
 import { buildSoundTimeline, encodeSoundTimelineWav, resampleSoundClip } from './sound-timeline'
 import { SoundCuePreparation } from './sound-preparation'
@@ -348,6 +348,22 @@ test('sound source alignment handles whitespace without guessing repeated or mis
   assert.deepEqual(alignSoundSourceSegments('Alpha. Beta.', ['Beta.', 'Alpha.']), [null, null])
 })
 
+test('sound alignment removes generated custom voice directions but preserves user-authored brackets', () => {
+  const message = 'The refrigerator hummed. She smiled. "Home."'
+  const plan = [
+    { text: 'The refrigerator hummed.', voice: 'narrator' },
+    { text: 'She smiled.', voice: 'narrator' },
+    { text: '[warm, settled, gently contented] Home.', voice: 'maya', originalSpeech: 'Home.' },
+  ]
+  const spans = alignSoundSourceSegments(message, plan.map(soundAlignmentText))
+  const stop = { kind: 'ambience' as const, action: 'stop' as const, anchor: 'Home.', offset: message.indexOf('Home.'), position: 'before' as const }
+  assert.deepEqual(mapSoundCueBoundaries([stop], spans, message.length).map(item => item.boundary), [2])
+  const authored = { text: '[mysterious] hello', voice: 'speaker', originalSpeech: '[mysterious] hello' }
+  assert.equal(soundAlignmentText(authored), authored.text)
+  const repeated = { text: '[warm] Hello. [warm] Again.', voice: 'speaker', originalSpeech: 'Hello. Again.' }
+  assert.equal(soundAlignmentText(repeated).replace(/\s+/gu, ' ').trim(), 'Hello. Again.')
+})
+
 test('sound Decision review targets overlapping competing cues, not distinct nearby actions', () => {
   const cue = { kind: 'event' as const, action: 'play' as const, anchor: 'door', position: 'after' as const, offset: 0 }
   assert.deepEqual(competingSoundCueIndexes([cue, { ...cue, offset: 2 }, { ...cue, offset: 40 }, { ...cue, kind: 'ambience', offset: 1 }]), [0, 1])
@@ -435,6 +451,18 @@ test('sound splitting uses available budget only where cue boundaries are safe t
   const protectedPlan = splitNarrationForSoundEvents([narration], { eventSounds: [sound], cues: [protectedCue], maxJobs: 1 })
   assert.ok(protectedPlan.length > 1)
   assert.ok(protectedPlan.some(item => item.text === 'The air was cold.'))
+})
+
+test('sound budget does not merge footsteps narration with a distinct creek ambience', () => {
+  const metadata = [
+    { version: 1 as const, id: 'steps', name: 'Foot step', description: '', tags: ['footsteps'], kind: 'event' as const, mime: 'audio/wav', bytes: 1, createdAt: new Date().toISOString() },
+    { version: 1 as const, id: 'creek', name: 'creek', description: '', tags: ['creek', 'brook', 'stream'], kind: 'ambience' as const, mime: 'audio/wav', bytes: 1, createdAt: new Date().toISOString() },
+  ]
+  const source = 'Her footsteps carried her toward the park. A creek burbled beside the path. She sat beside the water.'
+  const plan = splitNarrationForSoundEvents([{ voice: 'narrator', text: source }], { eventSounds: metadata, maxJobs: 1 })
+  assert.ok(plan.length > 1)
+  assert.ok(plan.some(item => item.text === 'A creek burbled beside the path.'))
+  assert.equal(plan.map(item => item.text).join(' '), source)
 })
 
 test('sound prefetch shortlist matches metadata without selecting the cue', () => {
