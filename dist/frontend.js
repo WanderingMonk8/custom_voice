@@ -4108,7 +4108,7 @@ function setup(ctx) {
   }
   const effectsNote = document.createElement("div");
   effectsNote.className = "chat-voice-hint";
-  effectsNote.textContent = "Experimental: events play between clips; ambience mixes underneath clips and may pause during buffering. When enabled, the current message and favorite sound names, descriptions, tags, types and IDs are sent to your selected LLM connection and, for competing cues, the default Decision connection. Online search is not available yet. Late or ambiguous effects are skipped.";
+  effectsNote.textContent = "Experimental: events play between clips; ambience mixes underneath clips and may pause during buffering. When enabled, the current message and favorite sound names, descriptions, tags, types and IDs are sent to your selected LLM connection and, for competing cues, the default Decision connection. Automatic online fallback is not available yet. Late or ambiguous effects are skipped.";
   const eventSoundsLabel = document.createElement("label");
   eventSoundsLabel.className = "chat-voice-toggle";
   const eventSoundsToggle = document.createElement("input");
@@ -4175,7 +4175,7 @@ function setup(ctx) {
   soundAdvancedPanel.hidden = true;
   const freesoundHint = document.createElement("div");
   freesoundHint.className = "chat-voice-hint";
-  freesoundHint.textContent = "Freesound search is not available yet. Your API key is stored encrypted per user and is never shown again after saving.";
+  freesoundHint.textContent = "Your API key is stored encrypted per user and is never shown again after saving. Freesound\u2019s free API is for non-commercial use; individual sounds have their own licenses.";
   const freesoundLink = document.createElement("a");
   freesoundLink.href = "https://freesound.org/apiv2/apply/";
   freesoundLink.target = "_blank";
@@ -4245,7 +4245,21 @@ function setup(ctx) {
     option.textContent = label;
     soundFilter.append(option);
   }
-  soundLibraryPanel.append(soundsHint, soundFile, soundName, soundTags, soundKind, soundAdd, soundSearch, soundFilter, soundList);
+  const freesoundSearchHint = document.createElement("div");
+  freesoundSearchHint.className = "chat-voice-hint";
+  freesoundSearchHint.textContent = "Search Freesound: your search terms are sent to Freesound. Review each sound\u2019s creator and license on its page. Previewing and importing results here are not available yet.";
+  const freesoundQuery = document.createElement("input");
+  freesoundQuery.placeholder = "Search Freesound";
+  freesoundQuery.maxLength = 120;
+  freesoundQuery.setAttribute("aria-label", "Search Freesound");
+  const freesoundSearchButton = document.createElement("button");
+  freesoundSearchButton.type = "button";
+  freesoundSearchButton.className = "chat-voice-add-button";
+  freesoundSearchButton.textContent = "Search Freesound";
+  const freesoundResults = document.createElement("div");
+  freesoundResults.className = "chat-voice-favorite-list";
+  freesoundResults.setAttribute("aria-live", "polite");
+  soundLibraryPanel.append(soundsHint, soundFile, soundName, soundTags, soundKind, soundAdd, soundSearch, soundFilter, soundList, freesoundSearchHint, freesoundQuery, freesoundSearchButton, freesoundResults);
   soundsBody.append(soundTabs, soundEffectsPanel, soundLibraryPanel, soundAdvancedPanel);
   soundsSection.append(soundsSummary, soundsBody);
   const status = document.createElement("div");
@@ -4691,6 +4705,53 @@ function setup(ctx) {
       ctx.sendToBackend({ type, requestId, ...fields });
     });
   }
+  freesoundSearchButton.addEventListener("click", () => {
+    void (async () => {
+      const query = freesoundQuery.value.trim();
+      if (!query) {
+        setStatus("Enter a Freesound search first.", "error");
+        return;
+      }
+      freesoundSearchButton.disabled = true;
+      freesoundResults.replaceChildren();
+      const loading = document.createElement("div");
+      loading.className = "chat-voice-hint";
+      loading.textContent = "Searching Freesound\u2026";
+      freesoundResults.append(loading);
+      try {
+        const response = await soundLibraryRequest("chat_voice_freesound_search", { query });
+        if (soundLibraryDisposed) return;
+        freesoundResults.replaceChildren();
+        const results = Array.isArray(response.results) ? response.results : [];
+        if (!results.length) {
+          loading.textContent = "No results found.";
+          freesoundResults.append(loading);
+        }
+        for (const item of results) {
+          if (!Number.isSafeInteger(item.id) || item.id < 1) continue;
+          const row = document.createElement("div");
+          row.className = "chat-voice-favorite-row";
+          const link = document.createElement("a");
+          link.href = `https://freesound.org/s/${item.id}/`;
+          link.target = "_blank";
+          link.rel = "noopener noreferrer";
+          link.textContent = item.name;
+          const info = document.createElement("div");
+          info.className = "chat-voice-hint";
+          info.textContent = `By ${item.username} \xB7 ${item.duration.toFixed(1)} seconds \xB7 ${item.license}`;
+          row.append(link, info);
+          freesoundResults.append(row);
+        }
+      } catch (error) {
+        if (!soundLibraryDisposed) {
+          loading.textContent = error instanceof Error ? error.message : "Could not search Freesound.";
+          freesoundResults.replaceChildren(loading);
+        }
+      } finally {
+        freesoundSearchButton.disabled = false;
+      }
+    })();
+  });
   async function readSoundAudio(id, isCancelled = () => false, onProgress = () => void 0) {
     const result = await soundLibraryRequest("chat_voice_sound_library_read", { id });
     try {

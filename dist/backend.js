@@ -279,6 +279,19 @@ var SoundDownloadTransfers = class {
   }
 };
 
+// src/freesound.ts
+function parseFreesoundSearch(payload) {
+  if (!payload || typeof payload !== "object" || !Array.isArray(payload.results)) throw new Error("Unexpected Freesound search response.");
+  const result = [];
+  for (const value of payload.results.slice(0, 20)) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) continue;
+    const row = value;
+    if (!Number.isSafeInteger(row.id) || row.id < 1 || typeof row.name !== "string" || !row.name.trim() || typeof row.username !== "string" || !row.username.trim() || typeof row.license !== "string" || !row.license.trim() || typeof row.duration !== "number" || !Number.isFinite(row.duration) || row.duration < 0) continue;
+    result.push({ id: row.id, name: row.name.trim().slice(0, 160), username: row.username.trim().slice(0, 120), license: row.license.trim().slice(0, 300), duration: row.duration, url: `https://freesound.org/s/${row.id}/` });
+  }
+  return result;
+}
+
 // src/sound-scene.ts
 function competingSoundCueIndexes(cues) {
   const selected = /* @__PURE__ */ new Set();
@@ -8391,7 +8404,33 @@ var soundDownloads = new SoundDownloadTransfers(generateUuidV7);
 spindle.onFrontendMessage(async (rawPayload, userId, frontendSessionId) => {
   const payload = rawPayload;
   try {
-    if (payload?.type === "chat_voice_sound_upload_begin" || payload?.type === "chat_voice_sound_upload_chunk" || payload?.type === "chat_voice_sound_upload_finish" || payload?.type === "chat_voice_sound_upload_cancel" || payload?.type === "chat_voice_sound_library_read_chunk" || payload?.type === "chat_voice_sound_download_release") {
+    if (payload?.type === "chat_voice_freesound_search") {
+      try {
+        if (!userId) throw new Error("An authenticated user is required.");
+        const query = typeof payload.query === "string" ? payload.query.trim() : "";
+        if (!query || query.length > 120) throw new Error("Enter a search of up to 120 characters.");
+        const key = await spindle.enclave.get("freesound_api_key", userId);
+        if (!key) throw new Error("Save a Freesound API key in Sound effects \u2192 Advanced first.");
+        const params = new URLSearchParams({ query, fields: "id,name,username,license,duration", page_size: "12" });
+        const response = await Promise.race([
+          spindle.cors(`https://freesound.org/apiv2/search/text/?${params}`, { method: "GET", headers: { Authorization: `Token ${key}` } }),
+          new Promise((_, reject) => setTimeout(() => reject(new Error("Freesound search timed out.")), 2e4))
+        ]);
+        if (!response || typeof response !== "object" || Array.isArray(response)) throw new Error("Freesound returned an invalid response.");
+        const envelope = response;
+        const status = typeof envelope.status === "number" ? envelope.status : 200;
+        if (status === 401 || status === 403) throw new Error("Freesound rejected the API key or access.");
+        if (status === 429) throw new Error("Freesound rate limit reached; try again later.");
+        if (status >= 400) throw new Error(`Freesound search failed (${status}).`);
+        let body = "body" in envelope ? envelope.body : envelope;
+        if (typeof body === "string") body = JSON.parse(body);
+        const results = parseFreesoundSearch(body);
+        sendFrontend({ type: "chat_voice_sound_library", requestId: payload.requestId, results }, userId, frontendSessionId);
+      } catch (error) {
+        const safe = error instanceof Error && /^(An authenticated|Enter a search|Save a Freesound|Freesound rejected|Freesound rate|Freesound search failed|Freesound search timed out|Unexpected Freesound)/u.test(error.message) ? error.message : "Could not search Freesound.";
+        sendFrontend({ type: "chat_voice_sound_library", requestId: payload.requestId, error: safe }, userId, frontendSessionId);
+      }
+    } else if (payload?.type === "chat_voice_sound_upload_begin" || payload?.type === "chat_voice_sound_upload_chunk" || payload?.type === "chat_voice_sound_upload_finish" || payload?.type === "chat_voice_sound_upload_cancel" || payload?.type === "chat_voice_sound_library_read_chunk" || payload?.type === "chat_voice_sound_download_release") {
       try {
         if (!userId || !frontendSessionId) throw new Error("An authenticated frontend session is required for large sound files.");
         const owner = JSON.stringify([userId, frontendSessionId]);

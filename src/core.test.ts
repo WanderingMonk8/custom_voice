@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { SoundLibrary, type SoundUserStorage } from './sound-library'
 import { SoundDownloadTransfers, SoundUploadTransfers } from './sound-transfer'
+import { parseFreesoundSearch } from './freesound'
 import { alignSoundSourceSegments, ambienceInstructionAtBoundary, competingSoundCueIndexes, interleaveSoundEvents, mapSoundCueBoundaries, parseSoundScenePlan, shortlistSoundAssets, splitNarrationForSoundEvents } from './sound-scene'
 import { DEFAULT_AMBIENCE_VOLUME, DEFAULT_EVENT_VOLUME, mixAmbienceClip, readSoundVolume, renderSoundMix, soundCategoryGain } from './sound-mix'
 import { buildSoundTimeline, encodeSoundTimelineWav, resampleSoundClip } from './sound-timeline'
@@ -41,6 +42,16 @@ class FakeSoundStorage implements SoundUserStorage {
     this.files.delete(this.key(from, userId))
   }
 }
+
+test('Freesound search results validate metadata and never trust remote URLs', () => {
+  const results = parseFreesoundSearch({ results: [
+    { id: 123, name: ' Creek ', username: 'artist', license: 'CC0', duration: 42, url: 'https://malicious.example/' },
+    { id: -1, name: 'bad', username: 'artist', license: 'CC0', duration: 1 },
+    { id: 124, name: 'missing license', username: 'artist', duration: 1 },
+  ] })
+  assert.deepEqual(results, [{ id: 123, name: 'Creek', username: 'artist', license: 'CC0', duration: 42, url: 'https://freesound.org/s/123/' }])
+  assert.throws(() => parseFreesoundSearch({ results: 'invalid' }), /Unexpected Freesound/)
+})
 
 test('sound favorites persist across library instances and stay isolated by user', async () => {
   const storage = new FakeSoundStorage()
