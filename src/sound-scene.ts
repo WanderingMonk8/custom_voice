@@ -14,6 +14,19 @@ export interface SoundSceneSegment {
   end: number
 }
 
+/** Select competing cues for one batched Decision-model review. */
+export function competingSoundCueIndexes(cues: readonly SoundSceneCue[]): number[] {
+  const selected = new Set<number>()
+  for (let i = 0; i < cues.length; i++) {
+    if (cues[i].action !== 'play') continue
+    for (let j = i + 1; j < cues.length; j++) {
+      if (cues[j].action === 'play' && cues[i].kind === cues[j].kind
+        && Math.abs(cues[i].offset - cues[j].offset) < 160) { selected.add(i); selected.add(j) }
+    }
+  }
+  return [...selected]
+}
+
 /** Align unmodified clip text to its source, tolerating whitespace only.
  * Duplicate or missing text stays unaligned rather than guessing an occurrence.
  * Null entries retain clip indexes so later cue boundaries cannot shift.
