@@ -23,14 +23,24 @@ function splitNarrationForSoundEvents(segments) {
   }
   return result;
 }
-function shortlistSoundAssets(message, favorites, limit = 8) {
+function shortlistSoundAssets(message, favorites, limit = 8, kinds = ["event", "ambience"]) {
   const words = new Set(message.toLocaleLowerCase().match(/[\p{L}\p{N}]{3,}/gu) ?? []);
-  return favorites.filter((sound) => sound.kind === "event").map((sound, order) => {
+  return favorites.filter((sound) => kinds.includes(sound.kind)).map((sound, order) => {
     const terms = new Set([sound.name, sound.description, ...sound.tags].join(" ").toLocaleLowerCase().match(/[\p{L}\p{N}]{3,}/gu) ?? []);
     let score = 0;
     for (const term of terms) if (words.has(term)) score++;
     return { sound, score, order };
   }).filter((item) => item.score > 0).sort((a, b) => b.score - a.score || a.order - b.order).slice(0, Math.max(0, Math.min(8, Math.floor(limit)))).map((item) => item.sound);
+}
+function ambienceInstructionAtBoundary(mapped, boundary) {
+  let latest = null;
+  mapped.forEach((item, index) => {
+    if (item.cue.kind !== "ambience" || item.boundary > boundary) return;
+    if (!latest || item.boundary > latest.boundary || item.boundary === latest.boundary && index > latest.index) latest = { ...item, index };
+  });
+  const instruction = latest;
+  if (!instruction || instruction.cue.action !== "play" || !instruction.cue.assetId) return null;
+  return { key: `${instruction.boundary}:${instruction.index}:${instruction.cue.assetId}`, assetId: instruction.cue.assetId };
 }
 function interleaveSoundEvents(voices, events) {
   const result = [];
@@ -4621,11 +4631,12 @@ function setup(ctx) {
       ctx.sendToBackend({ type, requestId, ...fields });
     });
   }
-  async function readSoundAudio(id, isCancelled = () => false) {
+  async function readSoundAudio(id, isCancelled = () => false, onProgress = () => void 0) {
     const result = await soundLibraryRequest("chat_voice_sound_library_read", { id });
     if (isCancelled()) throw new DOMException("Sound download stopped.", "AbortError");
     if (!result.favorite || result.favorite.id !== id || !Number.isSafeInteger(result.favorite.bytes) || result.favorite.bytes < 1 || result.favorite.bytes > MAX_FAVORITE_SOUND_BYTES) throw new Error("Invalid sound record.");
     const bytes = new Uint8Array(result.favorite.bytes);
+    onProgress(0, bytes.length);
     const decode = (audio, offset) => {
       const binary = atob(audio);
       if (!binary.length || offset + binary.length > bytes.length) throw new Error("Invalid sound download chunk.");
@@ -4634,6 +4645,7 @@ function setup(ctx) {
     };
     if (!result.chunked) {
       if (!result.audio || decode(result.audio, 0) !== bytes.length) throw new Error("Incomplete sound download.");
+      onProgress(bytes.length, bytes.length);
     } else {
       for (let offset = 0; offset < bytes.length; ) {
         if (isCancelled()) throw new DOMException("Sound download stopped.", "AbortError");
@@ -4642,6 +4654,7 @@ function setup(ctx) {
         const length = decode(chunk.audio, offset);
         if (length !== Math.min(SOUND_TRANSFER_CHUNK_BYTES, bytes.length - offset)) throw new Error("Incomplete sound download chunk.");
         offset += length;
+        onProgress(offset, bytes.length);
       }
     }
     return { favorite: result.favorite, bytes };
@@ -6059,6 +6072,7 @@ function setup(ctx) {
       const eventAssets = /* @__PURE__ */ new Map();
       const soundAssetKinds = /* @__PURE__ */ new Map();
       const eventLoads = /* @__PURE__ */ new Map();
+      const soundLoadStatus = /* @__PURE__ */ new Map();
       let eventPlanState = "not-requested";
       let eventAssetFailures = 0;
       const selectedEvents = /* @__PURE__ */ new Map();
@@ -6073,11 +6087,15 @@ function setup(ctx) {
       const prepareEventAsset = (id) => {
         const existing = eventLoads.get(id);
         if (existing) return existing;
+        soundLoadStatus.set(id, "requesting");
         const request = (async () => {
           try {
-            const asset = await readSoundAudio(id, () => playback.controller.signal.aborted);
+            const asset = await readSoundAudio(id, () => playback.controller.signal.aborted, (received, total) => {
+              soundLoadStatus.set(id, `transferring ${received}/${total} bytes`);
+            });
             if (playback.controller.signal.aborted) return;
             if (!["event", "ambience"].includes(asset.favorite.kind)) throw new Error("Unavailable sound.");
+            soundLoadStatus.set(id, "decoding");
             const decoded = await audioContext.decodeAudioData(asset.bytes.buffer);
             if (playback.controller.signal.aborted) return;
             if (decoded.duration > 120 || decoded.numberOfChannels < 1 || decoded.numberOfChannels > 2) throw new Error("Unsupported event sound.");
@@ -6088,8 +6106,12 @@ function setup(ctx) {
             const channels = Array.from({ length: cropped.numberOfChannels }, (_, channel) => cropped.getChannelData(channel));
             soundAssetKinds.set(id, asset.favorite.kind);
             eventAssets.set(id, { data: new ArrayBuffer(0), mime: "audio/wav", decodedBuffer: cropped, normalizationGain: soundCategoryGain(channels, asset.favorite.kind) });
+            soundLoadStatus.set(id, "ready");
           } catch {
-            eventAssetFailures++;
+            if (!playback.controller.signal.aborted) {
+              eventAssetFailures++;
+              soundLoadStatus.set(id, "failed");
+            }
           }
         })();
         eventLoads.set(id, request);
@@ -6098,7 +6120,10 @@ function setup(ctx) {
       if ((preferences.eventSounds || preferences.ambienceSounds) && eventSourceText.length <= 3e4 && eventSourceText.trim()) {
         eventPlanState = "pending";
         void soundLibraryRequest("chat_voice_sound_library_list").then((result) => {
-          if (!playback.controller.signal.aborted) for (const sound of shortlistSoundAssets(eventSourceText, result.favorites ?? [])) void prepareEventAsset(sound.id);
+          const kinds = [];
+          if (preferences.eventSounds) kinds.push("event");
+          if (preferences.ambienceSounds) kinds.push("ambience");
+          if (!playback.controller.signal.aborted) for (const sound of shortlistSoundAssets(eventSourceText, result.favorites ?? [], 8, kinds)) void prepareEventAsset(sound.id);
         }).catch(() => {
           eventAssetFailures++;
         });
@@ -6770,15 +6795,17 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
         const selectEventsAt = (boundary) => {
           if (!eventCues.length) return [];
           const chosen = [];
-          for (const { cue } of mapSoundCueBoundaries(eventCues, eventSpans, eventSourceText.length).filter((item) => item.boundary === boundary)) {
-            if (cue.kind === "ambience" && cue.action === "stop") {
-              activeAmbience = null;
-              continue;
-            }
+          const mapped = mapSoundCueBoundaries(eventCues, eventSpans, eventSourceText.length);
+          const instruction = ambienceInstructionAtBoundary(mapped, boundary);
+          if (!instruction) activeAmbience = null;
+          else if (activeAmbience?.key !== instruction.key) {
+            const asset = eventAssets.get(instruction.assetId);
+            activeAmbience = asset && soundAssetKinds.get(instruction.assetId) === "ambience" ? { key: instruction.key, segment: asset, elapsed: 0 } : null;
+          }
+          for (const { cue } of mapped.filter((item) => item.boundary === boundary && item.cue.kind === "event")) {
             const asset = cue.assetId ? eventAssets.get(cue.assetId) : void 0;
             if (!asset || !cue.assetId || soundAssetKinds.get(cue.assetId) !== cue.kind) continue;
-            if (cue.kind === "ambience") activeAmbience = { segment: asset, elapsed: 0 };
-            else chosen.push(asset);
+            chosen.push(asset);
           }
           return chosen;
         };
@@ -6802,7 +6829,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
             return foreground;
           }
         };
-        if (preferences.eventSounds || preferences.ambienceSounds) appendSpeakerDebugLog(`Sound effects at first playback: planner=${eventPlanState}, cues=${eventCues.length}, assets ready=${eventAssets.size}, asset failures=${eventAssetFailures}; later boundaries can use newly ready sounds.`);
+        if (preferences.eventSounds || preferences.ambienceSounds) appendSpeakerDebugLog(`Sound effects at first playback: planner=${eventPlanState}, cues=${eventCues.length}, assets ready=${eventAssets.size}, asset failures=${eventAssetFailures}; asset states=${JSON.stringify(Object.fromEntries(soundLoadStatus))}.`);
         for (let index = 0; index < plan.length; index += 1) {
           const current = await processed[index];
           if (!current.ok) throw current.error;
@@ -6844,7 +6871,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
         for (const event of lastEvents) await playDecodedBuffer(playback, event, preferences.volume);
         if (preferences.eventSounds || preferences.ambienceSounds) {
           const aligned = mapSoundCueBoundaries(eventCues, eventSpans, eventSourceText.length).length;
-          appendSpeakerDebugLog(`Sound effects at playback end: planner=${eventPlanState}, event cues=${eventCues.length}, aligned cues=${aligned}, assets ready=${eventAssets.size}, asset failures=${eventAssetFailures}, selected boundaries=${selectedEvents.size}.`);
+          appendSpeakerDebugLog(`Sound effects at playback end: planner=${eventPlanState}, cues=${eventCues.length}, aligned cues=${aligned}, assets ready=${eventAssets.size}, asset failures=${eventAssetFailures}, selected event boundaries=${selectedEvents.size}, ambience-mixed clips=${mixedVoices.size}, asset states=${JSON.stringify(Object.fromEntries(soundLoadStatus))}.`);
         }
         adaptiveSynthesisLimits.delete(adaptiveLimitToken);
         drainSynthesisQueue();

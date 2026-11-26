@@ -28,15 +28,29 @@ export function splitNarrationForSoundEvents(segments: readonly VoicePlanSegment
 }
 
 /** Small deterministic shortlist for speculative local reads, never a cue decision. */
-export function shortlistSoundAssets(message: string, favorites: readonly FavoriteSound[], limit = 8): FavoriteSound[] {
+export function shortlistSoundAssets(message: string, favorites: readonly FavoriteSound[], limit = 8, kinds: readonly FavoriteSound['kind'][] = ['event', 'ambience']): FavoriteSound[] {
   const words = new Set((message.toLocaleLowerCase().match(/[\p{L}\p{N}]{3,}/gu) ?? []))
-  return favorites.filter(sound => sound.kind === 'event').map((sound, order) => {
+  return favorites.filter(sound => kinds.includes(sound.kind)).map((sound, order) => {
     const terms = new Set(([sound.name, sound.description, ...sound.tags].join(' ').toLocaleLowerCase().match(/[\p{L}\p{N}]{3,}/gu) ?? []))
     let score = 0
     for (const term of terms) if (words.has(term)) score++
     return { sound, score, order }
   }).filter(item => item.score > 0).sort((a, b) => b.score - a.score || a.order - b.order)
     .slice(0, Math.max(0, Math.min(8, Math.floor(limit)))).map(item => item.sound)
+}
+
+/** Find the latest ambience instruction already reached, even if its asset was late. */
+export function ambienceInstructionAtBoundary(
+  mapped: readonly { cue: SoundSceneCue; boundary: number }[], boundary: number,
+): { key: string; assetId: string } | null {
+  let latest: { cue: SoundSceneCue; boundary: number; index: number } | null = null
+  mapped.forEach((item, index) => {
+    if (item.cue.kind !== 'ambience' || item.boundary > boundary) return
+    if (!latest || item.boundary > latest.boundary || (item.boundary === latest.boundary && index > latest.index)) latest = { ...item, index }
+  })
+  const instruction = latest as { cue: SoundSceneCue; boundary: number; index: number } | null
+  if (!instruction || instruction.cue.action !== 'play' || !instruction.cue.assetId) return null
+  return { key: `${instruction.boundary}:${instruction.index}:${instruction.cue.assetId}`, assetId: instruction.cue.assetId }
 }
 
 /** Insert events at voice boundaries, preserving both voice and event order. */

@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { SoundLibrary, type SoundUserStorage } from './sound-library'
 import { SoundUploadTransfers } from './sound-transfer'
-import { alignSoundSourceSegments, competingSoundCueIndexes, interleaveSoundEvents, mapSoundCueBoundaries, parseSoundScenePlan, shortlistSoundAssets, splitNarrationForSoundEvents } from './sound-scene'
+import { alignSoundSourceSegments, ambienceInstructionAtBoundary, competingSoundCueIndexes, interleaveSoundEvents, mapSoundCueBoundaries, parseSoundScenePlan, shortlistSoundAssets, splitNarrationForSoundEvents } from './sound-scene'
 import { mixAmbienceClip, renderSoundMix, soundCategoryGain } from './sound-mix'
 import { buildSoundTimeline, encodeSoundTimelineWav, resampleSoundClip } from './sound-timeline'
 import { SoundCuePreparation } from './sound-preparation'
@@ -206,6 +206,19 @@ test('sound prefetch shortlist matches metadata without selecting the cue', () =
   const sound = { version: 1 as const, id: 'door', name: 'door close', description: '', tags: ['door'], kind: 'event' as const, mime: 'audio/wav', bytes: 1, createdAt: new Date().toISOString() }
   assert.deepEqual(shortlistSoundAssets('The door opened.', [sound]).map(item => item.id), ['door'])
   assert.deepEqual(shortlistSoundAssets('The bell rang.', [sound]), [])
+  const creek = { ...sound, id: 'creek', name: 'creek water', tags: ['stream'], kind: 'ambience' as const }
+  assert.deepEqual(shortlistSoundAssets('A creek flows.', [sound, creek]).map(item => item.id), ['creek'])
+  assert.deepEqual(shortlistSoundAssets('A creek flows.', [creek], 8, ['event']), [])
+})
+
+test('late ambience starts at a later boundary but not after its stop', () => {
+  const start = { kind: 'ambience' as const, action: 'play' as const, assetId: 'creek', anchor: 'creek', offset: 0, position: 'before' as const }
+  const stop = { kind: 'ambience' as const, action: 'stop' as const, anchor: 'leaves', offset: 30, position: 'after' as const }
+  const mapped = [{ cue: start, boundary: 0 }, { cue: stop, boundary: 3 }]
+  assert.equal(ambienceInstructionAtBoundary(mapped, 0)?.assetId, 'creek')
+  assert.equal(ambienceInstructionAtBoundary(mapped, 2)?.assetId, 'creek')
+  assert.equal(ambienceInstructionAtBoundary(mapped, 3), null)
+  assert.equal(ambienceInstructionAtBoundary(mapped, 5), null)
 })
 
 test('local sound mix permits ambience under speech and events but prohibits event/voice overlap', () => {
