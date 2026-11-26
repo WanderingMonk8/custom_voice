@@ -3,6 +3,7 @@ import type {
   SpindleTextInputHandle,
 } from 'lumiverse-spindle-types'
 import { MAX_FAVORITE_SOUND_BYTES, MAX_FAVORITE_SOUND_SECONDS, SOUND_TRANSFER_CHUNK_BYTES, isSupportedSoundDuration, type FavoriteSound, type NewFavoriteSound } from './sound-library'
+import { SoundPreviewCache } from './sound-preview-cache'
 import { isFreesoundCc0, isFreesoundImportLicense, safeFreesoundPreviewUrl, type FreesoundSearchResult } from './freesound'
 import { alignSoundSourceSegments, ambienceInstructionAtBoundary, interleaveSoundEvents, mapSoundCueBoundaries, shortlistSoundAssets, splitNarrationForSoundEvents, type MissingSoundSuggestion, type SoundSceneCue } from './sound-scene'
 import { DEFAULT_AMBIENCE_VOLUME, DEFAULT_EVENT_VOLUME, mixAmbienceClip, readSoundVolume, soundCategoryGain } from './sound-mix'
@@ -2371,12 +2372,14 @@ export function setup(ctx: SpindleFrontendContext) {
   let soundPreviewContext: AudioContext | null = null
   let soundPreviewSource: AudioBufferSourceNode | null = null
   let externalSoundPreview: HTMLAudioElement | null = null
+  let externalSoundPreviewObjectUrl: string | null = null
   let soundPreviewId: string | null = null
   let soundPreviewProgress = ''
   const soundPreviewButtons = new Map<string, HTMLButtonElement>()
   const externalSoundPreviewButtons = new Map<string, HTMLButtonElement>()
   let soundPreviewGeneration = 0
   let soundLibraryDisposed = false
+  const soundPreviewCache = new SoundPreviewCache()
   const pendingStateRequests = new Map<string, {
     chatId: string | null
     resolve: (chat: ActiveChatState | null) => void
@@ -2513,6 +2516,8 @@ export function setup(ctx: SpindleFrontendContext) {
   }
 
   async function downloadFreesoundPreview(url: string): Promise<Uint8Array<ArrayBuffer>> {
+    const cached = soundPreviewCache.get(url)
+    if (cached) return cached
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), 30_000)
     try {
@@ -2586,7 +2591,9 @@ export function setup(ctx: SpindleFrontendContext) {
             stopSoundPreview(); stopVoicePreview()
             const generation = soundPreviewGeneration
             soundPreviewId = id; soundPreviewProgress = 'Loading'; updateSoundPreviewButton(id)
-            const audio = new Audio(previewUrl)
+            const cached = soundPreviewCache.get(previewUrl)
+            externalSoundPreviewObjectUrl = cached ? URL.createObjectURL(new Blob([cached], { type: 'audio/mpeg' })) : null
+            const audio = new Audio(externalSoundPreviewObjectUrl ?? previewUrl)
             externalSoundPreview = audio
             audio.onplaying = () => { if (generation === soundPreviewGeneration) { soundPreviewProgress = ''; updateSoundPreviewButton(id) } }
             audio.onended = () => { if (generation === soundPreviewGeneration) stopSoundPreview() }
@@ -2617,6 +2624,7 @@ export function setup(ctx: SpindleFrontendContext) {
                   const decoded = await context.decodeAudioData(bytes.buffer.slice(0))
                   if (!isSupportedSoundDuration(decoded.duration) || decoded.numberOfChannels > 2) throw new Error('Preview must be mono or stereo and at most 3 minutes.')
                 } finally { await context.close().catch(() => undefined) }
+                if (!soundLibraryDisposed) soundPreviewCache.put(url, bytes)
                 await uploadFavoriteSound({ name: item.name.trim().slice(0, 120), description: '', tags: item.tags ?? [], kind: category.value === 'ambience' ? 'ambience' : 'event', mime: 'audio/mpeg', provenance: { provider: 'freesound', soundId: item.id, title: item.name, creator: item.username, license: item.license, sourceUrl: `https://freesound.org/s/${item.id}/` } }, bytes)
                 await refreshSoundLibrary()
                 setStatus('Freesound preview imported to favorites.', 'saved')
@@ -2706,6 +2714,7 @@ export function setup(ctx: SpindleFrontendContext) {
     try { soundPreviewSource?.stop() } catch { /* already stopped */ }
     soundPreviewSource = null
     if (externalSoundPreview) { externalSoundPreview.pause(); externalSoundPreview.removeAttribute('src'); externalSoundPreview.load(); externalSoundPreview = null }
+    if (externalSoundPreviewObjectUrl) { URL.revokeObjectURL(externalSoundPreviewObjectUrl); externalSoundPreviewObjectUrl = null }
     if (soundPreviewContext) void soundPreviewContext.close().catch(() => undefined)
     soundPreviewContext = null
     if (previous) updateSoundPreviewButton(previous)
@@ -7376,6 +7385,7 @@ export function setup(ctx: SpindleFrontendContext) {
 
   return () => {
     soundLibraryDisposed = true
+    soundPreviewCache.clear()
     stopSoundPreview()
     for (const pending of pendingSoundLibrary.values()) { clearTimeout(pending.timer); pending.reject(new Error('Chat Voice was closed.')) }
     pendingSoundLibrary.clear()

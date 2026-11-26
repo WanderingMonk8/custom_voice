@@ -34,6 +34,53 @@ function isSupportedSoundDuration(seconds) {
 var SOUND_TRANSFER_CHUNK_BYTES = 1024 * 1024;
 var MAX_FAVORITE_LIBRARY_BYTES = 100 * 1024 * 1024;
 
+// src/sound-preview-cache.ts
+var SoundPreviewCache = class {
+  constructor(budget = 32 * 1024 * 1024, itemLimit = 8 * 1024 * 1024, ttlMs = 15 * 60 * 1e3, now = Date.now) {
+    this.budget = budget;
+    this.itemLimit = itemLimit;
+    this.ttlMs = ttlMs;
+    this.now = now;
+  }
+  entries = /* @__PURE__ */ new Map();
+  total = 0;
+  remove(key) {
+    const entry = this.entries.get(key);
+    if (!entry) return;
+    this.entries.delete(key);
+    this.total -= entry.bytes.byteLength;
+  }
+  get(key) {
+    const entry = this.entries.get(key);
+    if (!entry) return void 0;
+    if (this.now() - entry.touched >= this.ttlMs) {
+      this.remove(key);
+      return void 0;
+    }
+    entry.touched = this.now();
+    this.entries.delete(key);
+    this.entries.set(key, entry);
+    return entry.bytes.slice();
+  }
+  put(key, bytes) {
+    if (!key || !bytes.byteLength || bytes.byteLength > this.itemLimit || bytes.byteLength > this.budget) return;
+    this.remove(key);
+    for (const [cachedKey, entry] of this.entries) if (this.now() - entry.touched >= this.ttlMs) this.remove(cachedKey);
+    while (this.total + bytes.byteLength > this.budget) {
+      const oldest = this.entries.keys().next().value;
+      if (oldest === void 0) break;
+      this.remove(oldest);
+    }
+    const copy = bytes.slice();
+    this.entries.set(key, { bytes: copy, touched: this.now() });
+    this.total += copy.byteLength;
+  }
+  clear() {
+    this.entries.clear();
+    this.total = 0;
+  }
+};
+
 // src/sound-scene.ts
 function splitNarrationForSoundEvents(segments) {
   const result = [];
@@ -4753,12 +4800,14 @@ function setup(ctx) {
   let soundPreviewContext = null;
   let soundPreviewSource = null;
   let externalSoundPreview = null;
+  let externalSoundPreviewObjectUrl = null;
   let soundPreviewId = null;
   let soundPreviewProgress = "";
   const soundPreviewButtons = /* @__PURE__ */ new Map();
   const externalSoundPreviewButtons = /* @__PURE__ */ new Map();
   let soundPreviewGeneration = 0;
   let soundLibraryDisposed = false;
+  const soundPreviewCache = new SoundPreviewCache();
   const pendingStateRequests = /* @__PURE__ */ new Map();
   const pendingSpeakerParseRequests = /* @__PURE__ */ new Map();
   const pendingDecisionStatusRequests = /* @__PURE__ */ new Map();
@@ -4878,6 +4927,8 @@ function setup(ctx) {
     }
   }
   async function downloadFreesoundPreview(url) {
+    const cached = soundPreviewCache.get(url);
+    if (cached) return cached;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 3e4);
     try {
@@ -4993,7 +5044,9 @@ function setup(ctx) {
           soundPreviewId = id;
           soundPreviewProgress = "Loading";
           updateSoundPreviewButton(id);
-          const audio = new Audio(previewUrl2);
+          const cached = soundPreviewCache.get(previewUrl2);
+          externalSoundPreviewObjectUrl = cached ? URL.createObjectURL(new Blob([cached], { type: "audio/mpeg" })) : null;
+          const audio = new Audio(externalSoundPreviewObjectUrl ?? previewUrl2);
           externalSoundPreview = audio;
           audio.onplaying = () => {
             if (generation === soundPreviewGeneration) {
@@ -5057,6 +5110,7 @@ function setup(ctx) {
                 } finally {
                   await context2.close().catch(() => void 0);
                 }
+                if (!soundLibraryDisposed) soundPreviewCache.put(url, bytes);
                 await uploadFavoriteSound({ name: item.name.trim().slice(0, 120), description: "", tags: item.tags ?? [], kind: category.value === "ambience" ? "ambience" : "event", mime: "audio/mpeg", provenance: { provider: "freesound", soundId: item.id, title: item.name, creator: item.username, license: item.license, sourceUrl: `https://freesound.org/s/${item.id}/` } }, bytes);
                 await refreshSoundLibrary();
                 setStatus("Freesound preview imported to favorites.", "saved");
@@ -5172,6 +5226,10 @@ function setup(ctx) {
       externalSoundPreview.removeAttribute("src");
       externalSoundPreview.load();
       externalSoundPreview = null;
+    }
+    if (externalSoundPreviewObjectUrl) {
+      URL.revokeObjectURL(externalSoundPreviewObjectUrl);
+      externalSoundPreviewObjectUrl = null;
     }
     if (soundPreviewContext) void soundPreviewContext.close().catch(() => void 0);
     soundPreviewContext = null;
@@ -9535,6 +9593,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
   refreshLocalState();
   return () => {
     soundLibraryDisposed = true;
+    soundPreviewCache.clear();
     stopSoundPreview();
     for (const pending of pendingSoundLibrary.values()) {
       clearTimeout(pending.timer);

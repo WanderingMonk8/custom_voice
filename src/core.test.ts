@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { MAX_FAVORITE_SOUND_BYTES, MAX_FAVORITE_SOUND_SECONDS, SoundLibrary, isSupportedSoundDuration, type SoundUserStorage } from './sound-library'
 import { SoundDownloadTransfers, SoundUploadTransfers } from './sound-transfer'
+import { SoundPreviewCache } from './sound-preview-cache'
 import { isFreesoundCc0, parseFreesoundSearch, safeFreesoundPreviewUrl } from './freesound'
 import { alignSoundSourceSegments, ambienceInstructionAtBoundary, competingSoundCueIndexes, interleaveSoundEvents, mapSoundCueBoundaries, parseMissingSoundSuggestions, parseSoundScenePlan, shortlistSoundAssets, splitNarrationForSoundEvents } from './sound-scene'
 import { DEFAULT_AMBIENCE_VOLUME, DEFAULT_EVENT_VOLUME, mixAmbienceClip, readSoundVolume, renderSoundMix, soundCategoryGain } from './sound-mix'
@@ -51,6 +52,25 @@ test('sound duration validation accepts up to three minutes', () => {
   assert.equal(isSupportedSoundDuration(0), false)
   assert.equal(isSupportedSoundDuration(Number.NaN), false)
   assert.equal(isSupportedSoundDuration(Infinity), false)
+})
+
+test('sound preview cache is bounded, expiring and least-recently-used', () => {
+  let now = 0
+  const cache = new SoundPreviewCache(5, 3, 100, () => now)
+  cache.put('one', new Uint8Array([1, 2]))
+  cache.put('two', new Uint8Array([3, 4]))
+  const copy = cache.get('one')!
+  copy[0] = 9
+  assert.equal(cache.get('one')![0], 1)
+  cache.put('three', new Uint8Array([5, 6]))
+  assert.equal(cache.get('two'), undefined)
+  assert.deepEqual([...cache.get('three')!], [5, 6])
+  cache.put('oversized', new Uint8Array(4))
+  assert.equal(cache.get('oversized'), undefined)
+  now = 100
+  assert.equal(cache.get('one'), undefined)
+  cache.clear()
+  assert.equal(cache.get('three'), undefined)
 })
 
 test('missing sound suggestions require bounded safe searches and unique scene anchors', () => {
