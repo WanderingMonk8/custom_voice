@@ -4131,20 +4131,20 @@ function setup(ctx) {
   }
   const effectsNote = document.createElement("div");
   effectsNote.className = "chat-voice-hint";
-  effectsNote.textContent = "Experimental: events play between clips; ambience mixes underneath clips and may pause during buffering. When enabled, the current message and favorite sound names, descriptions, tags, types and IDs are sent to your selected LLM connection and, for competing cues, the default Decision connection. Automatic online fallback is not available yet. Late or ambiguous effects are skipped.";
+  effectsNote.textContent = "Events play between clips; ambience mixes underneath clips and may pause during buffering. When enabled, the current message and favorite sound names, descriptions, tags, types and IDs are sent to your selected LLM connection and, for competing cues, the default Decision connection. Automatic online fallback is not available yet. Late or ambiguous effects are skipped.";
   const eventSoundsLabel = document.createElement("label");
   eventSoundsLabel.className = "chat-voice-toggle";
   const eventSoundsToggle = document.createElement("input");
   eventSoundsToggle.type = "checkbox";
   const eventSoundsText = document.createElement("span");
-  eventSoundsText.textContent = "Enable experimental event sounds";
+  eventSoundsText.textContent = "Enable event sounds";
   eventSoundsLabel.append(eventSoundsToggle, eventSoundsText);
   const ambienceSoundsLabel = document.createElement("label");
   ambienceSoundsLabel.className = "chat-voice-toggle";
   const ambienceSoundsToggle = document.createElement("input");
   ambienceSoundsToggle.type = "checkbox";
   const ambienceSoundsText = document.createElement("span");
-  ambienceSoundsText.textContent = "Enable experimental ambience";
+  ambienceSoundsText.textContent = "Enable ambience";
   ambienceSoundsLabel.append(ambienceSoundsToggle, ambienceSoundsText);
   function makeSoundVolume(label, initial) {
     const container = document.createElement("label");
