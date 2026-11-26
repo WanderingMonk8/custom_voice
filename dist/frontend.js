@@ -127,6 +127,18 @@ var SoundLoadQueue = class {
   }
 };
 
+// src/sound-library-tabs.ts
+function selectSoundLibraryTab(panels, buttons, index, focus = false) {
+  if (!Number.isInteger(index) || index < 0 || index >= panels.length || panels.length !== buttons.length) return;
+  for (let n = 0; n < panels.length; n++) {
+    const selected = n === index;
+    panels[n].hidden = !selected;
+    buttons[n].setAttribute("aria-selected", String(selected));
+    buttons[n].tabIndex = selected ? 0 : -1;
+  }
+  if (focus) buttons[index].focus();
+}
+
 // src/sound-plan-diagnostics.ts
 var SOUND_PLANNER_TIMEOUT_MS = 6e4;
 var SOUND_LIBRARY_TIMEOUT_MS = 3e4;
@@ -4406,7 +4418,7 @@ function setup(ctx) {
   missingSoundsLabel.append(missingSoundsToggle, missingSoundsText);
   const missingSoundsHint = document.createElement("div");
   missingSoundsHint.className = "chat-voice-hint";
-  missingSoundsHint.textContent = "When sound effects are enabled, the scene planner may suggest search terms for sounds missing from favorites. Suggestions appear in Library; Freesound is contacted only when you search.";
+  missingSoundsHint.textContent = "When sound effects are enabled, the scene planner may suggest search terms for sounds missing from favorites. Suggestions appear in Library \u2192 Freesound; Freesound is contacted only when you search.";
   function makeSoundVolume(label, initial) {
     const container = document.createElement("label");
     container.className = "chat-voice-advanced";
@@ -4560,14 +4572,48 @@ function setup(ctx) {
   freesoundMore.className = "chat-voice-add-button";
   freesoundMore.textContent = "Next results";
   freesoundMore.hidden = true;
-  soundLibraryPanel.append(soundsHint, soundFile, soundName, soundTags, soundKind, soundAdd, soundSearch, soundFilter, soundList, freesoundSearchHint, missingSoundSuggestions, freesoundQuery, licenseFilter, freesoundSearchButton, freesoundResults, freesoundMore);
+  const libraryTabs = document.createElement("div");
+  libraryTabs.className = "chat-voice-voices-tabs";
+  libraryTabs.setAttribute("role", "tablist");
+  libraryTabs.setAttribute("aria-label", "Sound library sources");
+  const ownSoundsPanel = document.createElement("div");
+  const freesoundPanel = document.createElement("div");
+  const libraryPanels = [ownSoundsPanel, freesoundPanel];
+  const libraryTabButtons = [];
+  const selectLibraryTab = (index, focus = false) => selectSoundLibraryTab(libraryPanels, libraryTabButtons, index, focus);
+  for (const [index, label] of ["My sounds", "Freesound"].entries()) {
+    const panel2 = libraryPanels[index];
+    panel2.className = "chat-voice-advanced";
+    panel2.id = `chat-voice-library-source-panel-${index}`;
+    panel2.setAttribute("role", "tabpanel");
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "chat-voice-voices-tab";
+    button.textContent = label;
+    button.id = `chat-voice-library-source-tab-${index}`;
+    button.setAttribute("role", "tab");
+    button.setAttribute("aria-controls", panel2.id);
+    panel2.setAttribute("aria-labelledby", button.id);
+    button.addEventListener("click", () => selectLibraryTab(index));
+    button.addEventListener("keydown", (event) => {
+      if (event.key !== "ArrowLeft" && event.key !== "ArrowRight" && event.key !== "Home" && event.key !== "End") return;
+      event.preventDefault();
+      selectLibraryTab(event.key === "Home" ? 0 : event.key === "End" ? libraryPanels.length - 1 : (index + 1) % libraryPanels.length, true);
+    });
+    libraryTabButtons.push(button);
+    libraryTabs.append(button);
+  }
+  selectLibraryTab(0);
+  ownSoundsPanel.append(soundsHint, soundFile, soundName, soundTags, soundKind, soundAdd, soundSearch, soundFilter, soundList);
+  freesoundPanel.append(freesoundSearchHint, missingSoundSuggestions, freesoundQuery, licenseFilter, freesoundSearchButton, freesoundResults, freesoundMore);
+  soundLibraryPanel.append(libraryTabs, ownSoundsPanel, freesoundPanel);
   const creditsButton = document.createElement("button");
   creditsButton.type = "button";
   creditsButton.className = "chat-voice-add-button";
   creditsButton.textContent = "Show saved recording credits";
   const creditsList = document.createElement("div");
   creditsList.setAttribute("aria-live", "polite");
-  soundLibraryPanel.append(creditsButton, creditsList);
+  ownSoundsPanel.append(creditsButton, creditsList);
   creditsButton.addEventListener("click", () => {
     void (async () => {
       creditsButton.disabled = true;

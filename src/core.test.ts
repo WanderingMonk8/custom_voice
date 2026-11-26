@@ -4,6 +4,7 @@ import { MAX_FAVORITE_SOUND_BYTES, MAX_FAVORITE_SOUND_SECONDS, SoundLibrary, isS
 import { SoundDownloadTransfers, SoundUploadTransfers } from './sound-transfer'
 import { SoundPreviewCache } from './sound-preview-cache'
 import { SoundLoadQueue } from './sound-load-queue'
+import { selectSoundLibraryTab } from './sound-library-tabs'
 import { soundPlanErrorCategory, soundRequestTimeoutMs } from './sound-plan-diagnostics'
 import { isFreesoundCc0, parseFreesoundSearch, safeFreesoundPreviewUrl } from './freesound'
 import { alignSoundSourceSegments, ambienceInstructionAtBoundary, competingSoundCueIndexes, interleaveSoundEvents, mapSoundCueBoundaries, mergeOpeningSoundCues, parseMissingSoundSuggestions, parseSoundScenePlan, playBoundaryThenWaitForVoice, shortlistSoundAssets, shortlistSoundPlannerAssets, soundAlignmentText, soundOpeningExcerpt, splitNarrationForSoundEvents } from './sound-scene'
@@ -54,6 +55,26 @@ test('sound duration validation accepts up to three minutes', () => {
   assert.equal(isSupportedSoundDuration(0), false)
   assert.equal(isSupportedSoundDuration(Number.NaN), false)
   assert.equal(isSupportedSoundDuration(Infinity), false)
+})
+
+test('sound library source tabs show one panel and retain existing controls', () => {
+  const panels = [{ hidden: false, content: 'uploaded favorite' }, { hidden: false, content: 'existing search results' }]
+  const buttons = Array.from({ length: 2 }, () => ({ tabIndex: 0, selected: '', focused: false,
+    setAttribute(name: string, value: string) { if (name === 'aria-selected') this.selected = value },
+    focus() { this.focused = true },
+  }))
+  const panelElements = panels as unknown as HTMLElement[]
+  const buttonElements = buttons as unknown as HTMLButtonElement[]
+  selectSoundLibraryTab(panelElements, buttonElements, 0)
+  assert.deepEqual(panels.map(panel => panel.hidden), [false, true])
+  assert.deepEqual(buttons.map(button => button.selected), ['true', 'false'])
+  selectSoundLibraryTab(panelElements, buttonElements, 1, true)
+  assert.deepEqual(panels.map(panel => panel.hidden), [true, false])
+  assert.deepEqual(buttons.map(button => button.tabIndex), [-1, 0])
+  assert.equal(buttons[1].focused, true)
+  assert.deepEqual(panels.map(panel => panel.content), ['uploaded favorite', 'existing search results'])
+  selectSoundLibraryTab(panelElements, buttonElements, 9)
+  assert.deepEqual(panels.map(panel => panel.hidden), [true, false])
 })
 
 test('sound planner diagnostic categories never expose provider error text', () => {

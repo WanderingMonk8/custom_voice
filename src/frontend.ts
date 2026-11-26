@@ -5,6 +5,7 @@ import type {
 import { MAX_FAVORITE_SOUND_BYTES, MAX_FAVORITE_SOUND_SECONDS, SOUND_TRANSFER_CHUNK_BYTES, isSupportedSoundDuration, type FavoriteSound, type NewFavoriteSound } from './sound-library'
 import { SoundPreviewCache } from './sound-preview-cache'
 import { SoundLoadQueue } from './sound-load-queue'
+import { selectSoundLibraryTab } from './sound-library-tabs'
 import { soundRequestTimeoutMs } from './sound-plan-diagnostics'
 import { isFreesoundCc0, isFreesoundImportLicense, safeFreesoundPreviewUrl, type FreesoundSearchResult } from './freesound'
 import { alignSoundSourceSegments, ambienceInstructionAtBoundary, interleaveSoundEvents, mapSoundCueBoundaries, mergeOpeningSoundCues, playBoundaryThenWaitForVoice, shortlistSoundAssets, soundAlignmentText, splitNarrationForSoundEvents, type MissingSoundSuggestion, type SoundSceneCue } from './sound-scene'
@@ -1855,7 +1856,7 @@ export function setup(ctx: SpindleFrontendContext) {
   const missingSoundsText = document.createElement('span'); missingSoundsText.textContent = 'Suggest missing sounds'
   missingSoundsLabel.append(missingSoundsToggle, missingSoundsText)
   const missingSoundsHint = document.createElement('div'); missingSoundsHint.className = 'chat-voice-hint'
-  missingSoundsHint.textContent = 'When sound effects are enabled, the scene planner may suggest search terms for sounds missing from favorites. Suggestions appear in Library; Freesound is contacted only when you search.'
+  missingSoundsHint.textContent = 'When sound effects are enabled, the scene planner may suggest search terms for sounds missing from favorites. Suggestions appear in Library → Freesound; Freesound is contacted only when you search.'
   function makeSoundVolume(label: string, initial: number): { container: HTMLElement; input: HTMLInputElement; value: HTMLElement } {
     const container = document.createElement('label')
     container.className = 'chat-voice-advanced'
@@ -1957,12 +1958,37 @@ export function setup(ctx: SpindleFrontendContext) {
   const freesoundResults = document.createElement('div')
   freesoundResults.className = 'chat-voice-favorite-list'; freesoundResults.setAttribute('aria-live', 'polite')
   const freesoundMore = document.createElement('button'); freesoundMore.type = 'button'; freesoundMore.className = 'chat-voice-add-button'; freesoundMore.textContent = 'Next results'; freesoundMore.hidden = true
-  soundLibraryPanel.append(soundsHint, soundFile, soundName, soundTags, soundKind, soundAdd, soundSearch, soundFilter, soundList, freesoundSearchHint, missingSoundSuggestions, freesoundQuery, licenseFilter, freesoundSearchButton, freesoundResults, freesoundMore)
+  const libraryTabs = document.createElement('div')
+  libraryTabs.className = 'chat-voice-voices-tabs'; libraryTabs.setAttribute('role', 'tablist'); libraryTabs.setAttribute('aria-label', 'Sound library sources')
+  const ownSoundsPanel = document.createElement('div')
+  const freesoundPanel = document.createElement('div')
+  const libraryPanels = [ownSoundsPanel, freesoundPanel]
+  const libraryTabButtons: HTMLButtonElement[] = []
+  const selectLibraryTab = (index: number, focus = false) => selectSoundLibraryTab(libraryPanels, libraryTabButtons, index, focus)
+  for (const [index, label] of ['My sounds', 'Freesound'].entries()) {
+    const panel = libraryPanels[index]
+    panel.className = 'chat-voice-advanced'; panel.id = `chat-voice-library-source-panel-${index}`; panel.setAttribute('role', 'tabpanel')
+    const button = document.createElement('button')
+    button.type = 'button'; button.className = 'chat-voice-voices-tab'; button.textContent = label
+    button.id = `chat-voice-library-source-tab-${index}`; button.setAttribute('role', 'tab'); button.setAttribute('aria-controls', panel.id)
+    panel.setAttribute('aria-labelledby', button.id)
+    button.addEventListener('click', () => selectLibraryTab(index))
+    button.addEventListener('keydown', event => {
+      if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight' && event.key !== 'Home' && event.key !== 'End') return
+      event.preventDefault()
+      selectLibraryTab(event.key === 'Home' ? 0 : event.key === 'End' ? libraryPanels.length - 1 : (index + 1) % libraryPanels.length, true)
+    })
+    libraryTabButtons.push(button); libraryTabs.append(button)
+  }
+  selectLibraryTab(0)
+  ownSoundsPanel.append(soundsHint, soundFile, soundName, soundTags, soundKind, soundAdd, soundSearch, soundFilter, soundList)
+  freesoundPanel.append(freesoundSearchHint, missingSoundSuggestions, freesoundQuery, licenseFilter, freesoundSearchButton, freesoundResults, freesoundMore)
+  soundLibraryPanel.append(libraryTabs, ownSoundsPanel, freesoundPanel)
   const creditsButton = document.createElement('button')
   creditsButton.type = 'button'; creditsButton.className = 'chat-voice-add-button'; creditsButton.textContent = 'Show saved recording credits'
   const creditsList = document.createElement('div')
   creditsList.setAttribute('aria-live', 'polite')
-  soundLibraryPanel.append(creditsButton, creditsList)
+  ownSoundsPanel.append(creditsButton, creditsList)
   creditsButton.addEventListener('click', () => { void (async () => {
     creditsButton.disabled = true
     try {
