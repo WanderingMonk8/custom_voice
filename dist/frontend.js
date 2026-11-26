@@ -87,6 +87,33 @@ function mapSoundCueBoundaries(cues, segments, messageLength) {
 }
 
 // src/sound-mix.ts
+function mixAmbienceClip(foreground, ambience, elapsedSeconds, fadeInSeconds = 0.25) {
+  const valid = (clip) => Number.isSafeInteger(clip.sampleRate) && clip.sampleRate >= 8e3 && clip.sampleRate <= 192e3 && Number.isFinite(clip.gain) && clip.gain >= 0 && clip.gain <= 4 && [1, 2].includes(clip.channels.length) && !!clip.channels[0]?.length && clip.channels.every((channel) => channel instanceof Float32Array && channel.length === clip.channels[0].length);
+  if (!valid(foreground) || !valid(ambience) || !Number.isFinite(elapsedSeconds) || elapsedSeconds < 0 || !Number.isFinite(fadeInSeconds) || fadeInSeconds < 0 || fadeInSeconds > 30 || foreground.channels[0].length * 2 * 4 > MAX_MIX_BYTES) throw new Error("Invalid ambience mix.");
+  const frames = foreground.channels[0].length;
+  const output = [new Float32Array(frames), new Float32Array(frames)];
+  const ambientFrames = ambience.channels[0].length;
+  let peak = 0;
+  for (let frame = 0; frame < frames; frame++) {
+    const elapsed = elapsedSeconds + frame / foreground.sampleRate;
+    const position = elapsed * ambience.sampleRate % ambientFrames;
+    const lower = Math.floor(position);
+    const upper = (lower + 1) % ambientFrames;
+    const fraction = position - lower;
+    const fade = fadeInSeconds ? Math.min(1, elapsed / fadeInSeconds) : 1;
+    for (let channel = 0; channel < 2; channel++) {
+      const voice = foreground.channels[Math.min(channel, foreground.channels.length - 1)][frame];
+      const ambient = ambience.channels[Math.min(channel, ambience.channels.length - 1)];
+      const sample = voice * foreground.gain + (ambient[lower] + (ambient[upper] - ambient[lower]) * fraction) * ambience.gain * fade;
+      if (!Number.isFinite(sample)) throw new Error("Invalid audio sample.");
+      output[channel][frame] = sample;
+      peak = Math.max(peak, Math.abs(sample));
+    }
+  }
+  const peakGain = peak > 1 ? 1 / peak : 1;
+  if (peakGain < 1) for (const channel of output) for (let frame = 0; frame < frames; frame++) channel[frame] *= peakGain;
+  return { channels: output, peakGain, elapsedSeconds: elapsedSeconds + frames / foreground.sampleRate };
+}
 var MAX_MIX_BYTES = 128 * 1024 * 1024;
 function soundCategoryGain(channels, kind) {
   if (!["event", "ambience"].includes(kind) || ![1, 2].includes(channels.length) || !channels[0]?.length || channels.some((channel) => !(channel instanceof Float32Array) || channel.length !== channels[0].length)) throw new Error("Invalid sound audio.");
@@ -2828,6 +2855,7 @@ async function loadPlaybackPreferences() {
   });
   if (!response.ok) return {
     eventSounds: false,
+    ambienceSounds: false,
     speed: 1,
     volume: 1,
     connectionId: "",
@@ -2866,6 +2894,7 @@ async function loadPlaybackPreferences() {
   const ttsTagPlacement = row.value?.chatVoiceTtsTagPlacement === "llm" ? "llm" : "jev";
   return {
     eventSounds: row.value?.chatVoiceEventSounds === true,
+    ambienceSounds: row.value?.chatVoiceAmbienceSounds === true,
     speed: Math.min(4, Math.max(0.25, speed)),
     volume: Math.min(1, Math.max(0, volume)),
     connectionId: globalTtsConnectionPreference(row.value ?? {}),
@@ -4049,7 +4078,7 @@ function setup(ctx) {
   }
   const effectsNote = document.createElement("div");
   effectsNote.className = "chat-voice-hint";
-  effectsNote.textContent = "Experimental event sounds play between voice clips. When enabled, the current message and your favorite sounds\u2019 names, descriptions, tags, types and IDs are sent to your selected LLM connection and, for competing cues, the default Decision connection. Ambience and online search are not available yet. Late or ambiguous effects are skipped.";
+  effectsNote.textContent = "Experimental: events play between clips; ambience mixes underneath clips and may pause during buffering. When enabled, the current message and favorite sound names, descriptions, tags, types and IDs are sent to your selected LLM connection and, for competing cues, the default Decision connection. Online search is not available yet. Late or ambiguous effects are skipped.";
   const eventSoundsLabel = document.createElement("label");
   eventSoundsLabel.className = "chat-voice-toggle";
   const eventSoundsToggle = document.createElement("input");
@@ -4057,7 +4086,14 @@ function setup(ctx) {
   const eventSoundsText = document.createElement("span");
   eventSoundsText.textContent = "Enable experimental event sounds";
   eventSoundsLabel.append(eventSoundsToggle, eventSoundsText);
-  soundEffectsPanel.append(eventSoundsLabel, effectsNote);
+  const ambienceSoundsLabel = document.createElement("label");
+  ambienceSoundsLabel.className = "chat-voice-toggle";
+  const ambienceSoundsToggle = document.createElement("input");
+  ambienceSoundsToggle.type = "checkbox";
+  const ambienceSoundsText = document.createElement("span");
+  ambienceSoundsText.textContent = "Enable experimental ambience";
+  ambienceSoundsLabel.append(ambienceSoundsToggle, ambienceSoundsText);
+  soundEffectsPanel.append(eventSoundsLabel, ambienceSoundsLabel, effectsNote);
   const soundTabButtons = [];
   const soundPanels = [soundEffectsPanel, soundLibraryPanel, soundAdvancedPanel];
   for (const [index, label] of ["Effects", "Library", "Advanced"].entries()) {
@@ -4538,6 +4574,7 @@ function setup(ctx) {
     status.dataset.state = state;
   };
   let savingEventSounds = false;
+  let savingAmbienceSounds = false;
   eventSoundsToggle.addEventListener("change", () => {
     const enabled = eventSoundsToggle.checked;
     savingEventSounds = true;
@@ -4548,6 +4585,18 @@ function setup(ctx) {
     }).finally(() => {
       savingEventSounds = false;
       eventSoundsToggle.disabled = false;
+    });
+  });
+  ambienceSoundsToggle.addEventListener("change", () => {
+    const enabled = ambienceSoundsToggle.checked;
+    savingAmbienceSounds = true;
+    ambienceSoundsToggle.disabled = true;
+    void updateVoiceSettings((current) => ({ ...current, chatVoiceAmbienceSounds: enabled })).catch((error) => {
+      ambienceSoundsToggle.checked = !enabled;
+      setStatus(error instanceof Error ? error.message : "Could not save ambience settings.", "error");
+    }).finally(() => {
+      savingAmbienceSounds = false;
+      ambienceSoundsToggle.disabled = false;
     });
   });
   function soundLibraryRequest(type, fields = {}) {
@@ -5955,16 +6004,19 @@ function setup(ctx) {
       const eventSourceText = preparePlaybackContent(message.content, preferences.skippedTrackerTags);
       let eventCues = [];
       const eventAssets = /* @__PURE__ */ new Map();
+      const soundAssetKinds = /* @__PURE__ */ new Map();
       const eventLoads = /* @__PURE__ */ new Map();
       let eventPlanState = "not-requested";
       let eventAssetFailures = 0;
       const selectedEvents = /* @__PURE__ */ new Map();
+      const mixedVoices = /* @__PURE__ */ new Map();
+      const selectedAudio = { events: selectedEvents, voices: mixedVoices };
       let eventSelectionStarted = false;
       let resolveEventSelection;
       const eventSelection = new Promise((resolve) => {
         resolveEventSelection = resolve;
       });
-      if (!preferences.eventSounds) resolveEventSelection(selectedEvents);
+      if (!preferences.eventSounds && !preferences.ambienceSounds) resolveEventSelection(selectedAudio);
       const prepareEventAsset = (id) => {
         const existing = eventLoads.get(id);
         if (existing) return existing;
@@ -5972,17 +6024,18 @@ function setup(ctx) {
           try {
             const asset = await soundLibraryRequest("chat_voice_sound_library_read", { id });
             if (playback.controller.signal.aborted) return;
-            if (!asset.audio || asset.favorite?.kind !== "event") throw new Error("Unavailable event sound.");
+            if (!asset.audio || !asset.favorite || !["event", "ambience"].includes(asset.favorite.kind)) throw new Error("Unavailable sound.");
             const bytes = Uint8Array.from(atob(asset.audio), (char) => char.charCodeAt(0));
             const decoded = await audioContext.decodeAudioData(bytes.buffer);
             if (playback.controller.signal.aborted) return;
             if (decoded.duration > 120 || decoded.numberOfChannels < 1 || decoded.numberOfChannels > 2) throw new Error("Unsupported event sound.");
-            const frames = Math.min(decoded.length, Math.floor(decoded.sampleRate * 5));
+            const frames = Math.min(decoded.length, Math.floor(decoded.sampleRate * (asset.favorite.kind === "event" ? 5 : 120)));
             if (!frames) throw new Error("Empty event sound.");
             const cropped = audioContext.createBuffer(decoded.numberOfChannels, frames, decoded.sampleRate);
             for (let channel = 0; channel < decoded.numberOfChannels; channel++) cropped.copyToChannel(decoded.getChannelData(channel).subarray(0, frames), channel);
             const channels = Array.from({ length: cropped.numberOfChannels }, (_, channel) => cropped.getChannelData(channel));
-            eventAssets.set(id, { data: new ArrayBuffer(0), mime: "audio/wav", decodedBuffer: cropped, normalizationGain: soundCategoryGain(channels, "event") });
+            soundAssetKinds.set(id, asset.favorite.kind);
+            eventAssets.set(id, { data: new ArrayBuffer(0), mime: "audio/wav", decodedBuffer: cropped, normalizationGain: soundCategoryGain(channels, asset.favorite.kind) });
           } catch {
             eventAssetFailures++;
           }
@@ -5990,7 +6043,7 @@ function setup(ctx) {
         eventLoads.set(id, request);
         return request;
       };
-      if (preferences.eventSounds && eventSourceText.length <= 3e4 && eventSourceText.trim()) {
+      if ((preferences.eventSounds || preferences.ambienceSounds) && eventSourceText.length <= 3e4 && eventSourceText.trim()) {
         eventPlanState = "pending";
         void soundLibraryRequest("chat_voice_sound_library_list").then((result) => {
           if (!playback.controller.signal.aborted) for (const sound of shortlistSoundAssets(eventSourceText, result.favorites ?? [])) void prepareEventAsset(sound.id);
@@ -5999,9 +6052,9 @@ function setup(ctx) {
         });
         void soundLibraryRequest("chat_voice_sound_scene_plan", { message: eventSourceText, connectionId: preferences.tagLlmConnectionId, model: preferences.tagLlmModel }).then(async (result) => {
           if (playback.controller.signal.aborted) return;
-          eventCues = (result.cues ?? []).filter((cue) => cue.kind === "event" && cue.action === "play" && cue.assetId);
+          eventCues = (result.cues ?? []).filter((cue) => cue.kind === "event" ? preferences.eventSounds : preferences.ambienceSounds);
           eventPlanState = "completed";
-          await Promise.all([...new Set(eventCues.map((cue) => cue.assetId))].map(prepareEventAsset));
+          await Promise.all([...new Set(eventCues.flatMap((cue) => cue.action === "play" && cue.assetId ? [cue.assetId] : []))].map(prepareEventAsset));
         }).catch(() => {
           eventPlanState = "failed";
         });
@@ -6577,7 +6630,8 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
             }));
             const selected = await eventSelection;
             if (!selected) throw new DOMException("Playback ended before the sound plan was frozen.", "AbortError");
-            const captured = interleaveSoundEvents(voiceCaptured, selected);
+            const voices = voiceCaptured.map((voice, index) => selected.voices.get(index) ?? voice);
+            const captured = interleaveSoundEvents(voices, selected.events);
             const saved = await persistCapturedAudio(
               playbackChat.id,
               messageId,
@@ -6658,19 +6712,51 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
           `Buffering ${initialBufferSize} voice segment${initialBufferSize === 1 ? "" : "s"} before playback\u2026`
         );
         await Promise.all(processed.slice(0, initialBufferSize));
-        const eventSpans = preferences.eventSounds ? alignSoundSourceSegments(eventSourceText, plan.map((entry) => stripTtsTags(entry.text))) : [];
+        const eventSpans = preferences.eventSounds || preferences.ambienceSounds ? alignSoundSourceSegments(eventSourceText, plan.map((entry) => stripTtsTags(entry.text))) : [];
         eventSelectionStarted = true;
+        let activeAmbience = null;
         const selectEventsAt = (boundary) => {
-          if (!preferences.eventSounds || !eventCues.length) return [];
-          const chosen = mapSoundCueBoundaries(eventCues, eventSpans, eventSourceText.length).filter((item) => item.boundary === boundary).flatMap((item) => item.cue.assetId && eventAssets.has(item.cue.assetId) ? [eventAssets.get(item.cue.assetId)] : []);
-          if (chosen.length) selectedEvents.set(boundary, chosen);
+          if (!eventCues.length) return [];
+          const chosen = [];
+          for (const { cue } of mapSoundCueBoundaries(eventCues, eventSpans, eventSourceText.length).filter((item) => item.boundary === boundary)) {
+            if (cue.kind === "ambience" && cue.action === "stop") {
+              activeAmbience = null;
+              continue;
+            }
+            const asset = cue.assetId ? eventAssets.get(cue.assetId) : void 0;
+            if (!asset || !cue.assetId || soundAssetKinds.get(cue.assetId) !== cue.kind) continue;
+            if (cue.kind === "ambience") activeAmbience = { segment: asset, elapsed: 0 };
+            else chosen.push(asset);
+          }
           return chosen;
         };
-        if (preferences.eventSounds) appendSpeakerDebugLog(`Sound effects at first playback: planner=${eventPlanState}, event cues=${eventCues.length}, assets ready=${eventAssets.size}, asset failures=${eventAssetFailures}; later boundaries can use newly ready sounds.`);
+        const withAmbience = (foreground) => {
+          if (!activeAmbience || !foreground.decodedBuffer || !activeAmbience.segment.decodedBuffer) return foreground;
+          try {
+            const source = foreground.decodedBuffer;
+            const ambient = activeAmbience.segment.decodedBuffer;
+            const mixed = mixAmbienceClip(
+              { channels: Array.from({ length: source.numberOfChannels }, (_, channel) => source.getChannelData(channel)), sampleRate: source.sampleRate, gain: foreground.normalizationGain ?? 1 },
+              { channels: Array.from({ length: ambient.numberOfChannels }, (_, channel) => ambient.getChannelData(channel)), sampleRate: ambient.sampleRate, gain: activeAmbience.segment.normalizationGain ?? 1 },
+              activeAmbience.elapsed
+            );
+            activeAmbience.elapsed = mixed.elapsedSeconds;
+            const buffer = audioContext.createBuffer(2, source.length, source.sampleRate);
+            for (let channel = 0; channel < 2; channel++) buffer.getChannelData(channel).set(mixed.channels[channel]);
+            return { data: new ArrayBuffer(0), mime: "audio/wav", decodedBuffer: buffer, normalizationGain: 1 };
+          } catch {
+            activeAmbience = null;
+            appendSpeakerDebugLog("Sound effects: ambience mixing failed; continuing with voice-only playback.");
+            return foreground;
+          }
+        };
+        if (preferences.eventSounds || preferences.ambienceSounds) appendSpeakerDebugLog(`Sound effects at first playback: planner=${eventPlanState}, cues=${eventCues.length}, assets ready=${eventAssets.size}, asset failures=${eventAssetFailures}; later boundaries can use newly ready sounds.`);
         for (let index = 0; index < plan.length; index += 1) {
           const current = await processed[index];
           if (!current.ok) throw current.error;
-          for (const event of selectEventsAt(index)) await playDecodedBuffer(playback, event, preferences.volume);
+          const events = selectEventsAt(index).map(withAmbience);
+          if (events.length) selectedEvents.set(index, events);
+          for (const event of events) await playDecodedBuffer(playback, event, preferences.volume);
           playbackCursor = index + 1;
           if (synthesisCursor < plan.length || localSynthesisTasks > 0) {
             const pressuredConcurrency = bufferAwareGenerationConcurrency(
@@ -6697,10 +6783,14 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
           );
           if (index === 0) appendSpeakerDebugLog(`Time from playback setup to first audio dispatch: ${Date.now() - playbackSetupFinishedAt}ms (includes speaker review, tag placement and buffering).`);
           setStatus(`Playing ${index + 1} of ${plan.length} voice segment${plan.length === 1 ? "" : "s"}\u2026`);
-          await playDecodedBuffer(playback, current.segment, preferences.volume);
+          const voice = withAmbience(current.segment);
+          if (voice !== current.segment) mixedVoices.set(index, voice);
+          await playDecodedBuffer(playback, voice, preferences.volume);
         }
-        for (const event of selectEventsAt(plan.length)) await playDecodedBuffer(playback, event, preferences.volume);
-        if (preferences.eventSounds) {
+        const lastEvents = selectEventsAt(plan.length).map(withAmbience);
+        if (lastEvents.length) selectedEvents.set(plan.length, lastEvents);
+        for (const event of lastEvents) await playDecodedBuffer(playback, event, preferences.volume);
+        if (preferences.eventSounds || preferences.ambienceSounds) {
           const aligned = mapSoundCueBoundaries(eventCues, eventSpans, eventSourceText.length).length;
           appendSpeakerDebugLog(`Sound effects at playback end: planner=${eventPlanState}, event cues=${eventCues.length}, aligned cues=${aligned}, assets ready=${eventAssets.size}, asset failures=${eventAssetFailures}, selected boundaries=${selectedEvents.size}.`);
         }
@@ -6724,7 +6814,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
           setStatus(error instanceof Error ? error.message : "Custom voice playback failed.", "error");
         }
       } finally {
-        resolveEventSelection(eventSelectionStarted ? selectedEvents : null);
+        resolveEventSelection(eventSelectionStarted ? selectedAudio : null);
         playback.finishAudible();
         if (activePlayback === playback) {
           activePlayback = null;
@@ -8070,6 +8160,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
       ]);
       connections = loadedConnections;
       if (!savingEventSounds) eventSoundsToggle.checked = preferences.eventSounds;
+      if (!savingAmbienceSounds) ambienceSoundsToggle.checked = preferences.ambienceSounds;
       llmConnections = loadedLlmConnections;
       if (!favoritesSaving && !editingFavoriteVoiceId) {
         favoriteVoices = preferences.favoriteVoices;

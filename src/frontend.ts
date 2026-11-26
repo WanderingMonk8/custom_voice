@@ -4,7 +4,7 @@ import type {
 } from 'lumiverse-spindle-types'
 import type { FavoriteSound } from './sound-library'
 import { alignSoundSourceSegments, interleaveSoundEvents, mapSoundCueBoundaries, shortlistSoundAssets, splitNarrationForSoundEvents, type SoundSceneCue } from './sound-scene'
-import { soundCategoryGain } from './sound-mix'
+import { mixAmbienceClip, soundCategoryGain } from './sound-mix'
 import { AutoplayRequestRegistry, PlaybackLongPress, PlaybackStartupGuard, syncAutoplayIndicators, syncPlaybackButtons, waitForAutoplayDeadline, waitForAutoplayWork, type PlaybackButtonState } from './playback-ui'
 import {
   activeGhostVoices,
@@ -408,6 +408,7 @@ interface SavedMessageAudioResult {
 
 interface PlaybackPreferences {
   eventSounds: boolean
+  ambienceSounds: boolean
   speed: number
   volume: number
   connectionId: string
@@ -490,6 +491,7 @@ async function loadPlaybackPreferences(): Promise<PlaybackPreferences> {
   })
   if (!response.ok) return {
     eventSounds: false,
+    ambienceSounds: false,
     speed: 1,
     volume: 1,
     connectionId: '',
@@ -534,6 +536,7 @@ async function loadPlaybackPreferences(): Promise<PlaybackPreferences> {
   const ttsTagPlacement = row.value?.chatVoiceTtsTagPlacement === 'llm' ? 'llm' : 'jev'
   return {
     eventSounds: row.value?.chatVoiceEventSounds === true,
+    ambienceSounds: row.value?.chatVoiceAmbienceSounds === true,
     speed: Math.min(4, Math.max(0.25, speed)),
     volume: Math.min(1, Math.max(0, volume)),
     connectionId: globalTtsConnectionPreference(row.value ?? {}),
@@ -1780,7 +1783,7 @@ export function setup(ctx: SpindleFrontendContext) {
   }
   const effectsNote = document.createElement('div')
   effectsNote.className = 'chat-voice-hint'
-  effectsNote.textContent = 'Experimental event sounds play between voice clips. When enabled, the current message and your favorite sounds’ names, descriptions, tags, types and IDs are sent to your selected LLM connection and, for competing cues, the default Decision connection. Ambience and online search are not available yet. Late or ambiguous effects are skipped.'
+  effectsNote.textContent = 'Experimental: events play between clips; ambience mixes underneath clips and may pause during buffering. When enabled, the current message and favorite sound names, descriptions, tags, types and IDs are sent to your selected LLM connection and, for competing cues, the default Decision connection. Online search is not available yet. Late or ambiguous effects are skipped.'
   const eventSoundsLabel = document.createElement('label')
   eventSoundsLabel.className = 'chat-voice-toggle'
   const eventSoundsToggle = document.createElement('input')
@@ -1788,7 +1791,14 @@ export function setup(ctx: SpindleFrontendContext) {
   const eventSoundsText = document.createElement('span')
   eventSoundsText.textContent = 'Enable experimental event sounds'
   eventSoundsLabel.append(eventSoundsToggle, eventSoundsText)
-  soundEffectsPanel.append(eventSoundsLabel, effectsNote)
+  const ambienceSoundsLabel = document.createElement('label')
+  ambienceSoundsLabel.className = 'chat-voice-toggle'
+  const ambienceSoundsToggle = document.createElement('input')
+  ambienceSoundsToggle.type = 'checkbox'
+  const ambienceSoundsText = document.createElement('span')
+  ambienceSoundsText.textContent = 'Enable experimental ambience'
+  ambienceSoundsLabel.append(ambienceSoundsToggle, ambienceSoundsText)
+  soundEffectsPanel.append(eventSoundsLabel, ambienceSoundsLabel, effectsNote)
   const soundTabButtons: HTMLButtonElement[] = []
   const soundPanels = [soundEffectsPanel, soundLibraryPanel, soundAdvancedPanel]
   for (const [index, label] of ['Effects', 'Library', 'Advanced'].entries()) {
@@ -2299,6 +2309,7 @@ export function setup(ctx: SpindleFrontendContext) {
   }
 
   let savingEventSounds = false
+  let savingAmbienceSounds = false
   eventSoundsToggle.addEventListener('change', () => {
     const enabled = eventSoundsToggle.checked
     savingEventSounds = true
@@ -2306,6 +2317,14 @@ export function setup(ctx: SpindleFrontendContext) {
     void updateVoiceSettings(current => ({ ...current, chatVoiceEventSounds: enabled }))
       .catch(error => { eventSoundsToggle.checked = !enabled; setStatus(error instanceof Error ? error.message : 'Could not save sound settings.', 'error') })
       .finally(() => { savingEventSounds = false; eventSoundsToggle.disabled = false })
+  })
+  ambienceSoundsToggle.addEventListener('change', () => {
+    const enabled = ambienceSoundsToggle.checked
+    savingAmbienceSounds = true
+    ambienceSoundsToggle.disabled = true
+    void updateVoiceSettings(current => ({ ...current, chatVoiceAmbienceSounds: enabled }))
+      .catch(error => { ambienceSoundsToggle.checked = !enabled; setStatus(error instanceof Error ? error.message : 'Could not save ambience settings.', 'error') })
+      .finally(() => { savingAmbienceSounds = false; ambienceSoundsToggle.disabled = false })
   })
 
   function soundLibraryRequest(type: string, fields: Record<string, unknown> = {}): Promise<SoundLibraryPayload> {
@@ -3830,14 +3849,17 @@ export function setup(ctx: SpindleFrontendContext) {
     const eventSourceText = preparePlaybackContent(message.content, preferences.skippedTrackerTags)
     let eventCues: SoundSceneCue[] = []
     const eventAssets = new Map<string, SynthesizedVoiceSegment>()
+    const soundAssetKinds = new Map<string, 'event' | 'ambience'>()
     const eventLoads = new Map<string, Promise<void>>()
     let eventPlanState = 'not-requested'
     let eventAssetFailures = 0
     const selectedEvents = new Map<number, SynthesizedVoiceSegment[]>()
+    const mixedVoices = new Map<number, SynthesizedVoiceSegment>()
+    const selectedAudio = { events: selectedEvents, voices: mixedVoices }
     let eventSelectionStarted = false
-    let resolveEventSelection!: (selection: Map<number, SynthesizedVoiceSegment[]> | null) => void
-    const eventSelection = new Promise<Map<number, SynthesizedVoiceSegment[]> | null>(resolve => { resolveEventSelection = resolve })
-    if (!preferences.eventSounds) resolveEventSelection(selectedEvents)
+    let resolveEventSelection!: (selection: typeof selectedAudio | null) => void
+    const eventSelection = new Promise<typeof selectedAudio | null>(resolve => { resolveEventSelection = resolve })
+    if (!preferences.eventSounds && !preferences.ambienceSounds) resolveEventSelection(selectedAudio)
     const prepareEventAsset = (id: string): Promise<void> => {
       const existing = eventLoads.get(id)
       if (existing) return existing
@@ -3845,23 +3867,24 @@ export function setup(ctx: SpindleFrontendContext) {
         try {
           const asset = await soundLibraryRequest('chat_voice_sound_library_read', { id })
           if (playback.controller.signal.aborted) return
-          if (!asset.audio || asset.favorite?.kind !== 'event') throw new Error('Unavailable event sound.')
+          if (!asset.audio || !asset.favorite || !['event', 'ambience'].includes(asset.favorite.kind)) throw new Error('Unavailable sound.')
           const bytes = Uint8Array.from(atob(asset.audio), char => char.charCodeAt(0))
           const decoded = await audioContext.decodeAudioData(bytes.buffer)
           if (playback.controller.signal.aborted) return
           if (decoded.duration > 120 || decoded.numberOfChannels < 1 || decoded.numberOfChannels > 2) throw new Error('Unsupported event sound.')
-          const frames = Math.min(decoded.length, Math.floor(decoded.sampleRate * 5))
+          const frames = Math.min(decoded.length, Math.floor(decoded.sampleRate * (asset.favorite.kind === 'event' ? 5 : 120)))
           if (!frames) throw new Error('Empty event sound.')
           const cropped = audioContext.createBuffer(decoded.numberOfChannels, frames, decoded.sampleRate)
           for (let channel = 0; channel < decoded.numberOfChannels; channel++) cropped.copyToChannel(decoded.getChannelData(channel).subarray(0, frames), channel)
           const channels = Array.from({ length: cropped.numberOfChannels }, (_, channel) => cropped.getChannelData(channel))
-          eventAssets.set(id, { data: new ArrayBuffer(0), mime: 'audio/wav', decodedBuffer: cropped, normalizationGain: soundCategoryGain(channels, 'event') })
+          soundAssetKinds.set(id, asset.favorite.kind)
+          eventAssets.set(id, { data: new ArrayBuffer(0), mime: 'audio/wav', decodedBuffer: cropped, normalizationGain: soundCategoryGain(channels, asset.favorite.kind) })
         } catch { eventAssetFailures++ }
       })()
       eventLoads.set(id, request)
       return request
     }
-    if (preferences.eventSounds && eventSourceText.length <= 30000 && eventSourceText.trim()) {
+    if ((preferences.eventSounds || preferences.ambienceSounds) && eventSourceText.length <= 30000 && eventSourceText.trim()) {
       eventPlanState = 'pending'
       // A bounded local shortlist only prefetches assets; the model still selects cues.
       void soundLibraryRequest('chat_voice_sound_library_list').then(result => {
@@ -3870,9 +3893,9 @@ export function setup(ctx: SpindleFrontendContext) {
       void soundLibraryRequest('chat_voice_sound_scene_plan', { message: eventSourceText, connectionId: preferences.tagLlmConnectionId, model: preferences.tagLlmModel })
         .then(async result => {
           if (playback.controller.signal.aborted) return
-          eventCues = (result.cues ?? []).filter(cue => cue.kind === 'event' && cue.action === 'play' && cue.assetId)
+          eventCues = (result.cues ?? []).filter(cue => (cue.kind === 'event' ? preferences.eventSounds : preferences.ambienceSounds))
           eventPlanState = 'completed'
-          await Promise.all([...new Set(eventCues.map(cue => cue.assetId!))].map(prepareEventAsset))
+          await Promise.all([...new Set(eventCues.flatMap(cue => cue.action === 'play' && cue.assetId ? [cue.assetId] : []))].map(prepareEventAsset))
         }).catch(() => { eventPlanState = 'failed' })
     }
 
@@ -4589,7 +4612,8 @@ export function setup(ctx: SpindleFrontendContext) {
           }))
           const selected = await eventSelection
           if (!selected) throw new DOMException('Playback ended before the sound plan was frozen.', 'AbortError')
-          const captured = interleaveSoundEvents<SynthesizedVoiceSegment>(voiceCaptured, selected)
+          const voices = voiceCaptured.map((voice, index) => selected.voices.get(index) ?? voice)
+          const captured = interleaveSoundEvents<SynthesizedVoiceSegment>(voices, selected.events)
           const saved = await persistCapturedAudio(
             playbackChat.id,
             messageId,
@@ -4686,22 +4710,49 @@ export function setup(ctx: SpindleFrontendContext) {
       )
       await Promise.all(processed.slice(0, initialBufferSize))
 
-      const eventSpans = preferences.eventSounds ? alignSoundSourceSegments(eventSourceText, plan.map(entry => stripTtsTags(entry.text))) : []
+      const eventSpans = (preferences.eventSounds || preferences.ambienceSounds) ? alignSoundSourceSegments(eventSourceText, plan.map(entry => stripTtsTags(entry.text))) : []
       eventSelectionStarted = true
+      let activeAmbience: { segment: SynthesizedVoiceSegment; elapsed: number } | null = null
       const selectEventsAt = (boundary: number): SynthesizedVoiceSegment[] => {
-        if (!preferences.eventSounds || !eventCues.length) return []
-        const chosen = mapSoundCueBoundaries(eventCues, eventSpans, eventSourceText.length)
-          .filter(item => item.boundary === boundary)
-          .flatMap(item => item.cue.assetId && eventAssets.has(item.cue.assetId) ? [eventAssets.get(item.cue.assetId)!] : [])
-        if (chosen.length) selectedEvents.set(boundary, chosen)
+        if (!eventCues.length) return []
+        const chosen: SynthesizedVoiceSegment[] = []
+        for (const { cue } of mapSoundCueBoundaries(eventCues, eventSpans, eventSourceText.length).filter(item => item.boundary === boundary)) {
+          if (cue.kind === 'ambience' && cue.action === 'stop') { activeAmbience = null; continue }
+          const asset = cue.assetId ? eventAssets.get(cue.assetId) : undefined
+          if (!asset || !cue.assetId || soundAssetKinds.get(cue.assetId) !== cue.kind) continue
+          if (cue.kind === 'ambience') activeAmbience = { segment: asset, elapsed: 0 }
+          else chosen.push(asset)
+        }
         return chosen
       }
-      if (preferences.eventSounds) appendSpeakerDebugLog(`Sound effects at first playback: planner=${eventPlanState}, event cues=${eventCues.length}, assets ready=${eventAssets.size}, asset failures=${eventAssetFailures}; later boundaries can use newly ready sounds.`)
+      const withAmbience = (foreground: SynthesizedVoiceSegment): SynthesizedVoiceSegment => {
+        if (!activeAmbience || !foreground.decodedBuffer || !activeAmbience.segment.decodedBuffer) return foreground
+        try {
+        const source = foreground.decodedBuffer
+        const ambient = activeAmbience.segment.decodedBuffer
+        const mixed = mixAmbienceClip(
+          { channels: Array.from({ length: source.numberOfChannels }, (_, channel) => source.getChannelData(channel)), sampleRate: source.sampleRate, gain: foreground.normalizationGain ?? 1 },
+          { channels: Array.from({ length: ambient.numberOfChannels }, (_, channel) => ambient.getChannelData(channel)), sampleRate: ambient.sampleRate, gain: activeAmbience.segment.normalizationGain ?? 1 },
+          activeAmbience.elapsed,
+        )
+        activeAmbience.elapsed = mixed.elapsedSeconds
+        const buffer = audioContext.createBuffer(2, source.length, source.sampleRate)
+        for (let channel = 0; channel < 2; channel++) buffer.getChannelData(channel).set(mixed.channels[channel])
+        return { data: new ArrayBuffer(0), mime: 'audio/wav', decodedBuffer: buffer, normalizationGain: 1 }
+        } catch {
+          activeAmbience = null
+          appendSpeakerDebugLog('Sound effects: ambience mixing failed; continuing with voice-only playback.')
+          return foreground
+        }
+      }
+      if (preferences.eventSounds || preferences.ambienceSounds) appendSpeakerDebugLog(`Sound effects at first playback: planner=${eventPlanState}, cues=${eventCues.length}, assets ready=${eventAssets.size}, asset failures=${eventAssetFailures}; later boundaries can use newly ready sounds.`)
 
       for (let index = 0; index < plan.length; index += 1) {
         const current = await processed[index]
         if (!current.ok) throw current.error
-        for (const event of selectEventsAt(index)) await playDecodedBuffer(playback, event, preferences.volume)
+        const events = selectEventsAt(index).map(withAmbience)
+        if (events.length) selectedEvents.set(index, events)
+        for (const event of events) await playDecodedBuffer(playback, event, preferences.volume)
         playbackCursor = index + 1
         if (synthesisCursor < plan.length || localSynthesisTasks > 0) {
           const pressuredConcurrency = bufferAwareGenerationConcurrency(
@@ -4729,10 +4780,14 @@ export function setup(ctx: SpindleFrontendContext) {
         )
         if (index === 0) appendSpeakerDebugLog(`Time from playback setup to first audio dispatch: ${Date.now() - playbackSetupFinishedAt}ms (includes speaker review, tag placement and buffering).`)
         setStatus(`Playing ${index + 1} of ${plan.length} voice segment${plan.length === 1 ? '' : 's'}…`)
-        await playDecodedBuffer(playback, current.segment, preferences.volume)
+        const voice = withAmbience(current.segment)
+        if (voice !== current.segment) mixedVoices.set(index, voice)
+        await playDecodedBuffer(playback, voice, preferences.volume)
       }
-      for (const event of selectEventsAt(plan.length)) await playDecodedBuffer(playback, event, preferences.volume)
-      if (preferences.eventSounds) {
+      const lastEvents = selectEventsAt(plan.length).map(withAmbience)
+      if (lastEvents.length) selectedEvents.set(plan.length, lastEvents)
+      for (const event of lastEvents) await playDecodedBuffer(playback, event, preferences.volume)
+      if (preferences.eventSounds || preferences.ambienceSounds) {
         const aligned = mapSoundCueBoundaries(eventCues, eventSpans, eventSourceText.length).length
         appendSpeakerDebugLog(`Sound effects at playback end: planner=${eventPlanState}, event cues=${eventCues.length}, aligned cues=${aligned}, assets ready=${eventAssets.size}, asset failures=${eventAssetFailures}, selected boundaries=${selectedEvents.size}.`)
       }
@@ -4756,7 +4811,7 @@ export function setup(ctx: SpindleFrontendContext) {
         setStatus(error instanceof Error ? error.message : 'Custom voice playback failed.', 'error')
       }
     } finally {
-      resolveEventSelection(eventSelectionStarted ? selectedEvents : null)
+      resolveEventSelection(eventSelectionStarted ? selectedAudio : null)
       playback.finishAudible()
       if (activePlayback === playback) {
         activePlayback = null
@@ -6098,6 +6153,7 @@ export function setup(ctx: SpindleFrontendContext) {
       ])
       connections = loadedConnections
       if (!savingEventSounds) eventSoundsToggle.checked = preferences.eventSounds
+      if (!savingAmbienceSounds) ambienceSoundsToggle.checked = preferences.ambienceSounds
       llmConnections = loadedLlmConnections
       if (!favoritesSaving && !editingFavoriteVoiceId) {
         favoriteVoices = preferences.favoriteVoices

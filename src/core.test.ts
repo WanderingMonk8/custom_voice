@@ -202,6 +202,19 @@ test('ambience mixes under consecutive clips with a continuous loop and fade', (
   assert.throws(() => mixAmbienceClip(foreground, { ...ambience, channels: [new Float32Array([NaN])] }, 0), /Invalid audio sample/)
 })
 
+test('ambience-mixed clips encode with the same sample order for saving', () => {
+  const ambience = { channels: [new Float32Array([0.1, 0.2, 0.3, 0.4])], sampleRate: 8000, gain: 1 }
+  const foreground = { channels: [new Float32Array([0.1, 0.1])], sampleRate: 8000, gain: 1 }
+  const first = mixAmbienceClip(foreground, ambience, 0, 0)
+  const second = mixAmbienceClip(foreground, ambience, first.elapsedSeconds, 0)
+  const wav = encodeConcatenatedWav([{ sampleRate: 8000, channels: first.channels }, { sampleRate: 8000, channels: second.channels }])
+  const view = new DataView(wav)
+  for (let i = 0; i < 4; i++) {
+    const sample = i < 2 ? first.channels[0][i] : second.channels[0][i - 2]
+    assert.ok(Math.abs(view.getInt16(44 + i * 4, true) / 32767 - sample) < 0.0001)
+  }
+})
+
 test('sound timeline injects events, blends ambience and skips unavailable assets', () => {
   const clip = (length: number) => [new Float32Array(length).fill(0.1)]
   const assets = new Map([
