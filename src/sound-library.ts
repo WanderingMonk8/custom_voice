@@ -13,6 +13,13 @@ export interface SoundUserStorage {
 }
 
 export type SoundKind = 'ambience' | 'event'
+export interface SoundProvenance {
+  provider: 'freesound'
+  soundId: number
+  creator: string
+  license: string
+  sourceUrl: string
+}
 export interface FavoriteSound {
   version: 1
   id: string
@@ -23,6 +30,7 @@ export interface FavoriteSound {
   mime: string
   bytes: number
   createdAt: string
+  provenance?: SoundProvenance
 }
 
 export interface NewFavoriteSound {
@@ -31,6 +39,7 @@ export interface NewFavoriteSound {
   tags?: string[]
   kind: SoundKind
   mime: string
+  provenance?: SoundProvenance
 }
 
 const ROOT = 'sound-effects/v1'
@@ -43,6 +52,15 @@ export const MAX_FAVORITE_SOUNDS = 200
 export const MAX_FAVORITE_LIBRARY_BYTES = 100 * 1024 * 1024
 const ID_PATTERN = /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/u
 const writes = new Map<string, Promise<void>>()
+
+function normalizeProvenance(value: unknown): SoundProvenance | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined
+  const item = value as Record<string, unknown>
+  if (item.provider !== 'freesound' || !Number.isSafeInteger(item.soundId) || (item.soundId as number) < 1
+    || typeof item.creator !== 'string' || !item.creator.trim() || item.creator.length > 120
+    || typeof item.license !== 'string' || !item.license.trim() || item.license.length > 300) return undefined
+  return { provider: 'freesound', soundId: item.soundId as number, creator: item.creator.trim(), license: item.license.trim(), sourceUrl: `https://freesound.org/s/${item.soundId}/` }
+}
 
 function serializeUserWrite<T>(userId: string | undefined, task: () => Promise<T>): Promise<T> {
   const key = userId ?? '__extension_owner__'
@@ -71,6 +89,10 @@ function readRecord(value: unknown, id: string): FavoriteSound | null {
     || typeof row.mime !== 'string' || !/^audio\/(?:mpeg|wav|ogg|mp4|webm)$/u.test(row.mime)
     || typeof row.bytes !== 'number' || !Number.isInteger(row.bytes) || row.bytes < 1 || row.bytes > MAX_FAVORITE_SOUND_BYTES
     || typeof row.createdAt !== 'string' || !Number.isFinite(Date.parse(row.createdAt))) return null
+  if (row.provenance !== undefined) {
+    const provenance = normalizeProvenance(row.provenance)
+    if (!provenance || (row.provenance as Record<string, unknown>).sourceUrl !== provenance.sourceUrl) return null
+  }
   return row as unknown as FavoriteSound
 }
 
@@ -95,6 +117,8 @@ export class SoundLibrary {
     const description = typeof input.description === 'string' ? input.description.trim() : ''
     const tags = Array.isArray(input.tags) ? input.tags.map(tag => typeof tag === 'string' ? tag.trim() : '') : []
     const mime = typeof input.mime === 'string' ? input.mime.trim().toLowerCase() : ''
+    const provenance = input.provenance === undefined ? undefined : normalizeProvenance(input.provenance)
+    if (input.provenance !== undefined && !provenance) throw new Error('Invalid sound provenance.')
     if (!name || name.length > 120 || description.length > 500 || tags.length > 20 || tags.some(tag => !tag || tag.length > 40)
       || (input.kind !== 'ambience' && input.kind !== 'event')) throw new Error('Invalid favorite sound metadata.')
     if (!(data instanceof Uint8Array) || data.length < 1 || data.length > MAX_FAVORITE_SOUND_BYTES || !validAudio(data, mime)) {
@@ -108,7 +132,7 @@ export class SoundLibrary {
     const metaPath = recordPath(id)
     const bytesPath = audioPath(id)
     if (await this.storage.exists(metaPath, userId) || await this.storage.exists(bytesPath, userId)) throw new Error('Sound ID already exists.')
-    const record: FavoriteSound = { version: 1, id, name, description, tags, kind: input.kind, mime, bytes: data.byteLength, createdAt: new Date().toISOString() }
+    const record: FavoriteSound = { version: 1, id, name, description, tags, kind: input.kind, mime, bytes: data.byteLength, createdAt: new Date().toISOString(), ...(provenance ? { provenance } : {}) }
     try {
       await this.storage.writeBinary(bytesPath, data, userId)
       await this.storage.write(metaPath, JSON.stringify(record), userId)

@@ -3,7 +3,7 @@ import type {
   SpindleTextInputHandle,
 } from 'lumiverse-spindle-types'
 import { MAX_FAVORITE_SOUND_BYTES, SOUND_TRANSFER_CHUNK_BYTES, type FavoriteSound } from './sound-library'
-import type { FreesoundSearchResult } from './freesound'
+import { safeFreesoundPreviewUrl, type FreesoundSearchResult } from './freesound'
 import { alignSoundSourceSegments, ambienceInstructionAtBoundary, interleaveSoundEvents, mapSoundCueBoundaries, shortlistSoundAssets, splitNarrationForSoundEvents, type SoundSceneCue } from './sound-scene'
 import { DEFAULT_AMBIENCE_VOLUME, DEFAULT_EVENT_VOLUME, mixAmbienceClip, readSoundVolume, soundCategoryGain } from './sound-mix'
 import { AutoplayRequestRegistry, PlaybackLongPress, PlaybackStartupGuard, syncAutoplayIndicators, syncPlaybackButtons, waitForAutoplayDeadline, waitForAutoplayWork, type PlaybackButtonState } from './playback-ui'
@@ -1897,7 +1897,7 @@ export function setup(ctx: SpindleFrontendContext) {
   }
   const freesoundSearchHint = document.createElement('div')
   freesoundSearchHint.className = 'chat-voice-hint'
-  freesoundSearchHint.textContent = 'Search Freesound: your search terms are sent to Freesound. Review each sound’s creator and license on its page. Previewing and importing results here are not available yet.'
+  freesoundSearchHint.textContent = 'Search terms are sent to Freesound. Playing a preview connects your browser to Freesound’s audio server. Review the creator and license on the sound’s page. Importing results is not available yet.'
   const freesoundQuery = document.createElement('input')
   freesoundQuery.placeholder = 'Search Freesound'; freesoundQuery.maxLength = 120; freesoundQuery.setAttribute('aria-label', 'Search Freesound')
   const freesoundSearchButton = document.createElement('button')
@@ -2294,9 +2294,11 @@ export function setup(ctx: SpindleFrontendContext) {
   let soundLibrarySequence = 0
   let soundPreviewContext: AudioContext | null = null
   let soundPreviewSource: AudioBufferSourceNode | null = null
+  let externalSoundPreview: HTMLAudioElement | null = null
   let soundPreviewId: string | null = null
   let soundPreviewProgress = ''
   const soundPreviewButtons = new Map<string, HTMLButtonElement>()
+  const externalSoundPreviewButtons = new Map<string, HTMLButtonElement>()
   let soundPreviewGeneration = 0
   let soundLibraryDisposed = false
   const pendingStateRequests = new Map<string, {
@@ -2406,6 +2408,8 @@ export function setup(ctx: SpindleFrontendContext) {
     const query = freesoundQuery.value.trim()
     if (!query) { setStatus('Enter a Freesound search first.', 'error'); return }
     freesoundSearchButton.disabled = true
+    stopSoundPreview()
+    externalSoundPreviewButtons.clear()
     freesoundResults.replaceChildren()
     const loading = document.createElement('div'); loading.className = 'chat-voice-hint'; loading.textContent = 'Searching Freesound…'; freesoundResults.append(loading)
     try {
@@ -2421,7 +2425,27 @@ export function setup(ctx: SpindleFrontendContext) {
         link.href = `https://freesound.org/s/${item.id}/`; link.target = '_blank'; link.rel = 'noopener noreferrer'; link.textContent = item.name
         const info = document.createElement('div'); info.className = 'chat-voice-hint'
         info.textContent = `By ${item.username} · ${item.duration.toFixed(1)} seconds · ${item.license}`
-        row.append(link, info); freesoundResults.append(row)
+        row.append(link, info)
+        const previewUrl = safeFreesoundPreviewUrl(item.previewUrl, item.id)
+        if (previewUrl) {
+          const id = `freesound:${item.id}`
+          const preview = document.createElement('button'); preview.type = 'button'; preview.className = 'chat-voice-preview-button'
+          externalSoundPreviewButtons.set(id, preview); updateSoundPreviewButton(id)
+          preview.addEventListener('click', () => {
+            if (soundPreviewId === id) { stopSoundPreview(); return }
+            stopSoundPreview(); stopVoicePreview()
+            const generation = soundPreviewGeneration
+            soundPreviewId = id; soundPreviewProgress = 'Loading'; updateSoundPreviewButton(id)
+            const audio = new Audio(previewUrl)
+            externalSoundPreview = audio
+            audio.onplaying = () => { if (generation === soundPreviewGeneration) { soundPreviewProgress = ''; updateSoundPreviewButton(id) } }
+            audio.onended = () => { if (generation === soundPreviewGeneration) stopSoundPreview() }
+            audio.onerror = () => { if (generation === soundPreviewGeneration) { stopSoundPreview(); setStatus('Could not play the Freesound preview.', 'error') } }
+            void audio.play().catch(() => { if (generation === soundPreviewGeneration) { stopSoundPreview(); setStatus('Could not play the Freesound preview.', 'error') } })
+          })
+          row.append(preview)
+        }
+        freesoundResults.append(row)
       }
     } catch (error) {
       if (!soundLibraryDisposed) { loading.textContent = error instanceof Error ? error.message : 'Could not search Freesound.'; freesoundResults.replaceChildren(loading) }
@@ -2477,7 +2501,7 @@ export function setup(ctx: SpindleFrontendContext) {
   freesoundRemove.addEventListener('click', () => { void updateFreesoundKey('remove') })
 
   function updateSoundPreviewButton(id: string): void {
-    const button = soundPreviewButtons.get(id)
+    const button = soundPreviewButtons.get(id) ?? externalSoundPreviewButtons.get(id)
     if (!button) return
     const active = id === soundPreviewId
     button.innerHTML = active ? STOP_ACTION_ICON : PLAY_TTS_ACTION_ICON
@@ -2495,6 +2519,7 @@ export function setup(ctx: SpindleFrontendContext) {
     soundPreviewGeneration += 1
     try { soundPreviewSource?.stop() } catch { /* already stopped */ }
     soundPreviewSource = null
+    if (externalSoundPreview) { externalSoundPreview.pause(); externalSoundPreview.removeAttribute('src'); externalSoundPreview.load(); externalSoundPreview = null }
     if (soundPreviewContext) void soundPreviewContext.close().catch(() => undefined)
     soundPreviewContext = null
     if (previous) updateSoundPreviewButton(previous)
@@ -2578,7 +2603,14 @@ export function setup(ctx: SpindleFrontendContext) {
         try { await soundLibraryRequest('chat_voice_sound_library_remove', { id: favorite.id }); await refreshSoundLibrary(); setStatus('Favorite sound deleted.', 'saved') }
         catch (error) { setStatus(error instanceof Error ? error.message : 'Could not delete sound.', 'error') }
       })() })
-      row.append(name, tags, kind, preview, save, remove); soundList.appendChild(row)
+      row.append(name, tags, kind, preview, save, remove)
+      if (favorite.provenance?.provider === 'freesound' && Number.isSafeInteger(favorite.provenance.soundId) && favorite.provenance.soundId > 0) {
+        const credit = document.createElement('div'); credit.className = 'chat-voice-hint'
+        credit.textContent = `Freesound · ${favorite.provenance.creator} · ${favorite.provenance.license} `
+        const source = document.createElement('a'); source.href = `https://freesound.org/s/${favorite.provenance.soundId}/`; source.target = '_blank'; source.rel = 'noopener noreferrer'; source.textContent = 'Source'
+        credit.append(source); row.append(credit)
+      }
+      soundList.appendChild(row)
     }
   }
   soundSearch.addEventListener('input', renderSoundLibrary)

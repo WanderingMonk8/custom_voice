@@ -1996,7 +1996,7 @@ spindle.onFrontendMessage(async (rawPayload: unknown, userId, frontendSessionId)
         if (!query || query.length > 120) throw new Error('Enter a search of up to 120 characters.')
         const key = await spindle.enclave.get('freesound_api_key', userId)
         if (!key) throw new Error('Save a Freesound API key in Sound effects → Advanced first.')
-        const params = new URLSearchParams({ query, fields: 'id,name,username,license,duration', page_size: '12' })
+        const params = new URLSearchParams({ query, fields: 'id,name,username,license,duration,previews', page_size: '12' })
         const response = await Promise.race([
           spindle.cors(`https://freesound.org/apiv2/search/text/?${params}`, { method: 'GET', headers: { Authorization: `Token ${key}` } }),
           new Promise<never>((_, reject) => setTimeout(() => reject(new Error('Freesound search timed out.')), 20_000)),

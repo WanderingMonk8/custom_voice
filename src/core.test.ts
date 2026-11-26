@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { SoundLibrary, type SoundUserStorage } from './sound-library'
 import { SoundDownloadTransfers, SoundUploadTransfers } from './sound-transfer'
-import { parseFreesoundSearch } from './freesound'
+import { parseFreesoundSearch, safeFreesoundPreviewUrl } from './freesound'
 import { alignSoundSourceSegments, ambienceInstructionAtBoundary, competingSoundCueIndexes, interleaveSoundEvents, mapSoundCueBoundaries, parseSoundScenePlan, shortlistSoundAssets, splitNarrationForSoundEvents } from './sound-scene'
 import { DEFAULT_AMBIENCE_VOLUME, DEFAULT_EVENT_VOLUME, mixAmbienceClip, readSoundVolume, renderSoundMix, soundCategoryGain } from './sound-mix'
 import { buildSoundTimeline, encodeSoundTimelineWav, resampleSoundClip } from './sound-timeline'
@@ -53,6 +53,17 @@ test('Freesound search results validate metadata and never trust remote URLs', (
   assert.throws(() => parseFreesoundSearch({ results: 'invalid' }), /Unexpected Freesound/)
 })
 
+test('Freesound preview URLs must use a known HTTPS host and matching sound ID', () => {
+  const valid = 'https://cdn.freesound.org/previews/382/382353_7119516-hq.mp3'
+  assert.equal(safeFreesoundPreviewUrl(valid, 382353), valid)
+  assert.equal(safeFreesoundPreviewUrl(valid, 382354), undefined)
+  assert.equal(safeFreesoundPreviewUrl('https://cdn.freesound.org.evil.example/previews/382/382353_7119516-hq.mp3', 382353), undefined)
+  assert.equal(safeFreesoundPreviewUrl(`${valid}?token=secret`, 382353), undefined)
+  assert.equal(safeFreesoundPreviewUrl('http://cdn.freesound.org/previews/382/382353_7119516-hq.mp3', 382353), undefined)
+  const parsed = parseFreesoundSearch({ results: [{ id: 382353, name: 'Stream', username: 'artist', license: 'CC0', duration: 3, previews: { 'preview-hq-mp3': valid } }] })
+  assert.equal(parsed[0].previewUrl, valid)
+})
+
 test('sound favorites persist across library instances and stay isolated by user', async () => {
   const storage = new FakeSoundStorage()
   const wav = new TextEncoder().encode('RIFF0000WAVEaudio')
@@ -73,6 +84,16 @@ test('sound favorites persist across library instances and stay isolated by user
   await reinstalled.remove(favorite.id, 'alice')
   assert.deepEqual(await reinstalled.list('alice'), [])
   assert.equal(storage.files.size, 0)
+})
+
+test('sound provenance persists through edits and canonicalizes the source URL', async () => {
+  const library = new SoundLibrary(new FakeSoundStorage())
+  const audio = new TextEncoder().encode('RIFF0000WAVEaudio')
+  const favorite = await library.add({ name: 'Creek', kind: 'ambience', mime: 'audio/wav', provenance: { provider: 'freesound', soundId: 123, creator: 'artist', license: 'CC BY', sourceUrl: 'https://evil.example/' } }, audio, 'alice')
+  assert.equal(favorite.provenance?.sourceUrl, 'https://freesound.org/s/123/')
+  const edited = await library.edit(favorite.id, { name: 'Stream', kind: 'ambience', tags: [] }, 'alice')
+  assert.deepEqual(edited.provenance, favorite.provenance)
+  assert.deepEqual((await library.read(favorite.id, 'alice')).record.provenance, favorite.provenance)
 })
 
 test('large sound uploads are ordered, bounded and isolated by frontend session', () => {

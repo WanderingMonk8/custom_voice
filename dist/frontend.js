@@ -9,6 +9,20 @@ var MAX_FAVORITE_SOUND_BYTES = 24 * 1024 * 1024;
 var SOUND_TRANSFER_CHUNK_BYTES = 1024 * 1024;
 var MAX_FAVORITE_LIBRARY_BYTES = 100 * 1024 * 1024;
 
+// src/freesound.ts
+function safeFreesoundPreviewUrl(value, id) {
+  if (typeof value !== "string" || !Number.isSafeInteger(id) || id < 1) return void 0;
+  try {
+    const url = new URL(value);
+    if (url.protocol !== "https:" || url.username || url.password || url.port || url.search || url.hash) return void 0;
+    const prefix = url.hostname === "cdn.freesound.org" ? "/previews/" : url.hostname === "freesound.org" ? "/data/previews/" : "";
+    if (!prefix || !new RegExp(`^${prefix}\\d+/${id}_[0-9]+-hq\\.mp3$`, "u").test(url.pathname)) return void 0;
+    return url.href;
+  } catch {
+    return void 0;
+  }
+}
+
 // src/sound-scene.ts
 function splitNarrationForSoundEvents(segments) {
   const result = [];
@@ -4247,7 +4261,7 @@ function setup(ctx) {
   }
   const freesoundSearchHint = document.createElement("div");
   freesoundSearchHint.className = "chat-voice-hint";
-  freesoundSearchHint.textContent = "Search Freesound: your search terms are sent to Freesound. Review each sound\u2019s creator and license on its page. Previewing and importing results here are not available yet.";
+  freesoundSearchHint.textContent = "Search terms are sent to Freesound. Playing a preview connects your browser to Freesound\u2019s audio server. Review the creator and license on the sound\u2019s page. Importing results is not available yet.";
   const freesoundQuery = document.createElement("input");
   freesoundQuery.placeholder = "Search Freesound";
   freesoundQuery.maxLength = 120;
@@ -4618,9 +4632,11 @@ function setup(ctx) {
   let soundLibrarySequence = 0;
   let soundPreviewContext = null;
   let soundPreviewSource = null;
+  let externalSoundPreview = null;
   let soundPreviewId = null;
   let soundPreviewProgress = "";
   const soundPreviewButtons = /* @__PURE__ */ new Map();
+  const externalSoundPreviewButtons = /* @__PURE__ */ new Map();
   let soundPreviewGeneration = 0;
   let soundLibraryDisposed = false;
   const pendingStateRequests = /* @__PURE__ */ new Map();
@@ -4713,6 +4729,8 @@ function setup(ctx) {
         return;
       }
       freesoundSearchButton.disabled = true;
+      stopSoundPreview();
+      externalSoundPreviewButtons.clear();
       freesoundResults.replaceChildren();
       const loading = document.createElement("div");
       loading.className = "chat-voice-hint";
@@ -4740,6 +4758,51 @@ function setup(ctx) {
           info.className = "chat-voice-hint";
           info.textContent = `By ${item.username} \xB7 ${item.duration.toFixed(1)} seconds \xB7 ${item.license}`;
           row.append(link, info);
+          const previewUrl2 = safeFreesoundPreviewUrl(item.previewUrl, item.id);
+          if (previewUrl2) {
+            const id = `freesound:${item.id}`;
+            const preview = document.createElement("button");
+            preview.type = "button";
+            preview.className = "chat-voice-preview-button";
+            externalSoundPreviewButtons.set(id, preview);
+            updateSoundPreviewButton(id);
+            preview.addEventListener("click", () => {
+              if (soundPreviewId === id) {
+                stopSoundPreview();
+                return;
+              }
+              stopSoundPreview();
+              stopVoicePreview();
+              const generation = soundPreviewGeneration;
+              soundPreviewId = id;
+              soundPreviewProgress = "Loading";
+              updateSoundPreviewButton(id);
+              const audio = new Audio(previewUrl2);
+              externalSoundPreview = audio;
+              audio.onplaying = () => {
+                if (generation === soundPreviewGeneration) {
+                  soundPreviewProgress = "";
+                  updateSoundPreviewButton(id);
+                }
+              };
+              audio.onended = () => {
+                if (generation === soundPreviewGeneration) stopSoundPreview();
+              };
+              audio.onerror = () => {
+                if (generation === soundPreviewGeneration) {
+                  stopSoundPreview();
+                  setStatus("Could not play the Freesound preview.", "error");
+                }
+              };
+              void audio.play().catch(() => {
+                if (generation === soundPreviewGeneration) {
+                  stopSoundPreview();
+                  setStatus("Could not play the Freesound preview.", "error");
+                }
+              });
+            });
+            row.append(preview);
+          }
           freesoundResults.append(row);
         }
       } catch (error) {
@@ -4807,7 +4870,7 @@ function setup(ctx) {
     void updateFreesoundKey("remove");
   });
   function updateSoundPreviewButton(id) {
-    const button = soundPreviewButtons.get(id);
+    const button = soundPreviewButtons.get(id) ?? externalSoundPreviewButtons.get(id);
     if (!button) return;
     const active = id === soundPreviewId;
     button.innerHTML = active ? STOP_ACTION_ICON : PLAY_TTS_ACTION_ICON;
@@ -4827,6 +4890,12 @@ function setup(ctx) {
     } catch {
     }
     soundPreviewSource = null;
+    if (externalSoundPreview) {
+      externalSoundPreview.pause();
+      externalSoundPreview.removeAttribute("src");
+      externalSoundPreview.load();
+      externalSoundPreview = null;
+    }
     if (soundPreviewContext) void soundPreviewContext.close().catch(() => void 0);
     soundPreviewContext = null;
     if (previous) updateSoundPreviewButton(previous);
@@ -4963,6 +5032,18 @@ function setup(ctx) {
         })();
       });
       row.append(name, tags, kind, preview, save, remove);
+      if (favorite.provenance?.provider === "freesound" && Number.isSafeInteger(favorite.provenance.soundId) && favorite.provenance.soundId > 0) {
+        const credit = document.createElement("div");
+        credit.className = "chat-voice-hint";
+        credit.textContent = `Freesound \xB7 ${favorite.provenance.creator} \xB7 ${favorite.provenance.license} `;
+        const source = document.createElement("a");
+        source.href = `https://freesound.org/s/${favorite.provenance.soundId}/`;
+        source.target = "_blank";
+        source.rel = "noopener noreferrer";
+        source.textContent = "Source";
+        credit.append(source);
+        row.append(credit);
+      }
       soundList.appendChild(row);
     }
   }
