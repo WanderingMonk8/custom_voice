@@ -4960,14 +4960,14 @@ function setup(ctx) {
       missingSoundsToggle.disabled = false;
     });
   });
-  function soundLibraryRequest(type, fields = {}) {
+  function soundLibraryRequest(type, fields = {}, onProgress) {
     const requestId = `sound-${Date.now().toString(36)}-${++soundLibrarySequence}`;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         pendingSoundLibrary.delete(requestId);
-        reject(new Error("Sound library request timed out."));
+        reject(new Error(type === "chat_voice_sound_scene_plan" ? "Sound planner frontend request timed out after 30000ms." : "Sound library request timed out after 30000ms."));
       }, 3e4);
-      pendingSoundLibrary.set(requestId, { resolve, reject, timer });
+      pendingSoundLibrary.set(requestId, { resolve, reject, timer, onProgress });
       ctx.sendToBackend({ type, requestId, ...fields });
     });
   }
@@ -6618,7 +6618,10 @@ function setup(ctx) {
       }
       const eventSourceText = preparePlaybackContent(message.content, preferences.skippedTrackerTags);
       const soundPlanStarted = Date.now();
-      const earlySoundPlan = (preferences.eventSounds || preferences.ambienceSounds) && eventSourceText.length <= 3e4 && eventSourceText.trim() ? soundLibraryRequest("chat_voice_sound_scene_plan", { message: eventSourceText, connectionId: preferences.tagLlmConnectionId, model: preferences.tagLlmModel, suggestMissing: preferences.suggestMissingSounds }).then((result) => ({ result, error: null, completedAt: Date.now() }), (error) => ({ result: null, error, completedAt: Date.now() })) : null;
+      const soundPlanProgress = [];
+      const earlySoundPlan = (preferences.eventSounds || preferences.ambienceSounds) && eventSourceText.length <= 3e4 && eventSourceText.trim() ? soundLibraryRequest("chat_voice_sound_scene_plan", { message: eventSourceText, connectionId: preferences.tagLlmConnectionId, model: preferences.tagLlmModel, suggestMissing: preferences.suggestMissingSounds }, (progress) => {
+        soundPlanProgress.push(progress);
+      }).then((result) => ({ result, error: null, completedAt: Date.now() }), (error) => ({ result: null, error, completedAt: Date.now() })) : null;
       const connectionProfileVoice = (connections.find((connection) => connection.id === connectionId)?.voice ?? "").trim();
       let autoCastDiagnostics = [];
       if (preferences.autoVoiceCasting && poolVoicesForAutoCast().length && (!config.narratorVoice || !config.userVoice || playbackChat.characters.some((character) => !config.characterVoices[character.id]))) {
@@ -6804,8 +6807,10 @@ function setup(ctx) {
           planReceivedAfterBoundary = lastReachedSoundBoundary;
           eventPlanState = "completed";
           await Promise.all([...new Set(eventCues.flatMap((cue) => cue.action === "play" && cue.assetId ? [cue.assetId] : []))].map((id) => prepareEventAsset(id, true)));
-        }).catch(() => {
+        }).catch((error) => {
           eventPlanState = "failed";
+          const details = error instanceof Error ? error.message : "Unknown sound planner failure.";
+          appendSpeakerDebugLog(`Sound planner failed: ${details} elapsed=${Date.now() - soundPlanStarted}ms; stages=${JSON.stringify(soundPlanProgress)}.`);
           if (suggestionPlayback === playback && preferences.suggestMissingSounds) missingSoundSuggestions.textContent = "Could not generate missing-sound suggestions.";
         });
       }
@@ -7166,11 +7171,14 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
           `Voice serialization: ${serializeVoices ? "on (a clip uses the connection default voice)" : "off (every clip carries an explicit voice)"}.`
         );
         const prepare = async (index) => {
+          const startedAt = Date.now();
+          let dispatchedAt = null;
           try {
             appendSpeakerDebugLog(
               `Synthesis request [${index + 1}] started with voice=${JSON.stringify(plan[index].voice || "<connection default>")}.`
             );
             const segment = await runSynthesisTask(() => {
+              dispatchedAt = Date.now();
               const text = plan[index].text;
               const voice = plan[index].voice;
               appendSpeakerDebugLog(
@@ -7203,6 +7211,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
             appendSpeakerDebugLog(
               `Synthesis request [${index + 1}] completed with voice=${JSON.stringify(plan[index].voice || "<connection default>")} (${segment.data.byteLength} bytes, ${segment.mime}, fingerprint=${segment.fingerprint ?? "<none>"}).`
             );
+            appendSpeakerDebugLog(`Synthesis timing [${index + 1}]: total=${Date.now() - startedAt}ms, queue=${dispatchedAt === null ? "not-dispatched" : `${dispatchedAt - startedAt}ms`}, after-dispatch=${dispatchedAt === null ? "unknown" : `${Date.now() - dispatchedAt}ms`} (includes pacing, network, provider and retries).`);
             return { ok: true, segment };
           } catch (error) {
             appendSpeakerDebugLog(
@@ -9385,6 +9394,10 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
     if (payload.type === "chat_voice_sound_library") {
       const pending = pendingSoundLibrary.get(payload.requestId);
       if (!pending) return;
+      if (payload.plannerProgress) {
+        pending.onProgress?.(payload.plannerProgress);
+        return;
+      }
       clearTimeout(pending.timer);
       pendingSoundLibrary.delete(payload.requestId);
       if (payload.error) pending.reject(new Error(payload.error));

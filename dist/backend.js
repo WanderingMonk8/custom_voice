@@ -397,6 +397,19 @@ function parseSoundScenePlan(raw, message, favorites) {
   return result.sort((a, b) => a.offset - b.offset);
 }
 
+// src/sound-plan-diagnostics.ts
+function soundPlanErrorCategory(error) {
+  if (!error || typeof error !== "object") return "unknown failure";
+  const item = error;
+  const status = typeof item.status === "number" ? item.status : item.statusCode;
+  if (status === 429) return "provider rate limit (429)";
+  if (status === 401 || status === 403) return `provider authentication/access (${status})`;
+  if (typeof status === "number" && status >= 500 && status < 600) return `provider/server error (${status})`;
+  if (item.name === "AbortError") return "aborted";
+  if (item.name === "TimeoutError" || item.code === "ETIMEDOUT") return "timeout";
+  return "unknown failure";
+}
+
 // src/core.ts
 var CONFIG_KEY = "chat_voice";
 var USER_SPEAKER_ID = "__chat_voice_user__";
@@ -8545,8 +8558,15 @@ spindle.onFrontendMessage(async (rawPayload, userId, frontendSessionId) => {
         sendFrontend({ type: "chat_voice_sound_library", requestId: payload.requestId, error: "Could not update Freesound key in secure storage." }, userId, frontendSessionId);
       }
     } else if (payload?.type === "chat_voice_sound_scene_plan") {
+      const startedAt = Date.now();
+      let stage = "library";
+      const progress = (next) => {
+        stage = next;
+        sendFrontend({ type: "chat_voice_sound_library", requestId: payload.requestId, plannerProgress: { stage, elapsedMs: Date.now() - startedAt } }, userId, frontendSessionId);
+      };
       try {
         if (typeof payload.message !== "string" || payload.message.length > 3e4) throw new Error("Invalid or oversized scene.");
+        progress("library");
         const libraryStarted = Date.now();
         const favorites = await new SoundLibrary(spindle.userStorage).list(userId);
         const libraryMs = Date.now() - libraryStarted;
@@ -8554,7 +8574,9 @@ spindle.onFrontendMessage(async (rawPayload, userId, frontendSessionId) => {
           sendFrontend({ type: "chat_voice_sound_library", requestId: payload.requestId, cues: [] }, userId, frontendSessionId);
           return;
         }
+        progress("connection");
         const connectionId = await resolveGenerationConnection(userId, payload.connectionId);
+        progress("generation");
         const generationStarted = Date.now();
         const response = await spindle.generate.quiet({
           type: "quiet",
@@ -8568,12 +8590,14 @@ spindle.onFrontendMessage(async (rawPayload, userId, frontendSessionId) => {
           reasoning: { source: "off" }
         });
         const generationMs = Date.now() - generationStarted;
+        progress("parsing");
         const planText = extractGenerationText(response);
         let cues = parseSoundScenePlan(planText, payload.message, favorites);
         const missing = payload.suggestMissing === true ? parseMissingSoundSuggestions(planText, payload.message) : [];
         const competing = competingSoundCueIndexes(cues);
         let decisionMs = 0;
         if (competing.length) {
+          progress("decision");
           const questions = {};
           for (const index of competing) questions[`cue_${index}`] = {
             type: "choice",
@@ -8602,7 +8626,7 @@ spindle.onFrontendMessage(async (rawPayload, userId, frontendSessionId) => {
         }
         sendFrontend({ type: "chat_voice_sound_library", requestId: payload.requestId, cues, missing, soundTimings: { libraryMs, generationMs, decisionMs } }, userId, frontendSessionId);
       } catch (error) {
-        sendFrontend({ type: "chat_voice_sound_library", requestId: payload.requestId, error: "Could not plan sound effects." }, userId, frontendSessionId);
+        sendFrontend({ type: "chat_voice_sound_library", requestId: payload.requestId, error: `Sound planning failed during ${stage} after ${Date.now() - startedAt}ms: ${soundPlanErrorCategory(error)}.` }, userId, frontendSessionId);
       }
     } else if (payload?.type === "chat_voice_sound_library_list" || payload?.type === "chat_voice_sound_library_add" || payload?.type === "chat_voice_sound_library_read" || payload?.type === "chat_voice_sound_library_remove" || payload?.type === "chat_voice_sound_library_edit") {
       try {

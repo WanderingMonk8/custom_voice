@@ -352,6 +352,7 @@ interface SoundLibraryPayload {
   missing?: MissingSoundSuggestion[]
   results?: FreesoundSearchResult[]
   soundTimings?: { libraryMs: number; generationMs: number; decisionMs: number }
+  plannerProgress?: { stage: string; elapsedMs: number }
   hasMore?: boolean
   chunked?: boolean
   uploadId?: string
@@ -2369,7 +2370,7 @@ export function setup(ctx: SpindleFrontendContext) {
     reject: (error: Error) => void
     timer: ReturnType<typeof setTimeout>
   }>()
-  const pendingSoundLibrary = new Map<string, { resolve: (value: SoundLibraryPayload) => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout> }>()
+  const pendingSoundLibrary = new Map<string, { resolve: (value: SoundLibraryPayload) => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout>; onProgress?: (progress: NonNullable<SoundLibraryPayload['plannerProgress']>) => void }>()
   let soundLibrarySequence = 0
   let soundPreviewContext: AudioContext | null = null
   let soundPreviewSource: AudioBufferSourceNode | null = null
@@ -2484,11 +2485,11 @@ export function setup(ctx: SpindleFrontendContext) {
       .finally(() => { savingMissingSounds = false; missingSoundsToggle.disabled = false })
   })
 
-  function soundLibraryRequest(type: string, fields: Record<string, unknown> = {}): Promise<SoundLibraryPayload> {
+  function soundLibraryRequest(type: string, fields: Record<string, unknown> = {}, onProgress?: (progress: NonNullable<SoundLibraryPayload['plannerProgress']>) => void): Promise<SoundLibraryPayload> {
     const requestId = `sound-${Date.now().toString(36)}-${++soundLibrarySequence}`
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => { pendingSoundLibrary.delete(requestId); reject(new Error('Sound library request timed out.')) }, 30_000)
-      pendingSoundLibrary.set(requestId, { resolve, reject, timer })
+      const timer = setTimeout(() => { pendingSoundLibrary.delete(requestId); reject(new Error(type === 'chat_voice_sound_scene_plan' ? 'Sound planner frontend request timed out after 30000ms.' : 'Sound library request timed out after 30000ms.')) }, 30_000)
+      pendingSoundLibrary.set(requestId, { resolve, reject, timer, onProgress })
       ctx.sendToBackend({ type, requestId, ...fields })
     })
   }
@@ -4154,8 +4155,9 @@ export function setup(ctx: SpindleFrontendContext) {
     // Resolve failures into a value so an abandoned startup never leaks a rejection.
     const eventSourceText = preparePlaybackContent(message.content, preferences.skippedTrackerTags)
     const soundPlanStarted = Date.now()
+    const soundPlanProgress: Array<{ stage: string; elapsedMs: number }> = []
     const earlySoundPlan = (preferences.eventSounds || preferences.ambienceSounds) && eventSourceText.length <= 30000 && eventSourceText.trim()
-      ? soundLibraryRequest('chat_voice_sound_scene_plan', { message: eventSourceText, connectionId: preferences.tagLlmConnectionId, model: preferences.tagLlmModel, suggestMissing: preferences.suggestMissingSounds })
+      ? soundLibraryRequest('chat_voice_sound_scene_plan', { message: eventSourceText, connectionId: preferences.tagLlmConnectionId, model: preferences.tagLlmModel, suggestMissing: preferences.suggestMissingSounds }, progress => { soundPlanProgress.push(progress) })
         .then(result => ({ result, error: null, completedAt: Date.now() }), error => ({ result: null, error, completedAt: Date.now() }))
       : null
     // Fall back explicitly to the connection profile's voice instead of
@@ -4331,7 +4333,12 @@ export function setup(ctx: SpindleFrontendContext) {
           planReceivedAfterBoundary = lastReachedSoundBoundary
           eventPlanState = 'completed'
           await Promise.all([...new Set(eventCues.flatMap(cue => cue.action === 'play' && cue.assetId ? [cue.assetId] : []))].map(id => prepareEventAsset(id, true)))
-        }).catch(() => { eventPlanState = 'failed'; if (suggestionPlayback === playback && preferences.suggestMissingSounds) missingSoundSuggestions.textContent = 'Could not generate missing-sound suggestions.' })
+        }).catch(error => {
+          eventPlanState = 'failed'
+          const details = error instanceof Error ? error.message : 'Unknown sound planner failure.'
+          appendSpeakerDebugLog(`Sound planner failed: ${details} elapsed=${Date.now() - soundPlanStarted}ms; stages=${JSON.stringify(soundPlanProgress)}.`)
+          if (suggestionPlayback === playback && preferences.suggestMissingSounds) missingSoundSuggestions.textContent = 'Could not generate missing-sound suggestions.'
+        })
     }
 
     try {
@@ -4821,11 +4828,14 @@ export function setup(ctx: SpindleFrontendContext) {
           : 'off (every clip carries an explicit voice)'}.`,
       )
       const prepare = async (index: number): Promise<PreparedSegment> => {
+        const startedAt = Date.now()
+        let dispatchedAt: number | null = null
         try {
           appendSpeakerDebugLog(
             `Synthesis request [${index + 1}] started with voice=${JSON.stringify(plan[index].voice || '<connection default>')}.`,
           )
           const segment = await runSynthesisTask(() => {
+            dispatchedAt = Date.now()
             const text = plan[index].text
             const voice = plan[index].voice
             appendSpeakerDebugLog(
@@ -4861,6 +4871,7 @@ export function setup(ctx: SpindleFrontendContext) {
             `Synthesis request [${index + 1}] completed with voice=${JSON.stringify(plan[index].voice || '<connection default>')} `
               + `(${segment.data.byteLength} bytes, ${segment.mime}, fingerprint=${segment.fingerprint ?? '<none>'}).`,
           )
+          appendSpeakerDebugLog(`Synthesis timing [${index + 1}]: total=${Date.now() - startedAt}ms, queue=${dispatchedAt === null ? 'not-dispatched' : `${dispatchedAt - startedAt}ms`}, after-dispatch=${dispatchedAt === null ? 'unknown' : `${Date.now() - dispatchedAt}ms`} (includes pacing, network, provider and retries).`)
           return { ok: true, segment }
         } catch (error) {
           appendSpeakerDebugLog(
@@ -7126,6 +7137,7 @@ export function setup(ctx: SpindleFrontendContext) {
     if (payload.type === 'chat_voice_sound_library') {
       const pending = pendingSoundLibrary.get(payload.requestId)
       if (!pending) return
+      if (payload.plannerProgress) { pending.onProgress?.(payload.plannerProgress); return }
       clearTimeout(pending.timer)
       pendingSoundLibrary.delete(payload.requestId)
       if (payload.error) pending.reject(new Error(payload.error))

@@ -4,6 +4,7 @@ import { MAX_FAVORITE_SOUND_BYTES, MAX_FAVORITE_SOUND_SECONDS, SoundLibrary, isS
 import { SoundDownloadTransfers, SoundUploadTransfers } from './sound-transfer'
 import { SoundPreviewCache } from './sound-preview-cache'
 import { SoundLoadQueue } from './sound-load-queue'
+import { soundPlanErrorCategory } from './sound-plan-diagnostics'
 import { isFreesoundCc0, parseFreesoundSearch, safeFreesoundPreviewUrl } from './freesound'
 import { alignSoundSourceSegments, ambienceInstructionAtBoundary, competingSoundCueIndexes, interleaveSoundEvents, mapSoundCueBoundaries, parseMissingSoundSuggestions, parseSoundScenePlan, shortlistSoundAssets, splitNarrationForSoundEvents } from './sound-scene'
 import { DEFAULT_AMBIENCE_VOLUME, DEFAULT_EVENT_VOLUME, mixAmbienceClip, readSoundVolume, renderSoundMix, soundCategoryGain } from './sound-mix'
@@ -53,6 +54,14 @@ test('sound duration validation accepts up to three minutes', () => {
   assert.equal(isSupportedSoundDuration(0), false)
   assert.equal(isSupportedSoundDuration(Number.NaN), false)
   assert.equal(isSupportedSoundDuration(Infinity), false)
+})
+
+test('sound planner diagnostic categories never expose provider error text', () => {
+  assert.equal(soundPlanErrorCategory({ status: 429, message: 'private scene text' }), 'provider rate limit (429)')
+  assert.equal(soundPlanErrorCategory({ statusCode: 503, message: 'secret' }), 'provider/server error (503)')
+  assert.equal(soundPlanErrorCategory({ name: 'AbortError' }), 'aborted')
+  assert.equal(soundPlanErrorCategory({ code: 'ETIMEDOUT' }), 'timeout')
+  assert.equal(soundPlanErrorCategory(new Error('private scene text')), 'unknown failure')
 })
 
 test('sound preview cache is bounded, expiring and least-recently-used', () => {

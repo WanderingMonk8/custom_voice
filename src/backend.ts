@@ -2,6 +2,7 @@ import { SOUND_TRANSFER_CHUNK_BYTES, SoundLibrary, type NewFavoriteSound } from 
 import { SoundDownloadTransfers, SoundUploadTransfers } from './sound-transfer'
 import { parseFreesoundSearch } from './freesound'
 import { competingSoundCueIndexes, parseMissingSoundSuggestions, parseSoundScenePlan } from './sound-scene'
+import { soundPlanErrorCategory, type SoundPlanStage } from './sound-plan-diagnostics'
 import {
   addScannedFirstNameAliases,
   addUnconfiguredDialogueSpeakers,
@@ -2067,8 +2068,15 @@ spindle.onFrontendMessage(async (rawPayload: unknown, userId, frontendSessionId)
         sendFrontend({ type: 'chat_voice_sound_library', requestId: payload.requestId, error: 'Could not update Freesound key in secure storage.' }, userId, frontendSessionId)
       }
     } else if (payload?.type === 'chat_voice_sound_scene_plan') {
+      const startedAt = Date.now()
+      let stage: SoundPlanStage = 'library'
+      const progress = (next: SoundPlanStage) => {
+        stage = next
+        sendFrontend({ type: 'chat_voice_sound_library', requestId: payload.requestId, plannerProgress: { stage, elapsedMs: Date.now() - startedAt } }, userId, frontendSessionId)
+      }
       try {
         if (typeof payload.message !== 'string' || payload.message.length > 30000) throw new Error('Invalid or oversized scene.')
+        progress('library')
         const libraryStarted = Date.now()
         const favorites = await new SoundLibrary(spindle.userStorage).list(userId)
         const libraryMs = Date.now() - libraryStarted
@@ -2076,7 +2084,9 @@ spindle.onFrontendMessage(async (rawPayload: unknown, userId, frontendSessionId)
           sendFrontend({ type: 'chat_voice_sound_library', requestId: payload.requestId, cues: [] }, userId, frontendSessionId)
           return
         }
+        progress('connection')
         const connectionId = await resolveGenerationConnection(userId, payload.connectionId)
+        progress('generation')
         const generationStarted = Date.now()
         const response = await spindle.generate.quiet({
           type: 'quiet', userId,
@@ -2088,12 +2098,14 @@ spindle.onFrontendMessage(async (rawPayload: unknown, userId, frontendSessionId)
           parameters: { temperature: 0, ...(typeof payload.model === 'string' && payload.model.trim() ? { model: payload.model.trim().slice(0, 256) } : {}) }, reasoning: { source: 'off' },
         })
         const generationMs = Date.now() - generationStarted
+        progress('parsing')
         const planText = extractGenerationText(response)
         let cues = parseSoundScenePlan(planText, payload.message, favorites)
         const missing = payload.suggestMissing === true ? parseMissingSoundSuggestions(planText, payload.message) : []
         const competing = competingSoundCueIndexes(cues)
         let decisionMs = 0
         if (competing.length) {
+          progress('decision')
           const questions: Record<string, { type: 'choice'; instructions: string; criteria: Record<string, string> }> = {}
           for (const index of competing) questions[`cue_${index}`] = {
             type: 'choice',
@@ -2119,7 +2131,7 @@ spindle.onFrontendMessage(async (rawPayload: unknown, userId, frontendSessionId)
         }
         sendFrontend({ type: 'chat_voice_sound_library', requestId: payload.requestId, cues, missing, soundTimings: { libraryMs, generationMs, decisionMs } }, userId, frontendSessionId)
       } catch (error) {
-        sendFrontend({ type: 'chat_voice_sound_library', requestId: payload.requestId, error: 'Could not plan sound effects.' }, userId, frontendSessionId)
+        sendFrontend({ type: 'chat_voice_sound_library', requestId: payload.requestId, error: `Sound planning failed during ${stage} after ${Date.now() - startedAt}ms: ${soundPlanErrorCategory(error)}.` }, userId, frontendSessionId)
       }
     } else if (payload?.type === 'chat_voice_sound_library_list' || payload?.type === 'chat_voice_sound_library_add' || payload?.type === 'chat_voice_sound_library_read' || payload?.type === 'chat_voice_sound_library_remove' || payload?.type === 'chat_voice_sound_library_edit') {
       try {
