@@ -3366,15 +3366,24 @@ async function acquireRateLimitRecoverySlot(budget, signal) {
     releaseSlot();
   };
 }
-async function synthesizeVoiceSegment(connectionId, text, voice, speed, signal, pacer, rateLimitBudget, voiceGate, onRateLimit) {
+async function synthesizeVoiceSegment(connectionId, text, voice, speed, signal, pacer, rateLimitBudget, voiceGate, onRateLimit, onAttemptTiming) {
+  let attempt = 0;
   while (true) {
+    attempt++;
+    const recoveryStarted = Date.now();
     const releaseRecovery = await acquireRateLimitRecoverySlot(rateLimitBudget, signal);
+    const recoveryMs = Date.now() - recoveryStarted;
     let releaseVoice = null;
     let response;
     let audioData = null;
     try {
+      const voiceGateStarted = Date.now();
       releaseVoice = voiceGate ? await voiceGate.acquire(voice, signal) : null;
+      const voiceGateMs = Date.now() - voiceGateStarted;
+      const pacingStarted = Date.now();
       await waitForSynthesisSlot(pacer, signal);
+      const pacingMs = Date.now() - pacingStarted;
+      const requestStarted = Date.now();
       response = await fetch("/api/v1/tts/synthesize", {
         method: "POST",
         credentials: "same-origin",
@@ -3387,7 +3396,10 @@ async function synthesizeVoiceSegment(connectionId, text, voice, speed, signal, 
           parameters: { speed }
         })
       });
+      const responseMs = Date.now() - requestStarted;
+      const bodyStarted = Date.now();
       if (response.ok) audioData = await response.arrayBuffer();
+      onAttemptTiming?.({ attempt, recoveryMs, voiceGateMs, pacingMs, responseMs, bodyMs: Date.now() - bodyStarted, status: response.status });
     } finally {
       releaseVoice?.();
       releaseRecovery();
@@ -6785,7 +6797,7 @@ function setup(ctx) {
           if (response.error || !response.result) throw response.error ?? new Error("Sound planning failed.");
           const result = response.result;
           if (soundWorkClosed || playback.controller.signal.aborted) return;
-          appendSpeakerDebugLog(`Sound timing: planner round-trip=${response.completedAt - soundPlanStarted}ms${result.soundTimings ? `, library=${result.soundTimings.libraryMs}ms, generation=${result.soundTimings.generationMs}ms, decision=${result.soundTimings.decisionMs}ms` : ""}.`);
+          appendSpeakerDebugLog(`Sound timing: planner round-trip=${response.completedAt - soundPlanStarted}ms${result.soundTimings ? `, library=${result.soundTimings.libraryMs}ms, generation=${result.soundTimings.generationMs}ms, decision=${result.soundTimings.decisionMs}ms, candidates=${result.soundTimings.candidateCount ?? "?"} of ${result.soundTimings.libraryCount ?? "?"}` : ""}.`);
           if (preferences.suggestMissingSounds && suggestionPlayback === playback && ctx.getActiveChat().chatId === playbackChat.id) {
             const suggestions = (result.missing ?? []).filter((item) => item.kind === "event" ? preferences.eventSounds : preferences.ambienceSounds);
             missingSoundSuggestions.replaceChildren();
@@ -7205,7 +7217,8 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
                       `Rate limited; resuming in ${Math.max(1, Math.ceil(delayMs / 1e3))}s\u2026 (${Math.ceil(cumulativeWaitMs / 1e3)}s of ${preferences.rateLimitWaitSeconds}s wait budget)`
                     );
                   }
-                }
+                },
+                (timing) => appendSpeakerDebugLog(`Synthesis attempt [${index + 1}.${timing.attempt}]: recovery=${timing.recoveryMs}ms, voice-gate=${timing.voiceGateMs}ms, pacing=${timing.pacingMs}ms, response=${timing.responseMs}ms, body=${timing.bodyMs}ms, status=${timing.status}.`)
               );
             }, activePlayback === playback && !playback.playbackStopped);
             appendSpeakerDebugLog(

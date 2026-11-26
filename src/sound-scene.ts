@@ -86,6 +86,31 @@ export function shortlistSoundAssets(message: string, favorites: readonly Favori
     .slice(0, Math.max(0, Math.min(8, Math.floor(limit)))).map(item => item.sound)
 }
 
+/** Limit large model prompts while retaining unmatched examples from each category. */
+export function shortlistSoundPlannerAssets(message: string, favorites: readonly FavoriteSound[], limit = 32): FavoriteSound[] {
+  const cap = Math.max(1, Math.min(32, Math.floor(limit)))
+  if (favorites.length <= cap) return [...favorites]
+  const words = new Set((message.toLocaleLowerCase().match(/[\p{L}\p{N}]{3,}/gu) ?? []))
+  const ranked = favorites.map((sound, order) => {
+    const terms = new Set(([sound.name, sound.description, ...sound.tags].join(' ').toLocaleLowerCase().match(/[\p{L}\p{N}]{3,}/gu) ?? []))
+    let score = 0
+    for (const term of terms) if (words.has(term)) score++
+    return { sound, order, score }
+  }).sort((a, b) => b.score - a.score || a.order - b.order)
+  const result = ranked.filter(item => item.score > 0).slice(0, Math.max(0, cap - 8)).map(item => item.sound)
+  const selected = new Set(result.map(sound => sound.id))
+  const remaining = ranked.filter(item => !selected.has(item.sound.id))
+  for (const kind of ['event', 'ambience'] as const) {
+    const candidate = remaining.find(item => item.sound.kind === kind && !selected.has(item.sound.id))
+    if (candidate && result.length < cap) { result.push(candidate.sound); selected.add(candidate.sound.id) }
+  }
+  for (const item of remaining) {
+    if (result.length >= cap) break
+    if (!selected.has(item.sound.id)) { result.push(item.sound); selected.add(item.sound.id) }
+  }
+  return result
+}
+
 /** Find the latest ambience instruction already reached, even if its asset was late. */
 export function ambienceInstructionAtBoundary(
   mapped: readonly { cue: SoundSceneCue; boundary: number }[], boundary: number,
@@ -190,7 +215,7 @@ export function parseSoundScenePlan(raw: string, message: string, favorites: rea
   const available = new Map(favorites.map(item => [item.id, item]))
   const result: SoundSceneCue[] = []
   const seen = new Set<string>()
-  for (const value of (parsed as { cues: unknown[] }).cues.slice(0, 32)) {
+  for (const value of (parsed as { cues: unknown[] }).cues.slice(0, 48)) {
     if (!value || typeof value !== 'object' || Array.isArray(value)) continue
     const item = value as Record<string, unknown>
     if ((item.kind !== 'event' && item.kind !== 'ambience') || (item.action !== 'play' && item.action !== 'stop')
@@ -205,7 +230,7 @@ export function parseSoundScenePlan(raw: string, message: string, favorites: rea
     if (seen.has(key)) continue
     seen.add(key)
     result.push({ kind: item.kind, action: item.action, ...(item.action === 'play' ? { assetId } : {}), anchor: item.anchor, position: item.position, offset })
-    if (result.length >= 8) break
+    if (result.length >= 16) break
   }
   return result.sort((a, b) => a.offset - b.offset)
 }

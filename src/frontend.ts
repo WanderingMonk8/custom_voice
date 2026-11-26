@@ -351,7 +351,7 @@ interface SoundLibraryPayload {
   cues?: SoundSceneCue[]
   missing?: MissingSoundSuggestion[]
   results?: FreesoundSearchResult[]
-  soundTimings?: { libraryMs: number; generationMs: number; decisionMs: number }
+  soundTimings?: { libraryMs: number; generationMs: number; decisionMs: number; libraryCount?: number; candidateCount?: number }
   plannerProgress?: { stage: string; elapsedMs: number }
   hasMore?: boolean
   chunked?: boolean
@@ -935,15 +935,25 @@ async function synthesizeVoiceSegment(
   rateLimitBudget: RateLimitBudget,
   voiceGate: ConnectionVoiceGate | null,
   onRateLimit: (delayMs: number, cumulativeWaitMs: number) => void,
+  onAttemptTiming?: (timing: { attempt: number; recoveryMs: number; voiceGateMs: number; pacingMs: number; responseMs: number; bodyMs: number; status: number }) => void,
 ): Promise<SynthesizedVoiceSegment> {
+  let attempt = 0
   while (true) {
+    attempt++
+    const recoveryStarted = Date.now()
     const releaseRecovery = await acquireRateLimitRecoverySlot(rateLimitBudget, signal)
+    const recoveryMs = Date.now() - recoveryStarted
     let releaseVoice: (() => void) | null = null
     let response: Response
     let audioData: ArrayBuffer | null = null
     try {
+      const voiceGateStarted = Date.now()
       releaseVoice = voiceGate ? await voiceGate.acquire(voice, signal) : null
+      const voiceGateMs = Date.now() - voiceGateStarted
+      const pacingStarted = Date.now()
       await waitForSynthesisSlot(pacer, signal)
+      const pacingMs = Date.now() - pacingStarted
+      const requestStarted = Date.now()
       response = await fetch('/api/v1/tts/synthesize', {
         method: 'POST',
         credentials: 'same-origin',
@@ -956,7 +966,10 @@ async function synthesizeVoiceSegment(
           parameters: { speed },
         }),
       })
+      const responseMs = Date.now() - requestStarted
+      const bodyStarted = Date.now()
       if (response.ok) audioData = await response.arrayBuffer()
+      onAttemptTiming?.({ attempt, recoveryMs, voiceGateMs, pacingMs, responseMs, bodyMs: Date.now() - bodyStarted, status: response.status })
     } finally {
       releaseVoice?.()
       releaseRecovery()
@@ -4317,7 +4330,7 @@ export function setup(ctx: SpindleFrontendContext) {
           if (response.error || !response.result) throw response.error ?? new Error('Sound planning failed.')
           const result = response.result
           if (soundWorkClosed || playback.controller.signal.aborted) return
-          appendSpeakerDebugLog(`Sound timing: planner round-trip=${response.completedAt - soundPlanStarted}ms${result.soundTimings ? `, library=${result.soundTimings.libraryMs}ms, generation=${result.soundTimings.generationMs}ms, decision=${result.soundTimings.decisionMs}ms` : ''}.`)
+          appendSpeakerDebugLog(`Sound timing: planner round-trip=${response.completedAt - soundPlanStarted}ms${result.soundTimings ? `, library=${result.soundTimings.libraryMs}ms, generation=${result.soundTimings.generationMs}ms, decision=${result.soundTimings.decisionMs}ms, candidates=${result.soundTimings.candidateCount ?? '?'} of ${result.soundTimings.libraryCount ?? '?'}` : ''}.`)
           if (preferences.suggestMissingSounds && suggestionPlayback === playback && ctx.getActiveChat().chatId === playbackChat.id) {
             const suggestions = (result.missing ?? []).filter(item => item.kind === 'event' ? preferences.eventSounds : preferences.ambienceSounds)
             missingSoundSuggestions.replaceChildren()
@@ -4865,6 +4878,7 @@ export function setup(ctx: SpindleFrontendContext) {
                 )
               }
             },
+              timing => appendSpeakerDebugLog(`Synthesis attempt [${index + 1}.${timing.attempt}]: recovery=${timing.recoveryMs}ms, voice-gate=${timing.voiceGateMs}ms, pacing=${timing.pacingMs}ms, response=${timing.responseMs}ms, body=${timing.bodyMs}ms, status=${timing.status}.`),
           )
         }, activePlayback === playback && !playback.playbackStopped)
           appendSpeakerDebugLog(

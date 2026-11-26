@@ -6,7 +6,7 @@ import { SoundPreviewCache } from './sound-preview-cache'
 import { SoundLoadQueue } from './sound-load-queue'
 import { soundPlanErrorCategory } from './sound-plan-diagnostics'
 import { isFreesoundCc0, parseFreesoundSearch, safeFreesoundPreviewUrl } from './freesound'
-import { alignSoundSourceSegments, ambienceInstructionAtBoundary, competingSoundCueIndexes, interleaveSoundEvents, mapSoundCueBoundaries, parseMissingSoundSuggestions, parseSoundScenePlan, shortlistSoundAssets, splitNarrationForSoundEvents } from './sound-scene'
+import { alignSoundSourceSegments, ambienceInstructionAtBoundary, competingSoundCueIndexes, interleaveSoundEvents, mapSoundCueBoundaries, parseMissingSoundSuggestions, parseSoundScenePlan, shortlistSoundAssets, shortlistSoundPlannerAssets, splitNarrationForSoundEvents } from './sound-scene'
 import { DEFAULT_AMBIENCE_VOLUME, DEFAULT_EVENT_VOLUME, mixAmbienceClip, readSoundVolume, renderSoundMix, soundCategoryGain } from './sound-mix'
 import { buildSoundTimeline, encodeSoundTimelineWav, resampleSoundClip } from './sound-timeline'
 import { SoundCuePreparation } from './sound-preparation'
@@ -360,6 +360,25 @@ test('sound prefetch shortlist matches metadata without selecting the cue', () =
   const creek = { ...sound, id: 'creek', name: 'creek water', tags: ['stream'], kind: 'ambience' as const }
   assert.deepEqual(shortlistSoundAssets('A creek flows.', [sound, creek]).map(item => item.id), ['creek'])
   assert.deepEqual(shortlistSoundAssets('A creek flows.', [creek], 8, ['event']), [])
+})
+
+test('planner keeps small libraries intact and bounds large libraries with category exploration', () => {
+  const sounds = Array.from({ length: 50 }, (_, index) => ({ version: 1 as const, id: String(index), name: index === 45 ? 'creek stream' : `sound ${index}`, description: '', tags: [], kind: (index % 2 ? 'event' : 'ambience') as 'event' | 'ambience', mime: 'audio/wav', bytes: 1, createdAt: new Date().toISOString() }))
+  assert.deepEqual(shortlistSoundPlannerAssets('nothing', sounds.slice(0, 10)), sounds.slice(0, 10))
+  const result = shortlistSoundPlannerAssets('The creek flows.', sounds)
+  assert.equal(result.length, 32)
+  assert.equal(result[0].id, '45')
+  assert.ok(result.some(sound => sound.kind === 'event'))
+  assert.ok(result.some(sound => sound.kind === 'ambience'))
+  assert.equal(new Set(result.map(sound => sound.id)).size, result.length)
+})
+
+test('sound scene parser accepts up to sixteen distinct cues', () => {
+  const sound = { version: 1 as const, id: 'door', name: 'door', description: '', tags: [], kind: 'event' as const, mime: 'audio/wav', bytes: 1, createdAt: new Date().toISOString() }
+  const phrases = Array.from({ length: 20 }, (_, index) => `Door number ${index} opened.`)
+  const message = phrases.join(' ')
+  const cues = phrases.map(anchor => ({ kind: 'event', action: 'play', assetId: 'door', anchor, position: 'after' }))
+  assert.equal(parseSoundScenePlan(JSON.stringify({ cues }), message, [sound]).length, 16)
 })
 
 test('late ambience starts at a later boundary but not after its stop', () => {
