@@ -3,7 +3,7 @@ import test from 'node:test'
 import { SoundLibrary, type SoundUserStorage } from './sound-library'
 import { SoundDownloadTransfers, SoundUploadTransfers } from './sound-transfer'
 import { alignSoundSourceSegments, ambienceInstructionAtBoundary, competingSoundCueIndexes, interleaveSoundEvents, mapSoundCueBoundaries, parseSoundScenePlan, shortlistSoundAssets, splitNarrationForSoundEvents } from './sound-scene'
-import { mixAmbienceClip, renderSoundMix, soundCategoryGain } from './sound-mix'
+import { DEFAULT_AMBIENCE_VOLUME, DEFAULT_EVENT_VOLUME, mixAmbienceClip, readSoundVolume, renderSoundMix, soundCategoryGain } from './sound-mix'
 import { buildSoundTimeline, encodeSoundTimelineWav, resampleSoundClip } from './sound-timeline'
 import { SoundCuePreparation } from './sound-preparation'
 import { AutoplayRequestRegistry, PlaybackLongPress, PlaybackStartupGuard, syncAutoplayIndicators, syncPlaybackButtons, waitForAutoplayDeadline, waitForAutoplayWork, type PlaybackButtonState } from './playback-ui'
@@ -257,8 +257,17 @@ test('sound normalization uses category targets and limits boost and peaks', () 
   assert.ok(Math.abs(soundCategoryGain(audio, 'event') - 1.25) < 0.00001)
   assert.equal(soundCategoryGain([new Float32Array([0, 0])], 'event'), 1)
   assert.equal(soundCategoryGain([new Float32Array([0.001, -0.001])], 'event'), 4)
+  assert.equal(soundCategoryGain([new Float32Array([0.001, -0.001])], 'ambience'), 1)
   assert.ok(soundCategoryGain([new Float32Array([1, 0, 0, 0])], 'event') <= 0.98)
   assert.throws(() => soundCategoryGain([new Float32Array([NaN])], 'event'), /Invalid audio sample/)
+})
+
+test('sound volume settings default safely and clamp to the valid range', () => {
+  assert.equal(readSoundVolume(undefined, DEFAULT_AMBIENCE_VOLUME), 0.25)
+  assert.equal(readSoundVolume(null, DEFAULT_EVENT_VOLUME), 0.8)
+  assert.equal(readSoundVolume(2, DEFAULT_EVENT_VOLUME), 1)
+  assert.equal(readSoundVolume(-1, DEFAULT_AMBIENCE_VOLUME), 0)
+  assert.equal(readSoundVolume(NaN, DEFAULT_AMBIENCE_VOLUME), 0.25)
 })
 
 test('ambience mixes under consecutive clips with a continuous loop and fade', () => {

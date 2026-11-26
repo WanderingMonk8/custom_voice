@@ -4,7 +4,7 @@ import type {
 } from 'lumiverse-spindle-types'
 import { MAX_FAVORITE_SOUND_BYTES, SOUND_TRANSFER_CHUNK_BYTES, type FavoriteSound } from './sound-library'
 import { alignSoundSourceSegments, ambienceInstructionAtBoundary, interleaveSoundEvents, mapSoundCueBoundaries, shortlistSoundAssets, splitNarrationForSoundEvents, type SoundSceneCue } from './sound-scene'
-import { mixAmbienceClip, soundCategoryGain } from './sound-mix'
+import { DEFAULT_AMBIENCE_VOLUME, DEFAULT_EVENT_VOLUME, mixAmbienceClip, readSoundVolume, soundCategoryGain } from './sound-mix'
 import { AutoplayRequestRegistry, PlaybackLongPress, PlaybackStartupGuard, syncAutoplayIndicators, syncPlaybackButtons, waitForAutoplayDeadline, waitForAutoplayWork, type PlaybackButtonState } from './playback-ui'
 import {
   activeGhostVoices,
@@ -413,6 +413,8 @@ interface SavedMessageAudioResult {
 interface PlaybackPreferences {
   eventSounds: boolean
   ambienceSounds: boolean
+  eventSoundVolume: number
+  ambienceSoundVolume: number
   speed: number
   volume: number
   connectionId: string
@@ -496,6 +498,8 @@ async function loadPlaybackPreferences(): Promise<PlaybackPreferences> {
   if (!response.ok) return {
     eventSounds: false,
     ambienceSounds: false,
+    eventSoundVolume: DEFAULT_EVENT_VOLUME,
+    ambienceSoundVolume: DEFAULT_AMBIENCE_VOLUME,
     speed: 1,
     volume: 1,
     connectionId: '',
@@ -541,6 +545,8 @@ async function loadPlaybackPreferences(): Promise<PlaybackPreferences> {
   return {
     eventSounds: row.value?.chatVoiceEventSounds === true,
     ambienceSounds: row.value?.chatVoiceAmbienceSounds === true,
+    eventSoundVolume: readSoundVolume(row.value?.chatVoiceEventSoundVolume, DEFAULT_EVENT_VOLUME),
+    ambienceSoundVolume: readSoundVolume(row.value?.chatVoiceAmbienceSoundVolume, DEFAULT_AMBIENCE_VOLUME),
     speed: Math.min(4, Math.max(0.25, speed)),
     volume: Math.min(1, Math.max(0, volume)),
     connectionId: globalTtsConnectionPreference(row.value ?? {}),
@@ -1802,7 +1808,23 @@ export function setup(ctx: SpindleFrontendContext) {
   const ambienceSoundsText = document.createElement('span')
   ambienceSoundsText.textContent = 'Enable experimental ambience'
   ambienceSoundsLabel.append(ambienceSoundsToggle, ambienceSoundsText)
-  soundEffectsPanel.append(eventSoundsLabel, ambienceSoundsLabel, effectsNote)
+  function makeSoundVolume(label: string, initial: number): { container: HTMLElement; input: HTMLInputElement; value: HTMLElement } {
+    const container = document.createElement('label')
+    container.className = 'chat-voice-advanced'
+    const value = document.createElement('span')
+    value.textContent = `${label}: ${Math.round(initial * 100)}%`
+    const input = document.createElement('input')
+    input.type = 'range'; input.min = '0'; input.max = '100'; input.step = '1'; input.value = String(Math.round(initial * 100))
+    input.setAttribute('aria-label', label)
+    container.append(value, input)
+    return { container, input, value }
+  }
+  const eventSoundVolumeControl = makeSoundVolume('Event volume', DEFAULT_EVENT_VOLUME)
+  const ambienceSoundVolumeControl = makeSoundVolume('Ambience volume', DEFAULT_AMBIENCE_VOLUME)
+  const volumeHint = document.createElement('div')
+  volumeHint.className = 'chat-voice-hint'
+  volumeHint.textContent = 'Volume applies to previews and newly generated audio. Saved recordings are unchanged until regenerated.'
+  soundEffectsPanel.append(eventSoundsLabel, eventSoundVolumeControl.container, ambienceSoundsLabel, ambienceSoundVolumeControl.container, volumeHint, effectsNote)
   const soundTabButtons: HTMLButtonElement[] = []
   const soundPanels = [soundEffectsPanel, soundLibraryPanel, soundAdvancedPanel]
   for (const [index, label] of ['Effects', 'Library', 'Advanced'].entries()) {
@@ -2317,6 +2339,32 @@ export function setup(ctx: SpindleFrontendContext) {
 
   let savingEventSounds = false
   let savingAmbienceSounds = false
+  let savingSoundVolumes = 0
+  let eventSoundVolume = DEFAULT_EVENT_VOLUME
+  let ambienceSoundVolume = DEFAULT_AMBIENCE_VOLUME
+  function updateSoundVolumeControl(control: { input: HTMLInputElement; value: HTMLElement }, label: string, volume: number): void {
+    control.input.value = String(Math.round(volume * 100))
+    control.value.textContent = `${label}: ${Math.round(volume * 100)}%`
+  }
+  for (const [control, kind, label] of [
+    [eventSoundVolumeControl, 'event', 'Event volume'],
+    [ambienceSoundVolumeControl, 'ambience', 'Ambience volume'],
+  ] as const) {
+    control.input.addEventListener('input', () => {
+      const volume = readSoundVolume(control.input.valueAsNumber / 100, kind === 'event' ? DEFAULT_EVENT_VOLUME : DEFAULT_AMBIENCE_VOLUME)
+      if (kind === 'event') eventSoundVolume = volume
+      else ambienceSoundVolume = volume
+      updateSoundVolumeControl(control, label, volume)
+    })
+    control.input.addEventListener('change', () => {
+      const volume = kind === 'event' ? eventSoundVolume : ambienceSoundVolume
+      const key = kind === 'event' ? 'chatVoiceEventSoundVolume' : 'chatVoiceAmbienceSoundVolume'
+      savingSoundVolumes++
+      void updateVoiceSettings(current => ({ ...current, [key]: volume }))
+        .catch(error => { setStatus(error instanceof Error ? error.message : 'Could not save sound volume.', 'error') })
+        .finally(() => { savingSoundVolumes-- })
+    })
+  }
   eventSoundsToggle.addEventListener('change', () => {
     const enabled = eventSoundsToggle.checked
     savingEventSounds = true
@@ -2470,7 +2518,7 @@ export function setup(ctx: SpindleFrontendContext) {
           const channels = Array.from({ length: decoded.numberOfChannels }, (_, index) => decoded.getChannelData(index))
           const source = context.createBufferSource()
           const gain = context.createGain()
-          gain.gain.value = soundCategoryGain(channels, result.favorite.kind)
+          gain.gain.value = soundCategoryGain(channels, result.favorite.kind) * (result.favorite.kind === 'ambience' ? ambienceSoundVolume : eventSoundVolume)
           source.buffer = decoded; source.connect(gain); gain.connect(context.destination)
           soundPreviewSource = source
           source.onended = () => { if (generation === soundPreviewGeneration) stopSoundPreview() }
@@ -3817,6 +3865,10 @@ export function setup(ctx: SpindleFrontendContext) {
     const connectionVersionAtLoad = globalConnectionVersion
     const preferences = await loadPlaybackPreferences()
     if (!ownsStartup()) return
+    if (savingSoundVolumes) {
+      preferences.eventSoundVolume = eventSoundVolume
+      preferences.ambienceSoundVolume = ambienceSoundVolume
+    }
     if (llmSettingsSaveTimer || savingLlmSettings) {
       preferences.speakerParsingMode = speakerParsingMode
       preferences.ttsTagStyle = ttsTagStyle
@@ -3967,7 +4019,8 @@ export function setup(ctx: SpindleFrontendContext) {
           for (let channel = 0; channel < decoded.numberOfChannels; channel++) cropped.copyToChannel(decoded.getChannelData(channel).subarray(0, frames), channel)
           const channels = Array.from({ length: cropped.numberOfChannels }, (_, channel) => cropped.getChannelData(channel))
           soundAssetKinds.set(id, asset.favorite.kind)
-          eventAssets.set(id, { data: new ArrayBuffer(0), mime: 'audio/wav', decodedBuffer: cropped, normalizationGain: soundCategoryGain(channels, asset.favorite.kind) })
+          const categoryVolume = asset.favorite.kind === 'ambience' ? preferences.ambienceSoundVolume : preferences.eventSoundVolume
+          eventAssets.set(id, { data: new ArrayBuffer(0), mime: 'audio/wav', decodedBuffer: cropped, normalizationGain: soundCategoryGain(channels, asset.favorite.kind) * categoryVolume })
           soundLoadStatus.set(id, 'ready')
         } catch { if (!playback.controller.signal.aborted) { eventAssetFailures++; soundLoadStatus.set(id, 'failed') } }
       })()
@@ -6252,6 +6305,12 @@ export function setup(ctx: SpindleFrontendContext) {
       connections = loadedConnections
       if (!savingEventSounds) eventSoundsToggle.checked = preferences.eventSounds
       if (!savingAmbienceSounds) ambienceSoundsToggle.checked = preferences.ambienceSounds
+      if (!savingSoundVolumes) {
+        eventSoundVolume = preferences.eventSoundVolume
+        ambienceSoundVolume = preferences.ambienceSoundVolume
+        updateSoundVolumeControl(eventSoundVolumeControl, 'Event volume', eventSoundVolume)
+        updateSoundVolumeControl(ambienceSoundVolumeControl, 'Ambience volume', ambienceSoundVolume)
+      }
       llmConnections = loadedLlmConnections
       if (!favoritesSaving && !editingFavoriteVoiceId) {
         favoriteVoices = preferences.favoriteVoices

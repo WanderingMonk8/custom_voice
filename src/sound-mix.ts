@@ -61,6 +61,12 @@ export function mixAmbienceClip(
 }
 
 const MAX_MIX_BYTES = 128 * 1024 * 1024
+export const DEFAULT_EVENT_VOLUME = 0.8
+export const DEFAULT_AMBIENCE_VOLUME = 0.25
+
+export function readSoundVolume(value: unknown, fallback: number): number {
+  return typeof value === 'number' && Number.isFinite(value) ? Math.max(0, Math.min(1, value)) : fallback
+}
 
 /** Conservative RMS normalization targets per category; retain original PCM unchanged. */
 export function soundCategoryGain(channels: readonly Float32Array[], kind: 'event' | 'ambience'): number {
@@ -76,7 +82,7 @@ export function soundCategoryGain(channels: readonly Float32Array[], kind: 'even
   const rms = Math.sqrt(sum / (channels.length * channels[0].length))
   if (rms < 0.0001 || peak === 0) return 1
   const target = kind === 'ambience' ? 0.05 : 0.125
-  return Math.min(4, target / rms, 0.98 / peak)
+  return Math.min(kind === 'ambience' ? 1 : 4, target / rms, 0.98 / peak)
 }
 
 /** Render a bounded PCM timeline. All input tracks must share the target sample rate. */

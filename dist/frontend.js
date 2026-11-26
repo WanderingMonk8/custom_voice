@@ -136,6 +136,11 @@ function mixAmbienceClip(foreground, ambience, elapsedSeconds, fadeInSeconds = 0
   return { channels: output, peakGain, elapsedSeconds: elapsedSeconds + frames / foreground.sampleRate };
 }
 var MAX_MIX_BYTES = 128 * 1024 * 1024;
+var DEFAULT_EVENT_VOLUME = 0.8;
+var DEFAULT_AMBIENCE_VOLUME = 0.25;
+function readSoundVolume(value, fallback) {
+  return typeof value === "number" && Number.isFinite(value) ? Math.max(0, Math.min(1, value)) : fallback;
+}
 function soundCategoryGain(channels, kind) {
   if (!["event", "ambience"].includes(kind) || ![1, 2].includes(channels.length) || !channels[0]?.length || channels.some((channel) => !(channel instanceof Float32Array) || channel.length !== channels[0].length)) throw new Error("Invalid sound audio.");
   let sum = 0;
@@ -148,7 +153,7 @@ function soundCategoryGain(channels, kind) {
   const rms = Math.sqrt(sum / (channels.length * channels[0].length));
   if (rms < 1e-4 || peak === 0) return 1;
   const target = kind === "ambience" ? 0.05 : 0.125;
-  return Math.min(4, target / rms, 0.98 / peak);
+  return Math.min(kind === "ambience" ? 1 : 4, target / rms, 0.98 / peak);
 }
 
 // src/playback-ui.ts
@@ -2877,6 +2882,8 @@ async function loadPlaybackPreferences() {
   if (!response.ok) return {
     eventSounds: false,
     ambienceSounds: false,
+    eventSoundVolume: DEFAULT_EVENT_VOLUME,
+    ambienceSoundVolume: DEFAULT_AMBIENCE_VOLUME,
     speed: 1,
     volume: 1,
     connectionId: "",
@@ -2916,6 +2923,8 @@ async function loadPlaybackPreferences() {
   return {
     eventSounds: row.value?.chatVoiceEventSounds === true,
     ambienceSounds: row.value?.chatVoiceAmbienceSounds === true,
+    eventSoundVolume: readSoundVolume(row.value?.chatVoiceEventSoundVolume, DEFAULT_EVENT_VOLUME),
+    ambienceSoundVolume: readSoundVolume(row.value?.chatVoiceAmbienceSoundVolume, DEFAULT_AMBIENCE_VOLUME),
     speed: Math.min(4, Math.max(0.25, speed)),
     volume: Math.min(1, Math.max(0, volume)),
     connectionId: globalTtsConnectionPreference(row.value ?? {}),
@@ -4114,7 +4123,27 @@ function setup(ctx) {
   const ambienceSoundsText = document.createElement("span");
   ambienceSoundsText.textContent = "Enable experimental ambience";
   ambienceSoundsLabel.append(ambienceSoundsToggle, ambienceSoundsText);
-  soundEffectsPanel.append(eventSoundsLabel, ambienceSoundsLabel, effectsNote);
+  function makeSoundVolume(label, initial) {
+    const container = document.createElement("label");
+    container.className = "chat-voice-advanced";
+    const value = document.createElement("span");
+    value.textContent = `${label}: ${Math.round(initial * 100)}%`;
+    const input = document.createElement("input");
+    input.type = "range";
+    input.min = "0";
+    input.max = "100";
+    input.step = "1";
+    input.value = String(Math.round(initial * 100));
+    input.setAttribute("aria-label", label);
+    container.append(value, input);
+    return { container, input, value };
+  }
+  const eventSoundVolumeControl = makeSoundVolume("Event volume", DEFAULT_EVENT_VOLUME);
+  const ambienceSoundVolumeControl = makeSoundVolume("Ambience volume", DEFAULT_AMBIENCE_VOLUME);
+  const volumeHint = document.createElement("div");
+  volumeHint.className = "chat-voice-hint";
+  volumeHint.textContent = "Volume applies to previews and newly generated audio. Saved recordings are unchanged until regenerated.";
+  soundEffectsPanel.append(eventSoundsLabel, eventSoundVolumeControl.container, ambienceSoundsLabel, ambienceSoundVolumeControl.container, volumeHint, effectsNote);
   const soundTabButtons = [];
   const soundPanels = [soundEffectsPanel, soundLibraryPanel, soundAdvancedPanel];
   for (const [index, label] of ["Effects", "Library", "Advanced"].entries()) {
@@ -4599,6 +4628,34 @@ function setup(ctx) {
   };
   let savingEventSounds = false;
   let savingAmbienceSounds = false;
+  let savingSoundVolumes = 0;
+  let eventSoundVolume = DEFAULT_EVENT_VOLUME;
+  let ambienceSoundVolume = DEFAULT_AMBIENCE_VOLUME;
+  function updateSoundVolumeControl(control, label, volume) {
+    control.input.value = String(Math.round(volume * 100));
+    control.value.textContent = `${label}: ${Math.round(volume * 100)}%`;
+  }
+  for (const [control, kind, label] of [
+    [eventSoundVolumeControl, "event", "Event volume"],
+    [ambienceSoundVolumeControl, "ambience", "Ambience volume"]
+  ]) {
+    control.input.addEventListener("input", () => {
+      const volume = readSoundVolume(control.input.valueAsNumber / 100, kind === "event" ? DEFAULT_EVENT_VOLUME : DEFAULT_AMBIENCE_VOLUME);
+      if (kind === "event") eventSoundVolume = volume;
+      else ambienceSoundVolume = volume;
+      updateSoundVolumeControl(control, label, volume);
+    });
+    control.input.addEventListener("change", () => {
+      const volume = kind === "event" ? eventSoundVolume : ambienceSoundVolume;
+      const key = kind === "event" ? "chatVoiceEventSoundVolume" : "chatVoiceAmbienceSoundVolume";
+      savingSoundVolumes++;
+      void updateVoiceSettings((current) => ({ ...current, [key]: volume })).catch((error) => {
+        setStatus(error instanceof Error ? error.message : "Could not save sound volume.", "error");
+      }).finally(() => {
+        savingSoundVolumes--;
+      });
+    });
+  }
   eventSoundsToggle.addEventListener("change", () => {
     const enabled = eventSoundsToggle.checked;
     savingEventSounds = true;
@@ -4789,7 +4846,7 @@ function setup(ctx) {
             const channels = Array.from({ length: decoded.numberOfChannels }, (_, index) => decoded.getChannelData(index));
             const source = context2.createBufferSource();
             const gain = context2.createGain();
-            gain.gain.value = soundCategoryGain(channels, result.favorite.kind);
+            gain.gain.value = soundCategoryGain(channels, result.favorite.kind) * (result.favorite.kind === "ambience" ? ambienceSoundVolume : eventSoundVolume);
             source.buffer = decoded;
             source.connect(gain);
             gain.connect(context2.destination);
@@ -5998,6 +6055,10 @@ function setup(ctx) {
       const connectionVersionAtLoad = globalConnectionVersion;
       const preferences = await loadPlaybackPreferences();
       if (!ownsStartup()) return;
+      if (savingSoundVolumes) {
+        preferences.eventSoundVolume = eventSoundVolume;
+        preferences.ambienceSoundVolume = ambienceSoundVolume;
+      }
       if (llmSettingsSaveTimer || savingLlmSettings) {
         preferences.speakerParsingMode = speakerParsingMode;
         preferences.ttsTagStyle = ttsTagStyle;
@@ -6146,7 +6207,8 @@ function setup(ctx) {
             for (let channel = 0; channel < decoded.numberOfChannels; channel++) cropped.copyToChannel(decoded.getChannelData(channel).subarray(0, frames), channel);
             const channels = Array.from({ length: cropped.numberOfChannels }, (_, channel) => cropped.getChannelData(channel));
             soundAssetKinds.set(id, asset.favorite.kind);
-            eventAssets.set(id, { data: new ArrayBuffer(0), mime: "audio/wav", decodedBuffer: cropped, normalizationGain: soundCategoryGain(channels, asset.favorite.kind) });
+            const categoryVolume = asset.favorite.kind === "ambience" ? preferences.ambienceSoundVolume : preferences.eventSoundVolume;
+            eventAssets.set(id, { data: new ArrayBuffer(0), mime: "audio/wav", decodedBuffer: cropped, normalizationGain: soundCategoryGain(channels, asset.favorite.kind) * categoryVolume });
             soundLoadStatus.set(id, "ready");
           } catch {
             if (!playback.controller.signal.aborted) {
@@ -8281,6 +8343,12 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
       connections = loadedConnections;
       if (!savingEventSounds) eventSoundsToggle.checked = preferences.eventSounds;
       if (!savingAmbienceSounds) ambienceSoundsToggle.checked = preferences.ambienceSounds;
+      if (!savingSoundVolumes) {
+        eventSoundVolume = preferences.eventSoundVolume;
+        ambienceSoundVolume = preferences.ambienceSoundVolume;
+        updateSoundVolumeControl(eventSoundVolumeControl, "Event volume", eventSoundVolume);
+        updateSoundVolumeControl(ambienceSoundVolumeControl, "Ambience volume", ambienceSoundVolume);
+      }
       llmConnections = loadedLlmConnections;
       if (!favoritesSaving && !editingFavoriteVoiceId) {
         favoriteVoices = preferences.favoriteVoices;
