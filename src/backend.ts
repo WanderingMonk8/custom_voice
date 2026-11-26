@@ -1,4 +1,5 @@
-import { MAX_FAVORITE_SOUND_BYTES, SoundLibrary, type NewFavoriteSound } from './sound-library'
+import { SOUND_TRANSFER_CHUNK_BYTES, SoundLibrary, type NewFavoriteSound } from './sound-library'
+import { SoundUploadTransfers } from './sound-transfer'
 import { competingSoundCueIndexes, parseSoundScenePlan } from './sound-scene'
 import {
   addScannedFirstNameAliases,
@@ -164,6 +165,11 @@ type FrontendMessage =
   | { type: 'chat_voice_sound_library_read'; requestId: string; id: string }
   | { type: 'chat_voice_sound_library_remove'; requestId: string; id: string }
   | { type: 'chat_voice_sound_library_edit'; requestId: string; id: string; favorite: NewFavoriteSound }
+  | { type: 'chat_voice_sound_upload_begin'; requestId: string; size: number }
+  | { type: 'chat_voice_sound_upload_chunk'; requestId: string; uploadId: string; offset: number; audio: string }
+  | { type: 'chat_voice_sound_upload_finish'; requestId: string; uploadId: string; favorite: NewFavoriteSound }
+  | { type: 'chat_voice_sound_upload_cancel'; requestId: string; uploadId: string }
+  | { type: 'chat_voice_sound_library_read_chunk'; requestId: string; id: string; offset: number }
   | { type: 'chat_voice_freesound_key'; requestId: string; action: 'status' | 'save' | 'remove'; key?: string }
   | { type: 'chat_voice_sound_scene_plan'; requestId: string; message: string; connectionId?: string; model?: string }
   | { type: 'chat_voice_decision_status'; requestId?: string }
@@ -1974,10 +1980,44 @@ async function fetchCommunityModels(fishApiKey: string, request: CommunityModelR
   return parsed
 }
 
+const soundUploads = new SoundUploadTransfers(generateUuidV7)
+
 spindle.onFrontendMessage(async (rawPayload: unknown, userId, frontendSessionId) => {
   const payload = rawPayload as FrontendMessage
   try {
-    if (payload?.type === 'chat_voice_freesound_key') {
+    if (payload?.type === 'chat_voice_sound_upload_begin' || payload?.type === 'chat_voice_sound_upload_chunk' || payload?.type === 'chat_voice_sound_upload_finish' || payload?.type === 'chat_voice_sound_upload_cancel' || payload?.type === 'chat_voice_sound_library_read_chunk') {
+      try {
+        if (!userId || !frontendSessionId) throw new Error('An authenticated frontend session is required for large sound files.')
+        const owner = JSON.stringify([userId, frontendSessionId])
+        if (payload.type === 'chat_voice_sound_upload_begin') {
+          const uploadId = soundUploads.begin(owner, payload.size)
+          sendFrontend({ type: 'chat_voice_sound_library', requestId: payload.requestId, uploadId }, userId, frontendSessionId)
+        } else if (payload.type === 'chat_voice_sound_upload_chunk') {
+          if (typeof payload.audio !== 'string' || payload.audio.length > Math.ceil(SOUND_TRANSFER_CHUNK_BYTES / 3) * 4 || payload.audio.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/u.test(payload.audio)) throw new Error('Invalid sound upload encoding.')
+          const binary = atob(payload.audio)
+          soundUploads.append(owner, payload.uploadId, payload.offset, Uint8Array.from(binary, char => char.charCodeAt(0)))
+          sendFrontend({ type: 'chat_voice_sound_library', requestId: payload.requestId }, userId, frontendSessionId)
+        } else if (payload.type === 'chat_voice_sound_upload_finish') {
+          const bytes = soundUploads.take(owner, payload.uploadId)
+          try {
+            const favorite = await new SoundLibrary(spindle.userStorage).add(payload.favorite, bytes, userId)
+            sendFrontend({ type: 'chat_voice_sound_library', requestId: payload.requestId, favorite }, userId, frontendSessionId)
+          } finally { soundUploads.release(owner, payload.uploadId) }
+        } else if (payload.type === 'chat_voice_sound_upload_cancel') {
+          soundUploads.cancel(owner, payload.uploadId)
+          sendFrontend({ type: 'chat_voice_sound_library', requestId: payload.requestId }, userId, frontendSessionId)
+        } else {
+          const { record, data } = await new SoundLibrary(spindle.userStorage).read(payload.id, userId)
+          if (!Number.isSafeInteger(payload.offset) || payload.offset < 0 || payload.offset >= data.length) throw new Error('Invalid sound download offset.')
+          const part = data.subarray(payload.offset, payload.offset + SOUND_TRANSFER_CHUNK_BYTES)
+          let binary = ''
+          for (let offset = 0; offset < part.length; offset += 8192) binary += String.fromCharCode(...part.subarray(offset, offset + 8192))
+          sendFrontend({ type: 'chat_voice_sound_library', requestId: payload.requestId, audio: btoa(binary), favorite: record, offset: payload.offset }, userId, frontendSessionId)
+        }
+      } catch (error) {
+        sendFrontend({ type: 'chat_voice_sound_library', requestId: payload.requestId, error: error instanceof Error ? error.message : 'Sound transfer failed.' }, userId, frontendSessionId)
+      }
+    } else if (payload?.type === 'chat_voice_freesound_key') {
       try {
         if (!userId) throw new Error('An authenticated user is required.')
         if (payload.action === 'save') {
@@ -2042,16 +2082,20 @@ spindle.onFrontendMessage(async (rawPayload: unknown, userId, frontendSessionId)
       try {
         const library = new SoundLibrary(spindle.userStorage)
         if (payload.type === 'chat_voice_sound_library_add') {
-          if (typeof payload.audio !== 'string' || payload.audio.length > Math.ceil(MAX_FAVORITE_SOUND_BYTES / 3) * 4 || payload.audio.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/u.test(payload.audio)) throw new Error('Invalid or oversized audio encoding.')
+          if (typeof payload.audio !== 'string' || payload.audio.length > Math.ceil(2 * 1024 * 1024 / 3) * 4 || payload.audio.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/u.test(payload.audio)) throw new Error('Invalid or oversized audio encoding.')
           const binary = atob(payload.audio)
           const bytes = Uint8Array.from(binary, char => char.charCodeAt(0))
           const favorite = await library.add(payload.favorite, bytes, userId)
           sendFrontend({ type: 'chat_voice_sound_library', requestId: payload.requestId, favorite }, userId, frontendSessionId)
         } else if (payload.type === 'chat_voice_sound_library_read') {
           const { record, data } = await library.read(payload.id, userId)
-          let binary = ''
-          for (let offset = 0; offset < data.length; offset += 8192) binary += String.fromCharCode(...data.subarray(offset, offset + 8192))
-          sendFrontend({ type: 'chat_voice_sound_library', requestId: payload.requestId, favorite: record, audio: btoa(binary) }, userId, frontendSessionId)
+          if (data.length > 2 * 1024 * 1024) {
+            sendFrontend({ type: 'chat_voice_sound_library', requestId: payload.requestId, favorite: record, chunked: true }, userId, frontendSessionId)
+          } else {
+            let binary = ''
+            for (let offset = 0; offset < data.length; offset += 8192) binary += String.fromCharCode(...data.subarray(offset, offset + 8192))
+            sendFrontend({ type: 'chat_voice_sound_library', requestId: payload.requestId, favorite: record, audio: btoa(binary) }, userId, frontendSessionId)
+          }
         } else if (payload.type === 'chat_voice_sound_library_remove') {
           await library.remove(payload.id, userId)
           sendFrontend({ type: 'chat_voice_sound_library', requestId: payload.requestId }, userId, frontendSessionId)

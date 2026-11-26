@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { SoundLibrary, type SoundUserStorage } from './sound-library'
+import { SoundUploadTransfers } from './sound-transfer'
 import { alignSoundSourceSegments, competingSoundCueIndexes, interleaveSoundEvents, mapSoundCueBoundaries, parseSoundScenePlan, shortlistSoundAssets, splitNarrationForSoundEvents } from './sound-scene'
 import { mixAmbienceClip, renderSoundMix, soundCategoryGain } from './sound-mix'
 import { buildSoundTimeline, encodeSoundTimelineWav, resampleSoundClip } from './sound-timeline'
@@ -61,6 +62,47 @@ test('sound favorites persist across library instances and stay isolated by user
   await reinstalled.remove(favorite.id, 'alice')
   assert.deepEqual(await reinstalled.list('alice'), [])
   assert.equal(storage.files.size, 0)
+})
+
+test('large sound uploads are ordered, bounded and isolated by frontend session', () => {
+  let now = 0
+  let sequence = 0
+  const uploads = new SoundUploadTransfers(() => `id-${++sequence}`, () => now)
+  const id = uploads.begin('alice/session-a', 5)
+  assert.throws(() => uploads.append('alice/session-b', id, 0, new Uint8Array([1])), /not found/)
+  assert.throws(() => uploads.take('alice/session-a', id), /incomplete/)
+  uploads.append('alice/session-a', id, 0, new Uint8Array([1, 2]))
+  assert.throws(() => uploads.append('alice/session-a', id, 0, new Uint8Array([3])), /chunk/)
+  uploads.append('alice/session-a', id, 2, new Uint8Array([3, 4, 5]))
+  assert.deepEqual([...uploads.take('alice/session-a', id)], [1, 2, 3, 4, 5])
+  uploads.cancel('alice/session-a', id)
+  assert.throws(() => uploads.begin('alice/session-a', 1), /already in progress/)
+  uploads.release('alice/session-a', id)
+  const stale = uploads.begin('alice/session-a', 1)
+  now = 120_001
+  assert.throws(() => uploads.take('alice/session-a', stale), /not found/)
+  assert.throws(() => uploads.begin('alice/session-a', 24 * 1024 * 1024 + 1), /Invalid upload/)
+})
+
+test('sound library accepts an ambience file larger than the old 2 MiB limit', async () => {
+  const storage = new FakeSoundStorage()
+  const audio = new Uint8Array(2 * 1024 * 1024 + 12)
+  audio.set(new TextEncoder().encode('RIFF'), 0)
+  audio.set(new TextEncoder().encode('WAVE'), 8)
+  const library = new SoundLibrary(storage)
+  const favorite = await library.add({ name: 'Creek', kind: 'ambience', mime: 'audio/wav' }, audio, 'alice')
+  assert.equal(favorite.bytes, audio.length)
+  assert.equal((await library.read(favorite.id, 'alice')).data.length, audio.length)
+})
+
+test('sound transfer reassembles a file spanning multiple 1 MiB chunks', () => {
+  const uploads = new SoundUploadTransfers(() => 'large')
+  const input = new Uint8Array(2 * 1024 * 1024 + 17)
+  input[0] = 3; input[1024 * 1024] = 7; input[input.length - 1] = 9
+  const id = uploads.begin('alice/session-a', input.length)
+  for (let offset = 0; offset < input.length; offset += 1024 * 1024) uploads.append('alice/session-a', id, offset, input.subarray(offset, offset + 1024 * 1024))
+  assert.deepEqual(uploads.take('alice/session-a', id), input)
+  uploads.release('alice/session-a', id)
 })
 
 test('sound favorites validate inputs and clean up a failed record write', async () => {

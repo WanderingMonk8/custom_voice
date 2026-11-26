@@ -2,7 +2,7 @@ import type {
   SpindleFrontendContext,
   SpindleTextInputHandle,
 } from 'lumiverse-spindle-types'
-import type { FavoriteSound } from './sound-library'
+import { MAX_FAVORITE_SOUND_BYTES, SOUND_TRANSFER_CHUNK_BYTES, type FavoriteSound } from './sound-library'
 import { alignSoundSourceSegments, interleaveSoundEvents, mapSoundCueBoundaries, shortlistSoundAssets, splitNarrationForSoundEvents, type SoundSceneCue } from './sound-scene'
 import { mixAmbienceClip, soundCategoryGain } from './sound-mix'
 import { AutoplayRequestRegistry, PlaybackLongPress, PlaybackStartupGuard, syncAutoplayIndicators, syncPlaybackButtons, waitForAutoplayDeadline, waitForAutoplayWork, type PlaybackButtonState } from './playback-ui'
@@ -346,6 +346,9 @@ interface SoundLibraryPayload {
   audio?: string
   hasKey?: boolean
   cues?: SoundSceneCue[]
+  chunked?: boolean
+  uploadId?: string
+  offset?: number
   error?: string
 }
 
@@ -1769,7 +1772,7 @@ export function setup(ctx: SpindleFrontendContext) {
   soundsBody.className = 'chat-voice-advanced'
   const soundsHint = document.createElement('div')
   soundsHint.className = 'chat-voice-hint'
-  soundsHint.textContent = 'Manage your per-user sound library. Audio must be at most 2 MiB and 120 seconds.'
+  soundsHint.textContent = 'Manage your per-user sound library. Audio must be at most 24 MiB and 120 seconds; larger files may take longer to load.'
   const soundTabs = document.createElement('div')
   soundTabs.className = 'chat-voice-voices-tabs'
   soundTabs.setAttribute('role', 'tablist')
@@ -2336,6 +2339,32 @@ export function setup(ctx: SpindleFrontendContext) {
     })
   }
 
+  async function readSoundAudio(id: string, isCancelled: () => boolean = () => false): Promise<{ favorite: FavoriteSound; bytes: Uint8Array<ArrayBuffer> }> {
+    const result = await soundLibraryRequest('chat_voice_sound_library_read', { id })
+    if (isCancelled()) throw new DOMException('Sound download stopped.', 'AbortError')
+    if (!result.favorite || result.favorite.id !== id || !Number.isSafeInteger(result.favorite.bytes) || result.favorite.bytes < 1 || result.favorite.bytes > MAX_FAVORITE_SOUND_BYTES) throw new Error('Invalid sound record.')
+    const bytes = new Uint8Array(result.favorite.bytes)
+    const decode = (audio: string, offset: number) => {
+      const binary = atob(audio)
+      if (!binary.length || offset + binary.length > bytes.length) throw new Error('Invalid sound download chunk.')
+      for (let i = 0; i < binary.length; i++) bytes[offset + i] = binary.charCodeAt(i)
+      return binary.length
+    }
+    if (!result.chunked) {
+      if (!result.audio || decode(result.audio, 0) !== bytes.length) throw new Error('Incomplete sound download.')
+    } else {
+      for (let offset = 0; offset < bytes.length;) {
+        if (isCancelled()) throw new DOMException('Sound download stopped.', 'AbortError')
+        const chunk = await soundLibraryRequest('chat_voice_sound_library_read_chunk', { id, offset })
+        if (!chunk.audio || chunk.offset !== offset || chunk.favorite?.id !== id || chunk.favorite.bytes !== bytes.length) throw new Error('Invalid sound download response.')
+        const length = decode(chunk.audio, offset)
+        if (length !== Math.min(SOUND_TRANSFER_CHUNK_BYTES, bytes.length - offset)) throw new Error('Incomplete sound download chunk.')
+        offset += length
+      }
+    }
+    return { favorite: result.favorite, bytes }
+  }
+
   async function updateFreesoundKey(action: 'status' | 'save' | 'remove'): Promise<void> {
     freesoundSave.disabled = true; freesoundRemove.disabled = true
     try {
@@ -2394,11 +2423,9 @@ export function setup(ctx: SpindleFrontendContext) {
           const context = new Context()
           soundPreviewContext = context
           await context.resume()
-          const result = await soundLibraryRequest('chat_voice_sound_library_read', { id: favorite.id })
-          if (soundLibraryDisposed || generation !== soundPreviewGeneration || !result.audio || !result.favorite) return
-          const binary = atob(result.audio)
-          const bytes = Uint8Array.from(binary, char => char.charCodeAt(0))
-          const decoded = await context.decodeAudioData(bytes.buffer)
+          const result = await readSoundAudio(favorite.id, () => soundLibraryDisposed || generation !== soundPreviewGeneration)
+          if (soundLibraryDisposed || generation !== soundPreviewGeneration) return
+          const decoded = await context.decodeAudioData(result.bytes.buffer)
           if (soundLibraryDisposed || generation !== soundPreviewGeneration) return
           if (decoded.duration > 120 || decoded.numberOfChannels > 2) throw new Error('Sound preview requires mono or stereo audio of at most 120 seconds.')
           const channels = Array.from({ length: decoded.numberOfChannels }, (_, index) => decoded.getChannelData(index))
@@ -2444,7 +2471,7 @@ export function setup(ctx: SpindleFrontendContext) {
   soundAdd.addEventListener('click', () => { void (async () => {
     const file = soundFile.files?.[0]
     if (!file) { setStatus('Choose an audio file first.', 'error'); return }
-    if (file.size > 2 * 1024 * 1024) { setStatus('Sound files must be at most 2 MiB.', 'error'); return }
+    if (file.size > MAX_FAVORITE_SOUND_BYTES) { setStatus('Sound files must be at most 24 MiB.', 'error'); return }
     const types: Record<string, string> = { mp3: 'audio/mpeg', wav: 'audio/wav', ogg: 'audio/ogg', m4a: 'audio/mp4', webm: 'audio/webm' }
     const mime = types[file.name.split('.').pop()?.toLowerCase() ?? ''] ?? file.type
     soundAdd.disabled = true
@@ -2457,9 +2484,29 @@ export function setup(ctx: SpindleFrontendContext) {
         const audio = await audioContext.decodeAudioData(data.slice(0))
         if (!Number.isFinite(audio.duration) || audio.duration <= 0 || audio.duration > 120) throw new Error('Sound must be between 0 and 120 seconds long.')
       } finally { await audioContext.close().catch(() => undefined) }
-      const bytes = new Uint8Array(data); let binary = ''
-      for (let offset = 0; offset < bytes.length; offset += 8192) binary += String.fromCharCode(...bytes.subarray(offset, offset + 8192))
-      await soundLibraryRequest('chat_voice_sound_library_add', { favorite: { name: soundName.value, tags: soundTags.value.split(',').map(tag => tag.trim()).filter(Boolean), kind: soundKind.value, mime }, audio: btoa(binary) })
+      const bytes = new Uint8Array(data)
+      const favorite = { name: soundName.value, tags: soundTags.value.split(',').map(tag => tag.trim()).filter(Boolean), kind: soundKind.value, mime }
+      if (bytes.length <= 2 * 1024 * 1024) {
+        let binary = ''
+        for (let index = 0; index < bytes.length; index += 8192) binary += String.fromCharCode(...bytes.subarray(index, index + 8192))
+        await soundLibraryRequest('chat_voice_sound_library_add', { favorite, audio: btoa(binary) })
+      } else {
+      const begin = await soundLibraryRequest('chat_voice_sound_upload_begin', { size: bytes.length })
+      if (!begin.uploadId) throw new Error('Could not start sound upload.')
+      const uploadId = begin.uploadId
+      try {
+        for (let offset = 0; offset < bytes.length; offset += SOUND_TRANSFER_CHUNK_BYTES) {
+          const part = bytes.subarray(offset, offset + SOUND_TRANSFER_CHUNK_BYTES)
+          let binary = ''
+          for (let index = 0; index < part.length; index += 8192) binary += String.fromCharCode(...part.subarray(index, index + 8192))
+          await soundLibraryRequest('chat_voice_sound_upload_chunk', { uploadId, offset, audio: btoa(binary) })
+        }
+        await soundLibraryRequest('chat_voice_sound_upload_finish', { uploadId, favorite })
+      } catch (error) {
+        void soundLibraryRequest('chat_voice_sound_upload_cancel', { uploadId }).catch(() => undefined)
+        throw error
+      }
+      }
       soundFile.value = ''; soundName.value = ''; soundTags.value = ''
       await refreshSoundLibrary(); setStatus('Favorite sound added.', 'saved')
     } catch (error) { setStatus(error instanceof Error ? error.message : 'Could not add sound.', 'error') } finally { soundAdd.disabled = false }
@@ -3865,11 +3912,10 @@ export function setup(ctx: SpindleFrontendContext) {
       if (existing) return existing
       const request = (async () => {
         try {
-          const asset = await soundLibraryRequest('chat_voice_sound_library_read', { id })
+          const asset = await readSoundAudio(id, () => playback.controller.signal.aborted)
           if (playback.controller.signal.aborted) return
-          if (!asset.audio || !asset.favorite || !['event', 'ambience'].includes(asset.favorite.kind)) throw new Error('Unavailable sound.')
-          const bytes = Uint8Array.from(atob(asset.audio), char => char.charCodeAt(0))
-          const decoded = await audioContext.decodeAudioData(bytes.buffer)
+          if (!['event', 'ambience'].includes(asset.favorite.kind)) throw new Error('Unavailable sound.')
+          const decoded = await audioContext.decodeAudioData(asset.bytes.buffer)
           if (playback.controller.signal.aborted) return
           if (decoded.duration > 120 || decoded.numberOfChannels < 1 || decoded.numberOfChannels > 2) throw new Error('Unsupported event sound.')
           const frames = Math.min(decoded.length, Math.floor(decoded.sampleRate * (asset.favorite.kind === 'event' ? 5 : 120)))

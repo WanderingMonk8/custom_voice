@@ -36,8 +36,9 @@ export interface NewFavoriteSound {
 const ROOT = 'sound-effects/v1'
 const RECORDS = `${ROOT}/favorites`
 const AUDIO = `${ROOT}/audio`
-// Base64-encoded data plus the RPC envelope must remain below the host's 4 MiB message limit.
-export const MAX_FAVORITE_SOUND_BYTES = 2 * 1024 * 1024
+// Large files use bounded chunks so no single RPC exceeds the host message limit.
+export const MAX_FAVORITE_SOUND_BYTES = 24 * 1024 * 1024
+export const SOUND_TRANSFER_CHUNK_BYTES = 1024 * 1024
 export const MAX_FAVORITE_SOUNDS = 200
 export const MAX_FAVORITE_LIBRARY_BYTES = 100 * 1024 * 1024
 const ID_PATTERN = /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/u

@@ -1,3 +1,14 @@
+// src/uuid.ts
+var UUID_HEX = Array.from({ length: 256 }, (_, index) => index.toString(16).padStart(2, "0"));
+
+// src/sound-library.ts
+var ROOT = "sound-effects/v1";
+var RECORDS = `${ROOT}/favorites`;
+var AUDIO = `${ROOT}/audio`;
+var MAX_FAVORITE_SOUND_BYTES = 24 * 1024 * 1024;
+var SOUND_TRANSFER_CHUNK_BYTES = 1024 * 1024;
+var MAX_FAVORITE_LIBRARY_BYTES = 100 * 1024 * 1024;
+
 // src/sound-scene.ts
 function splitNarrationForSoundEvents(segments) {
   const result = [];
@@ -4064,7 +4075,7 @@ function setup(ctx) {
   soundsBody.className = "chat-voice-advanced";
   const soundsHint = document.createElement("div");
   soundsHint.className = "chat-voice-hint";
-  soundsHint.textContent = "Manage your per-user sound library. Audio must be at most 2 MiB and 120 seconds.";
+  soundsHint.textContent = "Manage your per-user sound library. Audio must be at most 24 MiB and 120 seconds; larger files may take longer to load.";
   const soundTabs = document.createElement("div");
   soundTabs.className = "chat-voice-voices-tabs";
   soundTabs.setAttribute("role", "tablist");
@@ -4610,6 +4621,31 @@ function setup(ctx) {
       ctx.sendToBackend({ type, requestId, ...fields });
     });
   }
+  async function readSoundAudio(id, isCancelled = () => false) {
+    const result = await soundLibraryRequest("chat_voice_sound_library_read", { id });
+    if (isCancelled()) throw new DOMException("Sound download stopped.", "AbortError");
+    if (!result.favorite || result.favorite.id !== id || !Number.isSafeInteger(result.favorite.bytes) || result.favorite.bytes < 1 || result.favorite.bytes > MAX_FAVORITE_SOUND_BYTES) throw new Error("Invalid sound record.");
+    const bytes = new Uint8Array(result.favorite.bytes);
+    const decode = (audio, offset) => {
+      const binary = atob(audio);
+      if (!binary.length || offset + binary.length > bytes.length) throw new Error("Invalid sound download chunk.");
+      for (let i = 0; i < binary.length; i++) bytes[offset + i] = binary.charCodeAt(i);
+      return binary.length;
+    };
+    if (!result.chunked) {
+      if (!result.audio || decode(result.audio, 0) !== bytes.length) throw new Error("Incomplete sound download.");
+    } else {
+      for (let offset = 0; offset < bytes.length; ) {
+        if (isCancelled()) throw new DOMException("Sound download stopped.", "AbortError");
+        const chunk = await soundLibraryRequest("chat_voice_sound_library_read_chunk", { id, offset });
+        if (!chunk.audio || chunk.offset !== offset || chunk.favorite?.id !== id || chunk.favorite.bytes !== bytes.length) throw new Error("Invalid sound download response.");
+        const length = decode(chunk.audio, offset);
+        if (length !== Math.min(SOUND_TRANSFER_CHUNK_BYTES, bytes.length - offset)) throw new Error("Incomplete sound download chunk.");
+        offset += length;
+      }
+    }
+    return { favorite: result.favorite, bytes };
+  }
   async function updateFreesoundKey(action) {
     freesoundSave.disabled = true;
     freesoundRemove.disabled = true;
@@ -4693,11 +4729,9 @@ function setup(ctx) {
             const context2 = new Context();
             soundPreviewContext = context2;
             await context2.resume();
-            const result = await soundLibraryRequest("chat_voice_sound_library_read", { id: favorite.id });
-            if (soundLibraryDisposed || generation !== soundPreviewGeneration || !result.audio || !result.favorite) return;
-            const binary = atob(result.audio);
-            const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
-            const decoded = await context2.decodeAudioData(bytes.buffer);
+            const result = await readSoundAudio(favorite.id, () => soundLibraryDisposed || generation !== soundPreviewGeneration);
+            if (soundLibraryDisposed || generation !== soundPreviewGeneration) return;
+            const decoded = await context2.decodeAudioData(result.bytes.buffer);
             if (soundLibraryDisposed || generation !== soundPreviewGeneration) return;
             if (decoded.duration > 120 || decoded.numberOfChannels > 2) throw new Error("Sound preview requires mono or stereo audio of at most 120 seconds.");
             const channels = Array.from({ length: decoded.numberOfChannels }, (_, index) => decoded.getChannelData(index));
@@ -4778,8 +4812,8 @@ function setup(ctx) {
         setStatus("Choose an audio file first.", "error");
         return;
       }
-      if (file.size > 2 * 1024 * 1024) {
-        setStatus("Sound files must be at most 2 MiB.", "error");
+      if (file.size > MAX_FAVORITE_SOUND_BYTES) {
+        setStatus("Sound files must be at most 24 MiB.", "error");
         return;
       }
       const types = { mp3: "audio/mpeg", wav: "audio/wav", ogg: "audio/ogg", m4a: "audio/mp4", webm: "audio/webm" };
@@ -4797,9 +4831,28 @@ function setup(ctx) {
           await audioContext.close().catch(() => void 0);
         }
         const bytes = new Uint8Array(data);
-        let binary = "";
-        for (let offset = 0; offset < bytes.length; offset += 8192) binary += String.fromCharCode(...bytes.subarray(offset, offset + 8192));
-        await soundLibraryRequest("chat_voice_sound_library_add", { favorite: { name: soundName.value, tags: soundTags.value.split(",").map((tag) => tag.trim()).filter(Boolean), kind: soundKind.value, mime }, audio: btoa(binary) });
+        const favorite = { name: soundName.value, tags: soundTags.value.split(",").map((tag) => tag.trim()).filter(Boolean), kind: soundKind.value, mime };
+        if (bytes.length <= 2 * 1024 * 1024) {
+          let binary = "";
+          for (let index = 0; index < bytes.length; index += 8192) binary += String.fromCharCode(...bytes.subarray(index, index + 8192));
+          await soundLibraryRequest("chat_voice_sound_library_add", { favorite, audio: btoa(binary) });
+        } else {
+          const begin = await soundLibraryRequest("chat_voice_sound_upload_begin", { size: bytes.length });
+          if (!begin.uploadId) throw new Error("Could not start sound upload.");
+          const uploadId = begin.uploadId;
+          try {
+            for (let offset = 0; offset < bytes.length; offset += SOUND_TRANSFER_CHUNK_BYTES) {
+              const part = bytes.subarray(offset, offset + SOUND_TRANSFER_CHUNK_BYTES);
+              let binary = "";
+              for (let index = 0; index < part.length; index += 8192) binary += String.fromCharCode(...part.subarray(index, index + 8192));
+              await soundLibraryRequest("chat_voice_sound_upload_chunk", { uploadId, offset, audio: btoa(binary) });
+            }
+            await soundLibraryRequest("chat_voice_sound_upload_finish", { uploadId, favorite });
+          } catch (error) {
+            void soundLibraryRequest("chat_voice_sound_upload_cancel", { uploadId }).catch(() => void 0);
+            throw error;
+          }
+        }
         soundFile.value = "";
         soundName.value = "";
         soundTags.value = "";
@@ -6022,11 +6075,10 @@ function setup(ctx) {
         if (existing) return existing;
         const request = (async () => {
           try {
-            const asset = await soundLibraryRequest("chat_voice_sound_library_read", { id });
+            const asset = await readSoundAudio(id, () => playback.controller.signal.aborted);
             if (playback.controller.signal.aborted) return;
-            if (!asset.audio || !asset.favorite || !["event", "ambience"].includes(asset.favorite.kind)) throw new Error("Unavailable sound.");
-            const bytes = Uint8Array.from(atob(asset.audio), (char) => char.charCodeAt(0));
-            const decoded = await audioContext.decodeAudioData(bytes.buffer);
+            if (!["event", "ambience"].includes(asset.favorite.kind)) throw new Error("Unavailable sound.");
+            const decoded = await audioContext.decodeAudioData(asset.bytes.buffer);
             if (playback.controller.signal.aborted) return;
             if (decoded.duration > 120 || decoded.numberOfChannels < 1 || decoded.numberOfChannels > 2) throw new Error("Unsupported event sound.");
             const frames = Math.min(decoded.length, Math.floor(decoded.sampleRate * (asset.favorite.kind === "event" ? 5 : 120)));
