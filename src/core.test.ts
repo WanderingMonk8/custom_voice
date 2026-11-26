@@ -3,6 +3,7 @@ import test from 'node:test'
 import { MAX_FAVORITE_SOUND_BYTES, MAX_FAVORITE_SOUND_SECONDS, SoundLibrary, isSupportedSoundDuration, type SoundUserStorage } from './sound-library'
 import { SoundDownloadTransfers, SoundUploadTransfers } from './sound-transfer'
 import { SoundPreviewCache } from './sound-preview-cache'
+import { SoundLoadQueue } from './sound-load-queue'
 import { isFreesoundCc0, parseFreesoundSearch, safeFreesoundPreviewUrl } from './freesound'
 import { alignSoundSourceSegments, ambienceInstructionAtBoundary, competingSoundCueIndexes, interleaveSoundEvents, mapSoundCueBoundaries, parseMissingSoundSuggestions, parseSoundScenePlan, shortlistSoundAssets, splitNarrationForSoundEvents } from './sound-scene'
 import { DEFAULT_AMBIENCE_VOLUME, DEFAULT_EVENT_VOLUME, mixAmbienceClip, readSoundVolume, renderSoundMix, soundCategoryGain } from './sound-mix'
@@ -71,6 +72,29 @@ test('sound preview cache is bounded, expiring and least-recently-used', () => {
   assert.equal(cache.get('one'), undefined)
   cache.clear()
   assert.equal(cache.get('three'), undefined)
+})
+
+test('sound loading is bounded, deduplicated, prioritizes confirmed cues, and cancels queued work', async () => {
+  const queue = new SoundLoadQueue(2)
+  const started: string[] = []
+  const finish: Record<string, () => void> = {}
+  const task = (name: string) => () => new Promise<void>(resolve => { started.push(name); finish[name] = resolve })
+  const first = queue.enqueue('first', task('first'))
+  const second = queue.enqueue('second', task('second'))
+  const speculative = queue.enqueue('speculative', task('speculative'))
+  const confirmed = queue.enqueue('confirmed', task('confirmed'))
+  assert.equal(queue.enqueue('confirmed', task('duplicate'), true), confirmed)
+  await new Promise(resolve => setTimeout(resolve, 0))
+  assert.deepEqual(started, ['first', 'second'])
+  finish.first()
+  await first
+  await new Promise(resolve => setTimeout(resolve, 0))
+  assert.deepEqual(started, ['first', 'second', 'confirmed'])
+  queue.cancel()
+  await speculative
+  finish.second(); finish.confirmed()
+  await Promise.all([second, confirmed])
+  assert.deepEqual(started, ['first', 'second', 'confirmed'])
 })
 
 test('missing sound suggestions require bounded safe searches and unique scene anchors', () => {

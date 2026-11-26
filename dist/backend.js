@@ -8547,12 +8547,15 @@ spindle.onFrontendMessage(async (rawPayload, userId, frontendSessionId) => {
     } else if (payload?.type === "chat_voice_sound_scene_plan") {
       try {
         if (typeof payload.message !== "string" || payload.message.length > 3e4) throw new Error("Invalid or oversized scene.");
+        const libraryStarted = Date.now();
         const favorites = await new SoundLibrary(spindle.userStorage).list(userId);
+        const libraryMs = Date.now() - libraryStarted;
         if (!favorites.length && payload.suggestMissing !== true || !payload.message.trim()) {
           sendFrontend({ type: "chat_voice_sound_library", requestId: payload.requestId, cues: [] }, userId, frontendSessionId);
           return;
         }
         const connectionId = await resolveGenerationConnection(userId, payload.connectionId);
+        const generationStarted = Date.now();
         const response = await spindle.generate.quiet({
           type: "quiet",
           userId,
@@ -8564,10 +8567,12 @@ spindle.onFrontendMessage(async (rawPayload, userId, frontendSessionId) => {
           parameters: { temperature: 0, ...typeof payload.model === "string" && payload.model.trim() ? { model: payload.model.trim().slice(0, 256) } : {} },
           reasoning: { source: "off" }
         });
+        const generationMs = Date.now() - generationStarted;
         const planText = extractGenerationText(response);
         let cues = parseSoundScenePlan(planText, payload.message, favorites);
         const missing = payload.suggestMissing === true ? parseMissingSoundSuggestions(planText, payload.message) : [];
         const competing = competingSoundCueIndexes(cues);
+        let decisionMs = 0;
         if (competing.length) {
           const questions = {};
           for (const index of competing) questions[`cue_${index}`] = {
@@ -8575,6 +8580,7 @@ spindle.onFrontendMessage(async (rawPayload, userId, frontendSessionId) => {
             instructions: `Assess sound candidate ${index} in the scene. Select skip if it is background, imagined, redundant, or not a clearly audible event.`,
             criteria: { keep: "The sound is a clear, useful audible cue in this scene.", skip: "The sound is unclear, inappropriate or redundant." }
           };
+          const decisionStarted = Date.now();
           try {
             const review = await spindle.decisions.evaluate({
               state: { message: payload.message, candidates: competing.map((index) => {
@@ -8590,9 +8596,11 @@ spindle.onFrontendMessage(async (rawPayload, userId, frontendSessionId) => {
               return !answer || answer.type !== "choice" || answer.choice !== "skip" || answer.confidence < 0.6;
             });
           } catch {
+          } finally {
+            decisionMs = Date.now() - decisionStarted;
           }
         }
-        sendFrontend({ type: "chat_voice_sound_library", requestId: payload.requestId, cues, missing }, userId, frontendSessionId);
+        sendFrontend({ type: "chat_voice_sound_library", requestId: payload.requestId, cues, missing, soundTimings: { libraryMs, generationMs, decisionMs } }, userId, frontendSessionId);
       } catch (error) {
         sendFrontend({ type: "chat_voice_sound_library", requestId: payload.requestId, error: "Could not plan sound effects." }, userId, frontendSessionId);
       }

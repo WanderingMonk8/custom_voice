@@ -81,6 +81,52 @@ var SoundPreviewCache = class {
   }
 };
 
+// src/sound-load-queue.ts
+var SoundLoadQueue = class {
+  constructor(limit = 2) {
+    this.limit = limit;
+  }
+  pending = [];
+  requests = /* @__PURE__ */ new Map();
+  running = 0;
+  closed = false;
+  enqueue(id, task, priority = false) {
+    if (this.closed) return Promise.resolve();
+    const existing = this.requests.get(id);
+    if (existing) {
+      if (priority) {
+        const item = this.pending.find((entry) => entry.id === id);
+        if (item) item.priority = true;
+      }
+      return existing;
+    }
+    let resolve;
+    const promise = new Promise((done) => {
+      resolve = done;
+    });
+    this.requests.set(id, promise);
+    this.pending.push({ id, task, resolve, priority });
+    this.drain();
+    return promise;
+  }
+  cancel() {
+    this.closed = true;
+    for (const item of this.pending.splice(0)) item.resolve();
+  }
+  drain() {
+    while (!this.closed && this.running < this.limit && this.pending.length) {
+      const index = this.pending.findIndex((item2) => item2.priority);
+      const item = this.pending.splice(index < 0 ? 0 : index, 1)[0];
+      this.running++;
+      void Promise.resolve().then(item.task).catch(() => void 0).finally(() => {
+        this.running--;
+        item.resolve();
+        this.drain();
+      });
+    }
+  }
+};
+
 // src/sound-scene.ts
 function splitNarrationForSoundEvents(segments) {
   const result = [];
@@ -6354,7 +6400,7 @@ function setup(ctx) {
     updatePlaybackButtons();
     return playback.persistenceState === "pending";
   }
-  async function playDecodedBuffer(playback, segment, volume) {
+  async function playDecodedBuffer(playback, segment, volume, onStart) {
     if (playback.controller.signal.aborted) throw new DOMException("Playback stopped.", "AbortError");
     const buffer = segment.decodedBuffer ?? await playback.context.decodeAudioData(segment.data.slice(0));
     if (playback.controller.signal.aborted) throw new DOMException("Playback stopped.", "AbortError");
@@ -6380,6 +6426,7 @@ function setup(ctx) {
         resolve();
       };
       source.start();
+      onStart?.();
     });
     return buffer;
   }
@@ -6634,7 +6681,8 @@ function setup(ctx) {
       const soundAssetKinds = /* @__PURE__ */ new Map();
       const soundCreditAssets = /* @__PURE__ */ new Map();
       const usedSoundCredits = /* @__PURE__ */ new Map();
-      const eventLoads = /* @__PURE__ */ new Map();
+      const soundLoadQueue = new SoundLoadQueue(2);
+      let soundWorkClosed = false;
       const soundLoadStatus = /* @__PURE__ */ new Map();
       let eventPlanState = "not-requested";
       let eventAssetFailures = 0;
@@ -6647,25 +6695,29 @@ function setup(ctx) {
         resolveEventSelection = resolve;
       });
       if (!preferences.eventSounds && !preferences.ambienceSounds) resolveEventSelection(selectedAudio);
-      const prepareEventAsset = (id) => {
-        const existing = eventLoads.get(id);
-        if (existing) return existing;
-        soundLoadStatus.set(id, "requesting");
-        const request = (async () => {
+      const prepareEventAsset = (id, priority = false) => {
+        if (!soundLoadStatus.has(id)) soundLoadStatus.set(id, "queued");
+        return soundLoadQueue.enqueue(id, async () => {
+          if (soundWorkClosed || playback.controller.signal.aborted) return;
+          const loadStart = Date.now();
+          soundLoadStatus.set(id, "requesting");
           try {
-            const asset = await readSoundAudio(id, () => playback.controller.signal.aborted, (received, total) => {
+            const asset = await readSoundAudio(id, () => soundWorkClosed || playback.controller.signal.aborted, (received, total) => {
               soundLoadStatus.set(id, `transferring ${received}/${total} bytes`);
             });
-            if (playback.controller.signal.aborted) return;
+            if (soundWorkClosed || playback.controller.signal.aborted) return;
             if (!["event", "ambience"].includes(asset.favorite.kind)) throw new Error("Unavailable sound.");
+            const transferMs = Date.now() - loadStart;
             soundLoadStatus.set(id, "decoding");
+            const decodeStart = Date.now();
             const decoded = await audioContext.decodeAudioData(asset.bytes.buffer);
-            if (playback.controller.signal.aborted) return;
+            if (soundWorkClosed || playback.controller.signal.aborted) return;
+            const decodeMs = Date.now() - decodeStart;
             if (!isSupportedSoundDuration(decoded.duration) || decoded.numberOfChannels < 1 || decoded.numberOfChannels > 2) throw new Error("Unsupported sound.");
             const frames = Math.min(decoded.length, Math.floor(decoded.sampleRate * (asset.favorite.kind === "event" ? 5 : MAX_FAVORITE_SOUND_SECONDS)));
             if (!frames) throw new Error("Empty event sound.");
-            const cropped = audioContext.createBuffer(decoded.numberOfChannels, frames, decoded.sampleRate);
-            for (let channel = 0; channel < decoded.numberOfChannels; channel++) cropped.copyToChannel(decoded.getChannelData(channel).subarray(0, frames), channel);
+            const cropped = frames === decoded.length ? decoded : audioContext.createBuffer(decoded.numberOfChannels, frames, decoded.sampleRate);
+            if (cropped !== decoded) for (let channel = 0; channel < decoded.numberOfChannels; channel++) cropped.copyToChannel(decoded.getChannelData(channel).subarray(0, frames), channel);
             const channels = Array.from({ length: cropped.numberOfChannels }, (_, channel) => cropped.getChannelData(channel));
             soundAssetKinds.set(id, asset.favorite.kind);
             const provenance = asset.favorite.provenance;
@@ -6673,29 +6725,32 @@ function setup(ctx) {
             const categoryVolume = asset.favorite.kind === "ambience" ? preferences.ambienceSoundVolume : preferences.eventSoundVolume;
             eventAssets.set(id, { data: new ArrayBuffer(0), mime: "audio/wav", decodedBuffer: cropped, normalizationGain: soundCategoryGain(channels, asset.favorite.kind) * categoryVolume });
             soundLoadStatus.set(id, "ready");
+            appendSpeakerDebugLog(`Sound timing: asset=${id}, transfer=${transferMs}ms, decode=${decodeMs}ms, total=${Date.now() - loadStart}ms, reused-decoded=${cropped === decoded}.`);
           } catch {
-            if (!playback.controller.signal.aborted) {
+            if (!soundWorkClosed && !playback.controller.signal.aborted) {
               eventAssetFailures++;
               soundLoadStatus.set(id, "failed");
             }
           }
-        })();
-        eventLoads.set(id, request);
-        return request;
+        }, priority);
       };
       if ((preferences.eventSounds || preferences.ambienceSounds) && eventSourceText.length <= 3e4 && eventSourceText.trim()) {
         eventPlanState = "pending";
+        const soundListStarted = Date.now();
         void soundLibraryRequest("chat_voice_sound_library_list").then((result) => {
+          appendSpeakerDebugLog(`Sound timing: local library list=${Date.now() - soundListStarted}ms.`);
           const kinds = [];
           if (preferences.eventSounds) kinds.push("event");
           if (preferences.ambienceSounds) kinds.push("ambience");
-          if (!playback.controller.signal.aborted) for (const sound of shortlistSoundAssets(eventSourceText, result.favorites ?? [], 8, kinds)) void prepareEventAsset(sound.id);
+          if (!soundWorkClosed && !playback.controller.signal.aborted) for (const sound of shortlistSoundAssets(eventSourceText, result.favorites ?? [], 8, kinds)) void prepareEventAsset(sound.id);
         }).catch(() => {
           eventAssetFailures++;
         });
         missingSoundSuggestions.textContent = preferences.suggestMissingSounds ? "Looking for missing sounds in this scene\u2026" : "No missing-sound suggestions for the current playback.";
+        const soundPlanStarted = Date.now();
         void soundLibraryRequest("chat_voice_sound_scene_plan", { message: eventSourceText, connectionId: preferences.tagLlmConnectionId, model: preferences.tagLlmModel, suggestMissing: preferences.suggestMissingSounds }).then(async (result) => {
-          if (playback.controller.signal.aborted) return;
+          if (soundWorkClosed || playback.controller.signal.aborted) return;
+          appendSpeakerDebugLog(`Sound timing: planner round-trip=${Date.now() - soundPlanStarted}ms${result.soundTimings ? `, library=${result.soundTimings.libraryMs}ms, generation=${result.soundTimings.generationMs}ms, decision=${result.soundTimings.decisionMs}ms` : ""}.`);
           if (preferences.suggestMissingSounds && suggestionPlayback === playback && ctx.getActiveChat().chatId === playbackChat.id) {
             const suggestions = (result.missing ?? []).filter((item) => item.kind === "event" ? preferences.eventSounds : preferences.ambienceSounds);
             missingSoundSuggestions.replaceChildren();
@@ -6715,7 +6770,7 @@ function setup(ctx) {
           }
           eventCues = (result.cues ?? []).filter((cue) => cue.kind === "event" ? preferences.eventSounds : preferences.ambienceSounds);
           eventPlanState = "completed";
-          await Promise.all([...new Set(eventCues.flatMap((cue) => cue.action === "play" && cue.assetId ? [cue.assetId] : []))].map(prepareEventAsset));
+          await Promise.all([...new Set(eventCues.flatMap((cue) => cue.action === "play" && cue.assetId ? [cue.assetId] : []))].map((id) => prepareEventAsset(id, true)));
         }).catch(() => {
           eventPlanState = "failed";
           if (suggestionPlayback === playback && preferences.suggestMissingSounds) missingSoundSuggestions.textContent = "Could not generate missing-sound suggestions.";
@@ -7425,12 +7480,26 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
           }
         };
         if (preferences.eventSounds || preferences.ambienceSounds) appendSpeakerDebugLog(`Sound effects at first playback: planner=${eventPlanState}, cues=${eventCues.length}, assets ready=${eventAssets.size}, asset failures=${eventAssetFailures}; asset states=${JSON.stringify(Object.fromEntries(soundLoadStatus))}.`);
+        let firstSoundStarted = false;
+        let previousAudioEndedAt = null;
+        const playbackStarted = (kind) => {
+          const now = Date.now();
+          if (!firstSoundStarted) {
+            firstSoundStarted = true;
+            appendSpeakerDebugLog(`Sound timing: first ${kind} audio scheduled ${now - playbackSetupFinishedAt}ms after playback setup.`);
+          }
+          if (previousAudioEndedAt !== null) appendSpeakerDebugLog(`Sound timing: gap before ${kind}=${Math.max(0, now - previousAudioEndedAt)}ms (callback-to-scheduling estimate).`);
+        };
+        const playMeasured = async (segment, kind) => {
+          await playDecodedBuffer(playback, segment, preferences.volume, () => playbackStarted(kind));
+          previousAudioEndedAt = Date.now();
+        };
         for (let index = 0; index < plan.length; index += 1) {
           const current = await processed[index];
           if (!current.ok) throw current.error;
           const events = selectEventsAt(index).map(withAmbience);
           if (events.length) selectedEvents.set(index, events);
-          for (const event of events) await playDecodedBuffer(playback, event, preferences.volume);
+          for (const event of events) await playMeasured(event, "event");
           playbackCursor = index + 1;
           if (synthesisCursor < plan.length || localSynthesisTasks > 0) {
             const pressuredConcurrency = bufferAwareGenerationConcurrency(
@@ -7459,11 +7528,11 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
           setStatus(`Playing ${index + 1} of ${plan.length} voice segment${plan.length === 1 ? "" : "s"}\u2026`);
           const voice = withAmbience(current.segment);
           if (voice !== current.segment) mixedVoices.set(index, voice);
-          await playDecodedBuffer(playback, voice, preferences.volume);
+          await playMeasured(voice, "voice");
         }
         const lastEvents = selectEventsAt(plan.length).map(withAmbience);
         if (lastEvents.length) selectedEvents.set(plan.length, lastEvents);
-        for (const event of lastEvents) await playDecodedBuffer(playback, event, preferences.volume);
+        for (const event of lastEvents) await playMeasured(event, "event");
         if (preferences.eventSounds || preferences.ambienceSounds) {
           const aligned = mapSoundCueBoundaries(eventCues, eventSpans, eventSourceText.length).length;
           appendSpeakerDebugLog(`Sound effects at playback end: planner=${eventPlanState}, cues=${eventCues.length}, aligned cues=${aligned}, assets ready=${eventAssets.size}, asset failures=${eventAssetFailures}, selected event boundaries=${selectedEvents.size}, ambience-mixed clips=${mixedVoices.size}, asset states=${JSON.stringify(Object.fromEntries(soundLoadStatus))}.`);
@@ -7488,6 +7557,8 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
           setStatus(error instanceof Error ? error.message : "Custom voice playback failed.", "error");
         }
       } finally {
+        soundWorkClosed = true;
+        soundLoadQueue.cancel();
         resolveEventSelection(eventSelectionStarted ? selectedAudio : null);
         playback.finishAudible();
         if (activePlayback === playback) {
