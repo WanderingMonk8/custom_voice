@@ -4291,10 +4291,30 @@ function setup(ctx) {
   freesoundSearchButton.type = "button";
   freesoundSearchButton.className = "chat-voice-add-button";
   freesoundSearchButton.textContent = "Search Freesound";
+  const durationFilterLabel = document.createElement("label");
+  durationFilterLabel.className = "chat-voice-toggle";
+  const durationFilter = document.createElement("input");
+  durationFilter.type = "checkbox";
+  const durationFilterText = document.createElement("span");
+  durationFilterText.textContent = "Only sounds up to 120 seconds";
+  durationFilterLabel.append(durationFilter, durationFilterText);
+  const licenseFilter = document.createElement("select");
+  licenseFilter.setAttribute("aria-label", "Filter licenses on this results page");
+  for (const [value, label] of [["all", "All licenses"], ["supported", "Importable licenses on this page"], ["cc0", "CC0 on this page"], ["by", "CC BY on this page"]]) {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = label;
+    licenseFilter.append(option);
+  }
   const freesoundResults = document.createElement("div");
   freesoundResults.className = "chat-voice-favorite-list";
   freesoundResults.setAttribute("aria-live", "polite");
-  soundLibraryPanel.append(soundsHint, soundFile, soundName, soundTags, soundKind, soundAdd, soundSearch, soundFilter, soundList, freesoundSearchHint, freesoundQuery, freesoundSearchButton, freesoundResults);
+  const freesoundMore = document.createElement("button");
+  freesoundMore.type = "button";
+  freesoundMore.className = "chat-voice-add-button";
+  freesoundMore.textContent = "Next results";
+  freesoundMore.hidden = true;
+  soundLibraryPanel.append(soundsHint, soundFile, soundName, soundTags, soundKind, soundAdd, soundSearch, soundFilter, soundList, freesoundSearchHint, freesoundQuery, durationFilterLabel, licenseFilter, freesoundSearchButton, freesoundResults, freesoundMore);
   const creditsButton = document.createElement("button");
   creditsButton.type = "button";
   creditsButton.className = "chat-voice-add-button";
@@ -4866,144 +4886,188 @@ function setup(ctx) {
       clearTimeout(timer);
     }
   }
-  freesoundSearchButton.addEventListener("click", () => {
-    void (async () => {
-      const query = freesoundQuery.value.trim();
-      if (!query) {
-        setStatus("Enter a Freesound search first.", "error");
-        return;
-      }
-      freesoundSearchButton.disabled = true;
-      stopSoundPreview();
-      externalSoundPreviewButtons.clear();
+  let freesoundPage = 1;
+  let freesoundSearchQuery = "";
+  let freesoundSearchDuration = false;
+  let freesoundPageResults = [];
+  async function searchFreesound(next) {
+    const query = next ? freesoundSearchQuery : freesoundQuery.value.trim();
+    if (!query) {
+      setStatus("Enter a Freesound search first.", "error");
+      return;
+    }
+    if (!next) {
+      freesoundPage = 1;
+      freesoundSearchQuery = query;
+      freesoundSearchDuration = durationFilter.checked;
+    }
+    freesoundSearchButton.disabled = true;
+    freesoundMore.disabled = true;
+    stopSoundPreview();
+    externalSoundPreviewButtons.clear();
+    freesoundResults.replaceChildren();
+    const loading = document.createElement("div");
+    loading.className = "chat-voice-hint";
+    loading.textContent = "Searching Freesound\u2026";
+    freesoundResults.append(loading);
+    try {
+      const response = await soundLibraryRequest("chat_voice_freesound_search", { query, page: freesoundPage, maxDuration: freesoundSearchDuration });
+      if (soundLibraryDisposed) return;
       freesoundResults.replaceChildren();
-      const loading = document.createElement("div");
-      loading.className = "chat-voice-hint";
-      loading.textContent = "Searching Freesound\u2026";
-      freesoundResults.append(loading);
-      try {
-        const response = await soundLibraryRequest("chat_voice_freesound_search", { query });
-        if (soundLibraryDisposed) return;
-        freesoundResults.replaceChildren();
-        const results = Array.isArray(response.results) ? response.results : [];
-        if (!results.length) {
-          loading.textContent = "No results found.";
-          freesoundResults.append(loading);
-        }
-        for (const item of results) {
-          if (!Number.isSafeInteger(item.id) || item.id < 1) continue;
-          const row = document.createElement("div");
-          row.className = "chat-voice-favorite-row";
-          const link = document.createElement("a");
-          link.href = `https://freesound.org/s/${item.id}/`;
-          link.target = "_blank";
-          link.rel = "noopener noreferrer";
-          link.textContent = item.name;
-          const info = document.createElement("div");
-          info.className = "chat-voice-hint";
-          info.textContent = `By ${item.username} \xB7 ${item.duration.toFixed(1)} seconds \xB7 ${item.license}`;
-          row.append(link, info);
-          const previewUrl2 = safeFreesoundPreviewUrl(item.previewUrl, item.id);
-          if (previewUrl2) {
-            const id = `freesound:${item.id}`;
-            const preview = document.createElement("button");
-            preview.type = "button";
-            preview.className = "chat-voice-preview-button";
-            externalSoundPreviewButtons.set(id, preview);
-            updateSoundPreviewButton(id);
-            preview.addEventListener("click", () => {
-              if (soundPreviewId === id) {
-                stopSoundPreview();
-                return;
-              }
-              stopSoundPreview();
-              stopVoicePreview();
-              const generation = soundPreviewGeneration;
-              soundPreviewId = id;
-              soundPreviewProgress = "Loading";
-              updateSoundPreviewButton(id);
-              const audio = new Audio(previewUrl2);
-              externalSoundPreview = audio;
-              audio.onplaying = () => {
-                if (generation === soundPreviewGeneration) {
-                  soundPreviewProgress = "";
-                  updateSoundPreviewButton(id);
-                }
-              };
-              audio.onended = () => {
-                if (generation === soundPreviewGeneration) stopSoundPreview();
-              };
-              audio.onerror = () => {
-                if (generation === soundPreviewGeneration) {
-                  stopSoundPreview();
-                  setStatus("Could not play the Freesound preview.", "error");
-                }
-              };
-              void audio.play().catch(() => {
-                if (generation === soundPreviewGeneration) {
-                  stopSoundPreview();
-                  setStatus("Could not play the Freesound preview.", "error");
-                }
-              });
-            });
-            row.append(preview);
-            if (isFreesoundImportLicense(item.license)) {
-              const category = document.createElement("select");
-              category.setAttribute("aria-label", `Sound type for ${item.name}`);
-              for (const [value, label] of [["event", "Event sound"], ["ambience", "Ambience"]]) {
-                const option = document.createElement("option");
-                option.value = value;
-                option.textContent = label;
-                category.append(option);
-              }
-              const add = document.createElement("button");
-              add.type = "button";
-              add.className = "chat-voice-add-button";
-              add.textContent = "Import preview";
-              add.addEventListener("click", () => {
-                void (async () => {
-                  add.disabled = true;
-                  add.textContent = "Importing\u2026";
-                  try {
-                    const url = safeFreesoundPreviewUrl(item.previewUrl, item.id);
-                    if (!url || !isFreesoundImportLicense(item.license)) throw new Error("This preview is not available for import.");
-                    if (item.duration > 120) throw new Error("Sound must be at most 120 seconds long.");
-                    const bytes = await downloadFreesoundPreview(url);
-                    const Context = window.AudioContext ?? window.webkitAudioContext;
-                    if (!Context) throw new Error("This browser cannot validate audio files.");
-                    const context2 = new Context();
-                    try {
-                      const decoded = await context2.decodeAudioData(bytes.buffer.slice(0));
-                      if (!Number.isFinite(decoded.duration) || decoded.duration <= 0 || decoded.duration > 120 || decoded.numberOfChannels > 2) throw new Error("Preview must be mono or stereo and at most 120 seconds.");
-                    } finally {
-                      await context2.close().catch(() => void 0);
-                    }
-                    await uploadFavoriteSound({ name: item.name.trim().slice(0, 120), description: "", tags: item.tags ?? [], kind: category.value === "ambience" ? "ambience" : "event", mime: "audio/mpeg", provenance: { provider: "freesound", soundId: item.id, title: item.name, creator: item.username, license: item.license, sourceUrl: `https://freesound.org/s/${item.id}/` } }, bytes);
-                    await refreshSoundLibrary();
-                    setStatus("Freesound preview imported to favorites.", "saved");
-                  } catch (error) {
-                    setStatus(error instanceof Error && error.name === "AbortError" ? "Freesound preview download timed out." : error instanceof TypeError ? "Could not download the preview; your browser or server may block cross-origin requests." : error instanceof Error ? error.message : "Could not import the Freesound preview.", "error");
-                  } finally {
-                    add.disabled = false;
-                    add.textContent = "Import preview";
-                  }
-                })();
-              });
-              row.append(category, add);
-            }
-          }
-          freesoundResults.append(row);
-        }
-      } catch (error) {
-        if (!soundLibraryDisposed) {
-          loading.textContent = error instanceof Error ? error.message : "Could not search Freesound.";
-          freesoundResults.replaceChildren(loading);
-        }
-      } finally {
-        freesoundSearchButton.disabled = false;
+      freesoundPageResults = Array.isArray(response.results) ? response.results : [];
+      freesoundMore.hidden = !response.hasMore;
+      renderFreesoundPage();
+    } catch (error) {
+      if (!soundLibraryDisposed) {
+        loading.textContent = error instanceof Error ? error.message : "Could not search Freesound.";
+        freesoundResults.replaceChildren(loading);
+        freesoundMore.hidden = true;
       }
-    })();
+    } finally {
+      freesoundSearchButton.disabled = false;
+      freesoundMore.disabled = false;
+    }
+  }
+  function renderFreesoundPage() {
+    freesoundResults.replaceChildren();
+    const results = freesoundPageResults.filter((item) => licenseFilter.value === "all" || (licenseFilter.value === "supported" ? isFreesoundImportLicense(item.license) : licenseFilter.value === "cc0" ? isFreesoundCc0(item.license) : isFreesoundImportLicense(item.license) && !isFreesoundCc0(item.license)));
+    if (!results.length) {
+      const empty = document.createElement("div");
+      empty.className = "chat-voice-hint";
+      empty.textContent = "No matching results on this page.";
+      freesoundResults.append(empty);
+    }
+    for (const item of results) {
+      if (!Number.isSafeInteger(item.id) || item.id < 1) continue;
+      const row = document.createElement("div");
+      row.className = "chat-voice-favorite-row";
+      const link = document.createElement("a");
+      link.href = `https://freesound.org/s/${item.id}/`;
+      link.target = "_blank";
+      link.rel = "noopener noreferrer";
+      link.textContent = item.name;
+      const info = document.createElement("div");
+      info.className = "chat-voice-hint";
+      info.textContent = `By ${item.username} \xB7 ${item.duration.toFixed(1)} seconds \xB7 ${item.license}`;
+      row.append(link, info);
+      const previewUrl2 = safeFreesoundPreviewUrl(item.previewUrl, item.id);
+      if (previewUrl2) {
+        const id = `freesound:${item.id}`;
+        const preview = document.createElement("button");
+        preview.type = "button";
+        preview.className = "chat-voice-preview-button";
+        externalSoundPreviewButtons.set(id, preview);
+        updateSoundPreviewButton(id);
+        preview.addEventListener("click", () => {
+          if (soundPreviewId === id) {
+            stopSoundPreview();
+            return;
+          }
+          stopSoundPreview();
+          stopVoicePreview();
+          const generation = soundPreviewGeneration;
+          soundPreviewId = id;
+          soundPreviewProgress = "Loading";
+          updateSoundPreviewButton(id);
+          const audio = new Audio(previewUrl2);
+          externalSoundPreview = audio;
+          audio.onplaying = () => {
+            if (generation === soundPreviewGeneration) {
+              soundPreviewProgress = "";
+              updateSoundPreviewButton(id);
+            }
+          };
+          audio.onended = () => {
+            if (generation === soundPreviewGeneration) stopSoundPreview();
+          };
+          audio.onerror = () => {
+            if (generation === soundPreviewGeneration) {
+              stopSoundPreview();
+              setStatus("Could not play the Freesound preview.", "error");
+            }
+          };
+          void audio.play().catch(() => {
+            if (generation === soundPreviewGeneration) {
+              stopSoundPreview();
+              setStatus("Could not play the Freesound preview.", "error");
+            }
+          });
+        });
+        row.append(preview);
+        if (isFreesoundImportLicense(item.license)) {
+          const category = document.createElement("select");
+          category.setAttribute("aria-label", `Sound type for ${item.name}`);
+          for (const [value, label] of [["event", "Event sound"], ["ambience", "Ambience"]]) {
+            const option = document.createElement("option");
+            option.value = value;
+            option.textContent = label;
+            category.append(option);
+          }
+          const add = document.createElement("button");
+          add.type = "button";
+          add.className = "chat-voice-add-button";
+          add.textContent = "Import preview";
+          if (item.duration > 120) {
+            add.disabled = true;
+            add.title = "Import is limited to 120 seconds.";
+            const reason = document.createElement("div");
+            reason.className = "chat-voice-hint";
+            reason.textContent = "Import unavailable: this sound is longer than 120 seconds.";
+            row.append(reason);
+          }
+          add.addEventListener("click", () => {
+            void (async () => {
+              add.disabled = true;
+              add.textContent = "Importing\u2026";
+              try {
+                const url = safeFreesoundPreviewUrl(item.previewUrl, item.id);
+                if (!url || !isFreesoundImportLicense(item.license)) throw new Error("This preview is not available for import.");
+                if (item.duration > 120) throw new Error("Sound must be at most 120 seconds long.");
+                const bytes = await downloadFreesoundPreview(url);
+                const Context = window.AudioContext ?? window.webkitAudioContext;
+                if (!Context) throw new Error("This browser cannot validate audio files.");
+                const context2 = new Context();
+                try {
+                  const decoded = await context2.decodeAudioData(bytes.buffer.slice(0));
+                  if (!Number.isFinite(decoded.duration) || decoded.duration <= 0 || decoded.duration > 120 || decoded.numberOfChannels > 2) throw new Error("Preview must be mono or stereo and at most 120 seconds.");
+                } finally {
+                  await context2.close().catch(() => void 0);
+                }
+                await uploadFavoriteSound({ name: item.name.trim().slice(0, 120), description: "", tags: item.tags ?? [], kind: category.value === "ambience" ? "ambience" : "event", mime: "audio/mpeg", provenance: { provider: "freesound", soundId: item.id, title: item.name, creator: item.username, license: item.license, sourceUrl: `https://freesound.org/s/${item.id}/` } }, bytes);
+                await refreshSoundLibrary();
+                setStatus("Freesound preview imported to favorites.", "saved");
+              } catch (error) {
+                setStatus(error instanceof Error && error.name === "AbortError" ? "Freesound preview download timed out." : error instanceof TypeError ? "Could not download the preview; your browser or server may block cross-origin requests." : error instanceof Error ? error.message : "Could not import the Freesound preview.", "error");
+              } finally {
+                add.disabled = false;
+                add.textContent = "Import preview";
+              }
+            })();
+          });
+          row.append(category, add);
+        } else {
+          const reason = document.createElement("div");
+          reason.className = "chat-voice-hint";
+          reason.textContent = "Import unavailable: this license is not supported.";
+          row.append(reason);
+        }
+      } else {
+        const reason = document.createElement("div");
+        reason.className = "chat-voice-hint";
+        reason.textContent = "Preview and import are unavailable for this result.";
+        row.append(reason);
+      }
+      freesoundResults.append(row);
+    }
+  }
+  freesoundSearchButton.addEventListener("click", () => {
+    void searchFreesound(false);
   });
+  freesoundMore.addEventListener("click", () => {
+    freesoundPage++;
+    void searchFreesound(true);
+  });
+  licenseFilter.addEventListener("change", renderFreesoundPage);
   async function readSoundAudio(id, isCancelled = () => false, onProgress = () => void 0) {
     const result = await soundLibraryRequest("chat_voice_sound_library_read", { id });
     try {

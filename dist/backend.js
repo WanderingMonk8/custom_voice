@@ -8447,6 +8447,9 @@ spindle.onFrontendMessage(async (rawPayload, userId, frontendSessionId) => {
         const key = await spindle.enclave.get("freesound_api_key", userId);
         if (!key) throw new Error("Save a Freesound API key in Sound effects \u2192 Advanced first.");
         const params = new URLSearchParams({ query, fields: "id,name,username,license,duration,previews,tags", page_size: "12" });
+        const page = Number.isSafeInteger(payload.page) ? Math.max(1, Math.min(50, payload.page)) : 1;
+        params.set("page", String(page));
+        if (payload.maxDuration === true) params.set("filter", "duration:[0 TO 120]");
         const response = await Promise.race([
           spindle.cors(`https://freesound.org/apiv2/search/text/?${params}`, { method: "GET", headers: { Authorization: `Token ${key}` } }),
           new Promise((_, reject) => setTimeout(() => reject(new Error("Freesound search timed out.")), 2e4))
@@ -8460,7 +8463,8 @@ spindle.onFrontendMessage(async (rawPayload, userId, frontendSessionId) => {
         let body = "body" in envelope ? envelope.body : envelope;
         if (typeof body === "string") body = JSON.parse(body);
         const results = parseFreesoundSearch(body);
-        sendFrontend({ type: "chat_voice_sound_library", requestId: payload.requestId, results }, userId, frontendSessionId);
+        const hasMore = !!body && typeof body === "object" && typeof body.next === "string" && page < 50;
+        sendFrontend({ type: "chat_voice_sound_library", requestId: payload.requestId, results, hasMore }, userId, frontendSessionId);
       } catch (error) {
         const safe = error instanceof Error && /^(An authenticated|Enter a search|Save a Freesound|Freesound rejected|Freesound rate|Freesound search failed|Freesound search timed out|Unexpected Freesound)/u.test(error.message) ? error.message : "Could not search Freesound.";
         sendFrontend({ type: "chat_voice_sound_library", requestId: payload.requestId, error: safe }, userId, frontendSessionId);

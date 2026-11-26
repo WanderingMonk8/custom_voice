@@ -173,7 +173,7 @@ type FrontendMessage =
   | { type: 'chat_voice_sound_library_read_chunk'; requestId: string; downloadId: string; offset: number }
   | { type: 'chat_voice_sound_download_release'; requestId: string; downloadId: string }
   | { type: 'chat_voice_freesound_key'; requestId: string; action: 'status' | 'save' | 'remove'; key?: string }
-  | { type: 'chat_voice_freesound_search'; requestId: string; query: string }
+  | { type: 'chat_voice_freesound_search'; requestId: string; query: string; page?: number; maxDuration?: boolean }
   | { type: 'chat_voice_sound_scene_plan'; requestId: string; message: string; connectionId?: string; model?: string }
   | { type: 'chat_voice_decision_status'; requestId?: string }
   | { type: 'chat_voice_list_llm_connections'; requestId: string }
@@ -1997,6 +1997,9 @@ spindle.onFrontendMessage(async (rawPayload: unknown, userId, frontendSessionId)
         const key = await spindle.enclave.get('freesound_api_key', userId)
         if (!key) throw new Error('Save a Freesound API key in Sound effects → Advanced first.')
         const params = new URLSearchParams({ query, fields: 'id,name,username,license,duration,previews,tags', page_size: '12' })
+        const page = Number.isSafeInteger(payload.page) ? Math.max(1, Math.min(50, payload.page!)) : 1
+        params.set('page', String(page))
+        if (payload.maxDuration === true) params.set('filter', 'duration:[0 TO 120]')
         const response = await Promise.race([
           spindle.cors(`https://freesound.org/apiv2/search/text/?${params}`, { method: 'GET', headers: { Authorization: `Token ${key}` } }),
           new Promise<never>((_, reject) => setTimeout(() => reject(new Error('Freesound search timed out.')), 20_000)),
@@ -2010,7 +2013,8 @@ spindle.onFrontendMessage(async (rawPayload: unknown, userId, frontendSessionId)
         let body: unknown = 'body' in envelope ? envelope.body : envelope
         if (typeof body === 'string') body = JSON.parse(body)
         const results = parseFreesoundSearch(body)
-        sendFrontend({ type: 'chat_voice_sound_library', requestId: payload.requestId, results }, userId, frontendSessionId)
+        const hasMore = !!body && typeof body === 'object' && typeof (body as Record<string, unknown>).next === 'string' && page < 50
+        sendFrontend({ type: 'chat_voice_sound_library', requestId: payload.requestId, results, hasMore }, userId, frontendSessionId)
       } catch (error) {
         const safe = error instanceof Error && /^(An authenticated|Enter a search|Save a Freesound|Freesound rejected|Freesound rate|Freesound search failed|Freesound search timed out|Unexpected Freesound)/u.test(error.message) ? error.message : 'Could not search Freesound.'
         sendFrontend({ type: 'chat_voice_sound_library', requestId: payload.requestId, error: safe }, userId, frontendSessionId)

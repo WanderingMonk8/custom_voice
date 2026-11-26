@@ -348,6 +348,7 @@ interface SoundLibraryPayload {
   hasKey?: boolean
   cues?: SoundSceneCue[]
   results?: FreesoundSearchResult[]
+  hasMore?: boolean
   chunked?: boolean
   uploadId?: string
   downloadId?: string
@@ -1911,9 +1912,18 @@ export function setup(ctx: SpindleFrontendContext) {
   freesoundQuery.placeholder = 'Search Freesound'; freesoundQuery.maxLength = 120; freesoundQuery.setAttribute('aria-label', 'Search Freesound')
   const freesoundSearchButton = document.createElement('button')
   freesoundSearchButton.type = 'button'; freesoundSearchButton.className = 'chat-voice-add-button'; freesoundSearchButton.textContent = 'Search Freesound'
+  const durationFilterLabel = document.createElement('label'); durationFilterLabel.className = 'chat-voice-toggle'
+  const durationFilter = document.createElement('input'); durationFilter.type = 'checkbox'
+  const durationFilterText = document.createElement('span'); durationFilterText.textContent = 'Only sounds up to 120 seconds'
+  durationFilterLabel.append(durationFilter, durationFilterText)
+  const licenseFilter = document.createElement('select'); licenseFilter.setAttribute('aria-label', 'Filter licenses on this results page')
+  for (const [value, label] of [['all', 'All licenses'], ['supported', 'Importable licenses on this page'], ['cc0', 'CC0 on this page'], ['by', 'CC BY on this page']]) {
+    const option = document.createElement('option'); option.value = value; option.textContent = label; licenseFilter.append(option)
+  }
   const freesoundResults = document.createElement('div')
   freesoundResults.className = 'chat-voice-favorite-list'; freesoundResults.setAttribute('aria-live', 'polite')
-  soundLibraryPanel.append(soundsHint, soundFile, soundName, soundTags, soundKind, soundAdd, soundSearch, soundFilter, soundList, freesoundSearchHint, freesoundQuery, freesoundSearchButton, freesoundResults)
+  const freesoundMore = document.createElement('button'); freesoundMore.type = 'button'; freesoundMore.className = 'chat-voice-add-button'; freesoundMore.textContent = 'Next results'; freesoundMore.hidden = true
+  soundLibraryPanel.append(soundsHint, soundFile, soundName, soundTags, soundKind, soundAdd, soundSearch, soundFilter, soundList, freesoundSearchHint, freesoundQuery, durationFilterLabel, licenseFilter, freesoundSearchButton, freesoundResults, freesoundMore)
   const creditsButton = document.createElement('button')
   creditsButton.type = 'button'; creditsButton.className = 'chat-voice-add-button'; creditsButton.textContent = 'Show saved recording credits'
   const creditsList = document.createElement('div')
@@ -2514,20 +2524,35 @@ export function setup(ctx: SpindleFrontendContext) {
     } finally { clearTimeout(timer) }
   }
 
-  freesoundSearchButton.addEventListener('click', () => { void (async () => {
-    const query = freesoundQuery.value.trim()
+  let freesoundPage = 1
+  let freesoundSearchQuery = ''
+  let freesoundSearchDuration = false
+  let freesoundPageResults: FreesoundSearchResult[] = []
+  async function searchFreesound(next: boolean): Promise<void> {
+    const query = next ? freesoundSearchQuery : freesoundQuery.value.trim()
     if (!query) { setStatus('Enter a Freesound search first.', 'error'); return }
+    if (!next) { freesoundPage = 1; freesoundSearchQuery = query; freesoundSearchDuration = durationFilter.checked }
     freesoundSearchButton.disabled = true
+    freesoundMore.disabled = true
     stopSoundPreview()
     externalSoundPreviewButtons.clear()
     freesoundResults.replaceChildren()
     const loading = document.createElement('div'); loading.className = 'chat-voice-hint'; loading.textContent = 'Searching Freesound…'; freesoundResults.append(loading)
     try {
-      const response = await soundLibraryRequest('chat_voice_freesound_search', { query })
+      const response = await soundLibraryRequest('chat_voice_freesound_search', { query, page: freesoundPage, maxDuration: freesoundSearchDuration })
       if (soundLibraryDisposed) return
       freesoundResults.replaceChildren()
-      const results = Array.isArray(response.results) ? response.results : []
-      if (!results.length) { loading.textContent = 'No results found.'; freesoundResults.append(loading) }
+      freesoundPageResults = Array.isArray(response.results) ? response.results : []
+      freesoundMore.hidden = !response.hasMore
+      renderFreesoundPage()
+    } catch (error) {
+      if (!soundLibraryDisposed) { loading.textContent = error instanceof Error ? error.message : 'Could not search Freesound.'; freesoundResults.replaceChildren(loading); freesoundMore.hidden = true }
+    } finally { freesoundSearchButton.disabled = false; freesoundMore.disabled = false }
+  }
+  function renderFreesoundPage(): void {
+      freesoundResults.replaceChildren()
+      const results = freesoundPageResults.filter(item => licenseFilter.value === 'all' || (licenseFilter.value === 'supported' ? isFreesoundImportLicense(item.license) : licenseFilter.value === 'cc0' ? isFreesoundCc0(item.license) : isFreesoundImportLicense(item.license) && !isFreesoundCc0(item.license)))
+      if (!results.length) { const empty = document.createElement('div'); empty.className = 'chat-voice-hint'; empty.textContent = 'No matching results on this page.'; freesoundResults.append(empty) }
       for (const item of results) {
         if (!Number.isSafeInteger(item.id) || item.id < 1) continue
         const row = document.createElement('div'); row.className = 'chat-voice-favorite-row'
@@ -2562,6 +2587,7 @@ export function setup(ctx: SpindleFrontendContext) {
             }
             const add = document.createElement('button')
             add.type = 'button'; add.className = 'chat-voice-add-button'; add.textContent = 'Import preview'
+            if (item.duration > 120) { add.disabled = true; add.title = 'Import is limited to 120 seconds.'; const reason = document.createElement('div'); reason.className = 'chat-voice-hint'; reason.textContent = 'Import unavailable: this sound is longer than 120 seconds.'; row.append(reason) }
             add.addEventListener('click', () => { void (async () => {
               add.disabled = true; add.textContent = 'Importing…'
               try {
@@ -2584,14 +2610,18 @@ export function setup(ctx: SpindleFrontendContext) {
               } finally { add.disabled = false; add.textContent = 'Import preview' }
             })() })
             row.append(category, add)
+          } else {
+            const reason = document.createElement('div'); reason.className = 'chat-voice-hint'; reason.textContent = 'Import unavailable: this license is not supported.'; row.append(reason)
           }
+        } else {
+          const reason = document.createElement('div'); reason.className = 'chat-voice-hint'; reason.textContent = 'Preview and import are unavailable for this result.'; row.append(reason)
         }
         freesoundResults.append(row)
       }
-    } catch (error) {
-      if (!soundLibraryDisposed) { loading.textContent = error instanceof Error ? error.message : 'Could not search Freesound.'; freesoundResults.replaceChildren(loading) }
-    } finally { freesoundSearchButton.disabled = false }
-  })() })
+  }
+  freesoundSearchButton.addEventListener('click', () => { void searchFreesound(false) })
+  freesoundMore.addEventListener('click', () => { freesoundPage++; void searchFreesound(true) })
+  licenseFilter.addEventListener('change', renderFreesoundPage)
 
   async function readSoundAudio(id: string, isCancelled: () => boolean = () => false, onProgress: (received: number, total: number) => void = () => undefined): Promise<{ favorite: FavoriteSound; bytes: Uint8Array<ArrayBuffer> }> {
     const result = await soundLibraryRequest('chat_voice_sound_library_read', { id })
