@@ -475,6 +475,24 @@ test('late ambience starts at a later boundary but not after its stop', () => {
   assert.equal(ambienceInstructionAtBoundary(mapped, 5), null)
 })
 
+test('ambience start and stop at the same boundary cover the introducing clip only', () => {
+  const message = 'Crickets chirped in the grass. Maya opened the cabin door.'
+  const clips = ['Crickets chirped in the grass.', 'Maya opened the cabin door.']
+  const segments = alignSoundSourceSegments(message, clips)
+  const start = { kind: 'ambience' as const, action: 'play' as const, assetId: 'crickets', anchor: 'Crickets chirped', offset: message.indexOf('Crickets chirped'), position: 'after' as const }
+  const stop = { kind: 'ambience' as const, action: 'stop' as const, anchor: 'Maya opened', offset: message.indexOf('Maya opened'), position: 'before' as const }
+  const mapped = mapSoundCueBoundaries([start, stop], segments, message.length)
+  assert.deepEqual(mapped.map(item => item.boundary), [0, 1])
+  assert.equal(mapped[0].adjustment, 'ambience-start-before-source-clip')
+  assert.equal(ambienceInstructionAtBoundary(mapped, 0)?.assetId, 'crickets')
+  assert.equal(ambienceInstructionAtBoundary(mapped, 1), null)
+  assert.equal(ambienceInstructionAtBoundary(mapped, 2), null)
+  const ambiguous = mapSoundCueBoundaries([start, stop, { ...stop, anchor: 'cabin door', offset: message.indexOf('cabin door') }], segments, message.length)
+  assert.deepEqual(ambiguous.map(item => item.boundary), [1, 1, 1])
+  const sameClip = { ...stop, anchor: 'grass', offset: message.indexOf('grass') }
+  assert.deepEqual(mapSoundCueBoundaries([start, sameClip], segments, message.length).map(item => item.boundary), [1, 0])
+})
+
 test('local sound mix permits ambience under speech and events but prohibits event/voice overlap', () => {
   const mono = (values: number[]) => [new Float32Array(values)]
   const tracks = [

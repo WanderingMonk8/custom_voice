@@ -276,7 +276,7 @@ export function alignSoundSourceSegments(message: string, clipTexts: readonly st
 }
 
 /** Map validated source anchors to clip boundaries; never split or overlap a voice clip. */
-export function mapSoundCueBoundaries(cues: readonly SoundSceneCue[], segments: readonly (SoundSceneSegment | null)[], messageLength: number): Array<{ cue: SoundSceneCue; boundary: number }> {
+export function mapSoundCueBoundaries(cues: readonly SoundSceneCue[], segments: readonly (SoundSceneSegment | null)[], messageLength: number): Array<{ cue: SoundSceneCue; boundary: number; adjustment?: 'ambience-start-before-source-clip' }> {
   let lastEnd = 0
   for (const segment of segments) {
     if (!segment) continue
@@ -284,12 +284,29 @@ export function mapSoundCueBoundaries(cues: readonly SoundSceneCue[], segments: 
       || segment.start < lastEnd || segment.end <= segment.start || segment.end > messageLength) throw new Error('Invalid scene segment boundaries.')
     lastEnd = segment.end
   }
-  const mapped: Array<{ cue: SoundSceneCue; boundary: number }> = []
+  const mapped: Array<{ cue: SoundSceneCue; boundary: number; adjustment?: 'ambience-start-before-source-clip' }> = []
   for (const cue of cues) {
     const end = cue.offset + cue.anchor.length
     const index = segments.findIndex(segment => segment !== null && cue.offset >= segment.start && end <= segment.end)
     if (index < 0) continue
     mapped.push({ cue, boundary: cue.position === 'before' ? index : index + 1 })
+  }
+  // A start anchored AFTER one voice and a stop BEFORE the next otherwise
+  // collapse to the same boundary and never play. For an unambiguous pair,
+  // place the start at the beginning of its own source clip, retaining the
+  // original stop boundary. This is clip-level approximation, not word timing.
+  for (const start of mapped) {
+    if (start.cue.kind !== 'ambience' || start.cue.action !== 'play' || start.cue.position !== 'after' || start.boundary < 1) continue
+    const sameBoundary = mapped.filter(item => item.cue.kind === 'ambience' && item.boundary === start.boundary)
+    if (sameBoundary.length !== 2) continue
+    const stop = sameBoundary.find(item => item.cue.action === 'stop' && item.cue.position === 'before')
+    const previous = segments[start.boundary - 1]
+    const next = segments[start.boundary]
+    if (!stop || !previous || !next || start.cue.offset < previous.start || start.cue.offset + start.cue.anchor.length > previous.end
+      || stop.cue.offset < next.start || stop.cue.offset + stop.cue.anchor.length > next.end
+      || start.cue.offset + start.cue.anchor.length > stop.cue.offset) continue
+    start.boundary -= 1
+    start.adjustment = 'ambience-start-before-source-clip'
   }
   return mapped
 }

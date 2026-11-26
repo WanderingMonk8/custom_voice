@@ -2743,6 +2743,17 @@ function mapSoundCueBoundaries(cues, segments, messageLength) {
     if (index < 0) continue;
     mapped.push({ cue, boundary: cue.position === "before" ? index : index + 1 });
   }
+  for (const start of mapped) {
+    if (start.cue.kind !== "ambience" || start.cue.action !== "play" || start.cue.position !== "after" || start.boundary < 1) continue;
+    const sameBoundary = mapped.filter((item) => item.cue.kind === "ambience" && item.boundary === start.boundary);
+    if (sameBoundary.length !== 2) continue;
+    const stop = sameBoundary.find((item) => item.cue.action === "stop" && item.cue.position === "before");
+    const previous = segments[start.boundary - 1];
+    const next = segments[start.boundary];
+    if (!stop || !previous || !next || start.cue.offset < previous.start || start.cue.offset + start.cue.anchor.length > previous.end || stop.cue.offset < next.start || stop.cue.offset + stop.cue.anchor.length > next.end || start.cue.offset + start.cue.anchor.length > stop.cue.offset) continue;
+    start.boundary -= 1;
+    start.adjustment = "ambience-start-before-source-clip";
+  }
   return mapped;
 }
 
@@ -7753,7 +7764,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
             const boundary = mappedIndex < 0 ? null : mapped[mappedIndex].boundary;
             const key = boundary === null ? "" : `${cue.offset}:${cue.position}:${cue.assetId ?? ""}`;
             const state = boundary === null ? "unaligned" : cue.kind === "event" && selectedEventCues.has(cue) ? "selected" : cue.kind === "ambience" && cue.action === "play" && mixedAmbienceKeys.has(key) ? "mixed" : cue.action === "stop" ? boundary <= lastReachedSoundBoundary ? "stop boundary reached" : "boundary not reached" : cue.kind === "event" && boundary <= (cueArrivalBoundary.get(cue) ?? planReceivedAfterBoundary) ? "plan arrived after boundary" : boundary > lastReachedSoundBoundary ? "boundary not reached" : cue.kind === "ambience" && eventAssets.has(cue.assetId ?? "") ? "not mixed (replaced or no foreground clip)" : cue.kind === "event" && eventAssets.has(cue.assetId ?? "") ? "not selected at boundary (asset may have arrived late)" : `asset not ready (${soundLoadStatus.get(cue.assetId ?? "") ?? "not requested"})`;
-            appendSpeakerDebugLog(`Sound cue [${index + 1}]: kind=${cue.kind}, action=${cue.action}, sound=${JSON.stringify(soundAssetNames.get(cue.assetId ?? "") ?? cue.assetId ?? "<none>")}, boundary=${boundary ?? "unaligned"}, outcome=${state}.`);
+            appendSpeakerDebugLog(`Sound cue [${index + 1}]: kind=${cue.kind}, action=${cue.action}, sound=${JSON.stringify(soundAssetNames.get(cue.assetId ?? "") ?? cue.assetId ?? "<none>")}, anchor-offset=${cue.offset}, anchor-length=${cue.anchor.length}, position=${cue.position}, boundary=${boundary ?? "unaligned"}, adjustment=${mappedIndex < 0 ? "none" : mapped[mappedIndex].adjustment ?? "none"}, outcome=${state}.`);
           });
         }
         adaptiveSynthesisLimits.delete(adaptiveLimitToken);

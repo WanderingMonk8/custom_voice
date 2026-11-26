@@ -5351,7 +5351,7 @@ export function setup(ctx: SpindleFrontendContext) {
             : cue.kind === 'ambience' && eventAssets.has(cue.assetId ?? '') ? 'not mixed (replaced or no foreground clip)'
             : cue.kind === 'event' && eventAssets.has(cue.assetId ?? '') ? 'not selected at boundary (asset may have arrived late)'
             : `asset not ready (${soundLoadStatus.get(cue.assetId ?? '') ?? 'not requested'})`
-          appendSpeakerDebugLog(`Sound cue [${index + 1}]: kind=${cue.kind}, action=${cue.action}, sound=${JSON.stringify(soundAssetNames.get(cue.assetId ?? '') ?? cue.assetId ?? '<none>')}, boundary=${boundary ?? 'unaligned'}, outcome=${state}.`)
+          appendSpeakerDebugLog(`Sound cue [${index + 1}]: kind=${cue.kind}, action=${cue.action}, sound=${JSON.stringify(soundAssetNames.get(cue.assetId ?? '') ?? cue.assetId ?? '<none>')}, anchor-offset=${cue.offset}, anchor-length=${cue.anchor.length}, position=${cue.position}, boundary=${boundary ?? 'unaligned'}, adjustment=${mappedIndex < 0 ? 'none' : mapped[mappedIndex].adjustment ?? 'none'}, outcome=${state}.`)
         })
       }
       adaptiveSynthesisLimits.delete(adaptiveLimitToken)
