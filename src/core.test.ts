@@ -4,6 +4,7 @@ import { MAX_FAVORITE_SOUND_BYTES, MAX_FAVORITE_SOUND_SECONDS, SoundLibrary, isS
 import { SoundDownloadTransfers, SoundUploadTransfers } from './sound-transfer'
 import { SoundPreviewCache } from './sound-preview-cache'
 import { SoundLoadQueue } from './sound-load-queue'
+import { AutomaticSoundCache } from './sound-auto-cache'
 import { selectSoundLibraryTab } from './sound-library-tabs'
 import { soundPlanErrorCategory, soundRequestTimeoutMs } from './sound-plan-diagnostics'
 import { isFreesoundCc0, parseFreesoundSearch, safeFreesoundPreviewUrl } from './freesound'
@@ -195,6 +196,22 @@ test('sound favorites persist across library instances and stay isolated by user
   await reinstalled.remove(favorite.id, 'alice')
   assert.deepEqual(await reinstalled.list('alice'), [])
   assert.equal(storage.files.size, 0)
+})
+
+test('automatic cache persists independently of favorites and deduplicates by sound and category', async () => {
+  const storage = new FakeSoundStorage()
+  const wav = new TextEncoder().encode('RIFF0000WAVEaudio')
+  const favorite = await new SoundLibrary(storage).add({ name: 'Favorite', kind: 'event', mime: 'audio/wav' }, wav, 'alice')
+  const cache = new AutomaticSoundCache(storage)
+  const input = { name: 'Door', kind: 'event' as const, mime: 'audio/wav', provenance: { provider: 'freesound' as const, soundId: 42, creator: 'artist', license: 'https://creativecommons.org/publicdomain/zero/1.0/', sourceUrl: 'https://freesound.org/s/42/' } }
+  const [first, duplicate] = await Promise.all([cache.add(input, wav, 'alice'), cache.add(input, wav, 'alice')])
+  assert.equal(first.id, duplicate.id)
+  assert.deepEqual(await new AutomaticSoundCache(storage).list('alice'), [first])
+  assert.deepEqual(await cache.list('bob'), [])
+  assert.deepEqual(await new SoundLibrary(storage).list('alice'), [favorite])
+  assert.deepEqual((await cache.read(first.id, 'alice')).data, wav)
+  await cache.remove(first.id, 'alice')
+  assert.deepEqual(await new SoundLibrary(storage).list('alice'), [favorite])
 })
 
 test('sound provenance persists through edits and canonicalizes the source URL', async () => {
