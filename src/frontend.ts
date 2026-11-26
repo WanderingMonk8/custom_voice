@@ -1199,6 +1199,15 @@ export function setup(ctx: SpindleFrontendContext) {
     .chat-voice-advanced-summary::after { content:'›'; color:var(--lumiverse-text-muted); transform:rotate(90deg); }
     .chat-voice-advanced-section[open] .chat-voice-advanced-summary::after { transform:rotate(-90deg); }
     .chat-voice-advanced { display:flex; flex-direction:column; gap:12px; padding-top:16px; }
+    .chat-voice-primary-section { border:1px solid var(--lumiverse-border); border-radius:var(--lumiverse-radius, 8px); overflow:hidden; }
+    .chat-voice-primary-summary { display:flex; align-items:center; justify-content:space-between; min-height:48px; padding:0 14px;
+      color:var(--lumiverse-text-primary, var(--lumiverse-text)); background:var(--lumiverse-fill-subtle); font-size:15px; font-weight:700;
+      cursor:pointer; list-style:none; user-select:none; }
+    .chat-voice-primary-summary::-webkit-details-marker { display:none; }
+    .chat-voice-primary-summary::after { content:'›'; color:var(--lumiverse-text-muted); font-size:20px; transform:rotate(90deg); }
+    .chat-voice-primary-section[open] > .chat-voice-primary-summary::after { transform:rotate(-90deg); }
+    .chat-voice-primary-summary:focus-visible { outline:2px solid var(--lumiverse-accent, #7a68f4); outline-offset:-2px; }
+    .chat-voice-primary-body { display:flex; flex-direction:column; gap:12px; padding:14px; min-width:0; }
     .chat-voice-number-input {
       box-sizing:border-box; width:100%; min-height:36px; padding:7px 10px;
       border:1px solid var(--lumiverse-border); border-radius:var(--lumiverse-radius);
@@ -1773,12 +1782,12 @@ export function setup(ctx: SpindleFrontendContext) {
   favoriteError.hidden = true
   favoritesSection.append(favoriteForm, favoriteError, favoriteFilter, favoriteList)
   const soundsSection = document.createElement('details')
-  soundsSection.className = 'chat-voice-advanced-section'
+  soundsSection.className = 'chat-voice-primary-section'
   const soundsSummary = document.createElement('summary')
-  soundsSummary.className = 'chat-voice-advanced-summary'
-  soundsSummary.textContent = 'Sound effects (experimental)'
+  soundsSummary.className = 'chat-voice-primary-summary'
+  soundsSummary.textContent = 'Sounds'
   const soundsBody = document.createElement('div')
-  soundsBody.className = 'chat-voice-advanced'
+  soundsBody.className = 'chat-voice-primary-body'
   const soundsHint = document.createElement('div')
   soundsHint.className = 'chat-voice-hint'
   soundsHint.textContent = 'Manage your per-user sound library. Audio must be at most 24 MiB and 120 seconds; larger files may take longer to load.'
@@ -1912,15 +1921,29 @@ export function setup(ctx: SpindleFrontendContext) {
   status.setAttribute('role', 'status')
   status.setAttribute('aria-live', 'polite')
   const advancedSection = document.createElement('details')
-  advancedSection.className = 'chat-voice-advanced-section'
+  advancedSection.className = 'chat-voice-primary-section'
   const advancedSummary = document.createElement('summary')
-  advancedSummary.className = 'chat-voice-advanced-summary'
-  advancedSummary.textContent = 'Advanced settings'
+  advancedSummary.className = 'chat-voice-primary-summary'
+  advancedSummary.textContent = 'Advanced'
   const advancedBody = document.createElement('div')
-  advancedBody.className = 'chat-voice-advanced'
+  advancedBody.className = 'chat-voice-primary-body'
   advancedSection.append(advancedSummary, advancedBody)
 
-  panel.append(
+  function createPrimarySection(title: string): { section: HTMLDetailsElement; body: HTMLDivElement } {
+    const section = document.createElement('details')
+    section.className = 'chat-voice-primary-section'
+    const summary = document.createElement('summary')
+    summary.className = 'chat-voice-primary-summary'
+    summary.textContent = title
+    const body = document.createElement('div')
+    body.className = 'chat-voice-primary-body'
+    section.append(summary, body)
+    return { section, body }
+  }
+  const mainSection = createPrimarySection('Main')
+  const castSection = createPrimarySection('Cast')
+  const catalogSection = createPrimarySection('Catalog')
+  mainSection.body.append(
     context,
     connectionField.field,
     scanField.field,
@@ -1930,19 +1953,28 @@ export function setup(ctx: SpindleFrontendContext) {
     ttsTagPlacementField.field,
     tagLlmConnectionField.field,
     tagLlmModelField.field,
+  )
+  castSection.body.append(
     narratorField.field,
     userVoiceField.field,
     routingHint,
     addNpcField.field,
     characterTitle,
     characterList,
+  )
+  catalogSection.body.append(
     favoritesTitle,
     voicesTabStrip,
     favoritesSection,
     communitySection,
+  )
+  panel.append(
+    mainSection.section,
+    castSection.section,
+    catalogSection.section,
     soundsSection,
-    status,
     advancedSection,
+    status,
   )
   tab.root.appendChild(panel)
 
