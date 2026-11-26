@@ -127,6 +127,13 @@ var SoundLoadQueue = class {
   }
 };
 
+// src/sound-plan-diagnostics.ts
+var SOUND_PLANNER_TIMEOUT_MS = 6e4;
+var SOUND_LIBRARY_TIMEOUT_MS = 3e4;
+function soundRequestTimeoutMs(type) {
+  return type === "chat_voice_sound_scene_plan" ? SOUND_PLANNER_TIMEOUT_MS : SOUND_LIBRARY_TIMEOUT_MS;
+}
+
 // src/sound-scene.ts
 function splitNarrationForSoundEvents(segments, options) {
   const result = [];
@@ -4989,10 +4996,11 @@ function setup(ctx) {
   function soundLibraryRequest(type, fields = {}, onProgress) {
     const requestId = `sound-${Date.now().toString(36)}-${++soundLibrarySequence}`;
     return new Promise((resolve, reject) => {
+      const timeoutMs = soundRequestTimeoutMs(type);
       const timer = setTimeout(() => {
         pendingSoundLibrary.delete(requestId);
-        reject(new Error(type === "chat_voice_sound_scene_plan" ? "Sound planner frontend request timed out after 30000ms." : "Sound library request timed out after 30000ms."));
-      }, 3e4);
+        reject(new Error(`${type === "chat_voice_sound_scene_plan" ? "Sound planner frontend request" : "Sound library request"} timed out after ${timeoutMs}ms.`));
+      }, timeoutMs);
       pendingSoundLibrary.set(requestId, { resolve, reject, timer, onProgress });
       ctx.sendToBackend({ type, requestId, ...fields });
     });
@@ -6813,7 +6821,7 @@ function setup(ctx) {
           if (response.error || !response.result) throw response.error ?? new Error("Sound planning failed.");
           const result = response.result;
           if (soundWorkClosed || playback.controller.signal.aborted) return;
-          appendSpeakerDebugLog(`Sound timing: planner round-trip=${response.completedAt - soundPlanStarted}ms${result.soundTimings ? `, library=${result.soundTimings.libraryMs}ms, generation=${result.soundTimings.generationMs}ms, decision=${result.soundTimings.decisionMs}ms, candidates=${result.soundTimings.candidateCount ?? "?"} of ${result.soundTimings.libraryCount ?? "?"}` : ""}.`);
+          appendSpeakerDebugLog(`Sound timing: planner round-trip=${response.completedAt - soundPlanStarted}ms, deadline=${soundRequestTimeoutMs("chat_voice_sound_scene_plan")}ms${result.soundTimings ? `, library=${result.soundTimings.libraryMs}ms, generation=${result.soundTimings.generationMs}ms, decision=${result.soundTimings.decisionMs}ms, candidates=${result.soundTimings.candidateCount ?? "?"} of ${result.soundTimings.libraryCount ?? "?"}` : ""}.`);
           if (preferences.suggestMissingSounds && suggestionPlayback === playback && ctx.getActiveChat().chatId === playbackChat.id) {
             const suggestions = (result.missing ?? []).filter((item) => item.kind === "event" ? preferences.eventSounds : preferences.ambienceSounds);
             missingSoundSuggestions.replaceChildren();

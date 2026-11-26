@@ -5,6 +5,7 @@ import type {
 import { MAX_FAVORITE_SOUND_BYTES, MAX_FAVORITE_SOUND_SECONDS, SOUND_TRANSFER_CHUNK_BYTES, isSupportedSoundDuration, type FavoriteSound, type NewFavoriteSound } from './sound-library'
 import { SoundPreviewCache } from './sound-preview-cache'
 import { SoundLoadQueue } from './sound-load-queue'
+import { soundRequestTimeoutMs } from './sound-plan-diagnostics'
 import { isFreesoundCc0, isFreesoundImportLicense, safeFreesoundPreviewUrl, type FreesoundSearchResult } from './freesound'
 import { alignSoundSourceSegments, ambienceInstructionAtBoundary, interleaveSoundEvents, mapSoundCueBoundaries, shortlistSoundAssets, splitNarrationForSoundEvents, type MissingSoundSuggestion, type SoundSceneCue } from './sound-scene'
 import { DEFAULT_AMBIENCE_VOLUME, DEFAULT_EVENT_VOLUME, mixAmbienceClip, readSoundVolume, soundCategoryGain } from './sound-mix'
@@ -2501,7 +2502,8 @@ export function setup(ctx: SpindleFrontendContext) {
   function soundLibraryRequest(type: string, fields: Record<string, unknown> = {}, onProgress?: (progress: NonNullable<SoundLibraryPayload['plannerProgress']>) => void): Promise<SoundLibraryPayload> {
     const requestId = `sound-${Date.now().toString(36)}-${++soundLibrarySequence}`
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => { pendingSoundLibrary.delete(requestId); reject(new Error(type === 'chat_voice_sound_scene_plan' ? 'Sound planner frontend request timed out after 30000ms.' : 'Sound library request timed out after 30000ms.')) }, 30_000)
+      const timeoutMs = soundRequestTimeoutMs(type)
+      const timer = setTimeout(() => { pendingSoundLibrary.delete(requestId); reject(new Error(`${type === 'chat_voice_sound_scene_plan' ? 'Sound planner frontend request' : 'Sound library request'} timed out after ${timeoutMs}ms.`)) }, timeoutMs)
       pendingSoundLibrary.set(requestId, { resolve, reject, timer, onProgress })
       ctx.sendToBackend({ type, requestId, ...fields })
     })
@@ -4332,7 +4334,7 @@ export function setup(ctx: SpindleFrontendContext) {
           if (response.error || !response.result) throw response.error ?? new Error('Sound planning failed.')
           const result = response.result
           if (soundWorkClosed || playback.controller.signal.aborted) return
-          appendSpeakerDebugLog(`Sound timing: planner round-trip=${response.completedAt - soundPlanStarted}ms${result.soundTimings ? `, library=${result.soundTimings.libraryMs}ms, generation=${result.soundTimings.generationMs}ms, decision=${result.soundTimings.decisionMs}ms, candidates=${result.soundTimings.candidateCount ?? '?'} of ${result.soundTimings.libraryCount ?? '?'}` : ''}.`)
+          appendSpeakerDebugLog(`Sound timing: planner round-trip=${response.completedAt - soundPlanStarted}ms, deadline=${soundRequestTimeoutMs('chat_voice_sound_scene_plan')}ms${result.soundTimings ? `, library=${result.soundTimings.libraryMs}ms, generation=${result.soundTimings.generationMs}ms, decision=${result.soundTimings.decisionMs}ms, candidates=${result.soundTimings.candidateCount ?? '?'} of ${result.soundTimings.libraryCount ?? '?'}` : ''}.`)
           if (preferences.suggestMissingSounds && suggestionPlayback === playback && ctx.getActiveChat().chatId === playbackChat.id) {
             const suggestions = (result.missing ?? []).filter(item => item.kind === 'event' ? preferences.eventSounds : preferences.ambienceSounds)
             missingSoundSuggestions.replaceChildren()

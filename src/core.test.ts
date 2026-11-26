@@ -4,7 +4,7 @@ import { MAX_FAVORITE_SOUND_BYTES, MAX_FAVORITE_SOUND_SECONDS, SoundLibrary, isS
 import { SoundDownloadTransfers, SoundUploadTransfers } from './sound-transfer'
 import { SoundPreviewCache } from './sound-preview-cache'
 import { SoundLoadQueue } from './sound-load-queue'
-import { soundPlanErrorCategory } from './sound-plan-diagnostics'
+import { soundPlanErrorCategory, soundRequestTimeoutMs } from './sound-plan-diagnostics'
 import { isFreesoundCc0, parseFreesoundSearch, safeFreesoundPreviewUrl } from './freesound'
 import { alignSoundSourceSegments, ambienceInstructionAtBoundary, competingSoundCueIndexes, interleaveSoundEvents, mapSoundCueBoundaries, parseMissingSoundSuggestions, parseSoundScenePlan, shortlistSoundAssets, shortlistSoundPlannerAssets, splitNarrationForSoundEvents } from './sound-scene'
 import { DEFAULT_AMBIENCE_VOLUME, DEFAULT_EVENT_VOLUME, mixAmbienceClip, readSoundVolume, renderSoundMix, soundCategoryGain } from './sound-mix'
@@ -62,6 +62,12 @@ test('sound planner diagnostic categories never expose provider error text', () 
   assert.equal(soundPlanErrorCategory({ name: 'AbortError' }), 'aborted')
   assert.equal(soundPlanErrorCategory({ code: 'ETIMEDOUT' }), 'timeout')
   assert.equal(soundPlanErrorCategory(new Error('private scene text')), 'unknown failure')
+})
+
+test('sound scene planning gets its own bounded deadline without changing library operations', () => {
+  assert.equal(soundRequestTimeoutMs('chat_voice_sound_scene_plan'), 60_000)
+  assert.equal(soundRequestTimeoutMs('chat_voice_sound_library_list'), 30_000)
+  assert.equal(soundRequestTimeoutMs('chat_voice_sound_library_read_chunk'), 30_000)
 })
 
 test('sound preview cache is bounded, expiring and least-recently-used', () => {

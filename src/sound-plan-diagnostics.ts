@@ -1,5 +1,11 @@
 export type SoundPlanStage = 'library' | 'connection' | 'generation' | 'parsing' | 'decision'
 
+export const SOUND_PLANNER_TIMEOUT_MS = 60_000
+export const SOUND_LIBRARY_TIMEOUT_MS = 30_000
+export function soundRequestTimeoutMs(type: string): number {
+  return type === 'chat_voice_sound_scene_plan' ? SOUND_PLANNER_TIMEOUT_MS : SOUND_LIBRARY_TIMEOUT_MS
+}
+
 /** Do not forward arbitrary provider messages, which may contain prompt text or credentials. */
 export function soundPlanErrorCategory(error: unknown): string {
   if (!error || typeof error !== 'object') return 'unknown failure'
