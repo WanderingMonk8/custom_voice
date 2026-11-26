@@ -8449,7 +8449,6 @@ spindle.onFrontendMessage(async (rawPayload, userId, frontendSessionId) => {
         const params = new URLSearchParams({ query, fields: "id,name,username,license,duration,previews,tags", page_size: "12" });
         const page = Number.isSafeInteger(payload.page) ? Math.max(1, Math.min(50, payload.page)) : 1;
         params.set("page", String(page));
-        if (payload.maxDuration === true) params.set("filter", "duration:[0 TO 120]");
         const response = await Promise.race([
           spindle.cors(`https://freesound.org/apiv2/search/text/?${params}`, { method: "GET", headers: { Authorization: `Token ${key}` } }),
           new Promise((_, reject) => setTimeout(() => reject(new Error("Freesound search timed out.")), 2e4))

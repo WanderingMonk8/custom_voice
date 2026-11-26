@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { SoundLibrary, type SoundUserStorage } from './sound-library'
+import { MAX_FAVORITE_SOUND_SECONDS, SoundLibrary, isSupportedSoundDuration, type SoundUserStorage } from './sound-library'
 import { SoundDownloadTransfers, SoundUploadTransfers } from './sound-transfer'
 import { isFreesoundCc0, parseFreesoundSearch, safeFreesoundPreviewUrl } from './freesound'
 import { alignSoundSourceSegments, ambienceInstructionAtBoundary, competingSoundCueIndexes, interleaveSoundEvents, mapSoundCueBoundaries, parseSoundScenePlan, shortlistSoundAssets, splitNarrationForSoundEvents } from './sound-scene'
@@ -42,6 +42,16 @@ class FakeSoundStorage implements SoundUserStorage {
     this.files.delete(this.key(from, userId))
   }
 }
+
+test('sound duration validation accepts up to three minutes', () => {
+  assert.equal(MAX_FAVORITE_SOUND_SECONDS, 180)
+  assert.equal(isSupportedSoundDuration(120.1), true)
+  assert.equal(isSupportedSoundDuration(180), true)
+  assert.equal(isSupportedSoundDuration(180.001), false)
+  assert.equal(isSupportedSoundDuration(0), false)
+  assert.equal(isSupportedSoundDuration(Number.NaN), false)
+  assert.equal(isSupportedSoundDuration(Infinity), false)
+})
 
 test('Freesound search results validate metadata and never trust remote URLs', () => {
   const results = parseFreesoundSearch({ results: [

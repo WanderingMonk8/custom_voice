@@ -2,7 +2,7 @@ import type {
   SpindleFrontendContext,
   SpindleTextInputHandle,
 } from 'lumiverse-spindle-types'
-import { MAX_FAVORITE_SOUND_BYTES, SOUND_TRANSFER_CHUNK_BYTES, type FavoriteSound, type NewFavoriteSound } from './sound-library'
+import { MAX_FAVORITE_SOUND_BYTES, MAX_FAVORITE_SOUND_SECONDS, SOUND_TRANSFER_CHUNK_BYTES, isSupportedSoundDuration, type FavoriteSound, type NewFavoriteSound } from './sound-library'
 import { isFreesoundCc0, isFreesoundImportLicense, safeFreesoundPreviewUrl, type FreesoundSearchResult } from './freesound'
 import { alignSoundSourceSegments, ambienceInstructionAtBoundary, interleaveSoundEvents, mapSoundCueBoundaries, shortlistSoundAssets, splitNarrationForSoundEvents, type SoundSceneCue } from './sound-scene'
 import { DEFAULT_AMBIENCE_VOLUME, DEFAULT_EVENT_VOLUME, mixAmbienceClip, readSoundVolume, soundCategoryGain } from './sound-mix'
@@ -1791,7 +1791,7 @@ export function setup(ctx: SpindleFrontendContext) {
   soundsBody.className = 'chat-voice-primary-body'
   const soundsHint = document.createElement('div')
   soundsHint.className = 'chat-voice-hint'
-  soundsHint.textContent = 'Manage your per-user sound library. Audio must be at most 24 MiB and 120 seconds; larger files may take longer to load.'
+  soundsHint.textContent = 'Manage your per-user sound library. Audio must be at most 24 MiB and 3 minutes; larger files may take longer to load.'
   const soundTabs = document.createElement('div')
   soundTabs.className = 'chat-voice-voices-tabs'
   soundTabs.setAttribute('role', 'tablist')
@@ -1912,10 +1912,6 @@ export function setup(ctx: SpindleFrontendContext) {
   freesoundQuery.placeholder = 'Search Freesound'; freesoundQuery.maxLength = 120; freesoundQuery.setAttribute('aria-label', 'Search Freesound')
   const freesoundSearchButton = document.createElement('button')
   freesoundSearchButton.type = 'button'; freesoundSearchButton.className = 'chat-voice-add-button'; freesoundSearchButton.textContent = 'Search Freesound'
-  const durationFilterLabel = document.createElement('label'); durationFilterLabel.className = 'chat-voice-toggle'
-  const durationFilter = document.createElement('input'); durationFilter.type = 'checkbox'
-  const durationFilterText = document.createElement('span'); durationFilterText.textContent = 'Only sounds up to 120 seconds'
-  durationFilterLabel.append(durationFilter, durationFilterText)
   const licenseFilter = document.createElement('select'); licenseFilter.setAttribute('aria-label', 'Filter licenses on this results page')
   for (const [value, label] of [['all', 'All licenses'], ['supported', 'Importable licenses on this page'], ['cc0', 'CC0 on this page'], ['by', 'CC BY on this page']]) {
     const option = document.createElement('option'); option.value = value; option.textContent = label; licenseFilter.append(option)
@@ -1923,7 +1919,7 @@ export function setup(ctx: SpindleFrontendContext) {
   const freesoundResults = document.createElement('div')
   freesoundResults.className = 'chat-voice-favorite-list'; freesoundResults.setAttribute('aria-live', 'polite')
   const freesoundMore = document.createElement('button'); freesoundMore.type = 'button'; freesoundMore.className = 'chat-voice-add-button'; freesoundMore.textContent = 'Next results'; freesoundMore.hidden = true
-  soundLibraryPanel.append(soundsHint, soundFile, soundName, soundTags, soundKind, soundAdd, soundSearch, soundFilter, soundList, freesoundSearchHint, freesoundQuery, durationFilterLabel, licenseFilter, freesoundSearchButton, freesoundResults, freesoundMore)
+  soundLibraryPanel.append(soundsHint, soundFile, soundName, soundTags, soundKind, soundAdd, soundSearch, soundFilter, soundList, freesoundSearchHint, freesoundQuery, licenseFilter, freesoundSearchButton, freesoundResults, freesoundMore)
   const creditsButton = document.createElement('button')
   creditsButton.type = 'button'; creditsButton.className = 'chat-voice-add-button'; creditsButton.textContent = 'Show saved recording credits'
   const creditsList = document.createElement('div')
@@ -2526,12 +2522,11 @@ export function setup(ctx: SpindleFrontendContext) {
 
   let freesoundPage = 1
   let freesoundSearchQuery = ''
-  let freesoundSearchDuration = false
   let freesoundPageResults: FreesoundSearchResult[] = []
   async function searchFreesound(next: boolean): Promise<void> {
     const query = next ? freesoundSearchQuery : freesoundQuery.value.trim()
     if (!query) { setStatus('Enter a Freesound search first.', 'error'); return }
-    if (!next) { freesoundPage = 1; freesoundSearchQuery = query; freesoundSearchDuration = durationFilter.checked }
+    if (!next) { freesoundPage = 1; freesoundSearchQuery = query }
     freesoundSearchButton.disabled = true
     freesoundMore.disabled = true
     stopSoundPreview()
@@ -2539,7 +2534,7 @@ export function setup(ctx: SpindleFrontendContext) {
     freesoundResults.replaceChildren()
     const loading = document.createElement('div'); loading.className = 'chat-voice-hint'; loading.textContent = 'Searching Freesound…'; freesoundResults.append(loading)
     try {
-      const response = await soundLibraryRequest('chat_voice_freesound_search', { query, page: freesoundPage, maxDuration: freesoundSearchDuration })
+      const response = await soundLibraryRequest('chat_voice_freesound_search', { query, page: freesoundPage })
       if (soundLibraryDisposed) return
       freesoundResults.replaceChildren()
       freesoundPageResults = Array.isArray(response.results) ? response.results : []
@@ -2587,20 +2582,20 @@ export function setup(ctx: SpindleFrontendContext) {
             }
             const add = document.createElement('button')
             add.type = 'button'; add.className = 'chat-voice-add-button'; add.textContent = 'Import preview'
-            if (item.duration > 120) { add.disabled = true; add.title = 'Import is limited to 120 seconds.'; const reason = document.createElement('div'); reason.className = 'chat-voice-hint'; reason.textContent = 'Import unavailable: this sound is longer than 120 seconds.'; row.append(reason) }
+            if (item.duration > MAX_FAVORITE_SOUND_SECONDS) { add.disabled = true; add.title = 'Import is limited to 3 minutes.'; const reason = document.createElement('div'); reason.className = 'chat-voice-hint'; reason.textContent = 'Import unavailable: this sound is longer than 3 minutes.'; row.append(reason) }
             add.addEventListener('click', () => { void (async () => {
               add.disabled = true; add.textContent = 'Importing…'
               try {
                 const url = safeFreesoundPreviewUrl(item.previewUrl, item.id)
                 if (!url || !isFreesoundImportLicense(item.license)) throw new Error('This preview is not available for import.')
-                if (item.duration > 120) throw new Error('Sound must be at most 120 seconds long.')
+                if (item.duration > MAX_FAVORITE_SOUND_SECONDS) throw new Error('Sound must be at most 3 minutes long.')
                 const bytes = await downloadFreesoundPreview(url)
                 const Context = window.AudioContext ?? (window as typeof window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext
                 if (!Context) throw new Error('This browser cannot validate audio files.')
                 const context = new Context()
                 try {
                   const decoded = await context.decodeAudioData(bytes.buffer.slice(0))
-                  if (!Number.isFinite(decoded.duration) || decoded.duration <= 0 || decoded.duration > 120 || decoded.numberOfChannels > 2) throw new Error('Preview must be mono or stereo and at most 120 seconds.')
+                  if (!isSupportedSoundDuration(decoded.duration) || decoded.numberOfChannels > 2) throw new Error('Preview must be mono or stereo and at most 3 minutes.')
                 } finally { await context.close().catch(() => undefined) }
                 await uploadFavoriteSound({ name: item.name.trim().slice(0, 120), description: '', tags: item.tags ?? [], kind: category.value === 'ambience' ? 'ambience' : 'event', mime: 'audio/mpeg', provenance: { provider: 'freesound', soundId: item.id, title: item.name, creator: item.username, license: item.license, sourceUrl: `https://freesound.org/s/${item.id}/` } }, bytes)
                 await refreshSoundLibrary()
@@ -2747,7 +2742,7 @@ export function setup(ctx: SpindleFrontendContext) {
           soundPreviewProgress = 'Decoding'; updateSoundPreviewButton(favorite.id)
           const decoded = await context.decodeAudioData(result.bytes.buffer)
           if (soundLibraryDisposed || generation !== soundPreviewGeneration) return
-          if (decoded.duration > 120 || decoded.numberOfChannels > 2) throw new Error('Sound preview requires mono or stereo audio of at most 120 seconds.')
+          if (!isSupportedSoundDuration(decoded.duration) || decoded.numberOfChannels > 2) throw new Error('Sound preview requires mono or stereo audio of at most 3 minutes.')
           const channels = Array.from({ length: decoded.numberOfChannels }, (_, index) => decoded.getChannelData(index))
           const source = context.createBufferSource()
           const gain = context.createGain()
@@ -2810,7 +2805,7 @@ export function setup(ctx: SpindleFrontendContext) {
       const audioContext = new Context()
       try {
         const audio = await audioContext.decodeAudioData(data.slice(0))
-        if (!Number.isFinite(audio.duration) || audio.duration <= 0 || audio.duration > 120) throw new Error('Sound must be between 0 and 120 seconds long.')
+        if (!isSupportedSoundDuration(audio.duration)) throw new Error('Sound must be longer than 0 seconds and at most 3 minutes long.')
       } finally { await audioContext.close().catch(() => undefined) }
       const bytes = new Uint8Array(data)
       const favorite = { name: soundName.value, tags: soundTags.value.split(',').map(tag => tag.trim()).filter(Boolean), kind: soundKind.value, mime }
@@ -4234,8 +4229,8 @@ export function setup(ctx: SpindleFrontendContext) {
           soundLoadStatus.set(id, 'decoding')
           const decoded = await audioContext.decodeAudioData(asset.bytes.buffer)
           if (playback.controller.signal.aborted) return
-          if (decoded.duration > 120 || decoded.numberOfChannels < 1 || decoded.numberOfChannels > 2) throw new Error('Unsupported event sound.')
-          const frames = Math.min(decoded.length, Math.floor(decoded.sampleRate * (asset.favorite.kind === 'event' ? 5 : 120)))
+          if (!isSupportedSoundDuration(decoded.duration) || decoded.numberOfChannels < 1 || decoded.numberOfChannels > 2) throw new Error('Unsupported sound.')
+          const frames = Math.min(decoded.length, Math.floor(decoded.sampleRate * (asset.favorite.kind === 'event' ? 5 : MAX_FAVORITE_SOUND_SECONDS)))
           if (!frames) throw new Error('Empty event sound.')
           const cropped = audioContext.createBuffer(decoded.numberOfChannels, frames, decoded.sampleRate)
           for (let channel = 0; channel < decoded.numberOfChannels; channel++) cropped.copyToChannel(decoded.getChannelData(channel).subarray(0, frames), channel)

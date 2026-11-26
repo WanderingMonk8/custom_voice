@@ -27,6 +27,10 @@ var ROOT = "sound-effects/v1";
 var RECORDS = `${ROOT}/favorites`;
 var AUDIO = `${ROOT}/audio`;
 var MAX_FAVORITE_SOUND_BYTES = 24 * 1024 * 1024;
+var MAX_FAVORITE_SOUND_SECONDS = 180;
+function isSupportedSoundDuration(seconds) {
+  return Number.isFinite(seconds) && seconds > 0 && seconds <= MAX_FAVORITE_SOUND_SECONDS;
+}
 var SOUND_TRANSFER_CHUNK_BYTES = 1024 * 1024;
 var MAX_FAVORITE_LIBRARY_BYTES = 100 * 1024 * 1024;
 
@@ -4129,7 +4133,7 @@ function setup(ctx) {
   soundsBody.className = "chat-voice-primary-body";
   const soundsHint = document.createElement("div");
   soundsHint.className = "chat-voice-hint";
-  soundsHint.textContent = "Manage your per-user sound library. Audio must be at most 24 MiB and 120 seconds; larger files may take longer to load.";
+  soundsHint.textContent = "Manage your per-user sound library. Audio must be at most 24 MiB and 3 minutes; larger files may take longer to load.";
   const soundTabs = document.createElement("div");
   soundTabs.className = "chat-voice-voices-tabs";
   soundTabs.setAttribute("role", "tablist");
@@ -4291,13 +4295,6 @@ function setup(ctx) {
   freesoundSearchButton.type = "button";
   freesoundSearchButton.className = "chat-voice-add-button";
   freesoundSearchButton.textContent = "Search Freesound";
-  const durationFilterLabel = document.createElement("label");
-  durationFilterLabel.className = "chat-voice-toggle";
-  const durationFilter = document.createElement("input");
-  durationFilter.type = "checkbox";
-  const durationFilterText = document.createElement("span");
-  durationFilterText.textContent = "Only sounds up to 120 seconds";
-  durationFilterLabel.append(durationFilter, durationFilterText);
   const licenseFilter = document.createElement("select");
   licenseFilter.setAttribute("aria-label", "Filter licenses on this results page");
   for (const [value, label] of [["all", "All licenses"], ["supported", "Importable licenses on this page"], ["cc0", "CC0 on this page"], ["by", "CC BY on this page"]]) {
@@ -4314,7 +4311,7 @@ function setup(ctx) {
   freesoundMore.className = "chat-voice-add-button";
   freesoundMore.textContent = "Next results";
   freesoundMore.hidden = true;
-  soundLibraryPanel.append(soundsHint, soundFile, soundName, soundTags, soundKind, soundAdd, soundSearch, soundFilter, soundList, freesoundSearchHint, freesoundQuery, durationFilterLabel, licenseFilter, freesoundSearchButton, freesoundResults, freesoundMore);
+  soundLibraryPanel.append(soundsHint, soundFile, soundName, soundTags, soundKind, soundAdd, soundSearch, soundFilter, soundList, freesoundSearchHint, freesoundQuery, licenseFilter, freesoundSearchButton, freesoundResults, freesoundMore);
   const creditsButton = document.createElement("button");
   creditsButton.type = "button";
   creditsButton.className = "chat-voice-add-button";
@@ -4888,7 +4885,6 @@ function setup(ctx) {
   }
   let freesoundPage = 1;
   let freesoundSearchQuery = "";
-  let freesoundSearchDuration = false;
   let freesoundPageResults = [];
   async function searchFreesound(next) {
     const query = next ? freesoundSearchQuery : freesoundQuery.value.trim();
@@ -4899,7 +4895,6 @@ function setup(ctx) {
     if (!next) {
       freesoundPage = 1;
       freesoundSearchQuery = query;
-      freesoundSearchDuration = durationFilter.checked;
     }
     freesoundSearchButton.disabled = true;
     freesoundMore.disabled = true;
@@ -4911,7 +4906,7 @@ function setup(ctx) {
     loading.textContent = "Searching Freesound\u2026";
     freesoundResults.append(loading);
     try {
-      const response = await soundLibraryRequest("chat_voice_freesound_search", { query, page: freesoundPage, maxDuration: freesoundSearchDuration });
+      const response = await soundLibraryRequest("chat_voice_freesound_search", { query, page: freesoundPage });
       if (soundLibraryDisposed) return;
       freesoundResults.replaceChildren();
       freesoundPageResults = Array.isArray(response.results) ? response.results : [];
@@ -5007,12 +5002,12 @@ function setup(ctx) {
           add.type = "button";
           add.className = "chat-voice-add-button";
           add.textContent = "Import preview";
-          if (item.duration > 120) {
+          if (item.duration > MAX_FAVORITE_SOUND_SECONDS) {
             add.disabled = true;
-            add.title = "Import is limited to 120 seconds.";
+            add.title = "Import is limited to 3 minutes.";
             const reason = document.createElement("div");
             reason.className = "chat-voice-hint";
-            reason.textContent = "Import unavailable: this sound is longer than 120 seconds.";
+            reason.textContent = "Import unavailable: this sound is longer than 3 minutes.";
             row.append(reason);
           }
           add.addEventListener("click", () => {
@@ -5022,14 +5017,14 @@ function setup(ctx) {
               try {
                 const url = safeFreesoundPreviewUrl(item.previewUrl, item.id);
                 if (!url || !isFreesoundImportLicense(item.license)) throw new Error("This preview is not available for import.");
-                if (item.duration > 120) throw new Error("Sound must be at most 120 seconds long.");
+                if (item.duration > MAX_FAVORITE_SOUND_SECONDS) throw new Error("Sound must be at most 3 minutes long.");
                 const bytes = await downloadFreesoundPreview(url);
                 const Context = window.AudioContext ?? window.webkitAudioContext;
                 if (!Context) throw new Error("This browser cannot validate audio files.");
                 const context2 = new Context();
                 try {
                   const decoded = await context2.decodeAudioData(bytes.buffer.slice(0));
-                  if (!Number.isFinite(decoded.duration) || decoded.duration <= 0 || decoded.duration > 120 || decoded.numberOfChannels > 2) throw new Error("Preview must be mono or stereo and at most 120 seconds.");
+                  if (!isSupportedSoundDuration(decoded.duration) || decoded.numberOfChannels > 2) throw new Error("Preview must be mono or stereo and at most 3 minutes.");
                 } finally {
                   await context2.close().catch(() => void 0);
                 }
@@ -5225,7 +5220,7 @@ function setup(ctx) {
             updateSoundPreviewButton(favorite.id);
             const decoded = await context2.decodeAudioData(result.bytes.buffer);
             if (soundLibraryDisposed || generation !== soundPreviewGeneration) return;
-            if (decoded.duration > 120 || decoded.numberOfChannels > 2) throw new Error("Sound preview requires mono or stereo audio of at most 120 seconds.");
+            if (!isSupportedSoundDuration(decoded.duration) || decoded.numberOfChannels > 2) throw new Error("Sound preview requires mono or stereo audio of at most 3 minutes.");
             const channels = Array.from({ length: decoded.numberOfChannels }, (_, index) => decoded.getChannelData(index));
             const source = context2.createBufferSource();
             const gain = context2.createGain();
@@ -5332,7 +5327,7 @@ function setup(ctx) {
         const audioContext = new Context();
         try {
           const audio = await audioContext.decodeAudioData(data.slice(0));
-          if (!Number.isFinite(audio.duration) || audio.duration <= 0 || audio.duration > 120) throw new Error("Sound must be between 0 and 120 seconds long.");
+          if (!isSupportedSoundDuration(audio.duration)) throw new Error("Sound must be longer than 0 seconds and at most 3 minutes long.");
         } finally {
           await audioContext.close().catch(() => void 0);
         }
@@ -6577,8 +6572,8 @@ function setup(ctx) {
             soundLoadStatus.set(id, "decoding");
             const decoded = await audioContext.decodeAudioData(asset.bytes.buffer);
             if (playback.controller.signal.aborted) return;
-            if (decoded.duration > 120 || decoded.numberOfChannels < 1 || decoded.numberOfChannels > 2) throw new Error("Unsupported event sound.");
-            const frames = Math.min(decoded.length, Math.floor(decoded.sampleRate * (asset.favorite.kind === "event" ? 5 : 120)));
+            if (!isSupportedSoundDuration(decoded.duration) || decoded.numberOfChannels < 1 || decoded.numberOfChannels > 2) throw new Error("Unsupported sound.");
+            const frames = Math.min(decoded.length, Math.floor(decoded.sampleRate * (asset.favorite.kind === "event" ? 5 : MAX_FAVORITE_SOUND_SECONDS)));
             if (!frames) throw new Error("Empty event sound.");
             const cropped = audioContext.createBuffer(decoded.numberOfChannels, frames, decoded.sampleRate);
             for (let channel = 0; channel < decoded.numberOfChannels; channel++) cropped.copyToChannel(decoded.getChannelData(channel).subarray(0, frames), channel);
