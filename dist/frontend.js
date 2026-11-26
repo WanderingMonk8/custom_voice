@@ -135,8 +135,30 @@ function splitNarrationForSoundEvents(segments) {
       result.push(segment);
       continue;
     }
-    const parts = segment.text.match(/[^,;.!?]+[,;.!?]+(?:["'”’)]*)|[^,;.!?]+$/gu)?.map((part) => part.trim()).filter(Boolean) ?? [];
-    if (parts.length < 2 || parts.length > 12 || parts.some((part) => part.length < 8)) result.push(segment);
+    if (/\b(?:Dr|Mr|Mrs|Ms|Prof|St|vs|etc)\.|\d\.\d/iu.test(segment.text)) {
+      result.push(segment);
+      continue;
+    }
+    const fragments = segment.text.match(/[^,;.!?]+[,;.!?]+(?:["'”’)]*)|[^,;.!?]+$/gu)?.map((part) => part.trim()).filter(Boolean) ?? [];
+    const parts = [];
+    let pending = "";
+    for (const fragment of fragments) {
+      pending = pending ? `${pending} ${fragment}` : fragment;
+      if (pending.length >= 8) {
+        parts.push(pending);
+        pending = "";
+      }
+    }
+    if (pending) {
+      if (parts.length) parts[parts.length - 1] += ` ${pending}`;
+      else parts.push(pending);
+    }
+    while (parts.length > 12) {
+      let shortest = 0;
+      for (let i = 1; i < parts.length - 1; i++) if (parts[i].length + parts[i + 1].length < parts[shortest].length + parts[shortest + 1].length) shortest = i;
+      parts.splice(shortest, 2, `${parts[shortest]} ${parts[shortest + 1]}`);
+    }
+    if (parts.length < 2) result.push(segment);
     else for (const text of parts) result.push({ ...segment, text });
   }
   return result;
@@ -6594,6 +6616,9 @@ function setup(ctx) {
         setStatus("Choose a TTS connection before playing.", "error");
         return;
       }
+      const eventSourceText = preparePlaybackContent(message.content, preferences.skippedTrackerTags);
+      const soundPlanStarted = Date.now();
+      const earlySoundPlan = (preferences.eventSounds || preferences.ambienceSounds) && eventSourceText.length <= 3e4 && eventSourceText.trim() ? soundLibraryRequest("chat_voice_sound_scene_plan", { message: eventSourceText, connectionId: preferences.tagLlmConnectionId, model: preferences.tagLlmModel, suggestMissing: preferences.suggestMissingSounds }).then((result) => ({ result, error: null, completedAt: Date.now() }), (error) => ({ result: null, error, completedAt: Date.now() })) : null;
       const connectionProfileVoice = (connections.find((connection) => connection.id === connectionId)?.voice ?? "").trim();
       let autoCastDiagnostics = [];
       if (preferences.autoVoiceCasting && poolVoicesForAutoCast().length && (!config.narratorVoice || !config.userVoice || playbackChat.characters.some((character) => !config.characterVoices[character.id]))) {
@@ -6675,10 +6700,10 @@ function setup(ctx) {
       const playbackSetupFinishedAt = Date.now();
       suggestionPlayback = playback;
       missingSoundSuggestions.textContent = "No missing-sound suggestions for the current playback.";
-      const eventSourceText = preparePlaybackContent(message.content, preferences.skippedTrackerTags);
       let eventCues = [];
       const eventAssets = /* @__PURE__ */ new Map();
       const soundAssetKinds = /* @__PURE__ */ new Map();
+      const soundAssetNames = /* @__PURE__ */ new Map();
       const soundCreditAssets = /* @__PURE__ */ new Map();
       const usedSoundCredits = /* @__PURE__ */ new Map();
       const soundLoadQueue = new SoundLoadQueue(2);
@@ -6686,6 +6711,10 @@ function setup(ctx) {
       const soundLoadStatus = /* @__PURE__ */ new Map();
       let eventPlanState = "not-requested";
       let eventAssetFailures = 0;
+      let lastReachedSoundBoundary = -1;
+      let planReceivedAfterBoundary = -1;
+      const selectedEventCues = /* @__PURE__ */ new Set();
+      const mixedAmbienceKeys = /* @__PURE__ */ new Set();
       const selectedEvents = /* @__PURE__ */ new Map();
       const mixedVoices = /* @__PURE__ */ new Map();
       const selectedAudio = { events: selectedEvents, voices: mixedVoices };
@@ -6707,6 +6736,7 @@ function setup(ctx) {
             });
             if (soundWorkClosed || playback.controller.signal.aborted) return;
             if (!["event", "ambience"].includes(asset.favorite.kind)) throw new Error("Unavailable sound.");
+            soundAssetNames.set(id, asset.favorite.name);
             const transferMs = Date.now() - loadStart;
             soundLoadStatus.set(id, "decoding");
             const decodeStart = Date.now();
@@ -6739,6 +6769,7 @@ function setup(ctx) {
         const soundListStarted = Date.now();
         void soundLibraryRequest("chat_voice_sound_library_list").then((result) => {
           appendSpeakerDebugLog(`Sound timing: local library list=${Date.now() - soundListStarted}ms.`);
+          for (const sound of result.favorites ?? []) soundAssetNames.set(sound.id, sound.name);
           const kinds = [];
           if (preferences.eventSounds) kinds.push("event");
           if (preferences.ambienceSounds) kinds.push("ambience");
@@ -6747,10 +6778,11 @@ function setup(ctx) {
           eventAssetFailures++;
         });
         missingSoundSuggestions.textContent = preferences.suggestMissingSounds ? "Looking for missing sounds in this scene\u2026" : "No missing-sound suggestions for the current playback.";
-        const soundPlanStarted = Date.now();
-        void soundLibraryRequest("chat_voice_sound_scene_plan", { message: eventSourceText, connectionId: preferences.tagLlmConnectionId, model: preferences.tagLlmModel, suggestMissing: preferences.suggestMissingSounds }).then(async (result) => {
+        void earlySoundPlan.then(async (response) => {
+          if (response.error || !response.result) throw response.error ?? new Error("Sound planning failed.");
+          const result = response.result;
           if (soundWorkClosed || playback.controller.signal.aborted) return;
-          appendSpeakerDebugLog(`Sound timing: planner round-trip=${Date.now() - soundPlanStarted}ms${result.soundTimings ? `, library=${result.soundTimings.libraryMs}ms, generation=${result.soundTimings.generationMs}ms, decision=${result.soundTimings.decisionMs}ms` : ""}.`);
+          appendSpeakerDebugLog(`Sound timing: planner round-trip=${response.completedAt - soundPlanStarted}ms${result.soundTimings ? `, library=${result.soundTimings.libraryMs}ms, generation=${result.soundTimings.generationMs}ms, decision=${result.soundTimings.decisionMs}ms` : ""}.`);
           if (preferences.suggestMissingSounds && suggestionPlayback === playback && ctx.getActiveChat().chatId === playbackChat.id) {
             const suggestions = (result.missing ?? []).filter((item) => item.kind === "event" ? preferences.eventSounds : preferences.ambienceSounds);
             missingSoundSuggestions.replaceChildren();
@@ -6769,6 +6801,7 @@ function setup(ctx) {
             }
           }
           eventCues = (result.cues ?? []).filter((cue) => cue.kind === "event" ? preferences.eventSounds : preferences.ambienceSounds);
+          planReceivedAfterBoundary = lastReachedSoundBoundary;
           eventPlanState = "completed";
           await Promise.all([...new Set(eventCues.flatMap((cue) => cue.action === "play" && cue.assetId ? [cue.assetId] : []))].map((id) => prepareEventAsset(id, true)));
         }).catch(() => {
@@ -7439,6 +7472,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
         eventSelectionStarted = true;
         let activeAmbience = null;
         const selectEventsAt = (boundary) => {
+          lastReachedSoundBoundary = boundary;
           if (!eventCues.length) return [];
           const chosen = [];
           const mapped = mapSoundCueBoundaries(eventCues, eventSpans, eventSourceText.length);
@@ -7452,6 +7486,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
             const asset = cue.assetId ? eventAssets.get(cue.assetId) : void 0;
             if (!asset || !cue.assetId || soundAssetKinds.get(cue.assetId) !== cue.kind) continue;
             chosen.push(asset);
+            selectedEventCues.add(cue);
             const credit = soundCreditAssets.get(cue.assetId);
             if (credit) usedSoundCredits.set(credit.soundId, credit);
           }
@@ -7468,6 +7503,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
               activeAmbience.elapsed
             );
             activeAmbience.elapsed = mixed.elapsedSeconds;
+            mixedAmbienceKeys.add(activeAmbience.key);
             const credit = soundCreditAssets.get(activeAmbience.assetId);
             if (credit) usedSoundCredits.set(credit.soundId, credit);
             const buffer = audioContext.createBuffer(2, source.length, source.sampleRate);
@@ -7534,8 +7570,16 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
         if (lastEvents.length) selectedEvents.set(plan.length, lastEvents);
         for (const event of lastEvents) await playMeasured(event, "event");
         if (preferences.eventSounds || preferences.ambienceSounds) {
-          const aligned = mapSoundCueBoundaries(eventCues, eventSpans, eventSourceText.length).length;
+          const mapped = mapSoundCueBoundaries(eventCues, eventSpans, eventSourceText.length);
+          const aligned = mapped.length;
           appendSpeakerDebugLog(`Sound effects at playback end: planner=${eventPlanState}, cues=${eventCues.length}, aligned cues=${aligned}, assets ready=${eventAssets.size}, asset failures=${eventAssetFailures}, selected event boundaries=${selectedEvents.size}, ambience-mixed clips=${mixedVoices.size}, asset states=${JSON.stringify(Object.fromEntries(soundLoadStatus))}.`);
+          eventCues.forEach((cue, index) => {
+            const mappedIndex = mapped.findIndex((item) => item.cue === cue);
+            const boundary = mappedIndex < 0 ? null : mapped[mappedIndex].boundary;
+            const key = boundary === null ? "" : `${boundary}:${mappedIndex}:${cue.assetId ?? ""}`;
+            const state = boundary === null ? "unaligned" : cue.kind === "event" && selectedEventCues.has(cue) ? "selected" : cue.kind === "ambience" && cue.action === "play" && mixedAmbienceKeys.has(key) ? "mixed" : cue.action === "stop" ? boundary <= lastReachedSoundBoundary ? "stop boundary reached" : "boundary not reached" : cue.kind === "event" && boundary <= planReceivedAfterBoundary ? "plan arrived after boundary" : boundary > lastReachedSoundBoundary ? "boundary not reached" : cue.kind === "ambience" && eventAssets.has(cue.assetId ?? "") ? "not mixed (replaced or no foreground clip)" : cue.kind === "event" && eventAssets.has(cue.assetId ?? "") ? "not selected at boundary (asset may have arrived late)" : `asset not ready (${soundLoadStatus.get(cue.assetId ?? "") ?? "not requested"})`;
+            appendSpeakerDebugLog(`Sound cue [${index + 1}]: kind=${cue.kind}, action=${cue.action}, sound=${JSON.stringify(soundAssetNames.get(cue.assetId ?? "") ?? cue.assetId ?? "<none>")}, boundary=${boundary ?? "unaligned"}, outcome=${state}.`);
+          });
         }
         adaptiveSynthesisLimits.delete(adaptiveLimitToken);
         drainSynthesisQueue();

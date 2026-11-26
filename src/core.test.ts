@@ -329,6 +329,21 @@ test('event mode adds natural narration boundaries but leaves dialogue intact', 
   assert.deepEqual(mapSoundCueBoundaries(cues, spans, text.length).map(item => item.boundary), [1, 2])
 })
 
+test('short narration fragments do not prevent splitting the rest of a sound-rich scene', () => {
+  const text = 'Maya opened the cabin door. Inside, the refrigerator hummed steadily in the quiet kitchen. She closed the door and set her keys on the counter.'
+  const plan = splitNarrationForSoundEvents([{ text, voice: 'narrator' }])
+  assert.deepEqual(plan.map(item => item.text), ['Maya opened the cabin door.', 'Inside, the refrigerator hummed steadily in the quiet kitchen.', 'She closed the door and set her keys on the counter.'])
+  const spans = alignSoundSourceSegments(text, plan.map(item => item.text))
+  const cue = { kind: 'event' as const, action: 'play' as const, anchor: 'closed the door', offset: text.indexOf('closed the door'), position: 'after' as const }
+  assert.equal(mapSoundCueBoundaries([cue], spans, text.length)[0].boundary, 3)
+  const many = Array.from({ length: 15 }, (_, index) => `Sentence number ${index}.`).join(' ')
+  const bounded = splitNarrationForSoundEvents([{ text: many, voice: 'narrator' }])
+  assert.equal(bounded.length, 12)
+  assert.equal(bounded.map(item => item.text).join(' '), many)
+  const abbreviation = 'Dr. Marsh opened the door. She walked inside.'
+  assert.equal(splitNarrationForSoundEvents([{ text: abbreviation, voice: 'narrator' }]).length, 1)
+})
+
 test('sound prefetch shortlist matches metadata without selecting the cue', () => {
   const sound = { version: 1 as const, id: 'door', name: 'door close', description: '', tags: ['door'], kind: 'event' as const, mime: 'audio/wav', bytes: 1, createdAt: new Date().toISOString() }
   assert.deepEqual(shortlistSoundAssets('The door opened.', [sound]).map(item => item.id), ['door'])

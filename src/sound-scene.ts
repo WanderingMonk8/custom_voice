@@ -49,8 +49,26 @@ export function splitNarrationForSoundEvents(segments: readonly VoicePlanSegment
   const result: VoicePlanSegment[] = []
   for (const segment of segments) {
     if (segment.originalSpeech !== undefined || segment.tagId || /[\[\]<>]/u.test(segment.text)) { result.push(segment); continue }
-    const parts = segment.text.match(/[^,;.!?]+[,;.!?]+(?:["'”’)]*)|[^,;.!?]+$/gu)?.map(part => part.trim()).filter(Boolean) ?? []
-    if (parts.length < 2 || parts.length > 12 || parts.some(part => part.length < 8)) result.push(segment)
+    // Avoid splitting obvious abbreviations and decimals into unrelated jobs.
+    if (/\b(?:Dr|Mr|Mrs|Ms|Prof|St|vs|etc)\.|\d\.\d/iu.test(segment.text)) { result.push(segment); continue }
+    const fragments = segment.text.match(/[^,;.!?]+[,;.!?]+(?:["'”’)]*)|[^,;.!?]+$/gu)?.map(part => part.trim()).filter(Boolean) ?? []
+    const parts: string[] = []
+    let pending = ''
+    for (const fragment of fragments) {
+      pending = pending ? `${pending} ${fragment}` : fragment
+      if (pending.length >= 8) { parts.push(pending); pending = '' }
+    }
+    if (pending) {
+      if (parts.length) parts[parts.length - 1] += ` ${pending}`
+      else parts.push(pending)
+    }
+    // Keep the request count bounded without giving up every useful boundary.
+    while (parts.length > 12) {
+      let shortest = 0
+      for (let i = 1; i < parts.length - 1; i++) if (parts[i].length + parts[i + 1].length < parts[shortest].length + parts[shortest + 1].length) shortest = i
+      parts.splice(shortest, 2, `${parts[shortest]} ${parts[shortest + 1]}`)
+    }
+    if (parts.length < 2) result.push(segment)
     else for (const text of parts) result.push({ ...segment, text })
   }
   return result
