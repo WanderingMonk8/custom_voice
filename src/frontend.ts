@@ -9,7 +9,8 @@ import { selectSoundLibraryTab } from './sound-library-tabs'
 import { automaticSoundErrorCategory, soundRequestTimeoutMs } from './sound-plan-diagnostics'
 import { isFreesoundCc0, isFreesoundImportLicense, rankAutomaticFreesoundResults, safeFreesoundPreviewUrl, type FreesoundSearchResult } from './freesound'
 import { alignSoundSourceSegments, ambienceInstructionAtBoundary, interleaveSoundEvents, mapSoundCueBoundaries, mergeOpeningSoundCues, playBoundaryThenWaitForVoice, shortlistSoundAssets, soundAlignmentText, splitNarrationForSoundEvents, type MissingSoundSuggestion, type SoundSceneCue } from './sound-scene'
-import { DEFAULT_AMBIENCE_VOLUME, DEFAULT_EVENT_VOLUME, mixAmbienceClip, readSoundVolume, soundCategoryGain } from './sound-mix'
+import { DEFAULT_AMBIENCE_VOLUME, DEFAULT_EVENT_VOLUME, readSoundVolume, soundCategoryGain } from './sound-mix'
+import { renderPlaybackTimeline, type PlaybackTimelineTrack } from './sound-timeline'
 import { AutoplayRequestRegistry, PlaybackLongPress, PlaybackStartupGuard, syncAutoplayIndicators, syncPlaybackButtons, waitForAutoplayDeadline, waitForAutoplayWork, type PlaybackButtonState } from './playback-ui'
 import {
   activeGhostVoices,
@@ -4392,7 +4393,12 @@ export function setup(ctx: SpindleFrontendContext) {
     const mixedAmbienceKeys = new Set<string>()
     const selectedEvents = new Map<number, SynthesizedVoiceSegment[]>()
     const mixedVoices = new Map<number, SynthesizedVoiceSegment>()
-    const selectedAudio = { events: selectedEvents, voices: mixedVoices }
+    const capturedTimeline: PlaybackTimelineTrack[] = []
+    let timelineOrigin: number | null = null
+    let timelineEnd = 0
+    let timelineUsed = false
+    let stopContinuousAmbience = () => {}
+    const selectedAudio = { events: selectedEvents, voices: mixedVoices, timeline: capturedTimeline, get origin() { return timelineOrigin }, get end() { return timelineEnd }, get continuous() { return timelineUsed } }
     let eventSelectionStarted = false
     let resolveEventSelection!: (selection: typeof selectedAudio | null) => void
     const eventSelection = new Promise<typeof selectedAudio | null>(resolve => { resolveEventSelection = resolve })
@@ -5257,7 +5263,14 @@ export function setup(ctx: SpindleFrontendContext) {
           const selected = await eventSelection
           if (!selected) throw new DOMException('Playback ended before the sound plan was frozen.', 'AbortError')
           const voices = voiceCaptured.map((voice, index) => selected.voices.get(index) ?? voice)
-          const captured = interleaveSoundEvents<SynthesizedVoiceSegment>(voices, selected.events)
+          let captured = interleaveSoundEvents<SynthesizedVoiceSegment>(voices, selected.events)
+          if (selected.continuous) {
+            if (!playback.playbackFinished || selected.origin === null) throw new DOMException('Continuous ambience recording was interrupted.', 'AbortError')
+            const origin = selected.origin
+            const tracks = selected.timeline.filter(track => track.endSeconds > track.startSeconds).map(track => ({ ...track, startSeconds: track.startSeconds - origin, endSeconds: track.endSeconds - origin }))
+            const channels = renderPlaybackTimeline(tracks, selected.end - origin, audioContext.sampleRate)
+            captured = [{ data: encodeConcatenatedWav([{ sampleRate: audioContext.sampleRate, channels }]), mime: 'audio/wav' }]
+          }
           const saved = await persistCapturedAudio(
             playbackChat.id,
             messageId,
@@ -5371,7 +5384,14 @@ export function setup(ctx: SpindleFrontendContext) {
 
       eventSpans = (preferences.eventSounds || preferences.ambienceSounds) ? alignSoundSourceSegments(eventSourceText, plan.map(soundAlignmentText)) : []
       eventSelectionStarted = true
-      let activeAmbience: { key: string; assetId: string; segment: SynthesizedVoiceSegment; elapsed: number } | null = null
+      let activeAmbience: { key: string; source: AudioBufferSourceNode; track: PlaybackTimelineTrack } | null = null
+      stopContinuousAmbience = () => {
+        if (!activeAmbience) return
+        activeAmbience.track.endSeconds = Math.max(activeAmbience.track.startSeconds, audioContext.currentTime)
+        try { activeAmbience.source.stop() } catch { /* already stopped */ }
+        activeAmbience.source.disconnect()
+        activeAmbience = null
+      }
       const selectEventsAt = (boundary: number): SynthesizedVoiceSegment[] => {
         if (fullCues !== null && mergedPlan === null) mergedPlan = mergeOpeningSoundCues(openingCues, fullCues, eventSpans, eventSourceText.length, planReceivedAfterBoundary)
         if (mergedPlan !== null) eventCues = mergedPlan
@@ -5380,10 +5400,30 @@ export function setup(ctx: SpindleFrontendContext) {
         const chosen: SynthesizedVoiceSegment[] = []
         const mapped = mapSoundCueBoundaries(eventCues, eventSpans, eventSourceText.length)
         const instruction = ambienceInstructionAtBoundary(mapped, boundary)
-        if (!instruction) activeAmbience = null
+        if (!instruction) stopContinuousAmbience()
         else if (activeAmbience?.key !== instruction.key) {
+          stopContinuousAmbience()
           const asset = eventAssets.get(instruction.assetId)
-          activeAmbience = asset && soundAssetKinds.get(instruction.assetId) === 'ambience' ? { key: instruction.key, assetId: instruction.assetId, segment: asset, elapsed: 0 } : null
+          if (asset?.decodedBuffer && soundAssetKinds.get(instruction.assetId) === 'ambience') {
+            const buffer = asset.decodedBuffer
+            const source = audioContext.createBufferSource()
+            const gain = audioContext.createGain()
+            const start = audioContext.currentTime
+            const level = asset.normalizationGain ?? 1
+            source.buffer = buffer; source.loop = true
+            gain.gain.setValueAtTime(0, start)
+            gain.gain.linearRampToValueAtTime(level * preferences.volume, start + 0.25)
+            source.connect(gain); gain.connect(audioContext.destination)
+            const track: PlaybackTimelineTrack = { channels: Array.from({ length: buffer.numberOfChannels }, (_, channel) => buffer.getChannelData(channel)), sampleRate: buffer.sampleRate, gain: level, startSeconds: start, endSeconds: start, loop: true, fadeInSeconds: 0.25 }
+            timelineOrigin ??= start
+            capturedTimeline.push(track)
+            timelineUsed = true
+            source.start(start)
+            activeAmbience = { key: instruction.key, source, track }
+            mixedAmbienceKeys.add(instruction.key)
+            const credit = soundCreditAssets.get(instruction.assetId)
+            if (credit) usedSoundCredits.set(credit.soundId, credit)
+          }
         }
         for (const { cue } of mapped.filter(item => item.boundary === boundary && item.cue.kind === 'event')) {
           const asset = cue.assetId ? eventAssets.get(cue.assetId) : undefined
@@ -5395,29 +5435,6 @@ export function setup(ctx: SpindleFrontendContext) {
         }
         return chosen
       }
-      const withAmbience = (foreground: SynthesizedVoiceSegment): SynthesizedVoiceSegment => {
-        if (!activeAmbience || !foreground.decodedBuffer || !activeAmbience.segment.decodedBuffer) return foreground
-        try {
-        const source = foreground.decodedBuffer
-        const ambient = activeAmbience.segment.decodedBuffer
-        const mixed = mixAmbienceClip(
-          { channels: Array.from({ length: source.numberOfChannels }, (_, channel) => source.getChannelData(channel)), sampleRate: source.sampleRate, gain: foreground.normalizationGain ?? 1 },
-          { channels: Array.from({ length: ambient.numberOfChannels }, (_, channel) => ambient.getChannelData(channel)), sampleRate: ambient.sampleRate, gain: activeAmbience.segment.normalizationGain ?? 1 },
-          activeAmbience.elapsed,
-        )
-        activeAmbience.elapsed = mixed.elapsedSeconds
-        mixedAmbienceKeys.add(activeAmbience.key)
-        const credit = soundCreditAssets.get(activeAmbience.assetId)
-        if (credit) usedSoundCredits.set(credit.soundId, credit)
-        const buffer = audioContext.createBuffer(2, source.length, source.sampleRate)
-        for (let channel = 0; channel < 2; channel++) buffer.getChannelData(channel).set(mixed.channels[channel])
-        return { data: new ArrayBuffer(0), mime: 'audio/wav', decodedBuffer: buffer, normalizationGain: 1 }
-        } catch {
-          activeAmbience = null
-          appendSpeakerDebugLog('Sound effects: ambience mixing failed; continuing with voice-only playback.')
-          return foreground
-        }
-      }
       if (preferences.eventSounds || preferences.ambienceSounds) appendSpeakerDebugLog(`Sound effects at first playback: planner=${eventPlanState}, opening-planner=${openingPlanState}, cues=${eventCues.length}, assets ready=${eventAssets.size}, asset failures=${eventAssetFailures}; asset states=${JSON.stringify(Object.fromEntries(soundLoadStatus))}.`)
 
       let firstSoundStarted = false
@@ -5428,12 +5445,19 @@ export function setup(ctx: SpindleFrontendContext) {
         if (previousAudioEndedAt !== null) appendSpeakerDebugLog(`Sound timing: gap before ${kind}=${Math.max(0, now - previousAudioEndedAt)}ms (callback-to-scheduling estimate).`)
       }
       const playMeasured = async (segment: SynthesizedVoiceSegment, kind: string) => {
-        await playDecodedBuffer(playback, segment, preferences.volume, () => playbackStarted(kind))
+        await playDecodedBuffer(playback, segment, preferences.volume, () => {
+          playbackStarted(kind)
+          const buffer = segment.decodedBuffer
+          if (!buffer) return
+          const start = audioContext.currentTime
+          timelineOrigin ??= start
+          capturedTimeline.push({ channels: Array.from({ length: buffer.numberOfChannels }, (_, channel) => buffer.getChannelData(channel)), sampleRate: buffer.sampleRate, gain: segment.normalizationGain ?? 1, startSeconds: start, endSeconds: start + buffer.duration })
+        })
         previousAudioEndedAt = Date.now()
       }
 
       for (let index = 0; index < plan.length; index += 1) {
-        const events = selectEventsAt(index).map(withAmbience)
+        const events = selectEventsAt(index)
         if (events.length) selectedEvents.set(index, events)
         const current = await playBoundaryThenWaitForVoice(events, event => playMeasured(event, 'event'), processed[index])
         if (!current.ok) throw current.error
@@ -5464,17 +5488,17 @@ export function setup(ctx: SpindleFrontendContext) {
         )
         if (index === 0) appendSpeakerDebugLog(`Time from playback setup to first audio dispatch: ${Date.now() - playbackSetupFinishedAt}ms (includes speaker review, tag placement and buffering).`)
         setStatus(`Playing ${index + 1} of ${plan.length} voice segment${plan.length === 1 ? '' : 's'}…`)
-        const voice = withAmbience(current.segment)
-        if (voice !== current.segment) mixedVoices.set(index, voice)
-        await playMeasured(voice, 'voice')
+        await playMeasured(current.segment, 'voice')
       }
-      const lastEvents = selectEventsAt(plan.length).map(withAmbience)
+      const lastEvents = selectEventsAt(plan.length)
       if (lastEvents.length) selectedEvents.set(plan.length, lastEvents)
       for (const event of lastEvents) await playMeasured(event, 'event')
+      timelineEnd = audioContext.currentTime
+      stopContinuousAmbience()
       if (preferences.eventSounds || preferences.ambienceSounds) {
         const mapped = mapSoundCueBoundaries(eventCues, eventSpans, eventSourceText.length)
         const aligned = mapped.length
-        appendSpeakerDebugLog(`Sound effects at playback end: planner=${eventPlanState}, cues=${eventCues.length}, aligned cues=${aligned}, assets ready=${eventAssets.size}, asset failures=${eventAssetFailures}, selected event boundaries=${selectedEvents.size}, ambience-mixed clips=${mixedVoices.size}, asset states=${JSON.stringify(Object.fromEntries(soundLoadStatus))}.`)
+        appendSpeakerDebugLog(`Sound effects at playback end: planner=${eventPlanState}, cues=${eventCues.length}, aligned cues=${aligned}, assets ready=${eventAssets.size}, asset failures=${eventAssetFailures}, selected event boundaries=${selectedEvents.size}, continuous ambience tracks=${mixedAmbienceKeys.size}, asset states=${JSON.stringify(Object.fromEntries(soundLoadStatus))}.`)
         eventCues.forEach((cue, index) => {
           const mappedIndex = mapped.findIndex(item => item.cue === cue)
           const boundary = mappedIndex < 0 ? null : mapped[mappedIndex].boundary
@@ -5511,6 +5535,7 @@ export function setup(ctx: SpindleFrontendContext) {
         setStatus(error instanceof Error ? error.message : 'Custom voice playback failed.', 'error')
       }
     } finally {
+      stopContinuousAmbience()
       soundWorkClosed = true
       soundLoadQueue.cancel()
       resolveEventSelection(eventSelectionStarted ? selectedAudio : null)

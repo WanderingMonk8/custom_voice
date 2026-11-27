@@ -2813,33 +2813,6 @@ function mapSoundCueBoundaries(cues, segments, messageLength) {
 }
 
 // src/sound-mix.ts
-function mixAmbienceClip(foreground, ambience, elapsedSeconds, fadeInSeconds = 0.25) {
-  const valid = (clip) => Number.isSafeInteger(clip.sampleRate) && clip.sampleRate >= 8e3 && clip.sampleRate <= 192e3 && Number.isFinite(clip.gain) && clip.gain >= 0 && clip.gain <= 4 && [1, 2].includes(clip.channels.length) && !!clip.channels[0]?.length && clip.channels.every((channel) => channel instanceof Float32Array && channel.length === clip.channels[0].length);
-  if (!valid(foreground) || !valid(ambience) || !Number.isFinite(elapsedSeconds) || elapsedSeconds < 0 || !Number.isFinite(fadeInSeconds) || fadeInSeconds < 0 || fadeInSeconds > 30 || foreground.channels[0].length * 2 * 4 > MAX_MIX_BYTES) throw new Error("Invalid ambience mix.");
-  const frames = foreground.channels[0].length;
-  const output = [new Float32Array(frames), new Float32Array(frames)];
-  const ambientFrames = ambience.channels[0].length;
-  let peak = 0;
-  for (let frame = 0; frame < frames; frame++) {
-    const elapsed = elapsedSeconds + frame / foreground.sampleRate;
-    const position = elapsed * ambience.sampleRate % ambientFrames;
-    const lower = Math.floor(position);
-    const upper = (lower + 1) % ambientFrames;
-    const fraction = position - lower;
-    const fade = fadeInSeconds ? Math.min(1, elapsed / fadeInSeconds) : 1;
-    for (let channel = 0; channel < 2; channel++) {
-      const voice = foreground.channels[Math.min(channel, foreground.channels.length - 1)][frame];
-      const ambient = ambience.channels[Math.min(channel, ambience.channels.length - 1)];
-      const sample = voice * foreground.gain + (ambient[lower] + (ambient[upper] - ambient[lower]) * fraction) * ambience.gain * fade;
-      if (!Number.isFinite(sample)) throw new Error("Invalid audio sample.");
-      output[channel][frame] = sample;
-      peak = Math.max(peak, Math.abs(sample));
-    }
-  }
-  const peakGain = peak > 1 ? 1 / peak : 1;
-  if (peakGain < 1) for (const channel of output) for (let frame = 0; frame < frames; frame++) channel[frame] *= peakGain;
-  return { channels: output, peakGain, elapsedSeconds: elapsedSeconds + frames / foreground.sampleRate };
-}
 var MAX_MIX_BYTES = 128 * 1024 * 1024;
 var DEFAULT_EVENT_VOLUME = 0.8;
 var DEFAULT_AMBIENCE_VOLUME = 0.25;
@@ -2859,6 +2832,39 @@ function soundCategoryGain(channels, kind) {
   if (rms < 1e-4 || peak === 0) return 1;
   const target = kind === "ambience" ? 0.05 : 0.125;
   return Math.min(kind === "ambience" ? 1 : 4, target / rms, 0.98 / peak);
+}
+
+// src/sound-timeline.ts
+function renderPlaybackTimeline(tracks, durationSeconds, sampleRate) {
+  if (!Number.isSafeInteger(sampleRate) || sampleRate < 8e3 || sampleRate > 192e3 || !Number.isFinite(durationSeconds) || durationSeconds <= 0 || tracks.length > 2048) throw new Error("Invalid playback timeline.");
+  const frames = Math.ceil(durationSeconds * sampleRate);
+  if (!Number.isSafeInteger(frames) || frames * 2 * Float32Array.BYTES_PER_ELEMENT > 128 * 1024 * 1024) throw new Error("Playback timeline exceeds supported limits.");
+  const output = [new Float32Array(frames), new Float32Array(frames)];
+  for (const track of tracks) {
+    if (!Number.isFinite(track.startSeconds) || !Number.isFinite(track.endSeconds) || track.startSeconds < 0 || track.endSeconds <= track.startSeconds || !Number.isSafeInteger(track.sampleRate) || track.sampleRate < 8e3 || track.sampleRate > 192e3 || !Number.isFinite(track.gain) || track.gain < 0 || track.gain > 4 || ![1, 2].includes(track.channels.length) || !track.channels[0]?.length || track.channels.some((channel) => !(channel instanceof Float32Array) || channel.length !== track.channels[0].length) || !Number.isFinite(track.fadeInSeconds ?? 0) || (track.fadeInSeconds ?? 0) < 0 || !Number.isFinite(track.fadeOutSeconds ?? 0) || (track.fadeOutSeconds ?? 0) < 0) throw new Error("Invalid playback timeline track.");
+    const first = Math.max(0, Math.ceil(track.startSeconds * sampleRate));
+    const end = Math.min(frames, Math.ceil(track.endSeconds * sampleRate));
+    const sourceFrames = track.channels[0].length;
+    for (let frame = first; frame < end; frame++) {
+      const elapsed = frame / sampleRate - track.startSeconds;
+      const position = elapsed * track.sampleRate;
+      if (!track.loop && position >= sourceFrames) break;
+      const wrapped = track.loop ? position % sourceFrames : position;
+      const lower = Math.floor(wrapped);
+      const upper = track.loop ? (lower + 1) % sourceFrames : Math.min(lower + 1, sourceFrames - 1);
+      const fraction = wrapped - lower;
+      const fadeIn = track.fadeInSeconds ? Math.min(1, elapsed / track.fadeInSeconds) : 1;
+      const fadeOut = track.fadeOutSeconds ? Math.min(1, (track.endSeconds - frame / sampleRate) / track.fadeOutSeconds) : 1;
+      const gain = track.gain * Math.max(0, Math.min(fadeIn, fadeOut));
+      for (let channel = 0; channel < 2; channel++) {
+        const input = track.channels[Math.min(channel, track.channels.length - 1)];
+        const sample = input[lower] + (input[upper] - input[lower]) * fraction;
+        if (!Number.isFinite(sample)) throw new Error("Invalid playback audio sample.");
+        output[channel][frame] += sample * gain;
+      }
+    }
+  }
+  return output;
 }
 
 // src/playback-ui.ts
@@ -7055,7 +7061,19 @@ function setup(ctx) {
       const mixedAmbienceKeys = /* @__PURE__ */ new Set();
       const selectedEvents = /* @__PURE__ */ new Map();
       const mixedVoices = /* @__PURE__ */ new Map();
-      const selectedAudio = { events: selectedEvents, voices: mixedVoices };
+      const capturedTimeline = [];
+      let timelineOrigin = null;
+      let timelineEnd = 0;
+      let timelineUsed = false;
+      let stopContinuousAmbience = () => {
+      };
+      const selectedAudio = { events: selectedEvents, voices: mixedVoices, timeline: capturedTimeline, get origin() {
+        return timelineOrigin;
+      }, get end() {
+        return timelineEnd;
+      }, get continuous() {
+        return timelineUsed;
+      } };
       let eventSelectionStarted = false;
       let resolveEventSelection;
       const eventSelection = new Promise((resolve) => {
@@ -7817,7 +7835,14 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
             const selected = await eventSelection;
             if (!selected) throw new DOMException("Playback ended before the sound plan was frozen.", "AbortError");
             const voices = voiceCaptured.map((voice, index) => selected.voices.get(index) ?? voice);
-            const captured = interleaveSoundEvents(voices, selected.events);
+            let captured = interleaveSoundEvents(voices, selected.events);
+            if (selected.continuous) {
+              if (!playback.playbackFinished || selected.origin === null) throw new DOMException("Continuous ambience recording was interrupted.", "AbortError");
+              const origin = selected.origin;
+              const tracks = selected.timeline.filter((track) => track.endSeconds > track.startSeconds).map((track) => ({ ...track, startSeconds: track.startSeconds - origin, endSeconds: track.endSeconds - origin }));
+              const channels = renderPlaybackTimeline(tracks, selected.end - origin, audioContext.sampleRate);
+              captured = [{ data: encodeConcatenatedWav([{ sampleRate: audioContext.sampleRate, channels }]), mime: "audio/wav" }];
+            }
             const saved = await persistCapturedAudio(
               playbackChat.id,
               messageId,
@@ -7917,6 +7942,16 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
         eventSpans = preferences.eventSounds || preferences.ambienceSounds ? alignSoundSourceSegments(eventSourceText, plan.map(soundAlignmentText)) : [];
         eventSelectionStarted = true;
         let activeAmbience = null;
+        stopContinuousAmbience = () => {
+          if (!activeAmbience) return;
+          activeAmbience.track.endSeconds = Math.max(activeAmbience.track.startSeconds, audioContext.currentTime);
+          try {
+            activeAmbience.source.stop();
+          } catch {
+          }
+          activeAmbience.source.disconnect();
+          activeAmbience = null;
+        };
         const selectEventsAt = (boundary) => {
           if (fullCues !== null && mergedPlan === null) mergedPlan = mergeOpeningSoundCues(openingCues, fullCues, eventSpans, eventSourceText.length, planReceivedAfterBoundary);
           if (mergedPlan !== null) eventCues = mergedPlan;
@@ -7925,10 +7960,32 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
           const chosen = [];
           const mapped = mapSoundCueBoundaries(eventCues, eventSpans, eventSourceText.length);
           const instruction = ambienceInstructionAtBoundary(mapped, boundary);
-          if (!instruction) activeAmbience = null;
+          if (!instruction) stopContinuousAmbience();
           else if (activeAmbience?.key !== instruction.key) {
+            stopContinuousAmbience();
             const asset = eventAssets.get(instruction.assetId);
-            activeAmbience = asset && soundAssetKinds.get(instruction.assetId) === "ambience" ? { key: instruction.key, assetId: instruction.assetId, segment: asset, elapsed: 0 } : null;
+            if (asset?.decodedBuffer && soundAssetKinds.get(instruction.assetId) === "ambience") {
+              const buffer = asset.decodedBuffer;
+              const source = audioContext.createBufferSource();
+              const gain = audioContext.createGain();
+              const start = audioContext.currentTime;
+              const level = asset.normalizationGain ?? 1;
+              source.buffer = buffer;
+              source.loop = true;
+              gain.gain.setValueAtTime(0, start);
+              gain.gain.linearRampToValueAtTime(level * preferences.volume, start + 0.25);
+              source.connect(gain);
+              gain.connect(audioContext.destination);
+              const track = { channels: Array.from({ length: buffer.numberOfChannels }, (_, channel) => buffer.getChannelData(channel)), sampleRate: buffer.sampleRate, gain: level, startSeconds: start, endSeconds: start, loop: true, fadeInSeconds: 0.25 };
+              timelineOrigin ??= start;
+              capturedTimeline.push(track);
+              timelineUsed = true;
+              source.start(start);
+              activeAmbience = { key: instruction.key, source, track };
+              mixedAmbienceKeys.add(instruction.key);
+              const credit = soundCreditAssets.get(instruction.assetId);
+              if (credit) usedSoundCredits.set(credit.soundId, credit);
+            }
           }
           for (const { cue } of mapped.filter((item) => item.boundary === boundary && item.cue.kind === "event")) {
             const asset = cue.assetId ? eventAssets.get(cue.assetId) : void 0;
@@ -7939,29 +7996,6 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
             if (credit) usedSoundCredits.set(credit.soundId, credit);
           }
           return chosen;
-        };
-        const withAmbience = (foreground) => {
-          if (!activeAmbience || !foreground.decodedBuffer || !activeAmbience.segment.decodedBuffer) return foreground;
-          try {
-            const source = foreground.decodedBuffer;
-            const ambient = activeAmbience.segment.decodedBuffer;
-            const mixed = mixAmbienceClip(
-              { channels: Array.from({ length: source.numberOfChannels }, (_, channel) => source.getChannelData(channel)), sampleRate: source.sampleRate, gain: foreground.normalizationGain ?? 1 },
-              { channels: Array.from({ length: ambient.numberOfChannels }, (_, channel) => ambient.getChannelData(channel)), sampleRate: ambient.sampleRate, gain: activeAmbience.segment.normalizationGain ?? 1 },
-              activeAmbience.elapsed
-            );
-            activeAmbience.elapsed = mixed.elapsedSeconds;
-            mixedAmbienceKeys.add(activeAmbience.key);
-            const credit = soundCreditAssets.get(activeAmbience.assetId);
-            if (credit) usedSoundCredits.set(credit.soundId, credit);
-            const buffer = audioContext.createBuffer(2, source.length, source.sampleRate);
-            for (let channel = 0; channel < 2; channel++) buffer.getChannelData(channel).set(mixed.channels[channel]);
-            return { data: new ArrayBuffer(0), mime: "audio/wav", decodedBuffer: buffer, normalizationGain: 1 };
-          } catch {
-            activeAmbience = null;
-            appendSpeakerDebugLog("Sound effects: ambience mixing failed; continuing with voice-only playback.");
-            return foreground;
-          }
         };
         if (preferences.eventSounds || preferences.ambienceSounds) appendSpeakerDebugLog(`Sound effects at first playback: planner=${eventPlanState}, opening-planner=${openingPlanState}, cues=${eventCues.length}, assets ready=${eventAssets.size}, asset failures=${eventAssetFailures}; asset states=${JSON.stringify(Object.fromEntries(soundLoadStatus))}.`);
         let firstSoundStarted = false;
@@ -7975,11 +8009,18 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
           if (previousAudioEndedAt !== null) appendSpeakerDebugLog(`Sound timing: gap before ${kind}=${Math.max(0, now - previousAudioEndedAt)}ms (callback-to-scheduling estimate).`);
         };
         const playMeasured = async (segment, kind) => {
-          await playDecodedBuffer(playback, segment, preferences.volume, () => playbackStarted(kind));
+          await playDecodedBuffer(playback, segment, preferences.volume, () => {
+            playbackStarted(kind);
+            const buffer = segment.decodedBuffer;
+            if (!buffer) return;
+            const start = audioContext.currentTime;
+            timelineOrigin ??= start;
+            capturedTimeline.push({ channels: Array.from({ length: buffer.numberOfChannels }, (_, channel) => buffer.getChannelData(channel)), sampleRate: buffer.sampleRate, gain: segment.normalizationGain ?? 1, startSeconds: start, endSeconds: start + buffer.duration });
+          });
           previousAudioEndedAt = Date.now();
         };
         for (let index = 0; index < plan.length; index += 1) {
-          const events = selectEventsAt(index).map(withAmbience);
+          const events = selectEventsAt(index);
           if (events.length) selectedEvents.set(index, events);
           const current = await playBoundaryThenWaitForVoice(events, (event) => playMeasured(event, "event"), processed[index]);
           if (!current.ok) throw current.error;
@@ -8009,17 +8050,17 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
           );
           if (index === 0) appendSpeakerDebugLog(`Time from playback setup to first audio dispatch: ${Date.now() - playbackSetupFinishedAt}ms (includes speaker review, tag placement and buffering).`);
           setStatus(`Playing ${index + 1} of ${plan.length} voice segment${plan.length === 1 ? "" : "s"}\u2026`);
-          const voice = withAmbience(current.segment);
-          if (voice !== current.segment) mixedVoices.set(index, voice);
-          await playMeasured(voice, "voice");
+          await playMeasured(current.segment, "voice");
         }
-        const lastEvents = selectEventsAt(plan.length).map(withAmbience);
+        const lastEvents = selectEventsAt(plan.length);
         if (lastEvents.length) selectedEvents.set(plan.length, lastEvents);
         for (const event of lastEvents) await playMeasured(event, "event");
+        timelineEnd = audioContext.currentTime;
+        stopContinuousAmbience();
         if (preferences.eventSounds || preferences.ambienceSounds) {
           const mapped = mapSoundCueBoundaries(eventCues, eventSpans, eventSourceText.length);
           const aligned = mapped.length;
-          appendSpeakerDebugLog(`Sound effects at playback end: planner=${eventPlanState}, cues=${eventCues.length}, aligned cues=${aligned}, assets ready=${eventAssets.size}, asset failures=${eventAssetFailures}, selected event boundaries=${selectedEvents.size}, ambience-mixed clips=${mixedVoices.size}, asset states=${JSON.stringify(Object.fromEntries(soundLoadStatus))}.`);
+          appendSpeakerDebugLog(`Sound effects at playback end: planner=${eventPlanState}, cues=${eventCues.length}, aligned cues=${aligned}, assets ready=${eventAssets.size}, asset failures=${eventAssetFailures}, selected event boundaries=${selectedEvents.size}, continuous ambience tracks=${mixedAmbienceKeys.size}, asset states=${JSON.stringify(Object.fromEntries(soundLoadStatus))}.`);
           eventCues.forEach((cue, index) => {
             const mappedIndex = mapped.findIndex((item) => item.cue === cue);
             const boundary = mappedIndex < 0 ? null : mapped[mappedIndex].boundary;
@@ -8048,6 +8089,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
           setStatus(error instanceof Error ? error.message : "Custom voice playback failed.", "error");
         }
       } finally {
+        stopContinuousAmbience();
         soundWorkClosed = true;
         soundLoadQueue.cancel();
         resolveEventSelection(eventSelectionStarted ? selectedAudio : null);
