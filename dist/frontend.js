@@ -2870,7 +2870,7 @@ function renderPlaybackTimeline(tracks, durationSeconds, sampleRate) {
     const end = Math.min(frames, Math.ceil(track.endSeconds * sampleRate));
     const sourceFrames = track.channels[0].length;
     for (let frame = first; frame < end; frame++) {
-      const elapsed = frame / sampleRate - track.startSeconds;
+      const elapsed = Math.max(0, frame / sampleRate - track.startSeconds);
       const position = elapsed * track.sampleRate;
       if (!track.loop && position >= sourceFrames) break;
       const wrapped = track.loop ? position % sourceFrames : position;

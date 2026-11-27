@@ -670,6 +670,19 @@ test('timeline channel snapshots survive source buffer detachment', () => {
   assert.ok(Math.abs(mixed[0][1] - 0.2) < 0.00001)
 })
 
+test('timeline sampling tolerates floating-point error at a source start boundary', () => {
+  const rate = 48000
+  const start = 0.0004791666666666667
+  assert.equal(Math.ceil(start * rate), 23)
+  assert.ok(23 / rate - start < 0)
+  const source = new Float32Array([0.25, 0.5])
+  for (const loop of [false, true]) {
+    const rendered = renderPlaybackTimeline([{ channels: [source], sampleRate: rate, gain: 1, startSeconds: start, endSeconds: 25 / rate, loop }], 25 / rate, rate)
+    assert.equal(rendered[0][23], 0.25)
+    assert.ok(rendered[0].every(Number.isFinite))
+  }
+})
+
 test('ambience-mixed clips encode with the same sample order for saving', () => {
   const ambience = { channels: [new Float32Array([0.1, 0.2, 0.3, 0.4])], sampleRate: 8000, gain: 1 }
   const foreground = { channels: [new Float32Array([0.1, 0.1])], sampleRate: 8000, gain: 1 }

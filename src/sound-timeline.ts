@@ -55,7 +55,10 @@ export function renderPlaybackTimeline(tracks: readonly PlaybackTimelineTrack[],
     const end = Math.min(frames, Math.ceil(track.endSeconds * sampleRate))
     const sourceFrames = track.channels[0].length
     for (let frame = first; frame < end; frame++) {
-      const elapsed = frame / sampleRate - track.startSeconds
+      // Multiplication and division can round in opposite directions even
+      // after ceil(), leaving a tiny negative elapsed at an exact boundary.
+      // A negative sample index reads undefined and poisons the recording.
+      const elapsed = Math.max(0, frame / sampleRate - track.startSeconds)
       const position = elapsed * track.sampleRate
       if (!track.loop && position >= sourceFrames) break
       const wrapped = track.loop ? position % sourceFrames : position
