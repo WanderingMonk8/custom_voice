@@ -2728,6 +2728,26 @@ function shortlistSoundAssets(message, favorites, limit = 8, kinds = ["event", "
     return { sound, score, order };
   }).filter((item) => item.score > 0).sort((a, b) => b.score - a.score || a.order - b.order).slice(0, Math.max(0, Math.min(8, Math.floor(limit)))).map((item) => item.sound);
 }
+function localOpeningAmbience(message, favorites) {
+  const opening = message.split(/\n\s*\n/u, 1)[0]?.split(/[.!?\n]/u, 1)[0] ?? "";
+  if (!opening || opening.length > 300 || /["“”‘’]/u.test(opening) || /\b(?:not|no|never|without|silent|quiet|stopped|stops|ceased|imagined|remembered|remember|would|could|might|if|before|until|once|yesterday|formerly)\b/iu.test(opening) || !/\b(?:flows?|flowing|murmurs?|murmuring|babbles?|bubbling|rushes|rushing|hums?|humming|rains?|raining|chirps?|chirping|buzzes|buzzing|roars?|roaring|rustles?|rustling|crackles?|crackling)\b/iu.test(opening)) return null;
+  const matches = [];
+  for (const sound2 of favorites) {
+    if (sound2.kind !== "ambience") continue;
+    for (const tag of sound2.tags) {
+      const term = tag.trim();
+      if (term.length < 4 || term.length > 40 || !/^[\p{L}\p{N}]+(?:[ -][\p{L}\p{N}]+)*$/u.test(term)) continue;
+      const escaped = term.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+      const match = new RegExp(`(?<![\\p{L}\\p{N}])${escaped}(?![\\p{L}\\p{N}])`, "iu").exec(opening);
+      if (!match || message.indexOf(match[0]) !== message.lastIndexOf(match[0])) continue;
+      matches.push({ sound: sound2, anchor: match[0], offset: match.index });
+      break;
+    }
+  }
+  if (matches.length !== 1) return null;
+  const { sound, anchor, offset } = matches[0];
+  return { kind: "ambience", action: "play", assetId: sound.id, anchor, offset, position: "before" };
+}
 function ambienceInstructionAtBoundary(mapped, boundary) {
   let latest = null;
   mapped.forEach((item, index) => {
@@ -6938,7 +6958,7 @@ function setup(ctx) {
       const earlySoundPlan = (preferences.eventSounds || preferences.ambienceSounds) && eventSourceText.length <= 3e4 && eventSourceText.trim() ? soundLibraryRequest("chat_voice_sound_scene_plan", { message: eventSourceText, connectionId: preferences.tagLlmConnectionId, model: preferences.tagLlmModel, suggestMissing: preferences.suggestMissingSounds || preferences.autoSoundLookup }, (progress) => {
         soundPlanProgress.push(progress);
       }).then((result) => ({ result, error: null, completedAt: Date.now() }), (error) => ({ result: null, error, completedAt: Date.now() })) : null;
-      const openingSoundPlan = earlySoundPlan && eventSourceText.length > 420 ? soundLibraryRequest("chat_voice_sound_scene_plan", { message: eventSourceText, connectionId: preferences.tagLlmConnectionId, model: preferences.tagLlmModel, opening: true }).then((result) => ({ result, error: null, completedAt: Date.now() }), (error) => ({ result: null, error, completedAt: Date.now() })) : null;
+      const openingSoundPlan = earlySoundPlan ? soundLibraryRequest("chat_voice_sound_scene_plan", { message: eventSourceText, connectionId: preferences.tagLlmConnectionId, model: preferences.tagLlmModel, opening: true }).then((result) => ({ result, error: null, completedAt: Date.now() }), (error) => ({ result: null, error, completedAt: Date.now() })) : null;
       const connectionProfileVoice = (connections.find((connection) => connection.id === connectionId)?.voice ?? "").trim();
       let autoCastDiagnostics = [];
       if (preferences.autoVoiceCasting && poolVoicesForAutoCast().length && (!config.narratorVoice || !config.userVoice || playbackChat.characters.some((character) => !config.characterVoices[character.id]))) {
@@ -7022,6 +7042,11 @@ function setup(ctx) {
       missingSoundSuggestions.textContent = "No missing-sound suggestions for the current playback.";
       let eventCues = [];
       let openingCues = [];
+      let localOpeningCue = null;
+      let resolveLocalOpening;
+      const localOpeningReady = new Promise((resolve) => {
+        resolveLocalOpening = resolve;
+      });
       let fullCues = null;
       let mergedPlan = null;
       let eventSpans = [];
@@ -7130,9 +7155,26 @@ function setup(ctx) {
           const kinds = [];
           if (preferences.eventSounds) kinds.push("event");
           if (preferences.ambienceSounds) kinds.push("ambience");
+          const local = preferences.ambienceSounds ? localOpeningAmbience(eventSourceText, result.favorites ?? []) : null;
+          if (local?.assetId && !soundWorkClosed && !playback.controller.signal.aborted) {
+            appendSpeakerDebugLog("Sound timing: local opening ambience identified; prioritizing asset.");
+            void prepareEventAsset(local.assetId, true).then(() => {
+              if (soundWorkClosed || playback.controller.signal.aborted || !eventAssets.has(local.assetId) || fullCues !== null || openingPlanState === "completed") {
+                resolveLocalOpening(false);
+                return;
+              }
+              localOpeningCue = local;
+              openingCues = [local];
+              cueArrivalBoundary.set(local, lastReachedSoundBoundary);
+              eventCues = [local];
+              appendSpeakerDebugLog("Sound timing: local opening ambience ready; playback need not wait for the model.");
+              resolveLocalOpening(true);
+            });
+          } else resolveLocalOpening(false);
           if (!soundWorkClosed && !playback.controller.signal.aborted) for (const sound of shortlistSoundAssets(eventSourceText, result.favorites ?? [], 8, kinds)) void prepareEventAsset(sound.id);
         }).catch(() => {
           eventAssetFailures++;
+          resolveLocalOpening(false);
         });
         missingSoundSuggestions.textContent = preferences.suggestMissingSounds ? "Looking for missing sounds in this scene\u2026" : "No missing-sound suggestions for the current playback.";
         if (openingSoundPlan) void openingSoundPlan.then(async (response) => {
@@ -7148,6 +7190,7 @@ function setup(ctx) {
             appendSpeakerDebugLog("Opening sound plan ignored: full plan already arrived.");
             return;
           }
+          localOpeningCue = null;
           openingCues = (response.result.cues ?? []).filter((cue) => cue.kind === "event" ? preferences.eventSounds : preferences.ambienceSounds);
           for (const cue of openingCues) cueArrivalBoundary.set(cue, lastReachedSoundBoundary);
           eventCues = [...openingCues];
@@ -7179,6 +7222,10 @@ function setup(ctx) {
             }
           }
           fullCues = (result.cues ?? []).filter((cue) => cue.kind === "event" ? preferences.eventSounds : preferences.ambienceSounds);
+          if (localOpeningCue) {
+            openingCues = openingCues.filter((cue) => cue !== localOpeningCue);
+            localOpeningCue = null;
+          }
           for (const cue of fullCues) cueArrivalBoundary.set(cue, lastReachedSoundBoundary);
           eventCues = mergeOpeningSoundCues(openingCues, fullCues, eventSpans, eventSourceText.length, lastReachedSoundBoundary);
           mergedPlan = eventSpans.length ? eventCues : null;
@@ -7932,10 +7979,16 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
         if (earlySoundPlan && eventPlanState === "pending" && preferences.soundStartupWaitSeconds > 0) {
           const waitStarted = Date.now();
           setStatus("Waiting briefly for opening sound cues\u2026");
-          const firstSuccessfulPlan = Promise.any([earlySoundPlan, openingSoundPlan].filter((item) => item !== null).map((pending) => pending.then((response) => {
-            if (response.error || !response.result) throw new Error("Sound plan unavailable.");
-            return response;
-          }))).catch(() => null);
+          const firstSuccessfulPlan = Promise.any([
+            ...[earlySoundPlan, openingSoundPlan].filter((item) => item !== null).map((pending) => pending.then((response) => {
+              if (response.error || !response.result) throw new Error("Sound plan unavailable.");
+              return response;
+            })),
+            localOpeningReady.then((ready) => {
+              if (!ready) throw new Error("No local opening ambience.");
+              return null;
+            })
+          ]).catch(() => null);
           await Promise.race([firstSuccessfulPlan, abortableDelay(preferences.soundStartupWaitSeconds * 1e3, playback.controller.signal)]);
           appendSpeakerDebugLog(`Sound timing: optional startup wait=${Date.now() - waitStarted}ms (limit=${preferences.soundStartupWaitSeconds * 1e3}ms).`);
         }

@@ -8,7 +8,7 @@ import { AutomaticSoundCache } from './sound-auto-cache'
 import { selectSoundLibraryTab } from './sound-library-tabs'
 import { automaticSoundErrorCategory, soundPlanErrorCategory, soundRequestTimeoutMs } from './sound-plan-diagnostics'
 import { isFreesoundCc0, parseFreesoundSearch, rankAutomaticFreesoundResults, safeFreesoundPreviewUrl } from './freesound'
-import { alignSoundSourceSegments, ambienceInstructionAtBoundary, competingSoundCueIndexes, interleaveSoundEvents, mapSoundCueBoundaries, mergeOpeningSoundCues, parseMissingSoundSuggestions, parseSoundScenePlan, playBoundaryThenWaitForVoice, shortlistSoundAssets, shortlistSoundPlannerAssets, soundAlignmentText, soundOpeningExcerpt, splitNarrationForSoundEvents } from './sound-scene'
+import { alignSoundSourceSegments, ambienceInstructionAtBoundary, competingSoundCueIndexes, interleaveSoundEvents, localOpeningAmbience, mapSoundCueBoundaries, mergeOpeningSoundCues, parseMissingSoundSuggestions, parseSoundScenePlan, playBoundaryThenWaitForVoice, shortlistSoundAssets, shortlistSoundPlannerAssets, soundAlignmentText, soundOpeningExcerpt, splitNarrationForSoundEvents } from './sound-scene'
 import { DEFAULT_AMBIENCE_VOLUME, DEFAULT_EVENT_VOLUME, mixAmbienceClip, readSoundVolume, renderSoundMix, soundCategoryGain } from './sound-mix'
 import { buildSoundTimeline, encodeSoundTimelineWav, renderPlaybackTimeline, resampleSoundClip } from './sound-timeline'
 import { SoundCuePreparation } from './sound-preparation'
@@ -362,6 +362,18 @@ test('opening sound excerpt is bounded and ends at a safe early boundary', () =>
   assert.ok(message.startsWith(opening))
   assert.match(opening, /[.!?]$/u)
   assert.equal(soundOpeningExcerpt('Short scene.'), 'Short scene.')
+})
+
+test('local opening ambience requires a unique active narrated match', () => {
+  const creek = { version: 1 as const, id: 'creek', name: 'Creek', description: '', tags: ['creek', 'brook'], kind: 'ambience' as const, mime: 'audio/wav', bytes: 1, createdAt: new Date().toISOString() }
+  const message = 'The creek murmurs beyond the cabin. She opens the door.'
+  assert.deepEqual(localOpeningAmbience(message, [creek]), { kind: 'ambience', action: 'play', assetId: 'creek', anchor: 'creek', offset: 4, position: 'before' })
+  assert.equal(localOpeningAmbience('“The creek murmurs,” she says.', [creek]), null)
+  assert.equal(localOpeningAmbience('The creek is not murmuring today.', [creek]), null)
+  assert.equal(localOpeningAmbience('She remembered when the creek murmured.', [creek]), null)
+  assert.equal(localOpeningAmbience(message, [creek, { ...creek, id: 'other' }]), null)
+  assert.equal(localOpeningAmbience('The creek murmurs. The creek is lovely.', [creek]), null)
+  assert.equal(localOpeningAmbience(message, [{ ...creek, kind: 'event' }]), null)
 })
 
 test('opening and full sound plans deduplicate shared boundaries and do not revive stale ambience', () => {

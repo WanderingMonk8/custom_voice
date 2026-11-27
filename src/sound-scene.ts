@@ -184,6 +184,29 @@ export function shortlistSoundAssets(message: string, favorites: readonly Favori
     .slice(0, Math.max(0, Math.min(8, Math.floor(limit)))).map(item => item.sound)
 }
 
+/** A narrow, uniquely grounded opening ambience hint; never infer from dialogue. */
+export function localOpeningAmbience(message: string, favorites: readonly FavoriteSound[]): SoundSceneCue | null {
+  const opening = message.split(/\n\s*\n/u, 1)[0]?.split(/[.!?\n]/u, 1)[0] ?? ''
+  if (!opening || opening.length > 300 || /["“”‘’]/u.test(opening)
+    || /\b(?:not|no|never|without|silent|quiet|stopped|stops|ceased|imagined|remembered|remember|would|could|might|if|before|until|once|yesterday|formerly)\b/iu.test(opening)
+    || !/\b(?:flows?|flowing|murmurs?|murmuring|babbles?|bubbling|rushes|rushing|hums?|humming|rains?|raining|chirps?|chirping|buzzes|buzzing|roars?|roaring|rustles?|rustling|crackles?|crackling)\b/iu.test(opening)) return null
+  const matches: Array<{ sound: FavoriteSound; anchor: string; offset: number }> = []
+  for (const sound of favorites) {
+    if (sound.kind !== 'ambience') continue
+    for (const tag of sound.tags) {
+      const term = tag.trim()
+      if (term.length < 4 || term.length > 40 || !/^[\p{L}\p{N}]+(?:[ -][\p{L}\p{N}]+)*$/u.test(term)) continue
+      const escaped = term.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&')
+      const match = new RegExp(`(?<![\\p{L}\\p{N}])${escaped}(?![\\p{L}\\p{N}])`, 'iu').exec(opening)
+      if (!match || message.indexOf(match[0]) !== message.lastIndexOf(match[0])) continue
+      matches.push({ sound, anchor: match[0], offset: match.index }); break
+    }
+  }
+  if (matches.length !== 1) return null
+  const { sound, anchor, offset } = matches[0]
+  return { kind: 'ambience', action: 'play', assetId: sound.id, anchor, offset, position: 'before' }
+}
+
 /** Limit large model prompts while retaining unmatched examples from each category. */
 export function shortlistSoundPlannerAssets(message: string, favorites: readonly FavoriteSound[], limit = 32): FavoriteSound[] {
   const cap = Math.max(1, Math.min(32, Math.floor(limit)))

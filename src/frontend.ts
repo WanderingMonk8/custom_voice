@@ -8,7 +8,7 @@ import { SoundLoadQueue } from './sound-load-queue'
 import { selectSoundLibraryTab } from './sound-library-tabs'
 import { automaticSoundErrorCategory, soundRequestTimeoutMs } from './sound-plan-diagnostics'
 import { isFreesoundCc0, isFreesoundImportLicense, rankAutomaticFreesoundResults, safeFreesoundPreviewUrl, type FreesoundSearchResult } from './freesound'
-import { alignSoundSourceSegments, ambienceInstructionAtBoundary, interleaveSoundEvents, mapSoundCueBoundaries, mergeOpeningSoundCues, playBoundaryThenWaitForVoice, shortlistSoundAssets, soundAlignmentText, splitNarrationForSoundEvents, type MissingSoundSuggestion, type SoundSceneCue } from './sound-scene'
+import { alignSoundSourceSegments, ambienceInstructionAtBoundary, interleaveSoundEvents, localOpeningAmbience, mapSoundCueBoundaries, mergeOpeningSoundCues, playBoundaryThenWaitForVoice, shortlistSoundAssets, soundAlignmentText, splitNarrationForSoundEvents, type MissingSoundSuggestion, type SoundSceneCue } from './sound-scene'
 import { DEFAULT_AMBIENCE_VOLUME, DEFAULT_EVENT_VOLUME, readSoundVolume, soundCategoryGain } from './sound-mix'
 import { renderPlaybackTimeline, type PlaybackTimelineTrack } from './sound-timeline'
 import { AutoplayRequestRegistry, PlaybackLongPress, PlaybackStartupGuard, syncAutoplayIndicators, syncPlaybackButtons, waitForAutoplayDeadline, waitForAutoplayWork, type PlaybackButtonState } from './playback-ui'
@@ -4268,7 +4268,7 @@ export function setup(ctx: SpindleFrontendContext) {
       ? soundLibraryRequest('chat_voice_sound_scene_plan', { message: eventSourceText, connectionId: preferences.tagLlmConnectionId, model: preferences.tagLlmModel, suggestMissing: preferences.suggestMissingSounds || preferences.autoSoundLookup }, progress => { soundPlanProgress.push(progress) })
         .then(result => ({ result, error: null, completedAt: Date.now() }), error => ({ result: null, error, completedAt: Date.now() }))
       : null
-    const openingSoundPlan = earlySoundPlan && eventSourceText.length > 420
+    const openingSoundPlan = earlySoundPlan
       ? soundLibraryRequest('chat_voice_sound_scene_plan', { message: eventSourceText, connectionId: preferences.tagLlmConnectionId, model: preferences.tagLlmModel, opening: true })
         .then(result => ({ result, error: null, completedAt: Date.now() }), error => ({ result: null, error, completedAt: Date.now() }))
       : null
@@ -4359,6 +4359,9 @@ export function setup(ctx: SpindleFrontendContext) {
     // sound metadata with the selected LLM and default Decision connections.
     let eventCues: SoundSceneCue[] = []
     let openingCues: SoundSceneCue[] = []
+    let localOpeningCue: SoundSceneCue | null = null
+    let resolveLocalOpening!: (ready: boolean) => void
+    const localOpeningReady = new Promise<boolean>(resolve => { resolveLocalOpening = resolve })
     let fullCues: SoundSceneCue[] | null = null
     let mergedPlan: SoundSceneCue[] | null = null
     let eventSpans: Array<{ start: number; end: number } | null> = []
@@ -4447,8 +4450,21 @@ export function setup(ctx: SpindleFrontendContext) {
         const kinds: Array<'event' | 'ambience'> = []
         if (preferences.eventSounds) kinds.push('event')
         if (preferences.ambienceSounds) kinds.push('ambience')
+        const local = preferences.ambienceSounds ? localOpeningAmbience(eventSourceText, result.favorites ?? []) : null
+        if (local?.assetId && !soundWorkClosed && !playback.controller.signal.aborted) {
+          appendSpeakerDebugLog('Sound timing: local opening ambience identified; prioritizing asset.')
+          void prepareEventAsset(local.assetId, true).then(() => {
+            if (soundWorkClosed || playback.controller.signal.aborted || !eventAssets.has(local.assetId!) || fullCues !== null || openingPlanState === 'completed') { resolveLocalOpening(false); return }
+            localOpeningCue = local
+            openingCues = [local]
+            cueArrivalBoundary.set(local, lastReachedSoundBoundary)
+            eventCues = [local]
+            appendSpeakerDebugLog('Sound timing: local opening ambience ready; playback need not wait for the model.')
+            resolveLocalOpening(true)
+          })
+        } else resolveLocalOpening(false)
         if (!soundWorkClosed && !playback.controller.signal.aborted) for (const sound of shortlistSoundAssets(eventSourceText, result.favorites ?? [], 8, kinds)) void prepareEventAsset(sound.id)
-      }).catch(() => { eventAssetFailures++ })
+      }).catch(() => { eventAssetFailures++; resolveLocalOpening(false) })
       missingSoundSuggestions.textContent = preferences.suggestMissingSounds ? 'Looking for missing sounds in this scene…' : 'No missing-sound suggestions for the current playback.'
       if (openingSoundPlan) void openingSoundPlan.then(async response => {
         if (soundWorkClosed || playback.controller.signal.aborted) return
@@ -4456,6 +4472,7 @@ export function setup(ctx: SpindleFrontendContext) {
         openingPlanState = 'completed'
         appendSpeakerDebugLog(`Sound timing: opening planner round-trip=${response.completedAt - soundPlanStarted}ms${response.result.soundTimings ? `, generation=${response.result.soundTimings.generationMs}ms, candidates=${response.result.soundTimings.candidateCount ?? '?'}` : ''}.`)
         if (fullCues !== null) { appendSpeakerDebugLog('Opening sound plan ignored: full plan already arrived.'); return }
+        localOpeningCue = null
         openingCues = (response.result.cues ?? []).filter(cue => cue.kind === 'event' ? preferences.eventSounds : preferences.ambienceSounds)
         for (const cue of openingCues) cueArrivalBoundary.set(cue, lastReachedSoundBoundary)
         eventCues = [...openingCues]
@@ -4478,6 +4495,7 @@ export function setup(ctx: SpindleFrontendContext) {
             }
           }
           fullCues = (result.cues ?? []).filter(cue => (cue.kind === 'event' ? preferences.eventSounds : preferences.ambienceSounds))
+          if (localOpeningCue) { openingCues = openingCues.filter(cue => cue !== localOpeningCue); localOpeningCue = null }
           for (const cue of fullCues) cueArrivalBoundary.set(cue, lastReachedSoundBoundary)
           eventCues = mergeOpeningSoundCues(openingCues, fullCues, eventSpans, eventSourceText.length, lastReachedSoundBoundary)
           mergedPlan = eventSpans.length ? eventCues : null
@@ -5375,8 +5393,11 @@ export function setup(ctx: SpindleFrontendContext) {
       if (earlySoundPlan && eventPlanState === 'pending' && preferences.soundStartupWaitSeconds > 0) {
         const waitStarted = Date.now()
         setStatus('Waiting briefly for opening sound cues…')
-        const firstSuccessfulPlan = Promise.any([earlySoundPlan, openingSoundPlan].filter((item): item is NonNullable<typeof earlySoundPlan> => item !== null)
-          .map(pending => pending.then(response => { if (response.error || !response.result) throw new Error('Sound plan unavailable.'); return response })))
+        const firstSuccessfulPlan = Promise.any([
+          ...[earlySoundPlan, openingSoundPlan].filter((item): item is NonNullable<typeof earlySoundPlan> => item !== null)
+            .map(pending => pending.then(response => { if (response.error || !response.result) throw new Error('Sound plan unavailable.'); return response })),
+          localOpeningReady.then(ready => { if (!ready) throw new Error('No local opening ambience.'); return null }),
+        ])
           .catch(() => null)
         await Promise.race([firstSuccessfulPlan, abortableDelay(preferences.soundStartupWaitSeconds * 1000, playback.controller.signal)])
         appendSpeakerDebugLog(`Sound timing: optional startup wait=${Date.now() - waitStarted}ms (limit=${preferences.soundStartupWaitSeconds * 1000}ms).`)
