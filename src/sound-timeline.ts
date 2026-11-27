@@ -22,6 +22,55 @@ export interface SampledSoundClip extends SoundTimelineClip {
   sampleRate: number
 }
 
+/** A source heard on the audio clock, including any silence between sources. */
+export interface PlaybackTimelineTrack extends SampledSoundClip {
+  startSeconds: number
+  endSeconds: number
+  loop?: boolean
+  fadeInSeconds?: number
+  fadeOutSeconds?: number
+}
+
+/** Render captured audio-clock positions into the recording, preserving gaps. */
+export function renderPlaybackTimeline(tracks: readonly PlaybackTimelineTrack[], durationSeconds: number, sampleRate: number): Float32Array[] {
+  if (!Number.isSafeInteger(sampleRate) || sampleRate < 8000 || sampleRate > 192000
+    || !Number.isFinite(durationSeconds) || durationSeconds <= 0 || tracks.length > 2048) throw new Error('Invalid playback timeline.')
+  const frames = Math.ceil(durationSeconds * sampleRate)
+  if (!Number.isSafeInteger(frames) || frames * 2 * Float32Array.BYTES_PER_ELEMENT > 128 * 1024 * 1024) throw new Error('Playback timeline exceeds supported limits.')
+  const output = [new Float32Array(frames), new Float32Array(frames)]
+  for (const track of tracks) {
+    if (!Number.isFinite(track.startSeconds) || !Number.isFinite(track.endSeconds) || track.startSeconds < 0 || track.endSeconds <= track.startSeconds
+      || !Number.isSafeInteger(track.sampleRate) || track.sampleRate < 8000 || track.sampleRate > 192000
+      || !Number.isFinite(track.gain) || track.gain < 0 || track.gain > 4
+      || ![1, 2].includes(track.channels.length) || !track.channels[0]?.length
+      || track.channels.some(channel => !(channel instanceof Float32Array) || channel.length !== track.channels[0].length)
+      || !Number.isFinite(track.fadeInSeconds ?? 0) || (track.fadeInSeconds ?? 0) < 0
+      || !Number.isFinite(track.fadeOutSeconds ?? 0) || (track.fadeOutSeconds ?? 0) < 0) throw new Error('Invalid playback timeline track.')
+    const first = Math.max(0, Math.ceil(track.startSeconds * sampleRate))
+    const end = Math.min(frames, Math.ceil(track.endSeconds * sampleRate))
+    const sourceFrames = track.channels[0].length
+    for (let frame = first; frame < end; frame++) {
+      const elapsed = frame / sampleRate - track.startSeconds
+      const position = elapsed * track.sampleRate
+      if (!track.loop && position >= sourceFrames) break
+      const wrapped = track.loop ? position % sourceFrames : position
+      const lower = Math.floor(wrapped)
+      const upper = track.loop ? (lower + 1) % sourceFrames : Math.min(lower + 1, sourceFrames - 1)
+      const fraction = wrapped - lower
+      const fadeIn = track.fadeInSeconds ? Math.min(1, elapsed / track.fadeInSeconds) : 1
+      const fadeOut = track.fadeOutSeconds ? Math.min(1, (track.endSeconds - frame / sampleRate) / track.fadeOutSeconds) : 1
+      const gain = track.gain * Math.max(0, Math.min(fadeIn, fadeOut))
+      for (let channel = 0; channel < 2; channel++) {
+        const input = track.channels[Math.min(channel, track.channels.length - 1)]
+        const sample = input[lower] + (input[upper] - input[lower]) * fraction
+        if (!Number.isFinite(sample)) throw new Error('Invalid playback audio sample.')
+        output[channel][frame] += sample * gain
+      }
+    }
+  }
+  return output
+}
+
 /** Resample bounded decoded PCM into a common rate before timeline assembly. */
 export function resampleSoundClip(clip: SampledSoundClip, sampleRate: number): SoundTimelineClip {
   if (!Number.isSafeInteger(sampleRate) || sampleRate < 8000 || sampleRate > 192000

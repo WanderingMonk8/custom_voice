@@ -10,7 +10,7 @@ import { automaticSoundErrorCategory, soundPlanErrorCategory, soundRequestTimeou
 import { isFreesoundCc0, parseFreesoundSearch, rankAutomaticFreesoundResults, safeFreesoundPreviewUrl } from './freesound'
 import { alignSoundSourceSegments, ambienceInstructionAtBoundary, competingSoundCueIndexes, interleaveSoundEvents, mapSoundCueBoundaries, mergeOpeningSoundCues, parseMissingSoundSuggestions, parseSoundScenePlan, playBoundaryThenWaitForVoice, shortlistSoundAssets, shortlistSoundPlannerAssets, soundAlignmentText, soundOpeningExcerpt, splitNarrationForSoundEvents } from './sound-scene'
 import { DEFAULT_AMBIENCE_VOLUME, DEFAULT_EVENT_VOLUME, mixAmbienceClip, readSoundVolume, renderSoundMix, soundCategoryGain } from './sound-mix'
-import { buildSoundTimeline, encodeSoundTimelineWav, resampleSoundClip } from './sound-timeline'
+import { buildSoundTimeline, encodeSoundTimelineWav, renderPlaybackTimeline, resampleSoundClip } from './sound-timeline'
 import { SoundCuePreparation } from './sound-preparation'
 import { AutoplayRequestRegistry, PlaybackLongPress, PlaybackStartupGuard, syncAutoplayIndicators, syncPlaybackButtons, waitForAutoplayDeadline, waitForAutoplayWork, type PlaybackButtonState } from './playback-ui'
 import { evaluateSpeakerReviews } from './speaker-review-evaluation'
@@ -631,6 +631,22 @@ test('ambience mixes under consecutive clips with a continuous loop and fade', (
   const faded = mixAmbienceClip(foreground, ambience, 0, 1)
   assert.ok(Math.abs(faded.channels[0][0] - 0.1) < 0.00001)
   assert.throws(() => mixAmbienceClip(foreground, { ...ambience, channels: [new Float32Array([NaN])] }, 0), /Invalid audio sample/)
+})
+
+test('captured playback timeline keeps ambience continuous through speech gaps', () => {
+  const rate = 8000
+  const ambient = new Float32Array([0.1, 0.2, 0.3, 0.4])
+  const voice = new Float32Array([0.5, 0.5])
+  const tracks = [
+    { channels: [ambient], sampleRate: rate, gain: 1, startSeconds: 0, endSeconds: 8 / rate, loop: true },
+    { channels: [voice], sampleRate: rate, gain: 1, startSeconds: 0, endSeconds: 2 / rate },
+    { channels: [voice], sampleRate: rate, gain: 1, startSeconds: 6 / rate, endSeconds: 8 / rate },
+  ]
+  const rendered = renderPlaybackTimeline(tracks, 8 / rate, rate)
+  const expected = [0.6, 0.7, 0.3, 0.4, 0.1, 0.2, 0.8, 0.9]
+  for (let i = 0; i < expected.length; i++) assert.ok(Math.abs(rendered[0][i] - expected[i]) < 0.00001)
+  assert.deepEqual(rendered[0], rendered[1])
+  assert.throws(() => renderPlaybackTimeline(tracks, 999999, rate), /exceeds/)
 })
 
 test('ambience-mixed clips encode with the same sample order for saving', () => {
