@@ -10,7 +10,7 @@ import { automaticSoundErrorCategory, soundRequestTimeoutMs } from './sound-plan
 import { isFreesoundCc0, isFreesoundImportLicense, rankAutomaticFreesoundResults, safeFreesoundPreviewUrl, type FreesoundSearchResult } from './freesound'
 import { alignSoundSourceSegments, ambienceInstructionAtBoundary, interleaveSoundEvents, localOpeningAmbience, mapSoundCueBoundaries, mergeOpeningSoundCues, playBoundaryThenWaitForVoice, shortlistSoundAssets, soundAlignmentText, splitNarrationForSoundEvents, type MissingSoundSuggestion, type SoundSceneCue } from './sound-scene'
 import { DEFAULT_AMBIENCE_VOLUME, DEFAULT_EVENT_VOLUME, readSoundVolume, soundCategoryGain } from './sound-mix'
-import { renderPlaybackTimeline, type PlaybackTimelineTrack } from './sound-timeline'
+import { copyPlaybackChannels, renderPlaybackTimeline, type PlaybackTimelineTrack } from './sound-timeline'
 import { AutoplayRequestRegistry, PlaybackLongPress, PlaybackStartupGuard, syncAutoplayIndicators, syncPlaybackButtons, waitForAutoplayDeadline, waitForAutoplayWork, type PlaybackButtonState } from './playback-ui'
 import {
   activeGhostVoices,
@@ -5435,7 +5435,7 @@ export function setup(ctx: SpindleFrontendContext) {
             gain.gain.setValueAtTime(0, start)
             gain.gain.linearRampToValueAtTime(level * preferences.volume, start + 0.25)
             source.connect(gain); gain.connect(audioContext.destination)
-            const track: PlaybackTimelineTrack = { channels: Array.from({ length: buffer.numberOfChannels }, (_, channel) => buffer.getChannelData(channel)), sampleRate: buffer.sampleRate, gain: level, startSeconds: start, endSeconds: start, loop: true, fadeInSeconds: 0.25 }
+            const track: PlaybackTimelineTrack = { channels: copyPlaybackChannels(Array.from({ length: buffer.numberOfChannels }, (_, channel) => buffer.getChannelData(channel))), sampleRate: buffer.sampleRate, gain: level, startSeconds: start, endSeconds: start, loop: true, fadeInSeconds: 0.25 }
             timelineOrigin ??= start
             capturedTimeline.push(track)
             timelineUsed = true
@@ -5472,7 +5472,7 @@ export function setup(ctx: SpindleFrontendContext) {
           if (!buffer) return
           const start = audioContext.currentTime
           timelineOrigin ??= start
-          capturedTimeline.push({ channels: Array.from({ length: buffer.numberOfChannels }, (_, channel) => buffer.getChannelData(channel)), sampleRate: buffer.sampleRate, gain: segment.normalizationGain ?? 1, startSeconds: start, endSeconds: start + buffer.duration })
+          capturedTimeline.push({ channels: copyPlaybackChannels(Array.from({ length: buffer.numberOfChannels }, (_, channel) => buffer.getChannelData(channel))), sampleRate: buffer.sampleRate, gain: segment.normalizationGain ?? 1, startSeconds: start, endSeconds: start + buffer.duration })
         })
         previousAudioEndedAt = Date.now()
       }

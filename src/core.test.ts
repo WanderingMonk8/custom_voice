@@ -10,7 +10,7 @@ import { automaticSoundErrorCategory, soundPlanErrorCategory, soundRequestTimeou
 import { isFreesoundCc0, parseFreesoundSearch, rankAutomaticFreesoundResults, safeFreesoundPreviewUrl } from './freesound'
 import { alignSoundSourceSegments, ambienceInstructionAtBoundary, competingSoundCueIndexes, interleaveSoundEvents, localOpeningAmbience, mapSoundCueBoundaries, mergeOpeningSoundCues, parseMissingSoundSuggestions, parseSoundScenePlan, playBoundaryThenWaitForVoice, shortlistSoundAssets, shortlistSoundPlannerAssets, soundAlignmentText, soundOpeningExcerpt, splitNarrationForSoundEvents } from './sound-scene'
 import { DEFAULT_AMBIENCE_VOLUME, DEFAULT_EVENT_VOLUME, mixAmbienceClip, readSoundVolume, renderSoundMix, soundCategoryGain } from './sound-mix'
-import { buildSoundTimeline, encodeSoundTimelineWav, renderPlaybackTimeline, resampleSoundClip } from './sound-timeline'
+import { buildSoundTimeline, copyPlaybackChannels, encodeSoundTimelineWav, renderPlaybackTimeline, resampleSoundClip } from './sound-timeline'
 import { SoundCuePreparation } from './sound-preparation'
 import { AutoplayRequestRegistry, PlaybackLongPress, PlaybackStartupGuard, syncAutoplayIndicators, syncPlaybackButtons, waitForAutoplayDeadline, waitForAutoplayWork, type PlaybackButtonState } from './playback-ui'
 import { evaluateSpeakerReviews } from './speaker-review-evaluation'
@@ -659,6 +659,15 @@ test('captured playback timeline keeps ambience continuous through speech gaps',
   for (let i = 0; i < expected.length; i++) assert.ok(Math.abs(rendered[0][i] - expected[i]) < 0.00001)
   assert.deepEqual(rendered[0], rendered[1])
   assert.throws(() => renderPlaybackTimeline(tracks, 999999, rate), /exceeds/)
+})
+
+test('timeline channel snapshots survive source buffer detachment', () => {
+  const source = new Float32Array([0.1, 0.2, 0.3])
+  const captured = copyPlaybackChannels([source])
+  structuredClone(source.buffer, { transfer: [source.buffer] })
+  assert.equal(source.length, 0)
+  const mixed = renderPlaybackTimeline([{ channels: captured, sampleRate: 8000, gain: 1, startSeconds: 0, endSeconds: 3 / 8000 }], 3 / 8000, 8000)
+  assert.ok(Math.abs(mixed[0][1] - 0.2) < 0.00001)
 })
 
 test('ambience-mixed clips encode with the same sample order for saving', () => {

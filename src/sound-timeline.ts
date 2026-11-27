@@ -31,6 +31,11 @@ export interface PlaybackTimelineTrack extends SampledSoundClip {
   fadeOutSeconds?: number
 }
 
+/** Keep recording data independent of Web Audio's transferable channel buffers. */
+export function copyPlaybackChannels(channels: readonly Float32Array[]): Float32Array[] {
+  return channels.map(channel => channel.slice())
+}
+
 /** Render captured audio-clock positions into the recording, preserving gaps. */
 export function renderPlaybackTimeline(tracks: readonly PlaybackTimelineTrack[], durationSeconds: number, sampleRate: number): Float32Array[] {
   if (!Number.isSafeInteger(sampleRate) || sampleRate < 8000 || sampleRate > 192000
@@ -42,10 +47,10 @@ export function renderPlaybackTimeline(tracks: readonly PlaybackTimelineTrack[],
     if (!Number.isFinite(track.startSeconds) || !Number.isFinite(track.endSeconds) || track.startSeconds < 0 || track.endSeconds <= track.startSeconds
       || !Number.isSafeInteger(track.sampleRate) || track.sampleRate < 8000 || track.sampleRate > 192000
       || !Number.isFinite(track.gain) || track.gain < 0 || track.gain > 4
-      || ![1, 2].includes(track.channels.length) || !track.channels[0]?.length
-      || track.channels.some(channel => !(channel instanceof Float32Array) || channel.length !== track.channels[0].length)
       || !Number.isFinite(track.fadeInSeconds ?? 0) || (track.fadeInSeconds ?? 0) < 0
-      || !Number.isFinite(track.fadeOutSeconds ?? 0) || (track.fadeOutSeconds ?? 0) < 0) throw new Error('Invalid playback timeline track.')
+      || !Number.isFinite(track.fadeOutSeconds ?? 0) || (track.fadeOutSeconds ?? 0) < 0) throw new Error('Invalid playback timeline track (timing, gain, rate, or fade).')
+    if (![1, 2].includes(track.channels.length) || !track.channels[0]?.length
+      || track.channels.some(channel => !(channel instanceof Float32Array) || channel.length !== track.channels[0].length)) throw new Error('Invalid playback timeline track (empty or inconsistent audio channels).')
     const first = Math.max(0, Math.ceil(track.startSeconds * sampleRate))
     const end = Math.min(frames, Math.ceil(track.endSeconds * sampleRate))
     const sourceFrames = track.channels[0].length

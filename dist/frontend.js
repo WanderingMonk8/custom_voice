@@ -2855,13 +2855,17 @@ function soundCategoryGain(channels, kind) {
 }
 
 // src/sound-timeline.ts
+function copyPlaybackChannels(channels) {
+  return channels.map((channel) => channel.slice());
+}
 function renderPlaybackTimeline(tracks, durationSeconds, sampleRate) {
   if (!Number.isSafeInteger(sampleRate) || sampleRate < 8e3 || sampleRate > 192e3 || !Number.isFinite(durationSeconds) || durationSeconds <= 0 || tracks.length > 2048) throw new Error("Invalid playback timeline.");
   const frames = Math.ceil(durationSeconds * sampleRate);
   if (!Number.isSafeInteger(frames) || frames * 2 * Float32Array.BYTES_PER_ELEMENT > 128 * 1024 * 1024) throw new Error("Playback timeline exceeds supported limits.");
   const output = [new Float32Array(frames), new Float32Array(frames)];
   for (const track of tracks) {
-    if (!Number.isFinite(track.startSeconds) || !Number.isFinite(track.endSeconds) || track.startSeconds < 0 || track.endSeconds <= track.startSeconds || !Number.isSafeInteger(track.sampleRate) || track.sampleRate < 8e3 || track.sampleRate > 192e3 || !Number.isFinite(track.gain) || track.gain < 0 || track.gain > 4 || ![1, 2].includes(track.channels.length) || !track.channels[0]?.length || track.channels.some((channel) => !(channel instanceof Float32Array) || channel.length !== track.channels[0].length) || !Number.isFinite(track.fadeInSeconds ?? 0) || (track.fadeInSeconds ?? 0) < 0 || !Number.isFinite(track.fadeOutSeconds ?? 0) || (track.fadeOutSeconds ?? 0) < 0) throw new Error("Invalid playback timeline track.");
+    if (!Number.isFinite(track.startSeconds) || !Number.isFinite(track.endSeconds) || track.startSeconds < 0 || track.endSeconds <= track.startSeconds || !Number.isSafeInteger(track.sampleRate) || track.sampleRate < 8e3 || track.sampleRate > 192e3 || !Number.isFinite(track.gain) || track.gain < 0 || track.gain > 4 || !Number.isFinite(track.fadeInSeconds ?? 0) || (track.fadeInSeconds ?? 0) < 0 || !Number.isFinite(track.fadeOutSeconds ?? 0) || (track.fadeOutSeconds ?? 0) < 0) throw new Error("Invalid playback timeline track (timing, gain, rate, or fade).");
+    if (![1, 2].includes(track.channels.length) || !track.channels[0]?.length || track.channels.some((channel) => !(channel instanceof Float32Array) || channel.length !== track.channels[0].length)) throw new Error("Invalid playback timeline track (empty or inconsistent audio channels).");
     const first = Math.max(0, Math.ceil(track.startSeconds * sampleRate));
     const end = Math.min(frames, Math.ceil(track.endSeconds * sampleRate));
     const sourceFrames = track.channels[0].length;
@@ -8029,7 +8033,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
               gain.gain.linearRampToValueAtTime(level * preferences.volume, start + 0.25);
               source.connect(gain);
               gain.connect(audioContext.destination);
-              const track = { channels: Array.from({ length: buffer.numberOfChannels }, (_, channel) => buffer.getChannelData(channel)), sampleRate: buffer.sampleRate, gain: level, startSeconds: start, endSeconds: start, loop: true, fadeInSeconds: 0.25 };
+              const track = { channels: copyPlaybackChannels(Array.from({ length: buffer.numberOfChannels }, (_, channel) => buffer.getChannelData(channel))), sampleRate: buffer.sampleRate, gain: level, startSeconds: start, endSeconds: start, loop: true, fadeInSeconds: 0.25 };
               timelineOrigin ??= start;
               capturedTimeline.push(track);
               timelineUsed = true;
@@ -8068,7 +8072,7 @@ TTS tag placement: style=${placementStyle}, mode=llm, speeches=${tagSources.size
             if (!buffer) return;
             const start = audioContext.currentTime;
             timelineOrigin ??= start;
-            capturedTimeline.push({ channels: Array.from({ length: buffer.numberOfChannels }, (_, channel) => buffer.getChannelData(channel)), sampleRate: buffer.sampleRate, gain: segment.normalizationGain ?? 1, startSeconds: start, endSeconds: start + buffer.duration });
+            capturedTimeline.push({ channels: copyPlaybackChannels(Array.from({ length: buffer.numberOfChannels }, (_, channel) => buffer.getChannelData(channel))), sampleRate: buffer.sampleRate, gain: segment.normalizationGain ?? 1, startSeconds: start, endSeconds: start + buffer.duration });
           });
           previousAudioEndedAt = Date.now();
         };
